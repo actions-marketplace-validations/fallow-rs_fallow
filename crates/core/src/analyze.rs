@@ -98,15 +98,26 @@ pub fn find_dead_code_with_resolved(
 }
 
 /// Find files that are not reachable from any entry point.
+///
+/// TypeScript declaration files (`.d.ts`) are excluded because they are consumed
+/// by the TypeScript compiler via `tsconfig.json` includes, not via explicit
+/// import statements. Flagging them as unused is a false positive.
 fn find_unused_files(graph: &ModuleGraph) -> Vec<UnusedFile> {
     graph
         .modules
         .iter()
         .filter(|m| !m.is_reachable && !m.is_entry_point)
+        .filter(|m| !is_declaration_file(&m.path))
         .map(|m| UnusedFile {
             path: m.path.clone(),
         })
         .collect()
+}
+
+/// Check if a path is a TypeScript declaration file (`.d.ts`, `.d.mts`, `.d.cts`).
+fn is_declaration_file(path: &std::path::Path) -> bool {
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    name.ends_with(".d.ts") || name.ends_with(".d.mts") || name.ends_with(".d.cts")
 }
 
 /// Find exports that are never imported by other files.
@@ -331,6 +342,16 @@ fn find_unused_members(
                     continue;
                 }
 
+                // Skip React class component lifecycle methods — they are called by the
+                // React runtime, not user code, so they should never be flagged as unused.
+                if matches!(
+                    member.kind,
+                    MemberKind::ClassMethod | MemberKind::ClassProperty
+                ) && is_react_lifecycle_method(&member.name)
+                {
+                    continue;
+                }
+
                 let source = source_content.get_or_insert_with(|| read_source(&module.path));
                 let (line, col) = byte_offset_to_line_col(source, member.span.start);
 
@@ -511,6 +532,10 @@ fn is_tooling_dependency(name: &str) -> bool {
         "autoprefixer",
         "tailwindcss",
         "@tailwindcss",
+        "@vitest/",
+        "@jest/",
+        "@testing-library/",
+        "@playwright/",
     ];
 
     let exact_matches = [
@@ -524,9 +549,41 @@ fn is_tooling_dependency(name: &str) -> bool {
         "nodemon",
         "ts-node",
         "tsx",
+        "knip",
+        "jest",
+        "vitest",
+        "happy-dom",
+        "jsdom",
     ];
 
     tooling_prefixes.iter().any(|p| name.starts_with(p)) || exact_matches.contains(&name)
+}
+
+/// React class component lifecycle methods that are called by the React runtime.
+///
+/// These should never be flagged as unused class members because they are not
+/// invoked directly by user code.
+fn is_react_lifecycle_method(name: &str) -> bool {
+    matches!(
+        name,
+        "render"
+            | "componentDidMount"
+            | "componentDidUpdate"
+            | "componentWillUnmount"
+            | "shouldComponentUpdate"
+            | "getSnapshotBeforeUpdate"
+            | "getDerivedStateFromProps"
+            | "getDerivedStateFromError"
+            | "componentDidCatch"
+            | "componentWillMount"
+            | "componentWillReceiveProps"
+            | "componentWillUpdate"
+            | "UNSAFE_componentWillMount"
+            | "UNSAFE_componentWillReceiveProps"
+            | "UNSAFE_componentWillUpdate"
+            | "getChildContext"
+            | "contextType"
+    )
 }
 
 #[cfg(test)]
@@ -669,5 +726,98 @@ mod tests {
         assert!(!is_tooling_dependency("lodash"));
         assert!(!is_tooling_dependency("express"));
         assert!(!is_tooling_dependency("@emotion/react"));
+    }
+
+    // New tooling dependency tests (Issue 2)
+    #[test]
+    fn tooling_dep_testing_frameworks() {
+        assert!(is_tooling_dependency("jest"));
+        assert!(is_tooling_dependency("vitest"));
+        assert!(is_tooling_dependency("@jest/globals"));
+        assert!(is_tooling_dependency("@vitest/coverage-v8"));
+        assert!(is_tooling_dependency("@testing-library/react"));
+        assert!(is_tooling_dependency("@testing-library/jest-dom"));
+        assert!(is_tooling_dependency("@playwright/test"));
+    }
+
+    #[test]
+    fn tooling_dep_environments_and_cli() {
+        assert!(is_tooling_dependency("happy-dom"));
+        assert!(is_tooling_dependency("jsdom"));
+        assert!(is_tooling_dependency("knip"));
+    }
+
+    // React lifecycle method tests (Issue 1)
+    #[test]
+    fn react_lifecycle_standard_methods() {
+        assert!(is_react_lifecycle_method("render"));
+        assert!(is_react_lifecycle_method("componentDidMount"));
+        assert!(is_react_lifecycle_method("componentDidUpdate"));
+        assert!(is_react_lifecycle_method("componentWillUnmount"));
+        assert!(is_react_lifecycle_method("shouldComponentUpdate"));
+        assert!(is_react_lifecycle_method("getSnapshotBeforeUpdate"));
+    }
+
+    #[test]
+    fn react_lifecycle_static_methods() {
+        assert!(is_react_lifecycle_method("getDerivedStateFromProps"));
+        assert!(is_react_lifecycle_method("getDerivedStateFromError"));
+    }
+
+    #[test]
+    fn react_lifecycle_error_boundary() {
+        assert!(is_react_lifecycle_method("componentDidCatch"));
+    }
+
+    #[test]
+    fn react_lifecycle_deprecated_and_unsafe() {
+        assert!(is_react_lifecycle_method("componentWillMount"));
+        assert!(is_react_lifecycle_method("componentWillReceiveProps"));
+        assert!(is_react_lifecycle_method("componentWillUpdate"));
+        assert!(is_react_lifecycle_method("UNSAFE_componentWillMount"));
+        assert!(is_react_lifecycle_method(
+            "UNSAFE_componentWillReceiveProps"
+        ));
+        assert!(is_react_lifecycle_method("UNSAFE_componentWillUpdate"));
+    }
+
+    #[test]
+    fn react_lifecycle_context_methods() {
+        assert!(is_react_lifecycle_method("getChildContext"));
+        assert!(is_react_lifecycle_method("contextType"));
+    }
+
+    #[test]
+    fn not_react_lifecycle_method() {
+        assert!(!is_react_lifecycle_method("handleClick"));
+        assert!(!is_react_lifecycle_method("fetchData"));
+        assert!(!is_react_lifecycle_method("constructor"));
+        assert!(!is_react_lifecycle_method("setState"));
+        assert!(!is_react_lifecycle_method("forceUpdate"));
+        assert!(!is_react_lifecycle_method("customMethod"));
+    }
+
+    // Declaration file tests (Issue 4)
+    #[test]
+    fn declaration_file_dts() {
+        assert!(is_declaration_file(std::path::Path::new("styled.d.ts")));
+        assert!(is_declaration_file(std::path::Path::new(
+            "src/types/styled.d.ts"
+        )));
+        assert!(is_declaration_file(std::path::Path::new("env.d.ts")));
+    }
+
+    #[test]
+    fn declaration_file_dmts_dcts() {
+        assert!(is_declaration_file(std::path::Path::new("module.d.mts")));
+        assert!(is_declaration_file(std::path::Path::new("module.d.cts")));
+    }
+
+    #[test]
+    fn not_declaration_file() {
+        assert!(!is_declaration_file(std::path::Path::new("index.ts")));
+        assert!(!is_declaration_file(std::path::Path::new("component.tsx")));
+        assert!(!is_declaration_file(std::path::Path::new("utils.js")));
+        assert!(!is_declaration_file(std::path::Path::new("styles.d.css")));
     }
 }

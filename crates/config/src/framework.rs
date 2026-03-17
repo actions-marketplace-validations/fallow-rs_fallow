@@ -122,6 +122,7 @@ fn builtin_frameworks() -> Vec<FrameworkRule> {
                 package: "next".to_string(),
             }),
             entry_points: vec![
+                // App Router convention files
                 pat("app/**/page.{ts,tsx,js,jsx}"),
                 pat("app/**/layout.{ts,tsx,js,jsx}"),
                 pat("app/**/loading.{ts,tsx,js,jsx}"),
@@ -131,8 +132,17 @@ fn builtin_frameworks() -> Vec<FrameworkRule> {
                 pat("app/**/default.{ts,tsx,js,jsx}"),
                 pat("app/**/route.{ts,tsx,js,jsx}"),
                 pat("app/**/global-error.{ts,tsx,js,jsx}"),
+                // App Router metadata files
                 pat("app/**/opengraph-image.{ts,tsx,js,jsx}"),
+                pat("app/**/twitter-image.{ts,tsx,js,jsx}"),
+                pat("app/**/icon.{ts,tsx,js,jsx}"),
+                pat("app/**/apple-icon.{ts,tsx,js,jsx}"),
+                pat("app/**/manifest.{ts,tsx,js,jsx}"),
+                pat("app/**/sitemap.{ts,tsx,js,jsx}"),
+                pat("app/**/robots.{ts,tsx,js,jsx}"),
+                // Pages Router
                 pat("pages/**/*.{ts,tsx,js,jsx}"),
+                // src/ variants of App Router convention files
                 pat("src/app/**/page.{ts,tsx,js,jsx}"),
                 pat("src/app/**/layout.{ts,tsx,js,jsx}"),
                 pat("src/app/**/loading.{ts,tsx,js,jsx}"),
@@ -142,15 +152,28 @@ fn builtin_frameworks() -> Vec<FrameworkRule> {
                 pat("src/app/**/default.{ts,tsx,js,jsx}"),
                 pat("src/app/**/route.{ts,tsx,js,jsx}"),
                 pat("src/app/**/global-error.{ts,tsx,js,jsx}"),
+                // src/ variants of App Router metadata files
                 pat("src/app/**/opengraph-image.{ts,tsx,js,jsx}"),
+                pat("src/app/**/twitter-image.{ts,tsx,js,jsx}"),
+                pat("src/app/**/icon.{ts,tsx,js,jsx}"),
+                pat("src/app/**/apple-icon.{ts,tsx,js,jsx}"),
+                pat("src/app/**/manifest.{ts,tsx,js,jsx}"),
+                pat("src/app/**/sitemap.{ts,tsx,js,jsx}"),
+                pat("src/app/**/robots.{ts,tsx,js,jsx}"),
+                // src/ Pages Router
                 pat("src/pages/**/*.{ts,tsx,js,jsx}"),
-                pat("src/middleware.{ts,js}"),
+                // Middleware and proxy
                 pat("middleware.{ts,js}"),
+                pat("src/middleware.{ts,js}"),
+                pat("proxy.{ts,js}"),
+                pat("src/proxy.{ts,js}"),
+                // Instrumentation
                 pat("instrumentation.{ts,js}"),
             ],
             always_used: vec![
                 "next.config.{ts,js,mjs,cjs}".to_string(),
                 "next-env.d.ts".to_string(),
+                "favicon.ico".to_string(),
             ],
             used_exports: vec![
                 FrameworkUsedExport {
@@ -178,6 +201,117 @@ fn builtin_frameworks() -> Vec<FrameworkRule> {
                         "getStaticPaths",
                         "getServerSideProps",
                     ]),
+                },
+                // src/ variants of core App Router used exports
+                FrameworkUsedExport {
+                    file_pattern: "src/app/**/page.{ts,tsx,js,jsx}".to_string(),
+                    exports: strs(&["default"]),
+                },
+                FrameworkUsedExport {
+                    file_pattern: "src/app/**/layout.{ts,tsx,js,jsx}".to_string(),
+                    exports: strs(&[
+                        "default",
+                        "metadata",
+                        "generateMetadata",
+                        "generateStaticParams",
+                    ]),
+                },
+                FrameworkUsedExport {
+                    file_pattern: "src/app/**/route.{ts,tsx,js,jsx}".to_string(),
+                    exports: strs(&["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"]),
+                },
+                FrameworkUsedExport {
+                    file_pattern: "src/pages/**/*.{ts,tsx,js,jsx}".to_string(),
+                    exports: strs(&[
+                        "default",
+                        "getStaticProps",
+                        "getStaticPaths",
+                        "getServerSideProps",
+                    ]),
+                },
+                // Metadata image files (icon, apple-icon, opengraph-image, twitter-image)
+                FrameworkUsedExport {
+                    file_pattern: "app/**/icon.{ts,tsx,js,jsx}".to_string(),
+                    exports: strs(&["default", "size", "contentType", "generateImageMetadata"]),
+                },
+                FrameworkUsedExport {
+                    file_pattern: "app/**/apple-icon.{ts,tsx,js,jsx}".to_string(),
+                    exports: strs(&["default", "size", "contentType", "generateImageMetadata"]),
+                },
+                FrameworkUsedExport {
+                    file_pattern: "app/**/opengraph-image.{ts,tsx,js,jsx}".to_string(),
+                    exports: strs(&[
+                        "default",
+                        "size",
+                        "contentType",
+                        "generateImageMetadata",
+                        "alt",
+                    ]),
+                },
+                FrameworkUsedExport {
+                    file_pattern: "app/**/twitter-image.{ts,tsx,js,jsx}".to_string(),
+                    exports: strs(&[
+                        "default",
+                        "size",
+                        "contentType",
+                        "generateImageMetadata",
+                        "alt",
+                    ]),
+                },
+                // Metadata data files (manifest, sitemap, robots)
+                FrameworkUsedExport {
+                    file_pattern: "app/**/manifest.{ts,tsx,js,jsx}".to_string(),
+                    exports: strs(&["default"]),
+                },
+                FrameworkUsedExport {
+                    file_pattern: "app/**/sitemap.{ts,tsx,js,jsx}".to_string(),
+                    exports: strs(&["default", "generateSitemaps"]),
+                },
+                FrameworkUsedExport {
+                    file_pattern: "app/**/robots.{ts,tsx,js,jsx}".to_string(),
+                    exports: strs(&["default"]),
+                },
+                // src/ variants of metadata image files
+                FrameworkUsedExport {
+                    file_pattern: "src/app/**/icon.{ts,tsx,js,jsx}".to_string(),
+                    exports: strs(&["default", "size", "contentType", "generateImageMetadata"]),
+                },
+                FrameworkUsedExport {
+                    file_pattern: "src/app/**/apple-icon.{ts,tsx,js,jsx}".to_string(),
+                    exports: strs(&["default", "size", "contentType", "generateImageMetadata"]),
+                },
+                FrameworkUsedExport {
+                    file_pattern: "src/app/**/opengraph-image.{ts,tsx,js,jsx}".to_string(),
+                    exports: strs(&[
+                        "default",
+                        "size",
+                        "contentType",
+                        "generateImageMetadata",
+                        "alt",
+                    ]),
+                },
+                FrameworkUsedExport {
+                    file_pattern: "src/app/**/twitter-image.{ts,tsx,js,jsx}".to_string(),
+                    exports: strs(&[
+                        "default",
+                        "size",
+                        "contentType",
+                        "generateImageMetadata",
+                        "alt",
+                    ]),
+                },
+                // src/ variants of metadata data files
+                FrameworkUsedExport {
+                    file_pattern: "src/app/**/manifest.{ts,tsx,js,jsx}".to_string(),
+                    exports: strs(&["default"]),
+                },
+                FrameworkUsedExport {
+                    file_pattern: "src/app/**/sitemap.{ts,tsx,js,jsx}".to_string(),
+                    exports: strs(&["default", "generateSitemaps"]),
+                },
+                FrameworkUsedExport {
+                    file_pattern: "src/app/**/robots.{ts,tsx,js,jsx}".to_string(),
+                    exports: strs(&["default"]),
                 },
             ],
         },

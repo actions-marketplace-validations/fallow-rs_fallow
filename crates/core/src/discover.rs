@@ -32,6 +32,7 @@ pub enum EntryPointSource {
     PackageJsonModule,
     PackageJsonExports,
     PackageJsonBin,
+    PackageJsonScript,
     FrameworkRule { name: String },
     TestFile,
     DefaultIndex,
@@ -144,6 +145,33 @@ pub fn discover_entry_points(config: &ResolvedConfig, files: &[DiscoveredFile]) 
                             source: EntryPointSource::PackageJsonMain,
                         });
                         break;
+                    }
+                }
+            }
+        }
+
+        // 2b. Package.json scripts — extract file references as entry points
+        if let Some(scripts) = &pkg.scripts {
+            for script_value in scripts.values() {
+                for file_ref in extract_script_file_refs(script_value) {
+                    let resolved = config.root.join(&file_ref);
+                    if resolved.exists() {
+                        entries.push(EntryPoint {
+                            path: resolved,
+                            source: EntryPointSource::PackageJsonScript,
+                        });
+                    } else {
+                        // Try with extensions
+                        for ext in SOURCE_EXTENSIONS {
+                            let with_ext = resolved.with_extension(ext);
+                            if with_ext.exists() {
+                                entries.push(EntryPoint {
+                                    path: with_ext,
+                                    source: EntryPointSource::PackageJsonScript,
+                                });
+                                break;
+                            }
+                        }
                     }
                 }
             }
@@ -331,6 +359,32 @@ pub fn discover_workspace_entry_points(
             }
         }
 
+        // Scripts field — extract file references as entry points
+        if let Some(scripts) = &pkg.scripts {
+            for script_value in scripts.values() {
+                for file_ref in extract_script_file_refs(script_value) {
+                    let resolved = ws_root.join(&file_ref);
+                    if resolved.exists() {
+                        entries.push(EntryPoint {
+                            path: resolved,
+                            source: EntryPointSource::PackageJsonScript,
+                        });
+                    } else {
+                        for ext in SOURCE_EXTENSIONS {
+                            let with_ext = resolved.with_extension(ext);
+                            if with_ext.exists() {
+                                entries.push(EntryPoint {
+                                    path: with_ext,
+                                    source: EntryPointSource::PackageJsonScript,
+                                });
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Apply framework rules to workspace
         for rule in &config.framework_rules {
             if !is_framework_active(rule, &pkg, ws_root) {
@@ -369,6 +423,96 @@ pub fn discover_workspace_entry_points(
     entries.sort_by(|a, b| a.path.cmp(&b.path));
     entries.dedup_by(|a, b| a.path == b.path);
     entries
+}
+
+/// Extract file path references from a package.json script value.
+///
+/// Recognises patterns like:
+/// - `node path/to/script.js`
+/// - `ts-node path/to/script.ts`
+/// - `tsx path/to/script.ts`
+/// - `npx ts-node path/to/script.ts`
+/// - Bare file paths ending in `.js`, `.ts`, `.mjs`, `.cjs`, `.mts`, `.cts`
+///
+/// Script values are split by `&&`, `||`, and `;` to handle chained commands.
+fn extract_script_file_refs(script: &str) -> Vec<String> {
+    let mut refs = Vec::new();
+
+    // Runners whose next argument is a file path
+    const RUNNERS: &[&str] = &["node", "ts-node", "tsx", "babel-node"];
+
+    // Split on shell operators to handle chained commands
+    for segment in script.split(&['&', '|', ';'][..]) {
+        let segment = segment.trim();
+        if segment.is_empty() {
+            continue;
+        }
+
+        let tokens: Vec<&str> = segment.split_whitespace().collect();
+        if tokens.is_empty() {
+            continue;
+        }
+
+        // Skip leading `npx`/`pnpx`/`yarn`/`pnpm exec` to find the actual command
+        let mut start = 0;
+        if matches!(tokens.first(), Some(&"npx" | &"pnpx")) {
+            start = 1;
+        } else if tokens.len() >= 2 && matches!(tokens[0], "yarn" | "pnpm") && tokens[1] == "exec" {
+            start = 2;
+        }
+
+        if start >= tokens.len() {
+            continue;
+        }
+
+        let cmd = tokens[start];
+
+        // Check if the command is a known runner
+        if RUNNERS.contains(&cmd) {
+            // Find the first non-flag argument after the runner
+            for &token in &tokens[start + 1..] {
+                if token.starts_with('-') {
+                    continue;
+                }
+                // Must look like a file path (contains '/' or '.' extension)
+                if looks_like_file_path(token) {
+                    refs.push(token.to_string());
+                }
+                break;
+            }
+        } else {
+            // Scan all tokens for bare file paths (e.g. `./scripts/build.js`)
+            for &token in &tokens[start..] {
+                if token.starts_with('-') {
+                    continue;
+                }
+                if looks_like_script_file(token) {
+                    refs.push(token.to_string());
+                }
+            }
+        }
+    }
+
+    refs
+}
+
+/// Check if a token looks like a file path argument (has a directory separator or a
+/// JS/TS file extension).
+fn looks_like_file_path(token: &str) -> bool {
+    let extensions = [".js", ".ts", ".mjs", ".cjs", ".mts", ".cts", ".jsx", ".tsx"];
+    extensions.iter().any(|ext| token.ends_with(ext)) || token.contains('/')
+}
+
+/// Check if a token looks like a standalone script file reference (must have a
+/// JS/TS extension and a path-like structure, not a bare command name).
+fn looks_like_script_file(token: &str) -> bool {
+    let extensions = [".js", ".ts", ".mjs", ".cjs", ".mts", ".cts", ".jsx", ".tsx"];
+    if !extensions.iter().any(|ext| token.ends_with(ext)) {
+        return false;
+    }
+    // Must contain a path separator or start with ./ to distinguish from
+    // bare package names like `webpack.js`
+    token.contains('/') || token.starts_with("./") || token.starts_with("../")
 }
 
 /// Check whether any file matching a glob pattern exists under root.
@@ -475,4 +619,100 @@ pub fn compile_glob_set(patterns: &[String]) -> Option<globset::GlobSet> {
         }
     }
     builder.build().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // extract_script_file_refs tests (Issue 3)
+    #[test]
+    fn script_node_runner() {
+        let refs = extract_script_file_refs("node utilities/generate-coverage-badge.js");
+        assert_eq!(refs, vec!["utilities/generate-coverage-badge.js"]);
+    }
+
+    #[test]
+    fn script_ts_node_runner() {
+        let refs = extract_script_file_refs("ts-node scripts/seed.ts");
+        assert_eq!(refs, vec!["scripts/seed.ts"]);
+    }
+
+    #[test]
+    fn script_tsx_runner() {
+        let refs = extract_script_file_refs("tsx scripts/migrate.ts");
+        assert_eq!(refs, vec!["scripts/migrate.ts"]);
+    }
+
+    #[test]
+    fn script_npx_prefix() {
+        let refs = extract_script_file_refs("npx ts-node scripts/generate.ts");
+        assert_eq!(refs, vec!["scripts/generate.ts"]);
+    }
+
+    #[test]
+    fn script_chained_commands() {
+        let refs = extract_script_file_refs("node scripts/build.js && node scripts/post-build.js");
+        assert_eq!(refs, vec!["scripts/build.js", "scripts/post-build.js"]);
+    }
+
+    #[test]
+    fn script_with_flags() {
+        let refs = extract_script_file_refs(
+            "node --experimental-specifier-resolution=node scripts/run.mjs",
+        );
+        assert_eq!(refs, vec!["scripts/run.mjs"]);
+    }
+
+    #[test]
+    fn script_no_file_ref() {
+        let refs = extract_script_file_refs("next build");
+        assert!(refs.is_empty());
+    }
+
+    #[test]
+    fn script_bare_file_path() {
+        let refs = extract_script_file_refs("echo done && node ./scripts/check.js");
+        assert_eq!(refs, vec!["./scripts/check.js"]);
+    }
+
+    #[test]
+    fn script_semicolon_separator() {
+        let refs = extract_script_file_refs("node scripts/a.js; node scripts/b.ts");
+        assert_eq!(refs, vec!["scripts/a.js", "scripts/b.ts"]);
+    }
+
+    // looks_like_file_path tests
+    #[test]
+    fn file_path_with_extension() {
+        assert!(looks_like_file_path("scripts/build.js"));
+        assert!(looks_like_file_path("scripts/build.ts"));
+        assert!(looks_like_file_path("scripts/build.mjs"));
+    }
+
+    #[test]
+    fn file_path_with_slash() {
+        assert!(looks_like_file_path("scripts/build"));
+    }
+
+    #[test]
+    fn not_file_path() {
+        assert!(!looks_like_file_path("--watch"));
+        assert!(!looks_like_file_path("build"));
+    }
+
+    // looks_like_script_file tests
+    #[test]
+    fn script_file_with_path() {
+        assert!(looks_like_script_file("scripts/build.js"));
+        assert!(looks_like_script_file("./scripts/build.ts"));
+        assert!(looks_like_script_file("../scripts/build.mjs"));
+    }
+
+    #[test]
+    fn not_script_file_bare_name() {
+        // Bare names without path separator should not match
+        assert!(!looks_like_script_file("webpack.js"));
+        assert!(!looks_like_script_file("build"));
+    }
 }

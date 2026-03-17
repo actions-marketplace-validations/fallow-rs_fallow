@@ -253,7 +253,7 @@ impl ModuleGraph {
 
             let edge_end = all_edges.len();
 
-            let exports = module_by_id
+            let mut exports: Vec<ExportSymbol> = module_by_id
                 .get(&file.id)
                 .map(|m| {
                     m.exports
@@ -268,6 +268,42 @@ impl ModuleGraph {
                         .collect()
                 })
                 .unwrap_or_default();
+
+            // Create ExportSymbol entries for re-exports so that consumers
+            // importing from this barrel can have their references attached.
+            // Without this, `export { Foo } from './source'` on a barrel would
+            // not be trackable as an export of the barrel module.
+            if let Some(resolved) = module_by_id.get(&file.id) {
+                for re in &resolved.re_exports {
+                    // Skip star re-exports without an alias (`export * from './x'`)
+                    // — they don't create a named export on the barrel.
+                    // But `export * as name from './x'` does create one.
+                    if re.info.exported_name == "*" {
+                        continue;
+                    }
+
+                    // Avoid duplicates: if an export with this name already exists
+                    // (e.g. the module both declares and re-exports the same name),
+                    // skip creating another one.
+                    let export_name = if re.info.exported_name == "default" {
+                        ExportName::Default
+                    } else {
+                        ExportName::Named(re.info.exported_name.clone())
+                    };
+                    let already_exists = exports.iter().any(|e| e.name == export_name);
+                    if already_exists {
+                        continue;
+                    }
+
+                    exports.push(ExportSymbol {
+                        name: export_name,
+                        is_type_only: re.info.is_type_only,
+                        span: oxc_span::Span::new(0, 0), // re-exports don't have a meaningful span on the barrel
+                        references: Vec::new(),
+                        members: Vec::new(),
+                    });
+                }
+            }
 
             let has_cjs_exports = module_by_id
                 .get(&file.id)
@@ -1061,5 +1097,627 @@ mod tests {
 
         let graph = ModuleGraph::build(&resolved_modules, &entry_points, &files);
         assert!(graph.modules[0].has_cjs_exports);
+    }
+
+    #[test]
+    fn barrel_re_export_creates_export_symbol() {
+        // barrel.ts has `export { foo } from './source'`
+        // The barrel should have an ExportSymbol for "foo" so references can attach.
+        let files = vec![
+            DiscoveredFile {
+                id: FileId(0),
+                path: PathBuf::from("/project/entry.ts"),
+                size_bytes: 100,
+            },
+            DiscoveredFile {
+                id: FileId(1),
+                path: PathBuf::from("/project/barrel.ts"),
+                size_bytes: 50,
+            },
+            DiscoveredFile {
+                id: FileId(2),
+                path: PathBuf::from("/project/source.ts"),
+                size_bytes: 50,
+            },
+        ];
+
+        let entry_points = vec![EntryPoint {
+            path: PathBuf::from("/project/entry.ts"),
+            source: EntryPointSource::PackageJsonMain,
+        }];
+
+        let resolved_modules = vec![
+            ResolvedModule {
+                file_id: FileId(0),
+                path: PathBuf::from("/project/entry.ts"),
+                exports: vec![],
+                re_exports: vec![],
+                resolved_imports: vec![ResolvedImport {
+                    info: ImportInfo {
+                        source: "./barrel".to_string(),
+                        imported_name: ImportedName::Named("foo".to_string()),
+                        local_name: "foo".to_string(),
+                        is_type_only: false,
+                        span: oxc_span::Span::new(0, 10),
+                    },
+                    target: ResolveResult::InternalModule(FileId(1)),
+                }],
+                resolved_dynamic_imports: vec![],
+                member_accesses: vec![],
+                has_cjs_exports: false,
+            },
+            // barrel re-exports "foo" from source (no local exports)
+            ResolvedModule {
+                file_id: FileId(1),
+                path: PathBuf::from("/project/barrel.ts"),
+                exports: vec![], // barrel has NO local exports
+                re_exports: vec![ResolvedReExport {
+                    info: crate::extract::ReExportInfo {
+                        source: "./source".to_string(),
+                        imported_name: "foo".to_string(),
+                        exported_name: "foo".to_string(),
+                        is_type_only: false,
+                    },
+                    target: ResolveResult::InternalModule(FileId(2)),
+                }],
+                resolved_imports: vec![],
+                resolved_dynamic_imports: vec![],
+                member_accesses: vec![],
+                has_cjs_exports: false,
+            },
+            ResolvedModule {
+                file_id: FileId(2),
+                path: PathBuf::from("/project/source.ts"),
+                exports: vec![crate::extract::ExportInfo {
+                    name: ExportName::Named("foo".to_string()),
+                    local_name: Some("foo".to_string()),
+                    is_type_only: false,
+                    span: oxc_span::Span::new(0, 20),
+                    members: vec![],
+                }],
+                re_exports: vec![],
+                resolved_imports: vec![],
+                resolved_dynamic_imports: vec![],
+                member_accesses: vec![],
+                has_cjs_exports: false,
+            },
+        ];
+
+        let graph = ModuleGraph::build(&resolved_modules, &entry_points, &files);
+
+        // The barrel should have an ExportSymbol for "foo" created from its re-export
+        let barrel = &graph.modules[1];
+        let foo_export = barrel.exports.iter().find(|e| e.name.to_string() == "foo");
+        assert!(
+            foo_export.is_some(),
+            "barrel should have ExportSymbol for re-exported 'foo'"
+        );
+
+        // The barrel's foo export should have a reference from entry.ts
+        let foo = foo_export.unwrap();
+        assert!(
+            !foo.references.is_empty(),
+            "barrel's foo should have a reference from entry.ts"
+        );
+
+        // The source module's foo should also have propagated references
+        let source = &graph.modules[2];
+        let source_foo = source
+            .exports
+            .iter()
+            .find(|e| e.name.to_string() == "foo")
+            .unwrap();
+        assert!(
+            !source_foo.references.is_empty(),
+            "source foo should have propagated references through barrel"
+        );
+    }
+
+    #[test]
+    fn barrel_unused_re_export_has_no_references() {
+        // barrel.ts re-exports both foo and bar from source
+        // entry.ts only imports foo — bar should have no references on barrel
+        let files = vec![
+            DiscoveredFile {
+                id: FileId(0),
+                path: PathBuf::from("/project/entry.ts"),
+                size_bytes: 100,
+            },
+            DiscoveredFile {
+                id: FileId(1),
+                path: PathBuf::from("/project/barrel.ts"),
+                size_bytes: 50,
+            },
+            DiscoveredFile {
+                id: FileId(2),
+                path: PathBuf::from("/project/source.ts"),
+                size_bytes: 50,
+            },
+        ];
+
+        let entry_points = vec![EntryPoint {
+            path: PathBuf::from("/project/entry.ts"),
+            source: EntryPointSource::PackageJsonMain,
+        }];
+
+        let resolved_modules = vec![
+            ResolvedModule {
+                file_id: FileId(0),
+                path: PathBuf::from("/project/entry.ts"),
+                exports: vec![],
+                re_exports: vec![],
+                resolved_imports: vec![ResolvedImport {
+                    info: ImportInfo {
+                        source: "./barrel".to_string(),
+                        imported_name: ImportedName::Named("foo".to_string()),
+                        local_name: "foo".to_string(),
+                        is_type_only: false,
+                        span: oxc_span::Span::new(0, 10),
+                    },
+                    target: ResolveResult::InternalModule(FileId(1)),
+                }],
+                resolved_dynamic_imports: vec![],
+                member_accesses: vec![],
+                has_cjs_exports: false,
+            },
+            ResolvedModule {
+                file_id: FileId(1),
+                path: PathBuf::from("/project/barrel.ts"),
+                exports: vec![],
+                re_exports: vec![
+                    ResolvedReExport {
+                        info: crate::extract::ReExportInfo {
+                            source: "./source".to_string(),
+                            imported_name: "foo".to_string(),
+                            exported_name: "foo".to_string(),
+                            is_type_only: false,
+                        },
+                        target: ResolveResult::InternalModule(FileId(2)),
+                    },
+                    ResolvedReExport {
+                        info: crate::extract::ReExportInfo {
+                            source: "./source".to_string(),
+                            imported_name: "bar".to_string(),
+                            exported_name: "bar".to_string(),
+                            is_type_only: false,
+                        },
+                        target: ResolveResult::InternalModule(FileId(2)),
+                    },
+                ],
+                resolved_imports: vec![],
+                resolved_dynamic_imports: vec![],
+                member_accesses: vec![],
+                has_cjs_exports: false,
+            },
+            ResolvedModule {
+                file_id: FileId(2),
+                path: PathBuf::from("/project/source.ts"),
+                exports: vec![
+                    crate::extract::ExportInfo {
+                        name: ExportName::Named("foo".to_string()),
+                        local_name: Some("foo".to_string()),
+                        is_type_only: false,
+                        span: oxc_span::Span::new(0, 20),
+                        members: vec![],
+                    },
+                    crate::extract::ExportInfo {
+                        name: ExportName::Named("bar".to_string()),
+                        local_name: Some("bar".to_string()),
+                        is_type_only: false,
+                        span: oxc_span::Span::new(25, 45),
+                        members: vec![],
+                    },
+                ],
+                re_exports: vec![],
+                resolved_imports: vec![],
+                resolved_dynamic_imports: vec![],
+                member_accesses: vec![],
+                has_cjs_exports: false,
+            },
+        ];
+
+        let graph = ModuleGraph::build(&resolved_modules, &entry_points, &files);
+
+        let barrel = &graph.modules[1];
+        // foo should be referenced, bar should NOT
+        let foo = barrel
+            .exports
+            .iter()
+            .find(|e| e.name.to_string() == "foo")
+            .unwrap();
+        assert!(!foo.references.is_empty(), "barrel's foo should be used");
+
+        let bar = barrel
+            .exports
+            .iter()
+            .find(|e| e.name.to_string() == "bar")
+            .unwrap();
+        assert!(
+            bar.references.is_empty(),
+            "barrel's bar should be unused (no consumer imports it)"
+        );
+    }
+
+    #[test]
+    fn type_only_re_export_creates_type_only_export_symbol() {
+        // barrel has: export type { FooType } from './source'
+        let files = vec![
+            DiscoveredFile {
+                id: FileId(0),
+                path: PathBuf::from("/project/entry.ts"),
+                size_bytes: 100,
+            },
+            DiscoveredFile {
+                id: FileId(1),
+                path: PathBuf::from("/project/barrel.ts"),
+                size_bytes: 50,
+            },
+            DiscoveredFile {
+                id: FileId(2),
+                path: PathBuf::from("/project/source.ts"),
+                size_bytes: 50,
+            },
+        ];
+
+        let entry_points = vec![EntryPoint {
+            path: PathBuf::from("/project/entry.ts"),
+            source: EntryPointSource::PackageJsonMain,
+        }];
+
+        let resolved_modules = vec![
+            ResolvedModule {
+                file_id: FileId(0),
+                path: PathBuf::from("/project/entry.ts"),
+                exports: vec![],
+                re_exports: vec![],
+                resolved_imports: vec![ResolvedImport {
+                    info: ImportInfo {
+                        source: "./barrel".to_string(),
+                        imported_name: ImportedName::Named("UsedType".to_string()),
+                        local_name: "UsedType".to_string(),
+                        is_type_only: true,
+                        span: oxc_span::Span::new(0, 10),
+                    },
+                    target: ResolveResult::InternalModule(FileId(1)),
+                }],
+                resolved_dynamic_imports: vec![],
+                member_accesses: vec![],
+                has_cjs_exports: false,
+            },
+            ResolvedModule {
+                file_id: FileId(1),
+                path: PathBuf::from("/project/barrel.ts"),
+                exports: vec![],
+                re_exports: vec![
+                    ResolvedReExport {
+                        info: crate::extract::ReExportInfo {
+                            source: "./source".to_string(),
+                            imported_name: "UsedType".to_string(),
+                            exported_name: "UsedType".to_string(),
+                            is_type_only: true,
+                        },
+                        target: ResolveResult::InternalModule(FileId(2)),
+                    },
+                    ResolvedReExport {
+                        info: crate::extract::ReExportInfo {
+                            source: "./source".to_string(),
+                            imported_name: "UnusedType".to_string(),
+                            exported_name: "UnusedType".to_string(),
+                            is_type_only: true,
+                        },
+                        target: ResolveResult::InternalModule(FileId(2)),
+                    },
+                ],
+                resolved_imports: vec![],
+                resolved_dynamic_imports: vec![],
+                member_accesses: vec![],
+                has_cjs_exports: false,
+            },
+            ResolvedModule {
+                file_id: FileId(2),
+                path: PathBuf::from("/project/source.ts"),
+                exports: vec![
+                    crate::extract::ExportInfo {
+                        name: ExportName::Named("UsedType".to_string()),
+                        local_name: Some("UsedType".to_string()),
+                        is_type_only: true,
+                        span: oxc_span::Span::new(0, 20),
+                        members: vec![],
+                    },
+                    crate::extract::ExportInfo {
+                        name: ExportName::Named("UnusedType".to_string()),
+                        local_name: Some("UnusedType".to_string()),
+                        is_type_only: true,
+                        span: oxc_span::Span::new(25, 45),
+                        members: vec![],
+                    },
+                ],
+                re_exports: vec![],
+                resolved_imports: vec![],
+                resolved_dynamic_imports: vec![],
+                member_accesses: vec![],
+                has_cjs_exports: false,
+            },
+        ];
+
+        let graph = ModuleGraph::build(&resolved_modules, &entry_points, &files);
+
+        let barrel = &graph.modules[1];
+
+        // Both type re-exports should create type-only ExportSymbols
+        let used_type = barrel
+            .exports
+            .iter()
+            .find(|e| e.name.to_string() == "UsedType")
+            .expect("barrel should have ExportSymbol for UsedType");
+        assert!(used_type.is_type_only, "UsedType should be type-only");
+        assert!(
+            !used_type.references.is_empty(),
+            "UsedType should have references"
+        );
+
+        let unused_type = barrel
+            .exports
+            .iter()
+            .find(|e| e.name.to_string() == "UnusedType")
+            .expect("barrel should have ExportSymbol for UnusedType");
+        assert!(unused_type.is_type_only, "UnusedType should be type-only");
+        assert!(
+            unused_type.references.is_empty(),
+            "UnusedType should have no references"
+        );
+    }
+
+    #[test]
+    fn default_re_export_creates_default_export_symbol() {
+        // barrel has: export { default as Accordion } from './Accordion'
+        let files = vec![
+            DiscoveredFile {
+                id: FileId(0),
+                path: PathBuf::from("/project/entry.ts"),
+                size_bytes: 100,
+            },
+            DiscoveredFile {
+                id: FileId(1),
+                path: PathBuf::from("/project/barrel.ts"),
+                size_bytes: 50,
+            },
+            DiscoveredFile {
+                id: FileId(2),
+                path: PathBuf::from("/project/source.ts"),
+                size_bytes: 50,
+            },
+        ];
+
+        let entry_points = vec![EntryPoint {
+            path: PathBuf::from("/project/entry.ts"),
+            source: EntryPointSource::PackageJsonMain,
+        }];
+
+        let resolved_modules = vec![
+            ResolvedModule {
+                file_id: FileId(0),
+                path: PathBuf::from("/project/entry.ts"),
+                exports: vec![],
+                re_exports: vec![],
+                resolved_imports: vec![ResolvedImport {
+                    info: ImportInfo {
+                        source: "./barrel".to_string(),
+                        imported_name: ImportedName::Named("Accordion".to_string()),
+                        local_name: "Accordion".to_string(),
+                        is_type_only: false,
+                        span: oxc_span::Span::new(0, 10),
+                    },
+                    target: ResolveResult::InternalModule(FileId(1)),
+                }],
+                resolved_dynamic_imports: vec![],
+                member_accesses: vec![],
+                has_cjs_exports: false,
+            },
+            ResolvedModule {
+                file_id: FileId(1),
+                path: PathBuf::from("/project/barrel.ts"),
+                exports: vec![],
+                re_exports: vec![ResolvedReExport {
+                    info: crate::extract::ReExportInfo {
+                        source: "./source".to_string(),
+                        imported_name: "default".to_string(),
+                        exported_name: "Accordion".to_string(),
+                        is_type_only: false,
+                    },
+                    target: ResolveResult::InternalModule(FileId(2)),
+                }],
+                resolved_imports: vec![],
+                resolved_dynamic_imports: vec![],
+                member_accesses: vec![],
+                has_cjs_exports: false,
+            },
+            ResolvedModule {
+                file_id: FileId(2),
+                path: PathBuf::from("/project/source.ts"),
+                exports: vec![crate::extract::ExportInfo {
+                    name: ExportName::Default,
+                    local_name: None,
+                    is_type_only: false,
+                    span: oxc_span::Span::new(0, 20),
+                    members: vec![],
+                }],
+                re_exports: vec![],
+                resolved_imports: vec![],
+                resolved_dynamic_imports: vec![],
+                member_accesses: vec![],
+                has_cjs_exports: false,
+            },
+        ];
+
+        let graph = ModuleGraph::build(&resolved_modules, &entry_points, &files);
+
+        // Barrel should have "Accordion" as an export
+        let barrel = &graph.modules[1];
+        let accordion = barrel
+            .exports
+            .iter()
+            .find(|e| e.name.to_string() == "Accordion")
+            .expect("barrel should have ExportSymbol for Accordion");
+        assert!(
+            !accordion.references.is_empty(),
+            "Accordion should have reference from entry.ts"
+        );
+
+        // Source's default export should have propagated references
+        let source = &graph.modules[2];
+        let default_export = source
+            .exports
+            .iter()
+            .find(|e| matches!(e.name, ExportName::Default))
+            .unwrap();
+        assert!(
+            !default_export.references.is_empty(),
+            "source default export should have propagated references"
+        );
+    }
+
+    #[test]
+    fn multi_level_re_export_chain_propagation() {
+        // entry.ts -> barrel1.ts -re-exports-> barrel2.ts -re-exports-> source.ts
+        let files = vec![
+            DiscoveredFile {
+                id: FileId(0),
+                path: PathBuf::from("/project/entry.ts"),
+                size_bytes: 100,
+            },
+            DiscoveredFile {
+                id: FileId(1),
+                path: PathBuf::from("/project/barrel1.ts"),
+                size_bytes: 50,
+            },
+            DiscoveredFile {
+                id: FileId(2),
+                path: PathBuf::from("/project/barrel2.ts"),
+                size_bytes: 50,
+            },
+            DiscoveredFile {
+                id: FileId(3),
+                path: PathBuf::from("/project/source.ts"),
+                size_bytes: 50,
+            },
+        ];
+
+        let entry_points = vec![EntryPoint {
+            path: PathBuf::from("/project/entry.ts"),
+            source: EntryPointSource::PackageJsonMain,
+        }];
+
+        let resolved_modules = vec![
+            ResolvedModule {
+                file_id: FileId(0),
+                path: PathBuf::from("/project/entry.ts"),
+                exports: vec![],
+                re_exports: vec![],
+                resolved_imports: vec![ResolvedImport {
+                    info: ImportInfo {
+                        source: "./barrel1".to_string(),
+                        imported_name: ImportedName::Named("foo".to_string()),
+                        local_name: "foo".to_string(),
+                        is_type_only: false,
+                        span: oxc_span::Span::new(0, 10),
+                    },
+                    target: ResolveResult::InternalModule(FileId(1)),
+                }],
+                resolved_dynamic_imports: vec![],
+                member_accesses: vec![],
+                has_cjs_exports: false,
+            },
+            // barrel1 re-exports foo from barrel2
+            ResolvedModule {
+                file_id: FileId(1),
+                path: PathBuf::from("/project/barrel1.ts"),
+                exports: vec![],
+                re_exports: vec![ResolvedReExport {
+                    info: crate::extract::ReExportInfo {
+                        source: "./barrel2".to_string(),
+                        imported_name: "foo".to_string(),
+                        exported_name: "foo".to_string(),
+                        is_type_only: false,
+                    },
+                    target: ResolveResult::InternalModule(FileId(2)),
+                }],
+                resolved_imports: vec![],
+                resolved_dynamic_imports: vec![],
+                member_accesses: vec![],
+                has_cjs_exports: false,
+            },
+            // barrel2 re-exports foo from source
+            ResolvedModule {
+                file_id: FileId(2),
+                path: PathBuf::from("/project/barrel2.ts"),
+                exports: vec![],
+                re_exports: vec![ResolvedReExport {
+                    info: crate::extract::ReExportInfo {
+                        source: "./source".to_string(),
+                        imported_name: "foo".to_string(),
+                        exported_name: "foo".to_string(),
+                        is_type_only: false,
+                    },
+                    target: ResolveResult::InternalModule(FileId(3)),
+                }],
+                resolved_imports: vec![],
+                resolved_dynamic_imports: vec![],
+                member_accesses: vec![],
+                has_cjs_exports: false,
+            },
+            ResolvedModule {
+                file_id: FileId(3),
+                path: PathBuf::from("/project/source.ts"),
+                exports: vec![crate::extract::ExportInfo {
+                    name: ExportName::Named("foo".to_string()),
+                    local_name: Some("foo".to_string()),
+                    is_type_only: false,
+                    span: oxc_span::Span::new(0, 20),
+                    members: vec![],
+                }],
+                re_exports: vec![],
+                resolved_imports: vec![],
+                resolved_dynamic_imports: vec![],
+                member_accesses: vec![],
+                has_cjs_exports: false,
+            },
+        ];
+
+        let graph = ModuleGraph::build(&resolved_modules, &entry_points, &files);
+
+        // All modules in the chain should have foo referenced
+        let barrel1 = &graph.modules[1];
+        let b1_foo = barrel1
+            .exports
+            .iter()
+            .find(|e| e.name.to_string() == "foo")
+            .unwrap();
+        assert!(
+            !b1_foo.references.is_empty(),
+            "barrel1's foo should be referenced"
+        );
+
+        let barrel2 = &graph.modules[2];
+        let b2_foo = barrel2
+            .exports
+            .iter()
+            .find(|e| e.name.to_string() == "foo")
+            .unwrap();
+        assert!(
+            !b2_foo.references.is_empty(),
+            "barrel2's foo should be referenced (propagated through chain)"
+        );
+
+        let source = &graph.modules[3];
+        let src_foo = source
+            .exports
+            .iter()
+            .find(|e| e.name.to_string() == "foo")
+            .unwrap();
+        assert!(
+            !src_foo.references.is_empty(),
+            "source's foo should be referenced (propagated through 2-level chain)"
+        );
     }
 }

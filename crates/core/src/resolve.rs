@@ -207,11 +207,23 @@ fn resolve_specifier(
                 Ok(canonical) => {
                     if let Some(&file_id) = path_to_id.get(&canonical) {
                         ResolveResult::InternalModule(file_id)
+                    } else if let Some(pkg_name) =
+                        extract_package_name_from_node_modules_path(&canonical)
+                    {
+                        ResolveResult::NpmPackage(pkg_name)
                     } else {
                         ResolveResult::ExternalFile(canonical)
                     }
                 }
-                Err(_) => ResolveResult::ExternalFile(resolved_path.to_path_buf()),
+                Err(_) => {
+                    if let Some(pkg_name) =
+                        extract_package_name_from_node_modules_path(resolved_path)
+                    {
+                        ResolveResult::NpmPackage(pkg_name)
+                    } else {
+                        ResolveResult::ExternalFile(resolved_path.to_path_buf())
+                    }
+                }
             }
         }
         Err(_) => {
@@ -222,6 +234,40 @@ fn resolve_specifier(
                 ResolveResult::Unresolvable(specifier.to_string())
             }
         }
+    }
+}
+
+/// Extract npm package name from a resolved path inside `node_modules`.
+///
+/// Given a path like `/project/node_modules/react/index.js`, returns `Some("react")`.
+/// Given a path like `/project/node_modules/@scope/pkg/dist/index.js`, returns `Some("@scope/pkg")`.
+/// Returns `None` if the path doesn't contain a `node_modules` segment.
+fn extract_package_name_from_node_modules_path(path: &Path) -> Option<String> {
+    let components: Vec<&str> = path
+        .components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(s) => s.to_str(),
+            _ => None,
+        })
+        .collect();
+
+    // Find the last "node_modules" component (handles nested node_modules)
+    let nm_idx = components.iter().rposition(|&c| c == "node_modules")?;
+
+    let after = &components[nm_idx + 1..];
+    if after.is_empty() {
+        return None;
+    }
+
+    if after[0].starts_with('@') {
+        // Scoped package: @scope/pkg
+        if after.len() >= 2 {
+            Some(format!("{}/{}", after[0], after[1]))
+        } else {
+            Some(after[0].to_string())
+        }
+    } else {
+        Some(after[0].to_string())
     }
 }
 
@@ -265,5 +311,85 @@ mod tests {
         assert!(!is_bare_specifier("./utils"));
         assert!(!is_bare_specifier("../lib"));
         assert!(!is_bare_specifier("/absolute"));
+    }
+
+    #[test]
+    fn test_extract_package_name_from_node_modules_path_regular() {
+        let path = PathBuf::from("/project/node_modules/react/index.js");
+        assert_eq!(
+            extract_package_name_from_node_modules_path(&path),
+            Some("react".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_package_name_from_node_modules_path_scoped() {
+        let path = PathBuf::from("/project/node_modules/@babel/core/lib/index.js");
+        assert_eq!(
+            extract_package_name_from_node_modules_path(&path),
+            Some("@babel/core".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_package_name_from_node_modules_path_nested() {
+        // Nested node_modules: should use the last (innermost) one
+        let path = PathBuf::from("/project/node_modules/pkg-a/node_modules/pkg-b/dist/index.js");
+        assert_eq!(
+            extract_package_name_from_node_modules_path(&path),
+            Some("pkg-b".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_package_name_from_node_modules_path_deep_subpath() {
+        let path = PathBuf::from("/project/node_modules/react-dom/cjs/react-dom.production.min.js");
+        assert_eq!(
+            extract_package_name_from_node_modules_path(&path),
+            Some("react-dom".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_package_name_from_node_modules_path_no_node_modules() {
+        let path = PathBuf::from("/project/src/components/Button.tsx");
+        assert_eq!(extract_package_name_from_node_modules_path(&path), None);
+    }
+
+    #[test]
+    fn test_extract_package_name_from_node_modules_path_just_node_modules() {
+        let path = PathBuf::from("/project/node_modules");
+        assert_eq!(extract_package_name_from_node_modules_path(&path), None);
+    }
+
+    #[test]
+    fn test_extract_package_name_from_node_modules_path_scoped_only_scope() {
+        // Edge case: path ends at scope without package name
+        let path = PathBuf::from("/project/node_modules/@scope");
+        assert_eq!(
+            extract_package_name_from_node_modules_path(&path),
+            Some("@scope".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_specifier_node_modules_returns_npm_package() {
+        // When oxc_resolver resolves to a node_modules path that is NOT in path_to_id,
+        // it should return NpmPackage instead of ExternalFile.
+        // We can't easily test resolve_specifier directly without a real resolver,
+        // but the extract_package_name_from_node_modules_path function covers the
+        // core logic that was missing.
+        let path =
+            PathBuf::from("/project/node_modules/styled-components/dist/styled-components.esm.js");
+        assert_eq!(
+            extract_package_name_from_node_modules_path(&path),
+            Some("styled-components".to_string())
+        );
+
+        let path = PathBuf::from("/project/node_modules/next/dist/server/next.js");
+        assert_eq!(
+            extract_package_name_from_node_modules_path(&path),
+            Some("next".to_string())
+        );
     }
 }
