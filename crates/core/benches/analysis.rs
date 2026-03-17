@@ -168,7 +168,10 @@ export type Type{i} = {{ value: number }};
 
 /// Generate a synthetic project with `file_count` source files.
 /// Half of the exports are consumed by the entry point, the other half are "dead".
-fn create_synthetic_project(name: &str, file_count: usize) -> (std::path::PathBuf, fallow_config::ResolvedConfig) {
+fn create_synthetic_project(
+    name: &str,
+    file_count: usize,
+) -> (std::path::PathBuf, fallow_config::ResolvedConfig) {
     let temp_dir = std::env::temp_dir().join(format!("fallow-bench-{name}"));
     let _ = std::fs::remove_dir_all(&temp_dir);
     std::fs::create_dir_all(temp_dir.join("src")).unwrap();

@@ -454,8 +454,12 @@ pub fn discover_workspace_entry_points(
                 }
                 let relative = file.path.strip_prefix(ws_root).unwrap_or(&file.path);
                 let relative_str = relative.to_string_lossy();
-                let matched = entry_matchers.iter().any(|m| m.is_match(relative_str.as_ref()))
-                    || always_matchers.iter().any(|m| m.is_match(relative_str.as_ref()));
+                let matched = entry_matchers
+                    .iter()
+                    .any(|m| m.is_match(relative_str.as_ref()))
+                    || always_matchers
+                        .iter()
+                        .any(|m| m.is_match(relative_str.as_ref()));
                 if matched {
                     entries.push(EntryPoint {
                         path: file.path.clone(),
@@ -489,7 +493,10 @@ pub fn discover_workspace_entry_points(
             }
             let relative = file.path.strip_prefix(ws_root).unwrap_or(&file.path);
             let relative_str = relative.to_string_lossy();
-            if default_matchers.iter().any(|m| m.is_match(relative_str.as_ref())) {
+            if default_matchers
+                .iter()
+                .any(|m| m.is_match(relative_str.as_ref()))
+            {
                 entries.push(EntryPoint {
                     path: file.path.clone(),
                     source: EntryPointSource::DefaultIndex,
