@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: write
+  id-token: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -22,37 +23,50 @@ jobs:
           - target: x86_64-apple-darwin
             os: macos-latest
             binary: fallow
+            npm_dir: darwin-x64
           - target: aarch64-apple-darwin
             os: macos-latest
             binary: fallow
+            npm_dir: darwin-arm64
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             binary: fallow
+            npm_dir: linux-x64-gnu
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
             binary: fallow
+            npm_dir: linux-arm64-gnu
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
             binary: fallow
+            npm_dir: linux-x64-musl
           - target: aarch64-unknown-linux-musl
             os: ubuntu-latest
             binary: fallow
+            npm_dir: linux-arm64-musl
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             binary: fallow.exe
+            npm_dir: win32-x64-msvc
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install cross-compilation tools
-        if: contains(matrix.target, 'aarch64-unknown-linux') || contains(matrix.target, 'musl')
+      - name: Install musl tools
+        if: contains(matrix.target, 'musl')
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu musl-tools
+          sudo apt-get install -y musl-tools
+
+      - name: Install aarch64 cross-compilation tools
+        if: contains(matrix.target, 'aarch64-unknown-linux')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -62,6 +76,7 @@ jobs:
         run: cargo build --release --target ${{ matrix.target }} -p fallow-cli
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
 
       - name: Package binary (unix)
         if: runner.os != 'Windows'
@@ -75,23 +90,30 @@ jobs:
           cd target/${{ matrix.target }}/release
           7z a ../../../fallow-${{ matrix.target }}.zip ${{ matrix.binary }}
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v7
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v5
         with:
           name: fallow-${{ matrix.target }}
           path: fallow-${{ matrix.target }}.*
+
+      - name: Upload npm binary
+        uses: actions/upload-artifact@v5
+        with:
+          name: npm-${{ matrix.npm_dir }}
+          path: target/${{ matrix.target }}/release/${{ matrix.binary }}
 
   release:
     name: Create Release
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v5
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@v5
         with:
           path: artifacts
+          pattern: fallow-*
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -109,28 +131,94 @@ jobs:
     env:
       TAG_REF: ${{ github.ref }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v5
         with:
-          node-version: '20'
-          registry-url: 'https://registry.npmjs.org'
+          node-version: '22'
 
-      - name: Download all artifacts
-        uses: actions/download-artifact@v8
+      - name: Ensure latest npm (for trusted publishing)
+        run: npm install -g npm@latest
+
+      - name: Configure npm registry
+        run: npm config set registry https://registry.npmjs.org/
+
+      - name: Download darwin-arm64 binary
+        uses: actions/download-artifact@v5
         with:
-          path: artifacts
+          name: npm-darwin-arm64
+          path: npm/darwin-arm64
 
-      - name: Prepare and publish npm packages
+      - name: Download darwin-x64 binary
+        uses: actions/download-artifact@v5
+        with:
+          name: npm-darwin-x64
+          path: npm/darwin-x64
+
+      - name: Download linux-x64-gnu binary
+        uses: actions/download-artifact@v5
+        with:
+          name: npm-linux-x64-gnu
+          path: npm/linux-x64-gnu
+
+      - name: Download linux-arm64-gnu binary
+        uses: actions/download-artifact@v5
+        with:
+          name: npm-linux-arm64-gnu
+          path: npm/linux-arm64-gnu
+
+      - name: Download linux-x64-musl binary
+        uses: actions/download-artifact@v5
+        with:
+          name: npm-linux-x64-musl
+          path: npm/linux-x64-musl
+
+      - name: Download linux-arm64-musl binary
+        uses: actions/download-artifact@v5
+        with:
+          name: npm-linux-arm64-musl
+          path: npm/linux-arm64-musl
+
+      - name: Download win32-x64-msvc binary
+        uses: actions/download-artifact@v5
+        with:
+          name: npm-win32-x64-msvc
+          path: npm/win32-x64-msvc
+
+      - name: Set binary permissions
+        run: |
+          chmod +x npm/darwin-arm64/fallow
+          chmod +x npm/darwin-x64/fallow
+          chmod +x npm/linux-x64-gnu/fallow
+          chmod +x npm/linux-arm64-gnu/fallow
+          chmod +x npm/linux-x64-musl/fallow
+          chmod +x npm/linux-arm64-musl/fallow
+
+      - name: Update versions
         run: |
           VERSION="${TAG_REF#refs/tags/v}"
-
-          # Update version in all npm packages
-          for pkg in npm/*/package.json npm/@fallow-cli/*/package.json; do
-            jq --arg v "$VERSION" '.version = $v' "$pkg" > tmp.json && mv tmp.json "$pkg"
+          for pkg in npm/*/package.json; do
+            node -e "
+              const fs = require('fs');
+              const pkg = JSON.parse(fs.readFileSync('$pkg', 'utf8'));
+              pkg.version = '$VERSION';
+              if (pkg.optionalDependencies) {
+                for (const key of Object.keys(pkg.optionalDependencies)) {
+                  if (key.startsWith('@fallow-cli/')) {
+                    pkg.optionalDependencies[key] = '$VERSION';
+                  }
+                }
+              }
+              fs.writeFileSync('$pkg', JSON.stringify(pkg, null, 2) + '\n');
+            "
           done
 
-          cd npm/fallow
-          npm publish --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: Publish platform packages
+        run: |
+          for dir in npm/darwin-arm64 npm/darwin-x64 npm/linux-x64-gnu npm/linux-arm64-gnu npm/linux-x64-musl npm/linux-arm64-musl npm/win32-x64-msvc; do
+            echo "Publishing $(basename "$dir")..."
+            npm publish "$dir" --access public --provenance || echo "Skipping $(basename "$dir")"
+          done
+
+      - name: Publish fallow
+        run: npm publish npm/fallow --access public --provenance --ignore-scripts

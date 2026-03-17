@@ -14,6 +14,15 @@ coverage/
 # npm pack artifacts
 *.tgz
 
+# npm platform binaries (added by CI, not committed)
+npm/darwin-arm64/fallow
+npm/darwin-x64/fallow
+npm/linux-x64-gnu/fallow
+npm/linux-arm64-gnu/fallow
+npm/linux-x64-musl/fallow
+npm/linux-arm64-musl/fallow
+npm/win32-x64-msvc/fallow.exe
+
 # Claude
 .claude/*
 !.claude/settings.json

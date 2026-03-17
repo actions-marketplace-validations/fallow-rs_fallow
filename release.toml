@@ -8,3 +8,4 @@ sign-tag = true
 push = true
 publish = false
 dependent-version = "upgrade"
+pre-release-hook = ["bash", "-c", "\"$(git rev-parse --show-toplevel)/scripts/sync-npm-versions.sh\" \"$1\" \"$2\"", "--", "{{prev_version}}", "{{version}}"]

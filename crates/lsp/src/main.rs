@@ -286,13 +286,9 @@ impl FallowLspServer {
         // Collect diagnostics per file
         let mut diagnostics_by_file: HashMap<Url, Vec<Diagnostic>> = HashMap::new();
 
-        // Cache file contents to avoid re-reading the same file multiple times
-        let mut file_cache: HashMap<PathBuf, String> = HashMap::new();
-
         // Helper: get the package.json URI for dependency-related diagnostics
         let package_json_path = root.join("package.json");
         let package_json_uri = Url::from_file_path(&package_json_path).ok();
-
 
         for export in &results.unused_exports {
             if let Ok(uri) = Url::from_file_path(&export.path) {
@@ -332,7 +328,7 @@ impl FallowLspServer {
                         },
                         end: Position {
                             line,
-                            character: export.col,
+                            character: export.col + export.export_name.len() as u32,
                         },
                     },
                     severity: Some(DiagnosticSeverity::HINT),
@@ -452,10 +448,7 @@ impl FallowLspServer {
         // Unused enum members → HINT with UNNECESSARY tag
         for member in &results.unused_enum_members {
             if let Ok(uri) = Url::from_file_path(&member.path) {
-                let content = file_cache
-                    .entry(member.path.clone())
-                    .or_insert_with(|| std::fs::read_to_string(&member.path).unwrap_or_default());
-                let line = byte_offset_to_line(content, member.line as usize);
+                let line = member.line.saturating_sub(1);
                 let diag = Diagnostic {
                     range: Range {
                         start: Position {
@@ -484,10 +477,7 @@ impl FallowLspServer {
         // Unused class members → HINT with UNNECESSARY tag
         for member in &results.unused_class_members {
             if let Ok(uri) = Url::from_file_path(&member.path) {
-                let content = file_cache
-                    .entry(member.path.clone())
-                    .or_insert_with(|| std::fs::read_to_string(&member.path).unwrap_or_default());
-                let line = byte_offset_to_line(content, member.line as usize);
+                let line = member.line.saturating_sub(1);
                 let diag = Diagnostic {
                     range: Range {
                         start: Position {
@@ -606,14 +596,6 @@ impl FallowLspServer {
         *self.previous_diagnostic_uris.write().await = new_uris;
     }
 }
-
-/// Convert a byte offset in file content to a 0-based line number.
-fn byte_offset_to_line(content: &str, byte_offset: usize) -> u32 {
-    let offset = byte_offset.min(content.len());
-    let truncated = &content[..offset];
-    truncated.matches('\n').count() as u32
-}
-
 
 #[tokio::main]
 async fn main() {

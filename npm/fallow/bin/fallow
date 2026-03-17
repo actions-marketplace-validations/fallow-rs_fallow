@@ -4,42 +4,44 @@ const { execFileSync } = require('child_process');
 const { join } = require('path');
 const { existsSync } = require('fs');
 
-const PLATFORMS = {
-  'darwin-arm64': ['@fallow-cli/darwin-arm64'],
-  'darwin-x64': ['@fallow-cli/darwin-x64'],
-  'linux-x64': ['@fallow-cli/linux-x64-gnu', '@fallow-cli/linux-x64-musl'],
-  'linux-arm64': ['@fallow-cli/linux-arm64-gnu', '@fallow-cli/linux-arm64-musl'],
-  'win32-x64': ['@fallow-cli/win32-x64-msvc'],
-};
+function getPlatformPackage() {
+  const platform = process.platform;
+  const arch = process.arch;
 
-const platformKey = `${process.platform}-${process.arch}`;
-const candidates = PLATFORMS[platformKey];
+  if (platform === 'win32' && arch === 'x64') {
+    return '@fallow-cli/win32-x64-msvc';
+  }
+  if (platform === 'darwin') {
+    return `@fallow-cli/darwin-${arch}`;
+  }
+  if (platform === 'linux') {
+    const { familySync } = require('detect-libc');
+    const libc = familySync() === 'musl' ? 'musl' : 'gnu';
+    return `@fallow-cli/linux-${arch}-${libc}`;
+  }
 
-if (!candidates) {
-  console.error(`Unsupported platform: ${platformKey}`);
-  console.error(`Supported platforms: ${Object.keys(PLATFORMS).join(', ')}`);
+  return null;
+}
+
+const pkg = getPlatformPackage();
+
+if (!pkg) {
+  console.error(`Unsupported platform: ${process.platform}-${process.arch}`);
   process.exit(1);
 }
 
 let binaryPath;
-
-// Try each candidate package (gnu first, then musl fallback)
-for (const pkg of candidates) {
-  try {
-    const pkgDir = require.resolve(`${pkg}/package.json`);
-    const binaryName = process.platform === 'win32' ? 'fallow.exe' : 'fallow';
-    const candidate = join(pkgDir, '..', binaryName);
-    if (existsSync(candidate)) {
-      binaryPath = candidate;
-      break;
-    }
-  } catch {
-    // Package not installed, try next candidate
-  }
+try {
+  const pkgDir = require.resolve(`${pkg}/package.json`);
+  const binaryName = process.platform === 'win32' ? 'fallow.exe' : 'fallow';
+  binaryPath = join(pkgDir, '..', binaryName);
+} catch {
+  console.error(`Could not find ${pkg}. Run 'npm install' to install platform-specific binary.`);
+  process.exit(1);
 }
 
-if (!binaryPath) {
-  console.error(`Could not find fallow binary for ${platformKey}. Run 'npm install' to install platform-specific binary.`);
+if (!existsSync(binaryPath)) {
+  console.error(`Binary not found at ${binaryPath}`);
   process.exit(1);
 }
 

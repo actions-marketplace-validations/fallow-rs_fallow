@@ -161,7 +161,10 @@ impl FallowConfig {
     ///
     /// Stops searching at the first directory containing `.git` or `package.json`,
     /// to avoid picking up unrelated config files above the project root.
-    pub fn find_and_load(start: &Path) -> Option<(Self, PathBuf)> {
+    ///
+    /// Returns `Ok(Some(...))` if a config was found and parsed, `Ok(None)` if
+    /// no config file exists, and `Err(...)` if a config file exists but fails to parse.
+    pub fn find_and_load(start: &Path) -> Result<Option<(Self, PathBuf)>, String> {
         let config_names = ["fallow.toml", ".fallow.toml"];
 
         let mut dir = start;
@@ -170,10 +173,9 @@ impl FallowConfig {
                 let candidate = dir.join(name);
                 if candidate.exists() {
                     match Self::load(&candidate) {
-                        Ok(config) => return Some((config, candidate)),
+                        Ok(config) => return Ok(Some((config, candidate))),
                         Err(e) => {
-                            eprintln!("Warning: Failed to parse {}: {e}", candidate.display());
-                            return None; // Don't continue searching on parse error
+                            return Err(format!("Failed to parse {}: {e}", candidate.display()));
                         }
                     }
                 }
@@ -187,7 +189,7 @@ impl FallowConfig {
                 None => break,
             };
         }
-        None
+        Ok(None)
     }
 
     /// Resolve into a fully resolved config with compiled globs.

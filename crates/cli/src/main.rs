@@ -791,10 +791,15 @@ fn run_fix(
                     let after_default = after_export
                         .strip_prefix("default ")
                         .unwrap_or(after_export);
-                    if after_default.starts_with("function ") || after_default.starts_with("class ")
+                    if after_default.starts_with("function ")
+                        || after_default.starts_with("async function ")
+                        || after_default.starts_with("class ")
+                        || after_default.starts_with("abstract class ")
                     {
                         // `export default function Foo` -> `function Foo`
+                        // `export default async function Foo` -> `async function Foo`
                         // `export default class Foo` -> `class Foo`
+                        // `export default abstract class Foo` -> `abstract class Foo`
                         // handled below via line_fixes
                     } else {
                         // `export default expression` -> skip (can't safely remove)
@@ -848,7 +853,9 @@ fn run_fix(
                 let after_export = trimmed.strip_prefix("export ").unwrap_or(trimmed);
 
                 let replacement = if after_export.starts_with("default function ")
+                    || after_export.starts_with("default async function ")
                     || after_export.starts_with("default class ")
+                    || after_export.starts_with("default abstract class ")
                 {
                     // `export default function Foo` -> `function Foo`
                     after_export
@@ -860,7 +867,10 @@ fn run_fix(
 
                 new_lines[fix.line_idx] = format!("{}{}", &" ".repeat(indent), replacement);
             }
-            let new_content = new_lines.join("\n");
+            let mut new_content = new_lines.join("\n");
+            if content.ends_with('\n') {
+                new_content.push('\n');
+            }
 
             // Atomic write: temp file then rename
             let tmp_path = path.with_extension("fallow-tmp");
@@ -1354,7 +1364,13 @@ fn load_config(
             }
         }
     } else {
-        FallowConfig::find_and_load(root).map(|(c, _)| c)
+        match FallowConfig::find_and_load(root) {
+            Ok(found) => found.map(|(c, _)| c),
+            Err(e) => {
+                eprintln!("Error: {e}");
+                return Err(ExitCode::from(2));
+            }
+        }
     };
 
     Ok(match user_config {

@@ -814,7 +814,7 @@ fn results_serializable_to_json() {
 fn workspace_project_discovers_workspace_packages() {
     let root = fixture_path("workspace-project");
     let config = create_config(root.clone());
-    let results = fallow_core::analyze(&config);
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
 
     // Workspace discovery should find files across workspace packages
     // orphan.ts should always be detected as unused since nothing imports it
@@ -842,7 +842,7 @@ fn workspace_project_discovers_workspace_packages() {
 fn enum_class_members_detects_unused_members() {
     let root = fixture_path("enum-class-members");
     let config = create_config(root.clone());
-    let results = fallow_core::analyze(&config);
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
 
     let unused_enum_member_names: Vec<&str> = results
         .unused_enum_members
@@ -879,7 +879,7 @@ fn enum_class_members_detects_unused_members() {
 fn unlisted_dependencies_detected() {
     let root = fixture_path("unlisted-deps");
     let config = create_config(root.clone());
-    let results = fallow_core::analyze(&config);
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
 
     let unlisted_names: Vec<&str> = results
         .unlisted_dependencies
@@ -899,7 +899,7 @@ fn unlisted_dependencies_detected() {
 fn unresolved_imports_detected() {
     let root = fixture_path("unresolved-imports");
     let config = create_config(root.clone());
-    let results = fallow_core::analyze(&config);
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
 
     let unresolved_specifiers: Vec<&str> = results
         .unresolved_imports

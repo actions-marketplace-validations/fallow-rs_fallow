@@ -1,9 +1,0 @@
-{
-  "name": "@fallow-cli/darwin-x64",
-  "version": "0.1.0",
-  "os": ["darwin"],
-  "cpu": ["x64"],
-  "bin": {
-    "fallow": "fallow"
-  }
-}

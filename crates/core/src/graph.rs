@@ -203,7 +203,7 @@ impl ModuleGraph {
                         // Track namespace re-exports
                         if matches!(imp_name, ImportedName::Namespace) {
                             let idx = target_id.0 as usize;
-                            if idx < module_count {
+                            if idx < total_capacity {
                                 namespace_imported.insert(idx);
                             }
                         }
@@ -311,7 +311,9 @@ impl ModuleGraph {
         // Populate export references from edges — O(edges) not O(edges × modules)
         for edge in &all_edges {
             let source_id = edge.source;
-            let target_module = &mut modules[edge.target.0 as usize];
+            let Some(target_module) = modules.get_mut(edge.target.0 as usize) else {
+                continue;
+            };
             for sym in &edge.symbols {
                 let ref_kind = match &sym.imported_name {
                     ImportedName::Named(_) => ReferenceKind::NamedImport,

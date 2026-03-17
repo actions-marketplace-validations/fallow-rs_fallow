@@ -383,8 +383,6 @@ fn build_sarif(results: &AnalysisResults, root: &std::path::Path) -> serde_json:
 
     for export in &results.unused_exports {
         let relative = export.path.strip_prefix(root).unwrap_or(&export.path);
-        // TODO: Once core provides `line` as a real line number, use it directly.
-        // Currently `line` is a byte offset; `col` is the column number.
         sarif_results.push(serde_json::json!({
             "ruleId": "fallow/unused-export",
             "level": "warning",
@@ -394,7 +392,7 @@ fn build_sarif(results: &AnalysisResults, root: &std::path::Path) -> serde_json:
             "locations": [{
                 "physicalLocation": {
                     "artifactLocation": { "uri": normalize_uri(&relative.display().to_string()) },
-                    "region": { "startLine": export.line, "startColumn": export.col }
+                    "region": { "startLine": export.line, "startColumn": export.col + 1 }
                 }
             }]
         }));
@@ -402,7 +400,6 @@ fn build_sarif(results: &AnalysisResults, root: &std::path::Path) -> serde_json:
 
     for export in &results.unused_types {
         let relative = export.path.strip_prefix(root).unwrap_or(&export.path);
-        // TODO: Once core provides `line` as a real line number, use it directly.
         sarif_results.push(serde_json::json!({
             "ruleId": "fallow/unused-type",
             "level": "warning",
@@ -412,7 +409,7 @@ fn build_sarif(results: &AnalysisResults, root: &std::path::Path) -> serde_json:
             "locations": [{
                 "physicalLocation": {
                     "artifactLocation": { "uri": normalize_uri(&relative.display().to_string()) },
-                    "region": { "startLine": export.line, "startColumn": export.col }
+                    "region": { "startLine": export.line, "startColumn": export.col + 1 }
                 }
             }]
         }));
@@ -450,7 +447,6 @@ fn build_sarif(results: &AnalysisResults, root: &std::path::Path) -> serde_json:
 
     for member in &results.unused_enum_members {
         let relative = member.path.strip_prefix(root).unwrap_or(&member.path);
-        // TODO: Once core provides `line` as a real line number, use it directly.
         sarif_results.push(serde_json::json!({
             "ruleId": "fallow/unused-enum-member",
             "level": "warning",
@@ -460,7 +456,7 @@ fn build_sarif(results: &AnalysisResults, root: &std::path::Path) -> serde_json:
             "locations": [{
                 "physicalLocation": {
                     "artifactLocation": { "uri": normalize_uri(&relative.display().to_string()) },
-                    "region": { "startLine": member.line, "startColumn": member.col }
+                    "region": { "startLine": member.line, "startColumn": member.col + 1 }
                 }
             }]
         }));
@@ -468,7 +464,6 @@ fn build_sarif(results: &AnalysisResults, root: &std::path::Path) -> serde_json:
 
     for member in &results.unused_class_members {
         let relative = member.path.strip_prefix(root).unwrap_or(&member.path);
-        // TODO: Once core provides `line` as a real line number, use it directly.
         sarif_results.push(serde_json::json!({
             "ruleId": "fallow/unused-class-member",
             "level": "warning",
@@ -478,7 +473,7 @@ fn build_sarif(results: &AnalysisResults, root: &std::path::Path) -> serde_json:
             "locations": [{
                 "physicalLocation": {
                     "artifactLocation": { "uri": normalize_uri(&relative.display().to_string()) },
-                    "region": { "startLine": member.line, "startColumn": member.col }
+                    "region": { "startLine": member.line, "startColumn": member.col + 1 }
                 }
             }]
         }));
@@ -486,7 +481,6 @@ fn build_sarif(results: &AnalysisResults, root: &std::path::Path) -> serde_json:
 
     for import in &results.unresolved_imports {
         let relative = import.path.strip_prefix(root).unwrap_or(&import.path);
-        // TODO: Once core provides `line` as a real line number, use it directly.
         sarif_results.push(serde_json::json!({
             "ruleId": "fallow/unresolved-import",
             "level": "error",
@@ -496,7 +490,7 @@ fn build_sarif(results: &AnalysisResults, root: &std::path::Path) -> serde_json:
             "locations": [{
                 "physicalLocation": {
                     "artifactLocation": { "uri": normalize_uri(&relative.display().to_string()) },
-                    "region": { "startLine": import.line, "startColumn": import.col }
+                    "region": { "startLine": import.line, "startColumn": import.col + 1 }
                 }
             }]
         }));

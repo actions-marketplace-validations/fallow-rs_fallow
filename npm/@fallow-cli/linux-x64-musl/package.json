@@ -1,9 +1,0 @@
-{
-  "name": "@fallow-cli/linux-x64-musl",
-  "version": "0.1.0",
-  "os": ["linux"],
-  "cpu": ["x64"],
-  "bin": {
-    "fallow": "fallow"
-  }
-}

@@ -18,7 +18,7 @@ fn byte_offset_to_line_col(source: &str, byte_offset: u32) -> (u32, u32) {
         if ch == '\n' {
             line += 1;
             col = 0;
-        } else {
+        } else if ch != '\r' {
             col += 1;
         }
     }

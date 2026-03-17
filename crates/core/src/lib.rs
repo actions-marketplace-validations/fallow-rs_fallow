@@ -82,7 +82,9 @@ pub fn analyze_project(root: &Path) -> Result<AnalysisResults, FallowError> {
 
 /// Create a default config for a project root.
 fn default_config(root: &Path) -> ResolvedConfig {
-    let user_config = fallow_config::FallowConfig::find_and_load(root);
+    let user_config = fallow_config::FallowConfig::find_and_load(root)
+        .ok()
+        .flatten();
     match user_config {
         Some((config, _path)) => config.resolve(root.to_path_buf(), num_cpus(), false),
         None => fallow_config::FallowConfig {
