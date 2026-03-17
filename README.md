@@ -21,7 +21,9 @@ fallow is a drop-in alternative to [knip](https://knip.dev) that runs **25–40x
 npx fallow check    # zero config, sub-second results
 ```
 
-![Example `fallow check` output](assets/screenshots/fallow-check-output.png)
+<p align="center">
+  <img src="assets/screenshots/fallow-check-output.png" alt="Example fallow check output" width="560">
+</p>
 
 Regenerate this screenshot with `scripts/generate-readme-screenshot.sh` (uses `freeze`).
 
