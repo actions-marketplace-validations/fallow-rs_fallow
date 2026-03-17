@@ -1,0 +1,91 @@
+name: 'Fallow - Dead Code Analysis'
+description: 'Find unused files, exports, and dependencies in JavaScript/TypeScript projects'
+author: 'Nicholas Gasior'
+
+branding:
+  icon: 'search'
+  color: 'orange'
+
+inputs:
+  root:
+    description: 'Project root directory'
+    required: false
+    default: '.'
+  format:
+    description: 'Output format (human, json, sarif, compact)'
+    required: false
+    default: 'sarif'
+  fail-on-issues:
+    description: 'Exit with code 1 if issues are found'
+    required: false
+    default: 'true'
+  changed-since:
+    description: 'Only report issues in files changed since this git ref'
+    required: false
+  baseline:
+    description: 'Path to baseline file for comparison'
+    required: false
+  version:
+    description: 'Fallow version to use'
+    required: false
+    default: 'latest'
+  args:
+    description: 'Additional arguments to pass to fallow'
+    required: false
+    default: ''
+
+outputs:
+  results:
+    description: 'Analysis results in the specified format'
+  sarif:
+    description: 'Path to SARIF results file (when format=sarif)'
+  issues:
+    description: 'Total number of issues found'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Install fallow
+      shell: bash
+      run: |
+        if [ "${{ inputs.version }}" = "latest" ]; then
+          npm install -g fallow
+        else
+          npm install -g fallow@${{ inputs.version }}
+        fi
+
+    - name: Run analysis
+      id: analyze
+      shell: bash
+      run: |
+        ARGS="check --root ${{ inputs.root }} --format ${{ inputs.format }}"
+
+        if [ "${{ inputs.fail-on-issues }}" = "true" ]; then
+          ARGS="$ARGS --fail-on-issues"
+        fi
+
+        if [ -n "${{ inputs.changed-since }}" ]; then
+          ARGS="$ARGS --changed-since ${{ inputs.changed-since }}"
+        fi
+
+        if [ -n "${{ inputs.baseline }}" ]; then
+          ARGS="$ARGS --baseline ${{ inputs.baseline }}"
+        fi
+
+        if [ -n "${{ inputs.args }}" ]; then
+          ARGS="$ARGS ${{ inputs.args }}"
+        fi
+
+        if [ "${{ inputs.format }}" = "sarif" ]; then
+          fallow $ARGS > fallow-results.sarif 2>&1 || true
+          echo "sarif=fallow-results.sarif" >> $GITHUB_OUTPUT
+        else
+          fallow $ARGS
+        fi
+
+    - name: Upload SARIF
+      if: inputs.format == 'sarif' && always()
+      uses: github/codeql-action/upload-sarif@v3
+      with:
+        sarif_file: fallow-results.sarif
+        category: fallow

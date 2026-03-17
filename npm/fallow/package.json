@@ -1,0 +1,37 @@
+{
+  "name": "fallow",
+  "version": "0.1.0",
+  "description": "Find unused files, exports, and dependencies in JavaScript/TypeScript projects",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nicholasgasior/fallow"
+  },
+  "keywords": [
+    "dead-code",
+    "unused",
+    "exports",
+    "dependencies",
+    "lint",
+    "analyzer",
+    "typescript",
+    "javascript"
+  ],
+  "bin": {
+    "fallow": "bin/fallow"
+  },
+  "files": [
+    "bin",
+    "scripts"
+  ],
+  "scripts": {
+    "postinstall": "node scripts/postinstall.js"
+  },
+  "optionalDependencies": {
+    "@nicholasgasior/fallow-darwin-arm64": "0.1.0",
+    "@nicholasgasior/fallow-darwin-x64": "0.1.0",
+    "@nicholasgasior/fallow-linux-x64-gnu": "0.1.0",
+    "@nicholasgasior/fallow-linux-arm64-gnu": "0.1.0",
+    "@nicholasgasior/fallow-win32-x64-msvc": "0.1.0"
+  }
+}

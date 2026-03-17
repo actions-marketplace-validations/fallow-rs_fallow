@@ -1,0 +1,48 @@
+#!/usr/bin/env node
+
+const { execFileSync } = require('child_process');
+const { join } = require('path');
+const { existsSync } = require('fs');
+
+const PLATFORMS = {
+  'darwin-arm64': '@nicholasgasior/fallow-darwin-arm64',
+  'darwin-x64': '@nicholasgasior/fallow-darwin-x64',
+  'linux-x64': '@nicholasgasior/fallow-linux-x64-gnu',
+  'linux-arm64': '@nicholasgasior/fallow-linux-arm64-gnu',
+  'win32-x64': '@nicholasgasior/fallow-win32-x64-msvc',
+};
+
+const platformKey = `${process.platform}-${process.arch}`;
+const pkg = PLATFORMS[platformKey];
+
+if (!pkg) {
+  console.error(`Unsupported platform: ${platformKey}`);
+  console.error(`Supported platforms: ${Object.keys(PLATFORMS).join(', ')}`);
+  process.exit(1);
+}
+
+let binaryPath;
+
+// Try to find the binary in node_modules
+try {
+  const pkgDir = require.resolve(`${pkg}/package.json`);
+  const binaryName = process.platform === 'win32' ? 'fallow.exe' : 'fallow';
+  binaryPath = join(pkgDir, '..', binaryName);
+} catch {
+  console.error(`Could not find ${pkg}. Run 'npm install' to install platform-specific binary.`);
+  process.exit(1);
+}
+
+if (!existsSync(binaryPath)) {
+  console.error(`Binary not found at ${binaryPath}`);
+  process.exit(1);
+}
+
+try {
+  execFileSync(binaryPath, process.argv.slice(2), { stdio: 'inherit' });
+} catch (e) {
+  if (e.status !== undefined) {
+    process.exit(e.status);
+  }
+  throw e;
+}

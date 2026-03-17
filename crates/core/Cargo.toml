@@ -42,3 +42,7 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
+
+[[bench]]
+name = "analysis"
+harness = false
