@@ -1,5 +1,5 @@
-name: 'Fallow - Dead Code Analysis'
-description: 'Find unused files, exports, and dependencies in JavaScript/TypeScript projects. Supports SARIF upload, PR comments, and job summaries.'
+name: 'Fallow'
+description: 'Analyze JavaScript/TypeScript projects for unused code, code duplication, and auto-fixable issues. Supports SARIF upload, PR comments, and job summaries.'
 author: 'Bart Waardenburg'
 
 branding:
@@ -7,14 +7,25 @@ branding:
   color: 'orange'
 
 inputs:
+  command:
+    description: 'Command to run: check (unused code), dupes (code duplication), fix (auto-remove unused code)'
+    required: false
+    default: 'check'
   root:
     description: 'Project root directory'
     required: false
     default: '.'
+  config:
+    description: 'Path to config file (fallow.jsonc, fallow.json, or fallow.toml)'
+    required: false
   format:
     description: 'Output format (human, json, sarif, compact)'
     required: false
     default: 'sarif'
+  production:
+    description: 'Production mode: exclude test/dev files, only analyze start/build scripts'
+    required: false
+    default: 'false'
   fail-on-issues:
     description: 'Exit with code 1 if issues are found'
     required: false
@@ -25,42 +36,72 @@ inputs:
   baseline:
     description: 'Path to baseline file for comparison'
     required: false
+  save-baseline:
+    description: 'Save current results as a baseline file'
+    required: false
   version:
-    description: 'Fallow version to use (pin to a specific version for reproducible builds)'
+    description: 'Fallow version to use (default: latest)'
     required: false
     default: 'latest'
   args:
-    description: 'Additional arguments to pass to fallow (space-separated, no quoted values with spaces)'
+    description: 'Additional arguments to pass to fallow (space-separated)'
     required: false
     default: ''
   comment:
-    description: 'Post results as a PR comment (only works on pull_request events, requires pull-requests: write permission)'
+    description: 'Post results as a PR comment (requires pull-requests: write permission)'
     required: false
     default: 'false'
   github-token:
     description: 'GitHub token for PR comments and SARIF upload'
     required: false
     default: ${{ github.token }}
+  # Dupes-specific inputs
+  dupes-mode:
+    description: 'Detection mode for dupes command (strict, mild, weak, semantic)'
+    required: false
+    default: 'mild'
+  min-tokens:
+    description: 'Minimum token count for a clone (dupes command)'
+    required: false
+  min-lines:
+    description: 'Minimum line count for a clone (dupes command)'
+    required: false
+  threshold:
+    description: 'Fail if duplication exceeds this percentage (dupes command, 0 = no limit)'
+    required: false
+  skip-local:
+    description: 'Only report cross-directory duplicates (dupes command)'
+    required: false
+    default: 'false'
+  # Fix-specific inputs
+  dry-run:
+    description: 'Preview changes without modifying files (fix command, default: true for CI safety)'
+    required: false
+    default: 'true'
 
 outputs:
   results:
     description: 'Path to JSON results file'
     value: ${{ steps.analyze.outputs.results }}
   sarif:
-    description: 'Path to SARIF results file (when format=sarif)'
+    description: 'Path to SARIF results file'
     value: ${{ steps.analyze.outputs.sarif }}
   issues:
-    description: 'Total number of issues found'
+    description: 'Number of issues (check), clone groups (dupes), or fixes proposed/applied (fix)'
     value: ${{ steps.analyze.outputs.issues }}
 
 runs:
   using: 'composite'
   steps:
-    # Write the jq summary script early so both Job summary and PR comment can use it
-    - name: Prepare summary script
+    - name: Prepare summary scripts
       shell: bash
       run: |
-        cat > /tmp/fallow-summary.jq << 'JQEOF'
+        FALLOW_TMP="${RUNNER_TEMP:-/tmp}/fallow-$$"
+        mkdir -p "$FALLOW_TMP"
+        echo "FALLOW_TMP=${FALLOW_TMP}" >> "$GITHUB_ENV"
+
+        # --- Check command summary ---
+        cat > "$FALLOW_TMP/summary-check.jq" << 'JQEOF'
         def table_row(name; key):
           (.[key] | length) as $n |
           if $n > 0 then "| \(name) | \($n) |" else empty end;
@@ -75,9 +116,9 @@ runs:
           else "" end;
 
         if .total_issues == 0 then
-          "## Fallow — Dead Code Analysis\n\nNo dead code found.\n\n*Analyzed in \(.elapsed_ms)ms*"
+          "## Fallow — Unused Code Analysis\n\nNo unused code found.\n\n*Analyzed in \(.elapsed_ms)ms*"
         else
-          "## Fallow — Dead Code Analysis\n\nFound **\(.total_issues) issues** in \(.elapsed_ms)ms\n\n" +
+          "## Fallow — Unused Code Analysis\n\nFound **\(.total_issues) issues** in \(.elapsed_ms)ms\n\n" +
           "| Category | Issues |\n|----------|--------|\n" +
           ([
             table_row("Unused files"; "unused_files"),
@@ -109,10 +150,76 @@ runs:
           detail_section("Unresolved imports"; "unresolved_imports";
             "- `\(.path):\(.line)` — `\(.specifier)`") +
           detail_section("Unlisted dependencies"; "unlisted_dependencies";
-            "- `\(.package_name)` (used in \(.imported_from[:3] | join(", ")))") +
+            "- `\(.package_name)`\(if (.imported_from | length) > 0 then " (used in \(.imported_from[:3] | join(", ")))" else "" end)") +
           detail_section("Duplicate exports"; "duplicate_exports";
             "- `\(.export_name)` in \(.locations[:5] | join(", "))\(if (.locations | length) > 5 then " *(+\((.locations | length) - 5) more)*" else "" end)") +
-          "</details>"
+          "\n\n</details>"
+        end
+        JQEOF
+
+        # --- Dupes command summary ---
+        cat > "$FALLOW_TMP/summary-dupes.jq" << 'JQEOF'
+        if .stats.clone_groups == 0 then
+          "## Fallow — Code Duplication\n\nNo code duplication found.\n\n*Analyzed \(.stats.total_files) files in \(.elapsed_ms)ms*"
+        else
+          "## Fallow — Code Duplication\n\nFound **\(.stats.clone_groups) clone groups** (\(.stats.clone_instances) instances) across \(.stats.files_with_clones) files in \(.elapsed_ms)ms\n\n" +
+          "| Metric | Value |\n|--------|-------|\n" +
+          "| Files analyzed | \(.stats.total_files) |\n" +
+          "| Files with clones | \(.stats.files_with_clones) |\n" +
+          "| Clone groups | \(.stats.clone_groups) |\n" +
+          "| Clone instances | \(.stats.clone_instances) |\n" +
+          "| Duplicated lines | \(.stats.duplicated_lines) / \(.stats.total_lines) (\(.stats.duplication_percentage | . * 10 | round / 10)%) |\n" +
+          "\n<details>\n<summary>View details</summary>\n\n" +
+          (if (.clone_families | length) > 0 then
+            "**Clone Families (\(.clone_families | length))**\n\n" +
+            ([.clone_families[:15][] |
+              "- **\(.files[:3] | join(", "))\(if (.files | length) > 3 then " (+\((.files | length) - 3) more)" else "" end)** — \(.total_duplicated_lines) lines, \(.groups | length) groups" +
+              (if (.suggestions | length) > 0 then
+                "\n" + ([.suggestions[] | "  - \(.description) (~\(.estimated_savings) lines)"] | join("\n"))
+              else "" end)
+            ] | join("\n")) +
+            (if (.clone_families | length) > 15 then "\n- *... and \((.clone_families | length) - 15) more families*" else "" end)
+          else
+            ([.clone_groups[:20][] |
+              "- **\(.token_count) tokens, \(.line_count) lines** — \([.instances[] | .file] | unique | join(", "))"
+            ] | join("\n")) +
+            (if (.clone_groups | length) > 20 then "\n- *... and \((.clone_groups | length) - 20) more groups*" else "" end)
+          end) +
+          "\n\n</details>"
+        end
+        JQEOF
+
+        # --- Fix command summary ---
+        cat > "$FALLOW_TMP/summary-fix.jq" << 'JQEOF'
+        (.fixes | map(select(.type == "remove_export")) | length) as $exports |
+        (.fixes | map(select(.type == "remove_dependency")) | length) as $deps |
+
+        if (.fixes | length) == 0 then
+          "## Fallow — Auto-fix\n\nNo fixable issues found."
+        else
+          "## Fallow — Auto-fix\n\n" +
+          (if .dry_run then "**Dry run**: would apply" else "Applied" end) +
+          " **\(.fixes | length) fixes**" +
+          (if .dry_run then "" else " (\(.total_fixed) succeeded)" end) + "\n\n" +
+          "| Type | Count |\n|------|-------|\n" +
+          (if $exports > 0 then "| Export removals | \($exports) |\n" else "" end) +
+          (if $deps > 0 then "| Dependency removals | \($deps) |\n" else "" end) +
+          "\n<details>\n<summary>View details</summary>\n\n" +
+          (if $exports > 0 then
+            "**Export removals (\($exports))**\n" +
+            ([.fixes | map(select(.type == "remove_export"))[:25][] |
+              "- `\(.path):\(.line)` — `\(.name)`"] | join("\n")) +
+            (if $exports > 25 then "\n- *... and \($exports - 25) more*" else "" end) +
+            "\n\n"
+          else "" end) +
+          (if $deps > 0 then
+            "**Dependency removals (\($deps))**\n" +
+            ([.fixes | map(select(.type == "remove_dependency"))[:25][] |
+              "- `\(.package)` from \(.location) in `\(.file)`"] | join("\n")) +
+            (if $deps > 25 then "\n- *... and \($deps - 25) more*" else "" end) +
+            "\n"
+          else "" end) +
+          "\n\n</details>"
         end
         JQEOF
 
@@ -121,6 +228,12 @@ runs:
       env:
         FALLOW_VERSION: ${{ inputs.version }}
       run: |
+        # Validate version to prevent npm URL/path injection
+        if ! [[ "$FALLOW_VERSION" =~ ^(latest|[0-9]+\.[0-9]+\.[0-9]+([-.][a-zA-Z0-9.]+)*)$ ]]; then
+          echo "::error::Invalid version specifier: ${FALLOW_VERSION}. Use 'latest' or a semver like '0.3.0'."
+          exit 2
+        fi
+
         if [ "$FALLOW_VERSION" = "latest" ]; then
           npm install -g fallow
         else
@@ -132,41 +245,77 @@ runs:
       id: analyze
       shell: bash
       env:
+        INPUT_COMMAND: ${{ inputs.command }}
         INPUT_ROOT: ${{ inputs.root }}
+        INPUT_CONFIG: ${{ inputs.config }}
         INPUT_FORMAT: ${{ inputs.format }}
+        INPUT_PRODUCTION: ${{ inputs.production }}
         INPUT_CHANGED_SINCE: ${{ inputs.changed-since }}
         INPUT_BASELINE: ${{ inputs.baseline }}
+        INPUT_SAVE_BASELINE: ${{ inputs.save-baseline }}
         INPUT_ARGS: ${{ inputs.args }}
+        INPUT_DUPES_MODE: ${{ inputs.dupes-mode }}
+        INPUT_MIN_TOKENS: ${{ inputs.min-tokens }}
+        INPUT_MIN_LINES: ${{ inputs.min-lines }}
+        INPUT_THRESHOLD: ${{ inputs.threshold }}
+        INPUT_SKIP_LOCAL: ${{ inputs.skip-local }}
+        INPUT_DRY_RUN: ${{ inputs.dry-run }}
       run: |
-        # Check if installed fallow supports --sarif-file (added in v0.1.7)
+        # Validate command
+        case "$INPUT_COMMAND" in
+          check|dupes|fix) ;;
+          *) echo "::error::Invalid command: ${INPUT_COMMAND}. Must be check, dupes, or fix."; exit 2 ;;
+        esac
+
+        # Check for --sarif-file support (check command only)
         HAS_SARIF_FILE=false
-        if fallow check --help 2>/dev/null | grep -q -- '--sarif-file'; then
+        if [ "$INPUT_COMMAND" = "check" ] && fallow check --help 2>/dev/null | grep -q -- '--sarif-file'; then
           HAS_SARIF_FILE=true
         fi
 
-        # Build arguments safely using arrays to prevent shell injection
-        ARGS=(check --root "$INPUT_ROOT" --quiet --format json)
+        # Build base arguments
+        ARGS=("$INPUT_COMMAND" --root "$INPUT_ROOT" --quiet --format json)
 
-        if [ -n "$INPUT_CHANGED_SINCE" ]; then
-          ARGS+=(--changed-since "$INPUT_CHANGED_SINCE")
+        # Config file
+        [ -n "$INPUT_CONFIG" ] && ARGS+=(--config "$INPUT_CONFIG")
+
+        # Production mode
+        [ "$INPUT_PRODUCTION" = "true" ] && ARGS+=(--production)
+
+        # Common options
+        [ -n "$INPUT_CHANGED_SINCE" ] && ARGS+=(--changed-since "$INPUT_CHANGED_SINCE")
+        [ -n "$INPUT_BASELINE" ] && ARGS+=(--baseline "$INPUT_BASELINE")
+        [ -n "$INPUT_SAVE_BASELINE" ] && ARGS+=(--save-baseline "$INPUT_SAVE_BASELINE")
+
+        # Command-specific arguments
+        case "$INPUT_COMMAND" in
+          check)
+            if [ "$INPUT_FORMAT" = "sarif" ] && [ "$HAS_SARIF_FILE" = "true" ]; then
+              ARGS+=(--sarif-file fallow-results.sarif)
+            fi
+            ;;
+          dupes)
+            ARGS+=(--mode "$INPUT_DUPES_MODE")
+            [ -n "$INPUT_MIN_TOKENS" ] && ARGS+=(--min-tokens "$INPUT_MIN_TOKENS")
+            [ -n "$INPUT_MIN_LINES" ] && ARGS+=(--min-lines "$INPUT_MIN_LINES")
+            [ -n "$INPUT_THRESHOLD" ] && ARGS+=(--threshold "$INPUT_THRESHOLD")
+            [ "$INPUT_SKIP_LOCAL" = "true" ] && ARGS+=(--skip-local)
+            ;;
+          fix)
+            [ "$INPUT_DRY_RUN" = "true" ] && ARGS+=(--dry-run)
+            ;;
+        esac
+
+        # Parse extra arguments safely (guard against empty producing [""])
+        EXTRA_ARGS=()
+        if [ -n "$INPUT_ARGS" ]; then
+          read -ra EXTRA_ARGS <<< "$INPUT_ARGS"
         fi
 
-        if [ -n "$INPUT_BASELINE" ]; then
-          ARGS+=(--baseline "$INPUT_BASELINE")
-        fi
-
-        # Write SARIF alongside JSON in a single pass when supported
-        if [ "$INPUT_FORMAT" = "sarif" ] && [ "$HAS_SARIF_FILE" = "true" ]; then
-          ARGS+=(--sarif-file fallow-results.sarif)
-        fi
-
-        # Parse INPUT_ARGS into array to prevent glob expansion
-        read -ra EXTRA_ARGS <<< "$INPUT_ARGS"
-
-        # Run analysis — intentionally no --fail-on-issues so subsequent steps always run
+        # Run analysis — no --fail-on-issues so subsequent steps always run
         if ! fallow "${ARGS[@]}" "${EXTRA_ARGS[@]}" > fallow-results.json 2> fallow-stderr.log; then
-          # Exit code 2 = fallow error (not "issues found"), propagate it
-          if [ ! -s fallow-results.json ] || ! jq -e '.total_issues' fallow-results.json > /dev/null 2>&1; then
+          # Verify we got valid JSON output (exit code 1 = issues found, 2 = error)
+          if [ ! -s fallow-results.json ] || ! jq -e '.' fallow-results.json > /dev/null 2>&1; then
             echo "::error::Fallow failed to run"
             [ -s fallow-stderr.log ] && cat fallow-stderr.log
             [ -s fallow-results.json ] && cat fallow-results.json
@@ -174,49 +323,83 @@ runs:
           fi
         fi
 
-        # Fallback: generate SARIF in a second run if --sarif-file wasn't available
-        if [ "$INPUT_FORMAT" = "sarif" ] && [ ! -f fallow-results.sarif ]; then
-          SARIF_ARGS=(check --root "$INPUT_ROOT" --quiet --format sarif)
+        # Fallback SARIF generation (separate run when --sarif-file not available)
+        if [ "$INPUT_FORMAT" = "sarif" ] && [ "$INPUT_COMMAND" != "fix" ] && [ ! -f fallow-results.sarif ]; then
+          SARIF_ARGS=("$INPUT_COMMAND" --root "$INPUT_ROOT" --quiet --format sarif)
+          [ -n "$INPUT_CONFIG" ] && SARIF_ARGS+=(--config "$INPUT_CONFIG")
+          [ "$INPUT_PRODUCTION" = "true" ] && SARIF_ARGS+=(--production)
           [ -n "$INPUT_CHANGED_SINCE" ] && SARIF_ARGS+=(--changed-since "$INPUT_CHANGED_SINCE")
           [ -n "$INPUT_BASELINE" ] && SARIF_ARGS+=(--baseline "$INPUT_BASELINE")
-          if ! fallow "${SARIF_ARGS[@]}" > fallow-results.sarif 2>/dev/null; then
+
+          # Carry over dupes-specific args for SARIF run
+          if [ "$INPUT_COMMAND" = "dupes" ]; then
+            SARIF_ARGS+=(--mode "$INPUT_DUPES_MODE")
+            [ -n "$INPUT_MIN_TOKENS" ] && SARIF_ARGS+=(--min-tokens "$INPUT_MIN_TOKENS")
+            [ -n "$INPUT_MIN_LINES" ] && SARIF_ARGS+=(--min-lines "$INPUT_MIN_LINES")
+            [ -n "$INPUT_THRESHOLD" ] && SARIF_ARGS+=(--threshold "$INPUT_THRESHOLD")
+            [ "$INPUT_SKIP_LOCAL" = "true" ] && SARIF_ARGS+=(--skip-local)
+          fi
+
+          if ! fallow "${SARIF_ARGS[@]}" "${EXTRA_ARGS[@]}" > fallow-results.sarif 2>/dev/null; then
             echo "::warning::SARIF generation failed"
           fi
         fi
 
-        # Surface any warnings from stderr
+        # Surface warnings from stderr
         if [ -s fallow-stderr.log ]; then
           while IFS= read -r line; do
             echo "::debug::${line}"
           done < fallow-stderr.log
         fi
 
-        # Extract issue count and validate it is numeric
-        ISSUES=$(jq -r '.total_issues' fallow-results.json)
+        # Extract issue count based on command
+        case "$INPUT_COMMAND" in
+          check) ISSUES=$(jq -r '.total_issues' fallow-results.json) ;;
+          dupes) ISSUES=$(jq -r '.stats.clone_groups' fallow-results.json) ;;
+          fix)   ISSUES=$(jq -r '(.fixes | length)' fallow-results.json) ;;
+        esac
+
         if ! [[ "$ISSUES" =~ ^[0-9]+$ ]]; then
-          echo "::error::Unexpected total_issues value: ${ISSUES}"
+          echo "::error::Unexpected issue count: ${ISSUES}"
           exit 2
         fi
+
         echo "issues=${ISSUES}" >> "$GITHUB_OUTPUT"
         echo "results=fallow-results.json" >> "$GITHUB_OUTPUT"
+        echo "command=${INPUT_COMMAND}" >> "$GITHUB_OUTPUT"
 
-        # Set SARIF output if generated
         if [ -f fallow-results.sarif ]; then
           echo "sarif=fallow-results.sarif" >> "$GITHUB_OUTPUT"
         fi
 
         if [ "$ISSUES" -gt 0 ]; then
-          echo "::warning::Fallow found ${ISSUES} dead code issues"
+          case "$INPUT_COMMAND" in
+            check) echo "::warning::Fallow found ${ISSUES} unused code issues" ;;
+            dupes) echo "::warning::Fallow found ${ISSUES} clone groups" ;;
+            fix)   echo "::warning::Fallow proposed ${ISSUES} fixes" ;;
+          esac
         fi
 
     - name: Job summary
       if: always() && steps.analyze.outputs.issues != ''
       shell: bash
+      env:
+        FALLOW_COMMAND: ${{ steps.analyze.outputs.command }}
       run: |
-        jq -r -f /tmp/fallow-summary.jq fallow-results.json >> "$GITHUB_STEP_SUMMARY"
+        case "$FALLOW_COMMAND" in
+          check) JQ_FILE="$FALLOW_TMP/summary-check.jq" ;;
+          dupes) JQ_FILE="$FALLOW_TMP/summary-dupes.jq" ;;
+          fix)   JQ_FILE="$FALLOW_TMP/summary-fix.jq" ;;
+          *)     echo "::error::Unexpected command: ${FALLOW_COMMAND}"; exit 2 ;;
+        esac
+        jq -r -f "$JQ_FILE" fallow-results.json >> "$GITHUB_STEP_SUMMARY"
 
     - name: Upload SARIF
-      if: inputs.format == 'sarif' && steps.analyze.outputs.sarif != '' && always()
+      if: >-
+        inputs.command != 'fix' &&
+        inputs.format == 'sarif' &&
+        steps.analyze.outputs.sarif != '' &&
+        always()
       uses: github/codeql-action/upload-sarif@v4
       with:
         sarif_file: fallow-results.sarif
@@ -234,9 +417,18 @@ runs:
         GH_TOKEN: ${{ inputs.github-token }}
         PR_NUMBER: ${{ github.event.pull_request.number }}
         GH_REPO: ${{ github.repository }}
+        FALLOW_COMMAND: ${{ steps.analyze.outputs.command }}
       run: |
+        # Select jq script safely
+        case "$FALLOW_COMMAND" in
+          check) JQ_FILE="$FALLOW_TMP/summary-check.jq" ;;
+          dupes) JQ_FILE="$FALLOW_TMP/summary-dupes.jq" ;;
+          fix)   JQ_FILE="$FALLOW_TMP/summary-fix.jq" ;;
+          *)     echo "::error::Unexpected command: ${FALLOW_COMMAND}"; exit 2 ;;
+        esac
+
         # Generate comment body
-        COMMENT_BODY="$(jq -r -f /tmp/fallow-summary.jq fallow-results.json)
+        COMMENT_BODY="$(jq -r -f "$JQ_FILE" fallow-results.json)
 
         <!-- fallow-results -->"
 
@@ -267,10 +459,15 @@ runs:
       if: always() && steps.analyze.outputs.issues != ''
       shell: bash
       env:
+        INPUT_COMMAND: ${{ inputs.command }}
         INPUT_FAIL_ON_ISSUES: ${{ inputs.fail-on-issues }}
         ISSUES: ${{ steps.analyze.outputs.issues }}
       run: |
         if [ "$INPUT_FAIL_ON_ISSUES" = "true" ] && [ "$ISSUES" -gt 0 ]; then
-          echo "::error::Fallow found ${ISSUES} dead code issues"
+          case "$INPUT_COMMAND" in
+            check) echo "::error::Fallow found ${ISSUES} unused code issues" ;;
+            dupes) echo "::error::Fallow found ${ISSUES} clone groups" ;;
+            fix)   echo "::error::Fallow found ${ISSUES} fixable issues" ;;
+          esac
           exit 1
         fi
