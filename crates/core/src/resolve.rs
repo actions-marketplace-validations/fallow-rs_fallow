@@ -100,15 +100,50 @@ pub fn resolve_all_imports(
             let resolved_dynamic_imports: Vec<ResolvedImport> = module
                 .dynamic_imports
                 .iter()
-                .map(|imp| ResolvedImport {
-                    info: ImportInfo {
-                        source: imp.source.clone(),
-                        imported_name: crate::extract::ImportedName::SideEffect,
-                        local_name: String::new(),
-                        is_type_only: false,
-                        span: imp.span,
-                    },
-                    target: resolve_specifier(&resolver, file_path, &imp.source, &path_to_id),
+                .flat_map(|imp| {
+                    let target = resolve_specifier(&resolver, file_path, &imp.source, &path_to_id);
+                    if !imp.destructured_names.is_empty() {
+                        // `const { a, b } = await import('./x')` → Named imports
+                        imp.destructured_names
+                            .iter()
+                            .map(|name| ResolvedImport {
+                                info: ImportInfo {
+                                    source: imp.source.clone(),
+                                    imported_name: crate::extract::ImportedName::Named(
+                                        name.clone(),
+                                    ),
+                                    local_name: name.clone(),
+                                    is_type_only: false,
+                                    span: imp.span,
+                                },
+                                target: target.clone(),
+                            })
+                            .collect()
+                    } else if imp.local_name.is_some() {
+                        // `const mod = await import('./x')` → Namespace with local_name
+                        vec![ResolvedImport {
+                            info: ImportInfo {
+                                source: imp.source.clone(),
+                                imported_name: crate::extract::ImportedName::Namespace,
+                                local_name: imp.local_name.clone().unwrap_or_default(),
+                                is_type_only: false,
+                                span: imp.span,
+                            },
+                            target,
+                        }]
+                    } else {
+                        // Side-effect only: `await import('./x')` with no assignment
+                        vec![ResolvedImport {
+                            info: ImportInfo {
+                                source: imp.source.clone(),
+                                imported_name: crate::extract::ImportedName::SideEffect,
+                                local_name: String::new(),
+                                is_type_only: false,
+                                span: imp.span,
+                            },
+                            target,
+                        }]
+                    }
                 })
                 .collect();
 

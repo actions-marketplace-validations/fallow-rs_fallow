@@ -138,6 +138,13 @@ pub struct ReExportInfo {
 pub struct DynamicImportInfo {
     pub source: String,
     pub span: Span,
+    /// Names destructured from the dynamic import result.
+    /// Non-empty means `const { a, b } = await import(...)` → Named imports.
+    /// Empty means simple `import(...)` or `const x = await import(...)` → Namespace.
+    pub destructured_names: Vec<String>,
+    /// The local variable name for `const x = await import(...)`.
+    /// Used for namespace import narrowing via member access tracking.
+    pub local_name: Option<String>,
 }
 
 /// A `require()` call.
@@ -448,6 +455,8 @@ struct ModuleInfoExtractor {
     has_cjs_exports: bool,
     /// Spans of require() calls already handled via destructured require detection.
     handled_require_spans: Vec<Span>,
+    /// Spans of import() expressions already handled via variable declarator detection.
+    handled_import_spans: Vec<Span>,
 }
 
 impl ModuleInfoExtractor {
@@ -463,6 +472,7 @@ impl ModuleInfoExtractor {
             whole_object_uses: Vec::new(),
             has_cjs_exports: false,
             handled_require_spans: Vec::new(),
+            handled_import_spans: Vec::new(),
         }
     }
 
@@ -705,11 +715,19 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
     }
 
     fn visit_import_expression(&mut self, expr: &ImportExpression<'a>) {
+        // Skip imports already handled via visit_variable_declaration (with local_name capture)
+        if self.handled_import_spans.contains(&expr.span) {
+            walk::walk_import_expression(self, expr);
+            return;
+        }
+
         match &expr.source {
             Expression::StringLiteral(lit) => {
                 self.dynamic_imports.push(DynamicImportInfo {
                     source: lit.value.to_string(),
                     span: expr.span,
+                    destructured_names: Vec::new(),
+                    local_name: None,
                 });
             }
             Expression::TemplateLiteral(tpl)
@@ -749,6 +767,8 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
                     self.dynamic_imports.push(DynamicImportInfo {
                         source: value,
                         span: expr.span,
+                        destructured_names: Vec::new(),
+                        local_name: None,
                     });
                 }
             }
@@ -773,26 +793,88 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
 
     fn visit_variable_declaration(&mut self, decl: &VariableDeclaration<'a>) {
         for declarator in &decl.declarations {
-            let Some(Expression::CallExpression(call)) = &declarator.init else {
+            let Some(init) = &declarator.init else {
                 continue;
             };
-            let Expression::Identifier(callee) = &call.callee else {
-                continue;
-            };
-            if callee.name != "require" {
+
+            // Try to detect `const x = require('./y')` patterns
+            if let Expression::CallExpression(call) = init
+                && let Expression::Identifier(callee) = &call.callee
+                && callee.name == "require"
+                && let Some(Argument::StringLiteral(lit)) = call.arguments.first()
+            {
+                let source = lit.value.to_string();
+                match &declarator.id {
+                    BindingPattern::ObjectPattern(obj_pat) => {
+                        if obj_pat.rest.is_some() {
+                            self.require_calls.push(RequireCallInfo {
+                                source,
+                                span: call.span,
+                                destructured_names: Vec::new(),
+                                local_name: None,
+                            });
+                        } else {
+                            let names: Vec<String> = obj_pat
+                                .properties
+                                .iter()
+                                .filter_map(|prop| prop.key.static_name().map(|n| n.to_string()))
+                                .collect();
+                            self.require_calls.push(RequireCallInfo {
+                                source,
+                                span: call.span,
+                                destructured_names: names,
+                                local_name: None,
+                            });
+                        }
+                        self.handled_require_spans.push(call.span);
+                    }
+                    BindingPattern::BindingIdentifier(id) => {
+                        // `const mod = require('./x')` → Namespace with local_name for narrowing
+                        self.require_calls.push(RequireCallInfo {
+                            source,
+                            span: call.span,
+                            destructured_names: Vec::new(),
+                            local_name: Some(id.name.to_string()),
+                        });
+                        self.handled_require_spans.push(call.span);
+                    }
+                    _ => {}
+                }
                 continue;
             }
-            let Some(Argument::StringLiteral(lit)) = call.arguments.first() else {
+
+            // Try to detect `const x = await import('./y')` and `const x = import('./y')` patterns
+            // The import expression may be wrapped in an AwaitExpression or used directly.
+            let import_expr = match init {
+                Expression::AwaitExpression(await_expr) => {
+                    if let Expression::ImportExpression(imp) = &await_expr.argument {
+                        Some(imp)
+                    } else {
+                        None
+                    }
+                }
+                Expression::ImportExpression(imp) => Some(imp),
+                _ => None,
+            };
+
+            let Some(import_expr) = import_expr else {
                 continue;
             };
+
+            let Expression::StringLiteral(lit) = &import_expr.source else {
+                continue;
+            };
+
             let source = lit.value.to_string();
 
             match &declarator.id {
                 BindingPattern::ObjectPattern(obj_pat) => {
+                    // `const { foo, bar } = await import('./x')` → Named imports
                     if obj_pat.rest.is_some() {
-                        self.require_calls.push(RequireCallInfo {
+                        // Has rest element: conservative, treat as namespace
+                        self.dynamic_imports.push(DynamicImportInfo {
                             source,
-                            span: call.span,
+                            span: import_expr.span,
                             destructured_names: Vec::new(),
                             local_name: None,
                         });
@@ -802,24 +884,24 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
                             .iter()
                             .filter_map(|prop| prop.key.static_name().map(|n| n.to_string()))
                             .collect();
-                        self.require_calls.push(RequireCallInfo {
+                        self.dynamic_imports.push(DynamicImportInfo {
                             source,
-                            span: call.span,
+                            span: import_expr.span,
                             destructured_names: names,
                             local_name: None,
                         });
                     }
-                    self.handled_require_spans.push(call.span);
+                    self.handled_import_spans.push(import_expr.span);
                 }
                 BindingPattern::BindingIdentifier(id) => {
-                    // `const mod = require('./x')` → Namespace with local_name for narrowing
-                    self.require_calls.push(RequireCallInfo {
+                    // `const mod = await import('./x')` → Namespace with local_name for narrowing
+                    self.dynamic_imports.push(DynamicImportInfo {
                         source,
-                        span: call.span,
+                        span: import_expr.span,
                         destructured_names: Vec::new(),
                         local_name: Some(id.name.to_string()),
                     });
-                    self.handled_require_spans.push(call.span);
+                    self.handled_import_spans.push(import_expr.span);
                 }
                 _ => {}
             }
@@ -930,6 +1012,8 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
             self.dynamic_imports.push(DynamicImportInfo {
                 source: path_lit.value.to_string(),
                 span: expr.span,
+                destructured_names: Vec::new(),
+                local_name: None,
             });
         }
 
@@ -1639,5 +1723,70 @@ export default {};
         let info = parse_source("const ctx = require.context('./icons', true);");
         assert_eq!(info.dynamic_import_patterns.len(), 1);
         assert_eq!(info.dynamic_import_patterns[0].prefix, "./icons/**/");
+    }
+
+    // ── Dynamic import namespace tracking ────────────────────────
+
+    #[test]
+    fn dynamic_import_await_captures_local_name() {
+        let info = parse_source(
+            "async function f() { const mod = await import('./service'); mod.doStuff(); }",
+        );
+        assert_eq!(info.dynamic_imports.len(), 1);
+        assert_eq!(info.dynamic_imports[0].source, "./service");
+        assert_eq!(info.dynamic_imports[0].local_name, Some("mod".to_string()));
+        assert!(info.dynamic_imports[0].destructured_names.is_empty());
+    }
+
+    #[test]
+    fn dynamic_import_without_await_captures_local_name() {
+        // `const mod = import('./service')` (promise, no await)
+        let info = parse_source("const mod = import('./service');");
+        assert_eq!(info.dynamic_imports.len(), 1);
+        assert_eq!(info.dynamic_imports[0].source, "./service");
+        assert_eq!(info.dynamic_imports[0].local_name, Some("mod".to_string()));
+    }
+
+    #[test]
+    fn dynamic_import_destructured_captures_names() {
+        let info =
+            parse_source("async function f() { const { foo, bar } = await import('./module'); }");
+        assert_eq!(info.dynamic_imports.len(), 1);
+        assert_eq!(info.dynamic_imports[0].source, "./module");
+        assert!(info.dynamic_imports[0].local_name.is_none());
+        assert_eq!(
+            info.dynamic_imports[0].destructured_names,
+            vec!["foo", "bar"]
+        );
+    }
+
+    #[test]
+    fn dynamic_import_destructured_with_rest_is_namespace() {
+        let info = parse_source(
+            "async function f() { const { foo, ...rest } = await import('./module'); }",
+        );
+        assert_eq!(info.dynamic_imports.len(), 1);
+        assert_eq!(info.dynamic_imports[0].source, "./module");
+        // Has rest element → conservative namespace (no destructured_names, no local_name)
+        assert!(info.dynamic_imports[0].local_name.is_none());
+        assert!(info.dynamic_imports[0].destructured_names.is_empty());
+    }
+
+    #[test]
+    fn dynamic_import_side_effect_only() {
+        // No variable assignment → side-effect import
+        let info = parse_source("async function f() { await import('./side-effect'); }");
+        assert_eq!(info.dynamic_imports.len(), 1);
+        assert_eq!(info.dynamic_imports[0].source, "./side-effect");
+        assert!(info.dynamic_imports[0].local_name.is_none());
+        assert!(info.dynamic_imports[0].destructured_names.is_empty());
+    }
+
+    #[test]
+    fn dynamic_import_no_duplicate_entries() {
+        // When handled via visit_variable_declaration, visit_import_expression should skip it.
+        // There should be exactly 1 DynamicImportInfo, not 2.
+        let info = parse_source("async function f() { const mod = await import('./service'); }");
+        assert_eq!(info.dynamic_imports.len(), 1);
     }
 }

@@ -8,7 +8,7 @@ use oxc_span::Span;
 use crate::extract::{ExportName, MemberAccess, MemberKind};
 
 /// Cache version — bump when the cache format changes.
-const CACHE_VERSION: u32 = 5;
+const CACHE_VERSION: u32 = 6;
 
 /// Maximum cache file size to deserialize (256 MB).
 const MAX_CACHE_SIZE: usize = 256 * 1024 * 1024;
@@ -82,6 +82,8 @@ pub struct CachedDynamicImport {
     pub source: String,
     pub span_start: u32,
     pub span_end: u32,
+    pub destructured_names: Vec<String>,
+    pub local_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Encode, Decode)]
@@ -268,6 +270,8 @@ pub fn cached_to_module(
         .map(|d| DynamicImportInfo {
             source: d.source.clone(),
             span: Span::new(d.span_start, d.span_end),
+            destructured_names: d.destructured_names.clone(),
+            local_name: d.local_name.clone(),
         })
         .collect();
 
@@ -382,6 +386,8 @@ pub fn module_to_cached(module: &crate::extract::ModuleInfo) -> CachedModule {
                 source: d.source.clone(),
                 span_start: d.span.start,
                 span_end: d.span.end,
+                destructured_names: d.destructured_names.clone(),
+                local_name: d.local_name.clone(),
             })
             .collect(),
         require_calls: module
@@ -681,6 +687,8 @@ mod tests {
             dynamic_imports: vec![DynamicImportInfo {
                 source: "./lazy".to_string(),
                 span: Span::new(0, 10),
+                destructured_names: Vec::new(),
+                local_name: None,
             }],
             require_calls: vec![RequireCallInfo {
                 source: "fs".to_string(),

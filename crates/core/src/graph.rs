@@ -195,54 +195,41 @@ impl ModuleGraph {
                 // Re-exports also create edges
                 for re_export in &resolved.re_exports {
                     if let ResolveResult::InternalModule(target_id) = &re_export.target {
-                        let is_star = re_export.info.imported_name == "*"
-                            && re_export.info.exported_name == "*";
-                        let imp_name = if re_export.info.imported_name == "*" {
-                            ImportedName::Namespace
-                        } else {
-                            ImportedName::Named(re_export.info.imported_name.clone())
-                        };
-                        // Track namespace re-exports (but not bare star re-exports,
-                        // which are handled by the re-export chain propagation)
-                        if matches!(imp_name, ImportedName::Namespace) && !is_star {
-                            let idx = target_id.0 as usize;
-                            if idx < total_capacity {
-                                namespace_imported.insert(idx);
-                            }
-                        }
-                        // For bare `export * from './x'`, use SideEffect edge so we don't
-                        // conservatively mark all source exports as used. The re-export chain
-                        // propagation will handle individual name tracking.
-                        let (edge_imp_name, edge_local_name) = if is_star {
-                            (ImportedName::SideEffect, String::new())
-                        } else {
-                            (imp_name, re_export.info.exported_name.clone())
-                        };
+                        // ALL re-exports use SideEffect edges to avoid marking source
+                        // exports as "used" just because they're re-exported. The
+                        // re-export chain propagation handles tracking which specific
+                        // names consumers actually import.
                         edges_by_target
                             .entry(*target_id)
                             .or_default()
                             .push(ImportedSymbol {
-                                imported_name: edge_imp_name,
-                                local_name: edge_local_name,
+                                imported_name: ImportedName::SideEffect,
+                                local_name: String::new(),
                             });
                     } else if let ResolveResult::NpmPackage(name) = &re_export.target {
                         package_usage.entry(name.clone()).or_default().push(file.id);
                     }
                 }
 
-                // Dynamic imports - treat as namespace import since caller can access any export
+                // Dynamic imports — use the imported_name/local_name from resolution.
+                // Named imports (`const { foo } = await import('./x')`) create Named edges.
+                // Namespace imports (`const mod = await import('./x')`) create Namespace edges
+                // with a local_name, enabling member access narrowing.
+                // Side-effect imports (`await import('./x')`) create SideEffect edges.
                 for import in &resolved.resolved_dynamic_imports {
                     if let ResolveResult::InternalModule(target_id) = &import.target {
-                        let idx = target_id.0 as usize;
-                        if idx < total_capacity {
-                            namespace_imported.insert(idx);
+                        if matches!(import.info.imported_name, ImportedName::Namespace) {
+                            let idx = target_id.0 as usize;
+                            if idx < total_capacity {
+                                namespace_imported.insert(idx);
+                            }
                         }
                         edges_by_target
                             .entry(*target_id)
                             .or_default()
                             .push(ImportedSymbol {
-                                imported_name: ImportedName::Namespace,
-                                local_name: String::new(),
+                                imported_name: import.info.imported_name.clone(),
+                                local_name: import.info.local_name.clone(),
                             });
                     }
                 }
