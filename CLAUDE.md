@@ -23,9 +23,10 @@ tests/
 Pipeline: Config → File Discovery → Parallel Parsing (rayon + oxc_parser) → Script Analysis → Module Resolution (oxc_resolver) → Graph Construction → Re-export Chain Resolution → Dead Code Detection → Reporting
 
 Key modules in fallow-core:
-- `discover.rs` — File walking + entry point detection (also workspace-aware)
+- `project.rs` — `ProjectState` struct: owns the file registry (stable FileIds sorted by path) and workspace metadata. Foundation for cross-workspace resolution and future incremental analysis.
+- `discover.rs` — File walking + entry point detection (also workspace-aware). FileIds are assigned deterministically by path sort order (not size) for stability across runs.
 - `extract.rs` — AST visitor extracting imports, exports, re-exports, members, whole-object uses, dynamic import patterns; SFC (Vue/Svelte) script extraction
-- `resolve.rs` — oxc_resolver-based import resolution + glob-based dynamic import pattern resolution + DashMap-backed bare specifier cache for lock-free parallel lookups
+- `resolve.rs` — oxc_resolver-based import resolution + glob-based dynamic import pattern resolution + DashMap-backed bare specifier cache for lock-free parallel lookups. Cross-workspace imports resolve through node_modules symlinks via canonicalize.
 - `graph.rs` — Module graph with re-export chain propagation
 - `analyze.rs` — Dead code detection (10 issue types) with inline suppression filtering
 - `scripts.rs` — Shell command parser for package.json scripts: extracts binary names (mapped to package names for dependency usage detection), `--config` args (entry points), and file path args; handles env wrappers, package manager runners, node runners
@@ -102,6 +103,7 @@ cargo run -- fix --dry-run      # Auto-fix preview
 - `list` — show active plugins, entry points, files (--format json for structured output)
 - `schema` — dump CLI interface as machine-readable JSON for agent introspection
 - `config-schema` — print JSON Schema for fallow config files (enables IDE validation)
+- Global `--workspace <name>` / `-w` flag scopes output to a single workspace package while keeping the full cross-workspace graph
 
 See `AGENTS.md` for AI agent integration guide.
 
@@ -176,7 +178,7 @@ unresolved_imports = "error"
 - **Flat edge storage**: Contiguous `Vec<Edge>` with range indices for cache-friendly traversal.
 - **Lock-free parallel resolution**: Bare specifier cache uses `DashMap` (sharded concurrent map) for contention-free reads under rayon work-stealing.
 - **Re-export chain resolution**: Iterative propagation through barrel files with cycle detection.
-- **Workspace support**: npm/yarn/pnpm workspaces, pnpm-workspace.yaml.
+- **Cross-workspace resolution**: Unified module graph across npm/yarn/pnpm workspaces (pnpm-workspace.yaml). Cross-package imports resolve through node_modules symlinks via `canonicalize()`. `--workspace <name>` scopes output to one package while keeping the full graph. `ProjectState` struct owns the file registry with stable FileIds (path-sorted) for future incremental analysis.
 
 ## Git conventions
 

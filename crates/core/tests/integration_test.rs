@@ -829,6 +829,17 @@ fn results_serializable_to_json() {
 #[test]
 fn workspace_project_discovers_workspace_packages() {
     let root = fixture_path("workspace-project");
+
+    // Set up node_modules symlinks for cross-workspace resolution (like npm/pnpm install would)
+    let nm = root.join("node_modules");
+    let _ = std::fs::create_dir_all(nm.join("@workspace"));
+    #[cfg(unix)]
+    {
+        let _ = std::os::unix::fs::symlink(root.join("packages/shared"), nm.join("shared"));
+        let _ =
+            std::os::unix::fs::symlink(root.join("packages/utils"), nm.join("@workspace/utils"));
+    }
+
     let config = create_config(root.clone());
     let results = fallow_core::analyze(&config).expect("analysis should succeed");
 
@@ -845,11 +856,106 @@ fn workspace_project_discovers_workspace_packages() {
         "orphan.ts should be detected as unused file, found: {unused_file_names:?}"
     );
 
+    // Cross-workspace resolution via node_modules symlinks:
+    // app imports `@workspace/utils/src/deep` which resolves through the symlink,
+    // making deep.ts reachable. If symlinks are broken, deep.ts would be unreachable.
+    assert!(
+        !unused_file_names.contains(&"deep.ts".to_string()),
+        "deep.ts should NOT be unused (reachable via cross-workspace import through symlink), \
+         but found in unused files: {unused_file_names:?}"
+    );
+
+    // `unusedDeep` should be detected as unused export (deep.ts is reachable but
+    // only `deepHelper` is imported, not `unusedDeep`)
+    let unused_export_names: Vec<String> = results
+        .unused_exports
+        .iter()
+        .map(|e| e.export_name.clone())
+        .collect();
+    assert!(
+        unused_export_names.contains(&"unusedDeep".to_string()),
+        "unusedDeep should be detected as unused export, found: {unused_export_names:?}"
+    );
+
+    // No unresolved imports — all cross-workspace imports should resolve
+    assert!(
+        results.unresolved_imports.is_empty(),
+        "should have no unresolved imports, found: {:?}",
+        results
+            .unresolved_imports
+            .iter()
+            .map(|i| &i.specifier)
+            .collect::<Vec<_>>()
+    );
+
     // The analysis should have found issues across all workspace packages
     assert!(
         results.has_issues(),
         "workspace project should have issues detected"
     );
+}
+
+#[test]
+fn project_state_stable_file_ids_by_path() {
+    // FileIds should be deterministic: sorted by path, not size.
+    // Running discovery twice on the same project must produce identical IDs.
+    let root = fixture_path("workspace-project");
+    let config = create_config(root);
+
+    let files_a = fallow_core::discover::discover_files(&config);
+    let files_b = fallow_core::discover::discover_files(&config);
+
+    assert_eq!(files_a.len(), files_b.len());
+    for (a, b) in files_a.iter().zip(files_b.iter()) {
+        assert_eq!(a.id, b.id, "FileId mismatch for {:?}", a.path);
+        assert_eq!(a.path, b.path);
+    }
+
+    // Files should be sorted by path (not by size)
+    for window in files_a.windows(2) {
+        assert!(
+            window[0].path <= window[1].path,
+            "Files not sorted by path: {:?} > {:?}",
+            window[0].path,
+            window[1].path
+        );
+    }
+}
+
+#[test]
+fn project_state_workspace_queries() {
+    use fallow_config::discover_workspaces;
+
+    let root = fixture_path("workspace-project");
+    let config = create_config(root.clone());
+    let files = fallow_core::discover::discover_files(&config);
+    let workspaces = discover_workspaces(&root);
+    let project = fallow_core::project::ProjectState::new(files, workspaces);
+
+    // Should find all three workspace packages
+    assert!(project.workspace_by_name("app").is_some());
+    assert!(project.workspace_by_name("shared").is_some());
+    assert!(project.workspace_by_name("@workspace/utils").is_some());
+    assert!(project.workspace_by_name("nonexistent").is_none());
+
+    // Files should be assignable to workspaces
+    let app_ws = project.workspace_by_name("app").unwrap();
+    let app_files = project.files_in_workspace(app_ws);
+    assert!(
+        !app_files.is_empty(),
+        "app workspace should have at least one file"
+    );
+
+    // All app files should be under the app workspace root
+    for fid in &app_files {
+        let file = project.file_by_id(*fid);
+        assert!(
+            file.path.starts_with(&app_ws.root),
+            "File {:?} should be under app workspace root {:?}",
+            file.path,
+            app_ws.root
+        );
+    }
 }
 
 // ── Enum/class members integration ─────────────────────────────

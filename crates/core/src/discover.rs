@@ -132,12 +132,11 @@ pub fn discover_files(config: &ResolvedConfig) -> Vec<DiscoveredFile> {
         })
         .collect();
 
-    // Sort largest files first for better rayon work-stealing, with path as tiebreaker for determinism
-    files.sort_unstable_by(|a, b| {
-        b.size_bytes
-            .cmp(&a.size_bytes)
-            .then_with(|| a.path.cmp(&b.path))
-    });
+    // Sort by path for stable, deterministic FileId assignment.
+    // The same set of files always produces the same IDs regardless of file
+    // size changes, which is the foundation for incremental analysis and
+    // cross-run graph caching.
+    files.sort_unstable_by(|a, b| a.path.cmp(&b.path));
 
     // Re-assign IDs after sorting
     for (idx, file) in files.iter_mut().enumerate() {

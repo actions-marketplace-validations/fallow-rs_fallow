@@ -3,7 +3,7 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use clap::{CommandFactory, Parser, Subcommand};
-use fallow_config::{FallowConfig, OutputFormat, RulesConfig, Severity};
+use fallow_config::{FallowConfig, OutputFormat, RulesConfig, Severity, discover_workspaces};
 
 mod baseline;
 mod fix;
@@ -69,6 +69,12 @@ struct Cli {
     /// report type-only dependencies
     #[arg(long, global = true)]
     production: bool,
+
+    /// Scope output to a single workspace package (by package name).
+    /// The full cross-workspace graph is still built, but only issues within
+    /// the specified package are reported.
+    #[arg(short, long, global = true)]
+    workspace: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -328,6 +334,77 @@ fn has_error_severity_issues(
         || (rules.duplicate_exports == Severity::Error && !results.duplicate_exports.is_empty())
 }
 
+// ── Workspace filtering ──────────────────────────────────────────
+
+/// Scope results to a single workspace package.
+///
+/// The full cross-workspace graph is still built (so cross-package imports
+/// are resolved), but only issues from files under `ws_root` are reported.
+fn filter_to_workspace(
+    results: &mut fallow_core::results::AnalysisResults,
+    ws_root: &std::path::Path,
+) {
+    // File-scoped issues: retain only those under the workspace root
+    results.unused_files.retain(|f| f.path.starts_with(ws_root));
+    results
+        .unused_exports
+        .retain(|e| e.path.starts_with(ws_root));
+    results.unused_types.retain(|e| e.path.starts_with(ws_root));
+    results
+        .unused_enum_members
+        .retain(|m| m.path.starts_with(ws_root));
+    results
+        .unused_class_members
+        .retain(|m| m.path.starts_with(ws_root));
+    results
+        .unresolved_imports
+        .retain(|i| i.path.starts_with(ws_root));
+
+    // Dependency issues: scope to workspace's own package.json
+    let ws_pkg = ws_root.join("package.json");
+    results.unused_dependencies.retain(|d| d.path == ws_pkg);
+    results.unused_dev_dependencies.retain(|d| d.path == ws_pkg);
+    results.type_only_dependencies.retain(|d| d.path == ws_pkg);
+
+    // Unlisted deps: keep only if any importing file is in this workspace
+    results
+        .unlisted_dependencies
+        .retain(|d| d.imported_from.iter().any(|p| p.starts_with(ws_root)));
+
+    // Duplicate exports: filter locations to workspace, drop groups with < 2
+    for dup in &mut results.duplicate_exports {
+        dup.locations.retain(|p| p.starts_with(ws_root));
+    }
+    results.duplicate_exports.retain(|d| d.locations.len() >= 2);
+}
+
+/// Resolve `--workspace <name>` to a workspace root path, or exit with an error.
+fn resolve_workspace_filter(
+    root: &std::path::Path,
+    workspace_name: &str,
+) -> Result<std::path::PathBuf, ExitCode> {
+    let workspaces = discover_workspaces(root);
+    if workspaces.is_empty() {
+        eprintln!(
+            "Error: --workspace '{workspace_name}' specified but no workspaces found.\n\
+             Ensure root package.json has a \"workspaces\" field or pnpm-workspace.yaml exists."
+        );
+        return Err(ExitCode::from(2));
+    }
+
+    match workspaces.iter().find(|ws| ws.name == workspace_name) {
+        Some(ws) => Ok(ws.root.clone()),
+        None => {
+            let names: Vec<&str> = workspaces.iter().map(|ws| ws.name.as_str()).collect();
+            eprintln!(
+                "Error: workspace '{workspace_name}' not found.\nAvailable workspaces: {}",
+                names.join(", ")
+            );
+            Err(ExitCode::from(2))
+        }
+    }
+}
+
 // ── Input validation ─────────────────────────────────────────────
 
 fn validate_git_ref(s: &str) -> Result<&str, String> {
@@ -462,6 +539,7 @@ fn main() -> ExitCode {
                 cli.save_baseline.as_deref(),
                 sarif_file.as_deref(),
                 cli.production,
+                cli.workspace.as_deref(),
             )
         }
         Command::Watch => run_watch(
@@ -542,12 +620,23 @@ fn run_check(
     save_baseline: Option<&std::path::Path>,
     sarif_file: Option<&std::path::Path>,
     production: bool,
+    workspace: Option<&str>,
 ) -> ExitCode {
     let start = Instant::now();
 
     let config = match load_config(root, config_path, output, no_cache, threads, production) {
         Ok(c) => c,
         Err(code) => return code,
+    };
+
+    // Validate --workspace early (before analysis) to fail fast
+    let ws_root = if let Some(ws_name) = workspace {
+        match resolve_workspace_filter(root, ws_name) {
+            Ok(root) => Some(root),
+            Err(code) => return code,
+        }
+    } else {
+        None
     };
 
     // Get changed files if --changed-since is set (already validated)
@@ -562,6 +651,11 @@ fn run_check(
         }
     };
     let elapsed = start.elapsed();
+
+    // Scope to workspace package if requested (full graph is built, only output is filtered)
+    if let Some(ref ws_root) = ws_root {
+        filter_to_workspace(&mut results, ws_root);
+    }
 
     // Filter to only changed files if requested
     if let Some(changed) = &changed_files {
@@ -990,22 +1084,22 @@ fn run_init(root: &std::path::Path, use_toml: bool) -> ExitCode {
 # ignore = ["**/*.generated.ts"]
 
 # Dependencies to ignore (always considered used)
-# ignore_dependencies = ["autoprefixer"]
+# ignoreDependencies = ["autoprefixer"]
 
 [detect]
-unused_files = true
-unused_exports = true
-unused_dependencies = true
-unused_dev_dependencies = true
-unused_types = true
+unusedFiles = true
+unusedExports = true
+unusedDependencies = true
+unusedDevDependencies = true
+unusedTypes = true
 
 # Per-issue-type severity: "error" (fail CI), "warn" (report only), "off" (ignore)
 # All default to "error" when omitted.
 # [rules]
-# unused_files = "error"
-# unused_exports = "warn"
-# unused_types = "off"
-# unresolved_imports = "error"
+# unusedFiles = "error"
+# unusedExports = "warn"
+# unusedTypes = "off"
+# unresolvedImports = "error"
 "#;
         if let Err(e) = std::fs::write(&config_path, default_config) {
             eprintln!("Error: Failed to write fallow.toml: {e}");
@@ -1026,23 +1120,23 @@ unused_types = true
   // "ignore": ["**/*.generated.ts"],
 
   // Dependencies to ignore (always considered used)
-  // "ignore_dependencies": ["autoprefixer"],
+  // "ignoreDependencies": ["autoprefixer"],
 
   "detect": {
-    "unused_files": true,
-    "unused_exports": true,
-    "unused_dependencies": true,
-    "unused_dev_dependencies": true,
-    "unused_types": true
+    "unusedFiles": true,
+    "unusedExports": true,
+    "unusedDependencies": true,
+    "unusedDevDependencies": true,
+    "unusedTypes": true
   }
 
   // Per-issue-type severity: "error" (fail CI), "warn" (report only), "off" (ignore)
   // All default to "error" when omitted.
   // "rules": {
-  //   "unused_files": "error",
-  //   "unused_exports": "warn",
-  //   "unused_types": "off",
-  //   "unresolved_imports": "error"
+  //   "unusedFiles": "error",
+  //   "unusedExports": "warn",
+  //   "unusedTypes": "off",
+  //   "unresolvedImports": "error"
   // }
 }
 "#;

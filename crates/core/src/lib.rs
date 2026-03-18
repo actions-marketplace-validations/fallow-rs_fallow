@@ -7,6 +7,7 @@ pub mod extract;
 pub mod graph;
 pub mod plugins;
 pub mod progress;
+pub mod project;
 pub mod resolve;
 pub mod results;
 pub mod scripts;
@@ -33,20 +34,26 @@ pub fn analyze(config: &ResolvedConfig) -> Result<AnalysisResults, FallowError> 
 
     // Discover workspaces if in a monorepo
     let t = Instant::now();
-    let workspaces = discover_workspaces(&config.root);
+    let workspaces_vec = discover_workspaces(&config.root);
     let workspaces_ms = t.elapsed().as_secs_f64() * 1000.0;
-    if !workspaces.is_empty() {
-        tracing::info!(count = workspaces.len(), "workspaces discovered");
+    if !workspaces_vec.is_empty() {
+        tracing::info!(count = workspaces_vec.len(), "workspaces discovered");
     }
 
     // Stage 1: Discover all source files
     let t = Instant::now();
-    let files = discover::discover_files(config);
+    let discovered_files = discover::discover_files(config);
     let discover_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+    // Build ProjectState: owns the file registry with stable FileIds and workspace metadata.
+    // This is the foundation for cross-workspace resolution and future incremental analysis.
+    let project = project::ProjectState::new(discovered_files, workspaces_vec);
+    let files = project.files();
+    let workspaces = project.workspaces();
 
     // Stage 1.5: Run plugin system — parse config files, discover dynamic entries
     let t = Instant::now();
-    let mut plugin_result = run_plugins(config, &files, &workspaces);
+    let mut plugin_result = run_plugins(config, files, workspaces);
     let plugins_ms = t.elapsed().as_secs_f64() * 1000.0;
 
     // Stage 1.6: Analyze package.json scripts for binary usage and config file refs
@@ -70,7 +77,7 @@ pub fn analyze(config: &ResolvedConfig) -> Result<AnalysisResults, FallowError> 
         }
     }
     // Also analyze workspace package.json scripts
-    for ws in &workspaces {
+    for ws in workspaces {
         let ws_pkg_path = ws.root.join("package.json");
         if let Ok(ws_pkg) = PackageJson::load(&ws_pkg_path)
             && let Some(ref ws_scripts) = ws_pkg.scripts
@@ -107,7 +114,7 @@ pub fn analyze(config: &ResolvedConfig) -> Result<AnalysisResults, FallowError> 
         cache::CacheStore::load(&config.cache_dir)
     };
 
-    let modules = extract::parse_all_files(&files, config, cache_store.as_ref());
+    let modules = extract::parse_all_files(files, config, cache_store.as_ref());
     let parse_ms = t.elapsed().as_secs_f64() * 1000.0;
 
     // Update cache with parsed results
@@ -127,23 +134,23 @@ pub fn analyze(config: &ResolvedConfig) -> Result<AnalysisResults, FallowError> 
 
     // Stage 3: Discover entry points (static patterns + plugin-discovered patterns)
     let t = Instant::now();
-    let mut entry_points = discover::discover_entry_points(config, &files);
-    for ws in &workspaces {
-        let ws_entries = discover::discover_workspace_entry_points(&ws.root, config, &files);
+    let mut entry_points = discover::discover_entry_points(config, files);
+    for ws in workspaces {
+        let ws_entries = discover::discover_workspace_entry_points(&ws.root, config, files);
         entry_points.extend(ws_entries);
     }
-    let plugin_entries = discover::discover_plugin_entry_points(&plugin_result, config, &files);
+    let plugin_entries = discover::discover_plugin_entry_points(&plugin_result, config, files);
     entry_points.extend(plugin_entries);
     let entry_points_ms = t.elapsed().as_secs_f64() * 1000.0;
 
     // Stage 4: Resolve imports to file IDs
     let t = Instant::now();
-    let resolved = resolve::resolve_all_imports(&modules, config, &files);
+    let resolved = resolve::resolve_all_imports(&modules, config, files);
     let resolve_ms = t.elapsed().as_secs_f64() * 1000.0;
 
     // Stage 5: Build module graph
     let t = Instant::now();
-    let graph = graph::ModuleGraph::build(&resolved, &entry_points, &files);
+    let graph = graph::ModuleGraph::build(&resolved, &entry_points, files);
     let graph_ms = t.elapsed().as_secs_f64() * 1000.0;
 
     // Stage 6: Analyze for dead code (with plugin context and workspace info)
@@ -153,7 +160,7 @@ pub fn analyze(config: &ResolvedConfig) -> Result<AnalysisResults, FallowError> 
         config,
         &resolved,
         Some(&plugin_result),
-        &workspaces,
+        workspaces,
         &modules,
     );
     let analyze_ms = t.elapsed().as_secs_f64() * 1000.0;

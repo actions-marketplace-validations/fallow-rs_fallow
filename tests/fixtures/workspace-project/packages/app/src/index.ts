@@ -1,2 +1,4 @@
 import { sharedUtil } from 'shared';
-export const main = () => sharedUtil();
+import { formatDate } from '@workspace/utils';
+import { deepHelper } from '@workspace/utils/src/deep';
+export const main = () => sharedUtil() + formatDate(new Date()) + deepHelper();

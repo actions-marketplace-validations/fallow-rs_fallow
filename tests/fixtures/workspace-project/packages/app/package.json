@@ -2,6 +2,7 @@
   "name": "app",
   "main": "src/index.ts",
   "dependencies": {
-    "shared": "*"
+    "shared": "*",
+    "@workspace/utils": "*"
   }
 }
