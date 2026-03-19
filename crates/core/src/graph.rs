@@ -667,7 +667,20 @@ impl ModuleGraph {
                         })
                         .collect();
 
-                    // Propagate each named import to the matching source export
+                    // Check if the source module itself has star re-exports (for multi-level chains).
+                    // If so, we may need to create synthetic ExportSymbol entries on it so
+                    // that the next iteration can propagate names further down the chain.
+                    let source_has_star_re_exports = self.modules[source_idx]
+                        .re_exports
+                        .iter()
+                        .any(|re| re.exported_name == "*");
+
+                    // Propagate each named import to the matching source export.
+                    // For multi-level star re-export chains (e.g., index -> intermediate -> source),
+                    // intermediate barrels may not have ExportSymbol entries for the names being
+                    // imported. When the source has its own star re-exports, create synthetic
+                    // ExportSymbol entries so the iterative loop can propagate further on the
+                    // next pass.
                     let source = &mut self.modules[source_idx];
                     for (name, ref_item) in named_refs.iter().chain(barrel_export_refs.iter()) {
                         let export_name = if name == "default" {
@@ -677,12 +690,27 @@ impl ModuleGraph {
                         };
                         if let Some(export) =
                             source.exports.iter_mut().find(|e| e.name == export_name)
-                            && export
+                        {
+                            if export
                                 .references
                                 .iter()
                                 .all(|r| r.from_file != ref_item.from_file)
-                        {
-                            export.references.push(ref_item.clone());
+                            {
+                                export.references.push(ref_item.clone());
+                                changed = true;
+                            }
+                        } else if source_has_star_re_exports {
+                            // The source module doesn't have this export directly but
+                            // it has star re-exports — create a synthetic ExportSymbol
+                            // so the name can propagate through the chain on the next
+                            // iteration.
+                            source.exports.push(ExportSymbol {
+                                name: export_name,
+                                is_type_only: false,
+                                span: oxc_span::Span::new(0, 0),
+                                references: vec![ref_item.clone()],
+                                members: Vec::new(),
+                            });
                             changed = true;
                         }
                     }

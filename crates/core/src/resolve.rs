@@ -82,6 +82,7 @@ pub fn resolve_all_imports(
     config: &ResolvedConfig,
     files: &[DiscoveredFile],
     workspaces: &[fallow_config::WorkspaceInfo],
+    active_plugins: &[String],
 ) -> Vec<ResolvedModule> {
     // Build workspace name → root index for pnpm store fallback.
     // Canonicalize roots to match path_to_id (which uses canonical paths).
@@ -118,7 +119,7 @@ pub fn resolve_all_imports(
         files.iter().map(|f| (f.id, f.path.as_path())).collect();
 
     // Create resolver ONCE and share across threads (oxc_resolver::Resolver is Send + Sync)
-    let resolver = create_resolver(config);
+    let resolver = create_resolver(config, active_plugins);
 
     // Cache for bare specifier resolutions (e.g., `react`, `lodash/merge`)
     let bare_cache = BareSpecifierCache::new();
@@ -333,29 +334,113 @@ pub fn resolve_all_imports(
         .collect()
 }
 
+/// Check if a bare specifier looks like a path alias rather than an npm package.
+///
+/// Path aliases (e.g., `@/components`, `~/lib`, `#internal`, `~~/utils`) are resolved
+/// via tsconfig.json `paths` or package.json `imports`. They should not be cached
+/// (resolution depends on the importing file's tsconfig context) and should return
+/// Unresolvable (not NpmPackage) when resolution fails.
+pub fn is_path_alias(specifier: &str) -> bool {
+    // `#` prefix is Node.js imports maps (package.json "imports" field)
+    if specifier.starts_with('#') {
+        return true;
+    }
+    // `~/` and `~~/` prefixes are common alias conventions (e.g., Nuxt, custom tsconfig)
+    if specifier.starts_with("~/") || specifier.starts_with("~~/") {
+        return true;
+    }
+    // `@/` is a very common path alias (e.g., `@/components/Foo`)
+    if specifier.starts_with("@/") {
+        return true;
+    }
+    // npm scoped packages MUST be lowercase (npm registry requirement).
+    // PascalCase `@Scope` or `@Scope/path` patterns are tsconfig path aliases,
+    // not npm packages. E.g., `@Components`, `@Hooks/useApi`, `@Services/auth`.
+    if specifier.starts_with('@') {
+        let scope = specifier.split('/').next().unwrap_or(specifier);
+        if scope.len() > 1 && scope.chars().nth(1).is_some_and(|c| c.is_ascii_uppercase()) {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// React Native platform extension prefixes.
+/// Metro resolves platform-specific files (e.g., `./foo` -> `./foo.web.tsx` on web).
+const RN_PLATFORM_PREFIXES: &[&str] = &[".web", ".ios", ".android", ".native"];
+
+/// Check if React Native or Expo plugins are active.
+fn has_react_native_plugin(active_plugins: &[String]) -> bool {
+    active_plugins
+        .iter()
+        .any(|p| p == "react-native" || p == "expo")
+}
+
+/// Build the resolver extension list, optionally prepending React Native platform
+/// extensions when the RN/Expo plugin is active.
+fn build_extensions(active_plugins: &[String]) -> Vec<String> {
+    let base: Vec<String> = vec![
+        ".ts".into(),
+        ".tsx".into(),
+        ".d.ts".into(),
+        ".d.mts".into(),
+        ".d.cts".into(),
+        ".mts".into(),
+        ".cts".into(),
+        ".js".into(),
+        ".jsx".into(),
+        ".mjs".into(),
+        ".cjs".into(),
+        ".json".into(),
+        ".vue".into(),
+        ".svelte".into(),
+        ".astro".into(),
+        ".mdx".into(),
+        ".css".into(),
+        ".scss".into(),
+    ];
+
+    if has_react_native_plugin(active_plugins) {
+        let source_exts = [".ts", ".tsx", ".js", ".jsx"];
+        let mut rn_extensions: Vec<String> = Vec::new();
+        for platform in RN_PLATFORM_PREFIXES {
+            for ext in &source_exts {
+                rn_extensions.push(format!("{platform}{ext}"));
+            }
+        }
+        rn_extensions.extend(base);
+        rn_extensions
+    } else {
+        base
+    }
+}
+
+/// Build the resolver condition_names list, optionally prepending React Native
+/// conditions when the RN/Expo plugin is active.
+fn build_condition_names(active_plugins: &[String]) -> Vec<String> {
+    let mut names = vec![
+        "import".into(),
+        "require".into(),
+        "default".into(),
+        "types".into(),
+        "node".into(),
+    ];
+    if has_react_native_plugin(active_plugins) {
+        names.insert(0, "react-native".into());
+        names.insert(1, "browser".into());
+    }
+    names
+}
+
 /// Create an oxc_resolver instance with standard configuration.
-fn create_resolver(config: &ResolvedConfig) -> Resolver {
+///
+/// When React Native or Expo plugins are active, platform-specific extensions
+/// (e.g., `.web.tsx`, `.ios.ts`) are prepended to the extension list so that
+/// Metro-style platform resolution works correctly.
+fn create_resolver(config: &ResolvedConfig, active_plugins: &[String]) -> Resolver {
     let mut options = ResolveOptions {
-        extensions: vec![
-            ".ts".into(),
-            ".tsx".into(),
-            ".d.ts".into(),
-            ".d.mts".into(),
-            ".d.cts".into(),
-            ".mts".into(),
-            ".cts".into(),
-            ".js".into(),
-            ".jsx".into(),
-            ".mjs".into(),
-            ".cjs".into(),
-            ".json".into(),
-            ".vue".into(),
-            ".svelte".into(),
-            ".astro".into(),
-            ".mdx".into(),
-            ".css".into(),
-            ".scss".into(),
-        ],
+        extensions: build_extensions(active_plugins),
         // Support TypeScript's node16/nodenext module resolution where .ts files
         // are imported with .js extensions (e.g., `import './api.js'` for `api.ts`).
         extension_alias: vec![
@@ -367,13 +452,7 @@ fn create_resolver(config: &ResolvedConfig) -> Resolver {
             (".mjs".into(), vec![".mts".into(), ".mjs".into()]),
             (".cjs".into(), vec![".cts".into(), ".cjs".into()]),
         ],
-        condition_names: vec![
-            "import".into(),
-            "require".into(),
-            "default".into(),
-            "types".into(),
-            "node".into(),
-        ],
+        condition_names: build_condition_names(active_plugins),
         main_fields: vec!["module".into(), "main".into()],
         ..Default::default()
     };
@@ -418,9 +497,15 @@ fn resolve_specifier(
         return ResolveResult::ExternalFile(PathBuf::from(specifier));
     }
 
-    // Fast path for bare specifiers: check cache first to avoid repeated resolver work
+    // Fast path for bare specifiers: check cache first to avoid repeated resolver work.
+    // Path aliases (e.g., `@/components`, `~/lib`) are excluded from caching because
+    // they may resolve differently depending on the importing file's tsconfig context.
     let is_bare = is_bare_specifier(specifier);
-    if is_bare && let Some(cached) = bare_cache.get(specifier) {
+    let is_alias = is_path_alias(specifier);
+    if is_bare
+        && !is_alias
+        && let Some(cached) = bare_cache.get(specifier)
+    {
         return cached;
     }
 
@@ -473,7 +558,11 @@ fn resolve_specifier(
             }
         }
         Err(_) => {
-            if is_bare {
+            if is_alias {
+                // Path aliases that fail resolution are unresolvable, not npm packages.
+                // Classifying them as NpmPackage would cause false "unlisted dependency" reports.
+                ResolveResult::Unresolvable(specifier.to_string())
+            } else if is_bare {
                 let pkg_name = extract_package_name(specifier);
                 ResolveResult::NpmPackage(pkg_name)
             } else {
@@ -482,8 +571,9 @@ fn resolve_specifier(
         }
     };
 
-    // Cache bare specifier results (NpmPackage or failed resolutions) for reuse
-    if is_bare {
+    // Cache bare specifier results (NpmPackage or failed resolutions) for reuse.
+    // Path aliases are excluded — they resolve relative to the importing file's tsconfig.
+    if is_bare && !is_alias {
         bare_cache.insert(specifier.to_string(), result.clone());
     }
 
@@ -1099,5 +1189,62 @@ mod tests {
             Some(FileId(4)),
             ".pnpm path with peer dep suffix should still resolve"
         );
+    }
+
+    #[test]
+    fn test_has_react_native_plugin_active() {
+        let plugins = vec!["react-native".to_string(), "typescript".to_string()];
+        assert!(has_react_native_plugin(&plugins));
+    }
+
+    #[test]
+    fn test_has_expo_plugin_active() {
+        let plugins = vec!["expo".to_string(), "typescript".to_string()];
+        assert!(has_react_native_plugin(&plugins));
+    }
+
+    #[test]
+    fn test_has_react_native_plugin_inactive() {
+        let plugins = vec!["nextjs".to_string(), "typescript".to_string()];
+        assert!(!has_react_native_plugin(&plugins));
+    }
+
+    #[test]
+    fn test_rn_platform_extensions_prepended() {
+        let no_rn = build_extensions(&[]);
+        let rn_plugins = vec!["react-native".to_string()];
+        let with_rn = build_extensions(&rn_plugins);
+
+        // Without RN, the first extension should be .ts
+        assert_eq!(no_rn[0], ".ts");
+
+        // With RN, platform extensions should come first
+        assert_eq!(with_rn[0], ".web.ts");
+        assert_eq!(with_rn[1], ".web.tsx");
+        assert_eq!(with_rn[2], ".web.js");
+        assert_eq!(with_rn[3], ".web.jsx");
+
+        // Verify all 4 platforms (web, ios, android, native) x 4 exts = 16
+        assert!(with_rn.len() > no_rn.len());
+        assert_eq!(
+            with_rn.len(),
+            no_rn.len() + 16,
+            "should add 16 platform extensions (4 platforms x 4 exts)"
+        );
+    }
+
+    #[test]
+    fn test_rn_condition_names_prepended() {
+        let no_rn = build_condition_names(&[]);
+        let rn_plugins = vec!["react-native".to_string()];
+        let with_rn = build_condition_names(&rn_plugins);
+
+        // Without RN, first condition should be "import"
+        assert_eq!(no_rn[0], "import");
+
+        // With RN, "react-native" and "browser" should be prepended
+        assert_eq!(with_rn[0], "react-native");
+        assert_eq!(with_rn[1], "browser");
+        assert_eq!(with_rn[2], "import");
     }
 }

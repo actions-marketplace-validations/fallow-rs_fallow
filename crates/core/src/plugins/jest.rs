@@ -18,6 +18,7 @@ const ENTRY_PATTERNS: &[&str] = &[
     "**/*.test.{ts,tsx,js,jsx}",
     "**/*.spec.{ts,tsx,js,jsx}",
     "**/__tests__/**/*.{ts,tsx,js,jsx}",
+    "**/__mocks__/**/*.{ts,tsx,js,jsx,mjs,cjs}",
 ];
 
 const CONFIG_PATTERNS: &[&str] = &["jest.config.{ts,js,mjs,cjs}", "jest.config.json"];
@@ -59,6 +60,10 @@ impl Plugin for JestPlugin {
 
     fn tooling_dependencies(&self) -> &'static [&'static str] {
         TOOLING_DEPENDENCIES
+    }
+
+    fn package_json_config_key(&self) -> Option<&'static str> {
+        Some("jest")
     }
 
     fn resolve_config(&self, config_path: &Path, source: &str, root: &Path) -> PluginResult {

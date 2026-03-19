@@ -105,7 +105,7 @@ pub fn find_dead_code_full(
 
         if config.detect.unlisted_dependencies {
             results.unlisted_dependencies =
-                find_unlisted_dependencies(graph, pkg, config, workspaces);
+                find_unlisted_dependencies(graph, pkg, config, workspaces, plugin_result);
         }
     }
 
@@ -250,6 +250,7 @@ fn is_config_file(path: &std::path::Path) -> bool {
         "vitest.workspace.",
         "playwright.config.",
         "cypress.config.",
+        "karma.conf.",
         // Linting & formatting
         "eslint.config.",
         "prettier.config.",
@@ -856,6 +857,7 @@ fn find_unlisted_dependencies(
     pkg: &PackageJson,
     config: &ResolvedConfig,
     workspaces: &[fallow_config::WorkspaceInfo],
+    plugin_result: Option<&crate::plugins::AggregatedPluginResult>,
 ) -> Vec<UnlistedDependency> {
     let all_deps: HashSet<String> = pkg.all_dependency_names().into_iter().collect();
 
@@ -878,6 +880,16 @@ fn find_unlisted_dependencies(
         }
     }
 
+    // Collect virtual module prefixes from active plugins (e.g., Docusaurus @theme/, @site/)
+    let virtual_prefixes: Vec<&str> = plugin_result
+        .map(|pr| {
+            pr.virtual_module_prefixes
+                .iter()
+                .map(|s| s.as_str())
+                .collect()
+        })
+        .unwrap_or_default();
+
     let mut unlisted: HashMap<String, Vec<std::path::PathBuf>> = HashMap::new();
 
     for (package_name, file_ids) in &graph.package_usage {
@@ -886,6 +898,13 @@ fn find_unlisted_dependencies(
         }
         // Skip internal workspace package names
         if workspace_names.contains(package_name) {
+            continue;
+        }
+        // Skip virtual module imports provided by active framework plugins
+        if virtual_prefixes
+            .iter()
+            .any(|prefix| package_name.starts_with(prefix))
+        {
             continue;
         }
         // Quick check: if listed in any root or workspace deps, skip
@@ -1674,6 +1693,33 @@ mod tests {
         assert!(!is_declaration_file(std::path::Path::new("component.tsx")));
         assert!(!is_declaration_file(std::path::Path::new("utils.js")));
         assert!(!is_declaration_file(std::path::Path::new("styles.d.css")));
+    }
+
+    // Config file tests
+    #[test]
+    fn config_file_known_patterns() {
+        assert!(is_config_file(std::path::Path::new("webpack.config.js")));
+        assert!(is_config_file(std::path::Path::new("jest.config.ts")));
+        assert!(is_config_file(std::path::Path::new("karma.conf.js")));
+        assert!(is_config_file(std::path::Path::new("vite.config.mts")));
+        assert!(is_config_file(std::path::Path::new("playwright.config.ts")));
+        assert!(is_config_file(std::path::Path::new("eslint.config.mjs")));
+    }
+
+    #[test]
+    fn config_file_dotrc_pattern() {
+        assert!(is_config_file(std::path::Path::new(".eslintrc.js")));
+        assert!(is_config_file(std::path::Path::new(".babelrc.json")));
+    }
+
+    #[test]
+    fn not_config_file() {
+        assert!(!is_config_file(std::path::Path::new("index.ts")));
+        assert!(!is_config_file(std::path::Path::new("utils.js")));
+        assert!(!is_config_file(std::path::Path::new("config.ts")));
+        assert!(!is_config_file(std::path::Path::new(
+            "src/webpack-plugin.js"
+        )));
     }
 
     // byte_offset_to_line_col tests

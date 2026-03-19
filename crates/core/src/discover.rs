@@ -1,3 +1,4 @@
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use fallow_config::{PackageJson, ResolvedConfig};
@@ -44,6 +45,44 @@ const SOURCE_EXTENSIONS: &[&str] = &[
     "scss",
 ];
 
+/// Hidden (dot-prefixed) directories that should be included in file discovery.
+///
+/// Most hidden directories (`.git`, `.cache`, etc.) should be skipped, but certain
+/// convention directories contain source or config files that fallow needs to see:
+/// - `.storybook` — Storybook configuration (the Storybook plugin depends on this)
+/// - `.well-known` — Standard web convention directory
+/// - `.changeset` — Changesets configuration
+/// - `.github` — GitHub workflows and CI scripts
+const ALLOWED_HIDDEN_DIRS: &[&str] = &[".storybook", ".well-known", ".changeset", ".github"];
+
+/// Check if a hidden directory name is on the allowlist.
+fn is_allowed_hidden_dir(name: &OsStr) -> bool {
+    ALLOWED_HIDDEN_DIRS.iter().any(|&d| OsStr::new(d) == name)
+}
+
+/// Check if a hidden directory entry should be allowed through the filter.
+///
+/// Returns `true` if the entry is not hidden or is on the allowlist.
+/// Hidden files (not directories) are always allowed through since the type
+/// filter handles them.
+fn is_allowed_hidden(entry: &ignore::DirEntry) -> bool {
+    let name = entry.file_name();
+    let name_str = name.to_string_lossy();
+
+    // Not hidden — always allow
+    if !name_str.starts_with('.') {
+        return true;
+    }
+
+    // Hidden files are fine — the type filter (source extensions) will handle them
+    if entry.file_type().is_some_and(|ft| ft.is_file()) {
+        return true;
+    }
+
+    // Hidden directory — check against the allowlist
+    is_allowed_hidden_dir(name)
+}
+
 /// Glob patterns for test/dev/story files excluded in production mode.
 const PRODUCTION_EXCLUDE_PATTERNS: &[&str] = &[
     // Test files
@@ -84,14 +123,16 @@ pub fn discover_files(config: &ResolvedConfig) -> Vec<DiscoveredFile> {
     types_builder.select("source");
     let types = types_builder.build().expect("valid types");
 
-    let walker = WalkBuilder::new(&config.root)
-        .hidden(true)
+    let mut walk_builder = WalkBuilder::new(&config.root);
+    walk_builder
+        .hidden(false)
         .git_ignore(true)
         .git_global(true)
         .git_exclude(true)
         .types(types)
         .threads(config.threads)
-        .build();
+        .filter_entry(is_allowed_hidden);
+    let walker = walk_builder.build();
 
     // Build production exclude matcher if needed
     let production_excludes = if config.production {
@@ -784,5 +825,31 @@ mod tests {
         // Bare names without path separator should not match
         assert!(!looks_like_script_file("webpack.js"));
         assert!(!looks_like_script_file("build"));
+    }
+
+    // is_allowed_hidden_dir tests
+    #[test]
+    fn allowed_hidden_dirs() {
+        assert!(is_allowed_hidden_dir(OsStr::new(".storybook")));
+        assert!(is_allowed_hidden_dir(OsStr::new(".well-known")));
+        assert!(is_allowed_hidden_dir(OsStr::new(".changeset")));
+        assert!(is_allowed_hidden_dir(OsStr::new(".github")));
+    }
+
+    #[test]
+    fn disallowed_hidden_dirs() {
+        assert!(!is_allowed_hidden_dir(OsStr::new(".git")));
+        assert!(!is_allowed_hidden_dir(OsStr::new(".cache")));
+        assert!(!is_allowed_hidden_dir(OsStr::new(".vscode")));
+        assert!(!is_allowed_hidden_dir(OsStr::new(".fallow")));
+        assert!(!is_allowed_hidden_dir(OsStr::new(".next")));
+    }
+
+    #[test]
+    fn non_hidden_dirs_not_in_allowlist() {
+        // Non-hidden names should not match the allowlist (they are always allowed
+        // by is_allowed_hidden because they don't start with '.')
+        assert!(!is_allowed_hidden_dir(OsStr::new("src")));
+        assert!(!is_allowed_hidden_dir(OsStr::new("node_modules")));
     }
 }

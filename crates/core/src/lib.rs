@@ -178,7 +178,13 @@ fn analyze_full(config: &ResolvedConfig, retain: bool) -> Result<AnalysisOutput,
 
     // Stage 4: Resolve imports to file IDs
     let t = Instant::now();
-    let resolved = resolve::resolve_all_imports(&modules, config, files, workspaces);
+    let resolved = resolve::resolve_all_imports(
+        &modules,
+        config,
+        files,
+        workspaces,
+        &plugin_result.active_plugins,
+    );
     let resolve_ms = t.elapsed().as_secs_f64() * 1000.0;
 
     // Stage 5: Build module graph

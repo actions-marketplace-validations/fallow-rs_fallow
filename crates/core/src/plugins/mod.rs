@@ -90,12 +90,28 @@ pub trait Plugin: Send + Sync {
         &[]
     }
 
+    /// Import prefixes that are virtual modules provided by this framework at build time.
+    /// Imports matching these prefixes should not be flagged as unlisted dependencies.
+    /// Each entry is matched as a prefix against the extracted package name
+    /// (e.g., `"@theme/"` matches `@theme/Layout`).
+    fn virtual_module_prefixes(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     /// Parse a config file's AST to discover additional entries, dependencies, etc.
     ///
     /// Called for each config file matching `config_patterns()`. The source code
     /// and parsed AST are provided — use [`config_parser`] utilities to extract values.
     fn resolve_config(&self, _config_path: &Path, _source: &str, _root: &Path) -> PluginResult {
         PluginResult::default()
+    }
+
+    /// The key name in package.json that holds inline configuration for this tool.
+    /// When set (e.g., `"jest"` for the `"jest"` key in package.json), the plugin
+    /// system will extract that key's value and call `resolve_config` with its
+    /// JSON content if no standalone config file was found.
+    fn package_json_config_key(&self) -> Option<&'static str> {
+        None
     }
 }
 
@@ -141,6 +157,7 @@ macro_rules! define_plugin {
         $(, config_patterns: $config:expr)?
         $(, always_used: $always:expr)?
         $(, tooling_dependencies: $tooling:expr)?
+        $(, virtual_module_prefixes: $virtual:expr)?
         $(, used_exports: [$( ($pat:expr, $exports:expr) ),* $(,)?])?
         $(,)?
     ) => {
@@ -159,6 +176,7 @@ macro_rules! define_plugin {
             $( fn config_patterns(&self) -> &'static [&'static str] { $config } )?
             $( fn always_used(&self) -> &'static [&'static str] { $always } )?
             $( fn tooling_dependencies(&self) -> &'static [&'static str] { $tooling } )?
+            $( fn virtual_module_prefixes(&self) -> &'static [&'static str] { $virtual } )?
 
             $(
                 fn used_exports(&self) -> Vec<(&'static str, &'static [&'static str])> {
@@ -210,6 +228,7 @@ mod storybook;
 mod stylelint;
 mod sveltekit;
 mod tailwind;
+mod tsdown;
 mod tsup;
 mod turborepo;
 mod typescript;
@@ -245,6 +264,9 @@ pub struct AggregatedPluginResult {
     pub tooling_dependencies: Vec<String>,
     /// Package names discovered as used in package.json scripts (binary invocations).
     pub script_used_packages: std::collections::HashSet<String>,
+    /// Import prefixes for virtual modules provided by active frameworks.
+    /// Imports matching these prefixes should not be flagged as unlisted dependencies.
+    pub virtual_module_prefixes: Vec<String>,
     /// Names of active plugins.
     pub active_plugins: Vec<String>,
 }
@@ -272,6 +294,7 @@ impl PluginRegistry {
             Box::new(rollup::RollupPlugin),
             Box::new(rspack::RspackPlugin),
             Box::new(tsup::TsupPlugin),
+            Box::new(tsdown::TsdownPlugin),
             // Testing
             Box::new(vitest::VitestPlugin),
             Box::new(jest::JestPlugin),
@@ -370,6 +393,9 @@ impl PluginRegistry {
             for dep in plugin.tooling_dependencies() {
                 result.tooling_dependencies.push((*dep).to_string());
             }
+            for prefix in plugin.virtual_module_prefixes() {
+                result.virtual_module_prefixes.push((*prefix).to_string());
+            }
         }
 
         // Phase 2b: Process external plugins (includes inline framework definitions)
@@ -423,20 +449,20 @@ impl PluginRegistry {
             })
             .collect();
 
-        if !config_matchers.is_empty() {
-            // Build relative paths for matching
-            let relative_files: Vec<(&PathBuf, String)> = discovered_files
-                .iter()
-                .map(|f| {
-                    let rel = f
-                        .strip_prefix(root)
-                        .unwrap_or(f)
-                        .to_string_lossy()
-                        .into_owned();
-                    (f, rel)
-                })
-                .collect();
+        // Build relative paths for matching (used by Phase 3 and 4)
+        let relative_files: Vec<(&PathBuf, String)> = discovered_files
+            .iter()
+            .map(|f| {
+                let rel = f
+                    .strip_prefix(root)
+                    .unwrap_or(f)
+                    .to_string_lossy()
+                    .into_owned();
+                (f, rel)
+            })
+            .collect();
 
+        if !config_matchers.is_empty() {
             for (plugin, matchers) in &config_matchers {
                 for (abs_path, rel_path) in &relative_files {
                     if matchers.iter().any(|m| m.is_match(rel_path.as_str())) {
@@ -460,6 +486,49 @@ impl PluginRegistry {
                                     .extend(plugin_result.always_used_files);
                                 result.setup_files.extend(plugin_result.setup_files);
                             }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Phase 4: Package.json inline config fallback
+        // For plugins that define `package_json_config_key()`, check if the root
+        // package.json contains that key and no standalone config file was found.
+        for plugin in &active {
+            if let Some(key) = plugin.package_json_config_key() {
+                // Check if any config file was already found for this plugin
+                let has_config_file = !plugin.config_patterns().is_empty()
+                    && config_matchers.iter().any(|(p, matchers)| {
+                        p.name() == plugin.name()
+                            && relative_files
+                                .iter()
+                                .any(|(_, rel)| matchers.iter().any(|m| m.is_match(rel.as_str())))
+                    });
+                if !has_config_file {
+                    // Try to extract the key from package.json
+                    let pkg_path = root.join("package.json");
+                    if let Ok(content) = std::fs::read_to_string(&pkg_path)
+                        && let Ok(json) = serde_json::from_str::<serde_json::Value>(&content)
+                        && let Some(config_value) = json.get(key)
+                    {
+                        let config_json = serde_json::to_string(config_value).unwrap_or_default();
+                        let fake_path = root.join(format!("{key}.config.json"));
+                        let plugin_result = plugin.resolve_config(&fake_path, &config_json, root);
+                        if !plugin_result.is_empty() {
+                            tracing::debug!(
+                                plugin = plugin.name(),
+                                key = key,
+                                "resolved inline package.json config"
+                            );
+                            result.entry_patterns.extend(plugin_result.entry_patterns);
+                            result
+                                .referenced_dependencies
+                                .extend(plugin_result.referenced_dependencies);
+                            result
+                                .discovered_always_used
+                                .extend(plugin_result.always_used_files);
+                            result.setup_files.extend(plugin_result.setup_files);
                         }
                     }
                 }

@@ -1344,6 +1344,46 @@ fn multi_hop_barrel_unused_detected() {
     );
 }
 
+// ── Star re-export chains ──────────────────────────────────────
+
+#[test]
+fn star_re_export_chain_used_propagates() {
+    let root = fixture_path("star-re-export-chain");
+    let config = create_config(root.clone());
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+
+    let unused_export_names: Vec<&str> = results
+        .unused_exports
+        .iter()
+        .map(|e| e.export_name.as_str())
+        .collect();
+
+    // `used` is imported through barrel1 (export *) -> barrel2 (export *) -> source
+    assert!(
+        !unused_export_names.contains(&"used"),
+        "used should propagate through star re-export chain and NOT be flagged, found: {unused_export_names:?}"
+    );
+}
+
+#[test]
+fn star_re_export_chain_unused_detected() {
+    let root = fixture_path("star-re-export-chain");
+    let config = create_config(root.clone());
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+
+    let unused_export_names: Vec<&str> = results
+        .unused_exports
+        .iter()
+        .map(|e| e.export_name.as_str())
+        .collect();
+
+    // `unused` is exported from source.ts but never imported
+    assert!(
+        unused_export_names.contains(&"unused"),
+        "unused should be detected as unused export, found: {unused_export_names:?}"
+    );
+}
+
 // ── Path aliases ───────────────────────────────────────────────
 
 #[test]

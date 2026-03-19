@@ -455,10 +455,12 @@ impl FallowConfig {
         }
 
         // Default ignores
+        // Note: `build/` is only ignored at the project root (not `**/build/**`)
+        // because nested `build/` directories like `test/build/` may contain source files.
         let default_ignores = [
             "**/node_modules/**",
             "**/dist/**",
-            "**/build/**",
+            "build/**",
             "**/.git/**",
             "**/coverage/**",
             "**/*.min.js",

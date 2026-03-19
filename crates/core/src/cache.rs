@@ -8,7 +8,7 @@ use oxc_span::Span;
 use crate::extract::{ExportName, MemberAccess, MemberKind};
 
 /// Cache version — bump when the cache format changes.
-const CACHE_VERSION: u32 = 7;
+const CACHE_VERSION: u32 = 8;
 
 /// Maximum cache file size to deserialize (256 MB).
 const MAX_CACHE_SIZE: usize = 256 * 1024 * 1024;
@@ -120,6 +120,7 @@ pub struct CachedMember {
     pub kind: String,
     pub span_start: u32,
     pub span_end: u32,
+    pub has_decorator: bool,
 }
 
 #[derive(Debug, Clone, Encode, Decode)]
@@ -260,6 +261,7 @@ pub fn cached_to_module(
                         }
                     },
                     span: Span::new(m.span_start, m.span_end),
+                    has_decorator: m.has_decorator,
                 })
                 .collect(),
         })
@@ -384,6 +386,7 @@ pub fn module_to_cached(module: &crate::extract::ModuleInfo) -> CachedModule {
                         },
                         span_start: m.span.start,
                         span_end: m.span.end,
+                        has_decorator: m.has_decorator,
                     })
                     .collect(),
             })
@@ -798,16 +801,19 @@ mod tests {
                         name: "Red".to_string(),
                         kind: MemberKind::EnumMember,
                         span: Span::new(10, 15),
+                        has_decorator: false,
                     },
                     MemberInfo {
                         name: "greet".to_string(),
                         kind: MemberKind::ClassMethod,
                         span: Span::new(20, 30),
+                        has_decorator: false,
                     },
                     MemberInfo {
                         name: "name".to_string(),
                         kind: MemberKind::ClassProperty,
                         span: Span::new(35, 45),
+                        has_decorator: false,
                     },
                 ],
             }],

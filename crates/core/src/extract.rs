@@ -64,6 +64,11 @@ pub struct MemberInfo {
     pub kind: MemberKind,
     #[serde(serialize_with = "serialize_span")]
     pub span: Span,
+    /// Whether this member has decorators (e.g., `@Column()`, `@Inject()`).
+    /// Decorated members are used by frameworks at runtime and should not be
+    /// flagged as unused class members.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub has_decorator: bool,
 }
 
 /// The kind of member.
@@ -757,6 +762,7 @@ fn extract_class_members(class: &Class<'_>) -> Vec<MemberInfo> {
                             name: name_str,
                             kind: MemberKind::ClassMethod,
                             span: method.span,
+                            has_decorator: !method.decorators.is_empty(),
                         });
                     }
                 }
@@ -773,6 +779,7 @@ fn extract_class_members(class: &Class<'_>) -> Vec<MemberInfo> {
                         name: name.to_string(),
                         kind: MemberKind::ClassProperty,
                         span: prop.span,
+                        has_decorator: !prop.decorators.is_empty(),
                     });
                 }
             }
@@ -929,6 +936,7 @@ impl ModuleInfoExtractor {
                             name,
                             kind: MemberKind::EnumMember,
                             span: member.span,
+                            has_decorator: false,
                         })
                     })
                     .collect();

@@ -31,6 +31,11 @@ const TOOLING_DEPENDENCIES: &[&str] = &[
     "@docusaurus/theme-classic",
 ];
 
+/// Virtual module prefixes provided by Docusaurus at build time.
+/// These are resolved by the Docusaurus bundler and should not be
+/// flagged as unlisted dependencies.
+const VIRTUAL_MODULE_PREFIXES: &[&str] = &["@theme/", "@docusaurus/", "@site/", "@generated/"];
+
 impl Plugin for DocusaurusPlugin {
     fn name(&self) -> &'static str {
         "docusaurus"
@@ -54,6 +59,10 @@ impl Plugin for DocusaurusPlugin {
 
     fn tooling_dependencies(&self) -> &'static [&'static str] {
         TOOLING_DEPENDENCIES
+    }
+
+    fn virtual_module_prefixes(&self) -> &'static [&'static str] {
+        VIRTUAL_MODULE_PREFIXES
     }
 
     fn resolve_config(&self, config_path: &Path, source: &str, _root: &Path) -> PluginResult {

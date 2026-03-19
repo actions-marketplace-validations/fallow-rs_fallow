@@ -114,7 +114,18 @@ pub fn discover_workspaces(root: &Path) -> Vec<WorkspaceInfo> {
         }
     }
 
-    // 4. Mark workspaces that are depended on by other workspaces
+    // 4. Deduplicate workspaces by canonical path.
+    // Overlapping patterns (e.g., `examples/*` and `examples/minimal/*`) can match the
+    // same directory, causing duplicate workspace entries and double-reported issues.
+    {
+        let mut seen = std::collections::HashSet::new();
+        workspaces.retain(|ws| {
+            let canonical = ws.root.canonicalize().unwrap_or_else(|_| ws.root.clone());
+            seen.insert(canonical)
+        });
+    }
+
+    // 5. Mark workspaces that are depended on by other workspaces
     let all_dep_names: Vec<String> = workspaces
         .iter()
         .flat_map(|ws| {
@@ -201,6 +212,10 @@ pub struct PackageJson {
     #[serde(default)]
     pub typings: Option<String>,
     #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub browser: Option<serde_json::Value>,
+    #[serde(default)]
     pub bin: Option<serde_json::Value>,
     #[serde(default)]
     pub exports: Option<serde_json::Value>,
@@ -271,6 +286,26 @@ impl PackageJson {
         }
         if let Some(typings) = &self.typings {
             entries.push(typings.clone());
+        }
+        if let Some(source) = &self.source {
+            entries.push(source.clone());
+        }
+
+        // Handle browser field (string or object with path values)
+        if let Some(browser) = &self.browser {
+            match browser {
+                serde_json::Value::String(s) => entries.push(s.clone()),
+                serde_json::Value::Object(map) => {
+                    for v in map.values() {
+                        if let serde_json::Value::String(s) = v
+                            && (s.starts_with("./") || s.starts_with("../"))
+                        {
+                            entries.push(s.clone());
+                        }
+                    }
+                }
+                _ => {}
+            }
         }
 
         // Handle bin field (string or object)
@@ -511,5 +546,48 @@ mod tests {
         let entries = pkg.entry_points();
         // "not-a-relative-path" doesn't start with "./" so should be excluded
         assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn package_json_source_field() {
+        let pkg: PackageJson = serde_json::from_str(
+            r#"{
+            "main": "dist/index.js",
+            "source": "src/index.ts"
+        }"#,
+        )
+        .unwrap();
+        let entries = pkg.entry_points();
+        assert!(entries.contains(&"src/index.ts".to_string()));
+        assert!(entries.contains(&"dist/index.js".to_string()));
+    }
+
+    #[test]
+    fn package_json_browser_field_string() {
+        let pkg: PackageJson = serde_json::from_str(
+            r#"{
+            "browser": "./dist/browser.js"
+        }"#,
+        )
+        .unwrap();
+        let entries = pkg.entry_points();
+        assert!(entries.contains(&"./dist/browser.js".to_string()));
+    }
+
+    #[test]
+    fn package_json_browser_field_object() {
+        let pkg: PackageJson = serde_json::from_str(
+            r#"{
+            "browser": {
+                "./server.js": "./browser.js",
+                "module-name": false
+            }
+        }"#,
+        )
+        .unwrap();
+        let entries = pkg.entry_points();
+        assert!(entries.contains(&"./browser.js".to_string()));
+        // non-relative paths and false values should be excluded
+        assert_eq!(entries.len(), 1);
     }
 }
