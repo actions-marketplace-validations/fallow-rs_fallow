@@ -57,7 +57,8 @@ Fallow is a Rust-native dead code and duplication analyzer for JavaScript/TypeSc
 - CSS/SCSS (`@import`, `@use`, `@forward` as module dependencies; `@apply`/`@tailwind` as Tailwind dependency usage; CSS Modules class name export tracking)
 
 ### Performance
-- rayon parallelism, oxc_parser, incremental bincode cache, flat graph storage, DashMap lock-free bare specifier cache
+- rayon parallelism, oxc_parser, flat graph storage, DashMap lock-free bare specifier cache
+- **Cache-aware incremental parsing**: unchanged files skip AST parsing via content-hash cache; only changed/new files are parsed. `--performance` shows cache hit/miss breakdown.
 - Large-scale benchmarks on 1,000+ and 5,000+ file projects with warm/cold cache measurements
 - Curated duplication benchmark corpus with 100% precision/recall on default settings
 
@@ -65,26 +66,18 @@ Fallow is a Rust-native dead code and duplication analyzer for JavaScript/TypeSc
 
 - **Syntactic analysis only**: No TypeScript type information. Projects using `isolatedModules: true` (required for esbuild/swc/vite) are well-served; legacy tsc-only projects may see false positives on type-only imports.
 - **Config parsing ceiling**: AST-based extraction covers static object literals, string arrays, and simple wrappers like `defineConfig(...)`. Computed values (`getPlugins()`), conditionals (`process.env.NODE_ENV`), and nested config factories are out of reach without JS eval.
-- **CSS/SCSS parsing is regex-based**: Handles `@import`, `@use`, `@forward`, `@apply`, `@tailwind` with comment stripping, and CSS Module class name extraction. Does not parse full CSS syntax. SCSS partials (`_variables.scss` from `@use "variables"`) rely on the resolver, not SCSS-specific partial resolution.
+- **CSS/SCSS parsing is regex-based**: Handles `@import`, `@use`, `@forward`, `@apply`, `@tailwind` with comment stripping, and CSS Module class name extraction (strings and `url()` content are stripped before extraction). Does not parse full CSS syntax — CSS Modules `composes:` declarations and `:global()`/`:local()` pseudo-selectors are not tracked. SCSS partials (`_variables.scss` from `@use "variables"`) rely on the resolver, not SCSS-specific partial resolution.
 - **LSP column offsets are byte-based**: Diagnostics and Code Lens use byte column offsets from the Oxc parser, but the LSP spec requires UTF-16 code unit offsets. Identical for ASCII; may be off for non-ASCII characters before the target position on the same line.
 
 ---
 
 ## Next: Towards 1.0
 
-### Incremental Analysis
-
-**Two-phase approach** (per Rust architect review):
-
-**Phase A (cheap incremental)**: Re-parse only changed files, rebuild the full graph. Graph construction is sub-millisecond; parsing is the bottleneck. This gets 80% of the benefit with 20% of the work.
-
-**Phase B (fine-grained incremental, post-1.0)**: Patch the graph in place, track export-level dependencies, incremental re-export chain propagation. This requires redesigning the flat `Vec<Edge>` storage to support insertion/removal.
-
 ### Enhanced Code Actions
 
 - "Extract duplicate" — for duplication: offer to extract a clone family into a shared function
 - Hover: show where an export is used, or show other locations of a duplicate block
-- Code Lens: click to navigate to reference locations (currently display-only)
+- Code Lens: click to navigate to reference locations (reference counts are shown but not yet clickable)
 
 ### Cross-Workspace: Remaining Edge Cases
 
@@ -106,6 +99,9 @@ The basic cross-workspace resolution works (unified module graph, `--workspace` 
 ## Post-1.0: Exploration
 
 These are ideas, not commitments. They ship as 1.x releases based on user demand.
+
+### Fine-Grained Incremental Analysis
+Patch the graph in place, track export-level dependencies, incremental re-export chain propagation. Requires redesigning the flat `Vec<Edge>` storage to support insertion/removal. Cache-aware parsing already covers the main bottleneck; this would additionally skip file I/O for unchanged files via mtime-based short-circuiting.
 
 ### Historical Trend Tracking
 Store baselines over time. Generate trend reports for both dead code and duplication: "dead code grew 15% this quarter, duplication dropped 3%." Dashboard-friendly JSON API.
