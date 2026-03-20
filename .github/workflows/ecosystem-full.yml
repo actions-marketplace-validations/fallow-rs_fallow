@@ -1,0 +1,64 @@
+name: Ecosystem (Full)
+
+on:
+  schedule:
+    # Every Sunday at 04:00 UTC
+    - cron: '0 4 * * 0'
+  workflow_dispatch:
+
+concurrency:
+  group: ecosystem-full-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  FALLOW_QUIET: "1"
+
+jobs:
+  ecosystem-test:
+    name: Test against real-world projects
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ecosystem-full
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+
+      - name: Cache cloned repos
+        uses: actions/cache@v4
+        with:
+          path: /tmp/fallow-ecosystem
+          key: ecosystem-repos-${{ github.run_id }}
+          restore-keys: |
+            ecosystem-repos-
+
+      - name: Build fallow (release)
+        run: cargo build --release -p fallow-cli
+
+      - name: Run ecosystem tests
+        env:
+          FALLOW_BIN: ${{ github.workspace }}/target/release/fallow
+          ECOSYSTEM_DIR: /tmp/fallow-ecosystem
+        run: ./tests/ecosystem/run.sh
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ecosystem-results
+          path: /tmp/fallow-ecosystem/results/
+          retention-days: 30
