@@ -149,7 +149,7 @@ node bench-circular.mjs              # Run circular dep benchmarks (fallow vs ma
 | Speed vs knip v5 | **6-46x faster** | Baseline |
 | Speed vs knip v6 | **3-18x faster** | Baseline |
 | Memory usage | **3-11x less** | Baseline |
-| Dead code detection | 12 issue types | Comparable |
+| Dead code detection | 13 issue types | Comparable |
 | Duplication detection | Built-in | Not included |
 | Framework plugins | 84 (31 with config parsing) | 140+ (runtime config loading) |
 | Runtime dependency | None (standalone binary) | Node.js |
@@ -259,6 +259,7 @@ Supports `--changed-since main` for PR-only analysis, `--baseline` for failing o
 - **Non-JS file support** — Vue/Svelte SFC (`<script>` block extraction), Astro (frontmatter), MDX (import/export statements), CSS/SCSS (`@import`, `@use`, `@forward`, `@apply`/`@tailwind` as Tailwind dependency usage), CSS Modules (`.module.css`/`.module.scss` class name tracking)
 - **Production mode** — `--production` excludes test/story/dev files, only considers start/build scripts, and reports type-only dependencies that could be devDependencies
 - **Circular dependency detection** — finds import cycles using Tarjan's SCC algorithm; configurable via `"circular-dependencies"` rule. Unique feature not available in knip.
+- **JSDoc `@public` tag** — exports annotated with `/** @public */` are never reported as unused, for library authors whose exports are consumed by external projects
 
 ## Inline suppression comments
 
@@ -282,7 +283,7 @@ export const keepThisToo = 2;
 | `// fallow-ignore-file` | Suppress all issues in the file |
 | `// fallow-ignore-file unused-export` | Suppress a specific issue type for the file |
 
-Issue type tokens: `unused-file`, `unused-export`, `unused-type`, `unused-dependency`, `unused-dev-dependency`, `unused-enum-member`, `unused-class-member`, `unresolved-import`, `unlisted-dependency`, `duplicate-export`, `circular-dependency`, `code-duplication`.
+Issue type tokens: `unused-file`, `unused-export`, `unused-type`, `unused-dependency`, `unused-dev-dependency`, `unused-optional-dependency`, `unused-enum-member`, `unused-class-member`, `unresolved-import`, `unlisted-dependency`, `duplicate-export`, `circular-dependency`, `type-only-dependency`, `code-duplication`.
 
 ## Limitations
 

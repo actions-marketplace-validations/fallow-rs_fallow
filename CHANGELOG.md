@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-03-23
+
+### Added
+- Class instance member tracking: `const svc = new MyService(); svc.greet()` correctly tracks `greet` as a used class member, reducing false positives for class-based code (NestJS services, Angular components, etc.)
+- JSDoc `@public` tag support: exports annotated with `/** @public */` (or `/** @api public */`) are never reported as unused, designed for library authors whose exports are consumed by external projects
+- Type-only dependencies rule: production dependencies only imported via `import type` are reported as `type-only-dependency` (they should be devDependencies since types are erased at runtime)
+- Progress spinners showing analysis pipeline stages (discovery, parsing, resolution, analysis) for better UX on larger projects
+- VS Code extension published on Open VSX for Cursor and VSCodium support
+- Historical performance metric tracking with GitHub Pages dashboard
+- Package.json `#subpath` imports integration test
+
+### Changed
+- VS Code extension bundler migrated from esbuild to Rolldown
+- Large modules split into focused submodules for maintainability: `discover.rs`, `config.rs`, `resolve.rs`, `detect.rs`, `cache.rs`, `visitor.rs`, `check.rs`, and integration tests
+- Watch mode now shows changed file paths and clears screen between runs
+
+### Fixed
+- SARIF output now includes `tool.driver.version` and `$schema` fields
+- Conformance workflow JSON output handling
+
 ## [1.3.1] - 2026-03-23
 
 ### Added
@@ -210,7 +230,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `--changed-since` and `--fail-on-issues` for CI
 - Cross-workspace resolution for npm/yarn/pnpm workspaces
 
-[Unreleased]: https://github.com/fallow-rs/fallow/compare/v1.3.1...HEAD
+[Unreleased]: https://github.com/fallow-rs/fallow/compare/v1.4.0...HEAD
+[1.4.0]: https://github.com/fallow-rs/fallow/compare/v1.3.1...v1.4.0
 [1.3.1]: https://github.com/fallow-rs/fallow/compare/v1.3.0...v1.3.1
 [1.3.0]: https://github.com/fallow-rs/fallow/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/fallow-rs/fallow/compare/v1.1.0...v1.2.0
