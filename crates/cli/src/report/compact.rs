@@ -123,6 +123,19 @@ pub(super) fn print_health_compact(report: &crate::health_types::HealthReport, r
             score.complexity_density,
         );
     }
+    for entry in &report.hotspots {
+        let relative = normalize_uri(&relative_path(&entry.path, root).display().to_string());
+        println!(
+            "hotspot:{}:score={:.1},commits={},churn={},density={:.2},fan_in={},trend={}",
+            relative,
+            entry.score,
+            entry.commits,
+            entry.lines_added + entry.lines_deleted,
+            entry.complexity_density,
+            entry.fan_in,
+            entry.trend,
+        );
+    }
 }
 
 pub(super) fn print_duplication_compact(report: &DuplicationReport, root: &Path) {

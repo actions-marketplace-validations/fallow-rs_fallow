@@ -99,21 +99,26 @@ fallow dupes --format json --quiet --changed-since main
 
 ### `health`
 
-Analyze function complexity (cyclomatic and cognitive) and per-file health scores.
+Analyze function complexity (cyclomatic and cognitive), per-file health scores, and hotspots.
 
 ```bash
 fallow health --format json --quiet
 fallow health --format json --quiet --max-cyclomatic 15
 fallow health --format json --quiet --top 10 --sort cognitive
 fallow health --format json --quiet --file-scores
+fallow health --format json --quiet --hotspots
+fallow health --format json --quiet --hotspots --since 3m --min-commits 5
 ```
 
 **Flags:**
 - `--max-cyclomatic <N>` -- cyclomatic complexity threshold (default: 20)
 - `--max-cognitive <N>` -- cognitive complexity threshold (default: 15)
-- `--top <N>` -- only show the top N most complex functions (and file scores)
+- `--top <N>` -- only show the top N most complex functions (and file scores/hotspots)
 - `--sort cyclomatic|cognitive|lines` -- sort order for results
 - `--file-scores` -- compute per-file maintainability index (fan-in, fan-out, dead code ratio, complexity density). Runs the full analysis pipeline.
+- `--hotspots` -- identify files that are both complex and frequently changing (combines git churn with complexity). Requires a git repository.
+- `--since <DURATION>` -- git history window for hotspot analysis (default: 6m). Accepts durations (6m, 90d, 1y, 2w) or ISO dates (2025-06-01).
+- `--min-commits <N>` -- minimum commits for a file to appear in hotspot ranking (default: 3)
 - `--format human|json|compact|markdown|sarif` -- output format (default: human)
 
 **Exit codes:** 0 = no functions exceed thresholds, 1 = findings exist.
@@ -248,6 +253,7 @@ fallow dupes --format json --quiet --mode semantic --threshold 5
 fallow health --format json --quiet
 fallow health --format json --quiet --top 10 --sort cognitive
 fallow health --format json --quiet --file-scores   # includes per-file maintainability index
+fallow health --format json --quiet --hotspots      # identify riskiest files (churn x complexity)
 ```
 
 ### Safe auto-fix cycle

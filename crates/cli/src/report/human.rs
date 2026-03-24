@@ -7,7 +7,7 @@ use fallow_core::duplicates::DuplicationReport;
 use fallow_core::results::{AnalysisResults, UnusedExport, UnusedMember};
 use fallow_core::trace::{CloneTrace, DependencyTrace, ExportTrace, FileTrace, PipelineTimings};
 
-use super::{Level, relative_path, severity_to_level};
+use super::{Level, relative_path, severity_to_level, split_dir_filename};
 
 pub(super) fn print_human(
     results: &AnalysisResults,
@@ -458,11 +458,14 @@ pub(super) fn build_health_human_lines(
                 .cyan()
                 .bold()
         ));
+        lines.push(String::new());
 
         for score in &report.file_scores {
             let file_str = relative_path(&score.path, root).display().to_string();
             let mi = score.maintainability_index;
-            let mi_str = format!("{mi:.1}");
+
+            // MI score: color-coded by quality
+            let mi_str = format!("{mi:>5.1}");
             let mi_colored = if mi >= 80.0 {
                 mi_str.green().to_string()
             } else if mi >= 50.0 {
@@ -471,17 +474,111 @@ pub(super) fn build_health_human_lines(
                 mi_str.red().bold().to_string()
             };
 
+            // Path: dim directory, normal filename
+            let (dir, filename) = split_dir_filename(&file_str);
+
+            // Line 1: MI score + path
+            lines.push(format!("  {}    {}{}", mi_colored, dir.dimmed(), filename,));
+
+            // Line 2: metrics (indented, dimmed)
             lines.push(format!(
-                "  {} {} {}  {}  {}  {}",
-                file_str.dimmed(),
-                format!("MI:{mi_colored}").bold(),
-                format!("fan-in:{}", score.fan_in).dimmed(),
-                format!("fan-out:{}", score.fan_out).dimmed(),
-                format!("dead:{:.0}%", score.dead_code_ratio * 100.0).dimmed(),
-                format!("density:{:.2}", score.complexity_density).dimmed(),
+                "         {} fan-in  {} fan-out  {} dead  {} density",
+                format!("{:>3}", score.fan_in).dimmed(),
+                format!("{:>3}", score.fan_out).dimmed(),
+                format!("{:>3.0}%", score.dead_code_ratio * 100.0).dimmed(),
+                format!("{:.2}", score.complexity_density).dimmed(),
             ));
+
+            // Blank line between entries
+            lines.push(String::new());
         }
+    }
+
+    // Hotspots
+    if !report.hotspots.is_empty() {
+        let header = if let Some(ref summary) = report.hotspot_summary {
+            format!(
+                "Hotspots ({} files, since {})",
+                report.hotspots.len(),
+                summary.since,
+            )
+        } else {
+            format!("Hotspots ({} files)", report.hotspots.len())
+        };
+        lines.push(format!("{} {}", "\u{25cf}".red(), header.red().bold()));
         lines.push(String::new());
+
+        for entry in &report.hotspots {
+            let file_str = relative_path(&entry.path, root).display().to_string();
+
+            // Score: color-coded by severity
+            let score_str = format!("{:>5.1}", entry.score);
+            let score_colored = if entry.score >= 70.0 {
+                score_str.red().bold().to_string()
+            } else if entry.score >= 30.0 {
+                score_str.yellow().to_string()
+            } else {
+                score_str.green().to_string()
+            };
+
+            // Trend: symbol + color
+            let (trend_symbol, trend_colored) = match entry.trend {
+                fallow_core::churn::ChurnTrend::Accelerating => {
+                    ("\u{25b2}", "\u{25b2} accelerating".red().to_string())
+                }
+                fallow_core::churn::ChurnTrend::Cooling => {
+                    ("\u{25bc}", "\u{25bc} cooling".green().to_string())
+                }
+                fallow_core::churn::ChurnTrend::Stable => {
+                    ("\u{2500}", "\u{2500} stable".dimmed().to_string())
+                }
+            };
+
+            // Path: dim directory, normal filename
+            let (dir, filename) = split_dir_filename(&file_str);
+
+            // Line 1: score + trend symbol + path
+            lines.push(format!(
+                "  {} {}  {}{}",
+                score_colored,
+                match entry.trend {
+                    fallow_core::churn::ChurnTrend::Accelerating => trend_symbol.red().to_string(),
+                    fallow_core::churn::ChurnTrend::Cooling => trend_symbol.green().to_string(),
+                    fallow_core::churn::ChurnTrend::Stable => trend_symbol.dimmed().to_string(),
+                },
+                dir.dimmed(),
+                filename,
+            ));
+
+            // Line 2: metrics (indented, dimmed) + trend label
+            lines.push(format!(
+                "         {} commits  {} churn  {} density  {} fan-in  {}",
+                format!("{:>3}", entry.commits).dimmed(),
+                format!("{:>5}", entry.lines_added + entry.lines_deleted).dimmed(),
+                format!("{:.2}", entry.complexity_density).dimmed(),
+                format!("{:>2}", entry.fan_in).dimmed(),
+                trend_colored,
+            ));
+
+            // Blank line between entries
+            lines.push(String::new());
+        }
+
+        if let Some(ref summary) = report.hotspot_summary
+            && summary.files_excluded > 0
+        {
+            lines.push(format!(
+                "  {}",
+                format!(
+                    "{} file{} excluded (< {} commits)",
+                    summary.files_excluded,
+                    if summary.files_excluded == 1 { "" } else { "s" },
+                    summary.min_commits,
+                )
+                .dimmed()
+            ));
+            lines.push(String::new());
+        }
     }
 
     lines
@@ -1744,6 +1841,8 @@ mod tests {
                 average_maintainability: None,
             },
             file_scores: vec![],
+            hotspots: vec![],
+            hotspot_summary: None,
         };
         let lines = build_health_human_lines(&report, &root);
         let text = plain(&lines);
@@ -1775,6 +1874,8 @@ mod tests {
                 average_maintainability: None,
             },
             file_scores: vec![],
+            hotspots: vec![],
+            hotspot_summary: None,
         };
         let lines = build_health_human_lines(&report, &root);
         let text = plain(&lines);
@@ -1811,6 +1912,8 @@ mod tests {
                 average_maintainability: None,
             },
             file_scores: vec![],
+            hotspots: vec![],
+            hotspot_summary: None,
         };
         let lines = build_health_human_lines(&report, &root);
         let text = plain(&lines);
@@ -1854,6 +1957,8 @@ mod tests {
                 average_maintainability: None,
             },
             file_scores: vec![],
+            hotspots: vec![],
+            hotspot_summary: None,
         };
         let lines = build_health_human_lines(&report, &root);
         let text = plain(&lines);

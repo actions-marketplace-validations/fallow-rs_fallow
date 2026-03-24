@@ -34,6 +34,9 @@ pub struct HealthOptions<'a> {
     pub baseline: Option<&'a std::path::Path>,
     pub save_baseline: Option<&'a std::path::Path>,
     pub file_scores: bool,
+    pub hotspots: bool,
+    pub since: Option<&'a str>,
+    pub min_commits: Option<u32>,
 }
 
 pub fn run_health(opts: &HealthOptions<'_>) -> ExitCode {
@@ -211,12 +214,13 @@ pub fn run_health(opts: &HealthOptions<'_>) -> ExitCode {
         findings.truncate(top);
     }
 
-    // Compute file-level health scores when requested.
+    // Compute file-level health scores when requested or when hotspots need them.
     // NOTE: This runs the full analysis pipeline (discovery, parsing, graph, dead code detection)
     // a second time because there is no API to inject pre-parsed modules into the analysis
     // pipeline. The cache mitigates re-parsing cost but the discovery and graph construction
     // are repeated. Future optimization: expose a lower-level API that accepts ParseResult.
-    let (file_scores, files_scored, average_maintainability) = if opts.file_scores {
+    let needs_file_scores = opts.file_scores || opts.hotspots;
+    let (mut file_scores, files_scored, average_maintainability) = if needs_file_scores {
         match compute_file_scores(
             &config,
             &parse_result.modules,
@@ -242,10 +246,6 @@ pub fn run_health(opts: &HealthOptions<'_>) -> ExitCode {
                 } else {
                     None
                 };
-                // Apply --top to file scores too
-                if let Some(top) = opts.top {
-                    scores.truncate(top);
-                }
                 (scores, Some(total_scored), avg)
             }
             Err(e) => {
@@ -259,6 +259,23 @@ pub fn run_health(opts: &HealthOptions<'_>) -> ExitCode {
         (Vec::new(), None, None)
     };
 
+    // Compute hotspot analysis when requested.
+    let (hotspots, hotspot_summary) = if opts.hotspots {
+        compute_hotspots(opts, &config, &file_scores, &ignore_set, ws_root.as_deref())
+    } else {
+        (Vec::new(), None)
+    };
+
+    // Apply --top to file scores (after hotspot computation which uses the full list)
+    if opts.file_scores {
+        if let Some(top) = opts.top {
+            file_scores.truncate(top);
+        }
+    } else {
+        // If file_scores was only computed for hotspots, don't include it in the report
+        file_scores.clear();
+    }
+
     let report = HealthReport {
         summary: HealthSummary {
             files_analyzed,
@@ -266,11 +283,17 @@ pub fn run_health(opts: &HealthOptions<'_>) -> ExitCode {
             functions_above_threshold: total_above_threshold,
             max_cyclomatic_threshold: max_cyclomatic,
             max_cognitive_threshold: max_cognitive,
-            files_scored,
-            average_maintainability,
+            files_scored: if opts.file_scores { files_scored } else { None },
+            average_maintainability: if opts.file_scores {
+                average_maintainability
+            } else {
+                None
+            },
         },
         findings,
         file_scores,
+        hotspots,
+        hotspot_summary,
     };
 
     let elapsed = start.elapsed();
@@ -287,6 +310,140 @@ pub fn run_health(opts: &HealthOptions<'_>) -> ExitCode {
     }
 
     ExitCode::SUCCESS
+}
+
+/// Compute hotspot entries by combining git churn data with file health scores.
+fn compute_hotspots(
+    opts: &HealthOptions<'_>,
+    config: &fallow_config::ResolvedConfig,
+    file_scores: &[FileHealthScore],
+    ignore_set: &globset::GlobSet,
+    ws_root: Option<&std::path::Path>,
+) -> (Vec<HotspotEntry>, Option<HotspotSummary>) {
+    use fallow_core::churn;
+
+    // Validate we're in a git repo
+    if !churn::is_git_repo(opts.root) {
+        eprintln!("Error: hotspot analysis requires a git repository");
+        return (Vec::new(), None);
+    }
+
+    // Parse --since (default: 6m), with control character validation
+    let since_input = opts.since.unwrap_or("6m");
+    if let Err(e) = crate::validate::validate_no_control_chars(since_input, "--since") {
+        eprintln!("Error: {e}");
+        return (Vec::new(), None);
+    }
+    let since = match churn::parse_since(since_input) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Error: invalid --since: {e}");
+            return (Vec::new(), None);
+        }
+    };
+
+    // Get churn data from git
+    let Some(churn_result) = churn::analyze_churn(opts.root, &since) else {
+        return (Vec::new(), None);
+    };
+
+    // Warn about shallow clones (read from churn result to avoid redundant git call)
+    let shallow_clone = churn_result.shallow_clone;
+    if shallow_clone && !opts.quiet {
+        eprintln!(
+            "Warning: shallow clone detected. Hotspot analysis may be incomplete. \
+             Use `git fetch --unshallow` for full history."
+        );
+    }
+
+    let min_commits = opts.min_commits.unwrap_or(3);
+
+    // Find normalization maxima from all eligible files
+    let mut max_weighted: f64 = 0.0;
+    let mut max_density: f64 = 0.0;
+    for score in file_scores {
+        if let Some(churn) = churn_result.files.get(&score.path)
+            && churn.commits >= min_commits
+        {
+            max_weighted = max_weighted.max(churn.weighted_commits);
+            max_density = max_density.max(score.complexity_density);
+        }
+    }
+
+    // Build hotspot entries
+    let mut hotspot_entries = Vec::new();
+    let mut files_excluded: usize = 0;
+
+    for score in file_scores {
+        // Apply workspace filter
+        if let Some(ws) = ws_root
+            && !score.path.starts_with(ws)
+        {
+            continue;
+        }
+        // Apply ignore patterns
+        if !ignore_set.is_empty() {
+            let relative = score.path.strip_prefix(&config.root).unwrap_or(&score.path);
+            if ignore_set.is_match(relative) {
+                continue;
+            }
+        }
+
+        if let Some(churn) = churn_result.files.get(&score.path) {
+            if churn.commits < min_commits {
+                files_excluded += 1;
+                continue;
+            }
+
+            let norm_churn = if max_weighted > 0.0 {
+                churn.weighted_commits / max_weighted
+            } else {
+                0.0
+            };
+            let norm_complexity = if max_density > 0.0 {
+                score.complexity_density / max_density
+            } else {
+                0.0
+            };
+            let hotspot_score = (norm_churn * norm_complexity * 100.0 * 10.0).round() / 10.0;
+
+            hotspot_entries.push(HotspotEntry {
+                path: score.path.clone(),
+                score: hotspot_score,
+                commits: churn.commits,
+                weighted_commits: churn.weighted_commits,
+                lines_added: churn.lines_added,
+                lines_deleted: churn.lines_deleted,
+                complexity_density: score.complexity_density,
+                fan_in: score.fan_in,
+                trend: churn.trend,
+            });
+        }
+    }
+
+    // Sort by score descending (highest risk first)
+    hotspot_entries.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    // Compute summary BEFORE --top truncation
+    let files_analyzed = hotspot_entries.len();
+    let summary = HotspotSummary {
+        since: since.display,
+        min_commits,
+        files_analyzed,
+        files_excluded,
+        shallow_clone,
+    };
+
+    // Apply --top to hotspots
+    if let Some(top) = opts.top {
+        hotspot_entries.truncate(top);
+    }
+
+    (hotspot_entries, Some(summary))
 }
 
 /// Compute per-file health scores by running the full analysis pipeline.

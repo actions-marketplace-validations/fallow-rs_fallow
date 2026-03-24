@@ -20,11 +20,9 @@ Tested against real-world projects spanning Next.js, Nuxt, NestJS, React Native/
 
 ### Smarter health analysis
 
-`fallow health` currently reports function complexity. That's useful but incomplete — a complex function that hasn't changed in two years is stable legacy code, not a priority. The next step is combining complexity with git change history to surface **hotspots**: the files that are complex, changing frequently, and most likely to cause problems.
+`fallow health` now ships function complexity, per-file maintainability scores (`--file-scores`), and **hotspot analysis** (`--hotspots`) — combining git churn with complexity to surface the files that are complex, changing frequently, and most likely to cause problems. `fallow health --hotspots` answers "where should my team spend its refactoring budget?" with data, not gut feel.
 
-The goal: `fallow health --hotspots` answers "where should my team spend its refactoring budget?" with data, not gut feel.
-
-File-level health scores are now available via `fallow health --file-scores` — maintainability index combining complexity density, dead code ratio, and coupling (fan-out). Beyond that: codebase-wide vital signs with trend tracking over time, and regression detection in CI.
+Beyond that: codebase-wide vital signs with trend tracking over time, and regression detection in CI.
 
 ### Dependency risk
 

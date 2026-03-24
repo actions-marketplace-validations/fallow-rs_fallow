@@ -270,6 +270,20 @@ enum Command {
         /// apply to complexity findings only, not file scores.
         #[arg(long)]
         file_scores: bool,
+
+        /// Identify hotspots: files that are both complex and frequently changing.
+        /// Combines git churn history with complexity data. Requires a git repository.
+        #[arg(long)]
+        hotspots: bool,
+
+        /// Git history window for hotspot analysis (default: 6m).
+        /// Accepts durations (6m, 90d, 1y, 2w) or ISO dates (2025-06-01).
+        #[arg(long, value_name = "DURATION")]
+        since: Option<String>,
+
+        /// Minimum number of commits for a file to be included in hotspot ranking (default: 3)
+        #[arg(long, value_name = "N")]
+        min_commits: Option<u32>,
     },
 
     /// Dump the CLI interface as machine-readable JSON for agent introspection
@@ -722,6 +736,9 @@ fn main() -> ExitCode {
             top,
             sort,
             file_scores,
+            hotspots,
+            since,
+            min_commits,
         } => health::run_health(&HealthOptions {
             root: &root,
             config_path: &cli.config,
@@ -739,6 +756,9 @@ fn main() -> ExitCode {
             baseline: cli.baseline.as_deref(),
             save_baseline: cli.save_baseline.as_deref(),
             file_scores,
+            hotspots,
+            since: since.as_deref(),
+            min_commits,
         }),
         Command::Schema => unreachable!("handled above"),
         Command::Migrate {

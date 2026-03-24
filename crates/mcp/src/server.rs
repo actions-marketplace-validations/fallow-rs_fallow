@@ -119,6 +119,15 @@ pub struct HealthParams {
     /// Compute per-file health scores (fan-in, fan-out, dead code ratio, maintainability index).
     pub file_scores: Option<bool>,
 
+    /// Identify hotspots: files that are both complex and frequently changing.
+    pub hotspots: Option<bool>,
+
+    /// Git history window for hotspot analysis. Accepts durations (6m, 90d, 1y) or ISO dates.
+    pub since: Option<String>,
+
+    /// Minimum commits for a file to appear in hotspot ranking.
+    pub min_commits: Option<u32>,
+
     /// Scope output to a single workspace package.
     pub workspace: Option<String>,
 
@@ -388,6 +397,15 @@ fn build_health_args(params: &HealthParams) -> Vec<String> {
     if params.file_scores == Some(true) {
         args.push("--file-scores".to_string());
     }
+    if params.hotspots == Some(true) {
+        args.push("--hotspots".to_string());
+    }
+    if let Some(ref since) = params.since {
+        args.extend(["--since".to_string(), since.clone()]);
+    }
+    if let Some(min_commits) = params.min_commits {
+        args.extend(["--min-commits".to_string(), min_commits.to_string()]);
+    }
     if let Some(ref workspace) = params.workspace {
         args.extend(["--workspace".to_string(), workspace.clone()]);
     }
@@ -470,7 +488,7 @@ impl FallowMcp {
     }
 
     #[tool(
-        description = "Check code health metrics (cyclomatic and cognitive complexity) for functions in the project. Returns structured JSON with complexity scores per function, sorted by severity. Set file_scores=true for per-file maintainability index (fan-in, fan-out, dead code ratio, complexity density). Useful for identifying hard-to-maintain code.",
+        description = "Check code health metrics (cyclomatic and cognitive complexity) for functions in the project. Returns structured JSON with complexity scores per function, sorted by severity. Set file_scores=true for per-file maintainability index (fan-in, fan-out, dead code ratio, complexity density). Set hotspots=true to identify files that are both complex and frequently changing (combines git churn with complexity). Useful for identifying hard-to-maintain code and prioritizing refactoring.",
         annotations(read_only_hint = true, open_world_hint = true)
     )]
     async fn check_health(
@@ -1185,6 +1203,9 @@ mod tests {
             sort: None,
             changed_since: None,
             file_scores: None,
+            hotspots: None,
+            since: None,
+            min_commits: None,
             production: None,
             workspace: None,
         };
@@ -1202,6 +1223,9 @@ mod tests {
             sort: Some("cognitive".to_string()),
             changed_since: Some("develop".to_string()),
             file_scores: Some(true),
+            hotspots: Some(true),
+            since: Some("6m".to_string()),
+            min_commits: Some(5),
             workspace: Some("packages/ui".to_string()),
             production: Some(true),
         };
@@ -1226,6 +1250,11 @@ mod tests {
                 "--changed-since",
                 "develop",
                 "--file-scores",
+                "--hotspots",
+                "--since",
+                "6m",
+                "--min-commits",
+                "5",
                 "--workspace",
                 "packages/ui",
                 "--production",
@@ -1243,6 +1272,9 @@ mod tests {
             sort: Some("cyclomatic".to_string()),
             changed_since: None,
             file_scores: None,
+            hotspots: None,
+            since: None,
+            min_commits: None,
             workspace: None,
             production: None,
         };
@@ -1319,6 +1351,9 @@ mod tests {
             sort: None,
             changed_since: None,
             file_scores: None,
+            hotspots: None,
+            since: None,
+            min_commits: None,
             workspace: None,
             production: None,
         });
@@ -1407,6 +1442,9 @@ mod tests {
             sort: None,
             changed_since: None,
             file_scores: None,
+            hotspots: None,
+            since: None,
+            min_commits: None,
             workspace: None,
             production: None,
         });
@@ -1604,6 +1642,9 @@ mod tests {
             sort: None,
             changed_since: None,
             file_scores: None,
+            hotspots: None,
+            since: None,
+            min_commits: None,
             workspace: None,
             production: None,
         };
@@ -1622,6 +1663,9 @@ mod tests {
             sort: None,
             changed_since: None,
             file_scores: Some(true),
+            hotspots: None,
+            since: None,
+            min_commits: None,
             production: None,
             workspace: None,
         };

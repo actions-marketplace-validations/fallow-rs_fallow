@@ -96,6 +96,15 @@
           "type": "array",
           "description": "Per-file health scores. Only present when --file-scores is used. Sorted by maintainability_index ascending (worst first). Zero-function files (barrels) are excluded by default.",
           "items": { "$ref": "#/definitions/FileHealthScore" }
+        },
+        "hotspots": {
+          "type": "array",
+          "description": "Hotspot entries combining git churn with complexity. Only present when --hotspots is used. Sorted by score descending (highest risk first).",
+          "items": { "$ref": "#/definitions/HotspotEntry" }
+        },
+        "hotspot_summary": {
+          "$ref": "#/definitions/HotspotSummary",
+          "description": "Hotspot analysis summary. Only present when --hotspots is used."
         }
       }
     },
@@ -251,6 +260,79 @@
         "lines": {
           "type": "integer",
           "description": "Total lines of code in the file."
+        }
+      }
+    },
+
+    "HotspotEntry": {
+      "type": "object",
+      "required": ["path", "score", "commits", "weighted_commits", "lines_added", "lines_deleted", "complexity_density", "fan_in", "trend"],
+      "description": "A hotspot: a file that is both complex and frequently changing. Score = normalized_churn × normalized_complexity × 100 (0–100, higher = riskier).",
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "File path (relative to project root)."
+        },
+        "score": {
+          "type": "number",
+          "description": "Hotspot score (0–100). Higher means more risk.",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "commits": {
+          "type": "integer",
+          "description": "Number of commits touching this file in the analysis window."
+        },
+        "weighted_commits": {
+          "type": "number",
+          "description": "Recency-weighted commit count (exponential decay, half-life 90 days)."
+        },
+        "lines_added": {
+          "type": "integer",
+          "description": "Total lines added across all commits in the window."
+        },
+        "lines_deleted": {
+          "type": "integer",
+          "description": "Total lines deleted across all commits in the window."
+        },
+        "complexity_density": {
+          "type": "number",
+          "description": "Total cyclomatic complexity / lines of code."
+        },
+        "fan_in": {
+          "type": "integer",
+          "description": "Number of files that import this file (blast radius)."
+        },
+        "trend": {
+          "type": "string",
+          "enum": ["accelerating", "stable", "cooling"],
+          "description": "Churn trend: accelerating (recent > 1.5× older), stable, or cooling (recent < 0.67× older)."
+        }
+      }
+    },
+    "HotspotSummary": {
+      "type": "object",
+      "required": ["since", "min_commits", "files_analyzed", "files_excluded", "shallow_clone"],
+      "properties": {
+        "since": {
+          "type": "string",
+          "description": "Analysis window display string (e.g., '6 months')."
+        },
+        "min_commits": {
+          "type": "integer",
+          "description": "Minimum commits threshold."
+        },
+        "files_analyzed": {
+          "type": "integer",
+          "description": "Number of files with churn data meeting the threshold."
+        },
+        "files_excluded": {
+          "type": "integer",
+          "description": "Number of files excluded (below min_commits)."
+        },
+        "shallow_clone": {
+          "type": "boolean",
+          "description": "Whether the repository is a shallow clone."
         }
       }
     },

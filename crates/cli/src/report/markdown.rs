@@ -362,7 +362,7 @@ pub fn build_health_markdown(report: &crate::health_types::HealthReport, root: &
 
     let mut out = String::new();
 
-    if report.findings.is_empty() && report.file_scores.is_empty() {
+    if report.findings.is_empty() && report.file_scores.is_empty() && report.hotspots.is_empty() {
         let _ = write!(
             out,
             "## Fallow: no functions exceed complexity thresholds\n\n\
@@ -455,6 +455,49 @@ pub fn build_health_markdown(report: &crate::health_types::HealthReport, root: &
 
         if let Some(avg) = report.summary.average_maintainability {
             let _ = write!(out, "\n**Average maintainability index:** {avg:.1}/100\n");
+        }
+    }
+
+    // Hotspot table
+    if !report.hotspots.is_empty() {
+        out.push('\n');
+        let header = if let Some(ref summary) = report.hotspot_summary {
+            format!(
+                "### Hotspots ({} files, since {})\n",
+                report.hotspots.len(),
+                summary.since,
+            )
+        } else {
+            format!("### Hotspots ({} files)\n", report.hotspots.len())
+        };
+        let _ = writeln!(out, "{header}");
+        out.push_str("| File | Score | Commits | Churn | Density | Fan-in | Trend |\n");
+        out.push_str("|:-----|:------|:--------|:------|:--------|:-------|:------|\n");
+
+        for entry in &report.hotspots {
+            let file_str = rel(&entry.path);
+            let _ = writeln!(
+                out,
+                "| `{file_str}` | {score:.1} | {commits} | {churn} | {density:.2} | {fi} | {trend} |",
+                score = entry.score,
+                commits = entry.commits,
+                churn = entry.lines_added + entry.lines_deleted,
+                density = entry.complexity_density,
+                fi = entry.fan_in,
+                trend = entry.trend,
+            );
+        }
+
+        if let Some(ref summary) = report.hotspot_summary
+            && summary.files_excluded > 0
+        {
+            let _ = write!(
+                out,
+                "\n*{} file{} excluded (< {} commits)*\n",
+                summary.files_excluded,
+                if summary.files_excluded == 1 { "" } else { "s" },
+                summary.min_commits,
+            );
         }
     }
 
@@ -867,6 +910,8 @@ mod tests {
                 average_maintainability: None,
             },
             file_scores: vec![],
+            hotspots: vec![],
+            hotspot_summary: None,
         };
         let md = build_health_markdown(&report, &root);
         assert!(md.contains("no functions exceed complexity thresholds"));
@@ -897,6 +942,8 @@ mod tests {
                 average_maintainability: None,
             },
             file_scores: vec![],
+            hotspots: vec![],
+            hotspot_summary: None,
         };
         let md = build_health_markdown(&report, &root);
         assert!(md.contains("## Fallow: 1 high complexity function\n"));
@@ -932,6 +979,8 @@ mod tests {
                 average_maintainability: None,
             },
             file_scores: vec![],
+            hotspots: vec![],
+            hotspot_summary: None,
         };
         let md = build_health_markdown(&report, &root);
         // Cyclomatic 15 is below threshold 20, no marker

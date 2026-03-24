@@ -11,9 +11,15 @@ pub struct HealthReport {
     pub findings: Vec<HealthFinding>,
     /// Summary statistics.
     pub summary: HealthSummary,
-    /// Per-file health scores (only populated with `--file-scores`).
+    /// Per-file health scores (only populated with `--file-scores` or `--hotspots`).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub file_scores: Vec<FileHealthScore>,
+    /// Hotspot entries (only populated with `--hotspots`).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub hotspots: Vec<HotspotEntry>,
+    /// Hotspot analysis summary (only set with `--hotspots`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hotspot_summary: Option<HotspotSummary>,
 }
 
 /// A single function that exceeds a complexity threshold.
@@ -113,4 +119,53 @@ pub struct FileHealthScore {
     pub function_count: usize,
     /// Total lines of code (from line_offsets).
     pub lines: u32,
+}
+
+/// A hotspot: a file that is both complex and frequently changing.
+///
+/// ## Score Formula
+///
+/// ```text
+/// normalized_churn = weighted_commits / max_weighted_commits   (0..1)
+/// normalized_complexity = complexity_density / max_density      (0..1)
+/// score = normalized_churn × normalized_complexity × 100       (0..100)
+/// ```
+///
+/// Score uses within-project max normalization. Higher score = higher risk.
+/// Fan-in is shown separately as "blast radius" — not baked into the score.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct HotspotEntry {
+    /// File path (absolute; stripped to relative in output).
+    pub path: std::path::PathBuf,
+    /// Hotspot score (0–100). Higher means more risk.
+    pub score: f64,
+    /// Number of commits in the analysis window.
+    pub commits: u32,
+    /// Recency-weighted commit count (exponential decay, half-life 90 days).
+    pub weighted_commits: f64,
+    /// Total lines added across all commits.
+    pub lines_added: u32,
+    /// Total lines deleted across all commits.
+    pub lines_deleted: u32,
+    /// Cyclomatic complexity / lines of code.
+    pub complexity_density: f64,
+    /// Number of files that import this file (blast radius).
+    pub fan_in: usize,
+    /// Churn trend: accelerating, stable, or cooling.
+    pub trend: fallow_core::churn::ChurnTrend,
+}
+
+/// Summary statistics for hotspot analysis.
+#[derive(Debug, serde::Serialize)]
+pub struct HotspotSummary {
+    /// Analysis window display string (e.g., "6 months").
+    pub since: String,
+    /// Minimum commits threshold.
+    pub min_commits: u32,
+    /// Number of files with churn data meeting the threshold.
+    pub files_analyzed: usize,
+    /// Number of files excluded (below min_commits).
+    pub files_excluded: usize,
+    /// Whether the repository is a shallow clone.
+    pub shallow_clone: bool,
 }

@@ -978,6 +978,8 @@ mod tests {
                 average_maintainability: None,
             },
             file_scores: vec![],
+            hotspots: vec![],
+            hotspot_summary: None,
         };
         let sarif = build_health_sarif(&report, &root);
         assert_eq!(sarif["version"], "2.1.0");
@@ -1013,6 +1015,8 @@ mod tests {
                 average_maintainability: None,
             },
             file_scores: vec![],
+            hotspots: vec![],
+            hotspot_summary: None,
         };
         let sarif = build_health_sarif(&report, &root);
         let entry = &sarif["runs"][0]["results"][0];
@@ -1057,6 +1061,8 @@ mod tests {
                 average_maintainability: None,
             },
             file_scores: vec![],
+            hotspots: vec![],
+            hotspot_summary: None,
         };
         let sarif = build_health_sarif(&report, &root);
         let entry = &sarif["runs"][0]["results"][0];
@@ -1095,6 +1101,8 @@ mod tests {
                 average_maintainability: None,
             },
             file_scores: vec![],
+            hotspots: vec![],
+            hotspot_summary: None,
         };
         let sarif = build_health_sarif(&report, &root);
         let entry = &sarif["runs"][0]["results"][0];

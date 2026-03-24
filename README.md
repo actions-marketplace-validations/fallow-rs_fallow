@@ -98,10 +98,14 @@ fallow health --top 20                 # Show the 20 most complex functions
 fallow health --sort cognitive         # Sort by cognitive complexity
 fallow health --changed-since main     # Only analyze changed files
 fallow health --file-scores            # Per-file maintainability index (0–100)
+fallow health --hotspots               # Identify riskiest files (churn × complexity)
+fallow health --hotspots --since 3m    # Hotspots from the last 3 months
 fallow health --format json            # Machine-readable output
 ```
 
 `--file-scores` computes a per-file maintainability index combining complexity density, dead code ratio (value exports only, excluding types), and coupling (fan-out with logarithmic scaling). Barrel files are excluded by default. Formula: `100 - (complexity_density × 30) - (dead_code_ratio × 20) - min(ln(fan_out+1) × 4, 15)`, clamped to 0–100. Higher is better.
+
+`--hotspots` combines git churn with complexity to answer "where should we spend refactoring budget?" Score: `normalized_churn × normalized_complexity × 100` (0–100, higher = riskier). Churn uses recency-weighted commit count (half-life 90 days). Fan-in shown as "blast radius" column. Accepts `--since` (durations like `6m`/`90d`/`1y` or ISO dates, default 6 months) and `--min-commits` (default 3). Trend detection labels files as accelerating, stable, or cooling.
 
 ## Benchmarks
 

@@ -18,6 +18,15 @@ fn relative_path<'a>(path: &'a Path, root: &Path) -> &'a Path {
     path.strip_prefix(root).unwrap_or(path)
 }
 
+/// Split a path string into (directory, filename) for display.
+/// Directory includes the trailing `/`. If no directory, returns `("", filename)`.
+fn split_dir_filename(path: &str) -> (&str, &str) {
+    match path.rfind('/') {
+        Some(pos) => (&path[..=pos], &path[pos + 1..]),
+        None => ("", path),
+    }
+}
+
 /// Compute a SARIF-compatible relative URI from an absolute path and project root.
 fn relative_uri(path: &Path, root: &Path) -> String {
     normalize_uri(&relative_path(path, root).display().to_string())
