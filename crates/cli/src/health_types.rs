@@ -11,6 +11,9 @@ pub struct HealthReport {
     pub findings: Vec<HealthFinding>,
     /// Summary statistics.
     pub summary: HealthSummary,
+    /// Per-file health scores (only populated with `--file-scores`).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub file_scores: Vec<FileHealthScore>,
 }
 
 /// A single function that exceeds a complexity threshold.
@@ -59,4 +62,53 @@ pub struct HealthSummary {
     pub max_cyclomatic_threshold: u16,
     /// Configured cognitive threshold.
     pub max_cognitive_threshold: u16,
+    /// Number of files scored (only set with `--file-scores`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub files_scored: Option<usize>,
+    /// Average maintainability index across all scored files (only set with `--file-scores`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub average_maintainability: Option<f64>,
+}
+
+/// Per-file health score combining complexity, coupling, and dead code metrics.
+///
+/// ## Maintainability Index Formula
+///
+/// ```text
+/// maintainability = 100
+///     - (complexity_density × 30)
+///     - (dead_code_ratio × 20)
+///     - (fan_out × 0.5)
+/// ```
+///
+/// Clamped to \[0, 100\]. Higher is better.
+///
+/// - **complexity_density**: total cyclomatic complexity / lines of code
+/// - **dead_code_ratio**: fraction of exports with zero references (0.0–1.0)
+/// - **fan_out**: number of files this file directly imports
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FileHealthScore {
+    /// File path (absolute; stripped to relative in output).
+    pub path: std::path::PathBuf,
+    /// Number of files that import this file.
+    pub fan_in: usize,
+    /// Number of files this file imports.
+    pub fan_out: usize,
+    /// Fraction of exports with zero references (0.0–1.0). Files with no exports get 0.0.
+    /// Numerator: exports reported as unused by the analyzer (respects `@public`, suppression
+    /// comments, and rule severity). Denominator: total exports in the graph (all declared exports).
+    /// Suppressed-but-dead exports lower the ratio, making it a conservative estimate.
+    pub dead_code_ratio: f64,
+    /// Total cyclomatic complexity / lines of code.
+    pub complexity_density: f64,
+    /// Weighted composite score (0–100, higher is better).
+    pub maintainability_index: f64,
+    /// Sum of cyclomatic complexity across all functions.
+    pub total_cyclomatic: u32,
+    /// Sum of cognitive complexity across all functions.
+    pub total_cognitive: u32,
+    /// Number of functions in this file.
+    pub function_count: usize,
+    /// Total lines of code (from line_offsets).
+    pub lines: u32,
 }

@@ -263,6 +263,11 @@ enum Command {
         /// Sort by: cyclomatic, cognitive, or lines
         #[arg(long, default_value = "cyclomatic")]
         sort: SortBy,
+
+        /// Compute per-file health scores (fan-in, fan-out, dead code ratio, maintainability index).
+        /// Requires full analysis pipeline (graph + dead code detection).
+        #[arg(long)]
+        file_scores: bool,
     },
 
     /// Dump the CLI interface as machine-readable JSON for agent introspection
@@ -714,6 +719,7 @@ fn main() -> ExitCode {
             max_cognitive,
             top,
             sort,
+            file_scores,
         } => health::run_health(&HealthOptions {
             root: &root,
             config_path: &cli.config,
@@ -730,6 +736,7 @@ fn main() -> ExitCode {
             workspace: cli.workspace.as_deref(),
             baseline: cli.baseline.as_deref(),
             save_baseline: cli.save_baseline.as_deref(),
+            file_scores,
         }),
         Command::Schema => unreachable!("handled above"),
         Command::Migrate {

@@ -362,7 +362,7 @@ pub fn build_health_markdown(report: &crate::health_types::HealthReport, root: &
 
     let mut out = String::new();
 
-    if report.findings.is_empty() {
+    if report.findings.is_empty() && report.file_scores.is_empty() {
         let _ = write!(
             out,
             "## Fallow: no functions exceed complexity thresholds\n\n\
@@ -374,58 +374,89 @@ pub fn build_health_markdown(report: &crate::health_types::HealthReport, root: &
         return out;
     }
 
-    let count = report.summary.functions_above_threshold;
-    let shown = report.findings.len();
-    if shown < count {
+    if !report.findings.is_empty() {
+        let count = report.summary.functions_above_threshold;
+        let shown = report.findings.len();
+        if shown < count {
+            let _ = write!(
+                out,
+                "## Fallow: {count} high complexity function{} ({shown} shown)\n\n",
+                if count == 1 { "" } else { "s" },
+            );
+        } else {
+            let _ = write!(
+                out,
+                "## Fallow: {count} high complexity function{}\n\n",
+                if count == 1 { "" } else { "s" },
+            );
+        }
+
+        out.push_str("| File | Function | Cyclomatic | Cognitive | Lines |\n");
+        out.push_str("|:-----|:---------|:-----------|:----------|:------|\n");
+
+        for finding in &report.findings {
+            let file_str = rel(&finding.path);
+            let cyc_marker = if finding.cyclomatic > report.summary.max_cyclomatic_threshold {
+                " **!**"
+            } else {
+                ""
+            };
+            let cog_marker = if finding.cognitive > report.summary.max_cognitive_threshold {
+                " **!**"
+            } else {
+                ""
+            };
+            let _ = writeln!(
+                out,
+                "| `{file_str}:{line}` | `{name}` | {cyc}{cyc_marker} | {cog}{cog_marker} | {lines} |",
+                line = finding.line,
+                name = escape_backticks(&finding.name),
+                cyc = finding.cyclomatic,
+                cog = finding.cognitive,
+                lines = finding.line_count,
+            );
+        }
+
+        let s = &report.summary;
         let _ = write!(
             out,
-            "## Fallow: {count} high complexity function{} ({shown} shown)\n\n",
-            if count == 1 { "" } else { "s" },
-        );
-    } else {
-        let _ = write!(
-            out,
-            "## Fallow: {count} high complexity function{}\n\n",
-            if count == 1 { "" } else { "s" },
+            "\n**{files}** files, **{funcs}** functions analyzed \
+             (thresholds: cyclomatic > {cyc}, cognitive > {cog})\n",
+            files = s.files_analyzed,
+            funcs = s.functions_analyzed,
+            cyc = s.max_cyclomatic_threshold,
+            cog = s.max_cognitive_threshold,
         );
     }
 
-    out.push_str("| File | Function | Cyclomatic | Cognitive | Lines |\n");
-    out.push_str("|:-----|:---------|:-----------|:----------|:------|\n");
-
-    for finding in &report.findings {
-        let file_str = rel(&finding.path);
-        let cyc_marker = if finding.cyclomatic > report.summary.max_cyclomatic_threshold {
-            " **!**"
-        } else {
-            ""
-        };
-        let cog_marker = if finding.cognitive > report.summary.max_cognitive_threshold {
-            " **!**"
-        } else {
-            ""
-        };
+    // File health scores table
+    if !report.file_scores.is_empty() {
+        out.push('\n');
         let _ = writeln!(
             out,
-            "| `{file_str}:{line}` | `{name}` | {cyc}{cyc_marker} | {cog}{cog_marker} | {lines} |",
-            line = finding.line,
-            name = escape_backticks(&finding.name),
-            cyc = finding.cyclomatic,
-            cog = finding.cognitive,
-            lines = finding.line_count,
+            "### File Health Scores ({} files)\n",
+            report.file_scores.len(),
         );
-    }
+        out.push_str("| File | MI | Fan-in | Fan-out | Dead Code | Density |\n");
+        out.push_str("|:-----|:---|:-------|:--------|:----------|:--------|\n");
 
-    let s = &report.summary;
-    let _ = write!(
-        out,
-        "\n**{files}** files, **{funcs}** functions analyzed \
-         (thresholds: cyclomatic > {cyc}, cognitive > {cog})\n",
-        files = s.files_analyzed,
-        funcs = s.functions_analyzed,
-        cyc = s.max_cyclomatic_threshold,
-        cog = s.max_cognitive_threshold,
-    );
+        for score in &report.file_scores {
+            let file_str = rel(&score.path);
+            let _ = writeln!(
+                out,
+                "| `{file_str}` | {mi:.1} | {fi} | {fo} | {dead:.0}% | {density:.2} |",
+                mi = score.maintainability_index,
+                fi = score.fan_in,
+                fo = score.fan_out,
+                dead = score.dead_code_ratio * 100.0,
+                density = score.complexity_density,
+            );
+        }
+
+        if let Some(avg) = report.summary.average_maintainability {
+            let _ = write!(out, "\n**Average maintainability index:** {avg:.1}/100\n");
+        }
+    }
 
     out
 }
@@ -832,7 +863,10 @@ mod tests {
                 functions_above_threshold: 0,
                 max_cyclomatic_threshold: 20,
                 max_cognitive_threshold: 15,
+                files_scored: None,
+                average_maintainability: None,
             },
+            file_scores: vec![],
         };
         let md = build_health_markdown(&report, &root);
         assert!(md.contains("no functions exceed complexity thresholds"));
@@ -859,7 +893,10 @@ mod tests {
                 functions_above_threshold: 1,
                 max_cyclomatic_threshold: 20,
                 max_cognitive_threshold: 15,
+                files_scored: None,
+                average_maintainability: None,
             },
+            file_scores: vec![],
         };
         let md = build_health_markdown(&report, &root);
         assert!(md.contains("## Fallow: 1 high complexity function\n"));
@@ -891,7 +928,10 @@ mod tests {
                 functions_above_threshold: 1,
                 max_cyclomatic_threshold: 20,
                 max_cognitive_threshold: 15,
+                files_scored: None,
+                average_maintainability: None,
             },
+            file_scores: vec![],
         };
         let md = build_health_markdown(&report, &root);
         // Cyclomatic 15 is below threshold 20, no marker

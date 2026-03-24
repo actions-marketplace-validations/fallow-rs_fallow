@@ -111,6 +111,18 @@ pub(super) fn print_health_compact(report: &crate::health_types::HealthReport, r
             relative, finding.line, finding.name, finding.cyclomatic, finding.cognitive,
         );
     }
+    for score in &report.file_scores {
+        let relative = normalize_uri(&relative_path(&score.path, root).display().to_string());
+        println!(
+            "file-score:{}:mi={:.1},fan_in={},fan_out={},dead={:.2},density={:.2}",
+            relative,
+            score.maintainability_index,
+            score.fan_in,
+            score.fan_out,
+            score.dead_code_ratio,
+            score.complexity_density,
+        );
+    }
 }
 
 pub(super) fn print_duplication_compact(report: &DuplicationReport, root: &Path) {

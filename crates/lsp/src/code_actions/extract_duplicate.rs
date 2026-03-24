@@ -540,12 +540,19 @@ mod tests {
         }
 
         let edits = extract_edits(&actions[0], &uri);
-        // 3 edits: insert + 2 replacements (sorted reverse)
+        // 3 edits: insert + 2 replacements (sorted reverse by start line)
         assert_eq!(edits.len(), 3);
 
-        // Verify reverse order: highest line first
-        assert!(edits[0].0 >= edits[1].0);
-        assert!(edits[1].0 >= edits[2].0);
+        // Exact line numbers in reverse order:
+        // 1. Replace instance at 1-based line 15 (0-based 14)
+        assert_eq!(edits[0].0, 14);
+        assert_eq!(edits[0].1, 15);
+        // 2. Replace instance at 1-based line 5 (0-based 4)
+        assert_eq!(edits[1].0, 4);
+        assert_eq!(edits[1].1, 5);
+        // 3. Insert function definition (line before first instance: 0-based 3)
+        assert_eq!(edits[2].0, 3);
+        assert_eq!(edits[2].1, 3);
     }
 
     #[test]
@@ -1003,8 +1010,8 @@ function b() {
                 "Original function b should remain:\n{result}"
             );
 
-            // Print result for visual inspection
-            eprintln!("=== Applied edit result ===\n{result}=== End ===");
+            // Verify result is non-empty (edit was applied)
+            assert!(!result.is_empty());
         }
     }
 
@@ -1100,11 +1107,8 @@ function b() {
                 "Should contain function call:\n{result}"
             );
 
-            // Print for visual inspection
-            eprintln!(
-                "=== Real fixture: applied edit ===\n{result}=== End ({} chars) ===",
-                result.len()
-            );
+            // Verify result is non-empty (edit was applied)
+            assert!(!result.is_empty());
         }
     }
 
@@ -1189,7 +1193,6 @@ export function fetchProducts() {
                 .unwrap();
 
             let result = apply_edits(source, edits);
-            eprintln!("=== Realistic scenario ===\n{result}=== End ===");
 
             // The import and fetchOrders should be untouched
             assert!(
@@ -1234,5 +1237,329 @@ export function fetchProducts() {
                 "Function body should NOT have 4-space indent:\n{result}"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // dedent_fragment unit tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn dedent_removes_common_indent_and_adds_two_spaces() {
+        let fragment = "    const x = 1;\n    const y = 2;";
+        let result = dedent_fragment(fragment);
+        assert_eq!(result, "  const x = 1;\n  const y = 2;");
+    }
+
+    #[test]
+    fn dedent_handles_mixed_indent_levels() {
+        let fragment = "    if (true) {\n        return 1;\n    }";
+        let result = dedent_fragment(fragment);
+        // Common indent is 4, so 4 removed from each line
+        assert_eq!(result, "  if (true) {\n      return 1;\n  }");
+    }
+
+    #[test]
+    fn dedent_skips_empty_lines_for_common_indent_calculation() {
+        let fragment = "    const x = 1;\n\n    const y = 2;";
+        let result = dedent_fragment(fragment);
+        // Empty line should become empty (no indent added), others get 2-space indent
+        assert_eq!(result, "  const x = 1;\n\n  const y = 2;");
+    }
+
+    #[test]
+    fn dedent_handles_no_indentation() {
+        let fragment = "const x = 1;\nconst y = 2;";
+        let result = dedent_fragment(fragment);
+        // Common indent is 0, so each line gets 2 spaces prepended
+        assert_eq!(result, "  const x = 1;\n  const y = 2;");
+    }
+
+    #[test]
+    fn dedent_handles_single_line() {
+        let fragment = "  return 42;";
+        let result = dedent_fragment(fragment);
+        assert_eq!(result, "  return 42;");
+    }
+
+    #[test]
+    fn dedent_handles_all_empty_lines() {
+        let fragment = "\n\n";
+        let result = dedent_fragment(fragment);
+        // Rust's .lines() yields ["", ""] for "\n\n" (no trailing empty element).
+        // Both are empty so they stay empty. Joined with "\n" => "\n".
+        assert_eq!(result, "\n");
+    }
+
+    #[test]
+    fn dedent_handles_empty_fragment() {
+        let result = dedent_fragment("");
+        assert_eq!(result, "");
+    }
+
+    // -----------------------------------------------------------------------
+    // find_insert_line unit tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn find_insert_line_stops_at_empty_line() {
+        let lines = vec!["function a() {", "  return 1;", "}", "", "  const x = 1;"];
+        // Searching backwards from line 4, should stop at empty line 3
+        assert_eq!(find_insert_line(4, &lines), 3);
+    }
+
+    #[test]
+    fn find_insert_line_stops_at_module_scope_line() {
+        let lines = vec!["const a = 1;", "  indented code", "  more indented"];
+        // Searching backwards from line 2, hits "  indented code" (starts with space),
+        // then hits "const a = 1;" (no leading space/tab) at line 0
+        assert_eq!(find_insert_line(2, &lines), 0);
+    }
+
+    #[test]
+    fn find_insert_line_returns_0_when_all_indented() {
+        let lines = vec!["  a", "  b", "  c"];
+        // Searching backwards from line 2: line 1 is indented, line 0 is indented
+        // Loop goes: line=1 (indented, continue), line=0 (indented, continue),
+        // loop ends (line > 0 is false). Returns 0.
+        assert_eq!(find_insert_line(2, &lines), 0);
+    }
+
+    #[test]
+    fn find_insert_line_at_line_0_returns_0() {
+        let lines = vec!["  something"];
+        // first_start_0based is 0, while loop condition is line > 0, so loop never runs
+        assert_eq!(find_insert_line(0, &lines), 0);
+    }
+
+    #[test]
+    fn find_insert_line_stops_at_line_starting_with_text() {
+        let lines = vec![
+            "import { x } from 'y';",
+            "export function foo() {",
+            "  return x;",
+            "}",
+            "  // indented comment",
+            "  const z = 1;",
+        ];
+        // From line 5, walk back: line 4 (indented), line 3 ("}" at col 0) => stop
+        assert_eq!(find_insert_line(5, &lines), 3);
+    }
+
+    // -----------------------------------------------------------------------
+    // sort_edits_reverse unit tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn sort_edits_reverse_orders_by_line_descending() {
+        let mut edits = vec![
+            TextEdit {
+                range: Range {
+                    start: Position {
+                        line: 2,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 3,
+                        character: 0,
+                    },
+                },
+                new_text: "b".to_string(),
+            },
+            TextEdit {
+                range: Range {
+                    start: Position {
+                        line: 10,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 11,
+                        character: 0,
+                    },
+                },
+                new_text: "c".to_string(),
+            },
+            TextEdit {
+                range: Range {
+                    start: Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 1,
+                        character: 0,
+                    },
+                },
+                new_text: "a".to_string(),
+            },
+        ];
+
+        sort_edits_reverse(&mut edits);
+        assert_eq!(edits[0].range.start.line, 10);
+        assert_eq!(edits[1].range.start.line, 2);
+        assert_eq!(edits[2].range.start.line, 0);
+    }
+
+    #[test]
+    fn sort_edits_reverse_uses_character_as_tiebreaker() {
+        let mut edits = vec![
+            TextEdit {
+                range: Range {
+                    start: Position {
+                        line: 5,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 5,
+                        character: 5,
+                    },
+                },
+                new_text: "first".to_string(),
+            },
+            TextEdit {
+                range: Range {
+                    start: Position {
+                        line: 5,
+                        character: 10,
+                    },
+                    end: Position {
+                        line: 5,
+                        character: 15,
+                    },
+                },
+                new_text: "second".to_string(),
+            },
+        ];
+
+        sort_edits_reverse(&mut edits);
+        // Higher character should come first
+        assert_eq!(edits[0].range.start.character, 10);
+        assert_eq!(edits[1].range.start.character, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // build_title unit tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn title_single_instance_no_cross_file() {
+        assert_eq!(build_title(1, false), "Extract duplicate into function");
+    }
+
+    #[test]
+    fn title_single_instance_with_cross_file() {
+        assert_eq!(
+            build_title(1, true),
+            "Extract duplicate into function (other files unchanged)"
+        );
+    }
+
+    #[test]
+    fn title_multiple_instances_no_cross_file() {
+        assert_eq!(
+            build_title(3, false),
+            "Extract duplicate into function (3 instances in this file)"
+        );
+    }
+
+    #[test]
+    fn title_multiple_instances_with_cross_file() {
+        assert_eq!(
+            build_title(2, true),
+            "Extract duplicate into function (2 instances in this file, others remain)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // build_diagnostic unit tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn diagnostic_has_correct_range_and_code() {
+        let root = test_root();
+        let file = root.join("a.ts");
+        let other = root.join("b.ts");
+
+        let inst = instance(&file, 10, 20, "some code");
+        let g = group(vec![inst.clone(), instance(&other, 5, 15, "some code")], 11);
+
+        let diag = build_diagnostic(&file, &g, &g.instances[0]);
+
+        assert_eq!(diag.range.start.line, 9); // 10 - 1
+        assert_eq!(diag.range.end.line, 19); // 20 - 1
+        assert_eq!(diag.severity, Some(DiagnosticSeverity::HINT));
+        assert_eq!(diag.source, Some("fallow".to_string()));
+        assert_eq!(
+            diag.code,
+            Some(NumberOrString::String("code-duplication".to_string()))
+        );
+        assert_eq!(
+            diag.message,
+            "Duplicated code block (11 lines, 2 instances)"
+        );
+    }
+
+    #[test]
+    fn diagnostic_related_info_excludes_self() {
+        let root = test_root();
+        let file = root.join("a.ts");
+        let other = root.join("b.ts");
+
+        let inst_a = instance(&file, 10, 20, "code");
+        let inst_b = instance(&other, 5, 15, "code");
+        let g = group(vec![inst_a, inst_b], 11);
+
+        let diag = build_diagnostic(&file, &g, &g.instances[0]);
+
+        // Related info should only contain the "other" instance, not self
+        let related = diag.related_information.unwrap();
+        assert_eq!(related.len(), 1);
+        assert_eq!(related[0].message, "Also duplicated here");
+        assert_eq!(related[0].location.range.start.line, 4); // 5 - 1
+    }
+
+    #[test]
+    fn diagnostic_no_related_info_for_single_instance() {
+        let root = test_root();
+        let file = root.join("a.ts");
+
+        let inst = instance(&file, 5, 10, "code");
+        let g = group(vec![inst], 6);
+
+        let diag = build_diagnostic(&file, &g, &g.instances[0]);
+
+        // Self is filtered out, leaving nothing
+        assert!(diag.related_information.is_none());
+    }
+
+    #[test]
+    fn diagnostic_multiple_related_instances() {
+        let root = test_root();
+        let a = root.join("a.ts");
+        let b = root.join("b.ts");
+        let c = root.join("c.ts");
+
+        let inst_a = instance(&a, 1, 5, "code");
+        let inst_b = instance(&b, 10, 15, "code");
+        let inst_c = instance(&c, 20, 25, "code");
+        let g = group(vec![inst_a, inst_b, inst_c], 5);
+
+        let diag = build_diagnostic(&a, &g, &g.instances[0]);
+
+        let related = diag.related_information.unwrap();
+        assert_eq!(related.len(), 2); // b and c, not a (self)
+    }
+
+    #[test]
+    fn diagnostic_line_1_maps_to_0_based_line_0() {
+        let root = test_root();
+        let file = root.join("a.ts");
+        let other = root.join("b.ts");
+
+        let inst = instance(&file, 1, 1, "x");
+        let g = group(vec![inst, instance(&other, 1, 1, "x")], 1);
+
+        let diag = build_diagnostic(&file, &g, &g.instances[0]);
+        assert_eq!(diag.range.start.line, 0); // 1.saturating_sub(1) = 0
+        assert_eq!(diag.range.end.line, 0);
     }
 }

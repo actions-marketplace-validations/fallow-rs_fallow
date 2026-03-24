@@ -466,6 +466,9 @@ pub(super) fn print_duplication_sarif(report: &DuplicationReport, root: &Path) -
 }
 
 // ── Health SARIF output ────────────────────────────────────────────
+// Note: file_scores are intentionally omitted from SARIF output.
+// SARIF is designed for diagnostic results (issues/findings), not metric tables.
+// File health scores are available in JSON, human, compact, and markdown formats.
 
 pub fn build_health_sarif(
     report: &crate::health_types::HealthReport,
@@ -971,7 +974,10 @@ mod tests {
                 functions_above_threshold: 0,
                 max_cyclomatic_threshold: 20,
                 max_cognitive_threshold: 15,
+                files_scored: None,
+                average_maintainability: None,
             },
+            file_scores: vec![],
         };
         let sarif = build_health_sarif(&report, &root);
         assert_eq!(sarif["version"], "2.1.0");
@@ -1003,7 +1009,10 @@ mod tests {
                 functions_above_threshold: 1,
                 max_cyclomatic_threshold: 20,
                 max_cognitive_threshold: 15,
+                files_scored: None,
+                average_maintainability: None,
             },
+            file_scores: vec![],
         };
         let sarif = build_health_sarif(&report, &root);
         let entry = &sarif["runs"][0]["results"][0];
@@ -1044,7 +1053,10 @@ mod tests {
                 functions_above_threshold: 1,
                 max_cyclomatic_threshold: 20,
                 max_cognitive_threshold: 15,
+                files_scored: None,
+                average_maintainability: None,
             },
+            file_scores: vec![],
         };
         let sarif = build_health_sarif(&report, &root);
         let entry = &sarif["runs"][0]["results"][0];
@@ -1079,7 +1091,10 @@ mod tests {
                 functions_above_threshold: 1,
                 max_cyclomatic_threshold: 20,
                 max_cognitive_threshold: 15,
+                files_scored: None,
+                average_maintainability: None,
             },
+            file_scores: vec![],
         };
         let sarif = build_health_sarif(&report, &root);
         let entry = &sarif["runs"][0]["results"][0];

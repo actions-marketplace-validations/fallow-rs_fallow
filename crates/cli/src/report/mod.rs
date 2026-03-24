@@ -35,7 +35,7 @@ pub fn normalize_uri(path_str: &str) -> String {
 }
 
 /// Severity level for human-readable output.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum Level {
     Warn,
     Info,
@@ -325,5 +325,107 @@ mod tests {
     #[test]
     fn severity_off_maps_to_level_info() {
         assert!(matches!(severity_to_level(Severity::Off), Level::Info));
+    }
+
+    // ── normalize_uri bracket encoding ──────────────────────────────
+
+    #[test]
+    fn normalize_uri_single_bracket_pair() {
+        assert_eq!(normalize_uri("app/[id]/page.tsx"), "app/%5Bid%5D/page.tsx");
+    }
+
+    #[test]
+    fn normalize_uri_catch_all_route() {
+        assert_eq!(
+            normalize_uri("app/[...slug]/page.tsx"),
+            "app/%5B...slug%5D/page.tsx"
+        );
+    }
+
+    #[test]
+    fn normalize_uri_optional_catch_all_route() {
+        assert_eq!(
+            normalize_uri("app/[[...slug]]/page.tsx"),
+            "app/%5B%5B...slug%5D%5D/page.tsx"
+        );
+    }
+
+    #[test]
+    fn normalize_uri_multiple_dynamic_segments() {
+        assert_eq!(
+            normalize_uri("app/[lang]/posts/[id]"),
+            "app/%5Blang%5D/posts/%5Bid%5D"
+        );
+    }
+
+    #[test]
+    fn normalize_uri_no_special_chars() {
+        let plain = "src/components/Button.tsx";
+        assert_eq!(normalize_uri(plain), plain);
+    }
+
+    #[test]
+    fn normalize_uri_only_backslashes() {
+        assert_eq!(normalize_uri("a\\b\\c"), "a/b/c");
+    }
+
+    // ── relative_path edge cases ────────────────────────────────────
+
+    #[test]
+    fn relative_path_identical_paths_returns_empty() {
+        let root = Path::new("/project");
+        assert_eq!(relative_path(root, root), Path::new(""));
+    }
+
+    #[test]
+    fn relative_path_partial_name_match_not_stripped() {
+        // "/project-two/src/a.ts" should NOT strip "/project" because
+        // "/project" is not a proper prefix of "/project-two".
+        let root = Path::new("/project");
+        let path = Path::new("/project-two/src/a.ts");
+        assert_eq!(relative_path(path, root), path);
+    }
+
+    // ── relative_uri edge cases ─────────────────────────────────────
+
+    #[test]
+    fn relative_uri_combines_stripping_and_encoding() {
+        let root = PathBuf::from("/project");
+        let path = root.join("src/app/[slug]/page.tsx");
+        let uri = relative_uri(&path, &root);
+        // Should both strip the prefix AND encode brackets.
+        assert_eq!(uri, "src/app/%5Bslug%5D/page.tsx");
+        assert!(!uri.starts_with('/'));
+    }
+
+    #[test]
+    fn relative_uri_at_root_file() {
+        let root = PathBuf::from("/project");
+        let path = root.join("index.ts");
+        assert_eq!(relative_uri(&path, &root), "index.ts");
+    }
+
+    // ── severity_to_level exhaustiveness ────────────────────────────
+
+    #[test]
+    fn severity_to_level_is_const_evaluable() {
+        // Verify the function can be used in const context.
+        const LEVEL_FROM_ERROR: Level = severity_to_level(Severity::Error);
+        const LEVEL_FROM_WARN: Level = severity_to_level(Severity::Warn);
+        const LEVEL_FROM_OFF: Level = severity_to_level(Severity::Off);
+        assert!(matches!(LEVEL_FROM_ERROR, Level::Error));
+        assert!(matches!(LEVEL_FROM_WARN, Level::Warn));
+        assert!(matches!(LEVEL_FROM_OFF, Level::Info));
+    }
+
+    // ── Level is Copy ───────────────────────────────────────────────
+
+    #[test]
+    fn level_is_copy() {
+        let level = severity_to_level(Severity::Error);
+        let copy = level;
+        // Both should still be usable (Copy semantics).
+        assert!(matches!(level, Level::Error));
+        assert!(matches!(copy, Level::Error));
     }
 }
