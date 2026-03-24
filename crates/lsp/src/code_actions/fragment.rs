@@ -80,4 +80,37 @@ mod tests {
         let result = dedent_fragment("");
         assert_eq!(result, "");
     }
+
+    #[test]
+    fn dedent_single_line_no_indent() {
+        let result = dedent_fragment("return 42;");
+        // Common indent is 0, so it gets 2-space prefix
+        assert_eq!(result, "  return 42;");
+    }
+
+    #[test]
+    fn dedent_mixed_tabs_and_spaces() {
+        let fragment = "\t  const x = 1;\n\t  const y = 2;";
+        let result = dedent_fragment(fragment);
+        // Common indent is 3 (tab + 2 spaces), stripped then 2-space prefix
+        assert_eq!(result, "  const x = 1;\n  const y = 2;");
+    }
+
+    #[test]
+    fn dedent_all_lines_same_indent_stripped_to_zero() {
+        let fragment = "      a();\n      b();\n      c();";
+        let result = dedent_fragment(fragment);
+        // Common indent is 6, all stripped to 0 then re-indented with 2 spaces
+        assert_eq!(result, "  a();\n  b();\n  c();");
+    }
+
+    #[test]
+    fn dedent_whitespace_only_lines_treated_as_blank() {
+        // Middle line has only spaces — should be treated like a blank line
+        let fragment = "    const x = 1;\n    \n    const y = 2;";
+        let result = dedent_fragment(fragment);
+        // The whitespace-only line (4 spaces) is shorter than common_indent after
+        // trim_start yields empty, so it becomes empty. Other lines get 2-space prefix.
+        assert_eq!(result, "  const x = 1;\n\n  const y = 2;");
+    }
 }
