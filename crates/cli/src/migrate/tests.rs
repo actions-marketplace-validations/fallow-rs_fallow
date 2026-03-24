@@ -915,3 +915,166 @@ fn jsonc_full_roundtrip_with_all_fields() {
     assert_eq!(config.ignore_patterns, vec!["build/**"]);
     assert_eq!(config.ignore_dependencies, vec!["react", "lodash"]);
 }
+
+// -- indent_json_value edge cases ----------------------------------------
+
+#[test]
+fn indent_json_value_empty_string() {
+    let result = indent_json_value("", 4);
+    assert_eq!(result, "");
+}
+
+#[test]
+fn indent_json_value_deeply_nested_object() {
+    let json = serde_json::to_string_pretty(&serde_json::json!({
+        "a": {
+            "b": {
+                "c": 1
+            }
+        }
+    }))
+    .unwrap();
+    let result = indent_json_value(&json, 2);
+    // First line stays as-is, continuation lines get 2-space indent
+    let lines: Vec<&str> = result.lines().collect();
+    assert_eq!(lines[0], "{");
+    assert!(lines[1].starts_with("  ")); // continuation indented
+    assert!(result.contains("\"c\": 1"));
+}
+
+#[test]
+fn indent_json_value_array() {
+    let json = "[\n  1,\n  2,\n  3\n]";
+    let result = indent_json_value(json, 4);
+    assert_eq!(result, "[\n      1,\n      2,\n      3\n    ]");
+}
+
+// -- generate_jsonc edge cases -------------------------------------------
+
+#[test]
+fn jsonc_output_empty_config() {
+    let result = MigrationResult {
+        config: serde_json::json!({}),
+        warnings: vec![],
+        sources: vec!["knip.json".to_string()],
+    };
+    let output = generate_jsonc(&result);
+    assert!(output.contains("$schema"));
+    assert!(output.contains("// Migrated from knip.json"));
+    // No config keys should appear (only $schema and comment)
+    assert!(!output.contains("\"entry\""));
+    assert!(!output.contains("\"rules\""));
+    assert!(!output.contains("\"ignorePatterns\""));
+    assert!(!output.contains("\"duplicates\""));
+    // Output should start with { and end with }
+    assert!(output.starts_with('{'));
+    assert!(output.trim_end().ends_with('}'));
+}
+
+#[test]
+fn jsonc_output_only_rules() {
+    let result = MigrationResult {
+        config: serde_json::json!({
+            "rules": {
+                "unused-files": "error",
+                "unused-exports": "off"
+            }
+        }),
+        warnings: vec![],
+        sources: vec!["knip.json".to_string()],
+    };
+    let output = generate_jsonc(&result);
+    // Should contain rules but no entry/ignorePatterns/duplicates
+    assert!(output.contains("\"rules\""));
+    assert!(!output.contains("\"entry\""));
+    assert!(!output.contains("\"ignorePatterns\""));
+    assert!(!output.contains("\"duplicates\""));
+    // Should be valid JSONC that round-trips
+    let mut stripped = String::new();
+    json_comments::StripComments::new(output.as_bytes())
+        .read_to_string(&mut stripped)
+        .unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&stripped).unwrap();
+    let rules = parsed.get("rules").unwrap().as_object().unwrap();
+    assert_eq!(rules.get("unused-files").unwrap(), "error");
+    assert_eq!(rules.get("unused-exports").unwrap(), "off");
+}
+
+// -- generate_toml edge cases --------------------------------------------
+
+#[test]
+fn toml_output_empty_config() {
+    let result = MigrationResult {
+        config: serde_json::json!({}),
+        warnings: vec![],
+        sources: vec!["knip.json".to_string()],
+    };
+    let output = generate_toml(&result);
+    assert!(output.contains("# Migrated from knip.json"));
+    // No sections should appear
+    assert!(!output.contains("[rules]"));
+    assert!(!output.contains("[duplicates]"));
+    assert!(!output.contains("entry"));
+    assert!(!output.contains("ignorePatterns"));
+}
+
+#[test]
+fn toml_output_only_ignore_patterns() {
+    let result = MigrationResult {
+        config: serde_json::json!({
+            "ignorePatterns": ["dist/**", "build/**"]
+        }),
+        warnings: vec![],
+        sources: vec!["knip.json".to_string()],
+    };
+    let output = generate_toml(&result);
+    assert!(output.contains("ignorePatterns = [\"dist/**\", \"build/**\"]"));
+    assert!(!output.contains("[rules]"));
+    assert!(!output.contains("[duplicates]"));
+    // Should parse as valid TOML
+    let config: fallow_config::FallowConfig = toml::from_str(&output).unwrap();
+    assert_eq!(config.ignore_patterns, vec!["dist/**", "build/**"]);
+}
+
+#[test]
+fn toml_output_only_ignore_dependencies() {
+    let result = MigrationResult {
+        config: serde_json::json!({
+            "ignoreDependencies": ["lodash", "react"]
+        }),
+        warnings: vec![],
+        sources: vec!["knip.json".to_string()],
+    };
+    let output = generate_toml(&result);
+    assert!(output.contains("ignoreDependencies = [\"lodash\", \"react\"]"));
+    assert!(!output.contains("[rules]"));
+    assert!(!output.contains("[duplicates]"));
+    let config: fallow_config::FallowConfig = toml::from_str(&output).unwrap();
+    assert_eq!(config.ignore_dependencies, vec!["lodash", "react"]);
+}
+
+// -- string_or_array additional edge cases -------------------------------
+
+#[test]
+fn string_or_array_with_empty_array() {
+    let val = serde_json::json!([]);
+    assert!(string_or_array(&val).is_empty());
+}
+
+#[test]
+fn string_or_array_with_null() {
+    let val = serde_json::json!(null);
+    assert!(string_or_array(&val).is_empty());
+}
+
+#[test]
+fn string_or_array_with_bool() {
+    let val = serde_json::json!(true);
+    assert!(string_or_array(&val).is_empty());
+}
+
+#[test]
+fn string_or_array_with_object() {
+    let val = serde_json::json!({"key": "value"});
+    assert!(string_or_array(&val).is_empty());
+}
