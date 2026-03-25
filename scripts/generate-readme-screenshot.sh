@@ -19,7 +19,7 @@ cat >"$tmp_script" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
 
-printf '\$ fallow check\n\n'
+printf '\$ fallow\n\n'
 
 printf '\033[33m●\033[0m \033[1;33mUnused files (3)\033[0m\n'
 printf '  src/legacy/oldUtils.ts\n'

@@ -17,7 +17,10 @@ fn analyze_args_minimal_produces_base_args() {
         issue_types: None,
     };
     let args = build_analyze_args(&params).unwrap();
-    assert_eq!(args, ["check", "--format", "json", "--quiet", "--explain"]);
+    assert_eq!(
+        args,
+        ["dead-code", "--format", "json", "--quiet", "--explain"]
+    );
 }
 
 #[test]
@@ -36,7 +39,7 @@ fn analyze_args_with_all_options() {
     assert_eq!(
         args,
         [
-            "check",
+            "dead-code",
             "--format",
             "json",
             "--quiet",
@@ -130,7 +133,10 @@ fn analyze_args_empty_issue_types_vec_produces_no_flags() {
         issue_types: Some(vec![]),
     };
     let args = build_analyze_args(&params).unwrap();
-    assert_eq!(args, ["check", "--format", "json", "--quiet", "--explain"]);
+    assert_eq!(
+        args,
+        ["dead-code", "--format", "json", "--quiet", "--explain"]
+    );
 }
 
 // ── Argument building: check_changed ──────────────────────────────
@@ -148,7 +154,7 @@ fn check_changed_args_includes_since_ref() {
     assert_eq!(
         args,
         [
-            "check",
+            "dead-code",
             "--format",
             "json",
             "--quiet",
@@ -172,7 +178,7 @@ fn check_changed_args_with_all_options() {
     assert_eq!(
         args,
         [
-            "check",
+            "dead-code",
             "--format",
             "json",
             "--quiet",
@@ -662,7 +668,7 @@ fn each_tool_uses_correct_subcommand() {
         issue_types: None,
     })
     .unwrap();
-    assert_eq!(analyze[0], "check");
+    assert_eq!(analyze[0], "dead-code");
 
     let changed = build_check_changed_args(CheckChangedParams {
         root: None,
@@ -671,7 +677,7 @@ fn each_tool_uses_correct_subcommand() {
         production: None,
         workspace: None,
     });
-    assert_eq!(changed[0], "check");
+    assert_eq!(changed[0], "dead-code");
 
     let dupes = build_find_dupes_args(&FindDupesParams {
         root: None,

@@ -41,7 +41,7 @@ cargo build --workspace
 cargo test --workspace
 cargo clippy --workspace -- -D warnings
 cargo fmt --all -- --check
-cargo run -- check              # Run analysis
+cargo run                       # Run all analyses (check + dupes + health)
 cargo run -- watch              # Watch mode
 cargo run -- fix --dry-run      # Auto-fix preview
 ```

@@ -10,8 +10,8 @@ use serde_json::{Value, json};
 
 const DOCS_BASE: &str = "https://docs.fallow.tools";
 
-/// Docs URL for the check command.
-pub const CHECK_DOCS: &str = "https://docs.fallow.tools/cli/check";
+/// Docs URL for the dead-code (check) command.
+pub const CHECK_DOCS: &str = "https://docs.fallow.tools/cli/dead-code";
 
 /// Docs URL for the health command.
 pub const HEALTH_DOCS: &str = "https://docs.fallow.tools/cli/health";

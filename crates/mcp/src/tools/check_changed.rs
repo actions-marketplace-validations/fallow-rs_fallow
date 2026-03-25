@@ -3,7 +3,7 @@ use crate::params::CheckChangedParams;
 /// Build CLI arguments for the `check_changed` tool.
 pub fn build_check_changed_args(params: CheckChangedParams) -> Vec<String> {
     let mut args = vec![
-        "check".to_string(),
+        "dead-code".to_string(),
         "--format".to_string(),
         "json".to_string(),
         "--quiet".to_string(),

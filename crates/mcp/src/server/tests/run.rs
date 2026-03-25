@@ -16,7 +16,7 @@ fn extract_text(result: &CallToolResult) -> &str {
 
 #[tokio::test]
 async fn run_fallow_missing_binary() {
-    let result = run_fallow("nonexistent-binary-12345", &["check".to_string()]).await;
+    let result = run_fallow("nonexistent-binary-12345", &["dead-code".to_string()]).await;
     assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(err.message.contains("nonexistent-binary-12345"));

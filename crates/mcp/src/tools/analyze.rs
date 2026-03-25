@@ -6,7 +6,7 @@ use super::ISSUE_TYPE_FLAGS;
 /// Returns `Err(message)` if an invalid issue type is provided.
 pub fn build_analyze_args(params: &AnalyzeParams) -> Result<Vec<String>, String> {
     let mut args = vec![
-        "check".to_string(),
+        "dead-code".to_string(),
         "--format".to_string(),
         "json".to_string(),
         "--quiet".to_string(),

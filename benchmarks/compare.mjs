@@ -106,7 +106,7 @@ function compareProject(name, dir) {
   console.log(`PROJECT: ${name}`);
   console.log(`${'='.repeat(60)}`);
 
-  const fr = run(fallowBin, ['check', '--quiet', '--format', 'json', '--no-cache'], dir);
+  const fr = run(fallowBin, ['dead-code', '--quiet', '--format', 'json', '--no-cache'], dir);
   const kr = run(knipBin, ['--reporter', 'json'], dir);
 
   if (fr.status === 2) { console.log(`  fallow ERROR: ${fr.stderr.slice(0, 200)}`); return null; }
