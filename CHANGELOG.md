@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.9.0] - 2026-03-25
+
+### Added
+- **Refactoring targets** (`fallow health --targets`): ranked, actionable recommendations that synthesize complexity, coupling, churn, and dead code signals into a prioritized list of files to refactor
+  - Seven recommendation rules evaluated in priority order: urgent churn+complexity, break circular dependency, split high-impact file, remove dead code, extract complex functions, reduce coupling
+  - Priority formula: `min(density,1)×30 + hotspot×25 + dead_code×20 + fan_in_norm×15 + fan_out_norm×10`
+  - Contributing factors with raw `value` and `threshold` for programmatic use
+  - **Effort estimation** (`low`/`medium`/`high`) based on file size, function count, and fan-in — shown in all output formats
+  - **Evidence linking**: structured data for AI agents — unused export names, complex function names with line numbers, cycle member paths
+  - **Baseline support**: `--save-baseline` / `--baseline` now includes refactoring targets for tracking progress over time
+  - All five output formats: human (category · effort labels), JSON (with evidence), compact, markdown (Effort column), SARIF (warning-level findings)
+  - MCP server: `targets` parameter on `check_health` tool
+- VS Code extension overhaul: LSP notifications, walkthrough, diagnostics improvements, tree view enhancements
+- Clickable documentation links in all diagnostics + JSON schema for config
+- ~100 unit tests across 6 crates
+
+### Fixed
+- 11 bug fixes across parser, analysis, baseline, LSP, and performance
+- Empty tree views now show "no issues found" after analysis
+- `hasAnalyzed` context set from CLI analysis to clear welcome views
+- Removed buggy extract duplicate code action
+- Qualified `Span` in benchmark to resolve ambiguous import
+
 ## [1.8.1] - 2026-03-25
 
 ### Added
@@ -352,7 +375,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `--changed-since` and `--fail-on-issues` for CI
 - Cross-workspace resolution for npm/yarn/pnpm workspaces
 
-[Unreleased]: https://github.com/fallow-rs/fallow/compare/v1.8.1...HEAD
+[Unreleased]: https://github.com/fallow-rs/fallow/compare/v1.9.0...HEAD
+[1.9.0]: https://github.com/fallow-rs/fallow/compare/v1.8.1...v1.9.0
 [1.8.1]: https://github.com/fallow-rs/fallow/compare/v1.8.0...v1.8.1
 [1.8.0]: https://github.com/fallow-rs/fallow/compare/v1.7.0...v1.8.0
 [1.7.0]: https://github.com/fallow-rs/fallow/compare/v1.6.1...v1.7.0
