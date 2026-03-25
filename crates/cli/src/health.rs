@@ -3,7 +3,7 @@ use std::time::Instant;
 
 use fallow_config::OutputFormat;
 
-use crate::baseline::{HealthBaselineData, filter_new_health_findings};
+use crate::baseline::{HealthBaselineData, filter_new_health_findings, filter_new_health_targets};
 use crate::check::{get_changed_files, resolve_workspace_filter};
 pub use crate::health_types::*;
 use crate::load_config;
@@ -170,35 +170,16 @@ pub fn run_health(opts: &HealthOptions<'_>) -> ExitCode {
         SortBy::Lines => findings.sort_by(|a, b| b.line_count.cmp(&a.line_count)),
     }
 
-    // Save baseline (before filtering, captures full state)
-    if let Some(save_path) = opts.save_baseline {
-        let baseline = HealthBaselineData::from_findings(&findings, &config.root);
-        match serde_json::to_string_pretty(&baseline) {
-            Ok(json) => {
-                if let Err(e) = std::fs::write(save_path, json) {
-                    eprintln!("Error: failed to save health baseline: {e}");
-                    return ExitCode::from(2);
-                }
-                if !opts.quiet {
-                    eprintln!("Saved health baseline to {}", save_path.display());
-                }
-            }
-            Err(e) => {
-                eprintln!("Error: failed to serialize health baseline: {e}");
-                return ExitCode::from(2);
-            }
-        }
-    }
-
     // Capture total above threshold before baseline filtering
     let total_above_threshold = findings.len();
 
-    // Filter against baseline
-    if let Some(load_path) = opts.baseline {
+    // Load baseline for filtering (save happens after targets are computed)
+    let loaded_baseline = if let Some(load_path) = opts.baseline {
         match std::fs::read_to_string(load_path) {
             Ok(json) => match serde_json::from_str::<HealthBaselineData>(&json) {
                 Ok(baseline) => {
                     findings = filter_new_health_findings(findings, &baseline, &config.root);
+                    Some(baseline)
                 }
                 Err(e) => {
                     eprintln!("Error: failed to parse health baseline: {e}");
@@ -210,7 +191,9 @@ pub fn run_health(opts: &HealthOptions<'_>) -> ExitCode {
                 return ExitCode::from(2);
             }
         }
-    }
+    } else {
+        None
+    };
 
     // Apply --top limit
     if let Some(top) = opts.top {
@@ -255,6 +238,8 @@ pub fn run_health(opts: &HealthOptions<'_>) -> ExitCode {
                     output.top_complex_fns,
                     output.entry_points,
                     output.value_export_counts,
+                    output.unused_export_names,
+                    output.cycle_members,
                 );
                 (output.scores, Some(total_scored), avg, Some(aux))
             }
@@ -283,16 +268,23 @@ pub fn run_health(opts: &HealthOptions<'_>) -> ExitCode {
             ref top_complex_fns,
             ref entry_points,
             ref value_export_counts,
+            ref unused_export_names,
+            ref cycle_members,
         )) = score_aux
         {
-            let mut tgts = compute_refactoring_targets(
-                &file_scores,
+            let target_aux = TargetAuxData {
                 circular_files,
                 top_complex_fns,
                 entry_points,
                 value_export_counts,
-                &hotspots,
-            );
+                unused_export_names,
+                cycle_members,
+            };
+            let mut tgts = compute_refactoring_targets(&file_scores, &target_aux, &hotspots);
+            // Filter targets against baseline (before --top truncation)
+            if let Some(ref baseline) = loaded_baseline {
+                tgts = filter_new_health_targets(tgts, baseline, &config.root);
+            }
             if let Some(top) = opts.top {
                 tgts.truncate(top);
             }
@@ -303,6 +295,26 @@ pub fn run_health(opts: &HealthOptions<'_>) -> ExitCode {
     } else {
         Vec::new()
     };
+
+    // Save baseline (after targets are computed, captures full state)
+    if let Some(save_path) = opts.save_baseline {
+        let baseline = HealthBaselineData::from_findings(&findings, &targets, &config.root);
+        match serde_json::to_string_pretty(&baseline) {
+            Ok(json) => {
+                if let Err(e) = std::fs::write(save_path, json) {
+                    eprintln!("Error: failed to save health baseline: {e}");
+                    return ExitCode::from(2);
+                }
+                if !opts.quiet {
+                    eprintln!("Saved health baseline to {}", save_path.display());
+                }
+            }
+            Err(e) => {
+                eprintln!("Error: failed to serialize health baseline: {e}");
+                return ExitCode::from(2);
+            }
+        }
+    }
 
     // Apply --top to file scores (after hotspot and target computation which use the full list)
     if opts.file_scores {
@@ -628,12 +640,16 @@ struct FileScoreOutput {
     scores: Vec<FileHealthScore>,
     /// Files participating in circular dependencies (absolute paths).
     circular_files: rustc_hash::FxHashSet<std::path::PathBuf>,
-    /// Top 3 functions by cognitive complexity per file (name, cognitive score).
-    top_complex_fns: rustc_hash::FxHashMap<std::path::PathBuf, Vec<(String, u16)>>,
+    /// Top 3 functions by cognitive complexity per file (name, line, cognitive score).
+    top_complex_fns: rustc_hash::FxHashMap<std::path::PathBuf, Vec<(String, u32, u16)>>,
     /// Files that are configured entry points.
     entry_points: rustc_hash::FxHashSet<std::path::PathBuf>,
     /// Total number of value exports per file (for dead code gate: total_value_exports ≥ 3).
     value_export_counts: rustc_hash::FxHashMap<std::path::PathBuf, usize>,
+    /// Unused export names per file (for evidence linking).
+    unused_export_names: rustc_hash::FxHashMap<std::path::PathBuf, Vec<String>>,
+    /// Cycle members per file: maps each file to the other files in its cycle.
+    cycle_members: rustc_hash::FxHashMap<std::path::PathBuf, Vec<std::path::PathBuf>>,
 }
 
 /// Compute per-file health scores by running the full analysis pipeline.
@@ -659,7 +675,7 @@ fn compute_file_scores(
         .flat_map(|c| c.files.iter().cloned())
         .collect();
 
-    let mut top_complex_fns: rustc_hash::FxHashMap<std::path::PathBuf, Vec<(String, u16)>> =
+    let mut top_complex_fns: rustc_hash::FxHashMap<std::path::PathBuf, Vec<(String, u32, u16)>> =
         rustc_hash::FxHashMap::default();
     for module in modules {
         if module.complexity.is_empty() {
@@ -668,16 +684,40 @@ fn compute_file_scores(
         let Some(path) = file_paths.get(&module.file_id) else {
             continue;
         };
-        let mut funcs: Vec<(String, u16)> = module
+        let mut funcs: Vec<(String, u32, u16)> = module
             .complexity
             .iter()
-            .map(|f| (f.name.clone(), f.cognitive))
+            .map(|f| (f.name.clone(), f.line, f.cognitive))
             .collect();
-        funcs.sort_by(|a, b| b.1.cmp(&a.1));
+        funcs.sort_by(|a, b| b.2.cmp(&a.2));
         funcs.truncate(3);
-        if funcs[0].1 > 0 {
+        if funcs[0].2 > 0 {
             top_complex_fns.insert((*path).clone(), funcs);
         }
+    }
+
+    // Build cycle membership map: each file → list of other files in its cycle
+    let mut cycle_members: rustc_hash::FxHashMap<std::path::PathBuf, Vec<std::path::PathBuf>> =
+        rustc_hash::FxHashMap::default();
+    for cycle in &results.circular_dependencies {
+        for file in &cycle.files {
+            let others: Vec<std::path::PathBuf> =
+                cycle.files.iter().filter(|f| *f != file).cloned().collect();
+            cycle_members
+                .entry(file.clone())
+                .or_default()
+                .extend(others);
+        }
+    }
+
+    // Build unused export names per file for evidence linking
+    let mut unused_export_names: rustc_hash::FxHashMap<std::path::PathBuf, Vec<String>> =
+        rustc_hash::FxHashMap::default();
+    for exp in &results.unused_exports {
+        unused_export_names
+            .entry(exp.path.clone())
+            .or_default()
+            .push(exp.export_name.clone());
     }
 
     let mut entry_points: rustc_hash::FxHashSet<std::path::PathBuf> =
@@ -730,6 +770,20 @@ fn compute_file_scores(
         // Track value export count for dead code gate
         let value_exports = node.exports.iter().filter(|e| !e.is_type_only).count();
         value_export_counts.insert((*path).clone(), value_exports);
+
+        // For fully-unused files, populate all export names as evidence
+        // (unused_exports only tracks individually-unused exports, not exports from unreachable files)
+        if unused_files.contains((*path).as_path()) && !unused_export_names.contains_key(*path) {
+            let names: Vec<String> = node
+                .exports
+                .iter()
+                .filter(|e| !e.is_type_only)
+                .map(|e| e.name.to_string())
+                .collect();
+            if !names.is_empty() {
+                unused_export_names.insert((*path).clone(), names);
+            }
+        }
 
         let dead_code_ratio = compute_dead_code_ratio(
             (*path).as_path(),
@@ -788,6 +842,8 @@ fn compute_file_scores(
         top_complex_fns,
         entry_points,
         value_export_counts,
+        unused_export_names,
+        cycle_members,
     })
 }
 
@@ -816,6 +872,16 @@ fn compute_target_priority(score: &FileHealthScore, hotspot_score: Option<f64>) 
     (priority.clamp(0.0, 100.0) * 10.0).round() / 10.0
 }
 
+/// Auxiliary data used by `compute_refactoring_targets` to generate evidence and apply rules.
+struct TargetAuxData<'a> {
+    circular_files: &'a rustc_hash::FxHashSet<std::path::PathBuf>,
+    top_complex_fns: &'a rustc_hash::FxHashMap<std::path::PathBuf, Vec<(String, u32, u16)>>,
+    entry_points: &'a rustc_hash::FxHashSet<std::path::PathBuf>,
+    value_export_counts: &'a rustc_hash::FxHashMap<std::path::PathBuf, usize>,
+    unused_export_names: &'a rustc_hash::FxHashMap<std::path::PathBuf, Vec<String>>,
+    cycle_members: &'a rustc_hash::FxHashMap<std::path::PathBuf, Vec<std::path::PathBuf>>,
+}
+
 /// Compute refactoring targets by applying rules to file scores and auxiliary data.
 ///
 /// Rules are evaluated in priority order; first match determines the category and
@@ -823,10 +889,7 @@ fn compute_target_priority(score: &FileHealthScore, hotspot_score: Option<f64>) 
 /// Files matching no rule are skipped.
 fn compute_refactoring_targets(
     file_scores: &[FileHealthScore],
-    circular_files: &rustc_hash::FxHashSet<std::path::PathBuf>,
-    top_complex_fns: &rustc_hash::FxHashMap<std::path::PathBuf, Vec<(String, u16)>>,
-    entry_points: &rustc_hash::FxHashSet<std::path::PathBuf>,
-    value_export_counts: &rustc_hash::FxHashMap<std::path::PathBuf, usize>,
+    aux: &TargetAuxData,
     hotspots: &[HotspotEntry],
 ) -> Vec<RefactoringTarget> {
     // Build hotspot lookup by path for O(1) access
@@ -838,10 +901,14 @@ fn compute_refactoring_targets(
     for score in file_scores {
         let hotspot = hotspot_map.get(score.path.as_path());
         let hotspot_score = hotspot.map(|h| h.score);
-        let is_circular = circular_files.contains(&score.path);
-        let is_entry = entry_points.contains(&score.path);
-        let top_fns = top_complex_fns.get(&score.path);
-        let value_exports = value_export_counts.get(&score.path).copied().unwrap_or(0);
+        let is_circular = aux.circular_files.contains(&score.path);
+        let is_entry = aux.entry_points.contains(&score.path);
+        let top_fns = aux.top_complex_fns.get(&score.path);
+        let value_exports = aux
+            .value_export_counts
+            .get(&score.path)
+            .copied()
+            .unwrap_or(0);
 
         // Collect all contributing factors
         let mut factors = Vec::new();
@@ -914,7 +981,7 @@ fn compute_refactoring_targets(
             });
         }
         if let Some(fns) = top_fns
-            && let Some((name, cog)) = fns.first()
+            && let Some((name, _, cog)) = fns.first()
             && *cog >= 30
         {
             factors.push(ContributingFactor {
@@ -945,13 +1012,23 @@ fn compute_refactoring_targets(
         };
 
         let priority = compute_target_priority(score, hotspot_score);
+        let effort = compute_effort_estimate(score);
+        let evidence = build_evidence(
+            &category,
+            &score.path,
+            aux.unused_export_names,
+            top_fns,
+            aux.cycle_members,
+        );
 
         targets.push(RefactoringTarget {
             path: score.path.clone(),
             priority,
             recommendation,
             category,
+            effort,
             factors,
+            evidence,
         });
     }
 
@@ -974,7 +1051,7 @@ fn try_match_rules(
     hotspot: Option<&HotspotEntry>,
     is_circular: bool,
     is_entry: bool,
-    top_fns: Option<&Vec<(String, u16)>>,
+    top_fns: Option<&Vec<(String, u32, u16)>>,
     value_exports: usize,
 ) -> Option<(RecommendationCategory, String)> {
     // Rule 1: Urgent churn + complexity
@@ -1028,16 +1105,16 @@ fn try_match_rules(
 
     // Rule 5: Extract complex functions (cognitive ≥ 30)
     if let Some(fns) = top_fns {
-        let high: Vec<&(String, u16)> = fns.iter().filter(|(_, cog)| *cog >= 30).collect();
+        let high: Vec<&(String, u32, u16)> = fns.iter().filter(|(_, _, cog)| *cog >= 30).collect();
         if !high.is_empty() {
             let desc = match high.len() {
                 1 => format!(
                     "Extract {} (cognitive: {}) into smaller functions",
-                    high[0].0, high[0].1
+                    high[0].0, high[0].2
                 ),
                 _ => format!(
                     "Extract {} (cognitive: {}) and {} (cognitive: {}) into smaller functions",
-                    high[0].0, high[0].1, high[1].0, high[1].1
+                    high[0].0, high[0].2, high[1].0, high[1].2
                 ),
             };
             return Some((RecommendationCategory::ExtractComplexFunctions, desc));
@@ -1064,6 +1141,92 @@ fn try_match_rules(
     }
 
     None
+}
+
+/// Compute effort estimate based on file size, function count, and fan-in.
+///
+/// - **Low**: `lines < 100 AND function_count <= 3 AND fan_in < 5`
+/// - **High**: `lines >= 500 OR fan_in >= 20 OR (function_count >= 15 AND complexity_density > 0.5)`
+/// - **Medium**: everything else
+fn compute_effort_estimate(score: &FileHealthScore) -> EffortEstimate {
+    if score.lines >= 500
+        || score.fan_in >= 20
+        || (score.function_count >= 15 && score.complexity_density > 0.5)
+    {
+        EffortEstimate::High
+    } else if score.lines < 100 && score.function_count <= 3 && score.fan_in < 5 {
+        EffortEstimate::Low
+    } else {
+        EffortEstimate::Medium
+    }
+}
+
+/// Build structured evidence for a refactoring target based on its category.
+fn build_evidence(
+    category: &RecommendationCategory,
+    path: &std::path::Path,
+    unused_export_names: &rustc_hash::FxHashMap<std::path::PathBuf, Vec<String>>,
+    top_fns: Option<&Vec<(String, u32, u16)>>,
+    cycle_members: &rustc_hash::FxHashMap<std::path::PathBuf, Vec<std::path::PathBuf>>,
+) -> Option<TargetEvidence> {
+    match category {
+        RecommendationCategory::RemoveDeadCode => {
+            let exports = unused_export_names.get(path).cloned().unwrap_or_default();
+            if exports.is_empty() {
+                None
+            } else {
+                Some(TargetEvidence {
+                    unused_exports: exports,
+                    complex_functions: vec![],
+                    cycle_path: vec![],
+                })
+            }
+        }
+        RecommendationCategory::ExtractComplexFunctions => {
+            let functions = top_fns
+                .map(|fns| {
+                    fns.iter()
+                        .filter(|(_, _, cog)| *cog >= 30)
+                        .map(|(name, line, cog)| EvidenceFunction {
+                            name: name.clone(),
+                            line: *line,
+                            cognitive: *cog,
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if functions.is_empty() {
+                None
+            } else {
+                Some(TargetEvidence {
+                    unused_exports: vec![],
+                    complex_functions: functions,
+                    cycle_path: vec![],
+                })
+            }
+        }
+        RecommendationCategory::BreakCircularDependency => {
+            let members = cycle_members
+                .get(path)
+                .map(|files| {
+                    files
+                        .iter()
+                        .map(|f| f.to_string_lossy().into_owned())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if members.is_empty() {
+                None
+            } else {
+                Some(TargetEvidence {
+                    unused_exports: vec![],
+                    complex_functions: vec![],
+                    cycle_path: members,
+                })
+            }
+        }
+        _ => None,
+    }
 }
 
 /// Compute the maintainability index for a single file.
@@ -1779,7 +1942,7 @@ mod tests {
     #[test]
     fn rule_extract_complex_functions() {
         let score = make_score(|_| {});
-        let fns = vec![("handleSubmit".to_string(), 35u16)];
+        let fns = vec![("handleSubmit".to_string(), 10u32, 35u16)];
         let result = try_match_rules(&score, None, false, false, Some(&fns), 0);
         assert!(result.is_some());
         let (cat, rec) = result.unwrap();

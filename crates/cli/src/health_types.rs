@@ -233,6 +233,57 @@ pub struct ContributingFactor {
 /// All inputs clamped to \[0, 1\] so each weight is a true percentage share.
 /// Clamped to \[0, 100\]. Higher is more urgent. Does not use the maintainability
 /// index to avoid double-counting (MI already incorporates density and dead code).
+/// Effort estimate for a refactoring target.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EffortEstimate {
+    /// Small file, few functions, low fan-in — quick to address.
+    Low,
+    /// Moderate size or coupling — needs planning.
+    Medium,
+    /// Large file, many functions, or high fan-in — significant effort.
+    High,
+}
+
+impl EffortEstimate {
+    /// Human-readable label for terminal output.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
+}
+
+/// Evidence linking a target back to specific analysis data.
+///
+/// Provides enough detail for an AI agent to act on a recommendation
+/// without a second tool call.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TargetEvidence {
+    /// Names of unused exports (populated for `RemoveDeadCode` targets).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub unused_exports: Vec<String>,
+    /// Complex functions with line numbers and cognitive scores (populated for `ExtractComplexFunctions`).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub complex_functions: Vec<EvidenceFunction>,
+    /// Files forming the import cycle (populated for `BreakCircularDependency` targets).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub cycle_path: Vec<String>,
+}
+
+/// A function referenced in target evidence.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct EvidenceFunction {
+    /// Function name.
+    pub name: String,
+    /// 1-based line number.
+    pub line: u32,
+    /// Cognitive complexity score.
+    pub cognitive: u16,
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct RefactoringTarget {
     /// Absolute file path (stripped to relative in output).
@@ -243,9 +294,14 @@ pub struct RefactoringTarget {
     pub recommendation: String,
     /// Recommendation category for tooling/filtering.
     pub category: RecommendationCategory,
+    /// Estimated effort to address this target.
+    pub effort: EffortEstimate,
     /// Which metric values contributed to this recommendation.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub factors: Vec<ContributingFactor>,
+    /// Structured evidence linking to specific analysis data.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<TargetEvidence>,
 }
 
 #[cfg(test)]
@@ -337,10 +393,13 @@ mod tests {
             priority: 75.0,
             recommendation: "Test recommendation".into(),
             category: RecommendationCategory::RemoveDeadCode,
+            effort: EffortEstimate::Low,
             factors: vec![],
+            evidence: None,
         };
         let json = serde_json::to_string(&target).unwrap();
         assert!(!json.contains("factors"));
+        assert!(!json.contains("evidence"));
     }
 
     #[test]

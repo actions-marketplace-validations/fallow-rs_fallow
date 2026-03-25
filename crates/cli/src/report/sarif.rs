@@ -539,10 +539,16 @@ pub fn build_health_sarif(
     // Refactoring targets as SARIF results (warning level — advisory recommendations)
     for target in &report.targets {
         let uri = relative_uri(&target.path, root);
+        let message = format!(
+            "[{}] {} (effort: {})",
+            target.category.label(),
+            target.recommendation,
+            target.effort.label(),
+        );
         sarif_results.push(sarif_result(
             "fallow/refactoring-target",
             "warning",
-            &target.recommendation,
+            &message,
             &uri,
             None,
         ));

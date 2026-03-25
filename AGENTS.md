@@ -127,7 +127,7 @@ fallow health --format json --quiet --targets
 
 **Exit codes:** 0 = no functions exceed thresholds, 1 = findings exist.
 
-**JSON output** includes a `findings` array and a `summary` object. With `--file-scores`, also includes a `file_scores` array with per-file metrics and `summary.files_scored` / `summary.average_maintainability`. With `--targets`, includes a `targets` array with `path`, `priority`, `recommendation`, `category`, and `factors`.
+**JSON output** includes a `findings` array and a `summary` object. With `--file-scores`, also includes a `file_scores` array with per-file metrics and `summary.files_scored` / `summary.average_maintainability`. With `--targets`, includes a `targets` array with `path`, `priority`, `recommendation`, `category`, `effort` (low/medium/high), `factors` (with raw `value`/`threshold`), and `evidence` (unused export names, complex function names+lines, cycle paths). Target baselines are supported via `--save-baseline` / `--baseline`.
 
 ### `fix`
 

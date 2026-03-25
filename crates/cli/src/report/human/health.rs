@@ -340,11 +340,18 @@ pub(in crate::report) fn build_health_human_lines(
                 filename,
             ));
 
-            // Line 2: category label (yellow) + recommendation (dimmed)
+            // Line 2: category label (yellow) + effort (colored) + recommendation (dimmed)
             let label = target.category.label();
+            let effort = target.effort.label();
+            let effort_colored = match target.effort {
+                crate::health_types::EffortEstimate::Low => effort.green().to_string(),
+                crate::health_types::EffortEstimate::Medium => effort.yellow().to_string(),
+                crate::health_types::EffortEstimate::High => effort.red().to_string(),
+            };
             lines.push(format!(
-                "         {}  {}",
+                "         {} \u{00b7} {}  {}",
                 label.yellow(),
+                effort_colored,
                 target.recommendation.dimmed(),
             ));
 

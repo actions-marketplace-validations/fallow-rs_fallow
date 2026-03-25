@@ -280,6 +280,12 @@ pub fn health_meta() -> Value {
                 "description": "Weighted score: complexity density (30%), hotspot boost (25%), dead code ratio (20%), fan-in (15%), fan-out (10%). Does not use the maintainability index to avoid double-counting.",
                 "range": "[0, 100]",
                 "interpretation": "higher = more urgent to refactor"
+            },
+            "effort": {
+                "name": "Effort Estimate",
+                "description": "Heuristic effort estimate based on file size, function count, and fan-in. Low: <100 lines, \u{2264}3 functions, <5 importers. High: \u{2265}500 lines, \u{2265}20 importers, or \u{2265}15 functions with high density. Medium: everything else.",
+                "values": ["low", "medium", "high"],
+                "interpretation": "low = quick win, high = needs planning and coordination"
             }
         }
     })

@@ -512,14 +512,15 @@ pub fn build_health_markdown(report: &crate::health_types::HealthReport, root: &
             "\n### Refactoring Targets ({})\n\n",
             report.targets.len()
         );
-        out.push_str("| Priority | Category | File | Recommendation |\n");
-        out.push_str("|----------|----------|------|----------------|\n");
+        out.push_str("| Priority | Category | Effort | File | Recommendation |\n");
+        out.push_str("|----------|----------|--------|------|----------------|\n");
         for target in &report.targets {
             let file_str = normalize_uri(&relative_path(&target.path, root).display().to_string());
             let category = target.category.label();
+            let effort = target.effort.label();
             let _ = writeln!(
                 out,
-                "| {:.1} | {category} | `{file_str}` | {} |",
+                "| {:.1} | {category} | {effort} | `{file_str}` | {} |",
                 target.priority, target.recommendation,
             );
         }
@@ -549,6 +550,7 @@ pub fn build_health_markdown(report: &crate::health_types::HealthReport, root: &
         if has_targets {
             out.push_str("- **Priority** — weighted refactoring urgency (0\u{2013}100, higher = more urgent)\n");
             out.push_str("- **Category** — recommendation type (churn+complexity, high impact, dead code, complexity, coupling, circular dep)\n");
+            out.push_str("- **Effort** — estimated effort (low / medium / high) based on file size, function count, and fan-in\n");
         }
         out.push_str("\n[Full metric reference](https://docs.fallow.tools/explanations/metrics)\n\n</details>\n");
     }
@@ -1070,19 +1072,23 @@ mod tests {
                     priority: 82.5,
                     recommendation: "Split high-impact file".into(),
                     category: RecommendationCategory::SplitHighImpact,
+                    effort: crate::health_types::EffortEstimate::High,
                     factors: vec![ContributingFactor {
                         metric: "fan_in",
                         value: 25.0,
                         threshold: 10.0,
                         detail: "25 files depend on this".into(),
                     }],
+                    evidence: None,
                 },
                 RefactoringTarget {
                     path: PathBuf::from("/project/src/legacy.ts"),
                     priority: 45.0,
                     recommendation: "Remove 5 unused exports".into(),
                     category: RecommendationCategory::RemoveDeadCode,
+                    effort: crate::health_types::EffortEstimate::Low,
                     factors: vec![],
+                    evidence: None,
                 },
             ],
         };
