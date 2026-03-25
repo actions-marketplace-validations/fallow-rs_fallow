@@ -7,14 +7,15 @@ use fallow_core::duplicates::DuplicationReport;
 use fallow_core::results::AnalysisResults;
 
 /// LSP range at position (0,0) used for file-level and package.json diagnostics.
-pub const ZERO_RANGE: Range = Range {
+/// LSP range covering the entire first line — used for file-level diagnostics.
+pub const FIRST_LINE_RANGE: Range = Range {
     start: Position {
         line: 0,
         character: 0,
     },
     end: Position {
         line: 0,
-        character: 0,
+        character: u32::MAX,
     },
 };
 
@@ -70,7 +71,7 @@ pub fn build_diagnostics(
                 .entry(uri)
                 .or_default()
                 .push(Diagnostic {
-                    range: ZERO_RANGE,
+                    range: FIRST_LINE_RANGE,
                     severity: Some(DiagnosticSeverity::WARNING),
                     source: Some("fallow".to_string()),
                     code: Some(NumberOrString::String("unused-file".to_string())),
@@ -110,11 +111,19 @@ pub fn build_diagnostics(
     }
 
     // Dependency issues: unused deps, unused dev deps (routed to their respective package.json)
+    // Place diagnostic on the line where the dependency is declared.
     for dep in &results.unused_dependencies {
         if let Ok(dep_uri) = Url::from_file_path(&dep.path) {
+            let line = dep.line.saturating_sub(1);
             let entry = diagnostics_by_file.entry(dep_uri).or_default();
             entry.push(Diagnostic {
-                range: ZERO_RANGE,
+                range: Range {
+                    start: Position { line, character: 0 },
+                    end: Position {
+                        line,
+                        character: u32::MAX,
+                    },
+                },
                 severity: Some(DiagnosticSeverity::WARNING),
                 source: Some("fallow".to_string()),
                 code: Some(NumberOrString::String("unused-dependency".to_string())),
@@ -125,9 +134,16 @@ pub fn build_diagnostics(
     }
     for dep in &results.unused_dev_dependencies {
         if let Ok(dep_uri) = Url::from_file_path(&dep.path) {
+            let line = dep.line.saturating_sub(1);
             let entry = diagnostics_by_file.entry(dep_uri).or_default();
             entry.push(Diagnostic {
-                range: ZERO_RANGE,
+                range: Range {
+                    start: Position { line, character: 0 },
+                    end: Position {
+                        line,
+                        character: u32::MAX,
+                    },
+                },
                 severity: Some(DiagnosticSeverity::WARNING),
                 source: Some("fallow".to_string()),
                 code: Some(NumberOrString::String("unused-dev-dependency".to_string())),
@@ -138,9 +154,16 @@ pub fn build_diagnostics(
     }
     for dep in &results.unused_optional_dependencies {
         if let Ok(dep_uri) = Url::from_file_path(&dep.path) {
+            let line = dep.line.saturating_sub(1);
             let entry = diagnostics_by_file.entry(dep_uri).or_default();
             entry.push(Diagnostic {
-                range: ZERO_RANGE,
+                range: Range {
+                    start: Position { line, character: 0 },
+                    end: Position {
+                        line,
+                        character: u32::MAX,
+                    },
+                },
                 severity: Some(DiagnosticSeverity::WARNING),
                 source: Some("fallow".to_string()),
                 code: Some(NumberOrString::String(
@@ -156,7 +179,7 @@ pub fn build_diagnostics(
         for dep in &results.unlisted_dependencies {
             let entry = diagnostics_by_file.entry(uri.clone()).or_default();
             entry.push(Diagnostic {
-                range: ZERO_RANGE,
+                range: FIRST_LINE_RANGE,
                 severity: Some(DiagnosticSeverity::WARNING),
                 source: Some("fallow".to_string()),
                 code: Some(NumberOrString::String("unlisted-dependency".to_string())),
@@ -339,11 +362,21 @@ pub fn build_diagnostics(
                 })
                 .collect();
             let message = format!("Circular dependency: {}", chain.join(" \u{2192} "));
+            let line = cycle.line.saturating_sub(1);
             diagnostics_by_file
                 .entry(uri)
                 .or_default()
                 .push(Diagnostic {
-                    range: ZERO_RANGE,
+                    range: Range {
+                        start: Position {
+                            line,
+                            character: cycle.col,
+                        },
+                        end: Position {
+                            line,
+                            character: u32::MAX,
+                        },
+                    },
                     severity: Some(DiagnosticSeverity::WARNING),
                     source: Some("fallow".to_string()),
                     code: Some(NumberOrString::String("circular-dependency".to_string())),
@@ -488,7 +521,7 @@ mod tests {
 
         let d = &file_diags[0];
         assert_eq!(d.severity, Some(DiagnosticSeverity::WARNING));
-        assert_eq!(d.range, ZERO_RANGE);
+        assert_eq!(d.range, FIRST_LINE_RANGE);
         assert_eq!(d.message, "File is not reachable from any entry point");
         assert_eq!(
             d.code,
@@ -550,7 +583,7 @@ mod tests {
         let d = &file_diags[0];
         assert_eq!(d.severity, Some(DiagnosticSeverity::WARNING));
         assert_eq!(d.message, "Unused dependency: lodash");
-        assert_eq!(d.range, ZERO_RANGE);
+        assert_eq!(d.range.start.line, 4); // 1-based line 5 → 0-based line 4
     }
 
     #[test]

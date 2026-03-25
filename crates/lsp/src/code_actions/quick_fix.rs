@@ -6,7 +6,7 @@ use tower_lsp::lsp_types::*;
 
 use fallow_core::results::AnalysisResults;
 
-use crate::diagnostics::ZERO_RANGE;
+use crate::diagnostics::FIRST_LINE_RANGE;
 
 /// Build quick-fix code actions for unused exports (remove the `export` keyword).
 #[expect(clippy::disallowed_types)]
@@ -146,7 +146,7 @@ pub fn build_delete_file_actions(
                 ..Default::default()
             }),
             diagnostics: Some(vec![Diagnostic {
-                range: ZERO_RANGE,
+                range: FIRST_LINE_RANGE,
                 severity: Some(DiagnosticSeverity::WARNING),
                 source: Some("fallow".to_string()),
                 code: Some(NumberOrString::String("unused-file".to_string())),
@@ -696,7 +696,7 @@ mod tests {
         assert_eq!(diags.len(), 1);
         let diag = &diags[0];
 
-        assert_eq!(diag.range, ZERO_RANGE);
+        assert_eq!(diag.range, FIRST_LINE_RANGE);
         assert_eq!(diag.severity, Some(DiagnosticSeverity::WARNING));
         assert_eq!(diag.source, Some("fallow".to_string()));
         assert_eq!(

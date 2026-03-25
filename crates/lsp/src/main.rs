@@ -472,89 +472,21 @@ async fn main() {
 }
 
 /// Find all project roots under a workspace directory.
-///
 /// Find all project roots under a workspace directory.
 ///
-/// Discovers sub-projects by finding all `package.json` files (excluding
-/// `node_modules`, `.git`, `target`, etc.) and checking if they contain
-/// JS/TS source files worth analyzing.
+/// Uses the workspace root plus any configured monorepo workspaces
+/// (package.json `workspaces`, pnpm-workspace.yaml, tsconfig references).
 fn find_project_roots(workspace_root: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut roots = vec![workspace_root.to_path_buf()];
 
-    // Also include monorepo workspaces from config
     let workspaces = fallow_config::discover_workspaces(workspace_root);
     for ws in &workspaces {
         roots.push(ws.root.clone());
     }
 
-    // Walk for additional package.json files not covered by workspace config
-    walk_for_package_json(workspace_root, workspace_root, &mut roots);
-
     roots.sort();
     roots.dedup();
     roots
-}
-
-/// Recursively walk directories looking for package.json files that have
-/// JS/TS source files nearby. Skips node_modules, hidden dirs, and
-/// build artifacts.
-fn walk_for_package_json(
-    dir: &std::path::Path,
-    workspace_root: &std::path::Path,
-    roots: &mut Vec<std::path::PathBuf>,
-) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-
-        // Skip irrelevant directories
-        if matches!(
-            name_str.as_ref(),
-            "node_modules" | ".git" | "target" | "dist" | "coverage" | "__pycache__"
-        ) || name_str.starts_with('.')
-        {
-            continue;
-        }
-
-        // If this directory has a package.json and JS/TS source files, it's a project root
-        if path.join("package.json").exists() && path != workspace_root && has_js_ts_sources(&path)
-        {
-            roots.push(path.clone());
-            // Don't recurse into sub-projects — they'll be analyzed from their own root
-            continue;
-        }
-
-        walk_for_package_json(&path, workspace_root, roots);
-    }
-}
-
-/// Check if a directory (or its `src/` subdirectory) contains any JS/TS source files.
-fn has_js_ts_sources(dir: &std::path::Path) -> bool {
-    for check_dir in [dir.to_path_buf(), dir.join("src")] {
-        if let Ok(entries) = std::fs::read_dir(&check_dir) {
-            for entry in entries.flatten() {
-                if let Some(ext) = entry.path().extension() {
-                    let ext = ext.to_string_lossy();
-                    if matches!(
-                        ext.as_ref(),
-                        "ts" | "tsx" | "js" | "jsx" | "mts" | "mjs" | "vue" | "svelte"
-                    ) {
-                        return true;
-                    }
-                }
-            }
-        }
-    }
-    false
 }
 
 /// Merge analysis results from a sub-project into the accumulated results.
