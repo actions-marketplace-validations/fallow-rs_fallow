@@ -295,6 +295,7 @@ mod tests {
             specifier: "./missing-module".to_string(),
             line: 3,
             col: 0,
+            specifier_col: 0,
         });
         r.unlisted_dependencies.push(UnlistedDependency {
             package_name: "chalk".to_string(),
@@ -727,6 +728,7 @@ mod tests {
             specifier: "@acme/missing-pkg".to_string(),
             line: 7,
             col: 0,
+            specifier_col: 0,
         });
         let elapsed = Duration::from_millis(0);
         let output = build_json(&results, &root, elapsed).expect("should serialize");

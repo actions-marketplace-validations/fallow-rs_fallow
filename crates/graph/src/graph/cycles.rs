@@ -382,6 +382,7 @@ mod tests {
                             local_name: "x".to_string(),
                             is_type_only: false,
                             span: oxc_span::Span::new(0, 10),
+                            source_span: oxc_span::Span::default(),
                         },
                         target: ResolveResult::InternalModule(FileId(*tgt)),
                     })

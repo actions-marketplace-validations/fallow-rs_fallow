@@ -247,6 +247,7 @@ mod tests {
             specifier: "./missing".into(),
             line: 1,
             col: 0,
+            specifier_col: 0,
         });
         r.unlisted_dependencies.push(UnlistedDependency {
             package_name: "chalk".into(),
@@ -490,6 +491,7 @@ mod tests {
             specifier: "./missing".into(),
             line: 1,
             col: 0,
+            specifier_col: 0,
         });
         let mut rules = RulesConfig::default();
         rules.unresolved_imports = Severity::Off;

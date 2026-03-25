@@ -223,6 +223,7 @@ fn bench_resolve_re_export_chains(c: &mut Criterion) {
                     local_name: format!("barrel{b}_value{e}"),
                     is_type_only: false,
                     span: oxc_span::Span::new(0, 10),
+                    source_span: Span::default(),
                 },
                 target: ResolveResult::InternalModule(barrel_id),
             })
@@ -471,6 +472,7 @@ fn bench_cache_round_trip(c: &mut Criterion) {
                 local_name: "useState".to_string(),
                 is_type_only: false,
                 span: oxc_span::Span::new(0, 50),
+                source_span: Span::default(),
             },
             ImportInfo {
                 source: "react".to_string(),
@@ -478,6 +480,7 @@ fn bench_cache_round_trip(c: &mut Criterion) {
                 local_name: "useEffect".to_string(),
                 is_type_only: false,
                 span: oxc_span::Span::new(0, 50),
+                source_span: Span::default(),
             },
             ImportInfo {
                 source: "react".to_string(),
@@ -485,6 +488,7 @@ fn bench_cache_round_trip(c: &mut Criterion) {
                 local_name: "React".to_string(),
                 is_type_only: false,
                 span: oxc_span::Span::new(55, 80),
+                source_span: Span::default(),
             },
             ImportInfo {
                 source: "lodash".to_string(),
@@ -492,6 +496,7 @@ fn bench_cache_round_trip(c: &mut Criterion) {
                 local_name: "lodash".to_string(),
                 is_type_only: false,
                 span: oxc_span::Span::new(85, 110),
+                source_span: Span::default(),
             },
             ImportInfo {
                 source: "./styles.css".to_string(),
@@ -499,6 +504,7 @@ fn bench_cache_round_trip(c: &mut Criterion) {
                 local_name: String::new(),
                 is_type_only: false,
                 span: oxc_span::Span::new(115, 140),
+                source_span: Span::default(),
             },
             ImportInfo {
                 source: "./types".to_string(),
@@ -506,6 +512,7 @@ fn bench_cache_round_trip(c: &mut Criterion) {
                 local_name: "Config".to_string(),
                 is_type_only: true,
                 span: oxc_span::Span::new(145, 180),
+                source_span: Span::default(),
             },
         ],
         re_exports: vec![

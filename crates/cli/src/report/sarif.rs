@@ -653,6 +653,7 @@ mod tests {
             specifier: "./missing-module".to_string(),
             line: 3,
             col: 0,
+            specifier_col: 0,
         });
         r.unlisted_dependencies.push(UnlistedDependency {
             package_name: "chalk".to_string(),
@@ -815,6 +816,7 @@ mod tests {
             specifier: "./missing".to_string(),
             line: 1,
             col: 0,
+            specifier_col: 0,
         });
 
         let sarif = build_sarif(&results, &root, &RulesConfig::default());

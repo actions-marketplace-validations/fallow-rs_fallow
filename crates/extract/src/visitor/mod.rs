@@ -440,6 +440,8 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
         let source = decl.source.value.to_string();
         let is_type_only = decl.import_kind.is_type();
 
+        let source_span = decl.source.span;
+
         if let Some(specifiers) = &decl.specifiers {
             for spec in specifiers {
                 match spec {
@@ -450,6 +452,7 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
                             local_name: s.local.name.to_string(),
                             is_type_only: is_type_only || s.import_kind.is_type(),
                             span: s.span,
+                            source_span,
                         });
                     }
                     ImportDeclarationSpecifier::ImportDefaultSpecifier(s) => {
@@ -459,6 +462,7 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
                             local_name: s.local.name.to_string(),
                             is_type_only,
                             span: s.span,
+                            source_span,
                         });
                     }
                     ImportDeclarationSpecifier::ImportNamespaceSpecifier(s) => {
@@ -470,6 +474,7 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
                             local_name: local,
                             is_type_only,
                             span: s.span,
+                            source_span,
                         });
                     }
                 }
@@ -482,6 +487,7 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
                 local_name: String::new(),
                 is_type_only: false,
                 span: decl.span,
+                source_span,
             });
         }
     }

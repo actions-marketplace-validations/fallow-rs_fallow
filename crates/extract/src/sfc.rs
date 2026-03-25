@@ -138,6 +138,7 @@ pub(crate) fn parse_sfc_to_module(file_id: FileId, source: &str, content_hash: u
                 local_name: String::new(),
                 is_type_only: false,
                 span: Span::default(),
+                source_span: Span::default(),
             });
         }
 

@@ -64,6 +64,7 @@ fn sample_results(root: &Path) -> AnalysisResults {
         specifier: "./missing-module".to_string(),
         line: 3,
         col: 0,
+        specifier_col: 0,
     });
     r.unlisted_dependencies.push(UnlistedDependency {
         package_name: "chalk".to_string(),
@@ -320,12 +321,14 @@ fn compact_unresolved_imports_only_snapshot() {
         specifier: "./missing-module".to_string(),
         line: 3,
         col: 0,
+        specifier_col: 0,
     });
     results.unresolved_imports.push(UnresolvedImport {
         path: root.join("src/app.ts"),
         specifier: "@org/nonexistent".to_string(),
         line: 4,
         col: 0,
+        specifier_col: 0,
     });
     let lines = build_compact_lines(&results, &root);
     insta::assert_snapshot!("compact_unresolved_imports_only", lines.join("\n"));
@@ -621,6 +624,7 @@ fn json_unresolved_imports_only_snapshot() {
         specifier: "./missing-module".to_string(),
         line: 3,
         col: 0,
+        specifier_col: 0,
     });
     let value = build_json(&results, &root, Duration::ZERO).expect("JSON build should succeed");
     let json_str = serde_json::to_string_pretty(&value).expect("should serialize");
@@ -783,6 +787,7 @@ fn sarif_unresolved_imports_only_snapshot() {
         specifier: "./missing-module".to_string(),
         line: 3,
         col: 0,
+        specifier_col: 0,
     });
     let sarif = build_sarif(&results, &root, &RulesConfig::default());
     let json_str = serde_json::to_string_pretty(&sarif).expect("should serialize");

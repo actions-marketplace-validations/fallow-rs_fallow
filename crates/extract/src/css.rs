@@ -169,6 +169,7 @@ pub(crate) fn parse_css_to_module(
                 local_name: String::new(),
                 is_type_only: false,
                 span: Span::default(),
+                source_span: Span::default(),
             });
         }
     }
@@ -183,6 +184,7 @@ pub(crate) fn parse_css_to_module(
                     local_name: String::new(),
                     is_type_only: false,
                     span: Span::default(),
+                    source_span: Span::default(),
                 });
             }
         }
@@ -199,6 +201,7 @@ pub(crate) fn parse_css_to_module(
             local_name: String::new(),
             is_type_only: false,
             span: Span::default(),
+            source_span: Span::default(),
         });
     }
 

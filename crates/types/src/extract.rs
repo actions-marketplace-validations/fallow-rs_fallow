@@ -214,6 +214,9 @@ pub struct ImportInfo {
     pub is_type_only: bool,
     /// Source span of the import declaration.
     pub span: Span,
+    /// Span of the source string literal (e.g., the `'./utils'` in `import { foo } from './utils'`).
+    /// Used by the LSP to highlight just the specifier in diagnostics.
+    pub source_span: Span,
 }
 
 /// How a symbol is imported.
@@ -236,7 +239,7 @@ pub enum ImportedName {
 #[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<ExportInfo>() == 88);
 #[cfg(target_pointer_width = "64")]
-const _: () = assert!(std::mem::size_of::<ImportInfo>() == 88);
+const _: () = assert!(std::mem::size_of::<ImportInfo>() == 96);
 #[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<ExportName>() == 24);
 #[cfg(target_pointer_width = "64")]

@@ -151,8 +151,11 @@ pub struct UnresolvedImport {
     pub specifier: String,
     /// 1-based line number.
     pub line: u32,
-    /// 0-based byte column offset.
+    /// 0-based byte column offset of the import statement.
     pub col: u32,
+    /// 0-based byte column offset of the source string literal (the specifier in quotes).
+    /// Used by the LSP to underline just the specifier, not the entire import line.
+    pub specifier_col: u32,
 }
 
 /// A dependency used in code but not listed in package.json.
@@ -353,6 +356,7 @@ mod tests {
             specifier: "./missing".to_string(),
             line: 1,
             col: 0,
+            specifier_col: 0,
         });
         results.unlisted_dependencies.push(UnlistedDependency {
             package_name: "unlisted".to_string(),

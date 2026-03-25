@@ -102,6 +102,7 @@ mod tests {
             specifier: "./missing".to_string(),
             line: 1,
             col: 0,
+            specifier_col: 0,
         });
         results.unlisted_dependencies.push(UnlistedDependency {
             package_name: "unlisted".to_string(),

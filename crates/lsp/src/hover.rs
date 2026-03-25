@@ -266,8 +266,9 @@ fn check_unresolved_import(
         if import_line != position.line {
             continue;
         }
-        let end_col = import.col + import.specifier.len() as u32;
-        if position.character < import.col || position.character >= end_col {
+        // Range covers the source string literal including quotes (+2)
+        let end_col = import.specifier_col + import.specifier.len() as u32 + 2;
+        if position.character < import.specifier_col || position.character >= end_col {
             continue;
         }
 
@@ -285,11 +286,11 @@ fn check_unresolved_import(
             range: Some(Range {
                 start: Position {
                     line: import_line,
-                    character: import.col,
+                    character: import.specifier_col,
                 },
                 end: Position {
                     line: import_line,
-                    character: import.col + import.specifier.len() as u32,
+                    character: end_col,
                 },
             }),
         });
@@ -674,12 +675,13 @@ mod tests {
             path: path.clone(),
             specifier: "./missing-module".to_string(),
             line: 3,
-            col: 20,
+            col: 0,
+            specifier_col: 20,
         });
         let duplication = DuplicationReport::default();
         let pos = Position {
             line: 2,
-            character: 25,
+            character: 25, // inside the specifier range [20, 38)
         };
 
         let hover = build_hover(&results, &duplication, &path, pos).unwrap();

@@ -7,7 +7,7 @@ use bincode::{Decode, Encode};
 use crate::MemberKind;
 
 /// Cache version — bump when the cache format changes.
-pub(super) const CACHE_VERSION: u32 = 15;
+pub(super) const CACHE_VERSION: u32 = 16;
 
 /// Maximum cache file size to deserialize (256 MB).
 pub(super) const MAX_CACHE_SIZE: usize = 256 * 1024 * 1024;
@@ -104,6 +104,10 @@ pub struct CachedImport {
     pub span_start: u32,
     /// Byte offset of the import span end.
     pub span_end: u32,
+    /// Byte offset of the source string literal span start.
+    pub source_span_start: u32,
+    /// Byte offset of the source string literal span end.
+    pub source_span_end: u32,
 }
 
 /// Cached dynamic import data.

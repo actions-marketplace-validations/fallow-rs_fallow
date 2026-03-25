@@ -83,7 +83,8 @@ expression: "json_str.replace(&format!(\"\\\"version\\\": \\\"{}\\\"\", env!(\"C
       "path": "src/app.ts",
       "specifier": "./missing-module",
       "line": 3,
-      "col": 0
+      "col": 0,
+      "specifier_col": 0
     }
   ],
   "unlisted_dependencies": [

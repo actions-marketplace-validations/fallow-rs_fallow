@@ -596,6 +596,7 @@ mod tests {
             specifier: "./missing-module".to_string(),
             line: 3,
             col: 0,
+            specifier_col: 0,
         });
         r.unlisted_dependencies.push(UnlistedDependency {
             package_name: "chalk".to_string(),

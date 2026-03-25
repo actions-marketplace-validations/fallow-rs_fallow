@@ -19,6 +19,8 @@ use std::path::{Path, PathBuf};
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
+use oxc_span::Span;
+
 use fallow_types::discover::{DiscoveredFile, FileId};
 use fallow_types::extract::{
     DynamicImportInfo, DynamicImportPattern, ImportInfo, ImportedName, ModuleInfo, ReExportInfo,
@@ -190,6 +192,7 @@ fn resolve_single_dynamic_import(
                     local_name: name.clone(),
                     is_type_only: false,
                     span: imp.span,
+                    source_span: Span::default(),
                 },
                 target: target.clone(),
             })
@@ -205,6 +208,7 @@ fn resolve_single_dynamic_import(
                 local_name: imp.local_name.clone().unwrap_or_default(),
                 is_type_only: false,
                 span: imp.span,
+                source_span: Span::default(),
             },
             target,
         }];
@@ -218,6 +222,7 @@ fn resolve_single_dynamic_import(
             local_name: String::new(),
             is_type_only: false,
             span: imp.span,
+            source_span: Span::default(),
         },
         target,
     }]
@@ -267,6 +272,7 @@ fn resolve_single_require(
                 local_name: req.local_name.clone().unwrap_or_default(),
                 is_type_only: false,
                 span: req.span,
+                source_span: Span::default(),
             },
             target,
         }];
@@ -281,6 +287,7 @@ fn resolve_single_require(
                 local_name: name.clone(),
                 is_type_only: false,
                 span: req.span,
+                source_span: Span::default(),
             },
             target: target.clone(),
         })
@@ -432,6 +439,7 @@ mod tests {
             local_name: local.to_string(),
             is_type_only: false,
             span: dummy_span(),
+            source_span: Span::default(),
         }
     }
 
@@ -614,6 +622,7 @@ mod tests {
                 local_name: "FC".into(),
                 is_type_only: true,
                 span: dummy_span(),
+                source_span: Span::default(),
             }];
             let file = Path::new("/project/src/app.ts");
             let result = resolve_static_imports(ctx, file, &imports);

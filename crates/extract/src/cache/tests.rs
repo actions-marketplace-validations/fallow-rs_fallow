@@ -212,6 +212,7 @@ fn module_to_cached_roundtrip_imports() {
                 local_name: "foo".to_string(),
                 is_type_only: false,
                 span: Span::new(0, 10),
+                source_span: Span::new(5, 10),
             },
             ImportInfo {
                 source: "react".to_string(),
@@ -219,6 +220,7 @@ fn module_to_cached_roundtrip_imports() {
                 local_name: "React".to_string(),
                 is_type_only: false,
                 span: Span::new(15, 30),
+                source_span: Span::new(20, 30),
             },
             ImportInfo {
                 source: "./all".to_string(),
@@ -226,6 +228,7 @@ fn module_to_cached_roundtrip_imports() {
                 local_name: "all".to_string(),
                 is_type_only: false,
                 span: Span::new(35, 50),
+                source_span: Span::new(40, 50),
             },
             ImportInfo {
                 source: "./styles.css".to_string(),
@@ -233,6 +236,7 @@ fn module_to_cached_roundtrip_imports() {
                 local_name: String::new(),
                 is_type_only: false,
                 span: Span::new(55, 70),
+                source_span: Span::new(60, 70),
             },
         ],
         re_exports: vec![],
@@ -522,6 +526,7 @@ fn module_to_cached_roundtrip_type_only_import() {
             local_name: "Foo".to_string(),
             is_type_only: true,
             span: Span::new(0, 10),
+            source_span: Span::new(5, 10),
         }],
         re_exports: vec![],
         dynamic_imports: vec![],

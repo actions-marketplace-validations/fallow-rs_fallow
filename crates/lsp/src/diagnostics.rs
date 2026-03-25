@@ -92,17 +92,18 @@ pub fn build_diagnostics(
                     range: Range {
                         start: Position {
                             line,
-                            character: import.col,
+                            character: import.specifier_col,
                         },
                         end: Position {
                             line,
-                            character: import.col + import.specifier.len() as u32,
+                            // +2 accounts for the surrounding quotes on the string literal
+                            character: import.specifier_col + import.specifier.len() as u32 + 2,
                         },
                     },
                     severity: Some(DiagnosticSeverity::ERROR),
                     source: Some("fallow".to_string()),
                     code: Some(NumberOrString::String("unresolved-import".to_string())),
-                    message: format!("Cannot resolve import '{}'", import.specifier),
+                    message: format!("Cannot find module '{}'", import.specifier),
                     ..Default::default()
                 });
         }
@@ -499,11 +500,14 @@ mod tests {
     fn unresolved_import_produces_error_diagnostic() {
         let root = test_root();
         let mut results = AnalysisResults::default();
+        // import { foo } from './missing-module'
+        //                     ^--- specifier_col = 20 (quote position)
         results.unresolved_imports.push(UnresolvedImport {
             path: root.join("src/app.ts"),
             specifier: "./missing-module".to_string(),
             line: 3,
-            col: 20,
+            col: 0,
+            specifier_col: 20,
         });
 
         let duplication = empty_duplication();
@@ -515,9 +519,14 @@ mod tests {
 
         let d = &file_diags[0];
         assert_eq!(d.severity, Some(DiagnosticSeverity::ERROR));
-        assert_eq!(d.message, "Cannot resolve import './missing-module'");
-        assert_eq!(d.range.start.line, 2); // 1-based → 0-based
+        assert_eq!(d.message, "Cannot find module './missing-module'");
+        assert_eq!(d.range.start.line, 2); // 1-based -> 0-based
+        // Range covers the specifier string literal including quotes
         assert_eq!(d.range.start.character, 20);
+        assert_eq!(
+            d.range.end.character,
+            20 + "./missing-module".len() as u32 + 2
+        );
     }
 
     #[test]
@@ -804,6 +813,7 @@ mod tests {
             specifier: "./gone".to_string(),
             line: 10,
             col: 0,
+            specifier_col: 0,
         });
 
         let duplication = empty_duplication();
@@ -835,6 +845,7 @@ mod tests {
             specifier: "./nope".to_string(),
             line: 1,
             col: 0,
+            specifier_col: 0,
         });
 
         let duplication = empty_duplication();

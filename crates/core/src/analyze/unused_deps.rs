@@ -544,6 +544,19 @@ pub fn find_unresolved_imports(
                     import.info.span.start,
                 );
 
+                // Compute the column of the source string literal for precise LSP highlighting.
+                // Falls back to the import statement column when source_span is not available.
+                let specifier_col = if import.info.source_span.start > 0 {
+                    let (_, sc) = byte_offset_to_line_col(
+                        line_offsets_by_file,
+                        module.file_id,
+                        import.info.source_span.start,
+                    );
+                    sc
+                } else {
+                    col
+                };
+
                 // Check inline suppression
                 if let Some(supps) = suppressions_by_file.get(&module.file_id)
                     && suppress::is_suppressed(supps, line, IssueKind::UnresolvedImport)
@@ -556,6 +569,7 @@ pub fn find_unresolved_imports(
                     specifier: spec.clone(),
                     line,
                     col,
+                    specifier_col,
                 });
             }
         }

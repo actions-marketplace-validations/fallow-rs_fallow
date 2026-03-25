@@ -54,6 +54,7 @@ pub fn cached_to_module(
             local_name: i.local_name.clone(),
             is_type_only: i.is_type_only,
             span: Span::new(i.span_start, i.span_end),
+            source_span: Span::new(i.source_span_start, i.source_span_end),
         })
         .collect();
 
@@ -191,6 +192,8 @@ pub fn module_to_cached(
                     kind,
                     span_start: i.span.start,
                     span_end: i.span.end,
+                    source_span_start: i.source_span.start,
+                    source_span_end: i.source_span.end,
                 }
             })
             .collect(),
