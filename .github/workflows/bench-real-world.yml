@@ -32,7 +32,7 @@ jobs:
         with:
           node-version: '22'
 
-      - uses: pnpm/action-setup@fe02b34f77f8bc703571ae24983c6aaa0ee14cbe # v4
+      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4
         with:
           version: 9
 
