@@ -15,6 +15,7 @@ jobs:
   conformance:
     name: Fallow vs Knip
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     permissions:
       contents: write
       deployments: write
@@ -29,13 +30,21 @@ jobs:
         with:
           node-version: '22'
 
+      - uses: pnpm/action-setup@fe02b34f77f8bc703571ae24983c6aaa0ee14cbe # v4
+        with:
+          version: 9
+
       - name: Build fallow
         run: cargo build --release -p fallow-cli
 
       - name: Run conformance suite
         id: conformance
         run: |
-          REPORT="$(./tests/conformance/run.sh --fallow-bin ./target/release/fallow 2>conformance-stderr.txt)"
+          REPORT="$(./tests/conformance/run-all.sh \
+            --fallow-bin ./target/release/fallow \
+            --clone-dir /tmp/fallow-conformance \
+            --timeout 300 \
+            2>conformance-stderr.txt)"
           echo "${REPORT}" > conformance-report.json
 
           # Validate report is valid JSON before extracting
@@ -45,29 +54,34 @@ jobs:
           fi
 
           # Extract summary values for the step summary
-          FALLOW_TOTAL="$(echo "${REPORT}" | python3 -c "import json,sys; print(json.load(sys.stdin)['summary']['fallow_total'])")"
-          KNIP_TOTAL="$(echo "${REPORT}" | python3 -c "import json,sys; print(json.load(sys.stdin)['summary']['knip_total'])")"
-          AGREED="$(echo "${REPORT}" | python3 -c "import json,sys; print(json.load(sys.stdin)['summary']['agreed'])")"
-          FALLOW_ONLY="$(echo "${REPORT}" | python3 -c "import json,sys; print(json.load(sys.stdin)['summary']['fallow_only'])")"
-          KNIP_ONLY="$(echo "${REPORT}" | python3 -c "import json,sys; print(json.load(sys.stdin)['summary']['knip_only'])")"
-          AGREEMENT_PCT="$(echo "${REPORT}" | python3 -c "import json,sys; print(json.load(sys.stdin)['summary']['agreement_pct'])")"
-
-          echo "fallow_total=${FALLOW_TOTAL}" >> "$GITHUB_OUTPUT"
-          echo "knip_total=${KNIP_TOTAL}" >> "$GITHUB_OUTPUT"
-          echo "agreed=${AGREED}" >> "$GITHUB_OUTPUT"
-          echo "fallow_only=${FALLOW_ONLY}" >> "$GITHUB_OUTPUT"
-          echo "knip_only=${KNIP_ONLY}" >> "$GITHUB_OUTPUT"
-          echo "agreement_pct=${AGREEMENT_PCT}" >> "$GITHUB_OUTPUT"
-
-          # Write custom JSON for benchmark-action tracking
           python3 -c "
           import json
+          with open('conformance-report.json') as f:
+              r = json.load(f)
+          s = r['summary']
+          with open('$GITHUB_OUTPUT', 'a') as out:
+              out.write(f\"fallow_total={s['fallow_total']}\n\")
+              out.write(f\"knip_total={s['knip_total']}\n\")
+              out.write(f\"agreed={s['agreed']}\n\")
+              out.write(f\"fallow_only={s['fallow_only']}\n\")
+              out.write(f\"knip_only={s['knip_only']}\n\")
+              out.write(f\"agreement_pct={s['agreement_pct']}\n\")
+          "
+
+          # Write custom JSON for benchmark-action tracking
+          # Per-project agreement rates + overall
+          python3 -c "
+          import json
+          with open('conformance-report.json') as f:
+              r = json.load(f)
           data = [
-            {'name': 'Agreement Rate', 'unit': '%', 'value': float('${AGREEMENT_PCT:-0}')},
-            {'name': 'Agreed Issues', 'unit': 'issues', 'value': int('${AGREED:-0}')},
-            {'name': 'Fallow Total', 'unit': 'issues', 'value': int('${FALLOW_TOTAL:-0}')},
-            {'name': 'Knip Total', 'unit': 'issues', 'value': int('${KNIP_TOTAL:-0}')}
+            {'name': 'Agreement Rate', 'unit': '%', 'value': float(r['summary']['agreement_pct'])},
+            {'name': 'Agreed Issues', 'unit': 'issues', 'value': int(r['summary']['agreed'])},
+            {'name': 'Fallow Total', 'unit': 'issues', 'value': int(r['summary']['fallow_total'])},
+            {'name': 'Knip Total', 'unit': 'issues', 'value': int(r['summary']['knip_total'])},
           ]
+          for name, proj in sorted(r.get('projects', {}).items()):
+            data.append({'name': f'{name} Agreement', 'unit': '%', 'value': float(proj['agreement_pct'])})
           print(json.dumps(data, indent=2))
           " > conformance-bench.json
         # Never fail -- this is informational
@@ -111,13 +125,6 @@ jobs:
               cat conformance-stderr.txt >> "$GITHUB_STEP_SUMMARY"
               echo '```' >> "$GITHUB_STEP_SUMMARY"
             fi
-            if [[ -f conformance-report.json ]]; then
-              echo "" >> "$GITHUB_STEP_SUMMARY"
-              echo "Raw report content:" >> "$GITHUB_STEP_SUMMARY"
-              echo '```' >> "$GITHUB_STEP_SUMMARY"
-              head -5 conformance-report.json >> "$GITHUB_STEP_SUMMARY"
-              echo '```' >> "$GITHUB_STEP_SUMMARY"
-            fi
             exit 0
           fi
 
@@ -133,7 +140,23 @@ jobs:
           echo "| **Agreement** | **${AGREEMENT_PCT}%** |" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
 
+          # Add per-project breakdown
+          echo "### Per Project" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          python3 -c "
+          import json
+          with open('conformance-report.json') as f:
+              r = json.load(f)
+          projects = r.get('projects', {})
+          if projects:
+              print('| Project | Fallow | Knip | Agreed | Agreement |')
+              print('|---------|--------|------|--------|-----------|')
+              for name, s in sorted(projects.items()):
+                  print(f\"| {name} | {s['fallow_total']} | {s['knip_total']} | {s['agreed']} | {s['agreement_pct']}% |\")
+          " >> "$GITHUB_STEP_SUMMARY"
+
           # Add per-type breakdown
+          echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "### By Issue Type" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           python3 -c "
@@ -144,32 +167,6 @@ jobs:
           print('|------|--------|------|--------|-----------|')
           for t, d in sorted(r['by_type'].items()):
               print(f\"| {t} | {d['fallow_count']} | {d['knip_count']} | {d['agreed']} | {d['agreement_pct']}% |\")
-          " >> "$GITHUB_STEP_SUMMARY"
-
-          # Add disagreement details
-          python3 -c "
-          import json
-          with open('conformance-report.json') as f:
-              r = json.load(f)
-          details = r['details']
-          if details['fallow_only']:
-              print()
-              print('### Fallow-only findings')
-              print()
-              print('Issues found by fallow but not by knip:')
-              print()
-              for d in details['fallow_only']:
-                  name = f' (\`{d[\"name\"]}\`)' if d['name'] else ''
-                  print(f'- \`{d[\"type\"]}\` in \`{d[\"file\"]}\`{name}')
-          if details['knip_only']:
-              print()
-              print('### Knip-only findings')
-              print()
-              print('Issues found by knip but not by fallow:')
-              print()
-              for d in details['knip_only']:
-                  name = f' (\`{d[\"name\"]}\`)' if d['name'] else ''
-                  print(f'- \`{d[\"type\"]}\` in \`{d[\"file\"]}\`{name}')
           " >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload report

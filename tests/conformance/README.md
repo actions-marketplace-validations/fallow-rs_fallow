@@ -1,43 +1,67 @@
 # Conformance Test Suite
 
-Compares fallow's dead code detection results against [knip](https://github.com/webpro-nl/knip) on the same projects, producing a structured report of agreements and disagreements.
+Compares fallow's dead code detection results against [knip](https://github.com/webpro-nl/knip) on 8 real-world open-source projects, producing a structured report of agreements and disagreements.
 
 This suite is **informational** -- it does not fail on disagreements. Differences between the tools are expected due to different analysis strategies and heuristics.
+
+## Test Projects
+
+The same projects used by the performance benchmark suite:
+
+| Project | Repo | Size |
+|---------|------|------|
+| preact | preactjs/preact | Small |
+| fastify | fastify/fastify | Small |
+| zod | colinhacks/zod | Small |
+| vue-core | vuejs/core | Large monorepo |
+| svelte | sveltejs/svelte | Large monorepo |
+| query | TanStack/query | Large monorepo |
+| vite | vitejs/vite | Large monorepo |
+| next.js | vercel/next.js | XL monorepo |
 
 ## Prerequisites
 
 - **fallow** binary (built from this repo or in PATH)
-- **Node.js** (v18+) with `npx` available
-- **Python 3** (for the comparison logic)
+- **Node.js** (v22+) with `npx` available
+- **pnpm** (for monorepo projects)
+- **Python 3** (for the comparison and aggregation logic)
 - knip is installed automatically via `npx` on first run
 
 ## Running
 
+### All projects (CI mode)
+
 ```bash
-# From the repo root, using the built binary
 cargo build --release
-./tests/conformance/run.sh
+./tests/conformance/run-all.sh --fallow-bin ./target/release/fallow
+
+# With custom clone directory and timeout
+./tests/conformance/run-all.sh \
+  --fallow-bin ./target/release/fallow \
+  --clone-dir /tmp/fallow-conformance \
+  --timeout 300
+```
+
+### Single project
+
+```bash
+# Against a specific project
+./tests/conformance/run.sh /path/to/your/project
 
 # With a specific fallow binary
 ./tests/conformance/run.sh --fallow-bin ./target/debug/fallow
-
-# Against a custom project
-./tests/conformance/run.sh /path/to/your/project
-
-# Both options
-./tests/conformance/run.sh /path/to/project --fallow-bin ./target/release/fallow
 ```
 
-The script outputs:
+Both scripts output:
 - **stderr**: human-readable summary with issue counts and disagreement details
 - **stdout**: structured JSON report (pipe to `jq` or save to file)
 
 ```bash
 # Save JSON report
-./tests/conformance/run.sh > report.json
+./tests/conformance/run-all.sh > report.json
 
 # Pretty-print with jq
-./tests/conformance/run.sh 2>/dev/null | jq .
+./tests/conformance/run-all.sh 2>/dev/null | jq .
 ```
 
 ## Interpreting Results
@@ -69,56 +93,46 @@ The agreement percentage is calculated as `agreed / total_unique_issues * 100`.
 | `unused_enum_members`     | `enumMembers`   |
 | `unused_class_members`    | `classMembers`  |
 
-## Adding Test Projects
+## Scripts
 
-1. Create a new directory under `fixtures/`:
-   ```
-   fixtures/my-project/
-     package.json    # must exist, list deps to test
-     tsconfig.json   # optional but recommended
-     src/            # source files
-   ```
+| Script | Purpose |
+|--------|---------|
+| `run.sh` | Single-project comparison (fallow vs knip) |
+| `run-all.sh` | Multi-project orchestrator (clone, run, aggregate) |
+| `compare.py` | Normalizes and compares tool outputs for one project |
+| `aggregate.py` | Combines per-project reports into overall summary |
 
-2. Run the suite against it:
-   ```bash
-   ./tests/conformance/run.sh fixtures/my-project
-   ```
-
-3. The project should have realistic dead code patterns. Good candidates:
-   - Small open-source projects with known dead code
-   - Synthetic projects targeting specific edge cases
-   - Projects that exercise specific framework plugins
-
-## JSON Report Schema
+## Aggregated JSON Report Schema
 
 ```json
 {
   "summary": {
-    "fallow_total": 5,
-    "knip_total": 4,
-    "agreed": 3,
-    "fallow_only": 2,
-    "knip_only": 1,
-    "agreement_pct": 60.0
+    "fallow_total": 150,
+    "knip_total": 120,
+    "agreed": 100,
+    "fallow_only": 50,
+    "knip_only": 20,
+    "agreement_pct": 58.8
+  },
+  "projects": {
+    "preact": { "fallow_total": 10, "knip_total": 8, "agreed": 6, ... },
+    "vite": { "fallow_total": 20, "knip_total": 15, "agreed": 12, ... }
   },
   "by_type": {
     "unused_exports": {
-      "fallow_count": 2,
-      "knip_count": 2,
-      "agreed": 2,
-      "fallow_only": 0,
-      "knip_only": 0,
-      "agreement_pct": 100.0
+      "fallow_count": 50,
+      "knip_count": 40,
+      "agreed": 35,
+      "fallow_only": 15,
+      "knip_only": 5,
+      "agreement_pct": 63.6
     }
-  },
-  "details": {
-    "agreed": [{"file": "src/utils.ts", "name": "unusedFn", "type": "unused_exports"}],
-    "fallow_only": [],
-    "knip_only": []
   }
 }
 ```
 
 ## CI
 
-The conformance suite runs weekly via `.github/workflows/conformance.yml` and can be triggered manually. Results are posted to the GitHub Actions step summary. It never fails the CI pipeline -- it is purely informational.
+The conformance suite runs daily via `.github/workflows/conformance.yml` and can be triggered manually. Results are posted to the GitHub Actions step summary with per-project and per-issue-type breakdowns. It never fails the CI pipeline -- it is purely informational.
+
+Per-project agreement rates are tracked over time via benchmark-action and visible on the [metrics dashboard](https://fallow-rs.github.io/fallow/dev/conformance/).
