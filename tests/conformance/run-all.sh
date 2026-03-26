@@ -128,9 +128,9 @@ install_deps() {
 
     echo "    Installing dependencies (${pm})..." >&2
     if [[ "${pm}" == "pnpm" ]]; then
-        (cd "${dir}" && pnpm install --no-frozen-lockfile --ignore-scripts 2>/dev/null) || true
+        (cd "${dir}" && pnpm install --no-frozen-lockfile --ignore-scripts >/dev/null 2>/dev/null) || true
     else
-        (cd "${dir}" && npm install --ignore-scripts --no-audit --no-fund 2>/dev/null) || true
+        (cd "${dir}" && npm install --ignore-scripts --no-audit --no-fund >/dev/null 2>/dev/null) || true
     fi
 }
 
