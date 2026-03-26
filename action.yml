@@ -19,7 +19,7 @@ inputs:
     description: 'Path to config file (.fallowrc.json or fallow.toml)'
     required: false
   format:
-    description: 'Output format (human, json, sarif, compact, markdown)'
+    description: 'Output format (human, json, sarif, compact, markdown, codeclimate)'
     required: false
     default: 'sarif'
   production:
@@ -55,6 +55,14 @@ inputs:
     description: 'GitHub token for PR comments and SARIF upload'
     required: false
     default: ${{ github.token }}
+  annotations:
+    description: 'Emit findings as inline PR annotations via workflow commands (no Advanced Security required)'
+    required: false
+    default: 'true'
+  max-annotations:
+    description: 'Maximum number of inline annotations to emit (default: 50)'
+    required: false
+    default: '50'
   # Dupes-specific inputs
   dupes-mode:
     description: 'Detection mode for dupes command (strict, mild, weak, semantic)'
@@ -356,6 +364,63 @@ runs:
         end
         JQEOF
 
+        # --- Annotation scripts (workflow commands for inline PR annotations) ---
+        cat > "$FALLOW_TMP/annotations-check.jq" << 'JQEOF'
+        def san: gsub("\n"; " ") | gsub("\r"; " ") | gsub("%"; "%25");
+        [
+          (.unused_files[]? |
+            "::warning file=\(.path | san),title=Unused file::File is not reachable from any entry point"),
+          (.unused_exports[]? |
+            "::warning file=\(.path | san),line=\(.line),col=\(.col + 1),title=Unused export::\(if .is_re_export then "Re-export" else "Export" end) '\(.export_name | san)' is never imported by other modules"),
+          (.unused_types[]? |
+            "::warning file=\(.path | san),line=\(.line),col=\(.col + 1),title=Unused type::\(if .is_re_export then "Type re-export" else "Type export" end) '\(.export_name | san)' is never imported by other modules"),
+          (.unused_dependencies[]? |
+            "::warning file=\(.path | san)\(if .line > 0 then ",line=\(.line)" else "" end),title=Unused dependency::Package '\(.package_name | san)' is in dependencies but never imported"),
+          (.unused_dev_dependencies[]? |
+            "::warning file=\(.path | san)\(if .line > 0 then ",line=\(.line)" else "" end),title=Unused devDependency::Package '\(.package_name | san)' is in devDependencies but never imported"),
+          (.unused_optional_dependencies[]? |
+            "::warning file=\(.path | san)\(if .line > 0 then ",line=\(.line)" else "" end),title=Unused optionalDependency::Package '\(.package_name | san)' is in optionalDependencies but never imported"),
+          (.unused_enum_members[]? |
+            "::warning file=\(.path | san),line=\(.line),col=\(.col + 1),title=Unused enum member::Enum member '\(.parent_name | san).\(.member_name | san)' is never referenced"),
+          (.unused_class_members[]? |
+            "::warning file=\(.path | san),line=\(.line),col=\(.col + 1),title=Unused class member::Class member '\(.parent_name | san).\(.member_name | san)' is never referenced"),
+          (.unresolved_imports[]? |
+            "::warning file=\(.path | san),line=\(.line),col=\(.col + 1),title=Unresolved import::Import '\(.specifier | san)' could not be resolved"),
+          (.unlisted_dependencies[]? | (.package_name | san) as $pkg | .imported_from[]? |
+            "::warning file=\(.path | san),line=\(.line),col=\(.col + 1),title=Unlisted dependency::Package '\($pkg)' is imported but not listed in package.json"),
+          (.duplicate_exports[]? | (.export_name | san) as $name | .locations[]? |
+            "::warning file=\(.path | san),line=\(.line),col=\(.col + 1),title=Duplicate export::Export '\($name)' appears in multiple modules"),
+          (.circular_dependencies[]? |
+            "::warning file=\(.files[0] | san)\(if .line > 0 then ",line=\(.line),col=\(.col + 1)" else "" end),title=Circular dependency::Circular dependency: \(.files | join(" \u2192 "))"),
+          (.type_only_dependencies[]? |
+            "::warning file=\(.path | san)\(if .line > 0 then ",line=\(.line)" else "" end),title=Type-only dependency::Package '\(.package_name | san)' is only used via type imports")
+        ] | .[]
+        JQEOF
+
+        cat > "$FALLOW_TMP/annotations-health.jq" << 'JQEOF'
+        def san: gsub("\n"; " ") | gsub("\r"; " ") | gsub("%"; "%25");
+        (.summary.max_cyclomatic_threshold // 20) as $cyc_t |
+        (.summary.max_cognitive_threshold // 15) as $cog_t |
+        [
+          (.findings[]? |
+            if .exceeded == "both" then
+              "::warning file=\(.path | san),line=\(.line),col=\(.col + 1),title=High complexity::'\(.name | san)' has cyclomatic complexity \(.cyclomatic) (threshold: \($cyc_t)) and cognitive complexity \(.cognitive) (threshold: \($cog_t))"
+            elif .exceeded == "cyclomatic" then
+              "::warning file=\(.path | san),line=\(.line),col=\(.col + 1),title=High cyclomatic complexity::'\(.name | san)' has cyclomatic complexity \(.cyclomatic) (threshold: \($cyc_t))"
+            else
+              "::warning file=\(.path | san),line=\(.line),col=\(.col + 1),title=High cognitive complexity::'\(.name | san)' has cognitive complexity \(.cognitive) (threshold: \($cog_t))"
+            end)
+        ] | .[]
+        JQEOF
+
+        cat > "$FALLOW_TMP/annotations-dupes.jq" << 'JQEOF'
+        def san: gsub("\n"; " ") | gsub("\r"; " ") | gsub("%"; "%25");
+        [
+          (.clone_groups // [])[] | . as $group | .instances[]? |
+            "::warning file=\(.file | san),line=\(.start_line),col=\(.start_col + 1),title=Code duplication::Duplicated code (\($group.line_count) lines, \($group.instances | length) instances)"
+        ] | .[]
+        JQEOF
+
     - name: Install fallow
       shell: bash
       env:
@@ -651,6 +716,52 @@ runs:
           *)               echo "::error::Unexpected command: ${FALLOW_COMMAND}"; exit 2 ;;
         esac
         jq -r -f "$JQ_FILE" fallow-results.json >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Emit inline annotations
+      if: >-
+        always() &&
+        inputs.annotations == 'true' &&
+        inputs.command != 'fix' &&
+        steps.analyze.outputs.issues != '' &&
+        steps.analyze.outputs.issues != '0'
+      shell: bash
+      env:
+        FALLOW_COMMAND: ${{ steps.analyze.outputs.command }}
+        MAX_ANNOTATIONS: ${{ inputs.max-annotations }}
+      run: |
+        # Validate max-annotations
+        MAX="${MAX_ANNOTATIONS:-50}"
+        if ! [[ "$MAX" =~ ^[0-9]+$ ]]; then
+          echo "::warning::max-annotations must be a positive integer, got: ${MAX_ANNOTATIONS}. Using default: 50"
+          MAX=50
+        fi
+
+        ANNOTATIONS_FILE="$FALLOW_TMP/annotations.txt"
+        : > "$ANNOTATIONS_FILE"
+
+        case "$FALLOW_COMMAND" in
+          dead-code|check)
+            jq -r -f "$FALLOW_TMP/annotations-check.jq" fallow-results.json > "$ANNOTATIONS_FILE" 2>/dev/null || true ;;
+          dupes)
+            jq -r -f "$FALLOW_TMP/annotations-dupes.jq" fallow-results.json > "$ANNOTATIONS_FILE" 2>/dev/null || true ;;
+          health)
+            jq -r -f "$FALLOW_TMP/annotations-health.jq" fallow-results.json > "$ANNOTATIONS_FILE" 2>/dev/null || true ;;
+          fix) ;;
+          "")
+            {
+              jq '.check // empty' fallow-results.json | jq -r -f "$FALLOW_TMP/annotations-check.jq" 2>/dev/null || true
+              jq '.health // empty' fallow-results.json | jq -r -f "$FALLOW_TMP/annotations-health.jq" 2>/dev/null || true
+              jq '.dupes // empty' fallow-results.json | jq -r -f "$FALLOW_TMP/annotations-dupes.jq" 2>/dev/null || true
+            } > "$ANNOTATIONS_FILE" ;;
+        esac
+
+        TOTAL=$(wc -l < "$ANNOTATIONS_FILE" | tr -d ' ')
+        if [ "$TOTAL" -gt 0 ]; then
+          head -n "$MAX" "$ANNOTATIONS_FILE"
+          if [ "$TOTAL" -gt "$MAX" ]; then
+            echo "::notice::Showing ${MAX} of ${TOTAL} annotations. Increase max-annotations to see more."
+          fi
+        fi
 
     - name: Check Code Scanning availability
       id: ghas-check
