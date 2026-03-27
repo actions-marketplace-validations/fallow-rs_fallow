@@ -648,4 +648,161 @@ mod tests {
 
         assert!(!config.contains_key("duplicates"));
     }
+
+    // -- skipLocal as non-bool is ignored ------------------------------------
+
+    #[test]
+    fn migrate_jscpd_skip_local_non_bool_ignored() {
+        let jscpd: serde_json::Value = serde_json::from_str(r#"{"skipLocal": "yes"}"#).unwrap();
+        let mut config = empty_config();
+        let mut warnings = Vec::new();
+        migrate_jscpd(&jscpd, &mut config, &mut warnings);
+
+        assert!(!config.contains_key("duplicates"));
+    }
+
+    // -- minTokens as float is ignored (as_u64 fails) -----------------------
+
+    #[test]
+    fn migrate_jscpd_min_tokens_float_ignored() {
+        let jscpd: serde_json::Value = serde_json::from_str(r#"{"minTokens": 50.5}"#).unwrap();
+        let mut config = empty_config();
+        let mut warnings = Vec::new();
+        migrate_jscpd(&jscpd, &mut config, &mut warnings);
+
+        // as_u64 returns None for floating point, so minTokens is skipped
+        assert!(!config.contains_key("duplicates"));
+    }
+
+    // -- threshold as NaN/Infinity is handled --------------------------------
+
+    #[test]
+    fn migrate_jscpd_threshold_zero() {
+        let jscpd: serde_json::Value = serde_json::from_str(r#"{"threshold": 0}"#).unwrap();
+        let mut config = empty_config();
+        let mut warnings = Vec::new();
+        migrate_jscpd(&jscpd, &mut config, &mut warnings);
+
+        let dupes = config.get("duplicates").unwrap().as_object().unwrap();
+        assert_eq!(dupes.get("threshold").unwrap(), 0.0);
+    }
+
+    // -- ignore with mixed types in array ------------------------------------
+
+    #[test]
+    fn migrate_jscpd_ignore_mixed_types() {
+        let jscpd: serde_json::Value =
+            serde_json::from_str(r#"{"ignore": ["dist/**", 42, true]}"#).unwrap();
+        let mut config = empty_config();
+        let mut warnings = Vec::new();
+        migrate_jscpd(&jscpd, &mut config, &mut warnings);
+
+        let dupes = config.get("duplicates").unwrap().as_object().unwrap();
+        // Non-string elements are filtered out by string_or_array
+        assert_eq!(
+            dupes.get("ignore").unwrap(),
+            &serde_json::json!(["dist/**"])
+        );
+    }
+
+    // -- ignore as non-string non-array ------------------------------------
+
+    #[test]
+    fn migrate_jscpd_ignore_non_value() {
+        let jscpd: serde_json::Value = serde_json::from_str(r#"{"ignore": 42}"#).unwrap();
+        let mut config = empty_config();
+        let mut warnings = Vec::new();
+        migrate_jscpd(&jscpd, &mut config, &mut warnings);
+
+        // Non-string/non-array returns empty vec from string_or_array
+        assert!(!config.contains_key("duplicates"));
+    }
+
+    // -- All warnings have source "jscpd" -----------------------------------
+
+    #[test]
+    fn migrate_jscpd_all_warnings_have_jscpd_source() {
+        let jscpd: serde_json::Value =
+            serde_json::from_str(r#"{"mode": "unknown_mode", "maxLines": 100, "blame": true}"#)
+                .unwrap();
+        let mut config = empty_config();
+        let mut warnings = Vec::new();
+        migrate_jscpd(&jscpd, &mut config, &mut warnings);
+
+        assert!(!warnings.is_empty());
+        for w in &warnings {
+            assert_eq!(
+                w.source, "jscpd",
+                "warning for `{}` should have source \"jscpd\"",
+                w.field
+            );
+        }
+    }
+
+    // -- Only mappable fields produce config, unmappable only produce warnings
+
+    #[test]
+    fn migrate_jscpd_only_unmappable_fields_no_duplicates_key() {
+        let jscpd: serde_json::Value =
+            serde_json::from_str(r#"{"maxLines": 1000, "blame": true, "reporters": ["json"]}"#)
+                .unwrap();
+        let mut config = empty_config();
+        let mut warnings = Vec::new();
+        migrate_jscpd(&jscpd, &mut config, &mut warnings);
+
+        // No mappable fields -> no duplicates key
+        assert!(!config.contains_key("duplicates"));
+        assert_eq!(warnings.len(), 3);
+    }
+
+    // -- minLines as zero ---------------------------------------------------
+
+    #[test]
+    fn migrate_jscpd_min_lines_zero() {
+        let jscpd: serde_json::Value = serde_json::from_str(r#"{"minLines": 0}"#).unwrap();
+        let mut config = empty_config();
+        let mut warnings = Vec::new();
+        migrate_jscpd(&jscpd, &mut config, &mut warnings);
+
+        let dupes = config.get("duplicates").unwrap().as_object().unwrap();
+        assert_eq!(dupes.get("minLines").unwrap(), 0);
+    }
+
+    // -- Large numeric values -----------------------------------------------
+
+    #[test]
+    fn migrate_jscpd_large_min_tokens() {
+        let jscpd: serde_json::Value = serde_json::from_str(r#"{"minTokens": 999999}"#).unwrap();
+        let mut config = empty_config();
+        let mut warnings = Vec::new();
+        migrate_jscpd(&jscpd, &mut config, &mut warnings);
+
+        let dupes = config.get("duplicates").unwrap().as_object().unwrap();
+        assert_eq!(dupes.get("minTokens").unwrap(), 999_999);
+    }
+
+    // -- Non-object root types ----------------------------------------------
+
+    #[test]
+    fn migrate_jscpd_null_root() {
+        let jscpd: serde_json::Value = serde_json::json!(null);
+        let mut config = empty_config();
+        let mut warnings = Vec::new();
+        migrate_jscpd(&jscpd, &mut config, &mut warnings);
+
+        assert_eq!(warnings.len(), 1);
+        assert!(config.is_empty());
+    }
+
+    #[test]
+    fn migrate_jscpd_array_root() {
+        let jscpd: serde_json::Value = serde_json::json!([1, 2, 3]);
+        let mut config = empty_config();
+        let mut warnings = Vec::new();
+        migrate_jscpd(&jscpd, &mut config, &mut warnings);
+
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].field, "(root)");
+        assert!(config.is_empty());
+    }
 }

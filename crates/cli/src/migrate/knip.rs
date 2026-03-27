@@ -643,4 +643,163 @@ mod tests {
         assert!(warning_fields.contains(&"eslint"));
         assert!(warning_fields.contains(&"workspaces"));
     }
+
+    // -- Empty object produces no config keys --------------------------------
+
+    #[test]
+    fn migrate_knip_empty_object_no_config() {
+        let knip: serde_json::Value = serde_json::from_str(r"{}").unwrap();
+        let mut config = empty_config();
+        let mut warnings = Vec::new();
+        migrate_knip(&knip, &mut config, &mut warnings);
+
+        assert!(config.is_empty());
+        assert!(warnings.is_empty());
+    }
+
+    // -- Exclude then rules: exclude wins for overlapping types ---------------
+
+    #[test]
+    fn migrate_knip_exclude_overrides_rules_for_same_type() {
+        // rules sets "files" to "error", then exclude sets "files" to "off"
+        let knip: serde_json::Value =
+            serde_json::from_str(r#"{"rules": {"files": "error"}, "exclude": ["files"]}"#).unwrap();
+        let mut config = empty_config();
+        let mut warnings = Vec::new();
+        migrate_knip(&knip, &mut config, &mut warnings);
+
+        let rules = config.get("rules").unwrap().as_object().unwrap();
+        // exclude is processed after rules, so it should override to "off"
+        assert_eq!(rules.get("unused-files").unwrap(), "off");
+    }
+
+    // -- ignoreDependencies as non-string-non-array --------------------------
+
+    #[test]
+    fn migrate_knip_ignore_deps_non_value_ignored() {
+        let knip: serde_json::Value =
+            serde_json::from_str(r#"{"ignoreDependencies": 42}"#).unwrap();
+        let mut config = empty_config();
+        let mut warnings = Vec::new();
+        migrate_knip(&knip, &mut config, &mut warnings);
+
+        assert!(!config.contains_key("ignoreDependencies"));
+    }
+
+    // -- ignore as a single string -------------------------------------------
+
+    #[test]
+    fn migrate_knip_ignore_single_string() {
+        let knip: serde_json::Value = serde_json::from_str(r#"{"ignore": "dist/**"}"#).unwrap();
+        let mut config = empty_config();
+        let mut warnings = Vec::new();
+        migrate_knip(&knip, &mut config, &mut warnings);
+
+        assert_eq!(
+            config.get("ignorePatterns").unwrap(),
+            &serde_json::json!(["dist/**"])
+        );
+    }
+
+    // -- All warnings have source "knip" ------------------------------------
+
+    #[test]
+    fn migrate_knip_all_warnings_have_knip_source() {
+        let knip: serde_json::Value = serde_json::from_str(
+            r#"{
+                "project": ["src/**"],
+                "ignoreDependencies": ["/^@scope/"],
+                "rules": {"binaries": "warn"},
+                "exclude": ["optionalPeerDependencies"],
+                "eslint": {},
+                "workspaces": {"pkg": {}}
+            }"#,
+        )
+        .unwrap();
+        let mut config = empty_config();
+        let mut warnings = Vec::new();
+        migrate_knip(&knip, &mut config, &mut warnings);
+
+        assert!(!warnings.is_empty());
+        for w in &warnings {
+            assert_eq!(
+                w.source, "knip",
+                "warning for `{}` should have source \"knip\"",
+                w.field
+            );
+        }
+    }
+
+    // -- include with empty list does nothing --------------------------------
+
+    #[test]
+    fn migrate_knip_empty_include_array() {
+        let knip: serde_json::Value = serde_json::from_str(r#"{"include": []}"#).unwrap();
+        let mut config = empty_config();
+        let mut warnings = Vec::new();
+        migrate_knip(&knip, &mut config, &mut warnings);
+
+        // Empty include array is filtered out by string_or_array returning non-empty check
+        assert!(!config.contains_key("rules"));
+    }
+
+    // -- exclude with empty list does nothing --------------------------------
+
+    #[test]
+    fn migrate_knip_empty_exclude_array() {
+        let knip: serde_json::Value = serde_json::from_str(r#"{"exclude": []}"#).unwrap();
+        let mut config = empty_config();
+        let mut warnings = Vec::new();
+        migrate_knip(&knip, &mut config, &mut warnings);
+
+        assert!(!config.contains_key("rules"));
+    }
+
+    // -- mixed array with non-string values in ignoreDependencies ------------
+
+    #[test]
+    fn migrate_knip_ignore_deps_mixed_types_in_array() {
+        let knip: serde_json::Value =
+            serde_json::from_str(r#"{"ignoreDependencies": ["lodash", 42, true, "react"]}"#)
+                .unwrap();
+        let mut config = empty_config();
+        let mut warnings = Vec::new();
+        migrate_knip(&knip, &mut config, &mut warnings);
+
+        // Non-string elements in array are filtered by string_or_array
+        assert_eq!(
+            config.get("ignoreDependencies").unwrap(),
+            &serde_json::json!(["lodash", "react"])
+        );
+    }
+
+    // -- Exclude with single string (not array) ----------------------------
+
+    #[test]
+    fn migrate_knip_exclude_single_string() {
+        let knip: serde_json::Value = serde_json::from_str(r#"{"exclude": "files"}"#).unwrap();
+        let mut config = empty_config();
+        let mut warnings = Vec::new();
+        migrate_knip(&knip, &mut config, &mut warnings);
+
+        let rules = config.get("rules").unwrap().as_object().unwrap();
+        assert_eq!(rules.get("unused-files").unwrap(), "off");
+    }
+
+    // -- Include with single string (not array) ----------------------------
+
+    #[test]
+    fn migrate_knip_include_single_string() {
+        let knip: serde_json::Value = serde_json::from_str(r#"{"include": "files"}"#).unwrap();
+        let mut config = empty_config();
+        let mut warnings = Vec::new();
+        migrate_knip(&knip, &mut config, &mut warnings);
+
+        let rules = config.get("rules").unwrap().as_object().unwrap();
+        // "files" is included, so it should NOT be in rules
+        assert!(!rules.contains_key("unused-files"));
+        // Everything else should be "off"
+        assert_eq!(rules.get("unused-exports").unwrap(), "off");
+        assert_eq!(rules.get("unused-dependencies").unwrap(), "off");
+    }
 }

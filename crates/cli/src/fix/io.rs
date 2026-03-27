@@ -78,4 +78,151 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].file_name(), "test.ts");
     }
+
+    #[test]
+    fn atomic_write_to_nonexistent_dir_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nonexistent_dir").join("file.ts");
+        let result = atomic_write(&path, b"content");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn atomic_write_empty_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.ts");
+        atomic_write(&path, b"").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
+    }
+
+    #[test]
+    fn atomic_write_binary_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("binary.dat");
+        let data: Vec<u8> = (0..=255).collect();
+        atomic_write(&path, &data).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), data);
+    }
+
+    // -- read_source tests ---------------------------------------------------
+
+    #[test]
+    fn read_source_returns_none_for_path_outside_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        let outside = dir.path().join("outside.ts");
+        std::fs::write(&outside, "content").unwrap();
+
+        let result = read_source(&root, &outside);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn read_source_returns_none_for_nonexistent_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let missing = root.join("missing.ts");
+
+        let result = read_source(root, &missing);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn read_source_detects_lf_line_ending() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let file = root.join("lf.ts");
+        std::fs::write(&file, "line1\nline2\n").unwrap();
+
+        let (content, ending) = read_source(root, &file).unwrap();
+        assert_eq!(ending, "\n");
+        assert_eq!(content, "line1\nline2\n");
+    }
+
+    #[test]
+    fn read_source_detects_crlf_line_ending() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let file = root.join("crlf.ts");
+        std::fs::write(&file, "line1\r\nline2\r\n").unwrap();
+
+        let (content, ending) = read_source(root, &file).unwrap();
+        assert_eq!(ending, "\r\n");
+        assert_eq!(content, "line1\r\nline2\r\n");
+    }
+
+    #[test]
+    fn read_source_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let file = root.join("empty.ts");
+        std::fs::write(&file, "").unwrap();
+
+        let (content, ending) = read_source(root, &file).unwrap();
+        assert_eq!(content, "");
+        assert_eq!(ending, "\n"); // defaults to LF when no line endings found
+    }
+
+    // -- write_fixed_content tests -------------------------------------------
+
+    #[test]
+    fn write_fixed_content_preserves_trailing_newline() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.ts");
+        let lines = vec!["line1".to_string(), "line2".to_string()];
+        let original = "line1\nline2\n";
+
+        write_fixed_content(&path, &lines, "\n", original).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(content, "line1\nline2\n");
+    }
+
+    #[test]
+    fn write_fixed_content_no_trailing_newline_when_original_has_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.ts");
+        let lines = vec!["line1".to_string(), "line2".to_string()];
+        let original = "line1\nline2";
+
+        write_fixed_content(&path, &lines, "\n", original).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(content, "line1\nline2");
+    }
+
+    #[test]
+    fn write_fixed_content_preserves_crlf_trailing_newline() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.ts");
+        let lines = vec!["line1".to_string(), "line2".to_string()];
+        let original = "line1\r\nline2\r\n";
+
+        write_fixed_content(&path, &lines, "\r\n", original).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(content, "line1\r\nline2\r\n");
+    }
+
+    #[test]
+    fn write_fixed_content_single_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.ts");
+        let lines = vec!["only line".to_string()];
+        let original = "only line\n";
+
+        write_fixed_content(&path, &lines, "\n", original).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(content, "only line\n");
+    }
+
+    #[test]
+    fn write_fixed_content_empty_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.ts");
+        let lines: Vec<String> = vec![];
+        let original = "\n";
+
+        write_fixed_content(&path, &lines, "\n", original).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(content, "\n");
+    }
 }

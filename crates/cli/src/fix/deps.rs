@@ -180,4 +180,303 @@ mod tests {
         assert!(!had_error);
         assert!(fixes.is_empty());
     }
+
+    #[test]
+    fn dependency_fix_removes_dev_dependency() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let pkg_path = root.join("package.json");
+        std::fs::write(
+            &pkg_path,
+            r#"{"devDependencies": {"jest": "^29.0.0", "vitest": "^1.0.0"}}"#,
+        )
+        .unwrap();
+
+        let mut results = fallow_core::results::AnalysisResults::default();
+        results
+            .unused_dev_dependencies
+            .push(fallow_core::results::UnusedDependency {
+                package_name: "jest".into(),
+                location: fallow_core::results::DependencyLocation::DevDependencies,
+                path: pkg_path.clone(),
+                line: 3,
+            });
+
+        let mut fixes = Vec::new();
+        let had_error =
+            apply_dependency_fixes(root, &results, &OutputFormat::Human, false, &mut fixes);
+
+        assert!(!had_error);
+        let content = std::fs::read_to_string(&pkg_path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let dev_deps = parsed["devDependencies"].as_object().unwrap();
+        assert!(!dev_deps.contains_key("jest"));
+        assert!(dev_deps.contains_key("vitest"));
+        assert_eq!(fixes.len(), 1);
+        assert_eq!(fixes[0]["location"], "devDependencies");
+        assert_eq!(fixes[0]["applied"], true);
+    }
+
+    #[test]
+    fn dependency_fix_removes_optional_dependency() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let pkg_path = root.join("package.json");
+        std::fs::write(
+            &pkg_path,
+            r#"{"optionalDependencies": {"sharp": "^0.33.0", "canvas": "^2.0.0"}}"#,
+        )
+        .unwrap();
+
+        let mut results = fallow_core::results::AnalysisResults::default();
+        results
+            .unused_optional_dependencies
+            .push(fallow_core::results::UnusedDependency {
+                package_name: "sharp".into(),
+                location: fallow_core::results::DependencyLocation::OptionalDependencies,
+                path: pkg_path.clone(),
+                line: 3,
+            });
+
+        let mut fixes = Vec::new();
+        let had_error =
+            apply_dependency_fixes(root, &results, &OutputFormat::Human, false, &mut fixes);
+
+        assert!(!had_error);
+        let content = std::fs::read_to_string(&pkg_path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let opt_deps = parsed["optionalDependencies"].as_object().unwrap();
+        assert!(!opt_deps.contains_key("sharp"));
+        assert!(opt_deps.contains_key("canvas"));
+    }
+
+    #[test]
+    fn dependency_fix_removes_from_multiple_sections() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let pkg_path = root.join("package.json");
+        std::fs::write(
+            &pkg_path,
+            r#"{"dependencies": {"lodash": "^4.0.0"}, "devDependencies": {"jest": "^29.0.0"}}"#,
+        )
+        .unwrap();
+
+        let mut results = fallow_core::results::AnalysisResults::default();
+        results
+            .unused_dependencies
+            .push(fallow_core::results::UnusedDependency {
+                package_name: "lodash".into(),
+                location: fallow_core::results::DependencyLocation::Dependencies,
+                path: pkg_path.clone(),
+                line: 3,
+            });
+        results
+            .unused_dev_dependencies
+            .push(fallow_core::results::UnusedDependency {
+                package_name: "jest".into(),
+                location: fallow_core::results::DependencyLocation::DevDependencies,
+                path: pkg_path.clone(),
+                line: 5,
+            });
+
+        let mut fixes = Vec::new();
+        let had_error =
+            apply_dependency_fixes(root, &results, &OutputFormat::Human, false, &mut fixes);
+
+        assert!(!had_error);
+        let content = std::fs::read_to_string(&pkg_path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let deps = parsed["dependencies"].as_object().unwrap();
+        assert!(!deps.contains_key("lodash"));
+        let dev_deps = parsed["devDependencies"].as_object().unwrap();
+        assert!(!dev_deps.contains_key("jest"));
+        assert_eq!(fixes.len(), 2);
+    }
+
+    #[test]
+    fn dependency_fix_removes_last_dep_leaves_empty_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let pkg_path = root.join("package.json");
+        std::fs::write(&pkg_path, r#"{"dependencies": {"lodash": "^4.0.0"}}"#).unwrap();
+
+        let mut results = fallow_core::results::AnalysisResults::default();
+        results
+            .unused_dependencies
+            .push(fallow_core::results::UnusedDependency {
+                package_name: "lodash".into(),
+                location: fallow_core::results::DependencyLocation::Dependencies,
+                path: pkg_path.clone(),
+                line: 3,
+            });
+
+        let mut fixes = Vec::new();
+        let had_error =
+            apply_dependency_fixes(root, &results, &OutputFormat::Human, false, &mut fixes);
+
+        assert!(!had_error);
+        let content = std::fs::read_to_string(&pkg_path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let deps = parsed["dependencies"].as_object().unwrap();
+        assert!(deps.is_empty());
+    }
+
+    #[test]
+    fn dependency_fix_dep_not_in_package_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let pkg_path = root.join("package.json");
+        let original = r#"{"dependencies": {"react": "^18.0.0"}}"#;
+        std::fs::write(&pkg_path, original).unwrap();
+
+        let mut results = fallow_core::results::AnalysisResults::default();
+        results
+            .unused_dependencies
+            .push(fallow_core::results::UnusedDependency {
+                package_name: "nonexistent".into(),
+                location: fallow_core::results::DependencyLocation::Dependencies,
+                path: pkg_path,
+                line: 3,
+            });
+
+        let mut fixes = Vec::new();
+        let had_error =
+            apply_dependency_fixes(root, &results, &OutputFormat::Human, false, &mut fixes);
+
+        assert!(!had_error);
+        // No fix was applied (dep not found)
+        assert!(fixes.is_empty());
+    }
+
+    #[test]
+    fn dependency_fix_dry_run_with_human_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let pkg_path = root.join("package.json");
+        let original = r#"{"dependencies": {"lodash": "^4.0.0"}}"#;
+        std::fs::write(&pkg_path, original).unwrap();
+
+        let mut results = fallow_core::results::AnalysisResults::default();
+        results
+            .unused_dependencies
+            .push(fallow_core::results::UnusedDependency {
+                package_name: "lodash".into(),
+                location: fallow_core::results::DependencyLocation::Dependencies,
+                path: pkg_path.clone(),
+                line: 3,
+            });
+
+        let mut fixes = Vec::new();
+        apply_dependency_fixes(root, &results, &OutputFormat::Human, true, &mut fixes);
+
+        // File should not be modified
+        assert_eq!(std::fs::read_to_string(&pkg_path).unwrap(), original);
+        assert_eq!(fixes.len(), 1);
+        assert!(fixes[0].get("applied").is_none());
+    }
+
+    #[test]
+    fn dependency_fix_invalid_json_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let pkg_path = root.join("package.json");
+        std::fs::write(&pkg_path, "not valid json").unwrap();
+
+        let mut results = fallow_core::results::AnalysisResults::default();
+        results
+            .unused_dependencies
+            .push(fallow_core::results::UnusedDependency {
+                package_name: "lodash".into(),
+                location: fallow_core::results::DependencyLocation::Dependencies,
+                path: pkg_path,
+                line: 3,
+            });
+
+        let mut fixes = Vec::new();
+        let had_error =
+            apply_dependency_fixes(root, &results, &OutputFormat::Human, false, &mut fixes);
+
+        // Invalid JSON: the let-chain fails, so this path is just skipped
+        assert!(!had_error);
+        assert!(fixes.is_empty());
+    }
+
+    #[test]
+    fn dependency_fix_nonexistent_package_json_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let pkg_path = root.join("package.json"); // Does not exist
+
+        let mut results = fallow_core::results::AnalysisResults::default();
+        results
+            .unused_dependencies
+            .push(fallow_core::results::UnusedDependency {
+                package_name: "lodash".into(),
+                location: fallow_core::results::DependencyLocation::Dependencies,
+                path: pkg_path,
+                line: 3,
+            });
+
+        let mut fixes = Vec::new();
+        let had_error =
+            apply_dependency_fixes(root, &results, &OutputFormat::Human, false, &mut fixes);
+
+        assert!(!had_error);
+        assert!(fixes.is_empty());
+    }
+
+    #[test]
+    fn dependency_fix_missing_section_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let pkg_path = root.join("package.json");
+        let original = r#"{"name": "test"}"#;
+        std::fs::write(&pkg_path, original).unwrap();
+
+        let mut results = fallow_core::results::AnalysisResults::default();
+        results
+            .unused_dependencies
+            .push(fallow_core::results::UnusedDependency {
+                package_name: "lodash".into(),
+                location: fallow_core::results::DependencyLocation::Dependencies,
+                path: pkg_path,
+                line: 3,
+            });
+
+        let mut fixes = Vec::new();
+        let had_error =
+            apply_dependency_fixes(root, &results, &OutputFormat::Human, false, &mut fixes);
+
+        assert!(!had_error);
+        // No dependencies section -> no fix
+        assert!(fixes.is_empty());
+    }
+
+    #[test]
+    fn dependency_fix_output_has_trailing_newline() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let pkg_path = root.join("package.json");
+        std::fs::write(
+            &pkg_path,
+            r#"{"dependencies": {"lodash": "^4.0.0", "react": "^18.0.0"}}"#,
+        )
+        .unwrap();
+
+        let mut results = fallow_core::results::AnalysisResults::default();
+        results
+            .unused_dependencies
+            .push(fallow_core::results::UnusedDependency {
+                package_name: "lodash".into(),
+                location: fallow_core::results::DependencyLocation::Dependencies,
+                path: pkg_path.clone(),
+                line: 3,
+            });
+
+        let mut fixes = Vec::new();
+        apply_dependency_fixes(root, &results, &OutputFormat::Human, false, &mut fixes);
+
+        let content = std::fs::read_to_string(&pkg_path).unwrap();
+        assert!(content.ends_with('\n'), "output should end with newline");
+    }
 }

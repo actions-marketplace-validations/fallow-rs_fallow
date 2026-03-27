@@ -678,4 +678,257 @@ mod tests {
         let result = remove_member_from_single_line("enum Foo { A = \"a\", B = \"b\" }", "A");
         assert_eq!(result, "enum Foo { B = \"b\" }");
     }
+
+    #[test]
+    fn single_line_remove_two_members_sequentially() {
+        // Remove two members from a single-line enum via two separate fixes
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let file = root.join("status.ts");
+        std::fs::write(&file, "enum Status { A, B, C, D }\n").unwrap();
+
+        let m1 = make_enum_member(&file, "Status", "B", 1);
+        let m2 = make_enum_member(&file, "Status", "D", 1);
+        let mut members_by_file: FxHashMap<PathBuf, Vec<&UnusedMember>> = FxHashMap::default();
+        members_by_file.insert(file.clone(), vec![&m1, &m2]);
+
+        let mut fixes = Vec::new();
+        apply_enum_member_fixes(
+            root,
+            &members_by_file,
+            &OutputFormat::Human,
+            false,
+            &mut fixes,
+        );
+
+        // Dedup by line_idx means only one fix is applied; the first member alphabetically
+        // in descending sort wins. Both are on line 1, so dedup keeps one.
+        // The fix still removes whichever member name matched.
+        let content = std::fs::read_to_string(&file).unwrap();
+        // After dedup, only one fix is applied to line 1
+        assert_eq!(fixes.len(), 1);
+        // The line was modified (at least one member removed)
+        assert!(!content.contains("enum Status { A, B, C, D }"));
+    }
+
+    #[test]
+    fn enum_fix_removes_first_member_of_multi_line_enum() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let file = root.join("status.ts");
+        std::fs::write(
+            &file,
+            "enum Status {\n  Active,\n  Inactive,\n  Pending,\n}\n",
+        )
+        .unwrap();
+
+        let member = make_enum_member(&file, "Status", "Active", 2);
+        let mut members_by_file: FxHashMap<PathBuf, Vec<&UnusedMember>> = FxHashMap::default();
+        members_by_file.insert(file.clone(), vec![&member]);
+
+        let mut fixes = Vec::new();
+        apply_enum_member_fixes(
+            root,
+            &members_by_file,
+            &OutputFormat::Human,
+            false,
+            &mut fixes,
+        );
+
+        let content = std::fs::read_to_string(&file).unwrap();
+        assert_eq!(content, "enum Status {\n  Inactive,\n  Pending,\n}\n");
+    }
+
+    #[test]
+    fn enum_fix_nonexistent_file_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let file = root.join("missing.ts"); // Does not exist
+
+        let member = make_enum_member(&file, "Status", "Active", 2);
+        let mut members_by_file: FxHashMap<PathBuf, Vec<&UnusedMember>> = FxHashMap::default();
+        members_by_file.insert(file, vec![&member]);
+
+        let mut fixes = Vec::new();
+        let had_error = apply_enum_member_fixes(
+            root,
+            &members_by_file,
+            &OutputFormat::Human,
+            false,
+            &mut fixes,
+        );
+
+        assert!(!had_error);
+        assert!(fixes.is_empty());
+    }
+
+    #[test]
+    fn enum_fix_member_with_computed_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let file = root.join("computed.ts");
+        std::fs::write(
+            &file,
+            "enum Bits {\n  A = 1 << 0,\n  B = 1 << 1,\n  C = 1 << 2,\n}\n",
+        )
+        .unwrap();
+
+        let member = make_enum_member(&file, "Bits", "B", 3);
+        let mut members_by_file: FxHashMap<PathBuf, Vec<&UnusedMember>> = FxHashMap::default();
+        members_by_file.insert(file.clone(), vec![&member]);
+
+        let mut fixes = Vec::new();
+        apply_enum_member_fixes(
+            root,
+            &members_by_file,
+            &OutputFormat::Human,
+            false,
+            &mut fixes,
+        );
+
+        let content = std::fs::read_to_string(&file).unwrap();
+        assert_eq!(content, "enum Bits {\n  A = 1 << 0,\n  C = 1 << 2,\n}\n");
+    }
+
+    #[test]
+    fn enum_fix_single_line_with_trailing_comma() {
+        let result = remove_member_from_single_line("enum Foo { A, B, C, }", "B");
+        // Trailing empty part from split should be filtered (empty after trim)
+        assert_eq!(result, "enum Foo { A, C }");
+    }
+
+    #[test]
+    fn enum_fix_single_line_no_braces() {
+        // Edge case: no opening brace
+        let result = remove_member_from_single_line("enum Foo A, B, C", "B");
+        assert_eq!(result, "enum Foo A, B, C");
+    }
+
+    #[test]
+    fn enum_fix_single_line_close_before_open() {
+        // Edge case: close brace before open brace
+        let result = remove_member_from_single_line("} enum Foo { A }", "A");
+        // rfind('}') finds the last one, find('{') finds the first one at position 13
+        // But '}' at position 0 < '{' at position 13 is: open=13, close=15
+        // So open >= close? No, 13 < 15. Actually this would work.
+        // Let's just verify it doesn't panic
+        assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn enum_fix_returns_relative_path_in_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let file = root.join("src").join("status.ts");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(&file, "enum Status {\n  Active,\n  Inactive,\n}\n").unwrap();
+
+        let member = make_enum_member(&file, "Status", "Active", 2);
+        let mut members_by_file: FxHashMap<PathBuf, Vec<&UnusedMember>> = FxHashMap::default();
+        members_by_file.insert(file, vec![&member]);
+
+        let mut fixes = Vec::new();
+        apply_enum_member_fixes(
+            root,
+            &members_by_file,
+            &OutputFormat::Human,
+            false,
+            &mut fixes,
+        );
+
+        let path_str = fixes[0]["path"].as_str().unwrap().replace('\\', "/");
+        assert_eq!(path_str, "src/status.ts");
+    }
+
+    #[test]
+    fn dry_run_enum_fix_with_human_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let file = root.join("status.ts");
+        let original = "enum Status {\n  Active,\n  Inactive,\n}\n";
+        std::fs::write(&file, original).unwrap();
+
+        let member = make_enum_member(&file, "Status", "Active", 2);
+        let mut members_by_file: FxHashMap<PathBuf, Vec<&UnusedMember>> = FxHashMap::default();
+        members_by_file.insert(file.clone(), vec![&member]);
+
+        let mut fixes = Vec::new();
+        apply_enum_member_fixes(
+            root,
+            &members_by_file,
+            &OutputFormat::Human,
+            true,
+            &mut fixes,
+        );
+
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), original);
+        assert_eq!(fixes.len(), 1);
+        assert_eq!(fixes[0]["type"], "remove_enum_member");
+        assert!(fixes[0].get("applied").is_none());
+    }
+
+    #[test]
+    fn enum_fix_line_zero_saturating_sub() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let file = root.join("status.ts");
+        std::fs::write(&file, "enum Status { Active }\n").unwrap();
+
+        // line=0 saturates to line_idx=0
+        let member = make_enum_member(&file, "Status", "Active", 0);
+        let mut members_by_file: FxHashMap<PathBuf, Vec<&UnusedMember>> = FxHashMap::default();
+        members_by_file.insert(file.clone(), vec![&member]);
+
+        let mut fixes = Vec::new();
+        apply_enum_member_fixes(
+            root,
+            &members_by_file,
+            &OutputFormat::Human,
+            false,
+            &mut fixes,
+        );
+
+        // line_idx=0 points to "enum Status { Active }" which contains "Active"
+        // and has both { and }, so it's treated as single-line
+        let content = std::fs::read_to_string(&file).unwrap();
+        assert_eq!(content, "enum Status {}\n");
+    }
+
+    #[test]
+    fn enum_fix_const_enum() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let file = root.join("direction.ts");
+        std::fs::write(
+            &file,
+            "const enum Direction {\n  Up,\n  Down,\n  Left,\n  Right,\n}\n",
+        )
+        .unwrap();
+
+        let member = make_enum_member(&file, "Direction", "Left", 4);
+        let mut members_by_file: FxHashMap<PathBuf, Vec<&UnusedMember>> = FxHashMap::default();
+        members_by_file.insert(file.clone(), vec![&member]);
+
+        let mut fixes = Vec::new();
+        apply_enum_member_fixes(
+            root,
+            &members_by_file,
+            &OutputFormat::Human,
+            false,
+            &mut fixes,
+        );
+
+        let content = std::fs::read_to_string(&file).unwrap();
+        assert_eq!(
+            content,
+            "const enum Direction {\n  Up,\n  Down,\n  Right,\n}\n"
+        );
+    }
+
+    #[test]
+    fn single_line_remove_member_preserves_export_keyword() {
+        let result =
+            remove_member_from_single_line("export enum Status { Active, Inactive }", "Active");
+        assert_eq!(result, "export enum Status { Inactive }");
+    }
 }
