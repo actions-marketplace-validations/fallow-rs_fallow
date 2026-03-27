@@ -1,3 +1,4 @@
+#[cfg(unix)]
 use rmcp::model::*;
 
 use crate::tools::run_fallow;
@@ -5,6 +6,7 @@ use crate::tools::run_fallow;
 use super::super::resolve_binary;
 
 /// Extract the text content from a `CallToolResult`.
+#[cfg(unix)]
 fn extract_text(result: &CallToolResult) -> &str {
     match &result.content[0].raw {
         RawContent::Text(t) => &t.text,
@@ -139,26 +141,22 @@ async fn run_fallow_stderr_is_trimmed_in_error_message() {
 
 // ── resolve_binary ────────────────────────────────────────────────
 
+// Combined into a single test to avoid env var races when tests run in parallel.
 #[test]
 #[expect(unsafe_code)]
-fn resolve_binary_defaults_to_fallow() {
-    // SAFETY: test-only, no concurrent env access in this test binary
+fn resolve_binary_behavior() {
+    // 1. Without FALLOW_BIN, defaults to "fallow" or a sibling path
+    // SAFETY: test-only, sequential env access within this single test function
     unsafe { std::env::remove_var("FALLOW_BIN") };
     let bin = resolve_binary();
-    // Either "fallow" (PATH) or a sibling path — both are valid
     assert!(bin.contains("fallow"));
-}
 
-#[test]
-#[expect(unsafe_code)]
-fn resolve_binary_respects_env_var() {
-    // SAFETY: test-only, no concurrent env access in this test binary.
-    // Both set_var and remove_var are unsafe in Rust 2024 edition due to
-    // potential data races, but cargo test runs each test function serially
-    // within the same thread by default.
+    // 2. With FALLOW_BIN set, uses the custom path
+    // SAFETY: test-only, sequential env access within this single test function
     unsafe { std::env::set_var("FALLOW_BIN", "/custom/path/fallow") };
     let bin = resolve_binary();
     assert_eq!(bin, "/custom/path/fallow");
-    // SAFETY: cleanup after test, same reasoning as above
+
+    // SAFETY: test-only cleanup
     unsafe { std::env::remove_var("FALLOW_BIN") };
 }
