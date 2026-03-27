@@ -550,4 +550,85 @@ mod tests {
             "SearchSelectItem.tsx"
         );
     }
+
+    // ── split_dir_filename ──────────────────────────────────────────
+
+    #[test]
+    fn split_dir_filename_with_directory() {
+        let (dir, file) = split_dir_filename("src/utils/helpers.ts");
+        assert_eq!(dir, "src/utils/");
+        assert_eq!(file, "helpers.ts");
+    }
+
+    #[test]
+    fn split_dir_filename_no_directory() {
+        let (dir, file) = split_dir_filename("index.ts");
+        assert_eq!(dir, "");
+        assert_eq!(file, "index.ts");
+    }
+
+    #[test]
+    fn split_dir_filename_deeply_nested() {
+        let (dir, file) = split_dir_filename("packages/ui/src/components/Button.tsx");
+        assert_eq!(dir, "packages/ui/src/components/");
+        assert_eq!(file, "Button.tsx");
+    }
+
+    #[test]
+    fn split_dir_filename_trailing_slash() {
+        let (dir, file) = split_dir_filename("src/");
+        assert_eq!(dir, "src/");
+        assert_eq!(file, "");
+    }
+
+    #[test]
+    fn split_dir_filename_single_slash() {
+        let (dir, file) = split_dir_filename("/file.ts");
+        assert_eq!(dir, "/");
+        assert_eq!(file, "file.ts");
+    }
+
+    // ── plural ──────────────────────────────────────────────────────
+
+    #[test]
+    fn plural_zero_is_plural() {
+        assert_eq!(plural(0), "s");
+    }
+
+    #[test]
+    fn plural_one_is_singular() {
+        assert_eq!(plural(1), "");
+    }
+
+    #[test]
+    fn plural_many_is_plural() {
+        assert_eq!(plural(2), "s");
+        assert_eq!(plural(100), "s");
+    }
+
+    // ── emit_json ───────────────────────────────────────────────────
+
+    #[test]
+    fn emit_json_returns_success_for_valid_value() {
+        let value = serde_json::json!({"key": "value"});
+        let code = emit_json(&value, "test");
+        assert_eq!(code, ExitCode::SUCCESS);
+    }
+
+    // ── elide_common_prefix edge cases ──────────────────────────────
+
+    #[test]
+    fn elide_common_prefix_empty_base() {
+        assert_eq!(elide_common_prefix("", "src/foo.ts"), "src/foo.ts");
+    }
+
+    #[test]
+    fn elide_common_prefix_empty_target() {
+        assert_eq!(elide_common_prefix("src/foo.ts", ""), "");
+    }
+
+    #[test]
+    fn elide_common_prefix_identical_paths() {
+        assert_eq!(elide_common_prefix("src/foo.ts", "src/foo.ts"), "foo.ts");
+    }
 }
