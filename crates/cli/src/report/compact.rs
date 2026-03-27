@@ -392,8 +392,8 @@ mod tests {
         let results = sample_results(&root);
         let lines = build_compact_lines(&results, &root);
 
-        // 13 issue types, one of each
-        assert_eq!(lines.len(), 13);
+        // 14 issue types, one of each
+        assert_eq!(lines.len(), 14);
 
         // Verify ordering matches output order
         assert!(lines[0].starts_with("unused-file:"));

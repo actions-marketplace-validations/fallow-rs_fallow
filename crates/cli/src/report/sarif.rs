@@ -846,8 +846,8 @@ mod tests {
         let sarif = build_sarif(&results, &root, &RulesConfig::default());
 
         let entries = sarif["runs"][0]["results"].as_array().unwrap();
-        // 13 issues but duplicate_exports has 2 locations => 14 SARIF results
-        assert_eq!(entries.len(), 14);
+        // 14 issues but duplicate_exports has 2 locations => 15 SARIF results
+        assert_eq!(entries.len(), 15);
 
         let rule_ids: Vec<&str> = entries
             .iter()

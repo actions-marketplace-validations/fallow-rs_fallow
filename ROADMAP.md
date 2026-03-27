@@ -4,13 +4,13 @@
 
 AI agents write more code than ever. They rarely clean up after themselves. Every generated file, every scaffolded export, every copied utility accumulates until your codebase is half dead weight.
 
-Fallow is the counterbalance: fast, framework-aware dead code detection that works at the speed AI generates code. One binary, sub-second analysis, 13 issue types, 85 framework plugins, auto-fix, and native integration with the tools agents already use.
+Fallow is the counterbalance: fast, framework-aware dead code detection that works at the speed AI generates code. One binary, sub-second analysis, 14 issue types, 85 framework plugins, auto-fix, and native integration with the tools agents already use.
 
 ---
 
 ## Where we are (v2.2.3)
 
-**Dead code analysis** -- 13 issue types: unused files, exports, types, dependencies, enum/class members, unresolved imports, unlisted deps, duplicate exports, and circular dependencies. 85 framework plugins with auto-detection. Auto-fix for safe removals. Inline suppression. Severity rules (`error` / `warn` / `off`).
+**Dead code analysis** -- 14 issue types: unused files, exports, types, dependencies, enum/class members, unresolved imports, unlisted deps, duplicate exports, circular dependencies, type-only dependencies, and test-only production dependencies. 85 framework plugins with auto-detection. Auto-fix for safe removals. Inline suppression. Severity rules (`error` / `warn` / `off`).
 
 **Code duplication** -- 4 detection modes (strict, mild, weak, semantic) with cross-language TS/JS matching and cross-directory filtering.
 
@@ -79,7 +79,7 @@ Catch unused exports and unresolved imports before they reach CI. Scoped to chan
 ## Competitive context
 
 - **Knip** -- the closest alternative. Both use the Oxc parser, but fallow runs as a native Rust binary with no Node.js runtime -- 3-18x faster in benchmarks. Knip errors out on the largest monorepos (20k+ files).
-- **Biome** -- has module graph infrastructure but hasn't shipped cross-file unused export detection. If they do, they cover ~1 of fallow's 13 issue types.
+- **Biome** -- has module graph infrastructure but hasn't shipped cross-file unused export detection. If they do, they cover ~1 of fallow's 14 issue types.
 - **SonarQube** -- dominates enterprise code quality but is Java-centric, slow on JS/TS, and lacks framework-aware dead code analysis.
 - **AI code review tools** -- complementary. AI generates code faster than humans review it, accelerating the dead code problem. Fallow is the structural analysis layer that AI reviewers lack: it sees the full module graph, not just the diff.
 
