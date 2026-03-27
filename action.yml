@@ -921,80 +921,115 @@ runs:
         fi
 
         # Generate review comments JSON using jq
+        # Inspired by CodeRabbit, Semgrep, and SonarCloud formatting patterns
         cat > "$FALLOW_TMP/review-comments.jq" << 'JQEOF'
         def prefix: $ENV.PREFIX // "";
-        def body_unused_file:
-          "### \u26a0\ufe0f Unused file\n\nThis file is not imported by any module and is unreachable from entry points.\n\n**Action:** Remove this file or import it where needed.";
-        def body_unused_export:
-          "### \u26a0\ufe0f Unused export\n\n\(if .is_re_export then "Re-exported" else "Exported" end) \(if .is_type_only then "type" else "value" end) `\(.export_name)` is never imported by other modules.\n\n**Action:** Remove the `export` keyword or delete the declaration.\n\nIf this is part of a public API, add it to the [entry configuration](https://docs.fallow.tools/configuration/entry-points).";
-        def body_unused_type:
-          "### \u26a0\ufe0f Unused type export\n\n\(if .is_re_export then "Re-exported" else "Exported" end) type `\(.export_name)` is never imported.\n\n**Action:** Remove the `export` keyword if only used internally.";
-        def body_unused_dep:
-          "### \u26a0\ufe0f Unused dependency\n\nPackage `\(.package_name)` is listed in \(.location) but never imported anywhere.\n\n```sh\nnpm uninstall \(.package_name)\n```";
-        def body_unresolved:
-          "### \u26a0\ufe0f Unresolved import\n\nImport `\(.specifier)` could not be resolved.\n\n**Check for:** typos, missing dependencies, or incorrect path aliases.";
-        def body_unlisted:
-          "### \u26a0\ufe0f Unlisted dependency\n\nPackage `\(.package_name)` is imported but not in `package.json`.\n\n```sh\nnpm install \(.package_name)\n```";
-        def body_circular:
-          "### \u26a0\ufe0f Circular dependency\n\nCircular import chain:\n\n```\n\(.files | join(" \u2192 ")) \u2192 \(.files[0])\n```\n\n**Why it matters:** Circular dependencies can cause initialization bugs and make code harder to reason about.\n\n**Action:** Extract shared logic into a separate module.";
-        def body_type_only:
-          "### \u26a0\ufe0f Type-only dependency\n\nPackage `\(.package_name)` is only used via type imports.\n\n**Action:** Move from `dependencies` to `devDependencies` to reduce bundle size.";
-        def body_enum:
-          "### \u26a0\ufe0f Unused enum member\n\nEnum member `\(.parent_name).\(.member_name)` is never referenced.\n\n**Action:** Remove it to keep the enum minimal.";
-        def body_class:
-          "### \u26a0\ufe0f Unused class member\n\nClass member `\(.parent_name).\(.member_name)` is never referenced.\n\n**Action:** Remove it or mark as private.";
-        def body_duplicate:
-          "### \u26a0\ufe0f Duplicate export\n\nExport `\(.export_name)` is defined in \(.locations | length) modules:\n\n\(.locations | map("- `\(.path):\(.line)`") | join("\n"))\n\n**Action:** Keep one canonical location.";
-
+        def footer(rule): "\n\n---\n<sub>\ud83c\udf3f <a href=\"https://docs.fallow.tools/explanations/dead-code#" + rule + "\">" + rule + "</a> \u00b7 Add <code>// fallow-ignore-next-line</code> to suppress</sub>";
         [
-          (.unused_files[]? | {path: (prefix + .path), line: 1, body: body_unused_file}),
-          (.unused_exports[]? | {path: (prefix + .path), line: .line, body: body_unused_export}),
-          (.unused_types[]? | {path: (prefix + .path), line: .line, body: body_unused_type}),
-          (.unused_dependencies[]? | {path: (prefix + .path), line: (if .line > 0 then .line else 1 end), body: body_unused_dep}),
-          (.unused_dev_dependencies[]? | {path: (prefix + .path), line: (if .line > 0 then .line else 1 end), body: body_unused_dep}),
-          (.unused_optional_dependencies[]? | {path: (prefix + .path), line: (if .line > 0 then .line else 1 end), body: body_unused_dep}),
-          (.unused_enum_members[]? | {path: (prefix + .path), line: .line, body: body_enum}),
-          (.unused_class_members[]? | {path: (prefix + .path), line: .line, body: body_class}),
-          (.unresolved_imports[]? | {path: (prefix + .path), line: .line, body: body_unresolved}),
-          (.unlisted_dependencies[]? | (.package_name) as $pkg | .imported_from[]? | {path: (prefix + .path), line: .line, body: {package_name: $pkg} | body_unlisted}),
-          (.duplicate_exports[]? | .locations[0] as $loc | {path: (prefix + $loc.path), line: $loc.line, body: body_duplicate}),
-          (.circular_dependencies[]? | {path: (prefix + .files[0]), line: (if .line > 0 then .line else 1 end), body: body_circular}),
-          (.type_only_dependencies[]? | {path: (prefix + .path), line: (if .line > 0 then .line else 1 end), body: body_type_only})
+          (.unused_files[]? | {
+            path: (prefix + .path),
+            line: 1,
+            body: ":warning: **Unused file**\n\nThis file is not imported by any module and is unreachable from all entry points.\n\n<details>\n<summary>Why this matters</summary>\n\nUnused files increase project size, slow down tooling, and add maintenance burden. They can confuse developers who might think the code is still in use.\n</details>\n\n**Action:** Delete this file or import it where needed.\(footer("unused-files"))"
+          }),
+          (.unused_exports[]? | {
+            path: (prefix + .path),
+            line: .line,
+            body: ":warning: **Unused \(if .is_type_only then "type " else "" end)export**\n\n\(if .is_re_export then "Re-exported" else "Exported" end) \(if .is_type_only then "type" else "value" end) `\(.export_name)` is never imported by other modules.\n\n<details>\n<summary>Why this matters</summary>\n\nUnused exports increase the public API surface, making it harder to refactor safely. They also prevent tree-shaking from removing dead code from production bundles.\n</details>\n\n**Action:** Remove the `export` keyword or delete the declaration.\n\n> If this is part of a public API, add it to the [entry configuration](https://docs.fallow.tools/configuration/overview).\(footer("unused-exports"))"
+          }),
+          (.unused_types[]? | {
+            path: (prefix + .path),
+            line: .line,
+            body: ":warning: **Unused type export**\n\n\(if .is_re_export then "Re-exported" else "Exported" end) type `\(.export_name)` is never imported by other modules.\n\n**Action:** Remove the `export` keyword if only used internally.\(footer("unused-types"))"
+          }),
+          (.unused_dependencies[]? | {
+            path: (prefix + .path),
+            line: (if .line > 0 then .line else 1 end),
+            body: ":warning: **Unused dependency**\n\nPackage `\(.package_name)` is listed in `\(.location)` but never imported anywhere in the project.\n\n```sh\nnpm uninstall \(.package_name)\n```\n\n<details>\n<summary>Why this matters</summary>\n\nUnused dependencies increase install time, bundle size, and attack surface. They also create noise in security audits.\n</details>\(footer("unused-dependencies"))"
+          }),
+          (.unused_dev_dependencies[]? | {
+            path: (prefix + .path),
+            line: (if .line > 0 then .line else 1 end),
+            body: ":warning: **Unused devDependency**\n\nPackage `\(.package_name)` is listed in `devDependencies` but never imported.\n\n```sh\nnpm uninstall \(.package_name)\n```\(footer("unused-dependencies"))"
+          }),
+          (.unused_optional_dependencies[]? | {
+            path: (prefix + .path),
+            line: (if .line > 0 then .line else 1 end),
+            body: ":warning: **Unused optionalDependency**\n\nPackage `\(.package_name)` is listed in `optionalDependencies` but never imported.\n\n```sh\nnpm uninstall \(.package_name)\n```\(footer("unused-dependencies"))"
+          }),
+          (.unused_enum_members[]? | {
+            path: (prefix + .path),
+            line: .line,
+            body: ":warning: **Unused enum member**\n\n`\(.parent_name).\(.member_name)` is never referenced in the codebase.\n\n**Action:** Remove this member to keep the enum minimal.\n\n> Run `fallow fix` to auto-remove unused enum members.\(footer("unused-enum-members"))"
+          }),
+          (.unused_class_members[]? | {
+            path: (prefix + .path),
+            line: .line,
+            body: ":warning: **Unused class member**\n\n`\(.parent_name).\(.member_name)` is never referenced.\n\n**Action:** Remove it or restrict visibility.\(footer("unused-class-members"))"
+          }),
+          (.unresolved_imports[]? | {
+            path: (prefix + .path),
+            line: .line,
+            body: ":x: **Unresolved import**\n\nImport `\(.specifier)` could not be resolved to a file or package.\n\n**Check for:**\n- Typos in the import path\n- Missing dependency in `package.json`\n- Incorrect path alias in `tsconfig.json`\(footer("unresolved-imports"))"
+          }),
+          (.unlisted_dependencies[]? | (.package_name) as $pkg | .imported_from[]? | {
+            path: (prefix + .path),
+            line: .line,
+            body: ":x: **Unlisted dependency**\n\nPackage `\($pkg)` is imported here but not declared in `package.json`. This will fail on a clean install.\n\n```sh\nnpm install \($pkg)\n```\(footer("unlisted-dependencies"))"
+          }),
+          (.duplicate_exports[]? | .locations as $locs | .locations[0] as $loc | {
+            path: (prefix + $loc.path),
+            line: $loc.line,
+            body: ":warning: **Duplicate export**\n\nExport `\(.export_name)` is defined in \($locs | length) modules:\n\n\($locs | map("- `\(.path):\(.line)`") | join("\n"))\n\nThis causes ambiguity for consumers — barrel files may re-export the wrong one.\n\n**Action:** Keep one canonical location and remove the others.\(footer("duplicate-exports"))"
+          }),
+          (.circular_dependencies[]? | {
+            path: (prefix + .files[0]),
+            line: (if .line > 0 then .line else 1 end),
+            body: ":warning: **Circular dependency**\n\nCircular import chain detected:\n\n```\n\(.files | join(" \u2192 ")) \u2192 \(.files[0])\n```\n\n<details>\n<summary>Why this matters</summary>\n\nCircular dependencies can cause:\n- `undefined` values at runtime due to incomplete module initialization\n- Unpredictable behavior depending on import order\n- Difficulty reasoning about data flow\n</details>\n\n**Action:** Extract shared logic into a separate module that both files can import.\(footer("circular-dependencies"))"
+          }),
+          (.type_only_dependencies[]? | {
+            path: (prefix + .path),
+            line: (if .line > 0 then .line else 1 end),
+            body: ":blue_book: **Type-only dependency**\n\nPackage `\(.package_name)` is only used via `import type`. It doesn't need to be a production dependency.\n\n**Action:** Move from `dependencies` to `devDependencies`:\n\n```sh\nnpm uninstall \(.package_name) && npm install -D \(.package_name)\n```\(footer("type-only-dependencies"))"
+          })
         ] | .[:($ENV.MAX | tonumber)]
         JQEOF
 
         cat > "$FALLOW_TMP/review-comments-dupes.jq" << 'JQEOF'
         def prefix: $ENV.PREFIX // "";
+        def short_path: split("/") | if length > 3 then .[-3:] | join("/") else join("/") end;
+        def footer: "\n\n---\n<sub>\ud83c\udf3f <a href=\"https://docs.fallow.tools/explanations/duplication\">code-duplication</a> \u00b7 Add <code>// fallow-ignore-next-line</code> to suppress</sub>";
         [
-          (.clone_groups // [])[] | . as $group |
+          (.clone_families // [])[] | . as $family |
+            ($family.suggestions // []) as $suggestions |
+            $family.groups[]? | . as $group |
             ($group.instances | length) as $count |
-            .instances[0] |
-              ($group.instances[1:] | map("- `\(.file | split("/") | .[-2:] | join("/")):\(.start_line)-\(.end_line)`") | join("\n")) as $others |
+            .instances[]? | . as $inst |
+              ($group.instances | map(select(. != $inst)) | map("- `\(.file | short_path):\(.start_line)-\(.end_line)`") | join("\n")) as $others |
               {
-                path: (prefix + .file),
-                line: .start_line,
-                body: "### \u26a0\ufe0f Code duplication\n\n**\($group.line_count) duplicated lines** (\($group.token_count) tokens, \($count) instances)\n\nAlso found in:\n\($others)\n\n\(if .fragment then "```ts\n\(.fragment[:500])\n```\n\n" else "" end)**Action:** Extract a shared function to eliminate this duplication."
+                path: (prefix + $inst.file),
+                start_line: $inst.start_line,
+                line: $inst.end_line,
+                body: ":warning: **Code duplication**\n\n**\($group.line_count) duplicated lines** \u00b7 \($group.token_count) tokens \u00b7 \($count) instances\n\nAlso found in:\n\($others)\n\n\(if $inst.fragment then "<details>\n<summary>View duplicated code</summary>\n\n```ts\n\($inst.fragment[:800])\n```\n</details>\n\n" else "" end)\(if ($suggestions | length) > 0 then ($suggestions | map(":bulb: **\(.kind):** \(.description)\(if .estimated_savings then " (\(.estimated_savings) lines saved)" else "" end)") | join("\n")) + "\n" else "**Action:** Extract a shared function to eliminate this duplication.\n" end)\(footer)"
               }
         ] | .[:($ENV.MAX | tonumber)]
         JQEOF
 
         cat > "$FALLOW_TMP/review-comments-health.jq" << 'JQEOF'
         def prefix: $ENV.PREFIX // "";
+        def footer: "\n\n---\n<sub>\ud83c\udf3f <a href=\"https://docs.fallow.tools/explanations/health\">complexity</a> \u00b7 Configure thresholds in <code>.fallowrc.json</code></sub>";
         (.summary.max_cyclomatic_threshold // 20) as $cyc_t |
         (.summary.max_cognitive_threshold // 15) as $cog_t |
         [
-          (.findings[]? |
-            {
-              path: (prefix + .path),
-              line: .line,
-              body: "### \u26a0\ufe0f High complexity\n\nFunction `\(.name)` exceeds complexity thresholds:\n\n| Metric | Value | Threshold |\n|:-------|------:|----------:|\n| Cyclomatic | **\(.cyclomatic)** | \($cyc_t) |\n| Cognitive | **\(.cognitive)** | \($cog_t) |\n| Lines | \(.line_count) | — |\n\n**Action:** Split into smaller, focused functions.\(if .exceeded == "cyclomatic" then "\n\n> Cyclomatic complexity counts code paths — high values mean many branches to test." elif .exceeded == "cognitive" then "\n\n> Cognitive complexity measures how hard code is to understand — deep nesting and interleaved logic increase it." else "" end)"
-            }),
-          (.refactoring_targets[:3]? // empty |
-            {
-              path: (prefix + .path),
-              line: 1,
-              body: "### \ud83d\udca1 Refactoring suggestion\n\n**Priority:** \(.priority) | **Effort:** \(.effort) | **Confidence:** \(.confidence)\n\n\(.recommendation)\n\n\(if .factors then (.factors | map("- **\(.metric):** \(.detail // (.value | tostring))") | join("\n")) else "" end)"
-            })
+          (.findings[]? | {
+            path: (prefix + .path),
+            line: .line,
+            body: ":warning: **High complexity**\n\nFunction `\(.name)` exceeds complexity thresholds:\n\n| Metric | Value | Threshold | Status |\n|:-------|------:|----------:|:------:|\n| Cyclomatic | **\(.cyclomatic)** | \($cyc_t) | \(if .exceeded == "cyclomatic" or .exceeded == "both" then ":red_circle:" else ":white_check_mark:" end) |\n| Cognitive | **\(.cognitive)** | \($cog_t) | \(if .exceeded == "cognitive" or .exceeded == "both" then ":red_circle:" else ":white_check_mark:" end) |\n| Lines | \(.line_count) | — | — |\n\n<details>\n<summary>What these metrics mean</summary>\n\n- **Cyclomatic complexity** counts independent code paths (branches, loops, conditions). High values mean many paths to test.\n- **Cognitive complexity** measures how hard code is to understand. Deep nesting, `break`/`continue`, and interleaved logic increase it.\n</details>\n\n**Action:** Split into smaller, focused functions. Consider extracting conditionals into well-named helpers.\(footer)"
+          }),
+          (.refactoring_targets[:5]? // empty | {
+            path: (prefix + .path),
+            line: 1,
+            body: ":bulb: **Refactoring target**\n\n| Priority | Effort | Confidence |\n|:---------|:-------|:-----------|\n| \(.priority) | \(.effort) | \(.confidence) |\n\n\(.recommendation)\n\n\(if .factors then "**Contributing factors:**\n\(.factors | map("- `\(.metric)`: \(.detail // (.value | tostring))") | join("\n"))\n" else "" end)\(if .evidence then "\n<details>\n<summary>Evidence</summary>\n\n\(if .evidence.unused_exports then "Unused exports: " + (.evidence.unused_exports | map("`\(.)`") | join(", ")) + "\n" else "" end)\n</details>\n" else "" end)\(footer)"
+          })
         ] | .[:($ENV.MAX | tonumber)]
         JQEOF
 
