@@ -85,10 +85,11 @@ pick_jq() {
 }
 
 # Detect package manager from lock files
+_ROOT="${FALLOW_ROOT:-.}"
 PKG_MANAGER="npm"
-if [ -f "${FALLOW_ROOT}/pnpm-lock.yaml" ] || [ -f "pnpm-lock.yaml" ]; then
+if [ -f "${_ROOT}/pnpm-lock.yaml" ] || [ -f "pnpm-lock.yaml" ]; then
   PKG_MANAGER="pnpm"
-elif [ -f "${FALLOW_ROOT}/yarn.lock" ] || [ -f "yarn.lock" ]; then
+elif [ -f "${_ROOT}/yarn.lock" ] || [ -f "yarn.lock" ]; then
   PKG_MANAGER="yarn"
 fi
 
@@ -189,7 +190,7 @@ curl -sf \
 DIFF_REFS=$(curl -sf \
   --header "${AUTH_HEADER}" \
   "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/merge_requests/${CI_MERGE_REQUEST_IID}" \
-  | jq -r '.diff_refs // empty' 2>/dev/null)
+  | jq -r '.diff_refs // empty')
 
 if [ -n "$DIFF_REFS" ] && echo "$DIFF_REFS" | jq -e '.base_sha' > /dev/null 2>&1; then
   BASE_SHA=$(echo "$DIFF_REFS" | jq -r '.base_sha')

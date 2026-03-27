@@ -38,10 +38,11 @@ if [ "$FALLOW_ROOT" != "." ]; then
 fi
 
 # Detect package manager from lock files
+_ROOT="${FALLOW_ROOT:-.}"
 PKG_MANAGER="npm"
-if [ -f "${FALLOW_ROOT}/pnpm-lock.yaml" ] || [ -f "pnpm-lock.yaml" ]; then
+if [ -f "${_ROOT}/pnpm-lock.yaml" ] || [ -f "pnpm-lock.yaml" ]; then
   PKG_MANAGER="pnpm"
-elif [ -f "${FALLOW_ROOT}/yarn.lock" ] || [ -f "yarn.lock" ]; then
+elif [ -f "${_ROOT}/yarn.lock" ] || [ -f "yarn.lock" ]; then
   PKG_MANAGER="yarn"
 fi
 
@@ -66,7 +67,10 @@ case "$FALLOW_COMMAND" in
     CHECK=$(jq -f "${ACTION_JQ_DIR}/review-comments-check.jq" "$WORK_DIR/check.json" 2>/dev/null || echo "[]")
     DUPES=$(jq -f "${ACTION_JQ_DIR}/review-comments-dupes.jq" "$WORK_DIR/dupes.json" 2>/dev/null || echo "[]")
     HEALTH=$(jq -f "${ACTION_JQ_DIR}/review-comments-health.jq" "$WORK_DIR/health.json" 2>/dev/null || echo "[]")
-    COMMENTS=$(echo "$CHECK" "$DUPES" "$HEALTH" | jq -s 'add | .[:'"$MAX"']')
+    COMMENTS=$(jq -n \
+      --argjson a "$CHECK" --argjson b "$DUPES" --argjson c "$HEALTH" \
+      --argjson max "$MAX" \
+      '$a + $b + $c | .[:$max]')
     rm -rf "$WORK_DIR" ;;
 esac
 
@@ -85,7 +89,7 @@ ENRICHED=$(echo "$COMMENTS" | jq -c '.[]' | while IFS= read -r comment; do
         # Strip "export " or "export default " from the line
         FIXED_LINE=$(echo "$SOURCE_LINE" | sed 's/^export default //' | sed 's/^export //')
         if [ "$FIXED_LINE" != "$SOURCE_LINE" ]; then
-          SUGGESTION="\n\n\`\`\`suggestion\n${FIXED_LINE}\n\`\`\`"
+          SUGGESTION=$'\n\n```suggestion\n'"${FIXED_LINE}"$'\n```'
           echo "$comment" | jq --arg sug "$SUGGESTION" '.body = .body + $sug'
           continue
         fi
