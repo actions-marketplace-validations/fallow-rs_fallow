@@ -33,6 +33,10 @@ inputs:
   changed-since:
     description: 'Only report issues in files changed since this git ref (requires fetch-depth: 0)'
     required: false
+  auto-changed-since:
+    description: 'Automatically scope analysis to changed files in PR context using the base SHA (requires fetch-depth: 0). Ignored when changed-since is explicitly set.'
+    required: false
+    default: 'true'
   baseline:
     description: 'Path to baseline file for comparison'
     required: false
@@ -457,6 +461,9 @@ runs:
         INPUT_FORMAT: ${{ inputs.format }}
         INPUT_PRODUCTION: ${{ inputs.production }}
         INPUT_CHANGED_SINCE: ${{ inputs.changed-since }}
+        INPUT_AUTO_CHANGED_SINCE: ${{ inputs.auto-changed-since }}
+        PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        EVENT_NAME: ${{ github.event_name }}
         INPUT_BASELINE: ${{ inputs.baseline }}
         INPUT_SAVE_BASELINE: ${{ inputs.save-baseline }}
         INPUT_ARGS: ${{ inputs.args }}
@@ -520,6 +527,13 @@ runs:
 
         # Production mode
         [ "$INPUT_PRODUCTION" = "true" ] && ARGS+=(--production)
+
+        # Auto-detect changed-since in PR context
+        if [ -z "$INPUT_CHANGED_SINCE" ] && [ "$INPUT_AUTO_CHANGED_SINCE" = "true" ] && \
+           [ "$EVENT_NAME" = "pull_request" ] && [ -n "$PR_BASE_SHA" ]; then
+          INPUT_CHANGED_SINCE="$PR_BASE_SHA"
+          echo "::notice::Auto-scoping analysis to files changed since PR base (${PR_BASE_SHA:0:7})"
+        fi
 
         # Common options
         [ -n "$INPUT_CHANGED_SINCE" ] && ARGS+=(--changed-since "$INPUT_CHANGED_SINCE")
