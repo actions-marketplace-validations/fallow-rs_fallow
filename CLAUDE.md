@@ -29,6 +29,10 @@ action/       — GitHub Action (composite)
   jq/         — jq scripts for summaries, annotations, review comments, merging
   scripts/    — Bash scripts (install, analyze, annotate, comment, review, summary)
   tests/      — Unit tests for jq scripts (run: bash action/tests/run.sh)
+ci/           — GitLab CI template and supporting scripts
+  jq/         — jq scripts for GitLab MR formatting (comments, reviews, summaries, merging)
+  scripts/    — Bash scripts (comment.sh, review.sh)
+  tests/      — Unit tests for jq scripts (92 tests, run: bash ci/tests/run.sh)
 tests/
   fixtures/ — Integration test fixtures
 ```

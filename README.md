@@ -116,10 +116,43 @@ fallow:
 - `--format codeclimate` -- GitLab Code Quality inline MR annotations
 - `--format annotations` -- GitHub Actions inline PR annotations (no Action required)
 - `--format json` / `--format markdown` -- for custom workflows
+
+Both the GitHub Action and GitLab CI template auto-detect your package manager (npm/pnpm/yarn) from lock files, so install/uninstall commands in review comments match your project.
+
 Adopt incrementally -- surface issues without blocking CI, then promote when ready:
 
 ```jsonc
 { "rules": { "unused-files": "error", "unused-exports": "warn", "circular-dependencies": "off" } }
+```
+
+### GitLab CI rich MR comments
+
+The GitLab CI template can post rich comments directly on merge requests -- summary comments with collapsible sections and inline review discussions with suggestion blocks.
+
+| Variable | Default | Description |
+|---|---|---|
+| `FALLOW_COMMENT` | `"false"` | Post a summary comment on the MR with collapsible sections per analysis |
+| `FALLOW_REVIEW` | `"false"` | Post inline MR discussions at the relevant lines, with `suggestion` blocks for unused exports |
+| `FALLOW_MAX_COMMENTS` | `"50"` | Maximum number of inline review comments |
+
+In MR pipelines, `--changed-since` is set automatically to scope analysis to changed files. Previous fallow comments are cleaned up on re-runs.
+
+The comment merging pipeline groups unused exports per file and deduplicates clone reports, keeping MR threads readable.
+
+A `GITLAB_TOKEN` (PAT with `api` scope) is recommended for full features (suggestion blocks, cleanup of previous comments). `CI_JOB_TOKEN` works for posting but cannot delete comments from prior runs.
+
+```yaml
+# .gitlab-ci.yml — full example with rich MR comments
+include:
+  - remote: 'https://raw.githubusercontent.com/fallow-rs/fallow/main/ci/gitlab-ci.yml'
+
+fallow:
+  extends: .fallow
+  variables:
+    FALLOW_COMMENT: "true"       # Summary comment with collapsible sections
+    FALLOW_REVIEW: "true"        # Inline discussions with suggestion blocks
+    FALLOW_MAX_COMMENTS: "30"    # Cap inline comments (default: 50)
+    FALLOW_FAIL_ON_ISSUES: "true"
 ```
 
 ## Configuration

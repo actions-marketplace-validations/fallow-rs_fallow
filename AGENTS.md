@@ -358,7 +358,19 @@ fallow:
     FALLOW_COMMENT: "true"
 ```
 
-The template generates GitLab Code Quality reports (CodeClimate format) for inline MR annotations, supports MR comments, and all fallow commands. Variables use `FALLOW_` prefix (e.g., `FALLOW_ROOT`, `FALLOW_FAIL_ON_ISSUES`, `FALLOW_CHANGED_SINCE`). MR comments require a `GITLAB_TOKEN` CI/CD variable (project access token with `api` scope) or enabling job token API access in project settings.
+The template generates GitLab Code Quality reports (CodeClimate format) for inline MR annotations, supports MR comments with rich formatting, inline review discussions with suggestion blocks, and all fallow commands. Key variables:
+
+| Variable | Description |
+|----------|-------------|
+| `FALLOW_COMMAND` | Fallow command to run (`dead-code`, `dupes`, `health`, or bare for all) |
+| `FALLOW_COMMENT` | Set to `true` to post a summary comment on the MR |
+| `FALLOW_REVIEW` | Set to `true` to post inline review discussions on changed lines |
+| `FALLOW_MAX_COMMENTS` | Maximum number of inline review comments per MR (default: 25) |
+| `FALLOW_ROOT` | Project root directory |
+| `FALLOW_FAIL_ON_ISSUES` | Set to `true` to fail the job when issues are found |
+| `FALLOW_CHANGED_SINCE` | Git ref for incremental analysis (auto-set to MR target branch) |
+
+All variables use the `FALLOW_` prefix. MR comments and reviews require a `GITLAB_TOKEN` CI/CD variable (project access token with `api` scope) or enabling job token API access in project settings.
 
 ### Any CI
 
