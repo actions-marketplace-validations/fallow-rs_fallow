@@ -745,6 +745,7 @@ runs:
       if: >-
         always() &&
         inputs.annotations == 'true' &&
+        inputs.review-comments != 'true' &&
         inputs.command != 'fix' &&
         steps.analyze.outputs.issues != '' &&
         steps.analyze.outputs.issues != '0'
@@ -877,6 +878,179 @@ runs:
           else
             echo "Created new PR comment"
           fi
+        fi
+
+    - name: Post review comments
+      if: >-
+        inputs.review-comments == 'true' &&
+        github.event_name == 'pull_request' &&
+        inputs.command != 'fix' &&
+        always() &&
+        steps.analyze.outputs.issues != '' &&
+        steps.analyze.outputs.issues != '0'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        GH_REPO: ${{ github.repository }}
+        FALLOW_COMMAND: ${{ steps.analyze.outputs.command }}
+        FALLOW_ROOT: ${{ inputs.root }}
+        MAX_COMMENTS: ${{ inputs.max-annotations }}
+      run: |
+        MAX="${MAX_COMMENTS:-50}"
+
+        # Dismiss previous fallow review to avoid stacking
+        PREV_REVIEW_ID=$(gh api \
+          "repos/${GH_REPO}/pulls/${PR_NUMBER}/reviews" \
+          --jq '.[] | select(.user.login == "github-actions[bot]" and (.body | contains("<!-- fallow-review -->"))) | .id' \
+          2>/dev/null | head -1)
+        if [ -n "$PREV_REVIEW_ID" ]; then
+          gh api "repos/${GH_REPO}/pulls/${PR_NUMBER}/reviews/${PREV_REVIEW_ID}" \
+            --method PUT --field event=DISMISS \
+            --field message="Superseded by new analysis" > /dev/null 2>&1 || true
+        fi
+
+        # Prefix for paths: if root is not ".", prepend it
+        PREFIX=""
+        if [ "$FALLOW_ROOT" != "." ]; then
+          PREFIX="${FALLOW_ROOT}/"
+        fi
+
+        # Generate review comments JSON using jq
+        cat > "$FALLOW_TMP/review-comments.jq" << 'JQEOF'
+        def prefix: $ENV.PREFIX // "";
+        def body_unused_file:
+          "### \u26a0\ufe0f Unused file\n\nThis file is not imported by any module and is unreachable from entry points.\n\n**Action:** Remove this file or import it where needed.";
+        def body_unused_export:
+          "### \u26a0\ufe0f Unused export\n\n\(if .is_re_export then "Re-exported" else "Exported" end) \(if .is_type_only then "type" else "value" end) `\(.export_name)` is never imported by other modules.\n\n**Action:** Remove the `export` keyword or delete the declaration.\n\nIf this is part of a public API, add it to the [entry configuration](https://docs.fallow.tools/configuration/entry-points).";
+        def body_unused_type:
+          "### \u26a0\ufe0f Unused type export\n\n\(if .is_re_export then "Re-exported" else "Exported" end) type `\(.export_name)` is never imported.\n\n**Action:** Remove the `export` keyword if only used internally.";
+        def body_unused_dep:
+          "### \u26a0\ufe0f Unused dependency\n\nPackage `\(.package_name)` is listed in \(.location) but never imported anywhere.\n\n```sh\nnpm uninstall \(.package_name)\n```";
+        def body_unresolved:
+          "### \u26a0\ufe0f Unresolved import\n\nImport `\(.specifier)` could not be resolved.\n\n**Check for:** typos, missing dependencies, or incorrect path aliases.";
+        def body_unlisted:
+          "### \u26a0\ufe0f Unlisted dependency\n\nPackage `\(.package_name)` is imported but not in `package.json`.\n\n```sh\nnpm install \(.package_name)\n```";
+        def body_circular:
+          "### \u26a0\ufe0f Circular dependency\n\nCircular import chain:\n\n```\n\(.files | join(" \u2192 ")) \u2192 \(.files[0])\n```\n\n**Why it matters:** Circular dependencies can cause initialization bugs and make code harder to reason about.\n\n**Action:** Extract shared logic into a separate module.";
+        def body_type_only:
+          "### \u26a0\ufe0f Type-only dependency\n\nPackage `\(.package_name)` is only used via type imports.\n\n**Action:** Move from `dependencies` to `devDependencies` to reduce bundle size.";
+        def body_enum:
+          "### \u26a0\ufe0f Unused enum member\n\nEnum member `\(.parent_name).\(.member_name)` is never referenced.\n\n**Action:** Remove it to keep the enum minimal.";
+        def body_class:
+          "### \u26a0\ufe0f Unused class member\n\nClass member `\(.parent_name).\(.member_name)` is never referenced.\n\n**Action:** Remove it or mark as private.";
+        def body_duplicate:
+          "### \u26a0\ufe0f Duplicate export\n\nExport `\(.export_name)` is defined in \(.locations | length) modules:\n\n\(.locations | map("- `\(.path):\(.line)`") | join("\n"))\n\n**Action:** Keep one canonical location.";
+
+        [
+          (.unused_files[]? | {path: (prefix + .path), line: 1, body: body_unused_file}),
+          (.unused_exports[]? | {path: (prefix + .path), line: .line, body: body_unused_export}),
+          (.unused_types[]? | {path: (prefix + .path), line: .line, body: body_unused_type}),
+          (.unused_dependencies[]? | {path: (prefix + .path), line: (if .line > 0 then .line else 1 end), body: body_unused_dep}),
+          (.unused_dev_dependencies[]? | {path: (prefix + .path), line: (if .line > 0 then .line else 1 end), body: body_unused_dep}),
+          (.unused_optional_dependencies[]? | {path: (prefix + .path), line: (if .line > 0 then .line else 1 end), body: body_unused_dep}),
+          (.unused_enum_members[]? | {path: (prefix + .path), line: .line, body: body_enum}),
+          (.unused_class_members[]? | {path: (prefix + .path), line: .line, body: body_class}),
+          (.unresolved_imports[]? | {path: (prefix + .path), line: .line, body: body_unresolved}),
+          (.unlisted_dependencies[]? | (.package_name) as $pkg | .imported_from[]? | {path: (prefix + .path), line: .line, body: {package_name: $pkg} | body_unlisted}),
+          (.duplicate_exports[]? | .locations[0] as $loc | {path: (prefix + $loc.path), line: $loc.line, body: body_duplicate}),
+          (.circular_dependencies[]? | {path: (prefix + .files[0]), line: (if .line > 0 then .line else 1 end), body: body_circular}),
+          (.type_only_dependencies[]? | {path: (prefix + .path), line: (if .line > 0 then .line else 1 end), body: body_type_only})
+        ] | .[:($ENV.MAX | tonumber)]
+        JQEOF
+
+        cat > "$FALLOW_TMP/review-comments-dupes.jq" << 'JQEOF'
+        def prefix: $ENV.PREFIX // "";
+        [
+          (.clone_groups // [])[] | . as $group |
+            ($group.instances | length) as $count |
+            .instances[0] |
+              ($group.instances[1:] | map("- `\(.file | split("/") | .[-2:] | join("/")):\(.start_line)-\(.end_line)`") | join("\n")) as $others |
+              {
+                path: (prefix + .file),
+                line: .start_line,
+                body: "### \u26a0\ufe0f Code duplication\n\n**\($group.line_count) duplicated lines** (\($group.token_count) tokens, \($count) instances)\n\nAlso found in:\n\($others)\n\n\(if .fragment then "```ts\n\(.fragment[:500])\n```\n\n" else "" end)**Action:** Extract a shared function to eliminate this duplication."
+              }
+        ] | .[:($ENV.MAX | tonumber)]
+        JQEOF
+
+        cat > "$FALLOW_TMP/review-comments-health.jq" << 'JQEOF'
+        def prefix: $ENV.PREFIX // "";
+        (.summary.max_cyclomatic_threshold // 20) as $cyc_t |
+        (.summary.max_cognitive_threshold // 15) as $cog_t |
+        [
+          (.findings[]? |
+            {
+              path: (prefix + .path),
+              line: .line,
+              body: "### \u26a0\ufe0f High complexity\n\nFunction `\(.name)` exceeds complexity thresholds:\n\n| Metric | Value | Threshold |\n|:-------|------:|----------:|\n| Cyclomatic | **\(.cyclomatic)** | \($cyc_t) |\n| Cognitive | **\(.cognitive)** | \($cog_t) |\n| Lines | \(.line_count) | — |\n\n**Action:** Split into smaller, focused functions.\(if .exceeded == "cyclomatic" then "\n\n> Cyclomatic complexity counts code paths — high values mean many branches to test." elif .exceeded == "cognitive" then "\n\n> Cognitive complexity measures how hard code is to understand — deep nesting and interleaved logic increase it." else "" end)"
+            }),
+          (.refactoring_targets[:3]? // empty |
+            {
+              path: (prefix + .path),
+              line: 1,
+              body: "### \ud83d\udca1 Refactoring suggestion\n\n**Priority:** \(.priority) | **Effort:** \(.effort) | **Confidence:** \(.confidence)\n\n\(.recommendation)\n\n\(if .factors then (.factors | map("- **\(.metric):** \(.detail // (.value | tostring))") | join("\n")) else "" end)"
+            })
+        ] | .[:($ENV.MAX | tonumber)]
+        JQEOF
+
+        # Collect all review comments from the results
+        COMMENTS="[]"
+        case "$FALLOW_COMMAND" in
+          dead-code|check)
+            COMMENTS=$(PREFIX="$PREFIX" MAX="$MAX" jq -f "$FALLOW_TMP/review-comments.jq" fallow-results.json 2>/dev/null || echo "[]") ;;
+          dupes)
+            COMMENTS=$(PREFIX="$PREFIX" MAX="$MAX" jq -f "$FALLOW_TMP/review-comments-dupes.jq" fallow-results.json 2>/dev/null || echo "[]") ;;
+          health)
+            COMMENTS=$(PREFIX="$PREFIX" MAX="$MAX" jq -f "$FALLOW_TMP/review-comments-health.jq" fallow-results.json 2>/dev/null || echo "[]") ;;
+          "")
+            CHECK=$(PREFIX="$PREFIX" MAX="$MAX" jq '.check // empty' fallow-results.json 2>/dev/null | jq -f "$FALLOW_TMP/review-comments.jq" 2>/dev/null || echo "[]")
+            DUPES=$(PREFIX="$PREFIX" MAX="$MAX" jq '.dupes // empty' fallow-results.json 2>/dev/null | jq -f "$FALLOW_TMP/review-comments-dupes.jq" 2>/dev/null || echo "[]")
+            HEALTH=$(PREFIX="$PREFIX" MAX="$MAX" jq '.health // empty' fallow-results.json 2>/dev/null | jq -f "$FALLOW_TMP/review-comments-health.jq" 2>/dev/null || echo "[]")
+            COMMENTS=$(echo "$CHECK" "$DUPES" "$HEALTH" | jq -s 'add | .[:'"$MAX"']') ;;
+        esac
+
+        TOTAL=$(echo "$COMMENTS" | jq 'length')
+        if [ "$TOTAL" -eq 0 ]; then
+          echo "No review comments to post"
+          exit 0
+        fi
+
+        echo "Posting $TOTAL review comments..."
+
+        # Build the review payload
+        REVIEW_BODY="**Fallow** found issues in this PR — see inline comments below.\n\n<!-- fallow-review -->"
+        PAYLOAD=$(echo "$COMMENTS" | jq --arg body "$REVIEW_BODY" '{
+          event: "COMMENT",
+          body: $body,
+          comments: [.[] | {path: .path, line: .line, body: .body}]
+        }')
+
+        # Post the review
+        if ! echo "$PAYLOAD" | gh api \
+          "repos/${GH_REPO}/pulls/${PR_NUMBER}/reviews" \
+          --method POST \
+          --input - > /dev/null 2>&1; then
+          echo "::warning::Failed to post review comments. Some findings may be on lines not in the PR diff."
+
+          # Fallback: post comments one by one, skipping failures
+          POSTED=0
+          for i in $(seq 0 $((TOTAL - 1))); do
+            SINGLE=$(echo "$COMMENTS" | jq --arg body "$REVIEW_BODY" '{
+              event: "COMMENT",
+              body: (if '"$i"' == 0 then $body else "" end),
+              comments: [.['"$i"']]
+            }')
+            if echo "$SINGLE" | gh api \
+              "repos/${GH_REPO}/pulls/${PR_NUMBER}/reviews" \
+              --method POST \
+              --input - > /dev/null 2>&1; then
+              POSTED=$((POSTED + 1))
+            fi
+          done
+          echo "Posted $POSTED of $TOTAL comments individually"
+        else
+          echo "Posted review with $TOTAL inline comments"
         fi
 
     - name: Check threshold
