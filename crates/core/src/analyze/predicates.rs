@@ -1296,4 +1296,366 @@ mod tests {
     fn not_declaration_file_d_ts_in_middle() {
         assert!(!is_declaration_file(std::path::Path::new("my.d.ts.backup")));
     }
+
+    // ---------------------------------------------------------------
+    // is_config_file additional coverage
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn config_file_dotfiles_with_rc() {
+        assert!(is_config_file(std::path::Path::new(".eslintrc.js")));
+        assert!(is_config_file(std::path::Path::new(".prettierrc.cjs")));
+        assert!(is_config_file(std::path::Path::new(".commitlintrc.ts")));
+        assert!(is_config_file(std::path::Path::new(".secretlintrc.json")));
+    }
+
+    #[test]
+    fn config_file_dotfiles_without_rc_not_matched() {
+        // These are dotfiles but don't have the "rc." pattern
+        assert!(!is_config_file(std::path::Path::new(".env")));
+        assert!(!is_config_file(std::path::Path::new(".gitignore")));
+    }
+
+    #[test]
+    fn config_file_standard_patterns() {
+        assert!(is_config_file(std::path::Path::new("jest.config.ts")));
+        assert!(is_config_file(std::path::Path::new("vitest.config.ts")));
+        assert!(is_config_file(std::path::Path::new("webpack.config.js")));
+        assert!(is_config_file(std::path::Path::new("eslint.config.mjs")));
+        assert!(is_config_file(std::path::Path::new("next.config.js")));
+        assert!(is_config_file(std::path::Path::new("tailwind.config.ts")));
+        assert!(is_config_file(std::path::Path::new("drizzle.config.ts")));
+        assert!(is_config_file(std::path::Path::new(
+            "sentry.client.config.ts"
+        )));
+        assert!(is_config_file(std::path::Path::new(
+            "sentry.server.config.ts"
+        )));
+        assert!(is_config_file(std::path::Path::new(
+            "sentry.edge.config.ts"
+        )));
+        assert!(is_config_file(std::path::Path::new(
+            "react-router.config.ts"
+        )));
+    }
+
+    #[test]
+    fn config_file_env_declarations() {
+        assert!(is_config_file(std::path::Path::new("next-env.d.ts")));
+        assert!(is_config_file(std::path::Path::new("env.d.ts")));
+        assert!(is_config_file(std::path::Path::new("vite-env.d.ts")));
+    }
+
+    #[test]
+    fn not_config_file_regular_source() {
+        assert!(!is_config_file(std::path::Path::new("index.ts")));
+        assert!(!is_config_file(std::path::Path::new("App.tsx")));
+        assert!(!is_config_file(std::path::Path::new("utils.js")));
+        assert!(!is_config_file(std::path::Path::new("config.ts"))); // no "." before config
+    }
+
+    #[test]
+    fn config_file_double_dot_prefix_not_matched() {
+        // ".." prefix should not match the dotfile check
+        assert!(!is_config_file(std::path::Path::new("..eslintrc.js")));
+    }
+
+    // ---------------------------------------------------------------
+    // is_barrel_with_reachable_sources additional coverage
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn barrel_with_cjs_exports_not_barrel() {
+        use crate::discover::{DiscoveredFile, EntryPoint, EntryPointSource, FileId};
+        use crate::graph::{ModuleGraph, ReExportEdge};
+        use crate::resolve::ResolvedModule;
+        use rustc_hash::FxHashSet;
+        use std::path::PathBuf;
+
+        let files = vec![
+            DiscoveredFile {
+                id: FileId(0),
+                path: PathBuf::from("/src/entry.ts"),
+                size_bytes: 0,
+            },
+            DiscoveredFile {
+                id: FileId(1),
+                path: PathBuf::from("/src/index.ts"),
+                size_bytes: 0,
+            },
+            DiscoveredFile {
+                id: FileId(2),
+                path: PathBuf::from("/src/source.ts"),
+                size_bytes: 0,
+            },
+        ];
+        let entry_points = vec![EntryPoint {
+            path: PathBuf::from("/src/entry.ts"),
+            source: EntryPointSource::ManualEntry,
+        }];
+        let resolved = files
+            .iter()
+            .map(|f| ResolvedModule {
+                file_id: f.id,
+                path: f.path.clone(),
+                exports: vec![],
+                re_exports: vec![],
+                resolved_imports: vec![],
+                resolved_dynamic_imports: vec![],
+                resolved_dynamic_patterns: vec![],
+                member_accesses: vec![],
+                whole_object_uses: vec![],
+                has_cjs_exports: false,
+                unused_import_bindings: FxHashSet::default(),
+            })
+            .collect::<Vec<_>>();
+        let mut graph = ModuleGraph::build(&resolved, &entry_points, &files);
+
+        // Module 1 has re-exports AND cjs_exports — should NOT be considered a barrel
+        graph.modules[1].re_exports = vec![ReExportEdge {
+            source_file: FileId(2),
+            imported_name: "foo".to_string(),
+            exported_name: "foo".to_string(),
+            is_type_only: false,
+        }];
+        graph.modules[1].has_cjs_exports = true;
+        graph.modules[2].is_reachable = true;
+
+        assert!(
+            !is_barrel_with_reachable_sources(&graph.modules[1], &graph),
+            "module with CJS exports should not be considered a barrel"
+        );
+    }
+
+    #[test]
+    fn barrel_with_local_exports_not_barrel() {
+        use crate::discover::{DiscoveredFile, EntryPoint, EntryPointSource, FileId};
+        use crate::extract::ExportName;
+        use crate::graph::{ExportSymbol, ModuleGraph, ReExportEdge};
+        use crate::resolve::ResolvedModule;
+        use oxc_span::Span;
+        use rustc_hash::FxHashSet;
+        use std::path::PathBuf;
+
+        let files = vec![
+            DiscoveredFile {
+                id: FileId(0),
+                path: PathBuf::from("/src/entry.ts"),
+                size_bytes: 0,
+            },
+            DiscoveredFile {
+                id: FileId(1),
+                path: PathBuf::from("/src/index.ts"),
+                size_bytes: 0,
+            },
+            DiscoveredFile {
+                id: FileId(2),
+                path: PathBuf::from("/src/source.ts"),
+                size_bytes: 0,
+            },
+        ];
+        let entry_points = vec![EntryPoint {
+            path: PathBuf::from("/src/entry.ts"),
+            source: EntryPointSource::ManualEntry,
+        }];
+        let resolved = files
+            .iter()
+            .map(|f| ResolvedModule {
+                file_id: f.id,
+                path: f.path.clone(),
+                exports: vec![],
+                re_exports: vec![],
+                resolved_imports: vec![],
+                resolved_dynamic_imports: vec![],
+                resolved_dynamic_patterns: vec![],
+                member_accesses: vec![],
+                whole_object_uses: vec![],
+                has_cjs_exports: false,
+                unused_import_bindings: FxHashSet::default(),
+            })
+            .collect::<Vec<_>>();
+        let mut graph = ModuleGraph::build(&resolved, &entry_points, &files);
+
+        // Module 1 has re-exports AND a local export with a real span
+        graph.modules[1].re_exports = vec![ReExportEdge {
+            source_file: FileId(2),
+            imported_name: "foo".to_string(),
+            exported_name: "foo".to_string(),
+            is_type_only: false,
+        }];
+        graph.modules[1].exports = vec![ExportSymbol {
+            name: ExportName::Named("localFn".to_string()),
+            is_type_only: false,
+            is_public: false,
+            span: Span::new(10, 30), // real span, not synthetic
+            references: vec![],
+            members: vec![],
+        }];
+        graph.modules[2].is_reachable = true;
+
+        assert!(
+            !is_barrel_with_reachable_sources(&graph.modules[1], &graph),
+            "module with local exports should not be considered a pure barrel"
+        );
+    }
+
+    #[test]
+    fn barrel_with_no_reexports_not_barrel() {
+        use crate::discover::{DiscoveredFile, EntryPoint, EntryPointSource, FileId};
+        use crate::graph::ModuleGraph;
+        use crate::resolve::ResolvedModule;
+        use rustc_hash::FxHashSet;
+        use std::path::PathBuf;
+
+        let files = vec![DiscoveredFile {
+            id: FileId(0),
+            path: PathBuf::from("/src/entry.ts"),
+            size_bytes: 0,
+        }];
+        let entry_points = vec![EntryPoint {
+            path: PathBuf::from("/src/entry.ts"),
+            source: EntryPointSource::ManualEntry,
+        }];
+        let resolved = vec![ResolvedModule {
+            file_id: FileId(0),
+            path: PathBuf::from("/src/entry.ts"),
+            exports: vec![],
+            re_exports: vec![],
+            resolved_imports: vec![],
+            resolved_dynamic_imports: vec![],
+            resolved_dynamic_patterns: vec![],
+            member_accesses: vec![],
+            whole_object_uses: vec![],
+            has_cjs_exports: false,
+            unused_import_bindings: FxHashSet::default(),
+        }];
+        let graph = ModuleGraph::build(&resolved, &entry_points, &files);
+
+        assert!(
+            !is_barrel_with_reachable_sources(&graph.modules[0], &graph),
+            "module with no re-exports should not be a barrel"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // is_path_alias additional coverage
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn path_alias_hash_prefix() {
+        assert!(is_path_alias("#internal/module"));
+        assert!(is_path_alias("#app/utils"));
+    }
+
+    #[test]
+    fn path_alias_tilde_prefix() {
+        assert!(is_path_alias("~/store/auth"));
+    }
+
+    #[test]
+    fn path_alias_at_slash_prefix() {
+        assert!(is_path_alias("@/hooks/useAuth"));
+    }
+
+    #[test]
+    fn path_alias_pascal_case_scope_additional() {
+        assert!(is_path_alias("@Hooks/useAuth"));
+        assert!(is_path_alias("@Components/Button"));
+        assert!(is_path_alias("@Services/api"));
+    }
+
+    #[test]
+    fn not_path_alias_lowercase_scoped_packages() {
+        assert!(!is_path_alias("@angular/core"));
+        assert!(!is_path_alias("@emotion/styled"));
+        assert!(!is_path_alias("@tanstack/react-query"));
+    }
+
+    #[test]
+    fn not_path_alias_bare_packages() {
+        assert!(!is_path_alias("react"));
+        assert!(!is_path_alias("lodash"));
+        assert!(!is_path_alias("express"));
+    }
+
+    // ---------------------------------------------------------------
+    // Angular lifecycle additional methods
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn angular_guard_methods() {
+        assert!(is_angular_lifecycle_method("canActivate"));
+        assert!(is_angular_lifecycle_method("canDeactivate"));
+        assert!(is_angular_lifecycle_method("canActivateChild"));
+        assert!(is_angular_lifecycle_method("canMatch"));
+        assert!(is_angular_lifecycle_method("resolve"));
+        assert!(is_angular_lifecycle_method("intercept"));
+        assert!(is_angular_lifecycle_method("transform"));
+    }
+
+    #[test]
+    fn angular_form_methods() {
+        assert!(is_angular_lifecycle_method("validate"));
+        assert!(is_angular_lifecycle_method("registerOnChange"));
+        assert!(is_angular_lifecycle_method("registerOnTouched"));
+        assert!(is_angular_lifecycle_method("writeValue"));
+        assert!(is_angular_lifecycle_method("setDisabledState"));
+    }
+
+    #[test]
+    fn angular_lifecycle_non_angular_methods() {
+        assert!(!is_angular_lifecycle_method("myCustomMethod"));
+        assert!(!is_angular_lifecycle_method("constructor"));
+        assert!(!is_angular_lifecycle_method("ngOnSomethingCustom"));
+    }
+
+    // ---------------------------------------------------------------
+    // React lifecycle additional methods
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn react_unsafe_lifecycle_methods() {
+        assert!(is_react_lifecycle_method("UNSAFE_componentWillMount"));
+        assert!(is_react_lifecycle_method(
+            "UNSAFE_componentWillReceiveProps"
+        ));
+        assert!(is_react_lifecycle_method("UNSAFE_componentWillUpdate"));
+    }
+
+    #[test]
+    fn react_static_lifecycle_methods() {
+        assert!(is_react_lifecycle_method("getDerivedStateFromProps"));
+        assert!(is_react_lifecycle_method("getDerivedStateFromError"));
+    }
+
+    #[test]
+    fn react_context_methods() {
+        assert!(is_react_lifecycle_method("getChildContext"));
+        assert!(is_react_lifecycle_method("contextType"));
+    }
+
+    #[test]
+    fn react_non_lifecycle_methods() {
+        assert!(!is_react_lifecycle_method("handleClick"));
+        assert!(!is_react_lifecycle_method("constructor"));
+        assert!(!is_react_lifecycle_method("setState"));
+    }
+
+    // ---------------------------------------------------------------
+    // is_virtual_module
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn virtual_module_prefix() {
+        assert!(is_virtual_module("virtual:pwa-register"));
+        assert!(is_virtual_module("virtual:uno.css"));
+        assert!(is_virtual_module("virtual:generated-pages"));
+    }
+
+    #[test]
+    fn not_virtual_module_non_virtual_imports() {
+        assert!(!is_virtual_module("react"));
+        assert!(!is_virtual_module("@virtual/package"));
+        assert!(!is_virtual_module("./virtual-file"));
+    }
 }
