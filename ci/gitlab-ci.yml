@@ -174,8 +174,8 @@ variables:
       fi
 
       # ── Build CLI arguments ──────────────────────────────────────────
-      # Always use --format json internally; CodeClimate report is generated
-      # from JSON output via jq. Users who need other formats can use FALLOW_ARGS.
+      # Primary run uses --format json; CodeClimate report is generated via
+      # a second run with --format codeclimate when FALLOW_CODEQUALITY=true.
       ARGS=()
       [ -n "$FALLOW_COMMAND" ] && ARGS+=("$FALLOW_COMMAND")
       ARGS+=(--root "$FALLOW_ROOT" --quiet --format json)
@@ -274,162 +274,23 @@ variables:
       echo "Found ${ISSUES} issues"
 
       # ── GitLab Code Quality report (CodeClimate format) ──────────────
-      # Generates inline MR annotations — the GitLab equivalent of GitHub
-      # Code Scanning / SARIF integration.
+      # Uses fallow's native --format codeclimate for inline MR annotations.
       if [ "$FALLOW_CODEQUALITY" = "true" ] && [ "$FALLOW_COMMAND" != "fix" ]; then
         echo "Generating Code Quality report..."
-
-        case "$FALLOW_COMMAND" in
-          dead-code|check|"")
-            # For bare invocations, extract the .check sub-object
-            if [ -z "$FALLOW_COMMAND" ]; then
-              jq '.check // {"total_issues": 0}' fallow-results.json > /tmp/fallow-cq-input.json
-            else
-              cp fallow-results.json /tmp/fallow-cq-input.json
-            fi
-
-            cat > /tmp/fallow-cq.jq << 'JQEOF'
-      [
-        (.unused_files // [] | .[] | {
-          description: "Unused file: not reachable from any entry point",
-          check_name: "fallow/unused-file",
-          fingerprint: ("unused-file:" + .path | @base64),
-          severity: "major",
-          location: { path: .path, lines: { begin: 1 } }
-        }),
-        (.unused_exports // [] | .[] | {
-          description: ("Unused export: " + .export_name + (if .is_re_export then " (re-export)" else "" end)),
-          check_name: "fallow/unused-export",
-          fingerprint: ("unused-export:" + .path + ":" + (.line|tostring) + ":" + .export_name | @base64),
-          severity: "major",
-          location: { path: .path, lines: { begin: .line } }
-        }),
-        (.unused_types // [] | .[] | {
-          description: ("Unused type: " + .export_name),
-          check_name: "fallow/unused-type",
-          fingerprint: ("unused-type:" + .path + ":" + (.line|tostring) + ":" + .export_name | @base64),
-          severity: "major",
-          location: { path: .path, lines: { begin: .line } }
-        }),
-        (.unused_dependencies // [] | .[] | {
-          description: ("Unused dependency: " + .package_name),
-          check_name: "fallow/unused-dependency",
-          fingerprint: ("unused-dep:" + .package_name | @base64),
-          severity: "major",
-          location: { path: "package.json", lines: { begin: 1 } }
-        }),
-        (.unused_dev_dependencies // [] | .[] | {
-          description: ("Unused devDependency: " + .package_name),
-          check_name: "fallow/unused-dev-dependency",
-          fingerprint: ("unused-devdep:" + .package_name | @base64),
-          severity: "minor",
-          location: { path: "package.json", lines: { begin: 1 } }
-        }),
-        (.unused_optional_dependencies // [] | .[] | {
-          description: ("Unused optionalDependency: " + .package_name),
-          check_name: "fallow/unused-optional-dependency",
-          fingerprint: ("unused-optdep:" + .package_name | @base64),
-          severity: "minor",
-          location: { path: "package.json", lines: { begin: 1 } }
-        }),
-        (.unresolved_imports // [] | .[] | {
-          description: ("Unresolved import: " + .specifier),
-          check_name: "fallow/unresolved-import",
-          fingerprint: ("unresolved:" + .path + ":" + (.line|tostring) + ":" + .specifier | @base64),
-          severity: "critical",
-          location: { path: .path, lines: { begin: .line } }
-        }),
-        (.unlisted_dependencies // [] | .[] | {
-          description: ("Unlisted dependency: " + .package_name),
-          check_name: "fallow/unlisted-dependency",
-          fingerprint: ("unlisted:" + .package_name | @base64),
-          severity: "major",
-          location: {
-            path: (if (.imported_from | length) > 0 then .imported_from[0].path else "package.json" end),
-            lines: { begin: (if (.imported_from | length) > 0 then .imported_from[0].line else 1 end) }
-          }
-        }),
-        (.unused_enum_members // [] | .[] | {
-          description: ("Unused enum member: " + .parent_name + "." + .member_name),
-          check_name: "fallow/unused-enum-member",
-          fingerprint: ("unused-enum:" + .path + ":" + (.line|tostring) + ":" + .parent_name + "." + .member_name | @base64),
-          severity: "minor",
-          location: { path: .path, lines: { begin: .line } }
-        }),
-        (.unused_class_members // [] | .[] | {
-          description: ("Unused class member: " + .parent_name + "." + .member_name),
-          check_name: "fallow/unused-class-member",
-          fingerprint: ("unused-class:" + .path + ":" + (.line|tostring) + ":" + .parent_name + "." + .member_name | @base64),
-          severity: "minor",
-          location: { path: .path, lines: { begin: .line } }
-        }),
-        (.duplicate_exports // [] | .[] | .locations[0] as $loc | {
-          description: ("Duplicate export: " + .export_name + " exported from multiple modules"),
-          check_name: "fallow/duplicate-export",
-          fingerprint: ("dup-export:" + .export_name + ":" + $loc.path + ":" + ($loc.line|tostring) | @base64),
-          severity: "minor",
-          location: { path: $loc.path, lines: { begin: $loc.line } }
-        }),
-        (.circular_dependencies // [] | .[] | {
-          description: ("Circular dependency: " + (.files | join(" -> "))),
-          check_name: "fallow/circular-dependency",
-          fingerprint: ("circular:" + (.files | join(":")) | @base64),
-          severity: "major",
-          location: { path: .files[0], lines: { begin: 1 } }
-        }),
-        (.type_only_dependencies // [] | .[] | {
-          description: ("Type-only dependency: " + .package_name + " — consider moving to devDependencies"),
-          check_name: "fallow/type-only-dependency",
-          fingerprint: ("type-only:" + .package_name | @base64),
-          severity: "info",
-          location: { path: "package.json", lines: { begin: 1 } }
-        })
-      ]
-      JQEOF
-            jq -f /tmp/fallow-cq.jq /tmp/fallow-cq-input.json > gl-code-quality-report.json 2>/dev/null || echo "[]" > gl-code-quality-report.json
-            ;;
-
-          dupes)
-            cat > /tmp/fallow-cq.jq << 'JQEOF'
-      [
-        if (.clone_families | length) > 0 then
-          (.clone_families // [] | .[] | .groups[0].instances[0] as $inst | {
-            description: ("Code duplication: " + (.total_duplicated_lines|tostring) + " lines across " + (.files|length|tostring) + " files"),
-            check_name: "fallow/code-duplication",
-            fingerprint: ("dupes:" + $inst.file + ":" + ($inst.start_line|tostring) + ":" + (.total_duplicated_lines|tostring) | @base64),
-            severity: "major",
-            location: { path: $inst.file, lines: { begin: $inst.start_line } }
-          })
-        else
-          (.clone_groups // [] | .[] as $g | $g.instances[0] | {
-            description: ("Code duplication: " + ($g.line_count|tostring) + " lines, " + ($g.token_count|tostring) + " tokens"),
-            check_name: "fallow/code-duplication",
-            fingerprint: ("dupes:" + .file + ":" + (.start_line|tostring) + ":" + ($g.token_count|tostring) | @base64),
-            severity: "major",
-            location: { path: .file, lines: { begin: .start_line } }
-          })
-        end
-      ]
-      JQEOF
-            jq -f /tmp/fallow-cq.jq fallow-results.json > gl-code-quality-report.json 2>/dev/null || echo "[]" > gl-code-quality-report.json
-            ;;
-
-          health)
-            cat > /tmp/fallow-cq.jq << 'JQEOF'
-      [
-        (.findings // [] | .[] | {
-          description: ("High complexity: " + .name + " (cyclomatic: " + (.cyclomatic|tostring) + ", cognitive: " + (.cognitive|tostring) + ")"),
-          check_name: "fallow/high-complexity",
-          fingerprint: ("complexity:" + .path + ":" + (.line|tostring) + ":" + .name | @base64),
-          severity: (if .cyclomatic > 30 or .cognitive > 25 then "critical" elif .cyclomatic > 20 or .cognitive > 15 then "major" else "minor" end),
-          location: { path: .path, lines: { begin: .line } }
-        })
-      ]
-      JQEOF
-            jq -f /tmp/fallow-cq.jq fallow-results.json > gl-code-quality-report.json 2>/dev/null || echo "[]" > gl-code-quality-report.json
-            ;;
-        esac
-
+        # Re-run with --format codeclimate instead of json
+        CQ_ARGS=()
+        for arg in "${ARGS[@]}"; do
+          if [ "$arg" = "json" ] && [ "${prev_arg:-}" = "--format" ]; then
+            CQ_ARGS+=("codeclimate")
+          else
+            CQ_ARGS+=("$arg")
+          fi
+          prev_arg="$arg"
+        done
+        if ! fallow "${CQ_ARGS[@]}" "${EXTRA_ARGS[@]}" > gl-code-quality-report.json 2>/dev/null; then
+          # Fallback: empty report on failure
+          echo "[]" > gl-code-quality-report.json
+        fi
         CQ_COUNT=$(jq '. | length' gl-code-quality-report.json 2>/dev/null || echo 0)
         echo "Code Quality report: ${CQ_COUNT} findings"
       else
