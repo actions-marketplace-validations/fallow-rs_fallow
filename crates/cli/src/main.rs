@@ -334,6 +334,7 @@ enum Command {
         /// Save a vital signs snapshot for trend tracking.
         /// Defaults to `.fallow/snapshots/{timestamp}.json` if no path is given.
         /// Forces file-scores and hotspot computation for complete metrics.
+        /// Combine with --score to include the health score in the snapshot.
         #[expect(
             clippy::option_option,
             reason = "clap pattern: None=not passed, Some(None)=flag only, Some(Some(path))=with value"

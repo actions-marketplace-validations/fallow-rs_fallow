@@ -1882,6 +1882,68 @@ fn codeclimate_health_empty_snapshot() {
     insta::assert_snapshot!("codeclimate_health_empty", json_str);
 }
 
+// ── Health score snapshots ──────────────────────────────────────
+
+/// Build a health report with score populated.
+fn health_report_with_score(root: &Path) -> HealthReport {
+    let mut report = sample_health_report(root);
+    report.vital_signs = Some(VitalSigns {
+        dead_file_pct: Some(15.5),
+        dead_export_pct: Some(30.2),
+        avg_cyclomatic: 1.3,
+        p90_cyclomatic: 2,
+        duplication_pct: None,
+        hotspot_count: Some(0),
+        maintainability_avg: Some(85.2),
+        unused_dep_count: Some(22),
+        circular_dep_count: Some(4),
+    });
+    report.health_score = Some(HealthScore {
+        score: 76.9,
+        grade: "B",
+        penalties: HealthScorePenalties {
+            dead_files: Some(3.1),
+            dead_exports: Some(6.0),
+            complexity: 0.0,
+            p90_complexity: 0.0,
+            maintainability: Some(0.0),
+            hotspots: Some(0.0),
+            unused_deps: Some(10.0),
+            circular_deps: Some(4.0),
+        },
+    });
+    report
+}
+
+#[test]
+fn markdown_health_with_score_snapshot() {
+    let root = PathBuf::from("/project");
+    let report = health_report_with_score(&root);
+    let output = build_health_markdown(&report, &root);
+    insta::assert_snapshot!("markdown_health_with_score", output);
+}
+
+#[test]
+fn sarif_health_with_score_snapshot() {
+    let root = PathBuf::from("/project");
+    let report = health_report_with_score(&root);
+    let sarif = build_health_sarif(&report, &root);
+    let json_str = serde_json::to_string_pretty(&sarif).expect("should serialize");
+    insta::assert_snapshot!(
+        "sarif_health_with_score",
+        redact_health_sarif_version(&json_str)
+    );
+}
+
+#[test]
+fn codeclimate_health_with_score_snapshot() {
+    let root = PathBuf::from("/project");
+    let report = health_report_with_score(&root);
+    let cc = build_health_codeclimate(&report, &root);
+    let json_str = serde_json::to_string_pretty(&cc).expect("should serialize");
+    insta::assert_snapshot!("codeclimate_health_with_score", json_str);
+}
+
 // ── Duplication report snapshots ────────────────────────────────
 
 /// Build a sample duplication report for snapshot tests.
