@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.3.0] - 2026-03-27
+
+### Added
+
+- **GitLab CI rich MR comments** — new `FALLOW_COMMENT` and `FALLOW_REVIEW` variables enable rich MR summary comments with collapsible sections and inline review discussions with suggestion blocks, matching the GitHub Action's review quality
+- **GitLab inline review discussions** — posts findings as positioned `DiffNote` discussions on MR diffs with "Why this matters" sections, actionable fix steps, docs links, and one-click suppress instructions
+- **GitLab suggestion blocks** — unused export findings include `suggestion:-0+0` blocks for one-click `export` keyword removal directly in the MR diff
+- **Comment merging pipeline** — groups unused exports per file into single comments, deduplicates clone group findings, drops redundant refactoring targets, and merges same-line findings with numbered headers
+- **Auto `--changed-since` in GitLab MR context** — automatically scopes analysis to changed files using `CI_MERGE_REQUEST_DIFF_BASE_SHA` when running in merge request pipelines
+- **Package manager detection** — review comments and annotations now show correct install/uninstall commands (`npm uninstall`, `pnpm remove`, or `yarn remove`) based on lock file detection
+- **GitLab comment cleanup** — automatically removes previous fallow comments and discussions on re-runs to prevent comment spam
+
+### Changed
+
+- **GitLab CI template modularized** — inline jq scripts extracted to separate files in `ci/jq/` and `ci/scripts/`, downloaded at runtime for maintainability
+- **`diff_refs` from MR API** — GitLab inline discussions now fetch `base_sha`, `start_sha`, `head_sha` from the MR API instead of CI environment variables, matching the ictu-mcp pattern and improving positioning accuracy after rebases
+- **Suggestion block ANSI-C quoting** — GitHub Action suggestion blocks fixed to use `$'...'` quoting for correct newline rendering
+
+### Fixed
+
+- **Subshell variable loss** — review comment counters (`POSTED`/`SKIPPED`) now use process substitution instead of pipe subshell to correctly track posting results
+- **Comment body assignment** — `comment.sh` separates jq execution from string concatenation to correctly detect jq failures
+- **Combined mode null arrays** — `jq -s 'add'` replaced with explicit `jq -n --argjson` to prevent null output when all comment arrays are empty
+
 ## [2.2.3] - 2026-03-27
 
 ### Added
@@ -532,6 +556,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [1.0.3]: https://github.com/fallow-rs/fallow/compare/v1.0.2...v1.0.3
 [1.0.2]: https://github.com/fallow-rs/fallow/compare/v1.0.1...v1.0.2
 [1.0.1]: https://github.com/fallow-rs/fallow/compare/v1.0.0...v1.0.1
+[2.3.0]: https://github.com/fallow-rs/fallow/compare/v2.2.3...v2.3.0
 [2.2.3]: https://github.com/fallow-rs/fallow/compare/v2.2.2...v2.2.3
 [2.2.2]: https://github.com/fallow-rs/fallow/compare/v2.2.1...v2.2.2
 [1.0.0]: https://github.com/fallow-rs/fallow/compare/v0.3.0...v1.0.0
