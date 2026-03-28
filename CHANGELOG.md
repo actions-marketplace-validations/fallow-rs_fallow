@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.5.0] - 2026-03-28
+
+### Added
+
+- **Project health score** (`--score`, `--min-score`) -- a single 0-100 number with letter grade (A/B/C/D/F) aggregated from dead code, complexity, maintainability, hotspots, unused dependencies, and circular dependencies. Penalty breakdown in JSON is reproducible: `100 - sum(penalties) == score`. The score is shown by default in `fallow health` output and automatically included in vital signs snapshots (schema v2).
+- **CI quality gate** (`--min-score N`) -- exit code 1 when the health score drops below a threshold. Pairs with `--score` for a simple "is this codebase healthy enough?" CI check.
+- **Regression detection** (`--fail-on-regression`, `--tolerance`) -- CI gate that compares current issue counts against a previously saved baseline. Supports both absolute (`"5"`) and percentage (`"2%"`) tolerance. Baselines can be saved to a file (`--save-regression-baseline`) or embedded in config.
+
+### Changed
+
+- Health score is included by default when running `fallow health` (no section flags). Use `--score` as a section filter to show only the score.
+- `--save-snapshot` now automatically includes the health score and grade in the snapshot (snapshot schema v2). Old v1 snapshots remain readable.
+
 ## [2.4.0] - 2026-03-27
 
 ### Added
@@ -561,7 +574,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `--changed-since` and `--fail-on-issues` for CI
 - Cross-workspace resolution for npm/yarn/pnpm workspaces
 
-[Unreleased]: https://github.com/fallow-rs/fallow/compare/v2.4.0...HEAD
+[Unreleased]: https://github.com/fallow-rs/fallow/compare/v2.5.0...HEAD
+[2.5.0]: https://github.com/fallow-rs/fallow/compare/v2.4.0...v2.5.0
 [2.4.0]: https://github.com/fallow-rs/fallow/compare/v2.3.1...v2.4.0
 [2.3.1]: https://github.com/fallow-rs/fallow/compare/v2.3.0...v2.3.1
 [2.3.0]: https://github.com/fallow-rs/fallow/compare/v2.2.3...v2.3.0
