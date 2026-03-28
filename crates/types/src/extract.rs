@@ -65,6 +65,10 @@ pub fn compute_line_offsets(source: &str) -> Vec<u32> {
     let mut offsets = vec![0u32];
     for (i, byte) in source.bytes().enumerate() {
         if byte == b'\n' {
+            debug_assert!(
+                u32::try_from(i + 1).is_ok(),
+                "source file exceeds u32::MAX bytes — line offsets would overflow"
+            );
             offsets.push((i + 1) as u32);
         }
     }

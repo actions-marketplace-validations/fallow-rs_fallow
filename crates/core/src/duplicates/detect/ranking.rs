@@ -8,6 +8,10 @@ use super::FileData;
 ///
 /// Returns `ranked_files` where `ranked_files[i]` contains the rank
 /// sequence for `files[i]`.
+///
+/// Uses `u32` ranks, which limits the number of distinct tokens to ~4.3
+/// billion. This is safe for JS/TS codebases (even very large monorepos
+/// have at most tens of millions of tokens).
 pub(super) fn rank_reduce(files: &[FileData]) -> Vec<Vec<u32>> {
     // Single-pass: assign ranks on first encounter. The exact rank values
     // don't matter as long as equal hashes get equal ranks. Skipping the

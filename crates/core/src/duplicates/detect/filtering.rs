@@ -45,6 +45,12 @@ impl IntervalIndex {
 
     /// Insert `[start, end)` into `slot`, merging with the preceding interval
     /// when they overlap.
+    ///
+    /// **Invariant:** callers must insert intervals in ascending `start` order.
+    /// Only the preceding interval is checked for merge; right-neighbor overlap
+    /// is not handled. This is safe because both `remove_token_subsets` (sorted
+    /// by ascending offset) and `remove_line_subsets` (sorted by ascending
+    /// `start_line`) satisfy this invariant.
     fn insert(&mut self, slot: usize, start: usize, end: usize) {
         let intervals = &mut self.slots[slot];
         let idx = intervals.partition_point(|&(s, _)| s < start);
