@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.5.4] - 2026-03-28
+
+### Fixed
+
+- **`Record<Enum, T>` now marks all enum members as used** -- `Record<Status, string>` and nested variants like `Partial<Record<Status, number>>` are now recognized as whole-object enum usage, preventing false unused member reports
+- **`keyof typeof Enum` in mapped types now marks all members as used** -- `{ [K in keyof typeof Direction]: string }` is now detected as a whole-object use pattern
+- **Relaxed `@types/` unlisted dependency check** -- the type-only import check for `@types/<package>` now works regardless of the import's `type` modifier style
+
 ## [2.5.3] - 2026-03-28
 
 ### Fixed
@@ -596,7 +604,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `--changed-since` and `--fail-on-issues` for CI
 - Cross-workspace resolution for npm/yarn/pnpm workspaces
 
-[Unreleased]: https://github.com/fallow-rs/fallow/compare/v2.5.3...HEAD
+[Unreleased]: https://github.com/fallow-rs/fallow/compare/v2.5.4...HEAD
+[2.5.4]: https://github.com/fallow-rs/fallow/compare/v2.5.3...v2.5.4
 [2.5.3]: https://github.com/fallow-rs/fallow/compare/v2.5.2...v2.5.3
 [2.5.2]: https://github.com/fallow-rs/fallow/compare/v2.5.1...v2.5.2
 [2.5.1]: https://github.com/fallow-rs/fallow/compare/v2.5.0...v2.5.1
