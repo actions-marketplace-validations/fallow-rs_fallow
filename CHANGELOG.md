@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.5.1] - 2026-03-28
+
+### Fixed
+
+- **Absolute paths in duplication suggestions** -- refactoring suggestions (e.g. "Extract ... into src/hooks") were printing absolute filesystem paths instead of project-relative paths
+
 ## [2.5.0] - 2026-03-28
 
 ### Added
@@ -574,7 +580,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `--changed-since` and `--fail-on-issues` for CI
 - Cross-workspace resolution for npm/yarn/pnpm workspaces
 
-[Unreleased]: https://github.com/fallow-rs/fallow/compare/v2.5.0...HEAD
+[Unreleased]: https://github.com/fallow-rs/fallow/compare/v2.5.1...HEAD
+[2.5.1]: https://github.com/fallow-rs/fallow/compare/v2.5.0...v2.5.1
 [2.5.0]: https://github.com/fallow-rs/fallow/compare/v2.4.0...v2.5.0
 [2.4.0]: https://github.com/fallow-rs/fallow/compare/v2.3.1...v2.4.0
 [2.3.1]: https://github.com/fallow-rs/fallow/compare/v2.3.0...v2.3.1
