@@ -88,7 +88,9 @@ pub(crate) fn parse_mdx_to_module(file_id: FileId, source: &str, content_hash: u
     info
 }
 
-#[cfg(test)]
+// MDX tests exercise line-based import/export extraction — no unsafe code,
+// no Miri-specific value. Oxc parser tests are additionally ~1000x slower.
+#[cfg(all(test, not(miri)))]
 mod tests {
     use super::*;
 
@@ -331,7 +333,6 @@ mod tests {
     // ── Full parse tests (Oxc parser ~1000x slower under Miri) ──
 
     #[test]
-    #[cfg(not(miri))]
     fn mdx_empty_source_returns_empty_module() {
         let info = parse_mdx_to_module(fallow_types::discover::FileId(0), "", 0);
         assert!(info.imports.is_empty());
@@ -339,7 +340,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(miri))]
     fn mdx_only_prose_returns_empty_module() {
         let info = parse_mdx_to_module(
             fallow_types::discover::FileId(0),

@@ -65,7 +65,9 @@ pub(crate) fn parse_astro_to_module(
     info
 }
 
-#[cfg(test)]
+// Astro tests exercise regex-based frontmatter extraction — no unsafe code,
+// no Miri-specific value. Oxc parser tests are additionally ~1000x slower.
+#[cfg(all(test, not(miri)))]
 mod tests {
     use super::*;
 
@@ -225,7 +227,6 @@ mod tests {
     // ── Full parse tests (Oxc parser ~1000x slower under Miri) ──
 
     #[test]
-    #[cfg(not(miri))]
     fn parse_astro_to_module_no_frontmatter() {
         let info = parse_astro_to_module(FileId(0), "<div>Hello</div>", 42);
         assert!(info.imports.is_empty());
@@ -235,7 +236,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(miri))]
     fn parse_astro_to_module_with_imports() {
         let source = "---\nimport { ref } from 'vue';\nconst x = ref(0);\n---\n<div />";
         let info = parse_astro_to_module(FileId(1), source, 99);
@@ -246,7 +246,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(miri))]
     fn parse_astro_to_module_has_line_offsets() {
         let source = "---\nconst x = 1;\n---\n<div />";
         let info = parse_astro_to_module(FileId(0), source, 0);
@@ -254,7 +253,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(miri))]
     fn parse_astro_to_module_has_suppressions() {
         let source = "---\n// fallow-ignore-file\nconst x = 1;\n---\n<div />";
         let info = parse_astro_to_module(FileId(0), source, 0);

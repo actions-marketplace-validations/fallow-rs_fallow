@@ -55,9 +55,9 @@ jobs:
       - name: fallow-graph
         run: cargo +"$MIRI_TOOLCHAIN" miri test -p fallow-graph --lib --tests -- --skip proptests
 
-      # AST extraction — parser-invoking tests gated with #[cfg(not(miri))]
-      # in source (visitor, lib, complexity, sfc, astro, mdx parse_*_to_module).
-      # Only string-extraction tests run: suppress, css, sfc/astro/mdx extractors, helpers.
+      # AST extraction — modules gated with #[cfg(not(miri))]: visitor, lib,
+      # complexity, sfc, astro, mdx (parser-heavy or regex-heavy, no unsafe code).
+      # Only suppress, css, and visitor/helpers run under Miri.
       # Cache tests skipped (file I/O unsupported under Miri).
       - name: fallow-extract
         run: cargo +"$MIRI_TOOLCHAIN" miri test -p fallow-extract --lib --tests -- --skip cache
