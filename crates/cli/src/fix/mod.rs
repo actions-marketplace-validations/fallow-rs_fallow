@@ -116,7 +116,11 @@ pub fn run_fix(opts: &FixOptions<'_>) -> ExitCode {
     if matches!(opts.output, OutputFormat::Json) {
         let applied_count = fixes
             .iter()
-            .filter(|f| f.get("applied").and_then(|v| v.as_bool()).unwrap_or(false))
+            .filter(|f| {
+                f.get("applied")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+            })
             .count();
         match serde_json::to_string_pretty(&serde_json::json!({
             "dry_run": opts.dry_run,

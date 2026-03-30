@@ -11,7 +11,7 @@ fn css_modules_exports_tracked() {
         .iter()
         .filter_map(|f| f.path.file_name())
         .filter_map(|n| n.to_str())
-        .map(|s| s.to_string())
+        .map(ToString::to_string)
         .collect();
     assert!(
         unused_file_names.contains(&"unused.module.css".to_string()),

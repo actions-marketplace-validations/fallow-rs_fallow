@@ -4,7 +4,7 @@
 //! applies token-level and line-level subset removal, min_lines filter,
 //! and skip_local filter.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -152,7 +152,7 @@ fn build_clone_group(
     if skip_local && instances.len() >= 2 {
         let dirs: FxHashSet<_> = instances
             .iter()
-            .filter_map(|inst| inst.file.parent().map(|p| p.to_path_buf()))
+            .filter_map(|inst| inst.file.parent().map(Path::to_path_buf))
             .collect();
         if dirs.len() < 2 {
             return None;

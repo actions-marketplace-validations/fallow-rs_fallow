@@ -177,7 +177,7 @@ pub fn find_dead_code_full(
             .map(|pr| {
                 pr.virtual_module_prefixes
                     .iter()
-                    .map(|s| s.as_str())
+                    .map(String::as_str)
                     .collect()
             })
             .unwrap_or_default();

@@ -35,7 +35,7 @@ pub(super) fn compute_stats(
         }
     }
 
-    let dup_line_count: usize = file_dup_lines.values().map(|s| s.len()).sum();
+    let dup_line_count: usize = file_dup_lines.values().map(FxHashSet::len).sum();
     let duplication_percentage = if total_lines > 0 {
         (dup_line_count as f64 / total_lines as f64) * 100.0
     } else {

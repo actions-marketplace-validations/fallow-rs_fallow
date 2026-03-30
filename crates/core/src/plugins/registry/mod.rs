@@ -82,7 +82,7 @@ impl PluginRegistry {
             .plugins
             .iter()
             .filter(|p| p.is_enabled_with_deps(&all_deps, root))
-            .map(|p| p.as_ref())
+            .map(AsRef::as_ref)
             .collect();
 
         tracing::info!(
@@ -247,7 +247,7 @@ impl PluginRegistry {
             .plugins
             .iter()
             .filter(|p| p.is_enabled_with_deps(&all_deps, root))
-            .map(|p| p.as_ref())
+            .map(AsRef::as_ref)
             .collect();
 
         tracing::info!(

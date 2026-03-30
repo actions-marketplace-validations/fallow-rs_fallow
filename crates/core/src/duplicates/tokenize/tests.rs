@@ -172,8 +172,8 @@ fn tokenize_jsx_element() {
             matches!(
                 t.kind,
                 TokenKind::Punctuation(
-                        PunctuationType::OpenBracket | PunctuationType::CloseBracket,
-                    )
+                    PunctuationType::OpenBracket | PunctuationType::CloseBracket,
+                )
             )
         })
         .count();
@@ -1309,8 +1309,8 @@ fn tokenize_jsx_fragment() {
             matches!(
                 t.kind,
                 TokenKind::Punctuation(
-                        PunctuationType::OpenBracket | PunctuationType::CloseBracket,
-                    )
+                    PunctuationType::OpenBracket | PunctuationType::CloseBracket,
+                )
             )
         })
         .count();
@@ -1475,9 +1475,8 @@ fn tokenize_expression_statement_appends_semicolon() {
     assert!(
         matches!(
             last.kind,
-            TokenKind::Punctuation(
-                    PunctuationType::Semicolon | PunctuationType::CloseParen,
-                ) | TokenKind::Operator(OperatorType::Comma)
+            TokenKind::Punctuation(PunctuationType::Semicolon | PunctuationType::CloseParen,)
+                | TokenKind::Operator(OperatorType::Comma)
         ),
         "Expression statement should end with semicolon or related punctuation"
     );
@@ -2436,8 +2435,8 @@ fn tokenize_object_with_nested_member_access() {
             matches!(
                 t.kind,
                 TokenKind::Punctuation(
-                        PunctuationType::OpenBracket | PunctuationType::CloseBracket,
-                    )
+                    PunctuationType::OpenBracket | PunctuationType::CloseBracket,
+                )
             )
         })
         .count();

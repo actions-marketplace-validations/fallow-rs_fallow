@@ -13,7 +13,7 @@ pub(super) fn concatenate_with_sentinels(
     ranked_files: &[Vec<u32>],
 ) -> (Vec<i64>, Vec<usize>, Vec<usize>) {
     let sentinel_count = ranked_files.len().saturating_sub(1);
-    let total_len: usize = ranked_files.iter().map(|f| f.len()).sum::<usize>() + sentinel_count;
+    let total_len: usize = ranked_files.iter().map(Vec::len).sum::<usize>() + sentinel_count;
 
     let mut text = Vec::with_capacity(total_len);
     let mut file_of = Vec::with_capacity(total_len);

@@ -41,7 +41,7 @@ fn compile_plugin_matchers(
             globset::Glob::new(file_pat).ok().map(|g| {
                 (
                     g.compile_matcher(),
-                    exports.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                    exports.iter().map(String::as_str).collect::<Vec<_>>(),
                 )
             })
         })

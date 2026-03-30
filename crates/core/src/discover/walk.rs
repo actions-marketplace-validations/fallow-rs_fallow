@@ -105,7 +105,7 @@ pub fn discover_files(config: &ResolvedConfig) -> Vec<DiscoveredFile> {
     let walker = walk_builder.build();
 
     let mut files: Vec<DiscoveredFile> = walker
-        .filter_map(|entry| entry.ok())
+        .filter_map(Result::ok)
         .filter(|entry| entry.file_type().is_some_and(|ft| ft.is_file()))
         .filter(|entry| !config.ignore_patterns.is_match(entry.path()))
         .filter(|entry| {

@@ -35,7 +35,7 @@ pub fn process_static_patterns(
     for (file_pat, exports) in plugin.used_exports() {
         result.used_exports.push((
             file_pat.to_string(),
-            exports.iter().map(|s| s.to_string()).collect(),
+            exports.iter().map(ToString::to_string).collect(),
         ));
     }
     for dep in plugin.tooling_dependencies() {
@@ -57,7 +57,7 @@ pub fn process_external_plugins(
     discovered_files: &[PathBuf],
     result: &mut AggregatedPluginResult,
 ) {
-    let all_dep_refs: Vec<&str> = all_deps.iter().map(|s| s.as_str()).collect();
+    let all_dep_refs: Vec<&str> = all_deps.iter().map(String::as_str).collect();
     for ext in external_plugins {
         let is_active = if let Some(detection) = &ext.detection {
             check_plugin_detection(detection, &all_dep_refs, root, discovered_files)

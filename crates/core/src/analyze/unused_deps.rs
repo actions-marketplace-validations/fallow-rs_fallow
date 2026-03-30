@@ -128,19 +128,19 @@ pub fn find_unused_dependencies(
         .map(|pr| {
             pr.referenced_dependencies
                 .iter()
-                .map(|s| s.as_str())
+                .map(String::as_str)
                 .collect()
         })
         .unwrap_or_default();
 
     // Collect tooling deps from plugins
     let plugin_tooling: FxHashSet<&str> = plugin_result
-        .map(|pr| pr.tooling_dependencies.iter().map(|s| s.as_str()).collect())
+        .map(|pr| pr.tooling_dependencies.iter().map(String::as_str).collect())
         .unwrap_or_default();
 
     // Collect packages used as binaries in package.json scripts
     let script_used: FxHashSet<&str> = plugin_result
-        .map(|pr| pr.script_used_packages.iter().map(|s| s.as_str()).collect())
+        .map(|pr| pr.script_used_packages.iter().map(String::as_str).collect())
         .unwrap_or_default();
 
     // Collect workspace package names — these are internal deps, not npm packages
@@ -150,11 +150,11 @@ pub fn find_unused_dependencies(
     let ignore_deps: FxHashSet<&str> = config
         .ignore_dependencies
         .iter()
-        .map(|s| s.as_str())
+        .map(String::as_str)
         .collect();
 
     // Build per-package set of files that use it (globally)
-    let used_packages: FxHashSet<&str> = graph.package_usage.keys().map(|s| s.as_str()).collect();
+    let used_packages: FxHashSet<&str> = graph.package_usage.keys().map(String::as_str).collect();
 
     let root_pkg_path = config.root.join("package.json");
     let root_pkg_content = read_pkg_json_content(&root_pkg_path);
@@ -374,7 +374,7 @@ pub fn find_test_only_dependencies(
     let ignore_deps: FxHashSet<&str> = config
         .ignore_dependencies
         .iter()
-        .map(|s| s.as_str())
+        .map(String::as_str)
         .collect();
 
     let mut test_only_deps = Vec::new();
@@ -519,7 +519,7 @@ pub fn find_unlisted_dependencies(
         .map(|pr| {
             pr.virtual_module_prefixes
                 .iter()
-                .map(|s| s.as_str())
+                .map(String::as_str)
                 .collect()
         })
         .unwrap_or_default();
@@ -528,7 +528,7 @@ pub fn find_unlisted_dependencies(
     // packages (e.g., Nuxt provides `ofetch`, `h3`, `vue-router` at runtime) that may
     // be imported in user code without being listed in package.json.
     let plugin_tooling: FxHashSet<&str> = plugin_result
-        .map(|pr| pr.tooling_dependencies.iter().map(|s| s.as_str()).collect())
+        .map(|pr| pr.tooling_dependencies.iter().map(String::as_str).collect())
         .unwrap_or_default();
 
     // Build a lookup: FileId -> Vec<(package_name, span_start)> from resolved modules,

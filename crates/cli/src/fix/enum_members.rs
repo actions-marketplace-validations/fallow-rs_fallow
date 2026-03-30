@@ -84,7 +84,7 @@ pub(super) fn apply_enum_member_fixes(
                 }));
             }
         } else {
-            let mut new_lines: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+            let mut new_lines: Vec<String> = lines.iter().map(ToString::to_string).collect();
 
             // Check if this is a single-line enum (opening and closing brace on same line)
             // by looking for patterns like `enum Foo { A, B, C }`

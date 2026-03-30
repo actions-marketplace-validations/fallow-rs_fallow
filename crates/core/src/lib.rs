@@ -731,6 +731,6 @@ pub(crate) fn default_config(root: &Path) -> ResolvedConfig {
 
 fn num_cpus() -> usize {
     std::thread::available_parallelism()
-        .map(|n| n.get())
+        .map(std::num::NonZeroUsize::get)
         .unwrap_or(4)
 }

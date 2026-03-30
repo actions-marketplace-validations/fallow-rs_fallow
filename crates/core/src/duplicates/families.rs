@@ -75,7 +75,7 @@ fn generate_suggestions(
     // Determine if files are cross-directory
     let directories: BTreeSet<_> = file_set
         .iter()
-        .filter_map(|p| p.parent().map(|d| d.to_path_buf()))
+        .filter_map(|p| p.parent().map(Path::to_path_buf))
         .collect();
     let is_cross_directory = directories.len() > 1;
 

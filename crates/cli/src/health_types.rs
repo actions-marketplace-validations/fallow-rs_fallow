@@ -904,7 +904,10 @@ mod tests {
             RecommendationCategory::ExtractComplexFunctions,
             RecommendationCategory::ExtractDependencies,
         ];
-        let labels: Vec<&str> = categories.iter().map(|c| c.compact_label()).collect();
+        let labels: Vec<&str> = categories
+            .iter()
+            .map(RecommendationCategory::compact_label)
+            .collect();
         let unique: rustc_hash::FxHashSet<&&str> = labels.iter().collect();
         assert_eq!(labels.len(), unique.len(), "compact labels must be unique");
     }

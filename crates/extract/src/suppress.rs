@@ -80,7 +80,7 @@ pub fn parse_suppressions_from_source(source: &str) -> Vec<Suppression> {
         let comment_text = if let Some(rest) = trimmed.strip_prefix("//") {
             Some(rest.trim())
         } else if let Some(rest) = trimmed.strip_prefix("/*") {
-            rest.strip_suffix("*/").map(|r| r.trim())
+            rest.strip_suffix("*/").map(str::trim)
         } else {
             None
         };

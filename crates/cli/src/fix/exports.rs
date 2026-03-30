@@ -103,7 +103,7 @@ pub(super) fn apply_export_fixes(
             }
         } else {
             // Apply all fixes to a single in-memory copy
-            let mut new_lines: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+            let mut new_lines: Vec<String> = lines.iter().map(ToString::to_string).collect();
             for fix in &line_fixes {
                 let line = &new_lines[fix.line_idx];
                 let indent = line.len() - line.trim_start().len();

@@ -455,7 +455,7 @@ fn build_circular_deps_section(
         lines.push(String::new());
     }
     push_section_footer(lines, title);
-    if !lines.last().is_some_and(|l| l.is_empty()) {
+    if !lines.last().is_some_and(String::is_empty) {
         lines.push(String::new());
     }
 }

@@ -182,7 +182,7 @@ impl<'a> Visit<'a> for TokenExtractor {
         let raw_str = lit
             .raw
             .as_ref()
-            .map_or_else(|| lit.value.to_string(), |r| r.to_string());
+            .map_or_else(|| lit.value.to_string(), ToString::to_string);
         self.push(TokenKind::NumericLiteral(raw_str), lit.span);
     }
 

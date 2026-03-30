@@ -228,7 +228,7 @@ pub fn build_counts(input: &VitalSignsInput<'_>) -> VitalSignsCounts {
         dead_exports,
         duplicated_lines: None,
         total_lines: None,
-        files_scored: input.file_scores.map(|s| s.len()),
+        files_scored: input.file_scores.map(<[_]>::len),
         total_deps,
     }
 }
