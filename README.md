@@ -91,6 +91,7 @@ fallow health --top 20                    # 20 most complex functions
 fallow health --file-scores               # Per-file maintainability index (0-100)
 fallow health --hotspots                  # Riskiest files (git churn x complexity)
 fallow health --targets                   # Ranked refactoring recommendations
+fallow health --trend                     # Compare against saved snapshot
 fallow health --changed-since main        # Only changed files
 ```
 

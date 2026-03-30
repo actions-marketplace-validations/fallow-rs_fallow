@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.6.0] - 2026-03-30
+
+### Added
+
+- **Trend reporting** (`fallow health --trend`) -- compare current health metrics against the most recent saved snapshot and show per-metric deltas with directional indicators (improving/declining/stable). Tracks 8 metrics: health score, dead files, dead exports, avg cyclomatic complexity, maintainability, unused deps, circular deps, and hotspots. Implies `--score`. Reads from `.fallow/snapshots/` (saved via `--save-snapshot`). Output in all formats: human (colored arrows with all-stable collapse), JSON (structured `health_trend` object with raw counts), compact (grep-friendly `trend:overall:direction=` + per-metric lines), and markdown (table for PR comments). Warns when combined with `--changed-since`. Wired through MCP server and GitHub Action.
+
 ## [2.5.5] - 2026-03-28
 
 ### Fixed
@@ -610,7 +616,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `--changed-since` and `--fail-on-issues` for CI
 - Cross-workspace resolution for npm/yarn/pnpm workspaces
 
-[Unreleased]: https://github.com/fallow-rs/fallow/compare/v2.5.5...HEAD
+[Unreleased]: https://github.com/fallow-rs/fallow/compare/v2.6.0...HEAD
+[2.6.0]: https://github.com/fallow-rs/fallow/compare/v2.5.5...v2.6.0
 [2.5.5]: https://github.com/fallow-rs/fallow/compare/v2.5.4...v2.5.5
 [2.5.4]: https://github.com/fallow-rs/fallow/compare/v2.5.3...v2.5.4
 [2.5.3]: https://github.com/fallow-rs/fallow/compare/v2.5.2...v2.5.3
