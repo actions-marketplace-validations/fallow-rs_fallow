@@ -1159,6 +1159,7 @@ fn unresolved_import_detected() {
         &config,
         &suppressions,
         &[],
+        &[],
         &line_offsets,
     );
 
@@ -1200,6 +1201,7 @@ fn unresolved_virtual_module_not_reported() {
         &resolved_modules,
         &config,
         &suppressions,
+        &[],
         &[],
         &line_offsets,
     );
@@ -1245,12 +1247,82 @@ fn unresolved_import_with_virtual_prefix_not_reported() {
         &config,
         &suppressions,
         &["#"], // Nuxt-style virtual prefix
+        &[],
         &line_offsets,
     );
 
     assert!(
         unresolved.is_empty(),
         "imports matching virtual_prefixes should not be flagged as unresolved"
+    );
+}
+
+#[test]
+fn unresolved_import_suppressed_by_generated_import_pattern() {
+    let resolved_modules = vec![ResolvedModule {
+        file_id: FileId(0),
+        path: PathBuf::from("/project/src/routes/+page.ts"),
+        exports: vec![],
+        re_exports: vec![],
+        resolved_imports: vec![
+            ResolvedImport {
+                info: ImportInfo {
+                    source: "./$types".to_string(),
+                    imported_name: ImportedName::Named("PageLoad".to_string()),
+                    local_name: "PageLoad".to_string(),
+                    is_type_only: true,
+                    span: oxc_span::Span::new(0, 40),
+                    source_span: oxc_span::Span::default(),
+                },
+                target: ResolveResult::Unresolvable("./$types".to_string()),
+            },
+            ResolvedImport {
+                info: ImportInfo {
+                    source: "./$types.js".to_string(),
+                    imported_name: ImportedName::Named("PageLoad".to_string()),
+                    local_name: "PageLoad".to_string(),
+                    is_type_only: true,
+                    span: oxc_span::Span::new(50, 90),
+                    source_span: oxc_span::Span::default(),
+                },
+                target: ResolveResult::Unresolvable("./$types.js".to_string()),
+            },
+            ResolvedImport {
+                info: ImportInfo {
+                    source: "./$types.ts".to_string(),
+                    imported_name: ImportedName::Named("PageLoad".to_string()),
+                    local_name: "PageLoad".to_string(),
+                    is_type_only: true,
+                    span: oxc_span::Span::new(100, 140),
+                    source_span: oxc_span::Span::default(),
+                },
+                target: ResolveResult::Unresolvable("./$types.ts".to_string()),
+            },
+        ],
+        resolved_dynamic_imports: vec![],
+        resolved_dynamic_patterns: vec![],
+        member_accesses: vec![],
+        whole_object_uses: vec![],
+        has_cjs_exports: false,
+        unused_import_bindings: FxHashSet::default(),
+    }];
+
+    let config = test_config(PathBuf::from("/project"));
+    let suppressions: FxHashMap<FileId, &[Suppression]> = FxHashMap::default();
+    let line_offsets: LineOffsetsMap<'_> = FxHashMap::default();
+
+    let unresolved = find_unresolved_imports(
+        &resolved_modules,
+        &config,
+        &suppressions,
+        &[],
+        &["/$types"], // SvelteKit-style generated import
+        &line_offsets,
+    );
+
+    assert!(
+        unresolved.is_empty(),
+        "imports matching generated_import_patterns should not be flagged as unresolved, found: {unresolved:?}"
     );
 }
 
@@ -1294,6 +1366,7 @@ fn unresolved_import_suppressed_by_inline_comment() {
         &resolved_modules,
         &config,
         &suppressions,
+        &[],
         &[],
         &line_offsets,
     );
@@ -1344,6 +1417,7 @@ fn unresolved_import_file_level_suppression() {
         &resolved_modules,
         &config,
         &suppressions,
+        &[],
         &[],
         &line_offsets,
     );
@@ -1401,6 +1475,7 @@ fn resolved_import_not_reported_as_unresolved() {
         &resolved_modules,
         &config,
         &suppressions,
+        &[],
         &[],
         &line_offsets,
     );
@@ -1618,6 +1693,7 @@ fn multiple_unresolved_imports_collected() {
         &config,
         &suppressions,
         &[],
+        &[],
         &line_offsets,
     );
 
@@ -1678,6 +1754,7 @@ fn no_resolved_modules_produces_no_unresolved() {
         &resolved_modules,
         &config,
         &suppressions,
+        &[],
         &[],
         &line_offsets,
     );
@@ -1926,6 +2003,7 @@ fn unresolved_import_not_suppressed_by_wrong_kind() {
         &resolved_modules,
         &config,
         &suppressions,
+        &[],
         &[],
         &line_offsets,
     );

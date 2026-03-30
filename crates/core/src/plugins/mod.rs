@@ -105,6 +105,15 @@ pub trait Plugin: Send + Sync {
         &[]
     }
 
+    /// Import suffixes for build-time generated relative imports.
+    ///
+    /// Unresolved relative imports whose specifier ends with one of these suffixes
+    /// will not be flagged as unresolved. For example, SvelteKit generates
+    /// `./$types` imports in route files — returning `"/$types"` suppresses those.
+    fn generated_import_patterns(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     /// Path alias mappings provided by this framework at build time.
     ///
     /// Returns a list of `(prefix, replacement_dir)` tuples. When an import starting

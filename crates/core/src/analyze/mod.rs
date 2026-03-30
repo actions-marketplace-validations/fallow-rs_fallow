@@ -183,11 +183,20 @@ pub fn find_dead_code_full(
                     .collect()
             })
             .unwrap_or_default();
+        let generated_patterns: Vec<&str> = plugin_result
+            .map(|pr| {
+                pr.generated_import_patterns
+                    .iter()
+                    .map(String::as_str)
+                    .collect()
+            })
+            .unwrap_or_default();
         results.unresolved_imports = find_unresolved_imports(
             resolved_modules,
             config,
             &suppressions_by_file,
             &virtual_prefixes,
+            &generated_patterns,
             &line_offsets_by_file,
         );
     }

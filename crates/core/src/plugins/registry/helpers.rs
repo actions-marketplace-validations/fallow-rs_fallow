@@ -44,6 +44,11 @@ pub fn process_static_patterns(
     for prefix in plugin.virtual_module_prefixes() {
         result.virtual_module_prefixes.push((*prefix).to_string());
     }
+    for pattern in plugin.generated_import_patterns() {
+        result
+            .generated_import_patterns
+            .push((*pattern).to_string());
+    }
     for (prefix, replacement) in plugin.path_aliases(root) {
         result.path_aliases.push((prefix.to_string(), replacement));
     }

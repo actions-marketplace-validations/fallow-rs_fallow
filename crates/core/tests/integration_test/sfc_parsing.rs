@@ -103,3 +103,51 @@ fn svelte_imports_mark_exports_used() {
         "unusedUtil should be detected as unused export, found: {unused_export_names:?}"
     );
 }
+
+// ── SvelteKit virtual modules ─────────────────────────────────
+
+#[test]
+fn sveltekit_virtual_modules_not_unlisted() {
+    let root = fixture_path("sveltekit-project");
+    let config = create_config(root);
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+
+    let unlisted_names: Vec<&str> = results
+        .unlisted_dependencies
+        .iter()
+        .map(|d| d.package_name.as_str())
+        .collect();
+
+    // $app and $env are SvelteKit virtual modules — must not be flagged as unlisted
+    assert!(
+        !unlisted_names.contains(&"$app"),
+        "$app should not be unlisted (virtual module), found: {unlisted_names:?}"
+    );
+    assert!(
+        !unlisted_names.contains(&"$env"),
+        "$env should not be unlisted (virtual module), found: {unlisted_names:?}"
+    );
+}
+
+#[test]
+fn sveltekit_generated_types_not_unresolved() {
+    let root = fixture_path("sveltekit-project");
+    let config = create_config(root);
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+
+    let unresolved_specs: Vec<&str> = results
+        .unresolved_imports
+        .iter()
+        .map(|u| u.specifier.as_str())
+        .collect();
+
+    // ./$types and ./$types.js are SvelteKit generated route types — must not be flagged
+    assert!(
+        !unresolved_specs.contains(&"./$types"),
+        "./$types should not be unresolved (generated import), found: {unresolved_specs:?}"
+    );
+    assert!(
+        !unresolved_specs.contains(&"./$types.js"),
+        "./$types.js should not be unresolved (generated import), found: {unresolved_specs:?}"
+    );
+}

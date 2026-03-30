@@ -564,10 +564,12 @@ pub fn find_unlisted_dependencies(
         if plugin_tooling.contains(package_name.as_str()) {
             continue;
         }
-        if virtual_prefixes
-            .iter()
-            .any(|prefix| package_name.starts_with(prefix))
-        {
+        if virtual_prefixes.iter().any(|prefix| {
+            package_name.starts_with(prefix)
+                || prefix
+                    .strip_suffix('/')
+                    .is_some_and(|base| package_name == base)
+        }) {
             continue;
         }
         // Quick check: if listed in any root or workspace deps, skip
@@ -626,6 +628,7 @@ pub fn find_unresolved_imports(
     _config: &ResolvedConfig,
     suppressions_by_file: &FxHashMap<FileId, &[Suppression]>,
     virtual_prefixes: &[&str],
+    generated_patterns: &[&str],
     line_offsets_by_file: &LineOffsetsMap<'_>,
 ) -> Vec<UnresolvedImport> {
     let mut unresolved = Vec::new();
@@ -640,11 +643,27 @@ pub fn find_unresolved_imports(
                 }
                 // Skip virtual module imports provided by active framework plugins
                 // (e.g., Nuxt's #imports, #app, #components, #build).
+                // Note: `spec` is the full import specifier (e.g., `$app/navigation`),
+                // not the extracted package name, so trailing-slash prefixes like `$app/`
+                // always match when the import has a subpath.
                 if virtual_prefixes
                     .iter()
                     .any(|prefix| spec.starts_with(prefix))
                 {
                     continue;
+                }
+                // Skip build-time generated relative imports from framework plugins
+                // (e.g., SvelteKit's `./$types` / `./$types.js` route type imports).
+                // Strip `.js` or `.ts` extension before matching so `/$types.js` and
+                // `/$types.ts` both match the `/$types` pattern.
+                if !generated_patterns.is_empty() {
+                    let bare = spec
+                        .strip_suffix(".js")
+                        .or_else(|| spec.strip_suffix(".ts"))
+                        .unwrap_or(spec);
+                    if generated_patterns.iter().any(|pat| bare.ends_with(pat)) {
+                        continue;
+                    }
                 }
 
                 let (line, col) = byte_offset_to_line_col(

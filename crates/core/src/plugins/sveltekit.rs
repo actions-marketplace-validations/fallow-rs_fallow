@@ -62,6 +62,11 @@ const TOOLING_DEPENDENCIES: &[&str] = &[
 /// `$service-worker` provides service worker build info.
 const VIRTUAL_MODULE_PREFIXES: &[&str] = &["$app/", "$env/", "$lib/", "$service-worker"];
 
+/// Import suffixes for build-time generated relative imports.
+/// SvelteKit generates `./$types` (and `./$types.js`/`./$types.ts`) in route files
+/// containing type definitions for `PageLoad`, `PageData`, etc.
+const GENERATED_IMPORT_PATTERNS: &[&str] = &["/$types"];
+
 // SvelteKit route convention exports
 const PAGE_EXPORTS: &[&str] = &["default"];
 const PAGE_LOAD_EXPORTS: &[&str] = &[
@@ -117,6 +122,10 @@ impl Plugin for SvelteKitPlugin {
 
     fn virtual_module_prefixes(&self) -> &'static [&'static str] {
         VIRTUAL_MODULE_PREFIXES
+    }
+
+    fn generated_import_patterns(&self) -> &'static [&'static str] {
+        GENERATED_IMPORT_PATTERNS
     }
 
     fn path_aliases(&self, _root: &Path) -> Vec<(&'static str, String)> {
@@ -230,5 +239,15 @@ mod tests {
         assert!(prefixes.contains(&"$env/"));
         assert!(prefixes.contains(&"$lib/"));
         assert!(prefixes.contains(&"$service-worker"));
+    }
+
+    #[test]
+    fn generated_import_patterns_includes_types() {
+        let plugin = SvelteKitPlugin;
+        let patterns = plugin.generated_import_patterns();
+        assert!(
+            patterns.contains(&"/$types"),
+            "should include /$types for SvelteKit generated route types"
+        );
     }
 }
