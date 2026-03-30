@@ -119,7 +119,7 @@ fallow:
 - `--format sarif` -- upload to GitHub Code Scanning
 - `--format codeclimate` -- GitLab Code Quality inline MR annotations
 - `--format annotations` -- GitHub Actions inline PR annotations (no Action required)
-- `--format json` / `--format markdown` -- for custom workflows
+- `--format json` / `--format markdown` -- for custom workflows (JSON includes machine-actionable `actions` per issue)
 
 Both the GitHub Action and GitLab CI template auto-detect your package manager (npm/pnpm/yarn) from lock files, so install/uninstall commands in review comments match your project.
 
@@ -182,7 +182,7 @@ Works out of the box. When you need to customize, create `.fallowrc.json` or run
 }
 ```
 
-TOML also supported (`fallow init --toml`). Migrating from knip or jscpd? Run `fallow migrate`.
+TOML also supported (`fallow init --toml`). Scaffold a pre-commit hook with `fallow init --hooks`. Migrating from knip or jscpd? Run `fallow migrate`.
 
 See the [full configuration reference](https://docs.fallow.tools/configuration/overview) for all options.
 
@@ -205,6 +205,7 @@ See the [full configuration reference](https://docs.fallow.tools/configuration/o
 - **VS Code extension** -- tree views, status bar, one-click fixes, auto-download LSP binary ([Marketplace](https://github.com/fallow-rs/fallow/tree/main/editors/vscode))
 - **LSP server** -- real-time diagnostics, hover info, code actions, Code Lens with reference counts
 - **MCP server** -- AI agent integration for Claude Code, Cursor, Windsurf ([fallow-skills](https://github.com/fallow-rs/fallow-skills))
+- **JSON `actions` array** -- every issue in `--format json` output includes fix suggestions with `auto_fixable` flag, so agents can self-correct
 
 ## Performance
 
