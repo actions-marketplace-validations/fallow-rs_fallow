@@ -10,7 +10,7 @@ use std::time::Instant;
 
 use tokio::sync::{Mutex, RwLock};
 use tower_lsp::jsonrpc::Result;
-#[allow(clippy::wildcard_imports)] // many LSP types used
+#[expect(clippy::wildcard_imports, reason = "many LSP types used")]
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
 

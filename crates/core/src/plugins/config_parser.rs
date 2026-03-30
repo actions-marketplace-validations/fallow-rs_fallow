@@ -14,7 +14,7 @@
 use std::path::Path;
 
 use oxc_allocator::Allocator;
-#[allow(clippy::wildcard_imports)] // many AST types used
+#[expect(clippy::wildcard_imports, reason = "many AST types used")]
 use oxc_ast::ast::*;
 use oxc_parser::Parser;
 use oxc_span::SourceType;

@@ -3,7 +3,7 @@
 //! The `TokenExtractor` walks an Oxc AST and emits a `Vec<SourceToken>` suitable
 //! for suffix-array based clone detection.
 
-#[allow(clippy::wildcard_imports)] // many AST types used
+#[expect(clippy::wildcard_imports, reason = "many AST types used")]
 use oxc_ast::ast::*;
 use oxc_ast_visit::Visit;
 use oxc_ast_visit::walk;

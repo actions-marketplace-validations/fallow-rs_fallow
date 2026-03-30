@@ -11,7 +11,7 @@
 //! Counts control flow breaks weighted by nesting depth. Boolean operator sequences
 //! add +1 per operator kind change. Optional chaining (`?.`) is NOT counted (Principle 3).
 
-#[allow(clippy::wildcard_imports)] // many AST types used
+#[expect(clippy::wildcard_imports, reason = "many AST types used")]
 use oxc_ast::ast::*;
 use oxc_ast_visit::Visit;
 use oxc_ast_visit::walk;
