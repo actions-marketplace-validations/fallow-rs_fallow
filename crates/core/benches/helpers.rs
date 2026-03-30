@@ -40,6 +40,9 @@ pub fn create_synthetic_project(
     create_synthetic_project_with_cache(name, file_count, true)
 }
 
+/// # Panics
+///
+/// Panics if temporary directory creation or file writes fail.
 #[must_use]
 pub fn create_synthetic_project_with_cache(
     name: &str,
@@ -88,6 +91,9 @@ export const helper{i} = () => value{i} + 1;
 
 /// Generate a synthetic project with duplicated code blocks for dupe detection benchmarks.
 /// ~40% of files contain shared code blocks (each ~30 lines), rest is unique.
+/// # Panics
+///
+/// Panics if temporary directory creation or file writes fail.
 #[must_use]
 #[allow(dead_code)] // Used by large_analysis bench target
 pub fn create_dupe_project(

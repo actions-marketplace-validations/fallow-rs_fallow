@@ -17,6 +17,10 @@ impl AnalysisProgress {
     }
 
     /// Create a spinner for a stage.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the progress template string is invalid (compile-time constant).
     #[must_use]
     pub fn stage_spinner(&self, message: &str) -> ProgressBar {
         if !self.enabled {
@@ -35,6 +39,10 @@ impl AnalysisProgress {
     }
 
     /// Create a progress bar for file processing.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the progress template string is invalid (compile-time constant).
     #[must_use]
     pub fn file_progress(&self, total: u64, message: &str) -> ProgressBar {
         if !self.enabled {

@@ -19,6 +19,10 @@ impl ModuleGraph {
     ///
     /// Returns cycles sorted by length (shortest first), with files within each
     /// cycle sorted by path for deterministic output.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal file-to-path lookup is inconsistent with the module list.
     #[must_use]
     #[expect(clippy::excessive_nesting)]
     #[expect(

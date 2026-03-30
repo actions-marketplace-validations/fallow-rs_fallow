@@ -67,6 +67,10 @@ fn is_allowed_hidden(entry: &ignore::DirEntry) -> bool {
 }
 
 /// Discover all source files in the project.
+///
+/// # Panics
+///
+/// Panics if the file type glob or progress template is invalid (compile-time constants).
 #[expect(
     clippy::cast_possible_truncation,
     reason = "file count is bounded by project size, well under u32::MAX"
