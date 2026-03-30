@@ -405,4 +405,387 @@ mod tests {
         assert!((max_w).abs() < f64::EPSILON);
         assert!((max_d).abs() < f64::EPSILON);
     }
+
+    // --- compute_hotspot_score: additional edge cases ---
+
+    #[test]
+    fn hotspot_score_high_churn_low_complexity() {
+        // File at maximum churn but only 10% complexity -> 10.0
+        let score = compute_hotspot_score(10.0, 10.0, 0.1, 1.0);
+        assert!((score - 10.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn hotspot_score_low_churn_high_complexity() {
+        // File at 10% churn but maximum complexity -> 10.0
+        let score = compute_hotspot_score(1.0, 10.0, 2.0, 2.0);
+        assert!((score - 10.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn hotspot_score_rounding() {
+        // 0.33 * 0.33 * 100 = 10.89 -> should round to one decimal
+        let score = compute_hotspot_score(1.0, 3.0, 1.0, 3.0);
+        // 1/3 * 1/3 * 100 = 11.111... -> rounded to 11.1
+        assert!((score - 11.1).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn hotspot_score_very_small_values() {
+        // Both values are tiny fractions of their maxima
+        let score = compute_hotspot_score(0.01, 100.0, 0.001, 10.0);
+        // 0.0001 * 0.0001 * 100 = 0.001 -> rounds to 0.0
+        assert!((score).abs() < 0.1);
+    }
+
+    #[test]
+    fn hotspot_score_weighted_exceeds_max() {
+        // Edge case: weighted_commits > max_weighted (shouldn't happen but be robust)
+        let score = compute_hotspot_score(15.0, 10.0, 1.0, 2.0);
+        // 1.5 * 0.5 * 100 = 75.0
+        assert!((score - 75.0).abs() < f64::EPSILON);
+    }
+
+    // --- compute_normalization_maxima: additional edge cases ---
+
+    #[test]
+    fn normalization_maxima_multiple_files_picks_max() {
+        let scores = vec![
+            FileHealthScore {
+                path: std::path::PathBuf::from("/src/a.ts"),
+                fan_in: 0,
+                fan_out: 0,
+                dead_code_ratio: 0.0,
+                complexity_density: 0.5,
+                maintainability_index: 80.0,
+                total_cyclomatic: 10,
+                total_cognitive: 5,
+                function_count: 2,
+                lines: 50,
+            },
+            FileHealthScore {
+                path: std::path::PathBuf::from("/src/b.ts"),
+                fan_in: 0,
+                fan_out: 0,
+                dead_code_ratio: 0.0,
+                complexity_density: 1.2, // highest density
+                maintainability_index: 60.0,
+                total_cyclomatic: 30,
+                total_cognitive: 20,
+                function_count: 5,
+                lines: 100,
+            },
+            FileHealthScore {
+                path: std::path::PathBuf::from("/src/c.ts"),
+                fan_in: 0,
+                fan_out: 0,
+                dead_code_ratio: 0.0,
+                complexity_density: 0.8,
+                maintainability_index: 70.0,
+                total_cyclomatic: 20,
+                total_cognitive: 15,
+                function_count: 4,
+                lines: 80,
+            },
+        ];
+        let mut churn_files: rustc_hash::FxHashMap<
+            std::path::PathBuf,
+            fallow_core::churn::FileChurn,
+        > = rustc_hash::FxHashMap::default();
+        churn_files.insert(
+            std::path::PathBuf::from("/src/a.ts"),
+            fallow_core::churn::FileChurn {
+                path: std::path::PathBuf::from("/src/a.ts"),
+                commits: 5,
+                weighted_commits: 3.0,
+                lines_added: 50,
+                lines_deleted: 10,
+                trend: fallow_core::churn::ChurnTrend::Stable,
+            },
+        );
+        churn_files.insert(
+            std::path::PathBuf::from("/src/b.ts"),
+            fallow_core::churn::FileChurn {
+                path: std::path::PathBuf::from("/src/b.ts"),
+                commits: 10,
+                weighted_commits: 8.5, // highest weighted
+                lines_added: 200,
+                lines_deleted: 50,
+                trend: fallow_core::churn::ChurnTrend::Accelerating,
+            },
+        );
+        churn_files.insert(
+            std::path::PathBuf::from("/src/c.ts"),
+            fallow_core::churn::FileChurn {
+                path: std::path::PathBuf::from("/src/c.ts"),
+                commits: 7,
+                weighted_commits: 5.0,
+                lines_added: 100,
+                lines_deleted: 30,
+                trend: fallow_core::churn::ChurnTrend::Cooling,
+            },
+        );
+
+        let (max_w, max_d) = compute_normalization_maxima(&scores, &churn_files, 3);
+        assert!((max_w - 8.5).abs() < f64::EPSILON);
+        assert!((max_d - 1.2).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn normalization_maxima_mixed_above_and_below_threshold() {
+        // Two files: one above min_commits, one below.
+        // Only the above-threshold file should contribute.
+        let scores = vec![
+            FileHealthScore {
+                path: std::path::PathBuf::from("/src/frequent.ts"),
+                fan_in: 0,
+                fan_out: 0,
+                dead_code_ratio: 0.0,
+                complexity_density: 0.4,
+                maintainability_index: 85.0,
+                total_cyclomatic: 8,
+                total_cognitive: 4,
+                function_count: 2,
+                lines: 40,
+            },
+            FileHealthScore {
+                path: std::path::PathBuf::from("/src/rare.ts"),
+                fan_in: 0,
+                fan_out: 0,
+                dead_code_ratio: 0.0,
+                complexity_density: 2.0, // higher but excluded
+                maintainability_index: 50.0,
+                total_cyclomatic: 40,
+                total_cognitive: 30,
+                function_count: 8,
+                lines: 200,
+            },
+        ];
+        let mut churn_files: rustc_hash::FxHashMap<
+            std::path::PathBuf,
+            fallow_core::churn::FileChurn,
+        > = rustc_hash::FxHashMap::default();
+        churn_files.insert(
+            std::path::PathBuf::from("/src/frequent.ts"),
+            fallow_core::churn::FileChurn {
+                path: std::path::PathBuf::from("/src/frequent.ts"),
+                commits: 10,
+                weighted_commits: 7.0,
+                lines_added: 150,
+                lines_deleted: 40,
+                trend: fallow_core::churn::ChurnTrend::Stable,
+            },
+        );
+        churn_files.insert(
+            std::path::PathBuf::from("/src/rare.ts"),
+            fallow_core::churn::FileChurn {
+                path: std::path::PathBuf::from("/src/rare.ts"),
+                commits: 1, // below min_commits=5
+                weighted_commits: 0.9,
+                lines_added: 10,
+                lines_deleted: 2,
+                trend: fallow_core::churn::ChurnTrend::Cooling,
+            },
+        );
+
+        let (max_w, max_d) = compute_normalization_maxima(&scores, &churn_files, 5);
+        // Only frequent.ts qualifies
+        assert!((max_w - 7.0).abs() < f64::EPSILON);
+        assert!((max_d - 0.4).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn normalization_maxima_file_score_without_churn() {
+        // File exists in scores but has no churn data -> ignored
+        let scores = vec![FileHealthScore {
+            path: std::path::PathBuf::from("/src/no_churn.ts"),
+            fan_in: 0,
+            fan_out: 0,
+            dead_code_ratio: 0.0,
+            complexity_density: 5.0,
+            maintainability_index: 30.0,
+            total_cyclomatic: 100,
+            total_cognitive: 80,
+            function_count: 20,
+            lines: 500,
+        }];
+        let churn_files: rustc_hash::FxHashMap<std::path::PathBuf, fallow_core::churn::FileChurn> =
+            rustc_hash::FxHashMap::default();
+
+        let (max_w, max_d) = compute_normalization_maxima(&scores, &churn_files, 1);
+        assert!((max_w).abs() < f64::EPSILON);
+        assert!((max_d).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn normalization_maxima_min_commits_zero() {
+        // min_commits=0 means every file qualifies
+        let scores = vec![FileHealthScore {
+            path: std::path::PathBuf::from("/src/foo.ts"),
+            fan_in: 0,
+            fan_out: 0,
+            dead_code_ratio: 0.0,
+            complexity_density: 0.3,
+            maintainability_index: 90.0,
+            total_cyclomatic: 3,
+            total_cognitive: 2,
+            function_count: 1,
+            lines: 10,
+        }];
+        let mut churn_files: rustc_hash::FxHashMap<
+            std::path::PathBuf,
+            fallow_core::churn::FileChurn,
+        > = rustc_hash::FxHashMap::default();
+        churn_files.insert(
+            std::path::PathBuf::from("/src/foo.ts"),
+            fallow_core::churn::FileChurn {
+                path: std::path::PathBuf::from("/src/foo.ts"),
+                commits: 0,
+                weighted_commits: 0.0,
+                lines_added: 0,
+                lines_deleted: 0,
+                trend: fallow_core::churn::ChurnTrend::Stable,
+            },
+        );
+
+        // commits=0 >= min_commits=0, so file is included
+        let (max_w, max_d) = compute_normalization_maxima(&scores, &churn_files, 0);
+        assert!((max_w).abs() < f64::EPSILON);
+        assert!((max_d - 0.3).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn normalization_maxima_exactly_at_threshold() {
+        // File has exactly min_commits -> should be included
+        let scores = vec![FileHealthScore {
+            path: std::path::PathBuf::from("/src/foo.ts"),
+            fan_in: 0,
+            fan_out: 0,
+            dead_code_ratio: 0.0,
+            complexity_density: 1.5,
+            maintainability_index: 65.0,
+            total_cyclomatic: 25,
+            total_cognitive: 18,
+            function_count: 5,
+            lines: 120,
+        }];
+        let mut churn_files: rustc_hash::FxHashMap<
+            std::path::PathBuf,
+            fallow_core::churn::FileChurn,
+        > = rustc_hash::FxHashMap::default();
+        churn_files.insert(
+            std::path::PathBuf::from("/src/foo.ts"),
+            fallow_core::churn::FileChurn {
+                path: std::path::PathBuf::from("/src/foo.ts"),
+                commits: 3, // exactly at min_commits=3
+                weighted_commits: 2.8,
+                lines_added: 60,
+                lines_deleted: 15,
+                trend: fallow_core::churn::ChurnTrend::Stable,
+            },
+        );
+
+        let (max_w, max_d) = compute_normalization_maxima(&scores, &churn_files, 3);
+        assert!((max_w - 2.8).abs() < f64::EPSILON);
+        assert!((max_d - 1.5).abs() < f64::EPSILON);
+    }
+
+    // --- is_excluded_from_hotspots: additional edge cases ---
+
+    #[test]
+    fn excluded_workspace_and_glob_combined() {
+        // File matches workspace but also matches ignore glob -> excluded
+        let path = std::path::Path::new("/project/packages/a/src/generated/types.ts");
+        let root = std::path::Path::new("/project");
+        let ws_root = std::path::Path::new("/project/packages/a");
+        let mut builder = globset::GlobSetBuilder::new();
+        builder.add(globset::Glob::new("**/generated/**").unwrap());
+        let ignore_set = builder.build().unwrap();
+
+        assert!(is_excluded_from_hotspots(
+            path,
+            root,
+            &ignore_set,
+            Some(ws_root)
+        ));
+    }
+
+    #[test]
+    fn excluded_workspace_match_but_glob_no_match() {
+        // File is in workspace and doesn't match ignore -> not excluded
+        let path = std::path::Path::new("/project/packages/a/src/index.ts");
+        let root = std::path::Path::new("/project");
+        let ws_root = std::path::Path::new("/project/packages/a");
+        let mut builder = globset::GlobSetBuilder::new();
+        builder.add(globset::Glob::new("**/generated/**").unwrap());
+        let ignore_set = builder.build().unwrap();
+
+        assert!(!is_excluded_from_hotspots(
+            path,
+            root,
+            &ignore_set,
+            Some(ws_root)
+        ));
+    }
+
+    #[test]
+    fn excluded_path_equals_root() {
+        // Path is the root itself (edge case for strip_prefix)
+        let path = std::path::Path::new("/project");
+        let root = std::path::Path::new("/project");
+        let ignore_set = globset::GlobSet::empty();
+
+        assert!(!is_excluded_from_hotspots(path, root, &ignore_set, None));
+    }
+
+    #[test]
+    fn excluded_path_outside_root() {
+        // Path not under root -> strip_prefix falls back to full path
+        let path = std::path::Path::new("/other/src/foo.ts");
+        let root = std::path::Path::new("/project");
+        let mut builder = globset::GlobSetBuilder::new();
+        // Glob matches relative path, but strip_prefix fails so full path is used
+        builder.add(globset::Glob::new("src/foo.ts").unwrap());
+        let ignore_set = builder.build().unwrap();
+
+        // strip_prefix fails -> uses full path "/other/src/foo.ts"
+        // which doesn't match "src/foo.ts"
+        assert!(!is_excluded_from_hotspots(path, root, &ignore_set, None));
+    }
+
+    #[test]
+    fn excluded_multiple_globs_first_matches() {
+        let path = std::path::Path::new("/project/dist/bundle.js");
+        let root = std::path::Path::new("/project");
+        let mut builder = globset::GlobSetBuilder::new();
+        builder.add(globset::Glob::new("dist/**").unwrap());
+        builder.add(globset::Glob::new("node_modules/**").unwrap());
+        let ignore_set = builder.build().unwrap();
+
+        assert!(is_excluded_from_hotspots(path, root, &ignore_set, None));
+    }
+
+    #[test]
+    fn excluded_multiple_globs_second_matches() {
+        let path = std::path::Path::new("/project/node_modules/lodash/index.js");
+        let root = std::path::Path::new("/project");
+        let mut builder = globset::GlobSetBuilder::new();
+        builder.add(globset::Glob::new("dist/**").unwrap());
+        builder.add(globset::Glob::new("node_modules/**").unwrap());
+        let ignore_set = builder.build().unwrap();
+
+        assert!(is_excluded_from_hotspots(path, root, &ignore_set, None));
+    }
+
+    #[test]
+    fn excluded_multiple_globs_none_matches() {
+        let path = std::path::Path::new("/project/src/app.ts");
+        let root = std::path::Path::new("/project");
+        let mut builder = globset::GlobSetBuilder::new();
+        builder.add(globset::Glob::new("dist/**").unwrap());
+        builder.add(globset::Glob::new("node_modules/**").unwrap());
+        let ignore_set = builder.build().unwrap();
+
+        assert!(!is_excluded_from_hotspots(path, root, &ignore_set, None));
+    }
 }
