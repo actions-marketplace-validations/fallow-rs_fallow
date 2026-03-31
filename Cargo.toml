@@ -149,7 +149,6 @@ unsafe_op_in_unsafe_fn = "warn"         # Require unsafe blocks even inside unsa
 unused_unsafe = "warn"                  # Catch unnecessary unsafe blocks
 non_ascii_idents = "warn"              # Prevent non-ASCII identifiers
 unit_bindings = "warn"                 # Catch useless `let _ = expr` bindings
-absolute_paths_not_starting_with_crate = "allow" # Too strict for multi-crate workspace
 tail_expr_drop_order = "warn"          # Catch temporaries dropped in surprising order
 
 # Dev profile: disable debug info for faster builds
