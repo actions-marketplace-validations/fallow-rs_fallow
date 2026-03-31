@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.7.3] - 2026-03-31
+
+### Fixed
+
+- **`--format badge` now auto-enables `--score`** -- previously `fallow health --complexity --format badge` would error because score computation wasn't triggered when explicit section flags were passed. Badge format now implies `--score`, matching the behavior of `--min-score`, `--trend`, and `--save-snapshot`.
+
 ## [2.7.2] - 2026-03-31
 
 ### Added
@@ -636,7 +642,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `--changed-since` and `--fail-on-issues` for CI
 - Cross-workspace resolution for npm/yarn/pnpm workspaces
 
-[Unreleased]: https://github.com/fallow-rs/fallow/compare/v2.7.2...HEAD
+[Unreleased]: https://github.com/fallow-rs/fallow/compare/v2.7.3...HEAD
+[2.7.3]: https://github.com/fallow-rs/fallow/compare/v2.7.2...v2.7.3
 [2.7.2]: https://github.com/fallow-rs/fallow/compare/v2.7.1...v2.7.2
 [2.7.1]: https://github.com/fallow-rs/fallow/compare/v2.7.0...v2.7.1
 [2.7.0]: https://github.com/fallow-rs/fallow/compare/v2.6.0...v2.7.0
