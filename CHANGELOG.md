@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.8.0] - 2026-04-01
+
+### Added
+
+- **`fallow audit` command** -- combined dead-code + complexity + duplication analysis scoped to changed files, returning a verdict (pass/warn/fail). Purpose-built for reviewing AI-generated code and PR quality gates. Auto-detects the base branch if `--base` is not specified. JSON output includes `verdict`, per-category `summary`, and full sub-results with `actions` arrays. All 6 output formats supported. MCP `audit` tool wraps the CLI.
+- **`--base` global alias** -- `--base` is now a global alias for `--changed-since` on all commands. More intuitive for PR review workflows.
+- **`.fallow/` added to `.gitignore` during `fallow init`** -- prevents snapshot and cache directories from being committed.
+
+### Changed
+
+- **Release binary uses `panic=abort`** -- smaller binary size by removing unwind tables.
+- **Rust 2024 formatting style** -- `.rustfmt.toml` with `style_edition = "2024"`.
+- **Stricter lint discipline** -- 6 restriction lints added, `#[expect]` required for all lint suppressions, `tail_expr_drop_order` compiler lint enabled.
+
 ## [2.7.3] - 2026-03-31
 
 ### Fixed
@@ -642,7 +656,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `--changed-since` and `--fail-on-issues` for CI
 - Cross-workspace resolution for npm/yarn/pnpm workspaces
 
-[Unreleased]: https://github.com/fallow-rs/fallow/compare/v2.7.3...HEAD
+[Unreleased]: https://github.com/fallow-rs/fallow/compare/v2.8.0...HEAD
+[2.8.0]: https://github.com/fallow-rs/fallow/compare/v2.7.3...v2.8.0
 [2.7.3]: https://github.com/fallow-rs/fallow/compare/v2.7.2...v2.7.3
 [2.7.2]: https://github.com/fallow-rs/fallow/compare/v2.7.1...v2.7.2
 [2.7.1]: https://github.com/fallow-rs/fallow/compare/v2.7.0...v2.7.1
