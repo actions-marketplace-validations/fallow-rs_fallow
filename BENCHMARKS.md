@@ -7,7 +7,7 @@ This document describes how fallow's performance benchmarks are structured, how 
 Fallow uses two benchmark layers:
 
 1. **Criterion (Rust)** — Microbenchmarks for regression detection in CI. Measures individual pipeline stages and full end-to-end analysis at various project sizes (10, 100, 1000, 5000 files).
-2. **Comparative (Node.js)** — Wall-clock comparisons against knip (dead code), jscpd (duplication), and madge/dpdm (circular dependencies) on synthetic and real-world projects.
+2. **Comparative (Node.js)** — Wall-clock comparisons against knip (unused code), jscpd (duplication), and madge/dpdm (circular dependencies) on synthetic and real-world projects.
 
 ## Project Sizes
 

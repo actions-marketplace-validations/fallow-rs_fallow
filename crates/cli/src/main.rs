@@ -39,7 +39,7 @@ use list::ListOptions;
 #[derive(Parser)]
 #[command(
     name = "fallow",
-    about = "Find unused code, circular dependencies, code duplication, and complexity hotspots in TypeScript/JavaScript projects",
+    about = "Codebase analyzer for TypeScript/JavaScript — unused code, circular dependencies, code duplication, complexity hotspots, and architecture boundary violations",
     version,
     after_help = "When no command is given, runs dead-code + dupes + health together.\nUse --only/--skip to select specific analyses."
 )]

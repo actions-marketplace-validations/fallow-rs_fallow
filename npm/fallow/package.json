@@ -1,7 +1,7 @@
 {
   "name": "fallow",
   "version": "2.8.1",
-  "description": "Find unused code, circular dependencies, code duplication, and complexity hotspots in TypeScript/JavaScript projects",
+  "description": "Codebase analyzer for TypeScript/JavaScript — unused code, circular dependencies, code duplication, complexity hotspots, and architecture boundary violations",
   "license": "MIT",
   "repository": {
     "type": "git",

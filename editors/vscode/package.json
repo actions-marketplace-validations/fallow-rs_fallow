@@ -1,7 +1,7 @@
 {
   "name": "fallow-vscode",
   "displayName": "Fallow",
-  "description": "Find unused code, circular dependencies, and code duplication in TypeScript/JavaScript",
+  "description": "Codebase analyzer for TypeScript/JavaScript — unused code, circular dependencies, code duplication, complexity hotspots, and architecture boundaries",
   "version": "2.8.1",
   "packageManager": "pnpm@10.17.1",
   "publisher": "fallow-rs",
@@ -38,11 +38,12 @@
     "Other"
   ],
   "keywords": [
-    "dead-code",
+    "codebase-analyzer",
     "unused",
     "exports",
     "dependencies",
     "duplication",
+    "complexity",
     "typescript",
     "javascript",
     "knip",
@@ -263,12 +264,12 @@
       {
         "id": "fallow.gettingStarted",
         "title": "Get Started with Fallow",
-        "description": "Find and remove unused code, circular dependencies, and duplication in your TypeScript/JavaScript project.",
+        "description": "Analyze your TypeScript/JavaScript codebase for unused code, circular dependencies, code duplication, complexity hotspots, and architecture boundary violations.",
         "steps": [
           {
             "id": "fallow.gettingStarted.analyze",
             "title": "Run your first analysis",
-            "description": "Fallow scans your codebase to find unused files, exports, dependencies, circular dependencies, and code duplication.\n\nOpen the Command Palette and run **Fallow: Run Analysis**, or click the search icon in the Fallow sidebar.\n\n[Run Analysis](command:fallow.analyze)",
+            "description": "Fallow analyzes your codebase for unused code, circular dependencies, code duplication, complexity hotspots, and architecture boundary violations.\n\nOpen the Command Palette and run **Fallow: Run Analysis**, or click the search icon in the Fallow sidebar.\n\n[Run Analysis](command:fallow.analyze)",
             "media": {
               "markdown": "media/step-analyze.md"
             },

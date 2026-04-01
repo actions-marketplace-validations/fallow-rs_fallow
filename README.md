@@ -7,7 +7,7 @@
 </p>
 
 <p align="center">
-  <strong>Find dead code, duplication, and complexity hotspots in TypeScript & JavaScript.</strong><br>
+  <strong>Codebase analyzer for TypeScript & JavaScript — unused code, duplication, complexity, and architecture.</strong><br>
   <strong>Rust-native. Zero config. Sub-second.</strong>
 </p>
 
