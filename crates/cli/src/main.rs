@@ -250,7 +250,7 @@ enum Command {
 
         /// Base branch/ref for the pre-commit hook (default: auto-detect or "main")
         #[arg(long, requires = "hooks")]
-        base: Option<String>,
+        branch: Option<String>,
     },
 
     /// Print the JSON Schema for fallow configuration files
@@ -980,11 +980,15 @@ fn dispatch_subcommand(
             yes,
             production: cli.production,
         }),
-        Command::Init { toml, hooks, base } => init::run_init(&init::InitOptions {
+        Command::Init {
+            toml,
+            hooks,
+            branch,
+        } => init::run_init(&init::InitOptions {
             root,
             use_toml: toml,
             hooks,
-            base: base.as_deref(),
+            base: branch.as_deref(),
         }),
         Command::ConfigSchema => init::run_config_schema(),
         Command::PluginSchema => init::run_plugin_schema(),
