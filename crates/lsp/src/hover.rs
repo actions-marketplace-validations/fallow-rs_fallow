@@ -417,6 +417,23 @@ mod tests {
         ExportUsage, ReferenceLocation, UnresolvedImport, UnusedExport, UnusedFile, UnusedMember,
     };
 
+    /// Extract the markdown text from a Hover's contents.
+    ///
+    /// Panicking on an unexpected variant is acceptable in tests, but we use
+    /// a descriptive assertion so the failure message is clearer than a bare
+    /// `panic!`.
+    fn markup_value(hover: &Hover) -> &str {
+        match &hover.contents {
+            HoverContents::Markup(m) => {
+                assert_eq!(m.kind, MarkupKind::Markdown);
+                &m.value
+            }
+            other => {
+                panic!("Expected HoverContents::Markup, got {other:?}");
+            }
+        }
+    }
+
     fn test_root() -> PathBuf {
         if cfg!(windows) {
             PathBuf::from("C:\\project")
@@ -453,13 +470,9 @@ mod tests {
         };
 
         let hover = build_hover(&results, &duplication, &path, pos).unwrap();
-        match &hover.contents {
-            HoverContents::Markup(m) => {
-                assert!(m.value.contains("not imported"));
-                assert!(m.value.contains("entry point"));
-            }
-            _ => panic!("Expected markup contents"),
-        }
+        let value = markup_value(&hover);
+        assert!(value.contains("not imported"));
+        assert!(value.contains("entry point"));
     }
 
     #[test]
@@ -487,13 +500,9 @@ mod tests {
         };
 
         let hover = build_hover(&results, &duplication, &path, pos).unwrap();
-        match &hover.contents {
-            HoverContents::Markup(m) => {
-                assert!(m.value.contains("helper"));
-                assert!(m.value.contains("not imported"));
-            }
-            _ => panic!("Expected markup contents"),
-        }
+        let value = markup_value(&hover);
+        assert!(value.contains("helper"));
+        assert!(value.contains("not imported"));
         // Should have a range covering the export name
         let range = hover.range.unwrap();
         assert_eq!(range.start.line, 4);
@@ -522,13 +531,9 @@ mod tests {
         };
 
         let hover = build_hover(&results, &duplication, &path, pos).unwrap();
-        match &hover.contents {
-            HoverContents::Markup(m) => {
-                assert!(m.value.contains("Type export"));
-                assert!(m.value.contains("MyType"));
-            }
-            _ => panic!("Expected markup contents"),
-        }
+        let value = markup_value(&hover);
+        assert!(value.contains("Type export"));
+        assert!(value.contains("MyType"));
     }
 
     #[test]
@@ -562,15 +567,11 @@ mod tests {
         };
 
         let hover = build_hover(&results, &duplication, &path, pos).unwrap();
-        match &hover.contents {
-            HoverContents::Markup(m) => {
-                assert!(m.value.contains("format"));
-                assert!(m.value.contains("2 files"));
-                assert!(m.value.contains("app.ts"));
-                assert!(m.value.contains("main.ts"));
-            }
-            _ => panic!("Expected markup contents"),
-        }
+        let value = markup_value(&hover);
+        assert!(value.contains("format"));
+        assert!(value.contains("2 files"));
+        assert!(value.contains("app.ts"));
+        assert!(value.contains("main.ts"));
     }
 
     #[test]
@@ -597,14 +598,10 @@ mod tests {
         };
 
         let hover = build_hover(&results, &duplication, &path, pos).unwrap();
-        match &hover.contents {
-            HoverContents::Markup(m) => {
-                assert!(m.value.contains("1 file"));
-                // Should not contain "files" (plural)
-                assert!(!m.value.contains("1 files"));
-            }
-            _ => panic!("Expected markup contents"),
-        }
+        let value = markup_value(&hover);
+        assert!(value.contains("1 file"));
+        // Should not contain "files" (plural)
+        assert!(!value.contains("1 files"));
     }
 
     #[test]
@@ -652,13 +649,9 @@ mod tests {
         };
 
         let hover = build_hover(&results, &duplication, &path, pos).unwrap();
-        match &hover.contents {
-            HoverContents::Markup(m) => {
-                assert!(m.value.contains("Color.Blue"));
-                assert!(m.value.contains("never used"));
-            }
-            _ => panic!("Expected markup contents"),
-        }
+        let value = markup_value(&hover);
+        assert!(value.contains("Color.Blue"));
+        assert!(value.contains("never used"));
     }
 
     #[test]
@@ -681,13 +674,9 @@ mod tests {
         };
 
         let hover = build_hover(&results, &duplication, &path, pos).unwrap();
-        match &hover.contents {
-            HoverContents::Markup(m) => {
-                assert!(m.value.contains("UserService.reset"));
-                assert!(m.value.contains("Class member"));
-            }
-            _ => panic!("Expected markup contents"),
-        }
+        let value = markup_value(&hover);
+        assert!(value.contains("UserService.reset"));
+        assert!(value.contains("Class member"));
     }
 
     #[test]
@@ -709,13 +698,9 @@ mod tests {
         };
 
         let hover = build_hover(&results, &duplication, &path, pos).unwrap();
-        match &hover.contents {
-            HoverContents::Markup(m) => {
-                assert!(m.value.contains("./missing-module"));
-                assert!(m.value.contains("Cannot resolve"));
-            }
-            _ => panic!("Expected markup contents"),
-        }
+        let value = markup_value(&hover);
+        assert!(value.contains("./missing-module"));
+        assert!(value.contains("Cannot resolve"));
     }
 
     #[test]
@@ -768,15 +753,11 @@ mod tests {
         };
 
         let hover = build_hover(&results, &duplication, &path_a, pos).unwrap();
-        match &hover.contents {
-            HoverContents::Markup(m) => {
-                assert!(m.value.contains("6 lines"));
-                assert!(m.value.contains("50 tokens"));
-                assert!(m.value.contains("1 other instance"));
-                assert!(m.value.contains("b.ts"));
-            }
-            _ => panic!("Expected markup contents"),
-        }
+        let value = markup_value(&hover);
+        assert!(value.contains("6 lines"));
+        assert!(value.contains("50 tokens"));
+        assert!(value.contains("1 other instance"));
+        assert!(value.contains("b.ts"));
 
         // Range should cover the duplication span
         let range = hover.range.unwrap();
@@ -855,13 +836,9 @@ mod tests {
 
         // Should show unused file hover, not export usage
         let hover = build_hover(&results, &duplication, &path, pos).unwrap();
-        match &hover.contents {
-            HoverContents::Markup(m) => {
-                assert!(m.value.contains("not imported"));
-                assert!(m.value.contains("entry point"));
-            }
-            _ => panic!("Expected markup contents"),
-        }
+        let value = markup_value(&hover);
+        assert!(value.contains("not imported"));
+        assert!(value.contains("entry point"));
     }
 
     #[test]
@@ -979,14 +956,10 @@ mod tests {
             character: 0,
         };
         let hover = build_hover(&results, &duplication, &path_a, pos).unwrap();
-        match &hover.contents {
-            HoverContents::Markup(m) => {
-                assert!(m.value.contains("2 other instances"));
-                assert!(m.value.contains("b.ts"));
-                assert!(m.value.contains("c.ts"));
-            }
-            _ => panic!("Expected markup contents"),
-        }
+        let value = markup_value(&hover);
+        assert!(value.contains("2 other instances"));
+        assert!(value.contains("b.ts"));
+        assert!(value.contains("c.ts"));
     }
 
     #[test]
@@ -1009,19 +982,14 @@ mod tests {
         };
 
         let hover = build_hover(&results, &duplication, &path, pos).unwrap();
-        match &hover.contents {
-            HoverContents::Markup(m) => {
-                // Should end with "." when no locations are listed
-                assert!(
-                    m.value.ends_with('.'),
-                    "Expected message to end with period, got: {}",
-                    m.value
-                );
-                assert!(m.value.contains("3 files"));
-                assert!(!m.value.contains('\n'));
-            }
-            _ => panic!("Expected markup contents"),
-        }
+        let value = markup_value(&hover);
+        // Should end with "." when no locations are listed
+        assert!(
+            value.ends_with('.'),
+            "Expected message to end with period, got: {value}",
+        );
+        assert!(value.contains("3 files"));
+        assert!(!value.contains('\n'));
     }
 
     #[test]
@@ -1054,28 +1022,22 @@ mod tests {
         };
 
         let hover = build_hover(&results, &duplication, &path, pos).unwrap();
-        match &hover.contents {
-            HoverContents::Markup(m) => {
-                assert!(m.value.contains("15 files"));
-                // Should list first 10 files
-                for i in 1..=10 {
-                    assert!(
-                        m.value.contains(&format!("file{i}.ts")),
-                        "Expected file{i}.ts in hover, got: {}",
-                        m.value
-                    );
-                }
-                // Should NOT list files 11-15 inline
-                assert!(!m.value.contains("file11.ts"));
-                // Should show "... and 5 more"
-                assert!(
-                    m.value.contains("... and 5 more"),
-                    "Expected truncation message, got: {}",
-                    m.value
-                );
-            }
-            _ => panic!("Expected markup contents"),
+        let value = markup_value(&hover);
+        assert!(value.contains("15 files"));
+        // Should list first 10 files
+        for i in 1..=10 {
+            assert!(
+                value.contains(&format!("file{i}.ts")),
+                "Expected file{i}.ts in hover, got: {value}",
+            );
         }
+        // Should NOT list files 11-15 inline
+        assert!(!value.contains("file11.ts"));
+        // Should show "... and 5 more"
+        assert!(
+            value.contains("... and 5 more"),
+            "Expected truncation message, got: {value}",
+        );
     }
 
     #[test]
@@ -1107,17 +1069,13 @@ mod tests {
         };
 
         let hover = build_hover(&results, &duplication, &path, pos).unwrap();
-        match &hover.contents {
-            HoverContents::Markup(m) => {
-                // All 10 should be listed
-                for i in 1..=10 {
-                    assert!(m.value.contains(&format!("ref{i}.ts")));
-                }
-                // No "... and X more" message
-                assert!(!m.value.contains("... and"));
-            }
-            _ => panic!("Expected markup contents"),
+        let value = markup_value(&hover);
+        // All 10 should be listed
+        for i in 1..=10 {
+            assert!(value.contains(&format!("ref{i}.ts")));
         }
+        // No "... and X more" message
+        assert!(!value.contains("... and"));
     }
 
     #[test]
@@ -1275,21 +1233,17 @@ mod tests {
             character: 0,
         };
         let hover = build_hover(&results, &duplication, &path_main, pos).unwrap();
-        match &hover.contents {
-            HoverContents::Markup(m) => {
-                assert!(m.value.contains("12 other instances"));
-                // Should only list first 10 and truncate
-                for i in 1..=10 {
-                    assert!(
-                        m.value.contains(&format!("dup{i}.ts")),
-                        "Expected dup{i}.ts in hover"
-                    );
-                }
-                assert!(!m.value.contains("dup11.ts"));
-                assert!(m.value.contains("... and 2 more"));
-            }
-            _ => panic!("Expected markup contents"),
+        let value = markup_value(&hover);
+        assert!(value.contains("12 other instances"));
+        // Should only list first 10 and truncate
+        for i in 1..=10 {
+            assert!(
+                value.contains(&format!("dup{i}.ts")),
+                "Expected dup{i}.ts in hover"
+            );
         }
+        assert!(!value.contains("dup11.ts"));
+        assert!(value.contains("... and 2 more"));
     }
 
     #[test]
@@ -1323,13 +1277,9 @@ mod tests {
         };
 
         let hover = build_hover(&results, &duplication, &path, pos).unwrap();
-        match &hover.contents {
-            HoverContents::Markup(m) => {
-                // Unused export check runs before used export check
-                assert!(m.value.contains("not imported"));
-            }
-            _ => panic!("Expected markup contents"),
-        }
+        let value = markup_value(&hover);
+        // Unused export check runs before used export check
+        assert!(value.contains("not imported"));
     }
 
     #[test]
