@@ -708,5 +708,5 @@ pub fn find_unresolved_imports(
 }
 
 #[cfg(test)]
-#[path = "unused_deps_tests.rs"]
+#[path = "unused_deps_tests/mod.rs"]
 mod tests;
