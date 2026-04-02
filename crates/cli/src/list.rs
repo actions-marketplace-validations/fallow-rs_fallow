@@ -137,7 +137,7 @@ pub fn run_list(opts: &ListOptions<'_>) -> ExitCode {
                         let relative = ep.path.strip_prefix(opts.root).unwrap_or(&ep.path);
                         serde_json::json!({
                             "path": relative.display().to_string(),
-                            "source": format!("{:?}", ep.source),
+                            "source": ep.source.to_string(),
                         })
                     })
                     .collect();
@@ -175,14 +175,16 @@ pub fn run_list(opts: &ListOptions<'_>) -> ExitCode {
             {
                 eprintln!("Discovered {} files", disc.len());
                 for file in disc {
-                    println!("{}", file.path.display());
+                    let relative = file.path.strip_prefix(opts.root).unwrap_or(&file.path);
+                    println!("{}", relative.display());
                 }
             }
 
             if let Some(ref entries) = all_entry_points {
                 eprintln!("Found {} entry points", entries.len());
                 for ep in entries {
-                    println!("{} ({:?})", ep.path.display(), ep.source);
+                    let relative = ep.path.strip_prefix(opts.root).unwrap_or(&ep.path);
+                    println!("{} ({})", relative.display(), ep.source);
                 }
             }
 

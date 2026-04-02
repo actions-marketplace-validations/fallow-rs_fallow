@@ -240,8 +240,8 @@ fn list_basic_project_main_entry_point_source() {
 
     assert_eq!(
         main_ep["source"].as_str().unwrap(),
-        "PackageJsonMain",
-        "src/index.ts should be detected via PackageJsonMain"
+        "package.json main",
+        "src/index.ts should be detected via package.json main"
     );
 }
 
@@ -254,7 +254,7 @@ fn list_plugin_discovered_entry_points_in_show_all_mode() {
     let eps = json["entry_points"].as_array().unwrap();
     let plugin_eps: Vec<&serde_json::Value> = eps
         .iter()
-        .filter(|ep| ep["source"].as_str().is_some_and(|s| s.contains("Plugin")))
+        .filter(|ep| ep["source"].as_str().is_some_and(|s| s == "my-framework"))
         .collect();
 
     assert!(
@@ -264,9 +264,9 @@ fn list_plugin_discovered_entry_points_in_show_all_mode() {
 
     for ep in &plugin_eps {
         let source = ep["source"].as_str().unwrap();
-        assert!(
-            source.contains("my-framework"),
-            "plugin entry point source should mention 'my-framework', got: {source}"
+        assert_eq!(
+            source, "my-framework",
+            "plugin entry point source should be 'my-framework', got: {source}"
         );
     }
 }
@@ -435,27 +435,27 @@ fn list_human_output_entry_points_section() {
         output.stdout
     );
     assert!(
-        output.stdout.contains("PackageJsonMain"),
+        output.stdout.contains("package.json main"),
         "human output should include entry point source. Got: {}",
         output.stdout
     );
 }
 
 #[test]
-fn list_human_output_files_are_absolute_paths() {
+fn list_human_output_files_are_relative_paths() {
     let output = run_list("basic-project", &["--files"]);
 
-    // In human format, file paths should be absolute
+    // In human format, file paths should be relative (no absolute prefix)
     for line in output.stdout.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
         }
         assert!(
-            trimmed.starts_with('/')
-                || trimmed.starts_with("\\\\")
-                || trimmed.chars().nth(1) == Some(':'),
-            "human output file path should be absolute, got: {trimmed}"
+            !trimmed.starts_with('/')
+                && !trimmed.starts_with("\\\\")
+                && trimmed.chars().nth(1) != Some(':'),
+            "human output file path should be relative, got: {trimmed}"
         );
     }
 }
@@ -762,8 +762,8 @@ fn list_nextjs_project_app_page_is_plugin_entry_point() {
     );
 
     let source = page_ep.unwrap()["source"].as_str().unwrap();
-    assert!(
-        source.contains("Plugin") && source.contains("nextjs"),
+    assert_eq!(
+        source, "nextjs",
         "page.tsx should be discovered by nextjs plugin. Got source: {source}"
     );
 }

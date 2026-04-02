@@ -64,6 +64,23 @@ pub struct EntryPoint {
     pub source: EntryPointSource,
 }
 
+impl std::fmt::Display for EntryPointSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PackageJsonMain => f.write_str("package.json main"),
+            Self::PackageJsonModule => f.write_str("package.json module"),
+            Self::PackageJsonExports => f.write_str("package.json exports"),
+            Self::PackageJsonBin => f.write_str("package.json bin"),
+            Self::PackageJsonScript => f.write_str("package.json script"),
+            Self::Plugin { name } => write!(f, "{name}"),
+            Self::TestFile => f.write_str("test file"),
+            Self::DefaultIndex => f.write_str("default index"),
+            Self::ManualEntry => f.write_str("manual entry"),
+            Self::InfrastructureConfig => f.write_str("infrastructure config"),
+        }
+    }
+}
+
 /// Where an entry point was discovered from.
 #[derive(Debug, Clone)]
 pub enum EntryPointSource {
@@ -273,6 +290,44 @@ mod tests {
         assert!(
             debug.contains("remix"),
             "Debug should show plugin name: {debug}"
+        );
+    }
+
+    #[test]
+    fn entry_point_source_display_all_variants() {
+        assert_eq!(
+            EntryPointSource::PackageJsonMain.to_string(),
+            "package.json main"
+        );
+        assert_eq!(
+            EntryPointSource::PackageJsonModule.to_string(),
+            "package.json module"
+        );
+        assert_eq!(
+            EntryPointSource::PackageJsonExports.to_string(),
+            "package.json exports"
+        );
+        assert_eq!(
+            EntryPointSource::PackageJsonBin.to_string(),
+            "package.json bin"
+        );
+        assert_eq!(
+            EntryPointSource::PackageJsonScript.to_string(),
+            "package.json script"
+        );
+        assert_eq!(
+            EntryPointSource::Plugin {
+                name: "vitest".to_string()
+            }
+            .to_string(),
+            "vitest"
+        );
+        assert_eq!(EntryPointSource::TestFile.to_string(), "test file");
+        assert_eq!(EntryPointSource::DefaultIndex.to_string(), "default index");
+        assert_eq!(EntryPointSource::ManualEntry.to_string(), "manual entry");
+        assert_eq!(
+            EntryPointSource::InfrastructureConfig.to_string(),
+            "infrastructure config"
         );
     }
 }
