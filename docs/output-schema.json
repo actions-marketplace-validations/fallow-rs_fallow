@@ -315,6 +315,11 @@
           "type": "string",
           "enum": ["cyclomatic", "cognitive", "both"],
           "description": "Which threshold(s) this function exceeds."
+        },
+        "actions": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/HealthFindingAction" },
+          "description": "Suggested actions to address this complex function."
         }
       }
     },
@@ -414,6 +419,11 @@
           "type": "string",
           "enum": ["accelerating", "stable", "cooling"],
           "description": "Churn trend: accelerating (recent > 1.5× older), stable, or cooling (recent < 0.67× older)."
+        },
+        "actions": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/HotspotAction" },
+          "description": "Suggested actions to reduce hotspot risk."
         }
       }
     },
@@ -492,6 +502,11 @@
             },
             "cycle_path": { "type": "array", "items": { "type": "string" }, "description": "Files in the import cycle (for break_circular_dependency)." }
           }
+        },
+        "actions": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/RefactoringTargetAction" },
+          "description": "Suggested actions for this refactoring target."
         }
       }
     },
@@ -711,6 +726,147 @@
         "value": {
           "type": "string",
           "description": "The value to add to the config key (e.g., 'lodash')."
+        }
+      }
+    },
+
+    "HealthFindingAction": {
+      "description": "A suggested action for a complex function finding.",
+      "type": "object",
+      "required": ["type", "auto_fixable", "description"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["refactor-function", "suppress-line"],
+          "description": "Action type identifier."
+        },
+        "auto_fixable": {
+          "type": "boolean",
+          "description": "Whether fallow can auto-fix this action."
+        },
+        "description": {
+          "type": "string",
+          "description": "Human-readable description of the action."
+        },
+        "note": {
+          "type": "string",
+          "description": "Additional context for the action."
+        },
+        "comment": {
+          "type": "string",
+          "description": "The inline comment to insert (e.g., '// fallow-ignore-next-line complexity'). Present for suppress-line actions."
+        },
+        "placement": {
+          "type": "string",
+          "description": "Where to insert the suppress comment (e.g., 'above-function-declaration'). Present for suppress-line actions."
+        }
+      }
+    },
+    "HotspotAction": {
+      "description": "A suggested action for a hotspot file.",
+      "type": "object",
+      "required": ["type", "auto_fixable", "description"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["refactor-file", "add-tests"],
+          "description": "Action type identifier."
+        },
+        "auto_fixable": {
+          "type": "boolean",
+          "description": "Whether fallow can auto-fix this action."
+        },
+        "description": {
+          "type": "string",
+          "description": "Human-readable description of the action."
+        },
+        "note": {
+          "type": "string",
+          "description": "Additional context for the action."
+        }
+      }
+    },
+    "RefactoringTargetAction": {
+      "description": "A suggested action for a refactoring target.",
+      "type": "object",
+      "required": ["type", "auto_fixable", "description"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["apply-refactoring", "suppress-line"],
+          "description": "Action type identifier."
+        },
+        "auto_fixable": {
+          "type": "boolean",
+          "description": "Whether fallow can auto-fix this action."
+        },
+        "description": {
+          "type": "string",
+          "description": "Human-readable description of the action."
+        },
+        "category": {
+          "type": "string",
+          "description": "The recommendation category for apply-refactoring actions."
+        },
+        "comment": {
+          "type": "string",
+          "description": "The inline comment to insert. Present for suppress-line actions when evidence exists."
+        },
+        "placement": {
+          "type": "string",
+          "description": "Where to insert the suppress comment. Present for suppress-line actions."
+        }
+      }
+    },
+    "CloneFamilyAction": {
+      "description": "A suggested action for a clone family.",
+      "type": "object",
+      "required": ["type", "auto_fixable", "description"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["extract-shared", "apply-suggestion", "suppress-line"],
+          "description": "Action type identifier."
+        },
+        "auto_fixable": {
+          "type": "boolean",
+          "description": "Whether fallow can auto-fix this action."
+        },
+        "description": {
+          "type": "string",
+          "description": "Human-readable description of the action."
+        },
+        "note": {
+          "type": "string",
+          "description": "Additional context for the action."
+        },
+        "comment": {
+          "type": "string",
+          "description": "The inline comment to insert (e.g., '// fallow-ignore-next-line code-duplication'). Present for suppress-line actions."
+        }
+      }
+    },
+    "CloneGroupAction": {
+      "description": "A suggested action for a clone group.",
+      "type": "object",
+      "required": ["type", "auto_fixable", "description"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["extract-shared", "suppress-line"],
+          "description": "Action type identifier."
+        },
+        "auto_fixable": {
+          "type": "boolean",
+          "description": "Whether fallow can auto-fix this action."
+        },
+        "description": {
+          "type": "string",
+          "description": "Human-readable description of the action."
+        },
+        "comment": {
+          "type": "string",
+          "description": "The inline comment to insert (e.g., '// fallow-ignore-next-line code-duplication'). Present for suppress-line actions."
         }
       }
     },
@@ -1067,6 +1223,11 @@
         "line_count": {
           "type": "integer",
           "description": "Number of source lines in the duplicated block."
+        },
+        "actions": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/CloneGroupAction" },
+          "description": "Suggested actions to eliminate this clone group."
         }
       }
     },
@@ -1128,6 +1289,11 @@
           "type": "array",
           "items": { "$ref": "#/definitions/RefactoringSuggestion" },
           "description": "Refactoring suggestions for this family."
+        },
+        "actions": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/CloneFamilyAction" },
+          "description": "Suggested actions to eliminate duplication in this family."
         }
       }
     },
