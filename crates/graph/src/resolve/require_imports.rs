@@ -6,9 +6,9 @@ use oxc_span::Span;
 
 use fallow_types::extract::{ImportInfo, ImportedName, RequireCallInfo};
 
+use super::ResolvedImport;
 use super::specifier::resolve_specifier;
 use super::types::ResolveContext;
-use super::ResolvedImport;
 
 /// Resolve CommonJS `require()` calls.
 /// Destructured requires become Named imports; others become Namespace (conservative).

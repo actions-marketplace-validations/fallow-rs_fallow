@@ -9,7 +9,9 @@ use fallow_types::extract::{
     RequireCallInfo,
 };
 
-use super::dynamic_imports::{resolve_dynamic_imports, resolve_dynamic_patterns, resolve_single_dynamic_import};
+use super::dynamic_imports::{
+    resolve_dynamic_imports, resolve_dynamic_patterns, resolve_single_dynamic_import,
+};
 use super::re_exports::resolve_re_exports;
 use super::require_imports::{resolve_require_imports, resolve_single_require};
 use super::specifier;
@@ -1117,7 +1119,9 @@ fn specifier_upgrades_does_not_upgrade_external_file() {
             1,
             vec![ResolvedImport {
                 info: make_import("shared-lib", ImportedName::Default, "lib"),
-                target: ResolveResult::ExternalFile(PathBuf::from("/node_modules/shared-lib/index.js")),
+                target: ResolveResult::ExternalFile(PathBuf::from(
+                    "/node_modules/shared-lib/index.js",
+                )),
             }],
             vec![],
             vec![],

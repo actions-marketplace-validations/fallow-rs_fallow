@@ -11,6 +11,9 @@ categories.workspace = true
 description = "Module graph construction, resolution, and project state for the fallow TypeScript/JavaScript codebase analyzer"
 readme = "../../README.md"
 
+[lib]
+doctest = false
+
 [dependencies]
 fallow-types = { workspace = true }
 fallow-config = { workspace = true }

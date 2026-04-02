@@ -35,6 +35,7 @@ rustc-hash = { workspace = true }
 [lib]
 name = "fallow_cli"
 path = "src/lib.rs"
+doctest = false
 
 [dev-dependencies]
 toml = { workspace = true }

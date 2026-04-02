@@ -4,9 +4,9 @@ use std::path::Path;
 
 use fallow_types::extract::ReExportInfo;
 
+use super::ResolvedReExport;
 use super::specifier::resolve_specifier;
 use super::types::ResolveContext;
-use super::ResolvedReExport;
 
 /// Resolve re-export sources (`export { x } from './y'`).
 pub(super) fn resolve_re_exports(

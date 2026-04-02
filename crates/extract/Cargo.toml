@@ -11,6 +11,9 @@ categories.workspace = true
 description = "Parsing and extraction engine for the fallow TypeScript/JavaScript codebase analyzer"
 readme = "../../README.md"
 
+[lib]
+doctest = false
+
 [dependencies]
 fallow-types = { workspace = true }
 

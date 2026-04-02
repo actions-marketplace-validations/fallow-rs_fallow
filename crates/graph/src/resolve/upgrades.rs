@@ -4,9 +4,9 @@ use rustc_hash::FxHashMap;
 
 use fallow_types::discover::FileId;
 
+use super::ResolvedModule;
 use super::path_info::is_bare_specifier;
 use super::types::ResolveResult;
-use super::ResolvedModule;
 
 /// Post-resolution pass: deterministic specifier upgrade.
 ///

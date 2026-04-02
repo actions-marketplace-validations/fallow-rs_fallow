@@ -4,9 +4,9 @@ use std::path::Path;
 
 use fallow_types::extract::ImportInfo;
 
+use super::ResolvedImport;
 use super::specifier::resolve_specifier;
 use super::types::ResolveContext;
-use super::ResolvedImport;
 
 /// Resolve standard ES module imports (`import x from './y'`).
 pub(super) fn resolve_static_imports(
