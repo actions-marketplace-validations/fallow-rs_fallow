@@ -587,6 +587,7 @@ assert_not_contains "$OUT" "additional findings" "no filtered mention when count
 echo "  review-body.jq with all findings filtered (body-only):"
 OUT=$(INLINE_COUNT=0 FILTERED_COUNT=8 jq -r -f "$JQ_DIR/review-body.jq" "$FIXTURES/combined.json" 2>&1)
 assert_not_contains "$OUT" "See inline comments" "no inline mention when all filtered"
+assert_contains "$OUT" "none are on lines changed" "body-only explains why no inline comments"
 assert_contains "$OUT" "fallow-review" "still has marker"
 
 echo "  review-body.jq without env vars (backwards compat):"

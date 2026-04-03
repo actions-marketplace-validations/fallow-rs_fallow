@@ -113,9 +113,9 @@ MERGED=$(echo "$COMMENTS" | jq --argjson max "$MAX" -f "${ACTION_JQ_DIR}/merge-c
 # up-front avoids the batch-422-then-retry-one-by-one fallback path entirely.
 # Fail-open: if PR files can't be fetched or a file has no patch, keep all its comments.
 PRE_FILTER_COUNT=$(echo "$COMMENTS" | jq 'length' 2>/dev/null || echo 0)
-PR_FILES=$(gh api "repos/${GH_REPO}/pulls/${PR_NUMBER}/files" --paginate 2>/dev/null \
+PR_FILES=$(gh api "repos/${GH_REPO}/pulls/${PR_NUMBER}/files?per_page=100" --paginate 2>/dev/null \
   | jq -s 'add // []' 2>/dev/null) || {
-  echo "::warning::Could not fetch PR files for hunk filtering; posting all comments"
+  echo "::warning::Hunk filtering disabled — could not fetch PR files; some comments may be rejected by GitHub"
   PR_FILES='[]'
 }
 if echo "$PR_FILES" | jq -e 'length > 0' > /dev/null 2>&1; then

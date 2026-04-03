@@ -24,8 +24,10 @@ def count(obj; key): obj | if . then .[key] // 0 else 0 end;
   "\n\n"
 else "" end) +
 
-(if $filtered > 0 then
+(if $filtered > 0 and $inline > 0 then
   "**\($inline)** inline comments on your changes \u00b7 \($filtered) additional findings outside the diff\n\n"
+elif $filtered > 0 then
+  "\($filtered) findings in changed files \u00b7 none are on lines changed in this PR\n\n"
 elif $inline > 0 then
   "See inline comments for details.\n\n"
 else

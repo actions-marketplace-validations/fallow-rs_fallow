@@ -10,6 +10,9 @@
 
 # Parse @@ hunk headers from a unified diff patch string.
 # Returns [{start, end}] for the new-file (right) side of each hunk.
+# Note: startswith("@@") is safe even when the optional context label after
+# the closing @@ contains "@@" (e.g., `@@ -1,3 +1,5 @@ class @@iterator`),
+# because the capture regex anchors on the structured "-old +new @@" pattern.
 def parse_hunks:
   if . == null or . == "" then []
   else
@@ -33,6 +36,12 @@ def parse_hunks:
 # Keep a comment when:
 #   1. Its file is NOT in the hunk map (fail-open — no patch data), OR
 #   2. Its line falls within at least one hunk range for its file.
+#
+# File-level findings (unused_files, unused_deps, circular_deps) use line 1
+# as a fallback. For newly added files, line 1 is always inside the hunk
+# (@@ -0,0 +1,N @@). For modified files where line 1 is outside the diff,
+# these findings are filtered here but still appear in the review body summary
+# — which is better than the old behavior where GitHub silently rejected them.
 map(select(
   .path as $p | .line as $l |
   ($hunk_map[$p] // null) as $hunks |
