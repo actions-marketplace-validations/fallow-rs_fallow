@@ -114,6 +114,13 @@ assert_contains "$OUT_SCOPED" "86.8" "scoped: still shows codebase maintainabili
 echo "  summary-combined.jq (no scoped row when unfiltered, GitLab):"
 assert_not_contains "$OUT" "changed files" "unfiltered: no scoped maintainability row"
 
+echo "  summary-combined.jq (conditional tips, GitLab):"
+assert_contains "$OUT" "fallow fix --dry-run" "tip: shows fix tip when fixable issues present"
+assert_contains "$OUT" "@public" "tip: shows @public tip when unused exports present"
+OUT_NO_FIX=$(jq '.check.unused_exports = [] | .check.unused_dependencies = [] | .check.unused_enum_members = [] | .check.circular_dependencies = [{"files":["a.ts","b.ts"],"length":2}] | .check.total_issues = 1' "$FIXTURES/combined.json" | jq -r -f "$CI_JQ_DIR/summary-combined.jq" 2>&1)
+assert_not_contains "$OUT_NO_FIX" "fallow fix" "tip: no fix tip when no fixable issues"
+assert_not_contains "$OUT_NO_FIX" "@public" "tip: no @public tip when no unused exports"
+
 echo "  summary-combined.jq (clean state, GitLab):"
 OUT_CLEAN=$(jq -r -f "$CI_JQ_DIR/summary-combined.jq" "$FIXTURES/combined-clean.json" 2>&1)
 assert_contains "$OUT_CLEAN" "No issues found" "clean: no issues"

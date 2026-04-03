@@ -1,6 +1,8 @@
-def table_row(name; key):
+def docs(anchor): "https://docs.fallow.tools/explanations/dead-code#" + anchor;
+
+def table_row(name; key; anchor):
   (.[key] | length) as $n |
-  if $n > 0 then "| \(name) | \($n) |" else empty end;
+  if $n > 0 then "| [\(name)](\(docs(anchor))) | \($n) |" else empty end;
 
 def section(name; key; header; fmt):
   (.[key] | length) as $n |
@@ -21,20 +23,20 @@ else
   "> [!WARNING]\n> **\(.total_issues) issues** found \u00b7 \(.elapsed_ms)ms\n\n" +
   "| Category | Count |\n|----------|------:|\n" +
   ([
-    table_row("Unused files"; "unused_files"),
-    table_row("Unused exports"; "unused_exports"),
-    table_row("Unused types"; "unused_types"),
-    table_row("Unused dependencies"; "unused_dependencies"),
-    table_row("Unused devDependencies"; "unused_dev_dependencies"),
-    table_row("Unused optionalDependencies"; "unused_optional_dependencies"),
-    table_row("Unused enum members"; "unused_enum_members"),
-    table_row("Unused class members"; "unused_class_members"),
-    table_row("Unresolved imports"; "unresolved_imports"),
-    table_row("Unlisted dependencies"; "unlisted_dependencies"),
-    table_row("Duplicate exports"; "duplicate_exports"),
-    table_row("Circular dependencies"; "circular_dependencies"),
-    table_row("Boundary violations"; "boundary_violations"),
-    table_row("Type-only dependencies"; "type_only_dependencies")
+    table_row("Unused files"; "unused_files"; "unused-files"),
+    table_row("Unused exports"; "unused_exports"; "unused-exports"),
+    table_row("Unused types"; "unused_types"; "unused-types"),
+    table_row("Unused dependencies"; "unused_dependencies"; "unused-dependencies"),
+    table_row("Unused devDependencies"; "unused_dev_dependencies"; "unused-dependencies"),
+    table_row("Unused optionalDependencies"; "unused_optional_dependencies"; "unused-dependencies"),
+    table_row("Unused enum members"; "unused_enum_members"; "unused-enum-members"),
+    table_row("Unused class members"; "unused_class_members"; "unused-class-members"),
+    table_row("Unresolved imports"; "unresolved_imports"; "unresolved-imports"),
+    table_row("Unlisted dependencies"; "unlisted_dependencies"; "unlisted-dependencies"),
+    table_row("Duplicate exports"; "duplicate_exports"; "duplicate-exports"),
+    table_row("Circular dependencies"; "circular_dependencies"; "circular-dependencies"),
+    table_row("Boundary violations"; "boundary_violations"; "boundary-violations"),
+    table_row("Type-only dependencies"; "type_only_dependencies"; "type-only-dependencies")
   ] | join("\n")) +
   "\n\n---\n" +
   section("Unused files"; "unused_files";
@@ -79,5 +81,12 @@ else
   section("Type-only dependencies"; "type_only_dependencies";
     "Production deps only used via `import type` \u2014 consider moving to `devDependencies`.\n\n| Package |\n|---------|\n";
     "| `\(.package_name)` |") +
-  "\n\n> [!TIP]\n> Run `fallow fix --dry-run` to preview safe auto-fixes for unused exports, enum members, and dependencies.\n> Add `// fallow-ignore-next-line` above a line to suppress a specific finding."
+  "\n\n> [!TIP]\n" +
+  (if ((.unused_exports // []) + (.unused_dependencies // []) + (.unused_enum_members // [])) | length > 0 then
+    "> Run `fallow fix --dry-run` to preview safe auto-fixes.\n"
+  else "" end) +
+  (if (.unused_exports // []) | length > 0 then
+    "> Intentionally public? Add [`/** @public */`](https://docs.fallow.tools/configuration/suppression) above exports to preserve them.\n"
+  else "" end) +
+  "> Add [`// fallow-ignore-next-line`](https://docs.fallow.tools/configuration/suppression) above a line to suppress a specific finding."
 end

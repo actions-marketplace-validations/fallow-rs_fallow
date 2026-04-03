@@ -126,6 +126,15 @@ assert_contains "$OUT_SCOPED" "86.8" "scoped: still shows codebase maintainabili
 echo "  summary-combined.jq (no scoped row when unfiltered):"
 assert_not_contains "$OUT" "changed files" "unfiltered: no scoped maintainability row"
 
+echo "  summary-combined.jq (conditional tips):"
+# Fixture has unused_exports and unused_dependencies → fix tip + @public tip
+assert_contains "$OUT" "fallow fix --dry-run" "tip: shows fix tip when fixable issues present"
+assert_contains "$OUT" "@public" "tip: shows @public tip when unused exports present"
+# Remove fixable categories → no tip block
+OUT_NO_FIX=$(jq '.check.unused_exports = [] | .check.unused_dependencies = [] | .check.unused_enum_members = [] | .check.circular_dependencies = [{"files":["a.ts","b.ts"],"length":2}] | .check.total_issues = 1' "$FIXTURES/combined.json" | jq -r -f "$JQ_DIR/summary-combined.jq" 2>&1)
+assert_not_contains "$OUT_NO_FIX" "fallow fix" "tip: no fix tip when no fixable issues"
+assert_not_contains "$OUT_NO_FIX" "@public" "tip: no @public tip when no unused exports"
+
 echo "  summary-combined.jq (clean state):"
 OUT_CLEAN=$(jq -r -f "$JQ_DIR/summary-combined.jq" "$FIXTURES/combined-clean.json" 2>&1)
 assert_contains "$OUT_CLEAN" "No issues found" "clean: no issues"
@@ -584,12 +593,12 @@ echo "=== Review body with diff-hunk counts ==="
 echo "  review-body.jq with filtered findings:"
 OUT=$(INLINE_COUNT=5 FILTERED_COUNT=3 jq -r -f "$JQ_DIR/review-body.jq" "$FIXTURES/combined.json" 2>&1)
 assert_contains "$OUT" "inline comments" "shows inline count"
-assert_contains "$OUT" "additional findings outside the diff" "shows filtered count"
+assert_contains "$OUT" "findings in files not changed in this PR" "shows filtered count"
 assert_not_contains "$OUT" "See inline comments for details" "no generic message when filtered"
 
 echo "  review-body.jq with no filtered findings:"
 OUT=$(INLINE_COUNT=5 FILTERED_COUNT=0 jq -r -f "$JQ_DIR/review-body.jq" "$FIXTURES/combined.json" 2>&1)
-assert_contains "$OUT" "See inline comments for details" "generic message when nothing filtered"
+assert_contains "$OUT" "inline comments on your changes" "shows inline count when no filtered"
 assert_not_contains "$OUT" "additional findings" "no filtered mention when count is 0"
 
 echo "  review-body.jq with all findings filtered (body-only):"
