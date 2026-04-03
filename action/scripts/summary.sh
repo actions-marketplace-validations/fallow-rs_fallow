@@ -53,7 +53,8 @@ fi
 
 # Add scoping indicator when results were filtered to changed files
 if [ "$RESULTS_FILE" != "fallow-results.json" ]; then
-  BODY="${BODY}"$'\n\n'"*Scoped to files changed since \`${CHANGED_SINCE:0:7}\`*"
+  COMMIT_URL="${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY}/commit/${CHANGED_SINCE}"
+  BODY="${BODY}"$'\n\n'"*Issue counts scoped to files changed since [\`${CHANGED_SINCE:0:7}\`](${COMMIT_URL}) · health metrics reflect the full codebase*"
 fi
 
 echo "$BODY" >> "$GITHUB_STEP_SUMMARY"

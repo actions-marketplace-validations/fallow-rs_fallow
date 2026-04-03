@@ -71,9 +71,14 @@ else
 
   # Vital signs
   (if $vitals | length > 0 then
+    # Compute scoped maintainability from filtered file_scores (differs from codebase avg when --changed-since is active)
+    ((.health.file_scores // []) | if length > 0 then (map(.maintainability_index) | add / length | . * 10 | round / 10) else null end) as $scoped_maint |
+    "#### Codebase health\n\n" +
     "| Metric | Value |\n|:-------|------:|\n" +
     (if $vitals.maintainability_avg then "| Maintainability | **\(pct($vitals.maintainability_avg))** / 100 |\n" else "" end) +
-    (if $vitals.dead_export_pct then "| Dead exports | \(pct($vitals.dead_export_pct))% |\n" else "" end) +
+    (if $scoped_maint != null and $scoped_maint != pct($vitals.maintainability_avg // 0) then
+      "| Maintainability (changed files) | **\($scoped_maint)** / 100 |\n"
+    else "" end) +
     (if $vitals.avg_cyclomatic then "| Avg complexity | \(pct($vitals.avg_cyclomatic)) |\n" else "" end) +
     "\n"
   else "" end) +

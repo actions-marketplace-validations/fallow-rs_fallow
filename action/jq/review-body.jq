@@ -18,7 +18,6 @@ def count(obj; key): obj | if . then .[key] // 0 else 0 end;
 
 (if $vitals.maintainability_avg then
   "Maintainability: **\($vitals.maintainability_avg | . * 10 | round / 10)** / 100" +
-  (if $vitals.dead_export_pct then " \u00b7 Dead exports: \($vitals.dead_export_pct | . * 10 | round / 10)%" else "" end) +
   (if $vitals.avg_cyclomatic then " \u00b7 Avg complexity: \($vitals.avg_cyclomatic | . * 10 | round / 10)" else "" end) +
   "\n\n"
 else "" end) +

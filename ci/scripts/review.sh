@@ -195,7 +195,8 @@ fi
 
 # Add scoping indicator when results were filtered to changed files
 if [ "$RESULTS_FILE" != "fallow-results.json" ]; then
-  REVIEW_BODY="${REVIEW_BODY}"$'\n\n'"*Scoped to files changed since \`${CHANGED_SINCE:0:7}\`*"
+  COMMIT_URL="${CI_PROJECT_URL:-}/-/commit/${CHANGED_SINCE}"
+  REVIEW_BODY="${REVIEW_BODY}"$'\n\n'"*Issue counts scoped to files changed since [\`${CHANGED_SINCE:0:7}\`](${COMMIT_URL}) · health metrics reflect the full codebase*"
 fi
 
 curl -sf \

@@ -69,7 +69,8 @@ BODY=$(jq -r -f "$JQ_FILE" "$INPUT_FILE") || { echo "WARNING: Failed to generate
 
 # Add scoping indicator when results were filtered to changed files
 if [ "$RESULTS_BASE" != "fallow-results.json" ]; then
-  BODY="${BODY}"$'\n\n'"*Scoped to files changed since \`${CHANGED_SINCE:0:7}\`*"
+  COMMIT_URL="${CI_PROJECT_URL:-}/-/commit/${CHANGED_SINCE}"
+  BODY="${BODY}"$'\n\n'"*Issue counts scoped to files changed since [\`${CHANGED_SINCE:0:7}\`](${COMMIT_URL}) · health metrics reflect the full codebase*"
 fi
 
 COMMENT_BODY="${BODY}
