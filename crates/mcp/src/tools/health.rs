@@ -83,6 +83,12 @@ pub fn build_health_args(params: &HealthParams) -> Vec<String> {
     if params.trend == Some(true) {
         args.push("--trend".to_string());
     }
+    if let Some(ref effort) = params.effort {
+        args.extend(["--effort".to_string(), effort.clone()]);
+    }
+    if params.summary == Some(true) {
+        args.push("--summary".to_string());
+    }
 
     args
 }

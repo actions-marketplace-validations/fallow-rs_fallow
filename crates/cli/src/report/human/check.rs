@@ -138,8 +138,7 @@ pub(in crate::report) fn print_human(
                 .iter()
                 .filter(|e| unused_file_set.contains(e.path.as_path()))
                 .count();
-            let summary =
-                build_summary_footer(results, suppressed_exports, suppressed_types);
+            let summary = build_summary_footer(results, suppressed_exports, suppressed_types);
             eprintln!(
                 "{}",
                 format!("\u{2717} {summary} ({:.2}s)", elapsed.as_secs_f64())
@@ -474,12 +473,10 @@ fn build_dir_rollup_section(
                 .next()
                 .map(|c| c.as_os_str().to_string_lossy().to_string());
             if first.as_deref() == Some(dom_dir.as_str()) {
-                let sub_key = components
-                    .next()
-                    .map(|c| {
-                        format!("{}/{}", dom_dir, c.as_os_str().to_string_lossy())
-                    })
-                    .unwrap_or_else(|| dom_dir.clone());
+                let sub_key = components.next().map_or_else(
+                    || dom_dir.clone(),
+                    |c| format!("{}/{}", dom_dir, c.as_os_str().to_string_lossy()),
+                );
                 if let Some(&idx) = sub_map.get(&sub_key) {
                     sub_counts[idx].1 += 1;
                 } else {
@@ -1078,7 +1075,10 @@ fn build_summary_footer(
 
     add(results.unused_files.len(), "file");
     add(
-        results.unused_exports.len().saturating_sub(suppressed_exports),
+        results
+            .unused_exports
+            .len()
+            .saturating_sub(suppressed_exports),
         "export",
     );
     add(

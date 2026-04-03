@@ -375,6 +375,7 @@ pub use codeclimate::build_health_codeclimate;
     reason = "target-dependent: used in lib, unused in bin"
 )]
 pub use compact::build_compact_lines;
+pub use json::build_baseline_deltas_json;
 #[allow(
     unused_imports,
     reason = "target-dependent: used in lib, unused in bin"

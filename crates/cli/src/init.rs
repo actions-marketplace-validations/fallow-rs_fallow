@@ -165,7 +165,8 @@ fn build_json_config(info: &ProjectInfo) -> String {
     config["rules"] = serde_json::Value::Object(rules);
 
     // serde_json pretty-print + trailing newline
-    let mut output = serde_json::to_string_pretty(&config).unwrap_or_else(|_| String::from("{}\n"));
+    let mut output = serde_json::to_string_pretty(&config)
+        .expect("config built from json! literals is always serializable");
     output.push('\n');
     output
 }

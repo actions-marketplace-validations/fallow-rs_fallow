@@ -52,6 +52,12 @@ pub struct HealthOptions<'a> {
     pub since: Option<&'a str>,
     pub min_commits: Option<u32>,
     pub explain: bool,
+    /// When true, emit a condensed summary instead of full item-level output.
+    #[allow(
+        dead_code,
+        reason = "wired from CLI but consumed by combined mode, not standalone health"
+    )]
+    pub summary: bool,
     pub save_snapshot: Option<std::path::PathBuf>,
     pub trend: bool,
     pub group_by: Option<crate::GroupBy>,

@@ -1428,6 +1428,7 @@ mod tests {
                 hotspot_count: Some(3),
                 circular_dep_count: Some(1),
                 unused_dep_count: Some(2),
+                counts: None,
             }),
             health_score: None,
             file_scores: vec![],

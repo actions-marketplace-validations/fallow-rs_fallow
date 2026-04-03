@@ -57,7 +57,7 @@ fallow watch                # Re-analyze on file changes
 
 ## Dead code
 
-Finds unused files, exports, dependencies, types, enum members, class members, unresolved imports, unlisted dependencies, duplicate exports, circular dependencies, boundary violations, type-only dependencies, and test-only production dependencies.
+Finds unused files, exports, dependencies, types, enum members, class members, unresolved imports, unlisted dependencies, duplicate exports, circular dependencies (including cross-package cycles in monorepos), boundary violations, type-only dependencies, and test-only production dependencies. Entry points are auto-detected from package.json fields, framework conventions, and plugin patterns.
 
 ```bash
 fallow dead-code                          # All dead code issues
@@ -68,6 +68,7 @@ fallow dead-code --production             # Exclude test/dev files
 fallow dead-code --changed-since main     # Only changed files (for PRs)
 fallow dead-code --group-by owner         # Group by CODEOWNERS for team triage
 fallow dead-code --group-by directory     # Group by first directory component
+fallow dead-code --group-by package       # Group by workspace package (monorepo)
 ```
 
 ## Duplication
@@ -95,6 +96,7 @@ fallow health --top 20                    # 20 most complex functions
 fallow health --file-scores               # Per-file maintainability index (0-100)
 fallow health --hotspots                  # Riskiest files (git churn x complexity)
 fallow health --targets                   # Ranked refactoring recommendations
+fallow health --targets --effort low      # Only quick-win refactoring targets
 fallow health --trend                     # Compare against saved snapshot
 fallow health --changed-since main        # Only changed files
 ```
@@ -130,7 +132,8 @@ fallow:
 
 `--ci` enables SARIF output, quiet mode, and non-zero exit on issues. Also supports:
 
-- `--group-by owner|directory` -- group output by CODEOWNERS ownership or directory for team-level triage
+- `--group-by owner|directory|package` -- group output by CODEOWNERS ownership, directory, or workspace package for team-level triage
+- `--summary` -- show only category counts (no individual issues)
 - `--changed-since main` -- analyze only files touched in a PR
 - `--baseline` / `--save-baseline` -- fail only on **new** issues
 - `--fail-on-regression` / `--tolerance 2%` -- fail only if issues **grew** beyond tolerance
@@ -207,7 +210,7 @@ Architecture boundary presets enforce import rules between layers with zero manu
 { "boundaries": { "preset": "bulletproof" } } // or: layered, hexagonal, feature-sliced
 ```
 
-Run `fallow list --boundaries` to inspect the expanded rules. TOML also supported (`fallow init --toml`). The init command also adds `.fallow/` to your `.gitignore` (cache and local data). Scaffold a pre-commit hook with `fallow init --hooks`. Migrating from knip or jscpd? Run `fallow migrate`.
+Run `fallow list --boundaries` to inspect the expanded rules. TOML also supported (`fallow init --toml`). The init command auto-detects your project structure (monorepo layout, frameworks, existing config) and generates a tailored config. It also adds `.fallow/` to your `.gitignore` (cache and local data). Scaffold a pre-commit hook with `fallow init --hooks`. Migrating from knip or jscpd? Run `fallow migrate`.
 
 See the [full configuration reference](https://docs.fallow.tools/configuration/overview) for all options.
 

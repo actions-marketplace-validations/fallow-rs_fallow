@@ -130,6 +130,14 @@
       },
       "default": []
     },
+    "dynamicallyLoaded": {
+      "description": "Glob patterns for files that are dynamically loaded at runtime\n(plugin directories, locale files, etc.). These files are treated as\nalways-used and will never be flagged as unused.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "default": []
+    },
     "overrides": {
       "description": "Per-file rule overrides matching oxlint's overrides pattern.",
       "type": "array",
@@ -144,6 +152,14 @@
         "string",
         "null"
       ]
+    },
+    "publicPackages": {
+      "description": "Workspace package name patterns that are public libraries.\nExports from these packages are not flagged as unused.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "default": []
     },
     "regression": {
       "description": "Regression detection baseline embedded in config.\nStores issue counts from a known-good state for CI regression checks.\nPopulated by `--save-regression-baseline` (no path), read by `--fail-on-regression`.",

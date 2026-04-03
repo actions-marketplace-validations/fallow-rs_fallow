@@ -52,6 +52,8 @@ fn read_source(path: &std::path::Path) -> String {
 
 /// Check whether any two files in a cycle belong to different workspace packages.
 /// Uses longest-prefix-match to assign each file to a workspace root.
+/// Files outside all workspace roots (e.g., root-level shared code) are ignored —
+/// only cycles between two distinct named workspaces are flagged.
 fn is_cross_package_cycle(
     files: &[std::path::PathBuf],
     workspaces: &[fallow_config::WorkspaceInfo],

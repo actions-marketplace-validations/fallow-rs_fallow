@@ -519,6 +519,8 @@ fn health_args_with_all_options() {
         no_cache: Some(true),
         threads: Some(4),
         trend: None,
+        effort: Some("high".to_string()),
+        summary: Some(true),
     };
     let args = build_health_args(&params);
     assert_eq!(
@@ -560,6 +562,9 @@ fn health_args_with_all_options() {
             "--no-cache",
             "--threads",
             "4",
+            "--effort",
+            "high",
+            "--summary",
         ]
     );
 }

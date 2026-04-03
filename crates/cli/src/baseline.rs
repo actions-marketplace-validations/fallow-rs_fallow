@@ -544,6 +544,26 @@ pub fn filter_new_health_targets(
     targets
 }
 
+/// Per-category delta between current results and a baseline.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CategoryDelta {
+    pub current: usize,
+    pub baseline: usize,
+    pub delta: i64,
+}
+
+/// Deltas between current analysis results and a saved baseline.
+///
+/// Used in combined mode to show +/- counts in the failure summary and
+/// to emit `baseline_deltas` in JSON output.
+#[derive(Debug, Clone)]
+pub struct BaselineDeltas {
+    /// Net change in total issue count (positive = more issues).
+    pub total_delta: i64,
+    /// Per-category deltas keyed by category name.
+    pub per_category: Vec<(String, CategoryDelta)>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

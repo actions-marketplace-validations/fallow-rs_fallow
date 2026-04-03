@@ -1378,6 +1378,7 @@ mod tests {
             maintainability_avg: Some(72.4),
             unused_dep_count: Some(3),
             circular_dep_count: Some(1),
+            counts: None,
         });
         let lines = build_health_human_lines(&report, &root);
         let text = plain(&lines);
@@ -1405,6 +1406,7 @@ mod tests {
             maintainability_avg: Some(72.4),
             unused_dep_count: None,
             circular_dep_count: None,
+            counts: None,
         });
         report.health_trend = Some(crate::health_types::HealthTrend {
             compared_to: crate::health_types::TrendPoint {
@@ -1438,6 +1440,7 @@ mod tests {
             maintainability_avg: None,
             unused_dep_count: None,
             circular_dep_count: None,
+            counts: None,
         });
         let lines = build_health_human_lines(&report, &root);
         let text = plain(&lines);
@@ -1463,6 +1466,7 @@ mod tests {
             maintainability_avg: None,
             unused_dep_count: Some(0),
             circular_dep_count: Some(0),
+            counts: None,
         });
         let lines = build_health_human_lines(&report, &root);
         let text = plain(&lines);
@@ -1485,6 +1489,7 @@ mod tests {
             maintainability_avg: None,
             unused_dep_count: Some(1),
             circular_dep_count: Some(2),
+            counts: None,
         });
         let lines = build_health_human_lines(&report, &root);
         let text = plain(&lines);

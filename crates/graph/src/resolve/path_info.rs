@@ -42,6 +42,38 @@ pub fn is_bare_specifier(specifier: &str) -> bool {
         && !specifier.starts_with("data:")
 }
 
+/// Check if a string looks like a valid npm package name.
+///
+/// Rejects strings that are clearly not packages: shell variables (`$X`),
+/// pure numbers, strings starting with `!`, empty strings, etc.
+/// This prevents false "unlisted dependency" reports for test fixture
+/// artifacts like `$DIR` or `1`.
+#[must_use]
+pub fn is_valid_package_name(name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    let first = name.as_bytes()[0];
+    // Reject shell variables, shebangs, and similar non-package prefixes
+    if first == b'$' || first == b'!' || first == b'#' {
+        return false;
+    }
+    // Reject bundler-internal specifiers (webpack loaders, turbopack barrel optimization)
+    if name.contains('?') || name.contains('!') || name.starts_with("__") {
+        return false;
+    }
+    // Pure numeric strings (like "1", "123") are not package names
+    if name.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    // Must contain at least one letter or @ sign to be a plausible package name
+    if !name.bytes().any(|b| b.is_ascii_alphabetic() || b == b'@') {
+        return false;
+    }
+    // Reject strings with spaces or backslashes (not valid in npm names)
+    !name.contains(' ') && !name.contains('\\')
+}
+
 /// Extract the npm package name from a specifier.
 /// `@scope/pkg/foo/bar` -> `@scope/pkg`
 /// `lodash/merge` -> `lodash`
@@ -137,6 +169,30 @@ mod tests {
         assert!(!is_path_alias("~something"));
     }
 
+    // ── is_valid_package_name ────────────────────────────────────────
+
+    #[test]
+    fn valid_package_names() {
+        assert!(is_valid_package_name("react"));
+        assert!(is_valid_package_name("@scope/pkg"));
+        assert!(is_valid_package_name("lodash.get"));
+        assert!(is_valid_package_name("my-pkg"));
+        assert!(is_valid_package_name("@babel/core"));
+        assert!(is_valid_package_name("3d-view")); // starts with digit but has letters
+    }
+
+    #[test]
+    fn invalid_package_names() {
+        assert!(!is_valid_package_name("$DIR"));
+        assert!(!is_valid_package_name("$ENV_VAR"));
+        assert!(!is_valid_package_name("1"));
+        assert!(!is_valid_package_name("123"));
+        assert!(!is_valid_package_name(""));
+        assert!(!is_valid_package_name("!important"));
+        assert!(!is_valid_package_name("has spaces"));
+        assert!(!is_valid_package_name("back\\slash"));
+    }
+
     // ── extract_package_name edge cases ─────────────────────────────
 
     #[test]
@@ -196,11 +252,31 @@ mod tests {
                 prop_assert_eq!(extracted, pkg);
             }
 
-            /// is_bare_specifier and is_path_alias should never panic on arbitrary strings.
+            /// is_bare_specifier, is_path_alias, and is_valid_package_name should never panic on arbitrary strings.
             #[test]
-            fn bare_specifier_and_path_alias_no_panic(s in "[a-zA-Z0-9@#~/._-]{1,100}") {
+            fn classification_functions_no_panic(s in "[a-zA-Z0-9@#~/._$!\\-]{1,100}") {
                 let _ = is_bare_specifier(&s);
                 let _ = is_path_alias(&s);
+                let _ = is_valid_package_name(&s);
+            }
+
+            /// Valid npm package names (lowercase letters, digits, hyphens, dots) must be accepted.
+            #[test]
+            fn valid_npm_names_accepted(name in "[a-z][a-z0-9._-]{0,30}") {
+                prop_assert!(is_valid_package_name(&name));
+            }
+
+            /// Shell variable specifiers ($...) must be rejected.
+            #[test]
+            fn shell_variables_rejected(suffix in "[A-Z_]{1,20}") {
+                let specifier = format!("${suffix}");
+                prop_assert!(!is_valid_package_name(&specifier));
+            }
+
+            /// Pure numeric specifiers must be rejected.
+            #[test]
+            fn pure_numbers_rejected(n in "[0-9]{1,10}") {
+                prop_assert!(!is_valid_package_name(&n));
             }
 
             /// `@/` prefix should always be detected as a path alias.

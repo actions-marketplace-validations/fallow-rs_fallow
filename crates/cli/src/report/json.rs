@@ -475,6 +475,32 @@ fn inject_actions(output: &mut serde_json::Value) {
 
 // ── Health action injection ─────────────────────────────────────
 
+/// Build a JSON representation of baseline deltas for the combined JSON envelope.
+///
+/// Accepts a total delta and an iterator of per-category entries to avoid
+/// coupling the report module (compiled in both lib and bin) to the
+/// binary-only `baseline` module.
+pub fn build_baseline_deltas_json<'a>(
+    total_delta: i64,
+    per_category: impl Iterator<Item = (&'a str, usize, usize, i64)>,
+) -> serde_json::Value {
+    let mut per_cat = serde_json::Map::new();
+    for (cat, current, baseline, delta) in per_category {
+        per_cat.insert(
+            cat.to_string(),
+            serde_json::json!({
+                "current": current,
+                "baseline": baseline,
+                "delta": delta,
+            }),
+        );
+    }
+    serde_json::json!({
+        "total_delta": total_delta,
+        "per_category": per_cat
+    })
+}
+
 /// Inject `actions` arrays into complexity findings in a health JSON output.
 ///
 /// Walks `findings` and `targets` arrays, appending machine-actionable

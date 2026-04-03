@@ -237,11 +237,7 @@ pub fn run_combined(opts: &CombinedOptions<'_>) -> ExitCode {
                     eprintln!();
                     eprintln!("── Duplication ────────────────────────────────────");
                 }
-                let code = crate::dupes::print_dupes_result(
-                    result,
-                    opts.quiet,
-                    opts.explain,
-                );
+                let code = crate::dupes::print_dupes_result(result, opts.quiet, opts.explain);
                 max_exit = max_exit.max(exit_code_to_u8(code));
             }
 
@@ -251,12 +247,7 @@ pub fn run_combined(opts: &CombinedOptions<'_>) -> ExitCode {
                     eprintln!("── Complexity ─────────────────────────────────────");
                 }
                 let code =
-                    crate::health::print_health_result(
-                        result,
-                        opts.quiet,
-                        opts.explain,
-                        None,
-                    );
+                    crate::health::print_health_result(result, opts.quiet, opts.explain, None);
                 max_exit = max_exit.max(exit_code_to_u8(code));
             }
         }
@@ -311,19 +302,17 @@ pub fn run_combined(opts: &CombinedOptions<'_>) -> ExitCode {
                 .as_ref()
                 .filter(|r| !r.report.targets.is_empty())
                 .map(|r| {
-                    // Prefer non-test target; fall back to first if all are test paths
-                    let top = r
-                        .report
-                        .targets
-                        .iter()
-                        .find(|t| !is_test_path(&t.path))
-                        .unwrap_or(&r.report.targets[0]);
-                    let name = top
-                        .path
-                        .file_name()
-                        .map(|f| f.to_string_lossy().to_string())
-                        .unwrap_or_default();
-                    format!(" \u{2014} start with {name}")
+                    // Prefer non-test/fixture target; skip nudge if all targets are noise
+                    if let Some(top) = r.report.targets.iter().find(|t| !is_test_path(&t.path)) {
+                        let name = top
+                            .path
+                            .file_name()
+                            .map(|f| f.to_string_lossy().to_string())
+                            .unwrap_or_default();
+                        format!(" \u{2014} start with {name}")
+                    } else {
+                        String::new()
+                    }
                 })
                 .unwrap_or_default();
             eprintln!("\nFailed: {}{nudge}", parts.join(", "));
@@ -369,7 +358,13 @@ fn print_combined_json(
                 {
                     map.insert(
                         "baseline_deltas".to_string(),
-                        report::build_baseline_deltas_json(deltas),
+                        report::build_baseline_deltas_json(
+                            deltas.total_delta,
+                            deltas
+                                .per_category
+                                .iter()
+                                .map(|(cat, d)| (cat.as_str(), d.current, d.baseline, d.delta)),
+                        ),
                     );
                 }
                 combined.insert("check".into(), json);
@@ -680,34 +675,46 @@ fn print_orientation_header(health: &HealthResult, check: Option<&CheckResult>) 
                 .dimmed()
             );
         } else {
-            // Prefer non-test target; fall back to first target if all are test paths
-            let top = health
+            // Prefer non-test target; skip nudge if all targets are noise
+            if let Some(top) = health
                 .report
                 .targets
                 .iter()
                 .find(|t| !is_test_path(&t.path))
-                .unwrap_or(&health.report.targets[0]);
-            let file_name = top
-                .path
-                .file_name()
-                .map(|f| f.to_string_lossy().to_string())
-                .unwrap_or_default();
-            eprintln!(
-                "{}",
-                format!(
-                    "  {target_count} refactoring target{} \u{2014} start with {file_name} ({})",
-                    if target_count == 1 { "" } else { "s" },
-                    top.category.label()
-                )
-                .dimmed()
-            );
+            {
+                let file_name = top
+                    .path
+                    .file_name()
+                    .map(|f| f.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                eprintln!(
+                    "{}",
+                    format!(
+                        "  {target_count} refactoring target{} \u{2014} start with {file_name} ({})",
+                        if target_count == 1 { "" } else { "s" },
+                        top.category.label()
+                    )
+                    .dimmed()
+                );
+            } else {
+                eprintln!(
+                    "{}",
+                    format!(
+                        "  {target_count} refactoring target{}",
+                        if target_count == 1 { "" } else { "s" },
+                    )
+                    .dimmed()
+                );
+            }
         }
     }
 }
 
-/// Check if a path contains a test directory segment.
+/// Check if a path is a test, fixture, or generated file that shouldn't be
+/// recommended as a refactoring starting point.
 fn is_test_path(path: &std::path::Path) -> bool {
-    path.components().any(|c| {
+    // Check directory components for test/fixture/example directories
+    if path.components().any(|c| {
         let s = c.as_os_str().to_string_lossy();
         matches!(
             s.as_ref(),
@@ -720,8 +727,42 @@ fn is_test_path(path: &std::path::Path) -> bool {
                 | "__mocks__"
                 | "__fixtures__"
                 | "fixtures"
+                | "examples"
+                | "example"
+                | "__snapshots__"
+                | "snapshots"
+                | "benchmark"
+                | "benchmarks"
+                | "bench"
+                | "e2e"
+                | "playground"
+                | "playgrounds"
         )
-    })
+    }) {
+        return true;
+    }
+    // Check file name patterns
+    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+        if name.contains(".test.")
+            || name.contains(".spec.")
+            || name.contains(".fixture.")
+            || name.contains(".e2e.")
+            || name.contains(".bench.")
+            || name.contains(".story.")
+            || name.contains(".stories.")
+        {
+            return true;
+        }
+        // Generated file heuristic: single letter + digits (a0.js, b1.mjs)
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        if stem.len() <= 3
+            && stem.starts_with(|c: char| c.is_ascii_lowercase())
+            && stem[1..].bytes().all(|b| b.is_ascii_digit())
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// Print entry-point detection summary to stderr.

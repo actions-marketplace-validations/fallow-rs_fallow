@@ -74,7 +74,8 @@ These flags work with any subcommand:
 | `--regression-baseline <PATH>` | Path to regression baseline file (overrides config-embedded baseline) |
 | `--save-regression-baseline [PATH]` | Save current counts as regression baseline. No path = write into config file |
 | `--sarif-file <PATH>` | Write SARIF alongside primary output |
-| `--group-by owner\|directory` | Group output by CODEOWNERS ownership or first directory component |
+| `--group-by owner\|directory\|package` | Group output by CODEOWNERS ownership, first directory component, or workspace package |
+| `--summary` | Show only category counts (no individual issues) |
 | `--performance` | Show pipeline timing breakdown |
 
 ## Commands
@@ -187,6 +188,7 @@ fallow health --format json --quiet --targets
 - `--file-scores` -- compute per-file maintainability index (fan-in, fan-out, dead code ratio, complexity density). Runs the full analysis pipeline.
 - `--hotspots` -- identify files that are both complex and frequently changing (combines git churn with complexity). Requires a git repository.
 - `--targets` -- ranked refactoring recommendations based on complexity, coupling, churn, and dead code signals. Sorted by efficiency (priority/effort) to surface quick wins. Categories: churn+complexity, circular dep, high impact, dead code, complexity, coupling.
+- `--effort <low|medium|high>` -- filter refactoring targets by effort level (use with `--targets`)
 - `--score` -- show only the project health score (0-100) with letter grade (A/B/C/D/F). The score is included by default when no section flags are set. JSON output includes `health_score` object with `score`, `grade`, and `penalties` breakdown. Penalties are reproducible: `100 - sum(penalties) == score`.
 - `--min-score <N>` -- fail if health score is below threshold (exit code 1). Implies `--score`. Use as a CI quality gate.
 - `--since <DURATION>` -- git history window for hotspot analysis (default: 6m). Accepts durations (6m, 90d, 1y, 2w) or ISO dates (2025-06-01).
@@ -443,6 +445,13 @@ Fallow reads config from the project root in priority order: `.fallowrc.json` > 
 - `warn` -- report but exit 0
 - `off` -- skip detection entirely
 - `--fail-on-issues` promotes all `warn` to `error`
+
+### Additional config fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `dynamicallyLoaded` | `string[]` | Glob patterns for files loaded dynamically at runtime (e.g., plugin systems). Matched files are treated as entry points. |
+| `publicPackages` | `string[]` | Workspace package names whose exports are considered public API. Exports from these packages are never reported as unused. |
 
 ### Inline suppression
 

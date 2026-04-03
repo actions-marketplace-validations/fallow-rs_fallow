@@ -8,7 +8,9 @@ use super::fallbacks::{
     extract_package_name_from_node_modules_path, try_path_alias_fallback,
     try_pnpm_workspace_fallback, try_source_fallback,
 };
-use super::path_info::{extract_package_name, is_bare_specifier, is_path_alias};
+use super::path_info::{
+    extract_package_name, is_bare_specifier, is_path_alias, is_valid_package_name,
+};
 use super::react_native::{build_condition_names, build_extensions};
 use super::types::{ResolveContext, ResolveResult};
 
@@ -151,7 +153,7 @@ pub(super) fn resolve_specifier(
                 // Classifying them as NpmPackage would cause false "unlisted dependency" reports.
                 try_path_alias_fallback(ctx, specifier)
                     .unwrap_or_else(|| ResolveResult::Unresolvable(specifier.to_string()))
-            } else if is_bare {
+            } else if is_bare && is_valid_package_name(specifier) {
                 let pkg_name = extract_package_name(specifier);
                 ResolveResult::NpmPackage(pkg_name)
             } else {

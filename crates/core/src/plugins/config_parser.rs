@@ -1446,7 +1446,10 @@ mod tests {
             export default config;
         "#;
         let addons = extract_config_shallow_strings(source, &ts_path(), "addons");
-        assert_eq!(addons, vec!["@storybook/addon-a11y", "@storybook/addon-docs"]);
+        assert_eq!(
+            addons,
+            vec!["@storybook/addon-a11y", "@storybook/addon-docs"]
+        );
 
         let framework = extract_config_string(source, &ts_path(), &["framework"]);
         assert_eq!(framework, Some("@storybook/react-vite".to_string()));

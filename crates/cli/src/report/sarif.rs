@@ -447,7 +447,11 @@ pub fn build_sarif(
                 level: severity_to_sarif_level(rules.circular_dependencies),
                 message: format!(
                     "Circular dependency{}: {}",
-                    if cycle.is_cross_package { " (cross-package)" } else { "" },
+                    if cycle.is_cross_package {
+                        " (cross-package)"
+                    } else {
+                        ""
+                    },
                     display_chain.join(" \u{2192} ")
                 ),
                 uri: first_uri,

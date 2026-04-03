@@ -327,6 +327,7 @@ fn run_audit_check<'a>(
         trace_opts: &trace_opts,
         explain: opts.explain,
         top: None,
+        summary: false,
         regression_opts: crate::regression::RegressionOpts {
             fail_on_regression: false,
             tolerance: crate::regression::Tolerance::Absolute(0),
@@ -366,6 +367,7 @@ fn run_audit_dupes<'a>(
         trace: None,
         changed_since,
         explain: opts.explain,
+        summary: false,
         group_by: opts.group_by,
     }) {
         Ok(r) => Ok(Some(r)),
@@ -404,6 +406,7 @@ fn run_audit_health<'a>(
         since: None,
         min_commits: None,
         explain: opts.explain,
+        summary: false,
         save_snapshot: None,
         trend: false,
         group_by: opts.group_by,

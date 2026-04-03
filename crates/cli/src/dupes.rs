@@ -37,6 +37,12 @@ pub struct DupesOptions<'a> {
     pub trace: Option<&'a str>,
     pub changed_since: Option<&'a str>,
     pub explain: bool,
+    /// When true, emit a condensed summary instead of full item-level output.
+    #[allow(
+        dead_code,
+        reason = "wired from CLI but consumed by combined mode, not standalone dupes"
+    )]
+    pub summary: bool,
     pub group_by: Option<crate::GroupBy>,
 }
 
@@ -368,6 +374,7 @@ mod tests {
             trace: None,
             changed_since: None,
             explain: false,
+            summary: false,
             group_by: None,
         }
     }

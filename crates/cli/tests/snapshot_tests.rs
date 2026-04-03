@@ -1838,6 +1838,7 @@ fn markdown_health_with_vital_signs_snapshot() {
         maintainability_avg: Some(72.4),
         unused_dep_count: Some(3),
         circular_dep_count: Some(1),
+        counts: None,
     });
     let output = build_health_markdown(&report, &root);
     insta::assert_snapshot!("markdown_health_with_vital_signs", output);
@@ -1907,6 +1908,7 @@ fn health_report_with_score(root: &Path) -> HealthReport {
         maintainability_avg: Some(85.2),
         unused_dep_count: Some(22),
         circular_dep_count: Some(4),
+        counts: None,
     });
     report.health_score = Some(HealthScore {
         score: 76.9,

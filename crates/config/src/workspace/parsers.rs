@@ -150,6 +150,10 @@ pub(super) fn expand_workspace_glob(
         Ok(paths) => paths
             .filter_map(Result::ok)
             .filter(|p| p.is_dir())
+            // Exclude nested node_modules — glob patterns like `playground/*`
+            // or `packages/**` can match dirs inside node_modules, causing
+            // their dependencies to be analyzed as workspace packages.
+            .filter(|p| !p.components().any(|c| c.as_os_str() == "node_modules"))
             // Fast pre-filter: skip directories without package.json before
             // paying the cost of canonicalize() (the P0 perf fix — avoids
             // canonicalizing 759+ non-workspace dirs in large monorepos).
@@ -694,6 +698,41 @@ mod tests {
         // Trailing slash pattern gets `*` appended -> `packages/*`
         let results = expand_workspace_glob(&temp_dir, "packages/*", &canonical_root);
         assert_eq!(results.len(), 1);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    // ── expand_workspace_glob excludes node_modules ──────────────────
+
+    #[test]
+    fn expand_workspace_glob_excludes_node_modules() {
+        let temp_dir = std::env::temp_dir().join("fallow-test-expand-no-nodemod");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+
+        // Nested node_modules package — should be excluded
+        let nm_pkg = temp_dir.join("packages/foo/node_modules/bar");
+        std::fs::create_dir_all(&nm_pkg).unwrap();
+        std::fs::write(nm_pkg.join("package.json"), r#"{"name":"bar"}"#).unwrap();
+
+        // Legitimate workspace package — should be included
+        let ws_pkg = temp_dir.join("packages/foo");
+        std::fs::write(ws_pkg.join("package.json"), r#"{"name":"foo"}"#).unwrap();
+
+        let canonical_root = temp_dir.canonicalize().unwrap();
+        let results = expand_workspace_glob(&temp_dir, "packages/**", &canonical_root);
+
+        assert!(results.iter().any(|(_orig, canon)| {
+            canon
+                .to_string_lossy()
+                .replace('\\', "/")
+                .contains("packages/foo")
+                && !canon.to_string_lossy().contains("node_modules")
+        }));
+        assert!(
+            !results
+                .iter()
+                .any(|(_, cp)| cp.to_string_lossy().contains("node_modules"))
+        );
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

@@ -36,6 +36,9 @@ pub struct VitalSigns {
     /// Number of circular dependency chains.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub circular_dep_count: Option<u32>,
+    /// Raw counts backing the percentages (for orientation header display).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub counts: Option<VitalSignsCounts>,
 }
 
 /// Raw counts backing the vital signs percentages.
@@ -103,6 +106,7 @@ mod tests {
             maintainability_avg: Some(72.4),
             unused_dep_count: Some(4),
             circular_dep_count: Some(2),
+            counts: None,
         };
         let json = serde_json::to_string(&vs).unwrap();
         let deserialized: VitalSigns = serde_json::from_str(&json).unwrap();
@@ -133,6 +137,7 @@ mod tests {
                 maintainability_avg: Some(72.4),
                 unused_dep_count: Some(4),
                 circular_dep_count: Some(2),
+                counts: None,
             },
             counts: VitalSignsCounts {
                 total_files: 1200,
@@ -169,6 +174,7 @@ mod tests {
             maintainability_avg: None,
             unused_dep_count: None,
             circular_dep_count: None,
+            counts: None,
         };
         let json = serde_json::to_string(&vs).unwrap();
         assert!(!json.contains("dead_file_pct"));

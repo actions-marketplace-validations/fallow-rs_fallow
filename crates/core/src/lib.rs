@@ -577,8 +577,7 @@ fn discover_all_entry_points(
 
     // Add dynamically loaded files from config as entry points
     if !config.dynamically_loaded.is_empty() {
-        let dynamic_entries =
-            discover::discover_dynamically_loaded_entry_points(config, files);
+        let dynamic_entries = discover::discover_dynamically_loaded_entry_points(config, files);
         entry_points.extend(dynamic_entries);
     }
 
@@ -600,6 +599,7 @@ fn summarize_entry_points(entry_points: &[discover::EntryPoint]) -> results::Ent
             discover::EntryPointSource::DefaultIndex => "default index",
             discover::EntryPointSource::ManualEntry => "manual entry",
             discover::EntryPointSource::InfrastructureConfig => "config",
+            discover::EntryPointSource::DynamicallyLoaded => "dynamically loaded",
         };
         *counts.entry(category.to_string()).or_insert(0) += 1;
     }

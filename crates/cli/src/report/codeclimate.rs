@@ -391,7 +391,11 @@ pub fn build_codeclimate(
             "fallow/circular-dependency",
             &format!(
                 "Circular dependency{}: {}",
-                if cycle.is_cross_package { " (cross-package)" } else { "" },
+                if cycle.is_cross_package {
+                    " (cross-package)"
+                } else {
+                    ""
+                },
                 chain.join(" \u{2192} ")
             ),
             level,

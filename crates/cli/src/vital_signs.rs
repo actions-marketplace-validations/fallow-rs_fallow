@@ -110,6 +110,18 @@ pub fn compute_vital_signs(input: &VitalSignsInput<'_>) -> VitalSigns {
             .count() as u32
     });
 
+    // Build raw counts for percentage referents ("63.5% (N of M)")
+    let counts = input.analysis_counts.as_ref().map(|ac| VitalSignsCounts {
+        total_files: input.total_files,
+        total_exports: ac.total_exports,
+        dead_files: ac.dead_files,
+        dead_exports: ac.dead_exports,
+        duplicated_lines: None,
+        total_lines: None,
+        files_scored: input.file_scores.map(<[_]>::len),
+        total_deps: ac.total_deps,
+    });
+
     VitalSigns {
         dead_file_pct,
         dead_export_pct,
@@ -120,6 +132,7 @@ pub fn compute_vital_signs(input: &VitalSignsInput<'_>) -> VitalSigns {
         maintainability_avg,
         unused_dep_count,
         circular_dep_count,
+        counts,
     }
 }
 
@@ -785,6 +798,7 @@ mod tests {
             maintainability_avg: Some(72.4),
             unused_dep_count: Some(4),
             circular_dep_count: Some(2),
+            counts: None,
         };
         let counts = VitalSignsCounts {
             total_files: 1200,
@@ -828,6 +842,7 @@ mod tests {
             maintainability_avg: None,
             unused_dep_count: None,
             circular_dep_count: None,
+            counts: None,
         };
         let counts = VitalSignsCounts {
             total_files: 0,
@@ -860,6 +875,7 @@ mod tests {
             maintainability_avg: None,
             unused_dep_count: None,
             circular_dep_count: None,
+            counts: None,
         };
         let counts = VitalSignsCounts {
             total_files: 0,
@@ -902,6 +918,7 @@ mod tests {
             maintainability_avg: Some(90.0),
             unused_dep_count: Some(0),
             circular_dep_count: Some(0),
+            counts: None,
         };
         let score = compute_health_score(&vs, 100);
         assert!((score.score - 100.0).abs() < f64::EPSILON);
@@ -921,6 +938,7 @@ mod tests {
             maintainability_avg: None,
             unused_dep_count: None,
             circular_dep_count: None,
+            counts: None,
         };
         let score = compute_health_score(&vs, 0);
         // Only complexity penalties apply (both 0 since below thresholds)
@@ -942,6 +960,7 @@ mod tests {
             maintainability_avg: None,
             unused_dep_count: None,
             circular_dep_count: None,
+            counts: None,
         };
         let score = compute_health_score(&vs, 100);
         // dead_file: min(50*0.2, 15) = 10
@@ -963,6 +982,7 @@ mod tests {
             maintainability_avg: None,
             unused_dep_count: None,
             circular_dep_count: None,
+            counts: None,
         };
         let score = compute_health_score(&vs, 100);
         // complexity: min((5.5-1.5)*5, 20) = 20
@@ -984,6 +1004,7 @@ mod tests {
             maintainability_avg: Some(20.0),
             unused_dep_count: Some(100),
             circular_dep_count: Some(50),
+            counts: None,
         };
         let score = compute_health_score(&vs, 100);
         assert!((score.score).abs() < f64::EPSILON);
@@ -1002,6 +1023,7 @@ mod tests {
             maintainability_avg: None,
             unused_dep_count: None,
             circular_dep_count: None,
+            counts: None,
         };
         // 5 hotspots in 100 files = 5% = 10 points
         let score_100 = compute_health_score(&vs, 100);
@@ -1102,6 +1124,7 @@ mod tests {
             maintainability_avg: Some(75.0),
             unused_dep_count: Some(3),
             circular_dep_count: Some(1),
+            counts: None,
         };
         let counts = VitalSignsCounts {
             total_files: 100,
@@ -1178,6 +1201,7 @@ mod tests {
             maintainability_avg: Some(72.4),
             unused_dep_count: Some(4),
             circular_dep_count: Some(2),
+            counts: None,
         }
     }
 
@@ -1212,6 +1236,7 @@ mod tests {
                 maintainability_avg: Some(72.4),
                 unused_dep_count: Some(4),
                 circular_dep_count: Some(2),
+                counts: None,
             },
             counts: VitalSignsCounts {
                 total_files: 100,

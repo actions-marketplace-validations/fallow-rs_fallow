@@ -265,6 +265,13 @@ pub struct HealthParams {
     /// Compare current metrics against the most recent saved snapshot and show per-metric deltas.
     /// Implies --score. Reads from `.fallow/snapshots/`.
     pub trend: Option<bool>,
+
+    /// Analysis effort level. Controls the depth of analysis: "low" (fast, surface-level),
+    /// "medium" (balanced, default), "high" (thorough, includes all heuristics).
+    pub effort: Option<String>,
+
+    /// Include a natural-language summary of findings alongside the structured JSON output.
+    pub summary: Option<bool>,
 }
 
 #[derive(Default, Deserialize, JsonSchema)]

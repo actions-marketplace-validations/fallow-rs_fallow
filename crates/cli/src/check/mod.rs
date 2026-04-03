@@ -133,6 +133,13 @@ pub struct CheckOptions<'a> {
     pub trace_opts: &'a TraceOptions,
     pub explain: bool,
     pub top: Option<usize>,
+    /// When true, emit a condensed summary instead of full item-level output.
+    /// Read by combined mode; not yet consumed by standalone check.
+    #[allow(
+        dead_code,
+        reason = "wired from CLI but consumed by combined mode, not standalone check"
+    )]
+    pub summary: bool,
     pub regression_opts: RegressionOpts<'a>,
 }
 
@@ -143,6 +150,7 @@ pub struct CheckResult {
     pub elapsed: Duration,
     pub fail_on_issues: bool,
     pub regression: Option<RegressionOutcome>,
+    pub baseline_deltas: Option<crate::baseline::BaselineDeltas>,
 }
 
 /// Run analysis, filtering, and baseline handling. Returns results without printing.
@@ -292,6 +300,7 @@ pub fn execute_check(opts: &CheckOptions<'_>) -> Result<CheckResult, ExitCode> {
         elapsed,
         fail_on_issues: opts.fail_on_issues,
         regression: regression_outcome,
+        baseline_deltas: None,
     })
 }
 
