@@ -22,6 +22,8 @@ use globset::{Glob, GlobSet, GlobSetBuilder};
 pub struct CodeOwners {
     /// Primary owner per rule, indexed by glob position in the `GlobSet`.
     owners: Vec<String>,
+    /// Original CODEOWNERS pattern per rule (e.g. `/src/` or `*.ts`).
+    patterns: Vec<String>,
     /// Compiled glob patterns for matching.
     globs: GlobSet,
 }
@@ -78,6 +80,7 @@ impl CodeOwners {
     fn parse(content: &str) -> Result<Self, String> {
         let mut builder = GlobSetBuilder::new();
         let mut owners = Vec::new();
+        let mut patterns = Vec::new();
 
         for line in content.lines() {
             let line = line.trim();
@@ -99,13 +102,18 @@ impl CodeOwners {
 
             builder.add(glob);
             owners.push(owner.to_string());
+            patterns.push(pattern.to_string());
         }
 
         let globs = builder
             .build()
             .map_err(|e| format!("failed to compile CODEOWNERS patterns: {e}"))?;
 
-        Ok(Self { owners, globs })
+        Ok(Self {
+            owners,
+            patterns,
+            globs,
+        })
     }
 
     /// Look up the primary owner of a file path (relative to project root).
@@ -116,6 +124,19 @@ impl CodeOwners {
         let matches = self.globs.matches(relative_path);
         // Last match wins: highest index = last rule in file order
         matches.iter().max().map(|&idx| self.owners[idx].as_str())
+    }
+
+    /// Look up the primary owner and the original CODEOWNERS pattern for a path.
+    ///
+    /// Returns `(owner, pattern)` from the last matching rule, or `None` if
+    /// no rule matches. The pattern is the raw string from the CODEOWNERS file
+    /// (e.g. `/src/` or `*.ts`).
+    pub fn owner_and_rule_of(&self, relative_path: &Path) -> Option<(&str, &str)> {
+        let matches = self.globs.matches(relative_path);
+        matches
+            .iter()
+            .max()
+            .map(|&idx| (self.owners[idx].as_str(), self.patterns[idx].as_str()))
     }
 }
 
@@ -311,6 +332,33 @@ mod tests {
             Some("@backend")
         );
         assert_eq!(co.owner_of(Path::new("src/app.ts")), Some("@frontend"));
+    }
+
+    // ── owner_and_rule_of ──────────────────────────────────────────
+
+    #[test]
+    fn owner_and_rule_of_returns_owner_and_pattern() {
+        let content = "* @default\n/src/ @frontend\n*.rs @rust-team\n";
+        let co = CodeOwners::parse(content).unwrap();
+        assert_eq!(
+            co.owner_and_rule_of(Path::new("src/app.ts")),
+            Some(("@frontend", "/src/"))
+        );
+        assert_eq!(
+            co.owner_and_rule_of(Path::new("src/lib.rs")),
+            Some(("@rust-team", "*.rs"))
+        );
+        assert_eq!(
+            co.owner_and_rule_of(Path::new("README.md")),
+            Some(("@default", "*"))
+        );
+    }
+
+    #[test]
+    fn owner_and_rule_of_no_match() {
+        let content = "/src/ @frontend\n";
+        let co = CodeOwners::parse(content).unwrap();
+        assert_eq!(co.owner_and_rule_of(Path::new("README.md")), None);
     }
 
     // ── directory_group ────────────────────────────────────────────

@@ -31,6 +31,23 @@ impl OwnershipResolver {
         }
     }
 
+    /// Resolve the group key and matching rule for a path.
+    ///
+    /// Returns `(owner, Some(pattern))` for Owner mode,
+    /// `(directory, None)` for Directory mode.
+    pub fn resolve_with_rule(&self, rel_path: &Path) -> (String, Option<String>) {
+        match self {
+            Self::Owner(co) => {
+                if let Some((owner, rule)) = co.owner_and_rule_of(rel_path) {
+                    (owner.to_string(), Some(rule.to_string()))
+                } else {
+                    (UNOWNED_LABEL.to_string(), None)
+                }
+            }
+            Self::Directory => (codeowners::directory_group(rel_path).to_string(), None),
+        }
+    }
+
     /// Label for the grouping mode (used in JSON `grouped_by` field).
     pub fn mode_label(&self) -> &'static str {
         match self {
@@ -185,7 +202,7 @@ pub fn group_analysis_results(
             .push(item.clone());
     }
 
-    // ── Sort: alphabetical, (unowned) last ──────────────────────
+    // ── Sort: most issues first, alphabetical tiebreaker, (unowned) last
     let mut sorted: Vec<_> = groups
         .into_iter()
         .map(|(key, results)| ResultGroup { key, results })
@@ -196,7 +213,11 @@ pub fn group_analysis_results(
         match (a_unowned, b_unowned) {
             (true, false) => std::cmp::Ordering::Greater,
             (false, true) => std::cmp::Ordering::Less,
-            _ => a.key.cmp(&b.key),
+            _ => b
+                .results
+                .total_issues()
+                .cmp(&a.results.total_issues())
+                .then_with(|| a.key.cmp(&b.key)),
         }
     });
     sorted

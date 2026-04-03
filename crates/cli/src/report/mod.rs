@@ -184,7 +184,14 @@ fn print_grouped_results(
 ) -> ExitCode {
     match output {
         OutputFormat::Human => {
-            human::print_grouped_human(groups, ctx.root, ctx.rules, ctx.elapsed, ctx.quiet);
+            human::print_grouped_human(
+                groups,
+                ctx.root,
+                ctx.rules,
+                ctx.elapsed,
+                ctx.quiet,
+                Some(resolver),
+            );
             ExitCode::SUCCESS
         }
         OutputFormat::Json => json::print_grouped_json(

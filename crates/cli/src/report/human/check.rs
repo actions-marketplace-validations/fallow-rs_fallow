@@ -5,10 +5,12 @@ use std::time::Duration;
 use colored::Colorize;
 use fallow_config::RulesConfig;
 use fallow_core::results::{AnalysisResults, UnusedExport, UnusedMember};
+use rustc_hash::FxHashSet;
 
 use super::{
     MAX_FLAT_ITEMS, build_grouped_by_file, build_section_header, format_path, push_section_footer,
 };
+use crate::report::grouping::OwnershipResolver;
 use crate::report::{
     Level, elide_common_prefix, plural, relative_path, severity_to_level, split_dir_filename,
 };
@@ -504,23 +506,97 @@ fn build_boundary_violations_section(
     lines.push(String::new());
 }
 
+/// Collect the unique CODEOWNERS patterns that matched files in a result set.
+///
+/// Returns up to 3 sorted patterns. Only meaningful for `Owner` mode.
+fn collect_matching_rules(
+    results: &AnalysisResults,
+    root: &Path,
+    resolver: &OwnershipResolver,
+) -> Vec<String> {
+    let mut rules: FxHashSet<String> = FxHashSet::default();
+
+    let mut check = |path: &Path| {
+        if let (_, Some(rule)) = resolver.resolve_with_rule(relative_path(path, root)) {
+            rules.insert(rule);
+        }
+    };
+
+    for f in &results.unused_files {
+        check(&f.path);
+    }
+    for e in &results.unused_exports {
+        check(&e.path);
+    }
+    for e in &results.unused_types {
+        check(&e.path);
+    }
+    for m in &results.unused_enum_members {
+        check(&m.path);
+    }
+    for m in &results.unused_class_members {
+        check(&m.path);
+    }
+    for u in &results.unresolved_imports {
+        check(&u.path);
+    }
+    for c in &results.circular_dependencies {
+        if let Some(first) = c.files.first() {
+            check(first);
+        }
+    }
+    for b in &results.boundary_violations {
+        check(&b.from_path);
+    }
+
+    let mut sorted: Vec<String> = rules.into_iter().collect();
+    sorted.sort();
+    sorted.truncate(3);
+    sorted
+}
+
 /// Print analysis results grouped by owner or directory.
 ///
 /// Each group gets a colored header with its key and issue count, followed by
 /// the same section output that `print_human` produces. Unowned groups get
-/// an advisory footer.
+/// an advisory footer. Doc URL footers are deduplicated across groups.
 pub(in crate::report) fn print_grouped_human(
     groups: &[crate::report::grouping::ResultGroup],
     root: &Path,
     rules: &RulesConfig,
     elapsed: Duration,
     quiet: bool,
+    resolver: Option<&OwnershipResolver>,
 ) {
     if !quiet {
         eprintln!();
     }
 
+    // ── Summary line: groups sorted by issue count descending ───────
+    let mut group_counts: Vec<(&str, usize)> = groups
+        .iter()
+        .map(|g| (g.key.as_str(), g.results.total_issues()))
+        .filter(|(_, count)| *count > 0)
+        .collect();
+    group_counts.sort_by(|a, b| b.1.cmp(&a.1));
+
+    if !group_counts.is_empty() {
+        let summary_parts: Vec<String> = group_counts
+            .iter()
+            .map(|(key, count)| format!("{key} {count}"))
+            .collect();
+        let summary = format!(
+            "{} group{}: {}",
+            group_counts.len(),
+            plural(group_counts.len()),
+            summary_parts.join(" \u{00b7} ")
+        );
+        println!("{}", summary.dimmed());
+        println!();
+    }
+
     let mut grand_total: usize = 0;
+    let mut seen_footers: FxHashSet<String> = FxHashSet::default();
 
     for group in groups {
         let total = group.results.total_issues();
@@ -529,16 +605,36 @@ pub(in crate::report) fn print_grouped_human(
         }
         grand_total += total;
 
-        // Group header: bold cyan key with issue count
+        // Group header: bold cyan key with issue count and per-type breakdown
         let issue_word = if total == 1 { "issue" } else { "issues" };
-        println!(
-            "{}",
+        let breakdown = build_summary_footer(&group.results);
+        let header_text = if breakdown.is_empty() {
             format!("{} ({total} {issue_word})", group.key)
-                .cyan()
-                .bold()
-        );
+        } else {
+            format!("{} ({total} {issue_word}: {breakdown})", group.key)
+        };
 
-        for line in build_human_lines(&group.results, root, rules) {
+        // Optionally append matching CODEOWNERS rules for Owner mode
+        let header_text = match resolver {
+            Some(r @ OwnershipResolver::Owner(_)) => {
+                let matched = collect_matching_rules(&group.results, root, r);
+                if matched.is_empty() {
+                    header_text
+                } else {
+                    format!("{header_text} \u{2014} matched by {}", matched.join(", "))
+                }
+            }
+            _ => header_text,
+        };
+
+        println!("{}", header_text.cyan().bold());
+
+        // Build lines and dedup doc URL footers across groups
+        let lines = build_human_lines(&group.results, root, rules);
+        for line in &lines {
+            if line.contains("docs.fallow.tools") && !seen_footers.insert(line.clone()) {
+                continue;
+            }
             println!("{line}");
         }
 
@@ -608,15 +704,15 @@ fn build_summary_footer(results: &AnalysisResults) -> String {
             + results.unused_optional_dependencies.len(),
         "dep",
     );
-    add(results.unused_enum_members.len(), "enum");
-    add(results.unused_class_members.len(), "class");
-    add(results.unresolved_imports.len(), "unresolved");
-    add(results.unlisted_dependencies.len(), "unlisted");
-    add(results.duplicate_exports.len(), "duplicate");
-    add(results.type_only_dependencies.len(), "type-only");
-    add(results.test_only_dependencies.len(), "test-only");
-    add(results.circular_dependencies.len(), "circular");
-    add(results.boundary_violations.len(), "boundary");
+    add(results.unused_enum_members.len(), "enum members");
+    add(results.unused_class_members.len(), "class members");
+    add(results.unresolved_imports.len(), "unresolved imports");
+    add(results.unlisted_dependencies.len(), "unlisted deps");
+    add(results.duplicate_exports.len(), "duplicates");
+    add(results.type_only_dependencies.len(), "type-only deps");
+    add(results.test_only_dependencies.len(), "test-only deps");
+    add(results.circular_dependencies.len(), "circular deps");
+    add(results.boundary_violations.len(), "violations");
 
     parts.join(" \u{00b7} ")
 }
