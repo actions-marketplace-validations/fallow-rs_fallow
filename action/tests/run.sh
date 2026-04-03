@@ -496,6 +496,103 @@ OUT=$(cd "$WORK_DIR" && \
 
 rm -rf "$WORK_DIR"
 
+# --- Diff-hunk filter tests ---
+
+echo ""
+echo "=== Diff-hunk filter (filter-diff-hunks.jq) ==="
+
+# Mock PR files API response with patch hunks
+PR_FILES='[
+  {"filename": "src/foo.ts", "patch": "@@ -10,3 +10,5 @@ function foo() {\n+  added line\n+  another added line\n context\n"},
+  {"filename": "src/bar.ts", "patch": "@@ -1,2 +1,3 @@ header\n+new\n@@ -20,3 +21,4 @@ other\n+more\n"},
+  {"filename": "src/binary.png", "patch": null},
+  {"filename": "src/big-file.ts"}
+]'
+
+# Comments: some inside hunks, some outside
+COMMENTS='[
+  {"type": "other", "path": "src/foo.ts", "line": 12, "body": "inside hunk"},
+  {"type": "other", "path": "src/foo.ts", "line": 50, "body": "outside hunk"},
+  {"type": "other", "path": "src/bar.ts", "line": 2, "body": "inside first hunk"},
+  {"type": "other", "path": "src/bar.ts", "line": 22, "body": "inside second hunk"},
+  {"type": "other", "path": "src/bar.ts", "line": 100, "body": "outside all hunks"},
+  {"type": "other", "path": "src/binary.png", "line": 5, "body": "null patch file"},
+  {"type": "other", "path": "src/big-file.ts", "line": 3, "body": "missing patch field"},
+  {"type": "other", "path": "src/unknown.ts", "line": 1, "body": "file not in PR"}
+]'
+
+echo "  filter-diff-hunks.jq:"
+OUT=$(echo "$COMMENTS" | jq --argjson pr_files "$PR_FILES" -f "$JQ_DIR/filter-diff-hunks.jq" 2>&1)
+assert_valid_json "$OUT" "produces valid JSON"
+
+echo "  keeps comments inside hunks:"
+assert_json_value "$OUT" '[.[] | select(.body == "inside hunk")] | length' "1" "foo.ts line 12 inside hunk kept"
+assert_json_value "$OUT" '[.[] | select(.body == "inside first hunk")] | length' "1" "bar.ts line 2 inside first hunk kept"
+assert_json_value "$OUT" '[.[] | select(.body == "inside second hunk")] | length' "1" "bar.ts line 22 inside second hunk kept"
+
+echo "  removes comments outside hunks:"
+assert_json_value "$OUT" '[.[] | select(.body == "outside hunk")] | length' "0" "foo.ts line 50 outside hunk removed"
+assert_json_value "$OUT" '[.[] | select(.body == "outside all hunks")] | length' "0" "bar.ts line 100 outside all hunks removed"
+
+echo "  fail-open for null/missing patch:"
+assert_json_value "$OUT" '[.[] | select(.body == "null patch file")] | length' "1" "null patch: comment kept (fail-open)"
+assert_json_value "$OUT" '[.[] | select(.body == "missing patch field")] | length' "1" "missing patch: comment kept (fail-open)"
+
+echo "  fail-open for files not in PR:"
+assert_json_value "$OUT" '[.[] | select(.body == "file not in PR")] | length' "1" "unknown file: comment kept (fail-open)"
+
+echo "  total filtered count:"
+assert_json_length "$OUT" "6" "keeps 6 of 8 comments (2 outside hunks removed)"
+
+echo "  single-line hunk (no count in @@):"
+SINGLE_LINE_PR='[{"filename": "src/x.ts", "patch": "@@ -5 +5 @@ ctx\n-old\n+new"}]'
+SINGLE_LINE_COMMENTS='[
+  {"type": "other", "path": "src/x.ts", "line": 5, "body": "on single-line hunk"},
+  {"type": "other", "path": "src/x.ts", "line": 6, "body": "outside single-line hunk"}
+]'
+OUT=$(echo "$SINGLE_LINE_COMMENTS" | jq --argjson pr_files "$SINGLE_LINE_PR" -f "$JQ_DIR/filter-diff-hunks.jq" 2>&1)
+assert_json_length "$OUT" "1" "single-line hunk: keeps line 5, removes line 6"
+assert_json_value "$OUT" '.[0].line' "5" "single-line hunk: kept line is 5"
+
+echo "  empty comments array:"
+OUT=$(echo '[]' | jq --argjson pr_files "$PR_FILES" -f "$JQ_DIR/filter-diff-hunks.jq" 2>&1)
+assert_json_length "$OUT" "0" "empty input produces empty output"
+
+echo "  empty PR files array:"
+OUT=$(echo "$COMMENTS" | jq --argjson pr_files '[]' -f "$JQ_DIR/filter-diff-hunks.jq" 2>&1)
+assert_json_length "$OUT" "8" "empty PR files: all comments kept (fail-open)"
+
+echo "  deleted file (count=0 hunk):"
+DELETED_PR='[{"filename": "src/gone.ts", "patch": "@@ -1,5 +0,0 @@ removed\n-line1\n-line2"}]'
+DELETED_COMMENTS='[{"type": "other", "path": "src/gone.ts", "line": 1, "body": "in deleted file"}]'
+OUT=$(echo "$DELETED_COMMENTS" | jq --argjson pr_files "$DELETED_PR" -f "$JQ_DIR/filter-diff-hunks.jq" 2>&1)
+assert_json_length "$OUT" "0" "deleted file (count=0): no new-side lines, comment removed"
+
+# --- Review body with filtered counts ---
+
+echo ""
+echo "=== Review body with diff-hunk counts ==="
+
+echo "  review-body.jq with filtered findings:"
+OUT=$(INLINE_COUNT=5 FILTERED_COUNT=3 jq -r -f "$JQ_DIR/review-body.jq" "$FIXTURES/combined.json" 2>&1)
+assert_contains "$OUT" "inline comments" "shows inline count"
+assert_contains "$OUT" "additional findings outside the diff" "shows filtered count"
+assert_not_contains "$OUT" "See inline comments for details" "no generic message when filtered"
+
+echo "  review-body.jq with no filtered findings:"
+OUT=$(INLINE_COUNT=5 FILTERED_COUNT=0 jq -r -f "$JQ_DIR/review-body.jq" "$FIXTURES/combined.json" 2>&1)
+assert_contains "$OUT" "See inline comments for details" "generic message when nothing filtered"
+assert_not_contains "$OUT" "additional findings" "no filtered mention when count is 0"
+
+echo "  review-body.jq with all findings filtered (body-only):"
+OUT=$(INLINE_COUNT=0 FILTERED_COUNT=8 jq -r -f "$JQ_DIR/review-body.jq" "$FIXTURES/combined.json" 2>&1)
+assert_not_contains "$OUT" "See inline comments" "no inline mention when all filtered"
+assert_contains "$OUT" "fallow-review" "still has marker"
+
+echo "  review-body.jq without env vars (backwards compat):"
+OUT=$(jq -r -f "$JQ_DIR/review-body.jq" "$FIXTURES/combined.json" 2>&1)
+assert_contains "$OUT" "fallow-review" "marker present without env vars"
+
 # --- Summary ---
 
 echo ""

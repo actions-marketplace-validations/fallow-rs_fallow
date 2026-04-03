@@ -32,6 +32,12 @@ gh api "repos/${GH_REPO}/pulls/${PR_NUMBER}/reviews" --paginate \
     --field message="Superseded by new analysis" > /dev/null 2>&1 || true
 done
 
+# Clean up body-only fallow comments from previous runs (posted when all findings were outside the diff)
+while read -r CID; do
+  gh api "repos/${GH_REPO}/issues/comments/${CID}" --method DELETE > /dev/null 2>&1 || true
+done < <(gh api "repos/${GH_REPO}/issues/${PR_NUMBER}/comments" --paginate \
+  --jq '.[] | select(.user.login == "github-actions[bot]" and (.body | contains("fallow-review"))) | .id' 2>/dev/null)
+
 # Prefix for paths: if root is not ".", prepend it
 PREFIX=""
 if [ "$FALLOW_ROOT" != "." ]; then
@@ -102,6 +108,28 @@ esac
 # Post-process: group unused exports, dedup clones, drop refactoring targets, merge same-line
 MERGED=$(echo "$COMMENTS" | jq --argjson max "$MAX" -f "${ACTION_JQ_DIR}/merge-comments.jq" 2>&1) && COMMENTS="$MERGED" || echo "Merge warning: $MERGED"
 
+# Filter comments to only lines within PR diff hunks.
+# GitHub's review API rejects comments on lines outside the diff — filtering
+# up-front avoids the batch-422-then-retry-one-by-one fallback path entirely.
+# Fail-open: if PR files can't be fetched or a file has no patch, keep all its comments.
+PRE_FILTER_COUNT=$(echo "$COMMENTS" | jq 'length' 2>/dev/null || echo 0)
+PR_FILES=$(gh api "repos/${GH_REPO}/pulls/${PR_NUMBER}/files" --paginate 2>/dev/null \
+  | jq -s 'add // []' 2>/dev/null) || {
+  echo "::warning::Could not fetch PR files for hunk filtering; posting all comments"
+  PR_FILES='[]'
+}
+if echo "$PR_FILES" | jq -e 'length > 0' > /dev/null 2>&1; then
+  FILTERED=$(echo "$COMMENTS" | jq --argjson pr_files "$PR_FILES" -f "${ACTION_JQ_DIR}/filter-diff-hunks.jq" 2>&1) \
+    && COMMENTS="$FILTERED" \
+    || echo "::warning::Hunk filter failed, posting all comments: $FILTERED"
+fi
+POST_FILTER_COUNT=$(echo "$COMMENTS" | jq 'length' 2>/dev/null || echo 0)
+FILTERED_OUT=$((PRE_FILTER_COUNT - POST_FILTER_COUNT))
+if [ "$FILTERED_OUT" -gt 0 ]; then
+  echo "Filtered to $POST_FILTER_COUNT of $PRE_FILTER_COUNT comments (${FILTERED_OUT} outside diff hunks)"
+fi
+export INLINE_COUNT="$POST_FILTER_COUNT" FILTERED_COUNT="$FILTERED_OUT"
+
 # Add suggestion blocks for unused exports by reading source files
 ENRICHED=$(echo "$COMMENTS" | jq -c '.[]' | while IFS= read -r comment; do
   TYPE=$(echo "$comment" | jq -r '.type // ""')
@@ -128,12 +156,16 @@ if [ -n "$ENRICHED" ] && echo "$ENRICHED" | jq -e '.' > /dev/null 2>&1; then
 fi
 
 TOTAL=$(echo "$COMMENTS" | jq 'length')
-if [ "$TOTAL" -eq 0 ]; then
+if [ "$TOTAL" -eq 0 ] && [ "${PRE_FILTER_COUNT:-0}" -eq 0 ]; then
   echo "No review comments to post"
   exit 0
 fi
 
-echo "Posting $TOTAL review comments (after merging)..."
+if [ "$TOTAL" -eq 0 ]; then
+  echo "All ${PRE_FILTER_COUNT} findings are outside the diff — posting summary-only review"
+else
+  echo "Posting $TOTAL review comments (after merging)..."
+fi
 
 # Generate rich review body from the analysis results
 REVIEW_BODY=""
@@ -151,34 +183,45 @@ if [ "$RESULTS_FILE" != "fallow-results.json" ]; then
   REVIEW_BODY="${REVIEW_BODY}"$'\n\n'"*Issue counts scoped to files changed since [\`${CHANGED_SINCE:0:7}\`](${COMMIT_URL}) · health metrics reflect the full codebase*"
 fi
 
-PAYLOAD=$(echo "$COMMENTS" | jq --arg body "$REVIEW_BODY" '{
-  event: "COMMENT",
-  body: $body,
-  comments: [.[] | {path: .path, line: .line, body: .body}]
-}')
-
 # Post the review
-if ! echo "$PAYLOAD" | gh api \
-  "repos/${GH_REPO}/pulls/${PR_NUMBER}/reviews" \
-  --method POST \
-  --input - > /dev/null 2>&1; then
-  echo "::warning::Failed to post review comments. Some findings may be on lines not in the PR diff."
-
-  # Fallback: post comments one by one, skipping failures
-  POSTED=0
-  for i in $(seq 0 $((TOTAL - 1))); do
-    SINGLE=$(echo "$COMMENTS" | jq --arg body "$REVIEW_BODY" --argjson first "$POSTED" '{
-      event: "COMMENT",
-      body: (if $first == 0 then $body else "" end),
-      comments: [.['"$i"'] | {path, line, body}]
-    }')
-    RESULT=$(echo "$SINGLE" | gh api \
-      "repos/${GH_REPO}/pulls/${PR_NUMBER}/reviews" \
-      --method POST \
-      --input - 2>&1) && POSTED=$((POSTED + 1)) || \
-      echo "  Skip: $(echo "$COMMENTS" | jq -r ".[${i}].path"):$(echo "$COMMENTS" | jq -r ".[${i}].line")"
-  done
-  echo "Posted $POSTED of $TOTAL comments individually"
+if [ "$TOTAL" -eq 0 ]; then
+  # Body-only review: all findings were outside the diff.
+  # GitHub rejects COMMENT reviews with an empty comments array,
+  # so post a standalone PR comment instead.
+  gh api "repos/${GH_REPO}/issues/${PR_NUMBER}/comments" \
+    --method POST \
+    --field body="$REVIEW_BODY" > /dev/null 2>&1 \
+    && echo "Posted summary comment (no inline comments)" \
+    || echo "::warning::Failed to post summary comment"
 else
-  echo "Posted review with $TOTAL inline comments"
+  PAYLOAD=$(echo "$COMMENTS" | jq --arg body "$REVIEW_BODY" '{
+    event: "COMMENT",
+    body: $body,
+    comments: [.[] | {path: .path, line: .line, body: .body}]
+  }')
+
+  if ! echo "$PAYLOAD" | gh api \
+    "repos/${GH_REPO}/pulls/${PR_NUMBER}/reviews" \
+    --method POST \
+    --input - > /dev/null 2>&1; then
+    echo "::warning::Failed to post review comments. Some findings may be on lines not in the PR diff."
+
+    # Fallback: post comments one by one, skipping failures
+    POSTED=0
+    for i in $(seq 0 $((TOTAL - 1))); do
+      SINGLE=$(echo "$COMMENTS" | jq --arg body "$REVIEW_BODY" --argjson first "$POSTED" '{
+        event: "COMMENT",
+        body: (if $first == 0 then $body else "" end),
+        comments: [.['"$i"'] | {path, line, body}]
+      }')
+      RESULT=$(echo "$SINGLE" | gh api \
+        "repos/${GH_REPO}/pulls/${PR_NUMBER}/reviews" \
+        --method POST \
+        --input - 2>&1) && POSTED=$((POSTED + 1)) || \
+        echo "  Skip: $(echo "$COMMENTS" | jq -r ".[${i}].path"):$(echo "$COMMENTS" | jq -r ".[${i}].line")"
+    done
+    echo "Posted $POSTED of $TOTAL comments individually"
+  else
+    echo "Posted review with $TOTAL inline comments"
+  fi
 fi

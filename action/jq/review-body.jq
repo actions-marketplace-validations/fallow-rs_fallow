@@ -5,6 +5,8 @@ def count(obj; key): obj | if . then .[key] // 0 else 0 end;
 (count(.health.summary; "functions_above_threshold") // 0) as $health |
 ($check + $dupes + $health) as $total |
 (.health.vital_signs // {}) as $vitals |
+(($ENV.FILTERED_COUNT // "0") | tonumber) as $filtered |
+(($ENV.INLINE_COUNT // "0") | tonumber) as $inline |
 
 "## \ud83c\udf3f Fallow Review\n\n" +
 
@@ -22,5 +24,11 @@ def count(obj; key): obj | if . then .[key] // 0 else 0 end;
   "\n\n"
 else "" end) +
 
-"See inline comments for details.\n\n" +
+(if $filtered > 0 then
+  "**\($inline)** inline comments on your changes \u00b7 \($filtered) additional findings outside the diff\n\n"
+elif $inline > 0 then
+  "See inline comments for details.\n\n"
+else
+  "See inline comments for details.\n\n"
+end) +
 "<!-- fallow-review -->"
