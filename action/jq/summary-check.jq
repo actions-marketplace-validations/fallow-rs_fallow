@@ -52,34 +52,34 @@ else
     "Listed in `dependencies` but never imported.\n\n| Package |\n|---------|\n";
     "| `\(.package_name)` |") +
   section("Unused devDependencies"; "unused_dev_dependencies";
-    "Listed in `devDependencies` but never referenced.\n\n| Package |\n|---------|\n";
+    "Listed in `devDependencies` but never imported or referenced.\n\n| Package |\n|---------|\n";
     "| `\(.package_name)` |") +
   section("Unused optionalDependencies"; "unused_optional_dependencies";
     "Listed in `optionalDependencies` but never imported.\n\n| Package |\n|---------|\n";
     "| `\(.package_name)` |") +
   section("Unused enum members"; "unused_enum_members";
-    "| File | Line | Enum | Member |\n|------|-----:|------|--------|\n";
+    "Enum members never referenced outside their declaration.\n\n| File | Line | Enum | Member |\n|------|-----:|------|--------|\n";
     "| `\(.path)` | \(.line) | `\(.parent_name)` | `\(.member_name)` |") +
   section("Unused class members"; "unused_class_members";
-    "| File | Line | Class | Member |\n|------|-----:|-------|--------|\n";
+    "Class methods or properties never referenced outside their class.\n\n| File | Line | Class | Member |\n|------|-----:|-------|--------|\n";
     "| `\(.path)` | \(.line) | `\(.parent_name)` | `\(.member_name)` |") +
   section("Unresolved imports"; "unresolved_imports";
-    "Imports that could not be resolved. Check for missing packages or broken paths.\n\n| File | Line | Import |\n|------|-----:|--------|\n";
+    "Import paths that could not be resolved \u2014 check for missing packages or broken paths.\n\n| File | Line | Import |\n|------|-----:|--------|\n";
     "| `\(.path)` | \(.line) | `\(.specifier)` |") +
   section("Unlisted dependencies"; "unlisted_dependencies";
-    "Imported but not declared in `package.json`.\n\n| Package | Used in |\n|---------|--------|\n";
+    "Packages imported in code but missing from `package.json`.\n\n| Package | Used in |\n|---------|--------|\n";
     "| `\(.package_name)` | \(if (.imported_from | length) > 0 then (.imported_from[:3] | map("`\(.path):\(.line)`") | join(", ")) + (if (.imported_from | length) > 3 then " *+\((.imported_from | length) - 3) more*" else "" end) else "" end) |") +
   section("Duplicate exports"; "duplicate_exports";
-    "Same name exported from multiple modules.\n\n| Export | Locations |\n|--------|-----------|\n";
+    "Same export name defined in multiple files \u2014 barrel re-exports may resolve ambiguously.\n\n| Export | Locations |\n|--------|-----------|\n";
     "| `\(.export_name)` | \(.locations[:3] | map("`\(.path):\(.line)`") | join(", "))\(if (.locations | length) > 3 then " *+\((.locations | length) - 3) more*" else "" end) |") +
   section("Circular dependencies"; "circular_dependencies";
-    "Import cycles degrade tree-shaking and can cause runtime issues.\n\n| Cycle | Length |\n|-------|-------:|\n";
+    "Import cycles that can cause initialization failures and prevent tree-shaking.\n\n| Cycle | Length |\n|-------|-------:|\n";
     "| \(.files | join(" \u2192 ")) | \(.length) |") +
   section("Boundary violations"; "boundary_violations";
-    "Imports that cross architecture zone boundaries.\n\n| From | To | Zones |\n|------|-----|-------|\n";
+    "Imports that cross defined architecture zone boundaries.\n\n| From | To | Zones |\n|------|-----|-------|\n";
     "| `\(.from_path):\(.line)` | `\(.to_path)` | \(.from_zone) \u2192 \(.to_zone) |") +
   section("Type-only dependencies"; "type_only_dependencies";
-    "Production deps only used via `import type` \u2014 consider moving to `devDependencies`.\n\n| Package |\n|---------|\n";
+    "Dependencies only used for type imports \u2014 consider moving to `devDependencies`.\n\n| Package |\n|---------|\n";
     "| `\(.package_name)` |") +
   "\n\n> [!TIP]\n" +
   (if ((.unused_exports // []) + (.unused_dependencies // []) + (.unused_enum_members // [])) | length > 0 then
