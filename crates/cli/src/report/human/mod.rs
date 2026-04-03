@@ -54,31 +54,39 @@ pub(super) fn build_section_header(title: &str, count: usize, level: Level) -> S
 fn section_footer_text(title: &str) -> Option<(&'static str, &'static str)> {
     match title {
         "Unused files" => Some((
-            "Files not imported or referenced by any entry point",
+            "Files not reachable from any entry point",
             "https://docs.fallow.tools/explanations/dead-code#unused-files",
         )),
         "Unused exports" => Some((
-            "Exported symbols not imported by any reachable file",
+            "Exported symbols with no known consumers",
             "https://docs.fallow.tools/explanations/dead-code#unused-exports",
         )),
         "Unused type exports" => Some((
-            "Exported types/interfaces not imported by any reachable file",
+            "Type exports with no known consumers",
             "https://docs.fallow.tools/explanations/dead-code#unused-types",
         )),
-        "Unused dependencies" | "Unused devDependencies" | "Unused optionalDependencies" => Some((
-            "Packages in package.json not imported anywhere in the project",
+        "Unused dependencies" => Some((
+            "Listed in dependencies but never imported",
+            "https://docs.fallow.tools/explanations/dead-code#unused-dependencies",
+        )),
+        "Unused devDependencies" => Some((
+            "Listed in devDependencies but never imported or referenced",
+            "https://docs.fallow.tools/explanations/dead-code#unused-dependencies",
+        )),
+        "Unused optionalDependencies" => Some((
+            "Listed in optionalDependencies but never imported",
             "https://docs.fallow.tools/explanations/dead-code#unused-dependencies",
         )),
         "Unused enum members" => Some((
-            "Enum variants never referenced outside their declaration",
+            "Enum members never referenced outside their declaration",
             "https://docs.fallow.tools/explanations/dead-code#unused-enum-members",
         )),
         "Unused class members" => Some((
-            "Class methods/properties never referenced outside their class",
+            "Class methods or properties never referenced outside their class",
             "https://docs.fallow.tools/explanations/dead-code#unused-class-members",
         )),
         "Unresolved imports" => Some((
-            "Import specifiers that could not be resolved to a file",
+            "Import paths that could not be resolved \u{2014} check for missing packages or broken paths",
             "https://docs.fallow.tools/explanations/dead-code#unresolved-imports",
         )),
         "Unlisted dependencies" => Some((
@@ -86,15 +94,19 @@ fn section_footer_text(title: &str) -> Option<(&'static str, &'static str)> {
             "https://docs.fallow.tools/explanations/dead-code#unlisted-dependencies",
         )),
         "Duplicate exports" => Some((
-            "Same export name defined in multiple files",
+            "Same export name defined in multiple files \u{2014} barrel re-exports may resolve ambiguously",
             "https://docs.fallow.tools/explanations/dead-code#duplicate-exports",
         )),
         "Circular dependencies" => Some((
-            "Files that import each other, forming dependency cycles",
+            "Import cycles that can cause initialization failures and prevent tree-shaking",
             "https://docs.fallow.tools/explanations/dead-code#circular-dependencies",
         )),
+        "Boundary violations" => Some((
+            "Imports that cross defined architecture zone boundaries",
+            "https://docs.fallow.tools/explanations/dead-code#boundary-violations",
+        )),
         t if t.starts_with("Type-only") => Some((
-            "Dependencies only used for type imports, safe to move to devDependencies",
+            "Dependencies only used for type imports \u{2014} consider moving to devDependencies",
             "https://docs.fallow.tools/explanations/dead-code#type-only-dependencies",
         )),
         _ => None,

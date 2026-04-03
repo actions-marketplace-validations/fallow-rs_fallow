@@ -1721,7 +1721,7 @@ mod tests {
         let text = plain(&lines);
         // Human output always includes section footers with doc links
         assert!(text.contains("docs.fallow.tools/explanations/dead-code"));
-        assert!(text.contains("Files not imported or referenced by any entry point"));
+        assert!(text.contains("Files not reachable from any entry point"));
     }
 
     // ── Truncation tests ──
