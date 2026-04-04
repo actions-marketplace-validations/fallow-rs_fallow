@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.12.1] - 2026-04-04
+
+### Fixed
+
+- **Tab indentation preserved in export auto-fix** -- `fallow fix` no longer silently converts tab indentation to spaces when removing the `export` keyword. The original whitespace prefix is now preserved exactly. ([#36](https://github.com/fallow-rs/fallow/issues/36), [#37](https://github.com/fallow-rs/fallow/pull/37) by [@swalha1999](https://github.com/swalha1999))
+
 ## [2.12.0] - 2026-04-03
 
 ### Added
@@ -786,7 +792,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `--changed-since` and `--fail-on-issues` for CI
 - Cross-workspace resolution for npm/yarn/pnpm workspaces
 
-[Unreleased]: https://github.com/fallow-rs/fallow/compare/v2.12.0...HEAD
+[Unreleased]: https://github.com/fallow-rs/fallow/compare/v2.12.1...HEAD
+[2.12.1]: https://github.com/fallow-rs/fallow/compare/v2.12.0...v2.12.1
 [2.12.0]: https://github.com/fallow-rs/fallow/compare/v2.11.0...v2.12.0
 [2.11.0]: https://github.com/fallow-rs/fallow/compare/v2.10.1...v2.11.0
 [2.10.1]: https://github.com/fallow-rs/fallow/compare/v2.10.0...v2.10.1
