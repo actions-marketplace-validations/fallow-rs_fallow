@@ -111,30 +111,41 @@ clone_project() {
 
 install_deps() {
     local dir="$1" cmd="$2"
+    local install_log
+    install_log="$(mktemp)"
 
     if [[ "$cmd" == "-" ]]; then
         return 0
     fi
 
     echo "    Installing dependencies..."
-    (cd "$dir" && eval "$cmd") 2>&1 | tail -5 || true
+    if (cd "$dir" && eval "$cmd") >"$install_log" 2>&1; then
+        tail -5 "$install_log"
+        rm -f "$install_log"
+        return 0
+    fi
+
+    tail -5 "$install_log"
+    rm -f "$install_log"
+    return 1
 }
 
 run_fallow() {
     local project_dir="$1" name="$2" output_file="$3"
     local exit_code=0
+    local stderr_file="${output_file%.json}.stderr.log"
 
     # Run fallow with a timeout (5 minutes per project)
     if command -v timeout &>/dev/null; then
-        timeout 300 "$FALLOW_BIN" check --format json --root "$project_dir" \
-            > "$output_file" 2>&1 || exit_code=$?
+        timeout 300 "$FALLOW_BIN" dead-code --format json --quiet --root "$project_dir" \
+            > "$output_file" 2> "$stderr_file" || exit_code=$?
     elif command -v gtimeout &>/dev/null; then
-        gtimeout 300 "$FALLOW_BIN" check --format json --root "$project_dir" \
-            > "$output_file" 2>&1 || exit_code=$?
+        gtimeout 300 "$FALLOW_BIN" dead-code --format json --quiet --root "$project_dir" \
+            > "$output_file" 2> "$stderr_file" || exit_code=$?
     else
         # No timeout command available, run without timeout
-        "$FALLOW_BIN" check --format json --root "$project_dir" \
-            > "$output_file" 2>&1 || exit_code=$?
+        "$FALLOW_BIN" dead-code --format json --quiet --root "$project_dir" \
+            > "$output_file" 2> "$stderr_file" || exit_code=$?
     fi
 
     # timeout returns 124 on timeout, treat as crash

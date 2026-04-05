@@ -4,7 +4,7 @@ Tests fallow against real-world open-source TypeScript/JavaScript projects to ca
 
 ## What this tests
 
-The script clones popular JS/TS projects (shallow, depth=1), optionally installs their dependencies, and runs `fallow dead-code --format json` against each one. It distinguishes between:
+The script clones popular JS/TS projects (shallow, depth=1), optionally installs their dependencies, and runs `fallow dead-code --format json --quiet` against each one. It distinguishes between:
 
 - **Exit 0** — fallow ran successfully, no issues found (rare for large projects)
 - **Exit 1** — fallow ran successfully, issues found (expected and normal)
@@ -76,6 +76,6 @@ The `ecosystem-full.yml` workflow runs:
 - **Weekly** on Sundays at 04:00 UTC (cron schedule)
 - **On demand** via manual workflow_dispatch trigger
 
-It builds fallow in release mode, clones all projects, runs the test script, and uploads JSON results as artifacts. The workflow fails if any project causes a crash.
+It builds fallow in release mode, clones all projects, runs the test script, and uploads JSON results plus per-project stderr logs as artifacts. The workflow fails if any project causes a crash.
 
 There is also a lighter `ecosystem.yml` workflow that runs on push/PR with a smaller set of projects.
