@@ -2,10 +2,10 @@ name: Cross-Architecture
 
 on:
   pull_request:
-    paths: ['crates/**']
+    paths: ['crates/**', '.github/workflows/cross-arch.yml']
   push:
     branches: [main]
-    paths: ['crates/**']
+    paths: ['crates/**', '.github/workflows/cross-arch.yml']
 
 concurrency:
   group: cross-arch-${{ github.ref }}
