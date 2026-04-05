@@ -218,6 +218,21 @@ pub(in crate::report) fn build_human_lines(
         }
     };
 
+    // ── Unused Code ──
+    let has_unused_code = !results.unused_files.is_empty()
+        || !filtered_exports.is_empty()
+        || !filtered_types.is_empty()
+        || !results.unused_enum_members.is_empty()
+        || !results.unused_class_members.is_empty();
+    if has_unused_code {
+        lines.push(
+            "\u{2500}\u{2500} Unused Code \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}"
+                .dimmed()
+                .to_string(),
+        );
+        lines.push(String::new());
+    }
+
     if results.unused_files.len() > DIR_ROLLUP_THRESHOLD {
         // Directory rollup for large unused file counts
         build_dir_rollup_section(&mut lines, &results.unused_files, root, rules, total_issues);
@@ -291,6 +306,45 @@ pub(in crate::report) fn build_human_lines(
         );
     }
 
+    build_human_grouped_section(
+        &mut lines,
+        &results.unused_enum_members,
+        "Unused enum members",
+        severity_to_level(rules.unused_enum_members),
+        root,
+        max_grouped_files,
+        |m| m.path.as_path(),
+        &format_member,
+    );
+
+    build_human_grouped_section(
+        &mut lines,
+        &results.unused_class_members,
+        "Unused class members",
+        severity_to_level(rules.unused_class_members),
+        root,
+        max_grouped_files,
+        |m| m.path.as_path(),
+        &format_member,
+    );
+
+    // ── Dependencies ──
+    let has_dependencies = !results.unused_dependencies.is_empty()
+        || !results.unused_dev_dependencies.is_empty()
+        || !results.unused_optional_dependencies.is_empty()
+        || !results.unresolved_imports.is_empty()
+        || !results.unlisted_dependencies.is_empty()
+        || !results.type_only_dependencies.is_empty()
+        || !results.test_only_dependencies.is_empty();
+    if has_dependencies {
+        lines.push(
+            "\u{2500}\u{2500} Dependencies \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}"
+                .dimmed()
+                .to_string(),
+        );
+        lines.push(String::new());
+    }
+
     build_human_section_ex(
         &mut lines,
         &results.unused_dependencies,
@@ -323,28 +377,6 @@ pub(in crate::report) fn build_human_lines(
 
     build_human_grouped_section(
         &mut lines,
-        &results.unused_enum_members,
-        "Unused enum members",
-        severity_to_level(rules.unused_enum_members),
-        root,
-        max_grouped_files,
-        |m| m.path.as_path(),
-        &format_member,
-    );
-
-    build_human_grouped_section(
-        &mut lines,
-        &results.unused_class_members,
-        "Unused class members",
-        severity_to_level(rules.unused_class_members),
-        root,
-        max_grouped_files,
-        |m| m.path.as_path(),
-        &format_member,
-    );
-
-    build_human_grouped_section(
-        &mut lines,
         &results.unresolved_imports,
         "Unresolved imports",
         severity_to_level(rules.unresolved_imports),
@@ -362,14 +394,6 @@ pub(in crate::report) fn build_human_lines(
         max_items,
         total_issues,
         |dep| vec![format!("  {}", dep.package_name.bold())],
-    );
-
-    build_duplicate_exports_section(
-        &mut lines,
-        &results.duplicate_exports,
-        severity_to_level(rules.duplicate_exports),
-        root,
-        total_issues,
     );
 
     build_human_section_ex(
@@ -390,6 +414,27 @@ pub(in crate::report) fn build_human_lines(
         max_items,
         total_issues,
         |dep| vec![format!("  {}", format_dep(&dep.package_name, &dep.path))],
+    );
+
+    // ── Structure ──
+    let has_structure = !results.duplicate_exports.is_empty()
+        || !results.circular_dependencies.is_empty()
+        || !results.boundary_violations.is_empty();
+    if has_structure {
+        lines.push(
+            "\u{2500}\u{2500} Structure \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}"
+                .dimmed()
+                .to_string(),
+        );
+        lines.push(String::new());
+    }
+
+    build_duplicate_exports_section(
+        &mut lines,
+        &results.duplicate_exports,
+        severity_to_level(rules.duplicate_exports),
+        root,
+        total_issues,
     );
 
     build_circular_deps_section(
@@ -1113,8 +1158,14 @@ fn build_summary_footer(
         }
         add(pair_set.len(), "duplicate pair");
     }
-    add(results.type_only_dependencies.len(), "type-only dependencies");
-    add(results.test_only_dependencies.len(), "test-only dependencies");
+    add(
+        results.type_only_dependencies.len(),
+        "type-only dependencies",
+    );
+    add(
+        results.test_only_dependencies.len(),
+        "test-only dependencies",
+    );
     add(results.circular_dependencies.len(), "circular dependencies");
     add(results.boundary_violations.len(), "violations");
 
@@ -1773,11 +1824,12 @@ mod tests {
         });
         let rules = RulesConfig::default();
         let lines = build_human_lines(&results, &root, &rules, None);
-        // After each section, there should be an empty string separator
+        // Category headers + issue sections each add an empty line separator.
+        // Unused Code header + unused_files + Dependencies header + unused_deps = 4 empty lines.
         let empty_count = lines.iter().filter(|l| l.is_empty()).count();
         assert_eq!(
-            empty_count, 2,
-            "Expected 2 empty separators (one per section), got {empty_count}"
+            empty_count, 4,
+            "Expected 4 empty separators (2 category headers + 2 sections), got {empty_count}"
         );
     }
 
