@@ -242,7 +242,7 @@ Create a config file in the project root. Defaults to `.fallowrc.json` (JSON wit
 fallow init                  # creates .fallowrc.json
 fallow init --toml           # creates fallow.toml
 fallow init --hooks          # scaffold pre-commit hook (auto-detects base branch)
-fallow init --hooks --base develop  # use custom base branch
+fallow init --hooks --branch develop  # use custom base branch
 ```
 
 ### `migrate`

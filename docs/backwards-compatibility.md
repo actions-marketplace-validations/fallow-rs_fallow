@@ -29,7 +29,7 @@ These interfaces are covered by semver — breaking changes only happen in major
 - **Global flags**: `--format`, `--config`, `--workspace`, `--production`, `--baseline`, `--save-baseline`, `--no-cache`, `--threads`, `--changed-since` (alias: `--base`), `--performance`, `--explain`, `--ci`, `--fail-on-issues`, `--sarif-file`, `--fail-on-regression`, `--tolerance`, `--regression-baseline`, `--save-regression-baseline`, `--summary`, `--group-by` (owner, directory, package)
 - **Bare command flags**: `--only`, `--skip` (select which analyses to run)
 - **Health flags**: `--score` (project health score 0-100 with letter grade), `--min-score` (CI quality gate), `--targets` (refactoring recommendations), `--effort` (filter targets by effort level: low/medium/high), `--save-snapshot` (saves vital signs snapshot for trend tracking), `--trend` (compare against most recent snapshot)
-- **Init flags**: `--toml`, `--hooks` (scaffold pre-commit git hook), `--base` (base branch for hook)
+- **Init flags**: `--toml`, `--hooks` (scaffold pre-commit git hook), `--branch` (base branch for hook)
 - **Environment variables**: `FALLOW_FORMAT`, `FALLOW_QUIET`, `FALLOW_BIN`, `FALLOW_TIMEOUT_SECS`, `FALLOW_EXTENDS_TIMEOUT_SECS`
 
 ### External plugin format
