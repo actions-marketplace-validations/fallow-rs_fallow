@@ -10,7 +10,7 @@ This document is the single source of truth for fallow's positioning, taglines, 
 
 **Why now:** The JavaScript ecosystem has converged on Rust-native tooling for linting (oxlint) and formatting (Biome), but codebase analysis has remained either slow (knip) or fragmented across single-purpose tools (madge, jscpd). Fallow unifies these in a single tool that matches the performance expectations set by the new Rust-native stack. Codebases are also growing faster than ever through AI-assisted development, micro-package architectures, and rapid team scaling, making automated codebase analysis a necessity rather than a nice-to-have.
 
-**Why fallow:** The only tool that combines unused code detection, circular dependency analysis, clone detection, complexity analysis, and architecture boundary enforcement in a single Rust-native binary with sub-second performance. Zero configuration, 84 framework plugins, and fast enough to shift codebase analysis from a periodic audit to a continuous check.
+**Why fallow:** The only tool that combines unused code detection, circular dependency analysis, clone detection, complexity analysis, and architecture boundary enforcement in a single Rust-native binary with sub-second performance. Zero configuration, 85 framework plugins, and fast enough to shift codebase analysis from a periodic audit to a continuous check.
 
 ## Tagline
 
@@ -35,12 +35,12 @@ Usage: docs landing page, blog posts, conference talks, README explainer section
 | Surface | Copy |
 |---------|------|
 | npm description | Codebase analyzer for TypeScript/JavaScript — unused code, circular dependencies, code duplication, complexity hotspots, and architecture boundary violations |
-| GitHub repo description | The codebase analyzer for TypeScript and JavaScript. Finds unused code, circular dependencies, code duplication, complexity hotspots, and architecture boundary violations. Rust-native, sub-second, 84 framework plugins. |
+| GitHub repo description | The codebase analyzer for TypeScript and JavaScript. Finds unused code, circular dependencies, code duplication, complexity hotspots, and architecture boundary violations. Rust-native, sub-second, 85 framework plugins. |
 | fallow-skills GitHub description | Agent skills for the TypeScript/JavaScript codebase analyzer. Teaches AI agents how to find unused code, circular deps, duplication, complexity hotspots, and boundary violations with fallow. |
 
 ## Elevator Pitch
 
-> Fallow is a Rust-native codebase analyzer for TypeScript and JavaScript. It finds unused files, exports, types, and dependencies. It detects circular dependencies, duplicated code, complexity hotspots, and architecture boundary violations. It ships with 84 framework plugins, requires zero configuration, and typically finishes in under a second. Fast enough to run on every commit, not just in weekend CI jobs. Linters work file by file. TypeScript works type by type. Neither builds the full module graph, so neither can see what nothing depends on. Fallow does.
+> Fallow is a Rust-native codebase analyzer for TypeScript and JavaScript. It finds unused files, exports, types, and dependencies. It detects circular dependencies, duplicated code, complexity hotspots, and architecture boundary violations. It ships with 85 framework plugins, requires zero configuration, and typically finishes in under a second. Fast enough to run on every commit, not just in weekend CI jobs. Linters work file by file. TypeScript works type by type. Neither builds the full module graph, so neither can see what nothing depends on. Fallow does.
 
 ## AI Angle (narrative layer, NOT tagline)
 
@@ -80,4 +80,4 @@ The line "AI writes code. Nobody deletes it." is reserved for:
 | 2-14x faster than knip v6 | BENCHMARKS.md | README, docs, blog |
 | 20-33x faster than jscpd | BENCHMARKS.md | README, docs, blog |
 | Sub-second on most projects | BENCHMARKS.md | Tagline subtitle, everywhere |
-| 84 framework plugins | crates/core/src/plugins/ | Everywhere |
+| 85 framework plugins | crates/core/src/plugins/ | Everywhere |

@@ -97,7 +97,7 @@ KNIP_OUT="${TMPDIR_CONFORM}/knip.json"
 echo "Running fallow..." >&2
 FALLOW_EXIT=0
 cd "${PROJECT_DIR}"
-"${FALLOW_BIN}" check --format json > "${FALLOW_OUT}" 2>/dev/null || FALLOW_EXIT=$?
+"${FALLOW_BIN}" dead-code --format json > "${FALLOW_OUT}" 2>/dev/null || FALLOW_EXIT=$?
 
 # fallow exits 1 when issues are found (expected), 2 on error
 if [[ ${FALLOW_EXIT} -eq 2 ]]; then

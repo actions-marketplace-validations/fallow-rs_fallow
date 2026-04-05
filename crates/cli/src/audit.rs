@@ -535,7 +535,7 @@ fn print_audit_vital_signs(result: &AuditResult) {
     ));
 
     let line = parts.join(" \u{00b7} ");
-    println!("{} {}", "\u{25a0}".dimmed(), line.dimmed());
+    println!("{} {} {}", "\u{25a0}".dimmed(), "Metrics:".dimmed(), line.dimmed());
 }
 
 /// Build summary parts for the status line (shared between warn and fail).

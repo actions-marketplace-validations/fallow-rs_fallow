@@ -53,7 +53,7 @@ fallow dupes --save-baseline       # Save current duplication as baseline
 
 ## Framework support
 
-84 built-in plugins covering Next.js, Nuxt, Remix, SvelteKit, Gatsby, Astro, Angular, NestJS, Vite, Webpack, Vitest, Jest, Playwright, Cypress, Storybook, ESLint, TypeScript, Tailwind, Prisma, Drizzle, Turborepo, and many more. Auto-detected from your `package.json`.
+85 built-in plugins covering Next.js, Nuxt, Remix, SvelteKit, Gatsby, Astro, Angular, NestJS, Vite, Webpack, Vitest, Jest, Playwright, Cypress, Storybook, ESLint, TypeScript, Tailwind, Prisma, Drizzle, Turborepo, and many more. Auto-detected from your `package.json`.
 
 ## Configuration
 

@@ -33,7 +33,7 @@ npx fallow
  Total       26 issues across 847 files                             53ms
 ```
 
-84 framework plugins. No Node.js runtime. No config file needed.
+85 framework plugins. No Node.js runtime. No config file needed.
 
 ## Install
 
@@ -216,7 +216,7 @@ See the [full configuration reference](https://docs.fallow.tools/configuration/o
 
 ## Framework plugins
 
-84 built-in plugins detect entry points and used exports for your framework automatically.
+85 built-in plugins detect entry points and used exports for your framework automatically.
 
 | Category | Plugins |
 |---|---|
