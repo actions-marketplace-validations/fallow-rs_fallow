@@ -13,7 +13,9 @@ pub mod css;
 pub mod mdx;
 mod parse;
 pub mod sfc;
+mod sfc_template;
 pub mod suppress;
+mod template_usage;
 pub mod visitor;
 
 use std::path::Path;
