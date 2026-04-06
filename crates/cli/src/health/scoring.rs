@@ -1,8 +1,14 @@
-use crate::health_types::FileHealthScore;
+use crate::health_types::{
+    CoverageGapSummary, CoverageGaps, FileHealthScore, UntestedExport, UntestedFile,
+};
 
 /// Output from `compute_file_scores`, including auxiliary data for refactoring targets.
 pub(super) struct FileScoreOutput {
     pub scores: Vec<FileHealthScore>,
+    /// Static coverage gaps derived from runtime-vs-test reachability.
+    pub coverage_gaps: CoverageGaps,
+    /// Runtime-reachable paths used to recompute scoped coverage summaries.
+    pub coverage_runtime_paths: Vec<std::path::PathBuf>,
     /// Files participating in circular dependencies (absolute paths).
     pub circular_files: rustc_hash::FxHashSet<std::path::PathBuf>,
     /// Top 3 functions by cognitive complexity per file (name, line, cognitive score).
@@ -92,6 +98,116 @@ pub(super) fn count_unused_exports_by_path(
         *map.entry(exp.path.as_path()).or_default() += 1;
     }
     map
+}
+
+pub(super) fn build_coverage_summary(
+    runtime_files: usize,
+    covered_files: usize,
+    untested_files: usize,
+    untested_exports: usize,
+) -> CoverageGapSummary {
+    let file_coverage_pct = if runtime_files == 0 {
+        100.0
+    } else {
+        ((covered_files as f64 / runtime_files as f64) * 1000.0).round() / 10.0
+    };
+
+    CoverageGapSummary {
+        runtime_files,
+        covered_files,
+        file_coverage_pct,
+        untested_files,
+        untested_exports,
+    }
+}
+
+fn compute_coverage_gaps(
+    graph: &fallow_core::graph::ModuleGraph,
+    file_paths: &rustc_hash::FxHashMap<fallow_core::discover::FileId, &std::path::PathBuf>,
+    module_by_id: &rustc_hash::FxHashMap<
+        fallow_core::discover::FileId,
+        &fallow_core::extract::ModuleInfo,
+    >,
+) -> (CoverageGaps, Vec<std::path::PathBuf>) {
+    let mut runtime_files = 0usize;
+    let mut covered_files = 0usize;
+    let mut runtime_paths = Vec::new();
+    let mut files = Vec::new();
+    let mut exports = Vec::new();
+
+    for node in &graph.modules {
+        if !node.is_runtime_reachable {
+            continue;
+        }
+
+        let Some(path) = file_paths.get(&node.file_id) else {
+            continue;
+        };
+        runtime_paths.push((*path).clone());
+
+        runtime_files += 1;
+        if node.is_test_reachable {
+            covered_files += 1;
+        } else {
+            files.push(UntestedFile {
+                path: (*path).clone(),
+                value_export_count: node.exports.iter().filter(|e| !e.is_type_only).count(),
+            });
+        }
+
+        let Some(module) = module_by_id.get(&node.file_id) else {
+            continue;
+        };
+
+        for export in &node.exports {
+            if export.is_type_only {
+                continue;
+            }
+
+            let has_test_dependency = export.references.iter().any(|reference| {
+                graph
+                    .modules
+                    .get(reference.from_file.0 as usize)
+                    .is_some_and(|module| module.is_test_reachable)
+            });
+            if has_test_dependency {
+                continue;
+            }
+
+            let (line, col) = fallow_types::extract::byte_offset_to_line_col(
+                &module.line_offsets,
+                export.span.start,
+            );
+            exports.push(UntestedExport {
+                path: (*path).clone(),
+                export_name: export.name.to_string(),
+                line,
+                col,
+            });
+        }
+    }
+
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    exports.sort_by(|a, b| {
+        a.path
+            .cmp(&b.path)
+            .then_with(|| a.export_name.cmp(&b.export_name))
+            .then_with(|| a.line.cmp(&b.line))
+    });
+
+    (
+        CoverageGaps {
+            summary: build_coverage_summary(
+                runtime_files,
+                covered_files,
+                files.len(),
+                exports.len(),
+            ),
+            files,
+            exports,
+        },
+        runtime_paths,
+    )
 }
 
 /// Compute the maintainability index for a single file.
@@ -211,6 +327,8 @@ pub(super) fn compute_file_scores(
         fallow_core::discover::FileId,
         &fallow_core::extract::ModuleInfo,
     > = modules.iter().map(|m| (m.file_id, m)).collect();
+    let (coverage_gaps, coverage_runtime_paths) =
+        compute_coverage_gaps(&graph, file_paths, &module_by_id);
 
     let mut scores = Vec::with_capacity(graph.modules.len());
 
@@ -323,6 +441,8 @@ pub(super) fn compute_file_scores(
 
     Ok(FileScoreOutput {
         scores,
+        coverage_gaps,
+        coverage_runtime_paths,
         circular_files,
         top_complex_fns,
         entry_points,

@@ -557,6 +557,7 @@ fn build_health_opts<'a>(opts: &'a CombinedOptions<'a>) -> HealthOptions<'a> {
         save_baseline: None,
         complexity: true,
         file_scores: true,
+        coverage_gaps: false,
         hotspots: true,
         targets: true,
         effort: None,

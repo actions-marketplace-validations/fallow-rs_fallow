@@ -546,6 +546,55 @@ pub fn build_health_codeclimate(report: &HealthReport, root: &Path) -> serde_jso
         ));
     }
 
+    if let Some(ref gaps) = report.coverage_gaps {
+        for item in &gaps.files {
+            let path = cc_path(&item.path, root);
+            let description = format!(
+                "File is runtime-reachable but has no test dependency path ({} value export{})",
+                item.value_export_count,
+                if item.value_export_count == 1 {
+                    ""
+                } else {
+                    "s"
+                },
+            );
+            let fp = fingerprint_hash(&["fallow/untested-file", &path]);
+            issues.push(cc_issue(
+                "fallow/untested-file",
+                &description,
+                "minor",
+                "Coverage",
+                &path,
+                None,
+                &fp,
+            ));
+        }
+
+        for item in &gaps.exports {
+            let path = cc_path(&item.path, root);
+            let description = format!(
+                "Export '{}' is runtime-reachable but never referenced by test-reachable modules",
+                item.export_name
+            );
+            let line_str = item.line.to_string();
+            let fp = fingerprint_hash(&[
+                "fallow/untested-export",
+                &path,
+                &line_str,
+                &item.export_name,
+            ]);
+            issues.push(cc_issue(
+                "fallow/untested-export",
+                &description,
+                "minor",
+                "Coverage",
+                &path,
+                Some(item.line),
+                &fp,
+            ));
+        }
+    }
+
     serde_json::Value::Array(issues)
 }
 
@@ -980,5 +1029,66 @@ mod tests {
     #[test]
     fn health_severity_above_2_5x_returns_critical() {
         assert_eq!(health_severity(26, 10), "critical");
+    }
+
+    #[test]
+    fn health_codeclimate_includes_coverage_gaps() {
+        use crate::health_types::*;
+
+        let root = PathBuf::from("/project");
+        let report = HealthReport {
+            findings: vec![],
+            summary: HealthSummary {
+                files_analyzed: 10,
+                functions_analyzed: 50,
+                functions_above_threshold: 0,
+                max_cyclomatic_threshold: 20,
+                max_cognitive_threshold: 15,
+                files_scored: None,
+                average_maintainability: None,
+            },
+            vital_signs: None,
+            health_score: None,
+            file_scores: vec![],
+            coverage_gaps: Some(CoverageGaps {
+                summary: CoverageGapSummary {
+                    runtime_files: 2,
+                    covered_files: 0,
+                    file_coverage_pct: 0.0,
+                    untested_files: 1,
+                    untested_exports: 1,
+                },
+                files: vec![UntestedFile {
+                    path: root.join("src/app.ts"),
+                    value_export_count: 2,
+                }],
+                exports: vec![UntestedExport {
+                    path: root.join("src/app.ts"),
+                    export_name: "loader".into(),
+                    line: 12,
+                    col: 4,
+                }],
+            }),
+            hotspots: vec![],
+            hotspot_summary: None,
+            targets: vec![],
+            target_thresholds: None,
+            health_trend: None,
+        };
+
+        let output = build_health_codeclimate(&report, &root);
+        let issues = output.as_array().unwrap();
+        assert_eq!(issues.len(), 2);
+        assert_eq!(issues[0]["check_name"], "fallow/untested-file");
+        assert_eq!(issues[0]["categories"][0], "Coverage");
+        assert_eq!(issues[0]["location"]["path"], "src/app.ts");
+        assert_eq!(issues[1]["check_name"], "fallow/untested-export");
+        assert_eq!(issues[1]["location"]["lines"]["begin"], 12);
+        assert!(
+            issues[1]["description"]
+                .as_str()
+                .unwrap()
+                .contains("loader")
+        );
     }
 }

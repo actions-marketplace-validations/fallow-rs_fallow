@@ -18,6 +18,7 @@ path = "src/main.rs"
 [dependencies]
 fallow-core = { workspace = true }
 fallow-config = { workspace = true }
+fallow-types = { workspace = true }
 clap = { workspace = true }
 globset = { workspace = true }
 colored = { workspace = true }

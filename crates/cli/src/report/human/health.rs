@@ -21,6 +21,7 @@ pub(in crate::report) fn print_health_human(
     let has_score = report.health_score.is_some();
     if report.findings.is_empty()
         && report.file_scores.is_empty()
+        && report.coverage_gaps.is_none()
         && report.hotspots.is_empty()
         && report.targets.is_empty()
         && !has_score
@@ -98,6 +99,7 @@ pub(in crate::report) fn build_health_human_lines(
     render_health_trend(&mut lines, report);
     render_vital_signs(&mut lines, report);
     render_findings(&mut lines, report, root);
+    render_coverage_gaps(&mut lines, report, root);
     render_file_scores(&mut lines, report, root);
     render_hotspots(&mut lines, report, root);
     render_refactoring_targets(&mut lines, report, root);
@@ -562,6 +564,90 @@ fn render_file_scores(
     lines.push(String::new());
 }
 
+fn render_coverage_gaps(
+    lines: &mut Vec<String>,
+    report: &crate::health_types::HealthReport,
+    root: &Path,
+) {
+    let Some(ref gaps) = report.coverage_gaps else {
+        return;
+    };
+
+    lines.push(format!(
+        "{} {}",
+        "\u{25cf}".yellow(),
+        format!(
+            "Coverage gaps ({} untested files, {} untested exports, {:.1}% file coverage)",
+            gaps.summary.untested_files,
+            gaps.summary.untested_exports,
+            gaps.summary.file_coverage_pct,
+        )
+        .yellow()
+        .bold()
+    ));
+    lines.push(String::new());
+
+    if !gaps.files.is_empty() {
+        let shown_files = gaps.files.len().min(MAX_FLAT_ITEMS);
+        lines.push(format!("  {}", "Files".dimmed()));
+        for item in &gaps.files[..shown_files] {
+            let file_str = relative_path(&item.path, root).display().to_string();
+            let (dir, filename) = split_dir_filename(&file_str);
+            lines.push(format!(
+                "  {} {}{}",
+                format!("{:>2}x", item.value_export_count).dimmed(),
+                dir.dimmed(),
+                filename,
+            ));
+        }
+        if gaps.files.len() > MAX_FLAT_ITEMS {
+            lines.push(format!(
+                "  {}",
+                format!(
+                    "... and {} more files (--format json for full list)",
+                    gaps.files.len() - MAX_FLAT_ITEMS
+                )
+                .dimmed()
+            ));
+        }
+        lines.push(String::new());
+    }
+
+    if !gaps.exports.is_empty() {
+        let shown_exports = gaps.exports.len().min(MAX_FLAT_ITEMS);
+        lines.push(format!("  {}", "Exports".dimmed()));
+        for item in &gaps.exports[..shown_exports] {
+            let file_str = relative_path(&item.path, root).display().to_string();
+            lines.push(format!(
+                "  {}:{} `{}`",
+                file_str.dimmed(),
+                item.line,
+                item.export_name,
+            ));
+        }
+        if gaps.exports.len() > MAX_FLAT_ITEMS {
+            lines.push(format!(
+                "  {}",
+                format!(
+                    "... and {} more exports (--format json for full list)",
+                    gaps.exports.len() - MAX_FLAT_ITEMS
+                )
+                .dimmed()
+            ));
+        }
+        lines.push(String::new());
+    }
+
+    lines.push(format!(
+        "  {}",
+        format!(
+            "Static test dependency gaps derived from runtime vs test reachability \u{2014} {DOCS_HEALTH}#coverage-gaps"
+        )
+        .dimmed()
+    ));
+    lines.push(String::new());
+}
+
 fn render_hotspots(
     lines: &mut Vec<String>,
     report: &crate::health_types::HealthReport,
@@ -816,6 +902,13 @@ pub(in crate::report) fn print_health_summary(
     if let Some(ref score) = report.health_score {
         println!("  {:>5.0} {}  Health score", score.score, score.grade);
     }
+    if let Some(ref gaps) = report.coverage_gaps {
+        println!(
+            "  {:>6}  Untested files ({:.1}% file coverage)",
+            gaps.summary.untested_files, gaps.summary.file_coverage_pct,
+        );
+        println!("  {:>6}  Untested exports", gaps.summary.untested_exports);
+    }
 
     if !quiet {
         eprintln!(
@@ -879,6 +972,7 @@ mod tests {
             vital_signs: None,
             health_score: None,
             file_scores: vec![],
+            coverage_gaps: None,
             hotspots: vec![],
             hotspot_summary: None,
             targets: vec![],
@@ -917,6 +1011,7 @@ mod tests {
             vital_signs: None,
             health_score: None,
             file_scores: vec![],
+            coverage_gaps: None,
             hotspots: vec![],
             hotspot_summary: None,
             targets: vec![],
@@ -960,6 +1055,7 @@ mod tests {
             vital_signs: None,
             health_score: None,
             file_scores: vec![],
+            coverage_gaps: None,
             hotspots: vec![],
             hotspot_summary: None,
             targets: vec![],
@@ -1010,6 +1106,7 @@ mod tests {
             vital_signs: None,
             health_score: None,
             file_scores: vec![],
+            coverage_gaps: None,
             hotspots: vec![],
             hotspot_summary: None,
             targets: vec![],
@@ -1040,12 +1137,49 @@ mod tests {
             vital_signs: None,
             health_score: None,
             file_scores: vec![],
+            coverage_gaps: None,
             hotspots: vec![],
             hotspot_summary: None,
             targets: vec![],
             target_thresholds: None,
             health_trend: None,
         }
+    }
+
+    #[test]
+    fn health_coverage_gaps_render_section() {
+        use crate::health_types::*;
+
+        let root = PathBuf::from("/project");
+        let mut report = empty_report();
+        report.coverage_gaps = Some(CoverageGaps {
+            summary: CoverageGapSummary {
+                runtime_files: 1,
+                covered_files: 0,
+                file_coverage_pct: 0.0,
+                untested_files: 1,
+                untested_exports: 1,
+            },
+            files: vec![UntestedFile {
+                path: root.join("src/app.ts"),
+                value_export_count: 2,
+            }],
+            exports: vec![UntestedExport {
+                path: root.join("src/app.ts"),
+                export_name: "loader".into(),
+                line: 12,
+                col: 4,
+            }],
+        });
+
+        let text = plain(&build_health_human_lines(&report, &root));
+        assert!(
+            text.contains(
+                "Coverage gaps (1 untested files, 1 untested exports, 0.0% file coverage)"
+            )
+        );
+        assert!(text.contains("src/app.ts"));
+        assert!(text.contains("loader"));
     }
 
     // ── fmt_trend_val / fmt_trend_delta ───────────────────────────

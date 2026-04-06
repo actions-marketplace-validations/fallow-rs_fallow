@@ -398,6 +398,7 @@ fn run_audit_health<'a>(
         save_baseline: None,
         complexity: true,
         file_scores: false,
+        coverage_gaps: false,
         hotspots: false,
         targets: false,
         effort: None,

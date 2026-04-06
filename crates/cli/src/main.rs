@@ -333,9 +333,9 @@ enum Command {
 
     /// Analyze function complexity (cyclomatic + cognitive)
     ///
-    /// By default, shows all sections: health score, complexity findings, file scores,
-    /// hotspots, and refactoring targets. When any section flag is specified, only those
-    /// sections are shown.
+    /// By default, shows all existing sections: health score, complexity findings,
+    /// file scores, hotspots, and refactoring targets. When any section flag is
+    /// specified, only those sections are shown.
     Health {
         /// Maximum cyclomatic complexity threshold (overrides config)
         #[arg(long)]
@@ -364,6 +364,11 @@ enum Command {
         /// apply to complexity findings only, not file scores.
         #[arg(long)]
         file_scores: bool,
+
+        /// Show only static test coverage gaps: runtime files and exports with no
+        /// dependency path from any discovered test root. Requires full analysis pipeline.
+        #[arg(long)]
+        coverage_gaps: bool,
 
         /// Show only hotspots: files that are both complex and frequently changing.
         /// Combines git churn history with complexity data. Requires a git repository.
@@ -1163,6 +1168,7 @@ fn dispatch_subcommand(
             sort,
             complexity,
             file_scores,
+            coverage_gaps,
             hotspots,
             targets,
             effort,
@@ -1185,6 +1191,7 @@ fn dispatch_subcommand(
             sort,
             complexity,
             file_scores,
+            coverage_gaps,
             hotspots,
             targets,
             effort,
@@ -1235,6 +1242,7 @@ fn dispatch_health(
     sort: health::SortBy,
     complexity: bool,
     file_scores: bool,
+    coverage_gaps: bool,
     hotspots: bool,
     targets: bool,
     effort: Option<EffortFilter>,
@@ -1260,11 +1268,12 @@ fn dispatch_health(
     let snapshot_requested = save_snapshot.is_some();
     // No section flags = show all (including score). Any flag set = show only those.
     // --save-snapshot and --trend are orthogonal (not section flags) but force score.
-    let any_section = complexity || file_scores || hotspots || targets || score;
+    let any_section = complexity || file_scores || coverage_gaps || hotspots || targets || score;
     let eff_score = if any_section { score } else { true } || snapshot_requested;
     // Score needs full pipeline for accuracy
     let force_full = snapshot_requested || eff_score;
     let eff_file_scores = if any_section { file_scores } else { true } || force_full;
+    let eff_coverage_gaps = if any_section { coverage_gaps } else { false };
     let eff_hotspots = if any_section { hotspots } else { true } || force_full;
     let eff_complexity = if any_section { complexity } else { true };
     let eff_targets = if any_section { targets } else { true };
@@ -1286,6 +1295,7 @@ fn dispatch_health(
         save_baseline: cli.save_baseline.as_deref(),
         complexity: eff_complexity,
         file_scores: eff_file_scores,
+        coverage_gaps: eff_coverage_gaps,
         hotspots: eff_hotspots,
         targets: eff_targets,
         effort: effort.map(EffortFilter::to_estimate),

@@ -44,6 +44,7 @@ pub struct HealthOptions<'a> {
     pub save_baseline: Option<&'a std::path::Path>,
     pub complexity: bool,
     pub file_scores: bool,
+    pub coverage_gaps: bool,
     pub hotspots: bool,
     pub targets: bool,
     pub effort: Option<EffortEstimate>,
@@ -134,7 +135,7 @@ pub fn execute_health(opts: &HealthOptions<'_>) -> Result<HealthResult, ExitCode
     }
 
     // Compute file-level health scores (needed by hotspots and targets too)
-    let needs_file_scores = opts.file_scores || opts.hotspots || opts.targets;
+    let needs_file_scores = opts.file_scores || opts.coverage_gaps || opts.hotspots || opts.targets;
     let (score_output, files_scored, average_maintainability) = if needs_file_scores {
         compute_filtered_file_scores(
             &config,
@@ -273,6 +274,14 @@ fn compute_filtered_file_scores(
                     !ignore_set.is_match(relative)
                 });
             }
+            filter_coverage_gaps(
+                &mut output.coverage_gaps,
+                &mut output.coverage_runtime_paths,
+                config,
+                changed_files,
+                ws_root,
+                ignore_set,
+            );
             // Compute average BEFORE --top truncation so it reflects the full project
             let total_scored = output.scores.len();
             let avg = if total_scored > 0 {
@@ -318,6 +327,63 @@ fn compute_targets(
         tgts.truncate(top);
     }
     (tgts, Some(thresholds))
+}
+
+fn path_in_health_scope(
+    path: &std::path::Path,
+    config: &ResolvedConfig,
+    changed_files: Option<&rustc_hash::FxHashSet<std::path::PathBuf>>,
+    ws_root: Option<&std::path::Path>,
+    ignore_set: &globset::GlobSet,
+) -> bool {
+    if let Some(changed) = changed_files
+        && !changed.contains(path)
+    {
+        return false;
+    }
+    if let Some(ws) = ws_root
+        && !path.starts_with(ws)
+    {
+        return false;
+    }
+    if !ignore_set.is_empty() {
+        let relative = path.strip_prefix(&config.root).unwrap_or(path);
+        if ignore_set.is_match(relative) {
+            return false;
+        }
+    }
+    true
+}
+
+fn filter_coverage_gaps(
+    coverage_gaps: &mut CoverageGaps,
+    runtime_paths: &mut Vec<std::path::PathBuf>,
+    config: &ResolvedConfig,
+    changed_files: Option<&rustc_hash::FxHashSet<std::path::PathBuf>>,
+    ws_root: Option<&std::path::Path>,
+    ignore_set: &globset::GlobSet,
+) {
+    runtime_paths
+        .retain(|path| path_in_health_scope(path, config, changed_files, ws_root, ignore_set));
+    coverage_gaps.files.retain(|item| {
+        path_in_health_scope(&item.path, config, changed_files, ws_root, ignore_set)
+    });
+    coverage_gaps.exports.retain(|item| {
+        path_in_health_scope(&item.path, config, changed_files, ws_root, ignore_set)
+    });
+
+    runtime_paths.sort();
+    runtime_paths.dedup();
+
+    let runtime_files = runtime_paths.len();
+    let untested_files = coverage_gaps.files.len();
+    let covered_files = runtime_files.saturating_sub(untested_files);
+    coverage_gaps.summary = scoring::build_coverage_summary(
+        runtime_files,
+        covered_files,
+        untested_files,
+        coverage_gaps.exports.len(),
+    );
 }
 
 /// Build vital signs and counts from available analysis data.
@@ -450,6 +516,12 @@ fn assemble_health_report(
     target_thresholds: Option<TargetThresholds>,
     health_trend: Option<crate::health_types::HealthTrend>,
 ) -> HealthReport {
+    let coverage_gaps = if opts.coverage_gaps {
+        score_output.as_ref().map(|o| o.coverage_gaps.clone())
+    } else {
+        None
+    };
+
     // Extract file scores for the report (apply --top after hotspot/target computation)
     let file_scores = if opts.file_scores {
         let mut scores = score_output.map(|o| o.scores).unwrap_or_default();
@@ -490,6 +562,7 @@ fn assemble_health_report(
             Vec::new()
         },
         file_scores,
+        coverage_gaps,
         hotspots: report_hotspots,
         hotspot_summary: report_hotspot_summary,
         targets,
@@ -691,6 +764,15 @@ pub fn print_health_result(
     }
 
     if !result.report.findings.is_empty() {
+        return ExitCode::from(1);
+    }
+
+    if result
+        .report
+        .coverage_gaps
+        .as_ref()
+        .is_some_and(|gaps| !gaps.is_empty())
+    {
         return ExitCode::from(1);
     }
 

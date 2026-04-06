@@ -316,6 +316,7 @@ mod tests {
             vital_signs: None,
             health_score: None,
             file_scores: Vec::new(),
+            coverage_gaps: None,
             hotspots: Vec::new(),
             hotspot_summary: None,
             targets: Vec::new(),

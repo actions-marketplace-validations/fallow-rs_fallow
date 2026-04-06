@@ -427,6 +427,7 @@ pub fn build_health_markdown(report: &crate::health_types::HealthReport, root: &
 
     if report.findings.is_empty()
         && report.file_scores.is_empty()
+        && report.coverage_gaps.is_none()
         && report.hotspots.is_empty()
         && report.targets.is_empty()
     {
@@ -444,6 +445,7 @@ pub fn build_health_markdown(report: &crate::health_types::HealthReport, root: &
     }
 
     write_findings_section(&mut out, report, root);
+    write_coverage_gaps_section(&mut out, report, root);
     write_file_scores_section(&mut out, report, root);
     write_hotspots_section(&mut out, report, root);
     write_targets_section(&mut out, report, root);
@@ -671,6 +673,59 @@ fn write_file_scores_section(
     }
 }
 
+fn write_coverage_gaps_section(
+    out: &mut String,
+    report: &crate::health_types::HealthReport,
+    root: &Path,
+) {
+    let Some(ref gaps) = report.coverage_gaps else {
+        return;
+    };
+
+    out.push('\n');
+    let _ = writeln!(out, "### Coverage Gaps\n");
+    let _ = writeln!(
+        out,
+        "*{} untested files · {} untested exports · {:.1}% file coverage*\n",
+        gaps.summary.untested_files, gaps.summary.untested_exports, gaps.summary.file_coverage_pct,
+    );
+
+    if gaps.files.is_empty() && gaps.exports.is_empty() {
+        out.push_str("_No coverage gaps found in scope._\n");
+        return;
+    }
+
+    if !gaps.files.is_empty() {
+        out.push_str("#### Files\n");
+        for item in &gaps.files {
+            let file_str = escape_backticks(&normalize_uri(
+                &relative_path(&item.path, root).display().to_string(),
+            ));
+            let _ = writeln!(
+                out,
+                "- `{file_str}` ({count} value export{})",
+                if item.value_export_count == 1 {
+                    ""
+                } else {
+                    "s"
+                },
+                count = item.value_export_count,
+            );
+        }
+        out.push('\n');
+    }
+
+    if !gaps.exports.is_empty() {
+        out.push_str("#### Exports\n");
+        for item in &gaps.exports {
+            let file_str = escape_backticks(&normalize_uri(
+                &relative_path(&item.path, root).display().to_string(),
+            ));
+            let _ = writeln!(out, "- `{file_str}`:{} `{}`", item.line, item.export_name);
+        }
+    }
+}
+
 /// Write the hotspots table to the output.
 fn write_hotspots_section(
     out: &mut String,
@@ -761,9 +816,10 @@ fn write_targets_section(
 /// Write the metric legend collapsible section to the output.
 fn write_metric_legend(out: &mut String, report: &crate::health_types::HealthReport) {
     let has_scores = !report.file_scores.is_empty();
+    let has_coverage = report.coverage_gaps.is_some();
     let has_hotspots = !report.hotspots.is_empty();
     let has_targets = !report.targets.is_empty();
-    if !has_scores && !has_hotspots && !has_targets {
+    if !has_scores && !has_coverage && !has_hotspots && !has_targets {
         return;
     }
     out.push_str("\n---\n\n<details><summary>Metric definitions</summary>\n\n");
@@ -773,6 +829,12 @@ fn write_metric_legend(out: &mut String, report: &crate::health_types::HealthRep
         out.push_str("- **Fan-out** — files this file imports (coupling)\n");
         out.push_str("- **Dead Code** — % of value exports with zero references\n");
         out.push_str("- **Density** — cyclomatic complexity / lines of code\n");
+    }
+    if has_coverage {
+        out.push_str(
+            "- **File coverage** — runtime files also reachable from a discovered test root\n",
+        );
+        out.push_str("- **Untested export** — export with no reference chain from any test-reachable module\n");
     }
     if has_hotspots {
         out.push_str("- **Score** — churn \u{00d7} complexity (0\u{2013}100, higher = riskier)\n");
@@ -1106,6 +1168,7 @@ mod tests {
             vital_signs: None,
             health_score: None,
             file_scores: vec![],
+            coverage_gaps: None,
             hotspots: vec![],
             hotspot_summary: None,
             targets: vec![],
@@ -1143,6 +1206,7 @@ mod tests {
             vital_signs: None,
             health_score: None,
             file_scores: vec![],
+            coverage_gaps: None,
             hotspots: vec![],
             hotspot_summary: None,
             targets: vec![],
@@ -1185,6 +1249,7 @@ mod tests {
             vital_signs: None,
             health_score: None,
             file_scores: vec![],
+            coverage_gaps: None,
             hotspots: vec![],
             hotspot_summary: None,
             targets: vec![],
@@ -1217,6 +1282,7 @@ mod tests {
             vital_signs: None,
             health_score: None,
             file_scores: vec![],
+            coverage_gaps: None,
             hotspots: vec![],
             hotspot_summary: None,
             targets: vec![
@@ -1268,6 +1334,58 @@ mod tests {
             "should contain recommendation"
         );
         assert!(md.contains("src/legacy.ts"), "should contain second target");
+    }
+
+    #[test]
+    fn health_markdown_with_coverage_gaps() {
+        use crate::health_types::*;
+
+        let root = PathBuf::from("/project");
+        let report = HealthReport {
+            findings: vec![],
+            summary: HealthSummary {
+                files_analyzed: 10,
+                functions_analyzed: 50,
+                functions_above_threshold: 0,
+                max_cyclomatic_threshold: 20,
+                max_cognitive_threshold: 15,
+                files_scored: None,
+                average_maintainability: None,
+            },
+            vital_signs: None,
+            health_score: None,
+            file_scores: vec![],
+            coverage_gaps: Some(CoverageGaps {
+                summary: CoverageGapSummary {
+                    runtime_files: 2,
+                    covered_files: 0,
+                    file_coverage_pct: 0.0,
+                    untested_files: 1,
+                    untested_exports: 1,
+                },
+                files: vec![UntestedFile {
+                    path: root.join("src/app.ts"),
+                    value_export_count: 2,
+                }],
+                exports: vec![UntestedExport {
+                    path: root.join("src/app.ts"),
+                    export_name: "loader".into(),
+                    line: 12,
+                    col: 4,
+                }],
+            }),
+            hotspots: vec![],
+            hotspot_summary: None,
+            targets: vec![],
+            target_thresholds: None,
+            health_trend: None,
+        };
+
+        let md = build_health_markdown(&report, &root);
+        assert!(md.contains("### Coverage Gaps"));
+        assert!(md.contains("*1 untested files"));
+        assert!(md.contains("`src/app.ts` (2 value exports)"));
+        assert!(md.contains("`src/app.ts`:12 `loader`"));
     }
 
     // ── Dependency in workspace package ──
@@ -1432,6 +1550,7 @@ mod tests {
             }),
             health_score: None,
             file_scores: vec![],
+            coverage_gaps: None,
             hotspots: vec![],
             hotspot_summary: None,
             targets: vec![],
@@ -1490,6 +1609,7 @@ mod tests {
                 function_count: 10,
                 lines: 200,
             }],
+            coverage_gaps: None,
             hotspots: vec![],
             hotspot_summary: None,
             targets: vec![],
@@ -1531,6 +1651,7 @@ mod tests {
             vital_signs: None,
             health_score: None,
             file_scores: vec![],
+            coverage_gaps: None,
             hotspots: vec![crate::health_types::HotspotEntry {
                 path: root.join("src/hot.ts"),
                 score: 85.0,
@@ -1598,6 +1719,7 @@ mod tests {
                 function_count: 2,
                 lines: 50,
             }],
+            coverage_gaps: None,
             hotspots: vec![],
             hotspot_summary: None,
             targets: vec![],
@@ -1639,6 +1761,7 @@ mod tests {
             vital_signs: None,
             health_score: None,
             file_scores: vec![],
+            coverage_gaps: None,
             hotspots: vec![],
             hotspot_summary: None,
             targets: vec![],
@@ -1725,6 +1848,7 @@ mod tests {
             vital_signs: None,
             health_score: None,
             file_scores: vec![],
+            coverage_gaps: None,
             hotspots: vec![crate::health_types::HotspotEntry {
                 path: root.join("src/hot.ts"),
                 score: 50.0,

@@ -182,6 +182,30 @@ pub(super) fn print_health_compact(report: &crate::health_types::HealthReport, r
             score.complexity_density,
         );
     }
+    if let Some(ref gaps) = report.coverage_gaps {
+        println!(
+            "coverage-gap-summary:runtime_files={},covered_files={},file_coverage_pct={:.1},untested_files={},untested_exports={}",
+            gaps.summary.runtime_files,
+            gaps.summary.covered_files,
+            gaps.summary.file_coverage_pct,
+            gaps.summary.untested_files,
+            gaps.summary.untested_exports,
+        );
+        for item in &gaps.files {
+            let relative = normalize_uri(&relative_path(&item.path, root).display().to_string());
+            println!(
+                "untested-file:{}:value_exports={}",
+                relative, item.value_export_count,
+            );
+        }
+        for item in &gaps.exports {
+            let relative = normalize_uri(&relative_path(&item.path, root).display().to_string());
+            println!(
+                "untested-export:{}:{}:{}",
+                relative, item.line, item.export_name,
+            );
+        }
+    }
     for entry in &report.hotspots {
         let relative = normalize_uri(&relative_path(&entry.path, root).display().to_string());
         println!(

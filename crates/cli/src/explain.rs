@@ -171,6 +171,20 @@ pub const HEALTH_RULES: &[RuleDef] = &[
         full: "File identified as a refactoring candidate based on a weighted combination of complexity density, churn velocity, dead code ratio, fan-in (blast radius), and fan-out (coupling). Categories: urgent churn+complexity, break circular dependency, split high-impact file, remove dead code, extract complex functions, reduce coupling.",
         docs_path: "explanations/health#refactoring-targets",
     },
+    RuleDef {
+        id: "fallow/untested-file",
+        name: "Untested File",
+        short: "Runtime-reachable file has no test dependency path",
+        full: "A file is reachable from runtime entry points but not from any discovered test entry point. This indicates production code that no test imports, directly or transitively, according to the static module graph.",
+        docs_path: "explanations/health#coverage-gaps",
+    },
+    RuleDef {
+        id: "fallow/untested-export",
+        name: "Untested Export",
+        short: "Runtime-reachable export has no test dependency path",
+        full: "A value export is reachable from runtime entry points but no test-reachable module references it. This is a static test dependency gap rather than line coverage, and highlights exports exercised only through production entry paths.",
+        docs_path: "explanations/health#coverage-gaps",
+    },
 ];
 
 pub const DUPES_RULES: &[RuleDef] = &[RuleDef {
@@ -773,7 +787,7 @@ mod tests {
 
     #[test]
     fn health_rules_count() {
-        assert_eq!(HEALTH_RULES.len(), 4);
+        assert_eq!(HEALTH_RULES.len(), 6);
     }
 
     #[test]
