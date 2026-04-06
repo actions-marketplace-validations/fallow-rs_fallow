@@ -22,7 +22,9 @@ use std::path::Path;
 use std::time::Instant;
 
 use errors::FallowError;
-use fallow_config::{PackageJson, ResolvedConfig, discover_workspaces, find_undeclared_workspaces};
+use fallow_config::{
+    EntryPointRole, PackageJson, ResolvedConfig, discover_workspaces, find_undeclared_workspaces,
+};
 use rayon::prelude::*;
 use results::AnalysisResults;
 use trace::PipelineTimings;
@@ -181,7 +183,7 @@ pub fn analyze_with_parse_result(
     let entry_points_ms = t.elapsed().as_secs_f64() * 1000.0;
 
     // Compute entry-point summary before the graph consumes the entry_points vec
-    let ep_summary = summarize_entry_points(&entry_points);
+    let ep_summary = summarize_entry_points(&entry_points.all);
 
     // Stage 4: Resolve imports to file IDs
     let t = Instant::now();
@@ -200,7 +202,13 @@ pub fn analyze_with_parse_result(
     // Stage 5: Build module graph
     let t = Instant::now();
     let pb = progress.stage_spinner("Building module graph...");
-    let graph = graph::ModuleGraph::build(&resolved, &entry_points, files);
+    let graph = graph::ModuleGraph::build_with_reachability_roots(
+        &resolved,
+        &entry_points.all,
+        &entry_points.runtime,
+        &entry_points.test,
+        files,
+    );
     let graph_ms = t.elapsed().as_secs_f64() * 1000.0;
     pb.finish_and_clear();
 
@@ -245,7 +253,7 @@ pub fn analyze_with_parse_result(
         scripts_ms,
         modules.len(),
         entry_points_ms,
-        entry_points.len(),
+        entry_points.all.len(),
         resolve_ms,
         graph_ms,
         analyze_ms,
@@ -265,7 +273,7 @@ pub fn analyze_with_parse_result(
         cache_misses: 0,
         cache_update_ms: 0.0,
         entry_points_ms,
-        entry_point_count: entry_points.len(),
+        entry_point_count: entry_points.all.len(),
         resolve_imports_ms: resolve_ms,
         build_graph_ms: graph_ms,
         analyze_ms,
@@ -401,12 +409,18 @@ fn analyze_full(
     // Stage 5: Build module graph
     let t = Instant::now();
     let pb = progress.stage_spinner("Building module graph...");
-    let graph = graph::ModuleGraph::build(&resolved, &entry_points, files);
+    let graph = graph::ModuleGraph::build_with_reachability_roots(
+        &resolved,
+        &entry_points.all,
+        &entry_points.runtime,
+        &entry_points.test,
+        files,
+    );
     let graph_ms = t.elapsed().as_secs_f64() * 1000.0;
     pb.finish_and_clear();
 
     // Compute entry-point summary before the graph consumes the entry_points vec
-    let ep_summary = summarize_entry_points(&entry_points);
+    let ep_summary = summarize_entry_points(&entry_points.all);
 
     // Stage 6: Analyze for dead code (with plugin context and workspace info)
     let t = Instant::now();
@@ -459,7 +473,7 @@ fn analyze_full(
         cache_summary,
         cache_ms,
         entry_points_ms,
-        entry_points.len(),
+        entry_points.all.len(),
         resolve_ms,
         graph_ms,
         analyze_ms,
@@ -480,7 +494,7 @@ fn analyze_full(
             cache_misses,
             cache_update_ms: cache_ms,
             entry_points_ms,
-            entry_point_count: entry_points.len(),
+            entry_point_count: entry_points.all.len(),
             resolve_imports_ms: resolve_ms,
             build_graph_ms: graph_ms,
             analyze_ms,
@@ -520,7 +534,7 @@ fn analyze_all_scripts(
 
         for config_file in &script_analysis.config_files {
             plugin_result
-                .entry_patterns
+                .discovered_always_used
                 .push((config_file.clone(), "scripts".to_string()));
         }
     }
@@ -546,7 +560,7 @@ fn analyze_all_scripts(
                 .to_string_lossy();
             for config_file in &ws_analysis.config_files {
                 plugin_result
-                    .entry_patterns
+                    .discovered_always_used
                     .push((format!("{ws_prefix}/{config_file}"), "scripts".to_string()));
             }
         }
@@ -555,6 +569,10 @@ fn analyze_all_scripts(
     // Scan CI config files for binary invocations
     let ci_packages = scripts::ci::analyze_ci_files(&config.root);
     plugin_result.script_used_packages.extend(ci_packages);
+    plugin_result
+        .entry_point_roles
+        .entry("scripts".to_string())
+        .or_insert(EntryPointRole::Support);
 }
 
 /// Discover all entry points from static patterns, workspaces, plugins, and infrastructure.
@@ -563,25 +581,29 @@ fn discover_all_entry_points(
     files: &[discover::DiscoveredFile],
     workspaces: &[fallow_config::WorkspaceInfo],
     plugin_result: &plugins::AggregatedPluginResult,
-) -> Vec<discover::EntryPoint> {
-    let mut entry_points = discover::discover_entry_points(config, files);
+) -> discover::CategorizedEntryPoints {
+    let mut entry_points = discover::CategorizedEntryPoints::default();
+    entry_points.extend_runtime(discover::discover_entry_points(config, files));
+
     let ws_entries: Vec<_> = workspaces
         .par_iter()
         .flat_map(|ws| discover::discover_workspace_entry_points(&ws.root, config, files))
         .collect();
-    entry_points.extend(ws_entries);
-    let plugin_entries = discover::discover_plugin_entry_points(plugin_result, config, files);
+    entry_points.extend_runtime(ws_entries);
+
+    let plugin_entries = discover::discover_plugin_entry_point_sets(plugin_result, config, files);
     entry_points.extend(plugin_entries);
+
     let infra_entries = discover::discover_infrastructure_entry_points(&config.root);
-    entry_points.extend(infra_entries);
+    entry_points.extend_runtime(infra_entries);
 
     // Add dynamically loaded files from config as entry points
     if !config.dynamically_loaded.is_empty() {
         let dynamic_entries = discover::discover_dynamically_loaded_entry_points(config, files);
-        entry_points.extend(dynamic_entries);
+        entry_points.extend_runtime(dynamic_entries);
     }
 
-    entry_points
+    entry_points.dedup()
 }
 
 /// Summarize entry points by source category for user-facing output.
@@ -696,6 +718,9 @@ fn run_plugins(
             result
                 .entry_patterns
                 .push((prefix_if_needed(pat), pname.clone()));
+        }
+        for (plugin_name, role) in ws_result.entry_point_roles {
+            result.entry_point_roles.entry(plugin_name).or_insert(role);
         }
         for (pat, pname) in &ws_result.always_used {
             result

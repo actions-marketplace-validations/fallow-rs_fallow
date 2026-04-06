@@ -7,7 +7,7 @@
 use rustc_hash::FxHashSet;
 use std::path::{Path, PathBuf};
 
-use fallow_config::{ExternalPluginDef, PackageJson};
+use fallow_config::{EntryPointRole, ExternalPluginDef, PackageJson};
 
 use super::Plugin;
 
@@ -30,6 +30,8 @@ pub struct PluginRegistry {
 pub struct AggregatedPluginResult {
     /// All entry point patterns from active plugins: (pattern, plugin_name).
     pub entry_patterns: Vec<(String, String)>,
+    /// Coverage role for each plugin contributing entry point patterns.
+    pub entry_point_roles: rustc_hash::FxHashMap<String, EntryPointRole>,
     /// All config file patterns from active plugins.
     pub config_patterns: Vec<String>,
     /// All always-used file patterns from active plugins: (pattern, plugin_name).

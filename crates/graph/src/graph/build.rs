@@ -242,6 +242,8 @@ fn build_module_node(
         re_exports: re_export_edges,
         is_entry_point: entry_point_ids.contains(&file.id),
         is_reachable: false,
+        is_runtime_reachable: false,
+        is_test_reachable: false,
         has_cjs_exports,
     }
 }
@@ -561,6 +563,8 @@ impl ModuleGraph {
         files: &[DiscoveredFile],
         module_by_id: &FxHashMap<FileId, &ResolvedModule>,
         entry_point_ids: &FxHashSet<FileId>,
+        runtime_entry_point_ids: &FxHashSet<FileId>,
+        test_entry_point_ids: &FxHashSet<FileId>,
         module_count: usize,
         total_capacity: usize,
     ) -> Self {
@@ -609,6 +613,8 @@ impl ModuleGraph {
             package_usage: acc.package_usage,
             type_only_package_usage: acc.type_only_package_usage,
             entry_points: entry_point_ids.clone(),
+            runtime_entry_points: runtime_entry_point_ids.clone(),
+            test_entry_points: test_entry_point_ids.clone(),
             reverse_deps,
             namespace_imported: acc.namespace_imported,
         }

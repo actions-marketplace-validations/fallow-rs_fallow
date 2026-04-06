@@ -8,8 +8,9 @@ pub use fallow_types::discover::{DiscoveredFile, EntryPoint, EntryPointSource, F
 
 // Re-export public functions — preserves the existing `crate::discover::*` API
 pub use entry_points::{
-    compile_glob_set, discover_dynamically_loaded_entry_points, discover_entry_points,
-    discover_plugin_entry_points, discover_workspace_entry_points,
+    CategorizedEntryPoints, compile_glob_set, discover_dynamically_loaded_entry_points,
+    discover_entry_points, discover_plugin_entry_point_sets, discover_plugin_entry_points,
+    discover_workspace_entry_points,
 };
 pub use infrastructure::discover_infrastructure_entry_points;
 pub use walk::{PRODUCTION_EXCLUDE_PATTERNS, SOURCE_EXTENSIONS, discover_files};

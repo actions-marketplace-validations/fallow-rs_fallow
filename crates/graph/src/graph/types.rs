@@ -23,6 +23,10 @@ pub struct ModuleNode {
     pub is_entry_point: bool,
     /// Whether this module is reachable from any entry point.
     pub is_reachable: bool,
+    /// Whether this module is reachable from a runtime/application root.
+    pub is_runtime_reachable: bool,
+    /// Whether this module is reachable from a test root.
+    pub is_test_reachable: bool,
     /// Whether this module has CJS exports (module.exports / exports.*).
     pub has_cjs_exports: bool,
 }
@@ -99,7 +103,7 @@ const _: () = assert!(std::mem::size_of::<ReExportEdge>() == 56);
 // `ModuleNode` is stored in a Vec — one per discovered file.
 // PathBuf has different sizes on Unix vs Windows, so restrict to Unix.
 #[cfg(all(target_pointer_width = "64", unix))]
-const _: () = assert!(std::mem::size_of::<ModuleNode>() == 96);
+const _: () = assert!(std::mem::size_of::<ModuleNode>() == 104);
 
 #[cfg(test)]
 mod tests {
@@ -312,11 +316,15 @@ mod tests {
             re_exports: vec![],
             is_entry_point: true,
             is_reachable: true,
+            is_runtime_reachable: true,
+            is_test_reachable: false,
             has_cjs_exports: false,
         };
         assert_eq!(node.file_id, FileId(0));
         assert!(node.is_entry_point);
         assert!(node.is_reachable);
+        assert!(node.is_runtime_reachable);
+        assert!(!node.is_test_reachable);
         assert!(!node.has_cjs_exports);
         assert_eq!(node.edge_range, 0..5);
     }
@@ -331,10 +339,14 @@ mod tests {
             re_exports: vec![],
             is_entry_point: false,
             is_reachable: false,
+            is_runtime_reachable: false,
+            is_test_reachable: false,
             has_cjs_exports: false,
         };
         assert!(!node.is_entry_point);
         assert!(!node.is_reachable);
+        assert!(!node.is_runtime_reachable);
+        assert!(!node.is_test_reachable);
         assert!(node.edge_range.is_empty());
     }
 
@@ -348,9 +360,12 @@ mod tests {
             re_exports: vec![],
             is_entry_point: false,
             is_reachable: true,
+            is_runtime_reachable: true,
+            is_test_reachable: false,
             has_cjs_exports: true,
         };
         assert!(node.has_cjs_exports);
+        assert!(node.is_runtime_reachable);
         assert_eq!(node.edge_range.len(), 4);
     }
 
@@ -376,6 +391,8 @@ mod tests {
             }],
             is_entry_point: false,
             is_reachable: true,
+            is_runtime_reachable: true,
+            is_test_reachable: false,
             has_cjs_exports: false,
         };
         assert_eq!(node.exports.len(), 1);

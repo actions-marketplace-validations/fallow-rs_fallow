@@ -21,6 +21,9 @@ pub fn process_static_patterns(
     result.active_plugins.push(plugin.name().to_string());
 
     let pname = plugin.name().to_string();
+    result
+        .entry_point_roles
+        .insert(pname.clone(), plugin.entry_point_role());
     for pat in plugin.entry_patterns() {
         result
             .entry_patterns
@@ -84,6 +87,9 @@ pub fn process_external_plugins(
         };
         if is_active {
             result.active_plugins.push(ext.name.clone());
+            result
+                .entry_point_roles
+                .insert(ext.name.clone(), ext.entry_point_role);
             result.entry_patterns.extend(
                 ext.entry_points
                     .iter()

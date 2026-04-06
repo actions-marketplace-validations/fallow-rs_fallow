@@ -36,6 +36,10 @@ pub struct ModuleGraph {
     pub type_only_package_usage: FxHashMap<String, Vec<FileId>>,
     /// All entry point `FileId`s.
     pub entry_points: FxHashSet<FileId>,
+    /// Runtime/application entry point `FileId`s.
+    pub runtime_entry_points: FxHashSet<FileId>,
+    /// Test entry point `FileId`s.
+    pub test_entry_points: FxHashSet<FileId>,
     /// Reverse index: for each `FileId`, which files import it.
     pub reverse_deps: Vec<Vec<FileId>>,
     /// Precomputed: which modules have namespace imports (import * as ns).
@@ -68,10 +72,44 @@ const _: () = assert!(std::mem::size_of::<Edge>() == 32);
 const _: () = assert!(std::mem::size_of::<ImportedSymbol>() == 56);
 
 impl ModuleGraph {
+    fn resolve_entry_point_ids(
+        entry_points: &[EntryPoint],
+        path_to_id: &FxHashMap<PathBuf, FileId>,
+    ) -> FxHashSet<FileId> {
+        entry_points
+            .iter()
+            .filter_map(|ep| {
+                path_to_id.get(&ep.path).copied().or_else(|| {
+                    ep.path
+                        .canonicalize()
+                        .ok()
+                        .and_then(|path| path_to_id.get(&path).copied())
+                })
+            })
+            .collect()
+    }
+
     /// Build the module graph from resolved modules and entry points.
     pub fn build(
         resolved_modules: &[ResolvedModule],
         entry_points: &[EntryPoint],
+        files: &[DiscoveredFile],
+    ) -> Self {
+        Self::build_with_reachability_roots(
+            resolved_modules,
+            entry_points,
+            entry_points,
+            &[],
+            files,
+        )
+    }
+
+    /// Build the module graph with explicit runtime and test reachability roots.
+    pub fn build_with_reachability_roots(
+        resolved_modules: &[ResolvedModule],
+        entry_points: &[EntryPoint],
+        runtime_entry_points: &[EntryPoint],
+        test_entry_points: &[EntryPoint],
         files: &[DiscoveredFile],
     ) -> Self {
         let _span = tracing::info_span!("build_graph").entered();
@@ -96,25 +134,18 @@ impl ModuleGraph {
             resolved_modules.iter().map(|m| (m.file_id, m)).collect();
 
         // Build entry point set — use path_to_id map instead of O(n) scan per entry
-        let entry_point_ids: FxHashSet<FileId> = entry_points
-            .iter()
-            .filter_map(|ep| {
-                // Try direct lookup first (fast path)
-                path_to_id.get(&ep.path).copied().or_else(|| {
-                    // Fallback: canonicalize entry point and do a direct FxHashMap lookup
-                    ep.path
-                        .canonicalize()
-                        .ok()
-                        .and_then(|c| path_to_id.get(&c).copied())
-                })
-            })
-            .collect();
+        let entry_point_ids = Self::resolve_entry_point_ids(entry_points, &path_to_id);
+        let runtime_entry_point_ids =
+            Self::resolve_entry_point_ids(runtime_entry_points, &path_to_id);
+        let test_entry_point_ids = Self::resolve_entry_point_ids(test_entry_points, &path_to_id);
 
         // Phase 1: Build flat edge storage, module nodes, and package usage from resolved modules
         let mut graph = Self::populate_edges(
             files,
             &module_by_id,
             &entry_point_ids,
+            &runtime_entry_point_ids,
+            &test_entry_point_ids,
             module_count,
             total_capacity,
         );
@@ -122,8 +153,13 @@ impl ModuleGraph {
         // Phase 2: Record which files reference which exports (namespace + CSS module narrowing)
         graph.populate_references(&module_by_id, &entry_point_ids);
 
-        // Phase 3: BFS from entry points to mark reachable modules
-        graph.mark_reachable(total_capacity);
+        // Phase 3: BFS from entry points to mark overall/runtime/test reachability
+        graph.mark_reachable(
+            &entry_point_ids,
+            &runtime_entry_point_ids,
+            &test_entry_point_ids,
+            total_capacity,
+        );
 
         // Phase 4: Propagate references through re-export chains
         graph.resolve_re_export_chains();
@@ -295,6 +331,196 @@ mod tests {
         let graph = build_simple_graph();
         assert!(!graph.modules[1].is_entry_point);
         assert!(graph.modules[1].is_reachable);
+    }
+
+    #[test]
+    fn graph_distinguishes_runtime_test_and_support_reachability() {
+        let files = vec![
+            DiscoveredFile {
+                id: FileId(0),
+                path: PathBuf::from("/project/src/main.ts"),
+                size_bytes: 100,
+            },
+            DiscoveredFile {
+                id: FileId(1),
+                path: PathBuf::from("/project/src/runtime-only.ts"),
+                size_bytes: 50,
+            },
+            DiscoveredFile {
+                id: FileId(2),
+                path: PathBuf::from("/project/tests/app.test.ts"),
+                size_bytes: 50,
+            },
+            DiscoveredFile {
+                id: FileId(3),
+                path: PathBuf::from("/project/tests/setup.ts"),
+                size_bytes: 50,
+            },
+            DiscoveredFile {
+                id: FileId(4),
+                path: PathBuf::from("/project/src/covered.ts"),
+                size_bytes: 50,
+            },
+        ];
+
+        let all_entry_points = vec![
+            EntryPoint {
+                path: PathBuf::from("/project/src/main.ts"),
+                source: EntryPointSource::PackageJsonMain,
+            },
+            EntryPoint {
+                path: PathBuf::from("/project/tests/app.test.ts"),
+                source: EntryPointSource::TestFile,
+            },
+            EntryPoint {
+                path: PathBuf::from("/project/tests/setup.ts"),
+                source: EntryPointSource::Plugin {
+                    name: "vitest".to_string(),
+                },
+            },
+        ];
+        let runtime_entry_points = vec![EntryPoint {
+            path: PathBuf::from("/project/src/main.ts"),
+            source: EntryPointSource::PackageJsonMain,
+        }];
+        let test_entry_points = vec![EntryPoint {
+            path: PathBuf::from("/project/tests/app.test.ts"),
+            source: EntryPointSource::TestFile,
+        }];
+
+        let resolved_modules = vec![
+            ResolvedModule {
+                file_id: FileId(0),
+                path: PathBuf::from("/project/src/main.ts"),
+                exports: vec![],
+                re_exports: vec![],
+                resolved_imports: vec![ResolvedImport {
+                    info: ImportInfo {
+                        source: "./runtime-only".to_string(),
+                        imported_name: ImportedName::Named("runtimeOnly".to_string()),
+                        local_name: "runtimeOnly".to_string(),
+                        is_type_only: false,
+                        span: oxc_span::Span::new(0, 10),
+                        source_span: oxc_span::Span::default(),
+                    },
+                    target: ResolveResult::InternalModule(FileId(1)),
+                }],
+                resolved_dynamic_imports: vec![],
+                resolved_dynamic_patterns: vec![],
+                member_accesses: vec![],
+                whole_object_uses: vec![],
+                has_cjs_exports: false,
+                unused_import_bindings: FxHashSet::default(),
+            },
+            ResolvedModule {
+                file_id: FileId(1),
+                path: PathBuf::from("/project/src/runtime-only.ts"),
+                exports: vec![fallow_types::extract::ExportInfo {
+                    name: ExportName::Named("runtimeOnly".to_string()),
+                    local_name: Some("runtimeOnly".to_string()),
+                    is_type_only: false,
+                    is_public: false,
+                    span: oxc_span::Span::new(0, 20),
+                    members: vec![],
+                }],
+                re_exports: vec![],
+                resolved_imports: vec![],
+                resolved_dynamic_imports: vec![],
+                resolved_dynamic_patterns: vec![],
+                member_accesses: vec![],
+                whole_object_uses: vec![],
+                has_cjs_exports: false,
+                unused_import_bindings: FxHashSet::default(),
+            },
+            ResolvedModule {
+                file_id: FileId(2),
+                path: PathBuf::from("/project/tests/app.test.ts"),
+                exports: vec![],
+                re_exports: vec![],
+                resolved_imports: vec![ResolvedImport {
+                    info: ImportInfo {
+                        source: "../src/covered".to_string(),
+                        imported_name: ImportedName::Named("covered".to_string()),
+                        local_name: "covered".to_string(),
+                        is_type_only: false,
+                        span: oxc_span::Span::new(0, 10),
+                        source_span: oxc_span::Span::default(),
+                    },
+                    target: ResolveResult::InternalModule(FileId(4)),
+                }],
+                resolved_dynamic_imports: vec![],
+                resolved_dynamic_patterns: vec![],
+                member_accesses: vec![],
+                whole_object_uses: vec![],
+                has_cjs_exports: false,
+                unused_import_bindings: FxHashSet::default(),
+            },
+            ResolvedModule {
+                file_id: FileId(3),
+                path: PathBuf::from("/project/tests/setup.ts"),
+                exports: vec![],
+                re_exports: vec![],
+                resolved_imports: vec![ResolvedImport {
+                    info: ImportInfo {
+                        source: "../src/runtime-only".to_string(),
+                        imported_name: ImportedName::Named("runtimeOnly".to_string()),
+                        local_name: "runtimeOnly".to_string(),
+                        is_type_only: false,
+                        span: oxc_span::Span::new(0, 10),
+                        source_span: oxc_span::Span::default(),
+                    },
+                    target: ResolveResult::InternalModule(FileId(1)),
+                }],
+                resolved_dynamic_imports: vec![],
+                resolved_dynamic_patterns: vec![],
+                member_accesses: vec![],
+                whole_object_uses: vec![],
+                has_cjs_exports: false,
+                unused_import_bindings: FxHashSet::default(),
+            },
+            ResolvedModule {
+                file_id: FileId(4),
+                path: PathBuf::from("/project/src/covered.ts"),
+                exports: vec![fallow_types::extract::ExportInfo {
+                    name: ExportName::Named("covered".to_string()),
+                    local_name: Some("covered".to_string()),
+                    is_type_only: false,
+                    is_public: false,
+                    span: oxc_span::Span::new(0, 20),
+                    members: vec![],
+                }],
+                re_exports: vec![],
+                resolved_imports: vec![],
+                resolved_dynamic_imports: vec![],
+                resolved_dynamic_patterns: vec![],
+                member_accesses: vec![],
+                whole_object_uses: vec![],
+                has_cjs_exports: false,
+                unused_import_bindings: FxHashSet::default(),
+            },
+        ];
+
+        let graph = ModuleGraph::build_with_reachability_roots(
+            &resolved_modules,
+            &all_entry_points,
+            &runtime_entry_points,
+            &test_entry_points,
+            &files,
+        );
+
+        assert!(graph.modules[1].is_reachable);
+        assert!(graph.modules[1].is_runtime_reachable);
+        assert!(
+            !graph.modules[1].is_test_reachable,
+            "support roots should not make runtime-only modules test reachable"
+        );
+
+        assert!(graph.modules[4].is_reachable);
+        assert!(graph.modules[4].is_test_reachable);
+        assert!(
+            !graph.modules[4].is_runtime_reachable,
+            "test-only reachability should stay separate from runtime roots"
+        );
     }
 
     #[test]

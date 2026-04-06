@@ -631,6 +631,8 @@ mod tests {
                 re_exports: vec![],
                 is_entry_point: i == 0,
                 is_reachable: true,
+                is_runtime_reachable: true,
+                is_test_reachable: false,
                 has_cjs_exports: false,
             })
             .collect();

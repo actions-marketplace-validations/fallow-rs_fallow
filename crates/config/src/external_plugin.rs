@@ -7,6 +7,19 @@ use serde::{Deserialize, Serialize};
 /// Supported plugin file extensions.
 const PLUGIN_EXTENSIONS: &[&str] = &["toml", "json", "jsonc"];
 
+/// How a plugin's discovered entry points contribute to coverage reachability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum EntryPointRole {
+    /// Runtime/application roots that should count toward runtime reachability.
+    Runtime,
+    /// Test roots that should count toward test reachability.
+    Test,
+    /// Support/setup/config roots that should keep files alive but not count as runtime/test.
+    #[default]
+    Support,
+}
+
 /// How to detect if a plugin should be activated.
 ///
 /// When set on an `ExternalPluginDef`, this takes priority over `enablers`.
@@ -76,6 +89,13 @@ pub struct ExternalPluginDef {
     #[serde(default)]
     pub entry_points: Vec<String>,
 
+    /// Coverage role for `entryPoints`.
+    ///
+    /// Defaults to `runtime` for backwards compatibility with existing external
+    /// plugins, whose `entryPoints` typically model application roots.
+    #[serde(default = "default_external_entry_point_role")]
+    pub entry_point_role: EntryPointRole,
+
     /// Glob patterns for config files (marked as always-used when active).
     #[serde(default)]
     pub config_patterns: Vec<String>,
@@ -101,6 +121,10 @@ pub struct ExternalUsedExport {
     pub pattern: String,
     /// Export names always considered used.
     pub exports: Vec<String>,
+}
+
+fn default_external_entry_point_role() -> EntryPointRole {
+    EntryPointRole::Runtime
 }
 
 impl ExternalPluginDef {

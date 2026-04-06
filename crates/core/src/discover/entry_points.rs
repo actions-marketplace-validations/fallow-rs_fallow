@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use fallow_config::{PackageJson, ResolvedConfig};
+use fallow_config::{EntryPointRole, PackageJson, ResolvedConfig};
 use fallow_types::discover::{DiscoveredFile, EntryPoint, EntryPointSource};
 
 use super::parse_scripts::extract_script_file_refs;
@@ -10,6 +10,76 @@ use super::walk::SOURCE_EXTENSIONS;
 /// When an entry point path is inside one of these directories, we also try
 /// the `src/` equivalent to find the tracked source file.
 const OUTPUT_DIRS: &[&str] = &["dist", "build", "out", "esm", "cjs"];
+
+/// Entry points grouped by reachability role.
+#[derive(Debug, Clone, Default)]
+pub struct CategorizedEntryPoints {
+    pub all: Vec<EntryPoint>,
+    pub runtime: Vec<EntryPoint>,
+    pub test: Vec<EntryPoint>,
+}
+
+impl CategorizedEntryPoints {
+    pub fn push_runtime(&mut self, entry: EntryPoint) {
+        self.runtime.push(entry.clone());
+        self.all.push(entry);
+    }
+
+    pub fn push_test(&mut self, entry: EntryPoint) {
+        self.test.push(entry.clone());
+        self.all.push(entry);
+    }
+
+    pub fn push_support(&mut self, entry: EntryPoint) {
+        self.all.push(entry);
+    }
+
+    pub fn extend_runtime<I>(&mut self, entries: I)
+    where
+        I: IntoIterator<Item = EntryPoint>,
+    {
+        for entry in entries {
+            self.push_runtime(entry);
+        }
+    }
+
+    pub fn extend_test<I>(&mut self, entries: I)
+    where
+        I: IntoIterator<Item = EntryPoint>,
+    {
+        for entry in entries {
+            self.push_test(entry);
+        }
+    }
+
+    pub fn extend_support<I>(&mut self, entries: I)
+    where
+        I: IntoIterator<Item = EntryPoint>,
+    {
+        for entry in entries {
+            self.push_support(entry);
+        }
+    }
+
+    pub fn extend(&mut self, other: Self) {
+        self.all.extend(other.all);
+        self.runtime.extend(other.runtime);
+        self.test.extend(other.test);
+    }
+
+    #[must_use]
+    pub fn dedup(mut self) -> Self {
+        dedup_entry_paths(&mut self.all);
+        dedup_entry_paths(&mut self.runtime);
+        dedup_entry_paths(&mut self.test);
+        self
+    }
+}
+
+fn dedup_entry_paths(entries: &mut Vec<EntryPoint>) {
+    entries.sort_by(|a, b| a.path.cmp(&b.path));
+    entries.dedup_by(|a, b| a.path == b.path);
+}
 
 /// Resolve a path relative to a base directory, with security check and extension fallback.
 ///
@@ -379,7 +449,17 @@ pub fn discover_plugin_entry_points(
     config: &ResolvedConfig,
     files: &[DiscoveredFile],
 ) -> Vec<EntryPoint> {
-    let mut entries = Vec::new();
+    discover_plugin_entry_point_sets(plugin_result, config, files).all
+}
+
+/// Discover plugin-derived entry points with runtime/test/support roles preserved.
+#[must_use]
+pub fn discover_plugin_entry_point_sets(
+    plugin_result: &crate::plugins::AggregatedPluginResult,
+    config: &ResolvedConfig,
+    files: &[DiscoveredFile],
+) -> CategorizedEntryPoints {
+    let mut entries = CategorizedEntryPoints::default();
 
     // Pre-compute relative paths
     let relative_paths: Vec<String> = files
@@ -395,19 +475,29 @@ pub fn discover_plugin_entry_points(
 
     // Match plugin entry patterns against files using a single GlobSet
     // for O(files) matching instead of O(patterns × files).
-    // Track which plugin name corresponds to each glob index.
+    // Track which plugin name and reachability role correspond to each glob index.
     let mut builder = globset::GlobSetBuilder::new();
-    let mut glob_plugin_names: Vec<&str> = Vec::new();
+    let mut glob_meta: Vec<(&str, EntryPointRole)> = Vec::new();
+    for (pattern, pname) in &plugin_result.entry_patterns {
+        if let Ok(glob) = globset::Glob::new(pattern) {
+            builder.add(glob);
+            let role = plugin_result
+                .entry_point_roles
+                .get(pname)
+                .copied()
+                .unwrap_or(EntryPointRole::Support);
+            glob_meta.push((pname, role));
+        }
+    }
     for (pattern, pname) in plugin_result
-        .entry_patterns
+        .discovered_always_used
         .iter()
-        .chain(plugin_result.discovered_always_used.iter())
         .chain(plugin_result.always_used.iter())
         .chain(plugin_result.fixture_patterns.iter())
     {
         if let Ok(glob) = globset::Glob::new(pattern) {
             builder.add(glob);
-            glob_plugin_names.push(pname);
+            glob_meta.push((pname, EntryPointRole::Support));
         }
     }
     if let Ok(glob_set) = builder.build()
@@ -416,12 +506,34 @@ pub fn discover_plugin_entry_points(
         for (idx, rel) in relative_paths.iter().enumerate() {
             let matches = glob_set.matches(rel);
             if !matches.is_empty() {
-                // Use the plugin name from the first matching pattern
-                let name = glob_plugin_names[matches[0]].to_string();
-                entries.push(EntryPoint {
+                let (name, _) = glob_meta[matches[0]];
+                let entry = EntryPoint {
                     path: files[idx].path.clone(),
-                    source: EntryPointSource::Plugin { name },
-                });
+                    source: EntryPointSource::Plugin {
+                        name: name.to_string(),
+                    },
+                };
+
+                let mut has_runtime = false;
+                let mut has_test = false;
+                let mut has_support = false;
+                for match_idx in matches {
+                    match glob_meta[match_idx].1 {
+                        EntryPointRole::Runtime => has_runtime = true,
+                        EntryPointRole::Test => has_test = true,
+                        EntryPointRole::Support => has_support = true,
+                    }
+                }
+
+                if has_runtime {
+                    entries.push_runtime(entry.clone());
+                }
+                if has_test {
+                    entries.push_test(entry.clone());
+                }
+                if has_support || (!has_runtime && !has_test) {
+                    entries.push_support(entry);
+                }
             }
         }
     }
@@ -434,7 +546,7 @@ pub fn discover_plugin_entry_points(
             config.root.join(setup_file)
         };
         if resolved.exists() {
-            entries.push(EntryPoint {
+            entries.push_support(EntryPoint {
                 path: resolved,
                 source: EntryPointSource::Plugin {
                     name: pname.clone(),
@@ -445,7 +557,7 @@ pub fn discover_plugin_entry_points(
             for ext in SOURCE_EXTENSIONS {
                 let with_ext = resolved.with_extension(ext);
                 if with_ext.exists() {
-                    entries.push(EntryPoint {
+                    entries.push_support(EntryPoint {
                         path: with_ext,
                         source: EntryPointSource::Plugin {
                             name: pname.clone(),
@@ -457,10 +569,7 @@ pub fn discover_plugin_entry_points(
         }
     }
 
-    // Deduplicate
-    entries.sort_by(|a, b| a.path.cmp(&b.path));
-    entries.dedup_by(|a, b| a.path == b.path);
-    entries
+    entries.dedup()
 }
 
 /// Discover entry points from `dynamicallyLoaded` config patterns.

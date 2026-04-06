@@ -743,6 +743,7 @@ mod tests {
             config_patterns: vec![],
             always_used: vec![],
             used_exports,
+            entry_point_roles: FxHashMap::default(),
             referenced_dependencies: vec![],
             discovered_always_used: vec![],
             setup_files: vec![],
