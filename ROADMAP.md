@@ -1,6 +1,6 @@
 # Fallow Roadmap
 
-> Last updated: 2026-04-06
+> Last updated: 2026-04-07
 
 AI agents write more code than ever. They rarely clean up after themselves. Every generated file, every scaffolded export, every copied utility accumulates until your codebase is half dead weight.
 
@@ -8,7 +8,7 @@ Fallow is the counterbalance: fast, framework-aware dead code detection that wor
 
 ---
 
-## Where we are (v2.15.0)
+## Where we are (v2.16.0)
 
 **Dead code analysis** -- 14 issue types: unused files, exports, types, dependencies, enum/class members, unresolved imports, unlisted deps, duplicate exports, circular dependencies, type-only dependencies, and test-only production dependencies. 84 framework plugins with auto-detection. Auto-fix for safe removals. Inline suppression. Severity rules (`error` / `warn` / `off`).
 

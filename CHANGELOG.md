@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.16.0] - 2026-04-07
+
+### Added
+
+- **Untested complexity risk (CRAP) scores** -- per-function risk scoring combining cyclomatic complexity with static test reachability from the module graph. Binary model: test-reachable files score CC, untested files score CC^2+CC. Threshold at >=30 (CC>=5 untested), based on the CRAP metric (Savoia & Evans, 2007). Adds `crap_max` and `crap_above_threshold` fields to `FileHealthScore`, `coverage_model: "static_binary"` to `HealthSummary` and `TrendPoint`. Gated behind `--file-scores`. Extreme values (>999) capped in human output; JSON stays uncapped.
+- **AddTestCoverage refactoring target** -- new recommendation category (Rule 7) fires when a file has 2+ functions above the CRAP threshold and complexity density > 0.3. Contributing factor `crap_max` appears on targets with high untested risk. Evidence links to the top complex functions.
+- **SvelteKit `$types` route group parentheses coverage** -- route groups with parentheses in path segments are now handled correctly for `$types` imports. ([#54](https://github.com/fallow-rs/fallow/pull/54))
+
+### Changed
+
+- **Lazy complexity computation** -- cyclomatic/cognitive complexity is now computed on-demand rather than eagerly, reducing parse time for pipelines that don't need it.
+- **Packed ModuleNode flags** -- boolean flags on `ModuleNode` packed into a bitfield for tighter memory layout.
+- **Smarter BFS reachability** -- reachability analysis uses optimized graph traversal.
+- **Duplicate detection improvements** -- faster clone detection with reduced memory allocation.
+
+### Fixed
+
+- **Windows path separator normalization** -- health coverage-gaps tests now normalize backslashes for Windows CI compatibility.
+- **GitHub Action fork PR handling** -- PR comment tests are skipped on fork PRs where write permissions are unavailable.
+
 ## [2.15.0] - 2026-04-06
 
 ### Added
@@ -903,7 +923,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `--changed-since` and `--fail-on-issues` for CI
 - Cross-workspace resolution for npm/yarn/pnpm workspaces
 
-[Unreleased]: https://github.com/fallow-rs/fallow/compare/v2.15.0...HEAD
+[Unreleased]: https://github.com/fallow-rs/fallow/compare/v2.16.0...HEAD
+[2.16.0]: https://github.com/fallow-rs/fallow/compare/v2.15.0...v2.16.0
 [2.15.0]: https://github.com/fallow-rs/fallow/compare/v2.14.2...v2.15.0
 [2.14.2]: https://github.com/fallow-rs/fallow/compare/v2.14.1...v2.14.2
 [2.14.1]: https://github.com/fallow-rs/fallow/compare/v2.14.0...v2.14.1
