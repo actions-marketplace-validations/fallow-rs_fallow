@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.18.3] - 2026-04-07
+
+### Fixed
+
+- **`fallow fix` export specifier lists** -- `export { A, B, C }` lines are now fixed correctly by removing individual unused specifiers instead of stripping the `export` keyword (which left invalid `{ A, B, C }` syntax). Handles `export { ... }`, `export { ... } from "..."`, `export type { ... }`, and aliased specifiers. ([#74](https://github.com/fallow-rs/fallow/pull/74))
+- **npm publish CI** -- restored two-step npm bootstrap (`npm@10.9.8` then `npm@latest`) for reliable OIDC trusted publishing on Node 22 runners.
+
 ## [2.18.2] - 2026-04-07
 
 ### Fixed
@@ -980,7 +987,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `--changed-since` and `--fail-on-issues` for CI
 - Cross-workspace resolution for npm/yarn/pnpm workspaces
 
-[Unreleased]: https://github.com/fallow-rs/fallow/compare/v2.18.2...HEAD
+[Unreleased]: https://github.com/fallow-rs/fallow/compare/v2.18.3...HEAD
+[2.18.3]: https://github.com/fallow-rs/fallow/compare/v2.18.2...v2.18.3
 [2.18.2]: https://github.com/fallow-rs/fallow/compare/v2.18.1...v2.18.2
 [2.18.1]: https://github.com/fallow-rs/fallow/compare/v2.18.0...v2.18.1
 [2.18.0]: https://github.com/fallow-rs/fallow/compare/v2.17.1...v2.18.0
