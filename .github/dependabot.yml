@@ -6,9 +6,6 @@ updates:
       interval: weekly
     cooldown:
       default-days: 7
-    ignore:
-      - dependency-name: bincode
-        update-types: ["version-update:semver-major"]
     groups:
       oxc:
         patterns: ["oxc_*"]

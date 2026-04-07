@@ -1,4 +1,4 @@
-//! Incremental parse cache with bincode serialization.
+//! Incremental parse cache with bitcode serialization.
 //!
 //! Stores parsed module information (exports, imports, re-exports) on disk so
 //! unchanged files can skip AST parsing on subsequent runs. Uses xxh3 content

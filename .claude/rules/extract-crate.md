@@ -16,6 +16,6 @@ Key modules:
 - `css.rs` — CSS Module class name extraction (`.module.css`/`.module.scss` → named exports)
 - `html.rs` — HTML asset reference extraction (`<script src>`, `<link rel="stylesheet" href>`, `<link rel="modulepreload" href>` → `SideEffect` imports). Regex-based, comment-stripped.
 - `parse.rs` — File type dispatcher. Runs `oxc_semantic` after parsing to detect unused import bindings (imports where the binding is never read in the file).
-- `cache.rs` — Incremental bincode cache with xxh3 hashing. Unchanged files skip parsing and load from cache. Pruned of stale entries on each run.
+- `cache.rs` — Incremental bitcode cache with xxh3 hashing. Unchanged files skip parsing and load from cache. Pruned of stale entries on each run.
 - `complexity.rs` — Per-function cyclomatic/cognitive complexity via single-pass `ComplexityVisitor`
 - `tests/` — Integration tests split by parser type: `js_ts.rs`, `sfc.rs`, `astro.rs`, `mdx.rs`, `css.rs`

@@ -4,7 +4,7 @@ use std::path::Path;
 
 use rustc_hash::FxHashMap;
 
-use bincode::{Decode, Encode};
+use bitcode::{Decode, Encode};
 
 use super::types::{CACHE_VERSION, CachedModule, MAX_CACHE_SIZE};
 
@@ -38,8 +38,7 @@ impl CacheStore {
             );
             return None;
         }
-        let (store, _): (Self, usize) =
-            bincode::decode_from_slice(&data, bincode::config::standard()).ok()?;
+        let store: Self = bitcode::decode(&data).ok()?;
         if store.version != CACHE_VERSION {
             return None;
         }
@@ -50,14 +49,13 @@ impl CacheStore {
     ///
     /// # Errors
     ///
-    /// Returns an error string when the cache directory cannot be created,
-    /// the cache cannot be serialized, or the cache file cannot be written.
+    /// Returns an error string when the cache directory cannot be created
+    /// or the cache file cannot be written.
     pub fn save(&self, cache_dir: &Path) -> Result<(), String> {
         std::fs::create_dir_all(cache_dir)
             .map_err(|e| format!("Failed to create cache dir: {e}"))?;
         let cache_file = cache_dir.join("cache.bin");
-        let data = bincode::encode_to_vec(self, bincode::config::standard())
-            .map_err(|e| format!("Failed to serialize cache: {e}"))?;
+        let data = bitcode::encode(self);
         std::fs::write(&cache_file, data).map_err(|e| format!("Failed to write cache: {e}"))?;
         Ok(())
     }

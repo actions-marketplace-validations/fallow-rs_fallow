@@ -19,7 +19,7 @@ serde = { workspace = true }
 oxc_span = { workspace = true }
 
 # Cache serialization (for MemberAccess)
-bincode = { workspace = true }
+bitcode = { workspace = true }
 
 [lints]
 workspace = true

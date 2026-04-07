@@ -1,13 +1,13 @@
 //! Serialization types for the incremental parse cache.
 //!
-//! All types use bincode `Encode`/`Decode` for fast binary serialization.
+//! All types use bitcode `Encode`/`Decode` for fast binary serialization.
 
-use bincode::{Decode, Encode};
+use bitcode::{Decode, Encode};
 
 use crate::MemberKind;
 
 /// Cache version — bump when the cache format or cached extraction semantics change.
-pub(super) const CACHE_VERSION: u32 = 21;
+pub(super) const CACHE_VERSION: u32 = 22;
 
 /// Maximum cache file size to deserialize (256 MB).
 pub(super) const MAX_CACHE_SIZE: usize = 256 * 1024 * 1024;

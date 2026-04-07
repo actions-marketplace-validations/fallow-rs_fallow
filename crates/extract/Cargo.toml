@@ -36,7 +36,7 @@ xxhash-rust = { workspace = true }
 rustc-hash = { workspace = true }
 
 # Caching
-bincode = { workspace = true }
+bitcode = { workspace = true }
 
 # Logging
 tracing = { workspace = true }

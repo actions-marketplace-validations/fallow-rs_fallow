@@ -498,7 +498,6 @@ fn cache_version_mismatch_returns_none() {
     assert!(CacheStore::load(&dir).is_some());
 
     // Read raw bytes and modify the version field.
-    // With bincode standard config, u32 is varint-encoded.
     // The version (CACHE_VERSION) is the first encoded field.
     // Replace the first byte with a different version value (e.g., 255)
     // to simulate a version mismatch.
