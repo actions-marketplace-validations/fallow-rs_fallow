@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import type { IncomingMessage } from "node:http";
 import * as https from "node:https";
@@ -108,15 +109,65 @@ const getInstallDir = (context: vscode.ExtensionContext): string => {
   return dir;
 };
 
+/** Query the version of a fallow binary. Returns the version string or null. */
+const getBinaryVersion = (binaryPath: string): string | null => {
+  try {
+    // execFileSync is safe (no shell injection) — binary path is from our own storage dir.
+    const output = execFileSync(binaryPath, ["--version"], {
+      timeout: 5000,
+      encoding: "utf-8",
+    });
+    // Output format: "fallow-lsp 2.18.3" or "fallow 2.18.3"
+    const match = output.trim().match(/(\d+\.\d+\.\d+)/);
+    return match?.[1] ?? null;
+  } catch {
+    return null;
+  }
+};
+
 export const getInstalledBinaryPath = (
-  context: vscode.ExtensionContext
+  context: vscode.ExtensionContext,
+  outputChannel?: vscode.OutputChannel
 ): string | null => {
   const dir = getInstallDir(context);
-  const binaryPath = path.join(
+  const lspPath = path.join(
     dir,
     `${LSP_BINARY_NAME}${getExecutableExtension()}`
   );
-  return fs.existsSync(binaryPath) ? binaryPath : null;
+  if (!fs.existsSync(lspPath)) {
+    return null;
+  }
+
+  // Check if the installed binary matches the extension version.
+  // Without this, a binary downloaded by a previous extension version
+  // persists forever, causing version skew between LSP diagnostics and CLI.
+  const extensionVersion =
+    vscode.extensions.getExtension("fallow-rs.fallow-vscode")?.packageJSON
+      ?.version as string | undefined;
+  if (extensionVersion) {
+    const binaryVersion = getBinaryVersion(lspPath);
+    if (binaryVersion && binaryVersion !== extensionVersion) {
+      outputChannel?.appendLine(
+        `Fallow: installed binary is v${binaryVersion}, extension is v${extensionVersion}. Re-downloading.`
+      );
+      // Remove stale binaries to force a fresh download
+      try {
+        fs.unlinkSync(lspPath);
+        const cliPath = path.join(
+          dir,
+          `${CLI_BINARY_NAME}${getExecutableExtension()}`
+        );
+        if (fs.existsSync(cliPath)) {
+          fs.unlinkSync(cliPath);
+        }
+      } catch {
+        // If deletion fails, still return null to trigger download
+      }
+      return null;
+    }
+  }
+
+  return lspPath;
 };
 
 /** Download a single binary asset from a GitHub release. Returns the dest path or null. */

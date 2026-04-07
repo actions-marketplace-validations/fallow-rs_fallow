@@ -19,7 +19,8 @@ import {
 let client: LanguageClient | null = null;
 
 const resolveBinaryPath = async (
-  context: vscode.ExtensionContext
+  context: vscode.ExtensionContext,
+  outputChannel?: vscode.OutputChannel
 ): Promise<string | null> => {
   const configPath = getLspPath();
   if (configPath) {
@@ -37,7 +38,7 @@ const resolveBinaryPath = async (
     return inPath;
   }
 
-  const installed = getInstalledBinaryPath(context);
+  const installed = getInstalledBinaryPath(context, outputChannel);
   if (installed) {
     return installed;
   }
@@ -71,7 +72,7 @@ export const startClient = async (
   context: vscode.ExtensionContext,
   outputChannel: vscode.OutputChannel
 ): Promise<LanguageClient | null> => {
-  const binaryPath = await resolveBinaryPath(context);
+  const binaryPath = await resolveBinaryPath(context, outputChannel);
   if (!binaryPath) {
     return null;
   }
