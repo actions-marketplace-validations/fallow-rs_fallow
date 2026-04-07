@@ -227,7 +227,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.miri == 'true' || github.event_name == 'push'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     permissions:
       contents: read
     env:
