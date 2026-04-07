@@ -1,15 +1,20 @@
-//! HTML file parsing for script and stylesheet asset references.
+//! HTML file parsing for script, stylesheet, and Angular template references.
 //!
 //! Extracts `<script src="...">` and `<link rel="stylesheet" href="...">` references
 //! from HTML files, creating graph edges so that referenced JS/CSS assets (and their
 //! transitive imports) are reachable from the HTML entry point.
+//!
+//! Also scans for Angular template syntax (`{{ }}`, `[prop]`, `(event)`, `@if`, etc.)
+//! and stores referenced identifiers as `MemberAccess` entries with a sentinel object,
+//! enabling the analysis phase to credit component class members used in external templates.
 
 use std::path::Path;
 use std::sync::LazyLock;
 
 use oxc_span::Span;
 
-use crate::{ImportInfo, ImportedName, ModuleInfo};
+use crate::sfc_template::angular::{self, ANGULAR_TPL_SENTINEL};
+use crate::{ImportInfo, ImportedName, MemberAccess, ModuleInfo};
 use fallow_types::discover::FileId;
 
 /// Regex to match HTML comments (`<!-- ... -->`) for stripping before extraction.
@@ -122,6 +127,18 @@ pub(crate) fn parse_html_to_module(file_id: FileId, source: &str, content_hash: 
     imports.sort_unstable_by(|a, b| a.source.cmp(&b.source));
     imports.dedup_by(|a, b| a.source == b.source);
 
+    // Scan for Angular template syntax ({{ }}, [prop], (event), @if, etc.).
+    // Referenced identifiers are stored as MemberAccess entries with a sentinel
+    // object name so the analysis phase can bridge them to the component class.
+    let template_refs = angular::collect_angular_template_refs(source);
+    let member_accesses: Vec<MemberAccess> = template_refs
+        .into_iter()
+        .map(|name| MemberAccess {
+            object: ANGULAR_TPL_SENTINEL.to_string(),
+            member: name,
+        })
+        .collect();
+
     ModuleInfo {
         file_id,
         exports: Vec::new(),
@@ -130,7 +147,7 @@ pub(crate) fn parse_html_to_module(file_id: FileId, source: &str, content_hash: 
         dynamic_imports: Vec::new(),
         dynamic_import_patterns: Vec::new(),
         require_calls: Vec::new(),
-        member_accesses: Vec::new(),
+        member_accesses,
         whole_object_uses: Vec::new(),
         has_cjs_exports: false,
         content_hash,
@@ -460,5 +477,44 @@ mod tests {
         // from source text won't find standard JS-style comments.
         // This is expected — HTML suppression is not supported.
         assert_eq!(info.imports.len(), 1);
+    }
+
+    // ── Angular template scanning ──────────────────────────────
+
+    #[test]
+    fn angular_template_extracts_member_refs() {
+        let info = parse_html_to_module(
+            FileId(0),
+            "<h1>{{ title() }}</h1>\n\
+             <p [class.highlighted]=\"isHighlighted\">{{ greeting() }}</p>\n\
+             <button (click)=\"onButtonClick()\">Toggle</button>",
+            0,
+        );
+        let names: rustc_hash::FxHashSet<&str> = info
+            .member_accesses
+            .iter()
+            .filter(|a| a.object == ANGULAR_TPL_SENTINEL)
+            .map(|a| a.member.as_str())
+            .collect();
+        assert!(names.contains("title"), "should contain 'title'");
+        assert!(
+            names.contains("isHighlighted"),
+            "should contain 'isHighlighted'"
+        );
+        assert!(names.contains("greeting"), "should contain 'greeting'");
+        assert!(
+            names.contains("onButtonClick"),
+            "should contain 'onButtonClick'"
+        );
+    }
+
+    #[test]
+    fn plain_html_no_angular_refs() {
+        let info = parse_html_to_module(
+            FileId(0),
+            "<!doctype html><html><body><h1>Hello</h1></body></html>",
+            0,
+        );
+        assert!(info.member_accesses.is_empty());
     }
 }

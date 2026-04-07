@@ -1,0 +1,604 @@
+//! Angular HTML template scanner for member reference extraction.
+//!
+//! Scans Angular external HTML templates for identifier references in:
+//! - `{{ expression }}` interpolation
+//! - `[prop]="expression"` / `(event)="statement"` / `[(prop)]="expression"` bindings
+//! - `*ngIf="expression"` / `*ngFor="let x of expr"` structural directives
+//! - `@if (expr)` / `@for (x of expr; track expr)` / `@switch (expr)` control flow (Angular 17+)
+//! - `| pipeName` pipe references
+//!
+//! Referenced identifiers are stored as `MemberAccess` entries with a sentinel object name
+//! so the analysis phase can bridge them to the importing component's class members.
+
+use std::sync::LazyLock;
+
+use rustc_hash::FxHashSet;
+
+use crate::template_usage::{TemplateSnippetKind, collect_unresolved_refs};
+
+use super::scanners::{scan_curly_section, scan_html_tag};
+
+/// Sentinel value used as the `object` field in `MemberAccess` entries
+/// produced by the Angular template scanner. The analysis phase checks imports
+/// for entries with this sentinel and merges them into the component's
+/// `self_accessed_members` set.
+pub const ANGULAR_TPL_SENTINEL: &str = "__angular_tpl__";
+
+/// Regex to strip HTML comments before scanning.
+static HTML_COMMENT_RE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"(?s)<!--.*?-->").expect("valid regex"));
+
+/// Regex to extract attribute name-value pairs from an HTML tag.
+/// Captures: group 1 = attribute name (including prefix like `[`, `(`, `*`),
+///           group 2 = value (inside quotes).
+static ATTR_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r#"(?s)([\[()*#a-zA-Z][\w.\-\[\]()]*)\s*=\s*"([^"]*)""#).expect("valid regex")
+});
+
+/// Regex to parse `*ngFor` microsyntax: `let item of items`.
+static NG_FOR_OF_RE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"(?s)^\s*let\s+(\w+)\s+of\s+(.+)$").expect("valid regex"));
+
+/// Regex to match Angular 17+ `@for (item of expr; track expr)` control flow.
+static CONTROL_FOR_RE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"(?s)^\s*(\w+)\s+of\s+(.+)$").expect("valid regex"));
+
+/// Scan an Angular HTML template and collect all referenced identifiers.
+///
+/// Returns a deduplicated set of identifier names that appear as unresolved
+/// references in template expressions. These represent potential component
+/// class member references.
+pub fn collect_angular_template_refs(source: &str) -> FxHashSet<String> {
+    let stripped = HTML_COMMENT_RE.replace_all(source, "");
+    let source = stripped.as_ref();
+    let bytes = source.as_bytes();
+    let mut refs = FxHashSet::default();
+    let mut scopes: Vec<Vec<String>> = vec![Vec::new()];
+    let mut index = 0;
+
+    while index < bytes.len() {
+        // {{ expression }} interpolation
+        if index + 1 < bytes.len() && bytes[index] == b'{' && bytes[index + 1] == b'{' {
+            let Some((expr, next_index)) = scan_curly_section(source, index, 2, 2) else {
+                break;
+            };
+            collect_expression_refs(expr.trim(), &current_locals(&scopes), &mut refs);
+            index = next_index;
+            continue;
+        }
+
+        // @if/@for/@switch/@case/@else/@empty — Angular 17+ control flow
+        if bytes[index] == b'@'
+            && let Some(next_index) = handle_control_flow(source, index, &mut scopes, &mut refs)
+        {
+            index = next_index;
+            continue;
+        }
+
+        // Closing control flow blocks — pop scope
+        if bytes[index] == b'}' {
+            if scopes.len() > 1 {
+                scopes.pop();
+            }
+            index += 1;
+            continue;
+        }
+
+        // HTML tags with bindings
+        if bytes[index] == b'<' {
+            if let Some((tag, next_index)) = scan_html_tag(source, index) {
+                process_tag(tag, &mut scopes, &mut refs);
+                index = next_index;
+                continue;
+            }
+            // Bare `<` in text content (e.g., "count < 10") — skip and continue scanning.
+            index += 1;
+            continue;
+        }
+
+        index += 1;
+    }
+
+    refs
+}
+
+/// Handle Angular 17+ control flow blocks (`@if`, `@for`, `@switch`, `@case`, etc.).
+/// Returns the index after the opening `{` of the block, or `None` if not a control flow keyword.
+fn handle_control_flow(
+    source: &str,
+    start: usize,
+    scopes: &mut Vec<Vec<String>>,
+    refs: &mut FxHashSet<String>,
+) -> Option<usize> {
+    let rest = &source[start + 1..]; // skip '@'
+
+    // Match keyword
+    let keyword_end = rest.find(|c: char| !c.is_ascii_alphabetic())?;
+    let keyword = &rest[..keyword_end];
+
+    match keyword {
+        "if" | "switch" | "case" => {
+            // @if (expression) { ... }
+            let after_keyword = &source[start + 1 + keyword_end..];
+            let paren_start = after_keyword.find('(')?;
+            let paren_content_start = start + 1 + keyword_end + paren_start;
+            let (expr, after_paren) = scan_parenthesized(source, paren_content_start)?;
+            let locals = current_locals(scopes);
+            collect_expression_refs(expr.trim(), &locals, refs);
+            scopes.push(Vec::new());
+            // Search for opening brace AFTER the closing paren, not from the opening paren.
+            // Otherwise expressions containing `{` (object literals, template literals)
+            // would cause the scanner to land mid-expression.
+            let brace_pos = source[after_paren..].find('{')?;
+            Some(after_paren + brace_pos + 1)
+        }
+        "for" => {
+            // @for (item of expression; track expression) { ... }
+            let after_keyword = &source[start + 1 + keyword_end..];
+            let paren_start = after_keyword.find('(')?;
+            let paren_content_start = start + 1 + keyword_end + paren_start;
+            let (paren_content, after_paren) = scan_parenthesized(source, paren_content_start)?;
+
+            let mut locals_for_scope = Vec::new();
+
+            // Split on ';' to separate "item of expr" from "track expr"
+            let parts: Vec<&str> = paren_content.split(';').collect();
+            if let Some(first_part) = parts.first()
+                && let Some(caps) = CONTROL_FOR_RE.captures(first_part.trim())
+            {
+                let binding = caps.get(1).map_or("", |m| m.as_str());
+                locals_for_scope.push(binding.to_string());
+                // Also add $index, $first, $last, $even, $odd, $count as implicit locals
+                for implicit in &["$index", "$first", "$last", "$even", "$odd", "$count"] {
+                    locals_for_scope.push((*implicit).to_string());
+                }
+                let iterable = caps.get(2).map_or("", |m| m.as_str()).trim();
+                let current = current_locals(scopes);
+                collect_expression_refs(iterable, &current, refs);
+            }
+
+            // Handle "track expr" part
+            for part in parts.iter().skip(1) {
+                let part = part.trim();
+                if let Some(track_expr) = part.strip_prefix("track") {
+                    let mut all_locals = current_locals(scopes);
+                    all_locals.extend(locals_for_scope.clone());
+                    collect_expression_refs(track_expr.trim(), &all_locals, refs);
+                }
+            }
+
+            scopes.push(locals_for_scope);
+            let brace_pos = source[after_paren..].find('{')?;
+            Some(after_paren + brace_pos + 1)
+        }
+        // @else, @empty, @default, @placeholder, @loading, @error — no expression
+        "else" | "empty" | "default" | "placeholder" | "loading" | "error" => {
+            scopes.push(Vec::new());
+            let rest_from = start + 1 + keyword_end;
+            let brace_pos = source[rest_from..].find('{')?;
+            Some(rest_from + brace_pos + 1)
+        }
+        _ => None,
+    }
+}
+
+/// Scan a parenthesized expression starting at the `(` character.
+/// Returns `(content, index_after_closing_paren)`.
+fn scan_parenthesized(source: &str, start: usize) -> Option<(&str, usize)> {
+    let bytes = source.as_bytes();
+    if bytes.get(start) != Some(&b'(') {
+        return None;
+    }
+    let mut depth = 1u32;
+    let mut i = start + 1;
+    while i < bytes.len() && depth > 0 {
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            _ => {}
+        }
+        if depth > 0 {
+            i += 1;
+        }
+    }
+    if depth == 0 {
+        // i points at the closing ')'; content is between start+1..i
+        Some((&source[start + 1..i], i + 1))
+    } else {
+        None
+    }
+}
+
+/// Process an HTML tag, extracting Angular binding attributes.
+/// `*ngFor` bindings are added to the current scope so subsequent expressions see them.
+fn process_tag(tag: &str, scopes: &mut [Vec<String>], refs: &mut FxHashSet<String>) {
+    let locals = current_locals(scopes);
+
+    for caps in ATTR_RE.captures_iter(tag) {
+        let attr_name = caps.get(1).map_or("", |m| m.as_str());
+        let attr_value = caps.get(2).map_or("", |m| m.as_str()).trim();
+
+        if attr_value.is_empty() {
+            continue;
+        }
+
+        // [prop]="expression" — property binding
+        // [attr.x]="expression" — attribute binding
+        // [class.x]="expression" — class binding
+        // [style.x]="expression" — style binding
+        if attr_name.starts_with('[') && !attr_name.starts_with("[(") {
+            collect_expression_refs(attr_value, &locals, refs);
+            continue;
+        }
+
+        // (event)="statement" — event binding
+        if attr_name.starts_with('(') {
+            collect_statement_refs(attr_value, &locals, refs);
+            continue;
+        }
+
+        // [(prop)]="expression" — two-way binding (banana-in-a-box)
+        if attr_name.starts_with("[(") {
+            collect_expression_refs(attr_value, &locals, refs);
+            continue;
+        }
+
+        // *ngIf="expression" — structural directive
+        if attr_name == "*ngIf" || attr_name == "*ngShow" || attr_name == "*ngSwitch" {
+            // Strip '; else/then' clauses and parse the condition
+            let expr = attr_value.split(';').next().unwrap_or(attr_value).trim();
+            collect_expression_refs(expr, &locals, refs);
+            continue;
+        }
+
+        // *ngFor="let item of items; trackBy: fn" — structural directive
+        if attr_name == "*ngFor" {
+            handle_ng_for(attr_value, &locals, scopes, refs);
+            continue;
+        }
+
+        // Other structural directives (*ngSwitchCase, etc.)
+        if attr_name.starts_with('*') {
+            collect_expression_refs(attr_value, &locals, refs);
+            continue;
+        }
+
+        // bind-prop="expression" — alternative property binding syntax
+        if attr_name.starts_with("bind-") {
+            collect_expression_refs(attr_value, &locals, refs);
+            continue;
+        }
+
+        // on-event="statement" — alternative event binding syntax
+        if attr_name.starts_with("on-") {
+            collect_statement_refs(attr_value, &locals, refs);
+        }
+    }
+}
+
+/// Handle `*ngFor` microsyntax. Pushes bindings into the scope so subsequent
+/// expressions within the element see them as locals.
+fn handle_ng_for(
+    value: &str,
+    locals: &[String],
+    scopes: &mut [Vec<String>],
+    refs: &mut FxHashSet<String>,
+) {
+    // Split on ';' to separate clauses
+    let clauses: Vec<&str> = value.split(';').collect();
+
+    let mut ng_for_locals = locals.to_vec();
+    let mut new_scope_locals = Vec::new();
+
+    for clause in &clauses {
+        let clause = clause.trim();
+
+        // "let item of items" — main iteration
+        if let Some(caps) = NG_FOR_OF_RE.captures(clause) {
+            let binding = caps.get(1).map_or("", |m| m.as_str());
+            ng_for_locals.push(binding.to_string());
+            new_scope_locals.push(binding.to_string());
+            let iterable = caps.get(2).map_or("", |m| m.as_str()).trim();
+            collect_expression_refs(iterable, &ng_for_locals, refs);
+            continue;
+        }
+
+        // "let i = index" — local variable alias
+        if let Some(rest) = clause.strip_prefix("let ") {
+            if let Some(eq_pos) = rest.find('=') {
+                let name = rest[..eq_pos].trim();
+                ng_for_locals.push(name.to_string());
+                new_scope_locals.push(name.to_string());
+            }
+            continue;
+        }
+
+        // "trackBy: trackByFn" — track function reference
+        if let Some(rest) = clause.strip_prefix("trackBy:") {
+            collect_expression_refs(rest.trim(), &ng_for_locals, refs);
+        }
+    }
+
+    // Add *ngFor bindings to the current scope so that subsequent template
+    // expressions (e.g., {{ item }}) within this element see them as locals.
+    // Imprecise (flat scan cannot track element closing tags) but conservative:
+    // extra locals only suppress refs, preventing false positives.
+    if let Some(scope) = scopes.last_mut() {
+        scope.extend(new_scope_locals);
+    }
+}
+
+/// Collect unresolved identifier references from an expression, handling Angular pipes.
+fn collect_expression_refs(expr: &str, locals: &[String], refs: &mut FxHashSet<String>) {
+    if expr.is_empty() {
+        return;
+    }
+
+    let (main_expr, pipe_names) = split_pipes(expr);
+    let unresolved = collect_unresolved_refs(main_expr, TemplateSnippetKind::Expression, locals);
+    refs.extend(unresolved);
+
+    // Pipe names are also references (to Angular pipe classes)
+    for pipe_name in pipe_names {
+        if !pipe_name.is_empty() {
+            refs.insert(pipe_name.to_string());
+        }
+    }
+}
+
+/// Collect unresolved identifier references from a statement (event handler).
+fn collect_statement_refs(stmt: &str, locals: &[String], refs: &mut FxHashSet<String>) {
+    if stmt.is_empty() {
+        return;
+    }
+    let unresolved = collect_unresolved_refs(stmt, TemplateSnippetKind::Statement, locals);
+    refs.extend(unresolved);
+}
+
+/// Split an Angular expression on top-level pipe operators (`|`).
+/// Returns the main expression and a list of pipe names.
+/// Correctly distinguishes pipes from logical OR (`||`).
+fn split_pipes(expr: &str) -> (&str, Vec<&str>) {
+    let bytes = expr.as_bytes();
+    let mut pipe_positions = Vec::new();
+    let mut i = 0;
+    let mut depth = 0u32; // parens/brackets/braces nesting
+    let mut in_string: Option<u8> = None;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+
+        if let Some(quote) = in_string {
+            if b == b'\\' {
+                i += 2; // skip escape
+                continue;
+            }
+            if b == quote {
+                in_string = None;
+            }
+            i += 1;
+            continue;
+        }
+
+        match b {
+            b'\'' | b'"' | b'`' => in_string = Some(b),
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+            b'|' if depth == 0 => {
+                // Distinguish pipe `|` from logical OR `||`
+                let prev_is_pipe = i > 0 && bytes[i - 1] == b'|';
+                let next_is_pipe = i + 1 < bytes.len() && bytes[i + 1] == b'|';
+                if !prev_is_pipe && !next_is_pipe {
+                    pipe_positions.push(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    if pipe_positions.is_empty() {
+        return (expr, Vec::new());
+    }
+
+    let main_expr = expr[..pipe_positions[0]].trim();
+    let mut pipes = Vec::new();
+    for (j, &pos) in pipe_positions.iter().enumerate() {
+        let end = pipe_positions.get(j + 1).copied().unwrap_or(expr.len());
+        let pipe_part = expr[pos + 1..end].trim();
+        // Pipe name is the identifier before the first ':' (pipe arguments)
+        let name = pipe_part.split(':').next().unwrap_or("").trim();
+        if !name.is_empty() {
+            pipes.push(name);
+        }
+    }
+
+    (main_expr, pipes)
+}
+
+fn current_locals(scopes: &[Vec<String>]) -> Vec<String> {
+    scopes.iter().flat_map(|s| s.iter().cloned()).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interpolation_extracts_refs() {
+        let refs = collect_angular_template_refs("<p>{{ title() }}</p>");
+        assert!(refs.contains("title"));
+    }
+
+    #[test]
+    fn property_binding_extracts_refs() {
+        let refs =
+            collect_angular_template_refs(r#"<p [class.highlighted]="isHighlighted">text</p>"#);
+        assert!(refs.contains("isHighlighted"));
+    }
+
+    #[test]
+    fn event_binding_extracts_refs() {
+        let refs =
+            collect_angular_template_refs(r#"<button (click)="onButtonClick()">Click</button>"#);
+        assert!(refs.contains("onButtonClick"));
+    }
+
+    #[test]
+    fn two_way_binding_extracts_refs() {
+        let refs = collect_angular_template_refs(r#"<input [(ngModel)]="userName">"#);
+        assert!(refs.contains("userName"));
+    }
+
+    #[test]
+    fn ng_if_extracts_refs() {
+        let refs = collect_angular_template_refs(r#"<div *ngIf="isLoading()">Loading</div>"#);
+        assert!(refs.contains("isLoading"));
+    }
+
+    #[test]
+    fn ng_for_extracts_iterable_not_binding() {
+        let refs = collect_angular_template_refs(
+            r#"<li *ngFor="let item of items; trackBy: trackByFn">{{ item }}</li>"#,
+        );
+        assert!(refs.contains("items"), "should contain iterable 'items'");
+        assert!(
+            refs.contains("trackByFn"),
+            "should contain trackBy function"
+        );
+        assert!(!refs.contains("item"), "binding 'item' should be a local");
+    }
+
+    #[test]
+    fn control_flow_if_extracts_refs() {
+        let refs = collect_angular_template_refs(r"@if (isLoading()) { <div>Loading</div> }");
+        assert!(refs.contains("isLoading"));
+    }
+
+    #[test]
+    fn control_flow_for_extracts_refs() {
+        let refs = collect_angular_template_refs(
+            r"@for (item of items; track item.id) { <li>{{ item.name }}</li> }",
+        );
+        assert!(refs.contains("items"), "should contain iterable");
+        assert!(!refs.contains("item"), "binding should be a local");
+    }
+
+    #[test]
+    fn control_flow_switch_extracts_refs() {
+        let refs = collect_angular_template_refs(
+            r#"@switch (status) { @case ("active") { <span>Active</span> } }"#,
+        );
+        assert!(refs.contains("status"));
+    }
+
+    #[test]
+    fn pipe_extracts_name() {
+        let refs = collect_angular_template_refs("<p>{{ birthday | date:'short' }}</p>");
+        assert!(refs.contains("birthday"));
+        assert!(refs.contains("date"));
+    }
+
+    #[test]
+    fn logical_or_not_confused_with_pipe() {
+        let refs = collect_angular_template_refs("<p>{{ a || b }}</p>");
+        assert!(refs.contains("a"));
+        assert!(refs.contains("b"));
+    }
+
+    #[test]
+    fn html_comments_stripped() {
+        let refs = collect_angular_template_refs("<!-- {{ hidden }} -->\n<p>{{ visible }}</p>");
+        assert!(refs.contains("visible"));
+        assert!(!refs.contains("hidden"));
+    }
+
+    #[test]
+    fn empty_template_returns_empty() {
+        let refs = collect_angular_template_refs("");
+        assert!(refs.is_empty());
+    }
+
+    #[test]
+    fn full_angular_template() {
+        let refs = collect_angular_template_refs(
+            r#"<h1>{{ title() }}</h1>
+<p [class.highlighted]="isHighlighted">{{ greeting() }}</p>
+@if (isLoading()) { <div>Loading...</div> }
+<button (click)="onButtonClick()">Toggle</button>
+<button (click)="addItem()">Add</button>
+@for (item of items; track item) { <li>{{ item }}</li> }"#,
+        );
+        assert!(refs.contains("title"));
+        assert!(refs.contains("isHighlighted"));
+        assert!(refs.contains("greeting"));
+        assert!(refs.contains("isLoading"));
+        assert!(refs.contains("onButtonClick"));
+        assert!(refs.contains("addItem"));
+        assert!(refs.contains("items"));
+        // 'item' is a local from @for, should not appear
+        assert!(!refs.contains("item"));
+    }
+
+    #[test]
+    fn bare_less_than_in_text_does_not_abort_scanner() {
+        // A bare `<` in text content (e.g., "count < 10") should not cause the
+        // scanner to abort. Refs after the bare `<` must still be collected.
+        let refs = collect_angular_template_refs("count < 10\n<p>{{ title() }}</p>");
+        assert!(refs.contains("title"), "refs after bare < should be found");
+    }
+
+    #[test]
+    fn control_flow_with_object_literal_in_expression() {
+        // The `{` in the object literal inside the @if condition should not be
+        // confused with the block-opening `{`.
+        let refs =
+            collect_angular_template_refs(r"@if (config.enabled) { <span>{{ label }}</span> }");
+        assert!(refs.contains("config"));
+        assert!(refs.contains("label"));
+    }
+
+    // ── split_pipes ─────────────────────────────────────────────
+
+    #[test]
+    fn split_pipes_no_pipe() {
+        let (expr, pipes) = split_pipes("foo.bar");
+        assert_eq!(expr, "foo.bar");
+        assert!(pipes.is_empty());
+    }
+
+    #[test]
+    fn split_pipes_single_pipe() {
+        let (expr, pipes) = split_pipes("value | date");
+        assert_eq!(expr, "value");
+        assert_eq!(pipes, vec!["date"]);
+    }
+
+    #[test]
+    fn split_pipes_with_args() {
+        let (expr, pipes) = split_pipes("value | date:'short'");
+        assert_eq!(expr, "value");
+        assert_eq!(pipes, vec!["date"]);
+    }
+
+    #[test]
+    fn split_pipes_multiple() {
+        let (expr, pipes) = split_pipes("value | date:'short' | uppercase");
+        assert_eq!(expr, "value");
+        assert_eq!(pipes, vec!["date", "uppercase"]);
+    }
+
+    #[test]
+    fn split_pipes_preserves_logical_or() {
+        let (expr, pipes) = split_pipes("a || b");
+        assert_eq!(expr, "a || b");
+        assert!(pipes.is_empty());
+    }
+
+    #[test]
+    fn split_pipes_inside_parens_not_split() {
+        let (expr, pipes) = split_pipes("fn(a | b)");
+        assert_eq!(expr, "fn(a | b)");
+        assert!(pipes.is_empty());
+    }
+}

@@ -590,4 +590,34 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
         }
         walk::walk_spread_element(self, elem);
     }
+
+    fn visit_class(&mut self, class: &Class<'a>) {
+        // Detect Angular @Component decorator and emit synthetic SideEffect imports
+        // for templateUrl and styleUrl/styleUrls references. This creates graph edges
+        // from the component file to the referenced template/style files, preventing
+        // them from being reported as unused files.
+        if let Some(urls) = super::helpers::extract_angular_component_urls(class) {
+            if let Some(ref template_url) = urls.template_url {
+                self.imports.push(ImportInfo {
+                    source: template_url.clone(),
+                    imported_name: ImportedName::SideEffect,
+                    local_name: String::new(),
+                    is_type_only: false,
+                    span: oxc_span::Span::default(),
+                    source_span: oxc_span::Span::default(),
+                });
+            }
+            for style_url in &urls.style_urls {
+                self.imports.push(ImportInfo {
+                    source: style_url.clone(),
+                    imported_name: ImportedName::SideEffect,
+                    local_name: String::new(),
+                    is_type_only: false,
+                    span: oxc_span::Span::default(),
+                    source_span: oxc_span::Span::default(),
+                });
+            }
+        }
+        walk::walk_class(self, class);
+    }
 }

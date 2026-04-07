@@ -2,9 +2,83 @@
 //!
 //! These functions don't require visitor state and operate purely on AST nodes.
 
-use oxc_ast::ast::{Argument, BinaryExpression, Class, ClassElement, Expression};
+use oxc_ast::ast::{
+    Argument, ArrayExpressionElement, BinaryExpression, Class, ClassElement, Expression,
+    ObjectPropertyKind,
+};
 
 use crate::{MemberInfo, MemberKind};
+
+/// URLs extracted from an Angular `@Component` decorator.
+pub struct AngularComponentUrls {
+    /// The `templateUrl` value (e.g., `"./app.html"`).
+    pub template_url: Option<String>,
+    /// All style file URLs from `styleUrl` (singular) and `styleUrls` (array).
+    pub style_urls: Vec<String>,
+}
+
+/// Extract `templateUrl` and `styleUrl`/`styleUrls` from an Angular `@Component` decorator.
+///
+/// Walks the class's decorators looking for a `@Component({...})` call expression
+/// with string literal values for template and style file references.
+pub fn extract_angular_component_urls(class: &Class<'_>) -> Option<AngularComponentUrls> {
+    for decorator in &class.decorators {
+        let Expression::CallExpression(call) = &decorator.expression else {
+            continue;
+        };
+        let Expression::Identifier(id) = &call.callee else {
+            continue;
+        };
+        if id.name != "Component" {
+            continue;
+        }
+        let Some(Argument::ObjectExpression(obj)) = call.arguments.first() else {
+            continue;
+        };
+
+        let mut template_url = None;
+        let mut style_urls = Vec::new();
+
+        for prop in &obj.properties {
+            let ObjectPropertyKind::ObjectProperty(p) = prop else {
+                continue;
+            };
+            let Some(key_name) = p.key.static_name() else {
+                continue;
+            };
+            match key_name.as_ref() {
+                "templateUrl" => {
+                    if let Expression::StringLiteral(lit) = &p.value {
+                        template_url = Some(lit.value.to_string());
+                    }
+                }
+                "styleUrl" => {
+                    if let Expression::StringLiteral(lit) = &p.value {
+                        style_urls.push(lit.value.to_string());
+                    }
+                }
+                "styleUrls" => {
+                    if let Expression::ArrayExpression(arr) = &p.value {
+                        for elem in &arr.elements {
+                            if let ArrayExpressionElement::StringLiteral(lit) = elem {
+                                style_urls.push(lit.value.to_string());
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if template_url.is_some() || !style_urls.is_empty() {
+            return Some(AngularComponentUrls {
+                template_url,
+                style_urls,
+            });
+        }
+    }
+    None
+}
 
 /// Extract class members (methods and properties) from a class declaration.
 pub fn extract_class_members(class: &Class<'_>) -> Vec<MemberInfo> {

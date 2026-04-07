@@ -128,6 +128,35 @@ pub fn analyze_template_snippet(
     }
 }
 
+/// Collect all unresolved identifier references from a template snippet.
+///
+/// Unlike [`analyze_template_snippet`], this does NOT filter against imported bindings.
+/// Returns every identifier that is not locally scoped. Used for Angular external
+/// templates where unresolved identifiers are potential component class member refs.
+pub fn collect_unresolved_refs(
+    snippet: &str,
+    kind: TemplateSnippetKind,
+    locals: &[String],
+) -> FxHashSet<String> {
+    let snippet = snippet.trim();
+    if snippet.is_empty() {
+        return FxHashSet::default();
+    }
+
+    let wrapped = wrap_snippet(snippet, kind, locals);
+    let allocator = Allocator::default();
+    let parser_return = Parser::new(&allocator, &wrapped, SourceType::ts()).parse();
+    let semantic_ret = SemanticBuilder::new().build(&parser_return.program);
+
+    semantic_ret
+        .semantic
+        .scoping()
+        .root_unresolved_references()
+        .keys()
+        .map(|name| name.to_string())
+        .collect()
+}
+
 fn remap_object_name(
     name: &str,
     unresolved_names: &FxHashSet<String>,

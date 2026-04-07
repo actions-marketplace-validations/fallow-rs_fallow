@@ -2200,3 +2200,127 @@ mod proptests {
         }
     }
 }
+
+// ── Angular @Component decorator detection ───────────────────
+
+#[test]
+fn angular_component_template_url_emits_side_effect_import() {
+    let info = parse(
+        r"
+        import { Component } from '@angular/core';
+
+        @Component({
+            selector: 'app-root',
+            templateUrl: './app.html',
+        })
+        export class App {}
+        ",
+    );
+    let side_effect_count = info
+        .imports
+        .iter()
+        .filter(|i| matches!(i.imported_name, ImportedName::SideEffect))
+        .count();
+    assert_eq!(side_effect_count, 1);
+    assert_eq!(
+        info.imports
+            .iter()
+            .find(|i| matches!(i.imported_name, ImportedName::SideEffect))
+            .unwrap()
+            .source,
+        "./app.html"
+    );
+}
+
+#[test]
+fn angular_component_style_url_emits_side_effect_import() {
+    let info = parse(
+        r"
+        import { Component } from '@angular/core';
+
+        @Component({
+            selector: 'app-root',
+            templateUrl: './app.html',
+            styleUrl: './app.scss',
+        })
+        export class App {}
+        ",
+    );
+    let side_effect_count = info
+        .imports
+        .iter()
+        .filter(|i| matches!(i.imported_name, ImportedName::SideEffect))
+        .count();
+    assert_eq!(side_effect_count, 2);
+    let has_html = info
+        .imports
+        .iter()
+        .any(|i| i.source == "./app.html" && matches!(i.imported_name, ImportedName::SideEffect));
+    let has_scss = info
+        .imports
+        .iter()
+        .any(|i| i.source == "./app.scss" && matches!(i.imported_name, ImportedName::SideEffect));
+    assert!(has_html);
+    assert!(has_scss);
+}
+
+#[test]
+fn angular_component_style_urls_array_emits_multiple_imports() {
+    let info = parse(
+        r"
+        import { Component } from '@angular/core';
+
+        @Component({
+            selector: 'app-root',
+            templateUrl: './app.html',
+            styleUrls: ['./app.scss', './theme.scss'],
+        })
+        export class App {}
+        ",
+    );
+    let side_effect_count = info
+        .imports
+        .iter()
+        .filter(|i| matches!(i.imported_name, ImportedName::SideEffect))
+        .count();
+    assert_eq!(side_effect_count, 3);
+}
+
+#[test]
+fn angular_component_without_template_url_no_side_effect() {
+    let info = parse(
+        r"
+        import { Component } from '@angular/core';
+
+        @Component({
+            selector: 'app-root',
+            template: '<h1>Inline</h1>',
+        })
+        export class App {}
+        ",
+    );
+    let side_effect_count = info
+        .imports
+        .iter()
+        .filter(|i| matches!(i.imported_name, ImportedName::SideEffect))
+        .count();
+    assert_eq!(side_effect_count, 0);
+}
+
+#[test]
+fn non_component_decorator_ignored() {
+    let info = parse(
+        r"
+        import { Injectable } from '@angular/core';
+
+        @Injectable()
+        export class MyService {}
+        ",
+    );
+    let side_effect_count = info
+        .imports
+        .iter()
+        .filter(|i| matches!(i.imported_name, ImportedName::SideEffect))
+        .count();
+    assert_eq!(side_effect_count, 0);
+}

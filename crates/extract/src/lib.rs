@@ -38,6 +38,7 @@ pub use astro::extract_astro_frontmatter;
 pub use css::extract_css_module_exports;
 pub use mdx::extract_mdx_statements;
 pub use sfc::{extract_sfc_scripts, is_sfc_file};
+pub use sfc_template::angular::ANGULAR_TPL_SENTINEL;
 
 use parse::parse_source_to_module;
 

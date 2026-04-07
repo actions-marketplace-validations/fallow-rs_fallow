@@ -5,6 +5,7 @@
 //! constructs that can be analyzed reliably with lightweight scanning, without
 //! pretending to be a full framework compiler.
 
+pub mod angular;
 mod scanners;
 mod shared;
 mod svelte;

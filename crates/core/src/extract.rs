@@ -6,8 +6,9 @@
 
 // Re-export all types
 pub use fallow_extract::{
-    DynamicImportInfo, DynamicImportPattern, ExportInfo, ExportName, ImportInfo, ImportedName,
-    MemberAccess, MemberInfo, MemberKind, ModuleInfo, ParseResult, ReExportInfo, RequireCallInfo,
+    ANGULAR_TPL_SENTINEL, DynamicImportInfo, DynamicImportPattern, ExportInfo, ExportName,
+    ImportInfo, ImportedName, MemberAccess, MemberInfo, MemberKind, ModuleInfo, ParseResult,
+    ReExportInfo, RequireCallInfo,
 };
 
 // Re-export extraction functions

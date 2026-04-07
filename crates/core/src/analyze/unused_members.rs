@@ -1,9 +1,9 @@
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::discover::FileId;
-use crate::extract::MemberKind;
+use crate::extract::{ANGULAR_TPL_SENTINEL, MemberKind};
 use crate::graph::ModuleGraph;
-use crate::resolve::ResolvedModule;
+use crate::resolve::{ResolveResult, ResolvedModule};
 use crate::results::UnusedMember;
 use crate::suppress::{self, IssueKind, Suppression};
 
@@ -80,6 +80,46 @@ pub fn find_unused_members(
                 .copied()
                 .unwrap_or(local_name.as_str());
             whole_object_used_exports.insert(export_name.to_string());
+        }
+    }
+
+    // Bridge Angular external template member refs to their owning components.
+    //
+    // Angular components reference external HTML template files via @Component({ templateUrl }),
+    // which creates a SideEffect import edge. The HTML scanner stores identifier references
+    // from template expressions ({{ title }}, [prop]="expr", (event)="handler()") as
+    // MemberAccess entries with a sentinel object name. Here we propagate those refs into
+    // self_accessed_members for the importing component file, so its class members used
+    // only in the template are not falsely reported as unused.
+    let angular_tpl_refs: FxHashMap<FileId, Vec<&str>> = resolved_modules
+        .iter()
+        .filter_map(|m| {
+            let refs: Vec<&str> = m
+                .member_accesses
+                .iter()
+                .filter(|a| a.object == ANGULAR_TPL_SENTINEL)
+                .map(|a| a.member.as_str())
+                .collect();
+            if refs.is_empty() {
+                None
+            } else {
+                Some((m.file_id, refs))
+            }
+        })
+        .collect();
+
+    if !angular_tpl_refs.is_empty() {
+        for resolved in resolved_modules {
+            for import in &resolved.resolved_imports {
+                if let ResolveResult::InternalModule(target_id) = &import.target
+                    && let Some(refs) = angular_tpl_refs.get(target_id)
+                {
+                    let entry = self_accessed_members.entry(resolved.file_id).or_default();
+                    for &ref_name in refs {
+                        entry.insert(ref_name.to_string());
+                    }
+                }
+            }
         }
     }
 
