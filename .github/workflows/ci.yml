@@ -52,6 +52,7 @@ jobs:
               - 'crates/graph/**'
               - 'crates/extract/**'
               - 'crates/types/**'
+              - 'crates/config/**'
             ci-scripts:
               - 'ci/**'
               - 'action/**'
