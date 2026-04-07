@@ -2451,3 +2451,411 @@ fn non_component_decorator_ignored() {
         .count();
     assert_eq!(side_effect_count, 0);
 }
+
+// ── Angular inline template scanning ──────────────────────────
+
+#[test]
+fn angular_inline_template_emits_sentinel_member_accesses() {
+    let info = parse(
+        r#"
+        import { Component, signal } from '@angular/core';
+
+        @Component({
+            selector: 'app-inline',
+            template: '<p>{{ message() }}</p><button (click)="onClick()">Go</button>',
+        })
+        export class InlineComponent {
+            readonly message = signal('Hello');
+            onClick(): void {}
+        }
+        "#,
+    );
+    let sentinel = crate::sfc_template::angular::ANGULAR_TPL_SENTINEL;
+    let sentinel_refs: Vec<&str> = info
+        .member_accesses
+        .iter()
+        .filter(|a| a.object == sentinel)
+        .map(|a| a.member.as_str())
+        .collect();
+    assert!(sentinel_refs.contains(&"message"));
+    assert!(sentinel_refs.contains(&"onClick"));
+}
+
+#[test]
+fn angular_inline_template_backtick_scanned() {
+    let info = parse(
+        r"
+        import { Component } from '@angular/core';
+
+        @Component({
+            selector: 'app-root',
+            template: `<h1>{{ title }}</h1>`,
+        })
+        export class App {
+            title = 'Hello';
+        }
+        ",
+    );
+    let sentinel = crate::sfc_template::angular::ANGULAR_TPL_SENTINEL;
+    let has_title = info
+        .member_accesses
+        .iter()
+        .any(|a| a.object == sentinel && a.member == "title");
+    assert!(has_title);
+}
+
+#[test]
+fn angular_inline_template_no_side_effect_imports() {
+    let info = parse(
+        r"
+        import { Component } from '@angular/core';
+
+        @Component({
+            selector: 'app-root',
+            template: '<p>{{ value }}</p>',
+        })
+        export class App {
+            value = 42;
+        }
+        ",
+    );
+    let side_effects = info
+        .imports
+        .iter()
+        .filter(|i| matches!(i.imported_name, ImportedName::SideEffect))
+        .count();
+    assert_eq!(side_effects, 0);
+}
+
+// ── Angular host binding detection ────────────────────────────
+
+#[test]
+fn angular_host_bindings_emit_sentinel_accesses() {
+    let info = parse(
+        r"
+        import { Component } from '@angular/core';
+
+        @Component({
+            selector: 'app-root',
+            template: '<p>test</p>',
+            host: {
+                '[class]': 'hostClass()',
+                '[class.is-active]': 'isActive',
+                '(click)': 'onHostClick($event)',
+                '[style.--custom-color]': 'customColor()',
+            },
+        })
+        export class App {
+            hostClass(): string { return 'app'; }
+            isActive = true;
+            onHostClick(_event: Event): void {}
+            customColor(): string { return '#007bff'; }
+        }
+        ",
+    );
+    let sentinel = crate::sfc_template::angular::ANGULAR_TPL_SENTINEL;
+    let host_refs: Vec<&str> = info
+        .member_accesses
+        .iter()
+        .filter(|a| a.object == sentinel)
+        .map(|a| a.member.as_str())
+        .collect();
+    assert!(host_refs.contains(&"hostClass"));
+    assert!(host_refs.contains(&"isActive"));
+    assert!(host_refs.contains(&"onHostClick"));
+    assert!(host_refs.contains(&"customColor"));
+}
+
+#[test]
+fn angular_host_binding_skips_keywords() {
+    let info = parse(
+        r"
+        import { Component } from '@angular/core';
+
+        @Component({
+            selector: 'app-root',
+            template: '',
+            host: {
+                '[hidden]': 'true',
+                '(click)': 'undefined',
+            },
+        })
+        export class App {}
+        ",
+    );
+    let sentinel = crate::sfc_template::angular::ANGULAR_TPL_SENTINEL;
+    // "true" and "undefined" are keywords and should be skipped
+    assert!(
+        info.member_accesses
+            .iter()
+            .filter(|a| a.object == sentinel)
+            .map(|a| a.member.as_str())
+            .next()
+            .is_none()
+    );
+}
+
+// ── Angular inputs/outputs metadata arrays ────────────────────
+
+#[test]
+fn angular_inputs_outputs_metadata_emit_sentinel_accesses() {
+    let info = parse(
+        r"
+        import { Component } from '@angular/core';
+
+        @Component({
+            selector: 'app-root',
+            template: '<p>test</p>',
+            inputs: ['bankName', 'id: account-id'],
+            outputs: ['clicked'],
+        })
+        export class App {
+            bankName = '';
+            id = '';
+            clicked = null;
+        }
+        ",
+    );
+    let sentinel = crate::sfc_template::angular::ANGULAR_TPL_SENTINEL;
+    let refs: Vec<&str> = info
+        .member_accesses
+        .iter()
+        .filter(|a| a.object == sentinel)
+        .map(|a| a.member.as_str())
+        .collect();
+    // 'bankName' from inputs, 'id' from 'id: account-id', 'clicked' from outputs
+    assert!(refs.contains(&"bankName"));
+    assert!(refs.contains(&"id"));
+    assert!(refs.contains(&"clicked"));
+}
+
+#[test]
+fn angular_queries_metadata_emit_sentinel_accesses() {
+    let info = parse(
+        r"
+        import { Component, ViewChild, ContentChild, ElementRef } from '@angular/core';
+
+        @Component({
+            selector: 'app-root',
+            template: '<p>test</p>',
+            queries: {
+                header: null,
+                footer: null,
+            },
+        })
+        export class App {
+            header: ElementRef;
+            footer: ElementRef;
+        }
+        ",
+    );
+    let sentinel = crate::sfc_template::angular::ANGULAR_TPL_SENTINEL;
+    let refs: Vec<&str> = info
+        .member_accesses
+        .iter()
+        .filter(|a| a.object == sentinel)
+        .map(|a| a.member.as_str())
+        .collect();
+    assert!(refs.contains(&"header"));
+    assert!(refs.contains(&"footer"));
+}
+
+// ── Angular signal API detection ──────────────────────────────
+
+#[test]
+fn angular_signal_input_marks_member_as_decorated() {
+    let info = parse(
+        r"
+        import { Component, input } from '@angular/core';
+
+        @Component({ selector: 'app', template: '' })
+        export class App {
+            readonly label = input<string>('default');
+            readonly required = input.required<number>();
+        }
+        ",
+    );
+    let app_export = info
+        .exports
+        .iter()
+        .find(|e| e.name.to_string() == "App")
+        .unwrap();
+    let label = app_export
+        .members
+        .iter()
+        .find(|m| m.name == "label")
+        .unwrap();
+    let required = app_export
+        .members
+        .iter()
+        .find(|m| m.name == "required")
+        .unwrap();
+    assert!(label.has_decorator, "input() should set has_decorator");
+    assert!(
+        required.has_decorator,
+        "input.required() should set has_decorator"
+    );
+}
+
+#[test]
+fn angular_signal_output_model_viewchild_marks_as_decorated() {
+    let info = parse(
+        r"
+        import { Component, output, model, viewChild, contentChild, viewChildren, contentChildren, ElementRef } from '@angular/core';
+
+        @Component({ selector: 'app', template: '' })
+        export class App {
+            readonly saved = output<void>();
+            readonly count = model(0);
+            readonly myButton = viewChild<ElementRef>('btn');
+            readonly icon = contentChild<ElementRef>('icon');
+            readonly items = viewChildren<ElementRef>('item');
+            readonly tabs = contentChildren<ElementRef>('tab');
+        }
+        ",
+    );
+    let app_export = info
+        .exports
+        .iter()
+        .find(|e| e.name.to_string() == "App")
+        .unwrap();
+    for member_name in &["saved", "count", "myButton", "icon", "items", "tabs"] {
+        let member = app_export
+            .members
+            .iter()
+            .find(|m| m.name == *member_name)
+            .unwrap_or_else(|| panic!("member {member_name} not found"));
+        assert!(
+            member.has_decorator,
+            "{member_name} should have has_decorator=true"
+        );
+    }
+}
+
+#[test]
+fn angular_signal_apis_not_marked_on_non_angular_class() {
+    let info = parse(
+        r"
+        export class PlainClass {
+            readonly label = input<string>('default');
+        }
+        ",
+    );
+    let export = info
+        .exports
+        .iter()
+        .find(|e| e.name.to_string() == "PlainClass")
+        .unwrap();
+    let label = export.members.iter().find(|m| m.name == "label").unwrap();
+    assert!(
+        !label.has_decorator,
+        "signal APIs on non-Angular class should not set has_decorator"
+    );
+}
+
+#[test]
+fn angular_regular_property_not_marked_as_decorated() {
+    let info = parse(
+        r"
+        import { Component } from '@angular/core';
+
+        @Component({ selector: 'app', template: '' })
+        export class App {
+            regularProp = 'hello';
+            anotherProp = 42;
+        }
+        ",
+    );
+    let app_export = info
+        .exports
+        .iter()
+        .find(|e| e.name.to_string() == "App")
+        .unwrap();
+    let regular = app_export
+        .members
+        .iter()
+        .find(|m| m.name == "regularProp")
+        .unwrap();
+    let another = app_export
+        .members
+        .iter()
+        .find(|m| m.name == "anotherProp")
+        .unwrap();
+    assert!(
+        !regular.has_decorator,
+        "regular property should not have has_decorator"
+    );
+    assert!(
+        !another.has_decorator,
+        "regular property should not have has_decorator"
+    );
+}
+
+// ── Angular combined metadata extraction ──────────────────────
+
+#[test]
+fn angular_component_all_metadata_combined() {
+    let info = parse(
+        r"
+        import { Component, input, output } from '@angular/core';
+
+        @Component({
+            selector: 'app-root',
+            templateUrl: './app.html',
+            styleUrl: './app.scss',
+            template: '<p>{{ greeting() }}</p>',
+            host: {
+                '(click)': 'handleClick()',
+            },
+            inputs: ['externalInput'],
+            outputs: ['externalOutput'],
+        })
+        export class App {
+            readonly name = input<string>();
+            readonly saved = output<void>();
+            greeting(): string { return 'hi'; }
+            handleClick(): void {}
+            externalInput = '';
+            externalOutput = null;
+        }
+        ",
+    );
+    // templateUrl creates side-effect import
+    let has_html_import = info
+        .imports
+        .iter()
+        .any(|i| i.source == "./app.html" && matches!(i.imported_name, ImportedName::SideEffect));
+    assert!(has_html_import);
+
+    // Sentinel accesses from inline template + host + inputs/outputs
+    let sentinel = crate::sfc_template::angular::ANGULAR_TPL_SENTINEL;
+    let refs: Vec<&str> = info
+        .member_accesses
+        .iter()
+        .filter(|a| a.object == sentinel)
+        .map(|a| a.member.as_str())
+        .collect();
+    assert!(refs.contains(&"greeting")); // from inline template
+    assert!(refs.contains(&"handleClick")); // from host
+    assert!(refs.contains(&"externalInput")); // from inputs
+    assert!(refs.contains(&"externalOutput")); // from outputs
+
+    // Signal APIs mark members as decorated
+    let app_export = info
+        .exports
+        .iter()
+        .find(|e| e.name.to_string() == "App")
+        .unwrap();
+    let name_member = app_export
+        .members
+        .iter()
+        .find(|m| m.name == "name")
+        .unwrap();
+    let saved_member = app_export
+        .members
+        .iter()
+        .find(|m| m.name == "saved")
+        .unwrap();
+    assert!(name_member.has_decorator);
+    assert!(saved_member.has_decorator);
+}

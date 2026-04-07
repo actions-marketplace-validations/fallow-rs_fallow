@@ -9,19 +9,39 @@ use oxc_ast::ast::{
 
 use crate::{MemberInfo, MemberKind};
 
-/// URLs extracted from an Angular `@Component` decorator.
-pub struct AngularComponentUrls {
+/// Metadata extracted from an Angular `@Component` decorator.
+pub struct AngularComponentMetadata {
     /// The `templateUrl` value (e.g., `"./app.html"`).
     pub template_url: Option<String>,
     /// All style file URLs from `styleUrl` (singular) and `styleUrls` (array).
     pub style_urls: Vec<String>,
+    /// Inline `template:` string literal content.
+    pub inline_template: Option<String>,
+    /// Class member names referenced in `host:` binding expressions.
+    pub host_member_refs: Vec<String>,
+    /// Class member names listed in `inputs:` and `outputs:` metadata arrays.
+    pub input_output_members: Vec<String>,
 }
 
-/// Extract `templateUrl` and `styleUrl`/`styleUrls` from an Angular `@Component` decorator.
+/// Angular signal-based API function names that implicitly mark class properties
+/// as framework-managed (Angular 17+). Properties initialized with these calls
+/// should be treated like decorated members.
+const ANGULAR_SIGNAL_APIS: &[&str] = &[
+    "input",
+    "output",
+    "model",
+    "viewChild",
+    "viewChildren",
+    "contentChild",
+    "contentChildren",
+];
+
+/// Extract all metadata from an Angular `@Component` decorator.
 ///
 /// Walks the class's decorators looking for a `@Component({...})` call expression
-/// with string literal values for template and style file references.
-pub fn extract_angular_component_urls(class: &Class<'_>) -> Option<AngularComponentUrls> {
+/// and extracts template/style URLs, inline templates, host bindings, and
+/// inputs/outputs metadata.
+pub fn extract_angular_component_metadata(class: &Class<'_>) -> Option<AngularComponentMetadata> {
     for decorator in &class.decorators {
         let Expression::CallExpression(call) = &decorator.expression else {
             continue;
@@ -29,7 +49,7 @@ pub fn extract_angular_component_urls(class: &Class<'_>) -> Option<AngularCompon
         let Expression::Identifier(id) = &call.callee else {
             continue;
         };
-        if id.name != "Component" {
+        if !matches!(id.name.as_str(), "Component" | "Directive") {
             continue;
         }
         let Some(Argument::ObjectExpression(obj)) = call.arguments.first() else {
@@ -38,6 +58,9 @@ pub fn extract_angular_component_urls(class: &Class<'_>) -> Option<AngularCompon
 
         let mut template_url = None;
         let mut style_urls = Vec::new();
+        let mut inline_template = None;
+        let mut host_member_refs = Vec::new();
+        let mut input_output_members = Vec::new();
 
         for prop in &obj.properties {
             let ObjectPropertyKind::ObjectProperty(p) = prop else {
@@ -50,6 +73,16 @@ pub fn extract_angular_component_urls(class: &Class<'_>) -> Option<AngularCompon
                 "templateUrl" => {
                     if let Expression::StringLiteral(lit) = &p.value {
                         template_url = Some(lit.value.to_string());
+                    }
+                }
+                "template" => {
+                    if let Expression::StringLiteral(lit) = &p.value {
+                        inline_template = Some(lit.value.to_string());
+                    } else if let Expression::TemplateLiteral(tpl) = &p.value
+                        && tpl.expressions.is_empty()
+                        && let Some(quasi) = tpl.quasis.first()
+                    {
+                        inline_template = Some(quasi.value.raw.to_string());
                     }
                 }
                 "styleUrl" => {
@@ -66,22 +99,202 @@ pub fn extract_angular_component_urls(class: &Class<'_>) -> Option<AngularCompon
                         }
                     }
                 }
+                "host" => {
+                    if let Expression::ObjectExpression(host_obj) = &p.value {
+                        extract_host_member_refs(host_obj, &mut host_member_refs);
+                    }
+                }
+                "inputs" | "outputs" => {
+                    extract_input_output_members(&p.value, &mut input_output_members);
+                }
+                "queries" => {
+                    extract_query_members(&p.value, &mut input_output_members);
+                }
                 _ => {}
             }
         }
 
-        if template_url.is_some() || !style_urls.is_empty() {
-            return Some(AngularComponentUrls {
+        let has_data = template_url.is_some()
+            || !style_urls.is_empty()
+            || inline_template.is_some()
+            || !host_member_refs.is_empty()
+            || !input_output_members.is_empty();
+
+        if has_data {
+            return Some(AngularComponentMetadata {
                 template_url,
                 style_urls,
+                inline_template,
+                host_member_refs,
+                input_output_members,
             });
         }
     }
     None
 }
 
+/// Extract identifier references from Angular `host:` binding expressions.
+///
+/// Host bindings use string keys like `'[class.active]': 'isActive'`,
+/// `'(click)': 'onClick($event)'`, `'[style.--color]': 'customColor()'`.
+/// The value strings contain expressions referencing class members.
+fn extract_host_member_refs(host_obj: &oxc_ast::ast::ObjectExpression<'_>, refs: &mut Vec<String>) {
+    for prop in &host_obj.properties {
+        let ObjectPropertyKind::ObjectProperty(p) = prop else {
+            continue;
+        };
+        if let Expression::StringLiteral(lit) = &p.value {
+            extract_identifiers_from_host_expr(&lit.value, refs);
+        }
+    }
+}
+
+/// Extract property names from Angular `queries:` metadata object.
+///
+/// `queries: { myRef: new ViewChild('ref') }` declares class properties as
+/// view/content queries. The object keys are the class member names.
+fn extract_query_members(value: &Expression<'_>, members: &mut Vec<String>) {
+    let Expression::ObjectExpression(obj) = value else {
+        return;
+    };
+    for prop in &obj.properties {
+        let ObjectPropertyKind::ObjectProperty(p) = prop else {
+            continue;
+        };
+        if let Some(name) = p.key.static_name() {
+            let name = name.to_string();
+            if !name.is_empty() {
+                members.push(name);
+            }
+        }
+    }
+}
+
+/// Extract member names from Angular `inputs`/`outputs` metadata arrays.
+///
+/// Handles `inputs: ['memberName']` and `inputs: ['memberName: alias']`
+/// (takes the part before the colon as the class member name).
+fn extract_input_output_members(value: &Expression<'_>, members: &mut Vec<String>) {
+    let Expression::ArrayExpression(arr) = value else {
+        return;
+    };
+    for elem in &arr.elements {
+        let ArrayExpressionElement::StringLiteral(lit) = elem else {
+            continue;
+        };
+        let member = lit
+            .value
+            .as_ref()
+            .split(':')
+            .next()
+            .unwrap_or_default()
+            .trim();
+        if !member.is_empty() {
+            members.push(member.to_string());
+        }
+    }
+}
+
+/// Extract top-level identifier names from an Angular host binding expression string.
+///
+/// These are simple expressions like `'isActive'`, `'onClick($event)'`,
+/// `'hostClass()'`, `'customColor()'`. We extract the leading identifier
+/// before any `(` or `.` character.
+fn extract_identifiers_from_host_expr(expr: &str, refs: &mut Vec<String>) {
+    let expr = expr.trim();
+    if expr.is_empty() {
+        return;
+    }
+    // Extract the leading identifier (before any call parens, member access, etc.)
+    let ident: String = expr
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '$')
+        .collect();
+    if !is_valid_member_identifier(&ident) || refs.contains(&ident) {
+        return;
+    }
+    refs.push(ident);
+}
+
+/// Check if a string is a valid class member identifier (not a keyword or built-in).
+fn is_valid_member_identifier(ident: &str) -> bool {
+    !ident.is_empty()
+        && ident
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_' || c == '$')
+        && !matches!(
+            ident,
+            "true"
+                | "false"
+                | "null"
+                | "undefined"
+                | "this"
+                | "event"
+                | "window"
+                | "document"
+                | "console"
+                | "Math"
+                | "JSON"
+                | "Object"
+                | "Array"
+                | "String"
+                | "Number"
+                | "Boolean"
+                | "Date"
+                | "RegExp"
+                | "Error"
+                | "Promise"
+        )
+}
+
+/// Check if a class has any Angular decorator (`@Component`, `@Directive`,
+/// `@Injectable`, `@Pipe`).
+pub fn has_angular_class_decorator(class: &Class<'_>) -> bool {
+    class.decorators.iter().any(|d| {
+        if let Expression::CallExpression(call) = &d.expression
+            && let Expression::Identifier(id) = &call.callee
+        {
+            matches!(
+                id.name.as_str(),
+                "Component" | "Directive" | "Injectable" | "Pipe"
+            )
+        } else {
+            false
+        }
+    })
+}
+
+/// Check if a property initializer is an Angular signal API call.
+///
+/// Matches `input()`, `input.required()`, `output()`, `model()`,
+/// `viewChild()`, `viewChildren()`, `contentChild()`, `contentChildren()`.
+fn is_angular_signal_initializer(value: &Expression<'_>) -> bool {
+    let Expression::CallExpression(call) = value else {
+        return false;
+    };
+    match &call.callee {
+        // Direct call: `input()`, `output()`, `model()`, etc.
+        Expression::Identifier(id) => ANGULAR_SIGNAL_APIS.contains(&id.name.as_str()),
+        // Static member call: `input.required()`
+        Expression::StaticMemberExpression(member) => {
+            if let Expression::Identifier(obj) = &member.object {
+                ANGULAR_SIGNAL_APIS.contains(&obj.name.as_str())
+                    && member.property.name == "required"
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
+}
+
 /// Extract class members (methods and properties) from a class declaration.
-pub fn extract_class_members(class: &Class<'_>) -> Vec<MemberInfo> {
+///
+/// When `is_angular_class` is true, properties initialized with Angular signal
+/// APIs (`input()`, `output()`, `model()`, `viewChild()`, etc.) are treated as
+/// decorated (framework-managed) to prevent false unused-member reports.
+pub fn extract_class_members(class: &Class<'_>, is_angular_class: bool) -> Vec<MemberInfo> {
     let mut members = Vec::new();
     for element in &class.body.body {
         match element {
@@ -117,11 +330,17 @@ pub fn extract_class_members(class: &Class<'_>) -> Vec<MemberInfo> {
                         )
                     )
                 {
+                    let has_decorator = !prop.decorators.is_empty()
+                        || (is_angular_class
+                            && prop
+                                .value
+                                .as_ref()
+                                .is_some_and(is_angular_signal_initializer));
                     members.push(MemberInfo {
                         name: name.to_string(),
                         kind: MemberKind::ClassProperty,
                         span: prop.span,
-                        has_decorator: !prop.decorators.is_empty(),
+                        has_decorator,
                     });
                 }
             }

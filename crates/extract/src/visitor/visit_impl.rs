@@ -12,7 +12,10 @@ use crate::{
     MemberAccess, ReExportInfo, RequireCallInfo,
 };
 
-use super::helpers::{extract_concat_parts, is_meta_url_arg, regex_pattern_to_suffix};
+use super::helpers::{
+    extract_angular_component_metadata, extract_concat_parts, is_meta_url_arg,
+    regex_pattern_to_suffix,
+};
 use super::{ModuleInfoExtractor, try_extract_dynamic_import, try_extract_require};
 
 impl<'a> Visit<'a> for ModuleInfoExtractor {
@@ -606,12 +609,12 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
     }
 
     fn visit_class(&mut self, class: &Class<'a>) {
-        // Detect Angular @Component decorator and emit synthetic SideEffect imports
-        // for templateUrl and styleUrl/styleUrls references. This creates graph edges
-        // from the component file to the referenced template/style files, preventing
-        // them from being reported as unused files.
-        if let Some(urls) = super::helpers::extract_angular_component_urls(class) {
-            if let Some(ref template_url) = urls.template_url {
+        // Detect Angular @Component decorator and extract all metadata:
+        // templateUrl/styleUrl imports, inline template refs, host binding refs,
+        // and inputs/outputs member names.
+        if let Some(meta) = extract_angular_component_metadata(class) {
+            // Emit SideEffect imports for templateUrl and styleUrl/styleUrls
+            if let Some(ref template_url) = meta.template_url {
                 self.imports.push(ImportInfo {
                     source: template_url.clone(),
                     imported_name: ImportedName::SideEffect,
@@ -621,7 +624,7 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
                     source_span: oxc_span::Span::default(),
                 });
             }
-            for style_url in &urls.style_urls {
+            for style_url in &meta.style_urls {
                 self.imports.push(ImportInfo {
                     source: style_url.clone(),
                     imported_name: ImportedName::SideEffect,
@@ -629,6 +632,33 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
                     is_type_only: false,
                     span: oxc_span::Span::default(),
                     source_span: oxc_span::Span::default(),
+                });
+            }
+
+            // Scan inline template for member references
+            if let Some(ref template) = meta.inline_template {
+                let refs = crate::sfc_template::angular::collect_angular_template_refs(template);
+                for name in refs {
+                    self.member_accesses.push(MemberAccess {
+                        object: crate::sfc_template::angular::ANGULAR_TPL_SENTINEL.to_string(),
+                        member: name,
+                    });
+                }
+            }
+
+            // Emit sentinel accesses for host binding member references
+            for name in &meta.host_member_refs {
+                self.member_accesses.push(MemberAccess {
+                    object: crate::sfc_template::angular::ANGULAR_TPL_SENTINEL.to_string(),
+                    member: name.clone(),
+                });
+            }
+
+            // Emit sentinel accesses for inputs/outputs metadata members
+            for name in &meta.input_output_members {
+                self.member_accesses.push(MemberAccess {
+                    object: crate::sfc_template::angular::ANGULAR_TPL_SENTINEL.to_string(),
+                    member: name.clone(),
                 });
             }
         }

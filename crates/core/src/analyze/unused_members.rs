@@ -83,14 +83,14 @@ pub fn find_unused_members(
         }
     }
 
-    // Bridge Angular external template member refs to their owning components.
+    // Bridge Angular template member refs to their owning components.
     //
-    // Angular components reference external HTML template files via @Component({ templateUrl }),
-    // which creates a SideEffect import edge. The HTML scanner stores identifier references
-    // from template expressions ({{ title }}, [prop]="expr", (event)="handler()") as
-    // MemberAccess entries with a sentinel object name. Here we propagate those refs into
-    // self_accessed_members for the importing component file, so its class members used
-    // only in the template are not falsely reported as unused.
+    // Sentinel member accesses come from two sources:
+    // 1. External templates: HTML files scanned for Angular syntax, with sentinel
+    //    accesses stored on the HTML file's ModuleInfo. Bridged to the component
+    //    via the SideEffect import edge from @Component({ templateUrl }).
+    // 2. Inline templates/host/inputs/outputs: sentinel accesses stored directly
+    //    on the component's own ModuleInfo (same file as the class).
     let angular_tpl_refs: FxHashMap<FileId, Vec<&str>> = resolved_modules
         .iter()
         .filter_map(|m| {
@@ -110,6 +110,14 @@ pub fn find_unused_members(
 
     if !angular_tpl_refs.is_empty() {
         for resolved in resolved_modules {
+            // Case 1: sentinel accesses on the same file (inline template, host, inputs/outputs)
+            if let Some(refs) = angular_tpl_refs.get(&resolved.file_id) {
+                let entry = self_accessed_members.entry(resolved.file_id).or_default();
+                for &ref_name in refs {
+                    entry.insert(ref_name.to_string());
+                }
+            }
+            // Case 2: sentinel accesses on an imported file (external templateUrl)
             for import in &resolved.resolved_imports {
                 if let ResolveResult::InternalModule(target_id) = &import.target
                     && let Some(refs) = angular_tpl_refs.get(target_id)

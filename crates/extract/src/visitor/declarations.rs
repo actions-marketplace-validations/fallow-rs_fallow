@@ -10,7 +10,7 @@ use oxc_ast::ast::{
 
 use crate::{DynamicImportInfo, ExportInfo, ExportName, MemberInfo, MemberKind, RequireCallInfo};
 
-use super::helpers::extract_class_members;
+use super::helpers::{extract_class_members, has_angular_class_decorator};
 use super::{MemberAccess, ModuleInfoExtractor, extract_destructured_names};
 
 impl ModuleInfoExtractor {
@@ -47,7 +47,7 @@ impl ModuleInfoExtractor {
             }
             Declaration::ClassDeclaration(class) => {
                 if let Some(id) = class.id.as_ref() {
-                    let members = extract_class_members(class);
+                    let members = extract_class_members(class, has_angular_class_decorator(class));
                     self.exports.push(ExportInfo {
                         name: ExportName::Named(id.name.to_string()),
                         local_name: Some(id.name.to_string()),
