@@ -1271,7 +1271,9 @@ fn specifier_https_url_returns_external_file() {
         let file = Path::new("/project/src/app.ts");
         let result = specifier::resolve_specifier(ctx, file, "https://cdn.example.com/lib.js");
 
-        assert!(matches!(result, ResolveResult::ExternalFile(ref p) if p.to_str().unwrap() == "https://cdn.example.com/lib.js"));
+        assert!(
+            matches!(result, ResolveResult::ExternalFile(ref p) if p.to_str().unwrap() == "https://cdn.example.com/lib.js")
+        );
     });
 }
 
@@ -1281,7 +1283,9 @@ fn specifier_http_url_returns_external_file() {
         let file = Path::new("/project/src/app.ts");
         let result = specifier::resolve_specifier(ctx, file, "http://example.com/module.js");
 
-        assert!(matches!(result, ResolveResult::ExternalFile(ref p) if p.to_str().unwrap() == "http://example.com/module.js"));
+        assert!(
+            matches!(result, ResolveResult::ExternalFile(ref p) if p.to_str().unwrap() == "http://example.com/module.js")
+        );
     });
 }
 
@@ -1292,7 +1296,9 @@ fn specifier_data_url_returns_external_file() {
         let result =
             specifier::resolve_specifier(ctx, file, "data:text/javascript,export default 42");
 
-        assert!(matches!(result, ResolveResult::ExternalFile(ref p) if p.to_str().unwrap() == "data:text/javascript,export default 42"));
+        assert!(
+            matches!(result, ResolveResult::ExternalFile(ref p) if p.to_str().unwrap() == "data:text/javascript,export default 42")
+        );
     });
 }
 
@@ -1331,7 +1337,9 @@ fn specifier_html_root_relative_deep_path_unresolvable() {
         let file = Path::new("/project/nested/deep/page.html");
         let result = specifier::resolve_specifier(ctx, file, "/assets/styles/main.css");
 
-        assert!(matches!(result, ResolveResult::Unresolvable(ref s) if s == "/assets/styles/main.css"));
+        assert!(
+            matches!(result, ResolveResult::Unresolvable(ref s) if s == "/assets/styles/main.css")
+        );
     });
 }
 

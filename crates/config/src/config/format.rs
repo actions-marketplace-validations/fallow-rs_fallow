@@ -135,7 +135,10 @@ mod tests {
         for (i, a) in debug_strings.iter().enumerate() {
             for (j, b) in debug_strings.iter().enumerate() {
                 if i != j {
-                    assert_ne!(a, b, "variants at index {i} and {j} have the same debug output");
+                    assert_ne!(
+                        a, b,
+                        "variants at index {i} and {j} have the same debug output"
+                    );
                 }
             }
         }

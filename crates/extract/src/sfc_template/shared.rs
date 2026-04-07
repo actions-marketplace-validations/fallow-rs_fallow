@@ -440,26 +440,17 @@ mod tests {
 
     #[test]
     fn extract_pattern_object_with_empty_parts() {
-        assert_eq!(
-            extract_pattern_binding_names("{ a, , b }"),
-            vec!["a", "b"],
-        );
+        assert_eq!(extract_pattern_binding_names("{ a, , b }"), vec!["a", "b"],);
     }
 
     #[test]
     fn extract_pattern_object_with_rest_spread() {
-        assert_eq!(
-            extract_pattern_binding_names("{ a, ... }"),
-            vec!["a"],
-        );
+        assert_eq!(extract_pattern_binding_names("{ a, ... }"), vec!["a"],);
     }
 
     #[test]
     fn extract_pattern_top_level_default_value() {
-        assert_eq!(
-            extract_pattern_binding_names("x = 42"),
-            vec!["x"],
-        );
+        assert_eq!(extract_pattern_binding_names("x = 42"), vec!["x"],);
     }
 
     // --- merge_pattern_binding_usage ---
@@ -508,12 +499,8 @@ mod tests {
         let mut usage = TemplateUsage::default();
         let imported_bindings = FxHashSet::from_iter(["fallback".to_string()]);
 
-        let locals = merge_pattern_binding_usage(
-            &mut usage,
-            "[a, b = fallback]",
-            &imported_bindings,
-            &[],
-        );
+        let locals =
+            merge_pattern_binding_usage(&mut usage, "[a, b = fallback]", &imported_bindings, &[]);
 
         assert_eq!(locals, vec!["a", "b"]);
         assert!(usage.used_bindings.contains("fallback"));
@@ -663,12 +650,7 @@ mod tests {
         let mut usage = TemplateUsage::default();
         let imported_bindings = FxHashSet::from_iter(["count".to_string()]);
 
-        merge_expression_usage_allow_dollar_refs(
-            &mut usage,
-            "$count + 1",
-            &imported_bindings,
-            &[],
-        );
+        merge_expression_usage_allow_dollar_refs(&mut usage, "$count + 1", &imported_bindings, &[]);
 
         assert!(usage.used_bindings.contains("count"));
     }
@@ -852,58 +834,37 @@ mod tests {
 
     #[test]
     fn split_top_level_respects_nested_braces() {
-        assert_eq!(
-            split_top_level("{ a, b }, c", ','),
-            vec!["{ a, b }", " c"],
-        );
+        assert_eq!(split_top_level("{ a, b }, c", ','), vec!["{ a, b }", " c"],);
     }
 
     #[test]
     fn split_top_level_respects_nested_brackets() {
-        assert_eq!(
-            split_top_level("[a, b], c", ','),
-            vec!["[a, b]", " c"],
-        );
+        assert_eq!(split_top_level("[a, b], c", ','), vec!["[a, b]", " c"],);
     }
 
     #[test]
     fn split_top_level_respects_nested_parens() {
-        assert_eq!(
-            split_top_level("fn(a, b), c", ','),
-            vec!["fn(a, b)", " c"],
-        );
+        assert_eq!(split_top_level("fn(a, b), c", ','), vec!["fn(a, b)", " c"],);
     }
 
     #[test]
     fn split_top_level_respects_single_quotes() {
-        assert_eq!(
-            split_top_level("'a,b', c", ','),
-            vec!["'a,b'", " c"],
-        );
+        assert_eq!(split_top_level("'a,b', c", ','), vec!["'a,b'", " c"],);
     }
 
     #[test]
     fn split_top_level_respects_double_quotes() {
-        assert_eq!(
-            split_top_level(r#""a,b", c"#, ','),
-            vec![r#""a,b""#, " c"],
-        );
+        assert_eq!(split_top_level(r#""a,b", c"#, ','), vec![r#""a,b""#, " c"],);
     }
 
     #[test]
     fn split_top_level_respects_backticks() {
-        assert_eq!(
-            split_top_level("`a,b`, c", ','),
-            vec!["`a,b`", " c"],
-        );
+        assert_eq!(split_top_level("`a,b`, c", ','), vec!["`a,b`", " c"],);
     }
 
     #[test]
     fn split_top_level_respects_escape_in_string() {
-        assert_eq!(
-            split_top_level(r"'a\',b', c", ','),
-            vec![r"'a\',b'", " c"],
-        );
+        assert_eq!(split_top_level(r"'a\',b', c", ','), vec![r"'a\',b'", " c"],);
     }
 
     #[test]
@@ -936,10 +897,7 @@ mod tests {
 
     #[test]
     fn split_top_level_once_delimiter_in_single_quotes() {
-        assert_eq!(
-            split_top_level_once("'a:b': c", ':'),
-            Some(("'a:b'", " c")),
-        );
+        assert_eq!(split_top_level_once("'a:b': c", ':'), Some(("'a:b'", " c")),);
     }
 
     #[test]
@@ -952,10 +910,7 @@ mod tests {
 
     #[test]
     fn split_top_level_once_delimiter_in_backticks() {
-        assert_eq!(
-            split_top_level_once("`a:b`: c", ':'),
-            Some(("`a:b`", " c")),
-        );
+        assert_eq!(split_top_level_once("`a:b`: c", ':'), Some(("`a:b`", " c")),);
     }
 
     #[test]

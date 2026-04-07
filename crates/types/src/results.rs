@@ -739,10 +739,7 @@ mod tests {
         let r = AnalysisResults {
             entry_point_summary: Some(EntryPointSummary {
                 total: 5,
-                by_source: vec![
-                    ("package.json".to_string(), 2),
-                    ("plugin".to_string(), 3),
-                ],
+                by_source: vec![("package.json".to_string(), 2), ("plugin".to_string(), 3)],
             }),
             ..AnalysisResults::default()
         };
@@ -797,18 +794,16 @@ mod tests {
         let keys: Vec<_> = r
             .unused_exports
             .iter()
-            .map(|e| {
-                format!(
-                    "{}:{}:{}",
-                    e.path.to_string_lossy(),
-                    e.line,
-                    e.export_name
-                )
-            })
+            .map(|e| format!("{}:{}:{}", e.path.to_string_lossy(), e.line, e.export_name))
             .collect();
         assert_eq!(
             keys,
-            vec!["a.ts:1:gamma", "a.ts:10:alpha", "a.ts:10:zeta", "b.ts:5:beta"]
+            vec![
+                "a.ts:1:gamma",
+                "a.ts:10:alpha",
+                "a.ts:10:zeta",
+                "b.ts:5:beta"
+            ]
         );
     }
 
@@ -845,10 +840,8 @@ mod tests {
             line,
         };
         r.unused_dependencies.push(mk("b/package.json", 3, "zlib"));
-        r.unused_dependencies
-            .push(mk("a/package.json", 5, "react"));
-        r.unused_dependencies
-            .push(mk("a/package.json", 5, "axios"));
+        r.unused_dependencies.push(mk("a/package.json", 5, "react"));
+        r.unused_dependencies.push(mk("a/package.json", 5, "axios"));
         r.sort();
         let names: Vec<_> = r
             .unused_dependencies
@@ -917,8 +910,7 @@ mod tests {
         };
         r.unused_enum_members.push(mk("a.ts", 5, "Status", "Z"));
         r.unused_enum_members.push(mk("a.ts", 5, "Status", "A"));
-        r.unused_enum_members
-            .push(mk("a.ts", 1, "Direction", "Up"));
+        r.unused_enum_members.push(mk("a.ts", 1, "Direction", "Up"));
         r.sort();
         let keys: Vec<_> = r
             .unused_enum_members
@@ -944,14 +936,8 @@ mod tests {
         r.unused_class_members.push(mk("b.ts", 1, "Foo", "z"));
         r.unused_class_members.push(mk("a.ts", 1, "Bar", "a"));
         r.sort();
-        assert_eq!(
-            r.unused_class_members[0].path,
-            PathBuf::from("a.ts")
-        );
-        assert_eq!(
-            r.unused_class_members[1].path,
-            PathBuf::from("b.ts")
-        );
+        assert_eq!(r.unused_class_members[0].path, PathBuf::from("a.ts"));
+        assert_eq!(r.unused_class_members[1].path, PathBuf::from("b.ts"));
     }
 
     // ── sort: unresolved_imports by path, line, col, specifier ──
@@ -1236,10 +1222,7 @@ mod tests {
         // All arrays should be present and empty
         assert!(json["unused_files"].as_array().unwrap().is_empty());
         assert!(json["unused_exports"].as_array().unwrap().is_empty());
-        assert!(json["circular_dependencies"]
-            .as_array()
-            .unwrap()
-            .is_empty());
+        assert!(json["circular_dependencies"].as_array().unwrap().is_empty());
 
         // Skipped fields should be absent
         assert!(json.get("export_usages").is_none());
@@ -1472,7 +1455,8 @@ mod tests {
 
     #[test]
     fn deserialize_circular_dependency_with_all_fields() {
-        let json = r#"{"files":["a.ts","b.ts"],"length":2,"line":5,"col":10,"is_cross_package":true}"#;
+        let json =
+            r#"{"files":["a.ts","b.ts"],"length":2,"line":5,"col":10,"is_cross_package":true}"#;
         let cd: CircularDependency = serde_json::from_str(json).unwrap();
         assert_eq!(cd.line, 5);
         assert_eq!(cd.col, 10);

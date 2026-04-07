@@ -809,10 +809,7 @@ mod tests {
 
     #[test]
     fn at_html_marks_expression_used() {
-        let usage = collect_template_usage(
-            "{@html sanitize(content)}",
-            &imported(&["sanitize"]),
-        );
+        let usage = collect_template_usage("{@html sanitize(content)}", &imported(&["sanitize"]));
 
         assert!(usage.used_bindings.contains("sanitize"));
     }
@@ -821,10 +818,7 @@ mod tests {
 
     #[test]
     fn at_render_marks_expression_used() {
-        let usage = collect_template_usage(
-            "{@render header()}",
-            &imported(&["header"]),
-        );
+        let usage = collect_template_usage("{@render header()}", &imported(&["header"]));
 
         assert!(usage.used_bindings.contains("header"));
     }
@@ -859,10 +853,7 @@ mod tests {
 
     #[test]
     fn at_debug_marks_expression_used() {
-        let usage = collect_template_usage(
-            "{@debug count}",
-            &imported(&["count"]),
-        );
+        let usage = collect_template_usage("{@debug count}", &imported(&["count"]));
 
         assert!(usage.used_bindings.contains("count"));
     }
@@ -908,10 +899,7 @@ mod tests {
     #[test]
     fn closing_unknown_block_kind_is_no_op() {
         // {/unknownblock} should not crash or affect scopes
-        let usage = collect_template_usage(
-            "{/unknownblock}<p>{fmt(x)}</p>",
-            &imported(&["fmt"]),
-        );
+        let usage = collect_template_usage("{/unknownblock}<p>{fmt(x)}</p>", &imported(&["fmt"]));
 
         assert!(usage.used_bindings.contains("fmt"));
     }
@@ -1011,40 +999,29 @@ mod tests {
 
     #[test]
     fn animate_directive_marks_binding_used() {
-        let usage = collect_template_usage(
-            "<div animate:flip>content</div>",
-            &imported(&["flip"]),
-        );
+        let usage = collect_template_usage("<div animate:flip>content</div>", &imported(&["flip"]));
 
         assert!(usage.used_bindings.contains("flip"));
     }
 
     #[test]
     fn transition_directive_marks_binding_used() {
-        let usage = collect_template_usage(
-            "<div transition:fade>content</div>",
-            &imported(&["fade"]),
-        );
+        let usage =
+            collect_template_usage("<div transition:fade>content</div>", &imported(&["fade"]));
 
         assert!(usage.used_bindings.contains("fade"));
     }
 
     #[test]
     fn in_directive_marks_binding_used() {
-        let usage = collect_template_usage(
-            "<div in:fly>content</div>",
-            &imported(&["fly"]),
-        );
+        let usage = collect_template_usage("<div in:fly>content</div>", &imported(&["fly"]));
 
         assert!(usage.used_bindings.contains("fly"));
     }
 
     #[test]
     fn out_directive_marks_binding_used() {
-        let usage = collect_template_usage(
-            "<div out:slide>content</div>",
-            &imported(&["slide"]),
-        );
+        let usage = collect_template_usage("<div out:slide>content</div>", &imported(&["slide"]));
 
         assert!(usage.used_bindings.contains("slide"));
     }
@@ -1063,10 +1040,8 @@ mod tests {
 
     #[test]
     fn unquoted_attribute_value_is_parsed() {
-        let usage = collect_template_usage(
-            "<div data-value=hello>content</div>",
-            &imported(&["hello"]),
-        );
+        let usage =
+            collect_template_usage("<div data-value=hello>content</div>", &imported(&["hello"]));
 
         // Unquoted attribute values are plain strings, not expressions
         assert!(usage.is_empty());
@@ -1121,10 +1096,7 @@ mod tests {
 
     #[test]
     fn empty_curly_braces_produce_no_usage() {
-        let usage = collect_template_usage(
-            "{ }<p>{fmt(x)}</p>",
-            &imported(&["fmt"]),
-        );
+        let usage = collect_template_usage("{ }<p>{fmt(x)}</p>", &imported(&["fmt"]));
 
         assert!(usage.used_bindings.contains("fmt"));
     }
@@ -1133,10 +1105,7 @@ mod tests {
 
     #[test]
     fn self_closing_tag_does_not_push_scope() {
-        let usage = collect_template_usage(
-            "<br /><p>{fmt(x)}</p>",
-            &imported(&["fmt"]),
-        );
+        let usage = collect_template_usage("<br /><p>{fmt(x)}</p>", &imported(&["fmt"]));
 
         assert!(usage.used_bindings.contains("fmt"));
     }
@@ -1172,10 +1141,7 @@ mod tests {
     #[test]
     fn closing_tag_without_element_scope_is_safe() {
         // </div> with no matching open scope should not crash
-        let usage = collect_template_usage(
-            "</div><p>{fmt(x)}</p>",
-            &imported(&["fmt"]),
-        );
+        let usage = collect_template_usage("</div><p>{fmt(x)}</p>", &imported(&["fmt"]));
 
         assert!(usage.used_bindings.contains("fmt"));
     }
@@ -1212,10 +1178,7 @@ mod tests {
 
     #[test]
     fn plain_expression_without_prefix_is_tracked() {
-        let usage = collect_template_usage(
-            "{count + 1}",
-            &imported(&["count"]),
-        );
+        let usage = collect_template_usage("{count + 1}", &imported(&["count"]));
 
         assert!(usage.used_bindings.contains("count"));
     }

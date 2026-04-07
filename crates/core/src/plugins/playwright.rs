@@ -104,7 +104,10 @@ mod tests {
             source,
             Path::new("/project"),
         );
-        assert_eq!(result.setup_files, vec![Path::new("/project/global-setup.ts")]);
+        assert_eq!(
+            result.setup_files,
+            vec![Path::new("/project/global-setup.ts")]
+        );
     }
 
     #[test]

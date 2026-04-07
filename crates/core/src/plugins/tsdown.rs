@@ -98,7 +98,11 @@ mod tests {
         let plugin = TsdownPlugin;
         let result =
             plugin.resolve_config(Path::new("tsdown.config.ts"), source, Path::new("/project"));
-        assert!(result.referenced_dependencies.contains(&"tsdown".to_string()));
+        assert!(
+            result
+                .referenced_dependencies
+                .contains(&"tsdown".to_string())
+        );
         assert!(
             result
                 .referenced_dependencies
@@ -142,6 +146,10 @@ mod tests {
         let result =
             plugin.resolve_config(Path::new("tsdown.config.ts"), source, Path::new("/project"));
         assert_eq!(result.entry_patterns, vec!["src/main.ts", "src/worker.ts"]);
-        assert!(result.referenced_dependencies.contains(&"tsdown".to_string()));
+        assert!(
+            result
+                .referenced_dependencies
+                .contains(&"tsdown".to_string())
+        );
     }
 }
