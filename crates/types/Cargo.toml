@@ -21,5 +21,8 @@ oxc_span = { workspace = true }
 # Cache serialization (for MemberAccess)
 bitcode = { workspace = true }
 
+[dev-dependencies]
+serde_json = { workspace = true }
+
 [lints]
 workspace = true

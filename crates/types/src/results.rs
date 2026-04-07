@@ -718,4 +718,813 @@ mod tests {
         assert!(r.boundary_violations.is_empty());
         assert!(r.export_usages.is_empty());
     }
+
+    // ── EntryPointSummary ────────────────────────────────────────
+
+    #[test]
+    fn entry_point_summary_default() {
+        let summary = EntryPointSummary::default();
+        assert_eq!(summary.total, 0);
+        assert!(summary.by_source.is_empty());
+    }
+
+    #[test]
+    fn entry_point_summary_not_in_default_results() {
+        let r = AnalysisResults::default();
+        assert!(r.entry_point_summary.is_none());
+    }
+
+    #[test]
+    fn entry_point_summary_some_preserves_data() {
+        let r = AnalysisResults {
+            entry_point_summary: Some(EntryPointSummary {
+                total: 5,
+                by_source: vec![
+                    ("package.json".to_string(), 2),
+                    ("plugin".to_string(), 3),
+                ],
+            }),
+            ..AnalysisResults::default()
+        };
+        let summary = r.entry_point_summary.as_ref().unwrap();
+        assert_eq!(summary.total, 5);
+        assert_eq!(summary.by_source.len(), 2);
+        assert_eq!(summary.by_source[0], ("package.json".to_string(), 2));
+    }
+
+    // ── sort: unused_files by path ──────────────────────────────
+
+    #[test]
+    fn sort_unused_files_by_path() {
+        let mut r = AnalysisResults::default();
+        r.unused_files.push(UnusedFile {
+            path: PathBuf::from("z.ts"),
+        });
+        r.unused_files.push(UnusedFile {
+            path: PathBuf::from("a.ts"),
+        });
+        r.unused_files.push(UnusedFile {
+            path: PathBuf::from("m.ts"),
+        });
+        r.sort();
+        let paths: Vec<_> = r
+            .unused_files
+            .iter()
+            .map(|f| f.path.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(paths, vec!["a.ts", "m.ts", "z.ts"]);
+    }
+
+    // ── sort: unused_exports by path, line, name ────────────────
+
+    #[test]
+    fn sort_unused_exports_by_path_line_name() {
+        let mut r = AnalysisResults::default();
+        let mk = |path: &str, line: u32, name: &str| UnusedExport {
+            path: PathBuf::from(path),
+            export_name: name.to_string(),
+            is_type_only: false,
+            line,
+            col: 0,
+            span_start: 0,
+            is_re_export: false,
+        };
+        r.unused_exports.push(mk("b.ts", 5, "beta"));
+        r.unused_exports.push(mk("a.ts", 10, "zeta"));
+        r.unused_exports.push(mk("a.ts", 10, "alpha"));
+        r.unused_exports.push(mk("a.ts", 1, "gamma"));
+        r.sort();
+        let keys: Vec<_> = r
+            .unused_exports
+            .iter()
+            .map(|e| {
+                format!(
+                    "{}:{}:{}",
+                    e.path.to_string_lossy(),
+                    e.line,
+                    e.export_name
+                )
+            })
+            .collect();
+        assert_eq!(
+            keys,
+            vec!["a.ts:1:gamma", "a.ts:10:alpha", "a.ts:10:zeta", "b.ts:5:beta"]
+        );
+    }
+
+    // ── sort: unused_types (same sort as unused_exports) ────────
+
+    #[test]
+    fn sort_unused_types_by_path_line_name() {
+        let mut r = AnalysisResults::default();
+        let mk = |path: &str, line: u32, name: &str| UnusedExport {
+            path: PathBuf::from(path),
+            export_name: name.to_string(),
+            is_type_only: true,
+            line,
+            col: 0,
+            span_start: 0,
+            is_re_export: false,
+        };
+        r.unused_types.push(mk("z.ts", 1, "Z"));
+        r.unused_types.push(mk("a.ts", 1, "A"));
+        r.sort();
+        assert_eq!(r.unused_types[0].path, PathBuf::from("a.ts"));
+        assert_eq!(r.unused_types[1].path, PathBuf::from("z.ts"));
+    }
+
+    // ── sort: unused_dependencies by path, line, name ───────────
+
+    #[test]
+    fn sort_unused_dependencies_by_path_line_name() {
+        let mut r = AnalysisResults::default();
+        let mk = |path: &str, line: u32, name: &str| UnusedDependency {
+            package_name: name.to_string(),
+            location: DependencyLocation::Dependencies,
+            path: PathBuf::from(path),
+            line,
+        };
+        r.unused_dependencies.push(mk("b/package.json", 3, "zlib"));
+        r.unused_dependencies
+            .push(mk("a/package.json", 5, "react"));
+        r.unused_dependencies
+            .push(mk("a/package.json", 5, "axios"));
+        r.sort();
+        let names: Vec<_> = r
+            .unused_dependencies
+            .iter()
+            .map(|d| d.package_name.as_str())
+            .collect();
+        assert_eq!(names, vec!["axios", "react", "zlib"]);
+    }
+
+    // ── sort: unused_dev_dependencies ───────────────────────────
+
+    #[test]
+    fn sort_unused_dev_dependencies() {
+        let mut r = AnalysisResults::default();
+        r.unused_dev_dependencies.push(UnusedDependency {
+            package_name: "vitest".to_string(),
+            location: DependencyLocation::DevDependencies,
+            path: PathBuf::from("package.json"),
+            line: 10,
+        });
+        r.unused_dev_dependencies.push(UnusedDependency {
+            package_name: "jest".to_string(),
+            location: DependencyLocation::DevDependencies,
+            path: PathBuf::from("package.json"),
+            line: 5,
+        });
+        r.sort();
+        assert_eq!(r.unused_dev_dependencies[0].package_name, "jest");
+        assert_eq!(r.unused_dev_dependencies[1].package_name, "vitest");
+    }
+
+    // ── sort: unused_optional_dependencies ──────────────────────
+
+    #[test]
+    fn sort_unused_optional_dependencies() {
+        let mut r = AnalysisResults::default();
+        r.unused_optional_dependencies.push(UnusedDependency {
+            package_name: "zod".to_string(),
+            location: DependencyLocation::OptionalDependencies,
+            path: PathBuf::from("package.json"),
+            line: 3,
+        });
+        r.unused_optional_dependencies.push(UnusedDependency {
+            package_name: "ajv".to_string(),
+            location: DependencyLocation::OptionalDependencies,
+            path: PathBuf::from("package.json"),
+            line: 2,
+        });
+        r.sort();
+        assert_eq!(r.unused_optional_dependencies[0].package_name, "ajv");
+        assert_eq!(r.unused_optional_dependencies[1].package_name, "zod");
+    }
+
+    // ── sort: unused_enum_members by path, line, parent, member ─
+
+    #[test]
+    fn sort_unused_enum_members_by_path_line_parent_member() {
+        let mut r = AnalysisResults::default();
+        let mk = |path: &str, line: u32, parent: &str, member: &str| UnusedMember {
+            path: PathBuf::from(path),
+            parent_name: parent.to_string(),
+            member_name: member.to_string(),
+            kind: MemberKind::EnumMember,
+            line,
+            col: 0,
+        };
+        r.unused_enum_members.push(mk("a.ts", 5, "Status", "Z"));
+        r.unused_enum_members.push(mk("a.ts", 5, "Status", "A"));
+        r.unused_enum_members
+            .push(mk("a.ts", 1, "Direction", "Up"));
+        r.sort();
+        let keys: Vec<_> = r
+            .unused_enum_members
+            .iter()
+            .map(|m| format!("{}:{}", m.parent_name, m.member_name))
+            .collect();
+        assert_eq!(keys, vec!["Direction:Up", "Status:A", "Status:Z"]);
+    }
+
+    // ── sort: unused_class_members by path, line, parent, member
+
+    #[test]
+    fn sort_unused_class_members() {
+        let mut r = AnalysisResults::default();
+        let mk = |path: &str, line: u32, parent: &str, member: &str| UnusedMember {
+            path: PathBuf::from(path),
+            parent_name: parent.to_string(),
+            member_name: member.to_string(),
+            kind: MemberKind::ClassMethod,
+            line,
+            col: 0,
+        };
+        r.unused_class_members.push(mk("b.ts", 1, "Foo", "z"));
+        r.unused_class_members.push(mk("a.ts", 1, "Bar", "a"));
+        r.sort();
+        assert_eq!(
+            r.unused_class_members[0].path,
+            PathBuf::from("a.ts")
+        );
+        assert_eq!(
+            r.unused_class_members[1].path,
+            PathBuf::from("b.ts")
+        );
+    }
+
+    // ── sort: unresolved_imports by path, line, col, specifier ──
+
+    #[test]
+    fn sort_unresolved_imports_by_path_line_col_specifier() {
+        let mut r = AnalysisResults::default();
+        let mk = |path: &str, line: u32, col: u32, spec: &str| UnresolvedImport {
+            path: PathBuf::from(path),
+            specifier: spec.to_string(),
+            line,
+            col,
+            specifier_col: 0,
+        };
+        r.unresolved_imports.push(mk("a.ts", 5, 0, "./z"));
+        r.unresolved_imports.push(mk("a.ts", 5, 0, "./a"));
+        r.unresolved_imports.push(mk("a.ts", 1, 0, "./m"));
+        r.sort();
+        let specs: Vec<_> = r
+            .unresolved_imports
+            .iter()
+            .map(|i| i.specifier.as_str())
+            .collect();
+        assert_eq!(specs, vec!["./m", "./a", "./z"]);
+    }
+
+    // ── sort: unlisted_dependencies + inner imported_from ───────
+
+    #[test]
+    fn sort_unlisted_dependencies_by_name_and_inner_sites() {
+        let mut r = AnalysisResults::default();
+        r.unlisted_dependencies.push(UnlistedDependency {
+            package_name: "zod".to_string(),
+            imported_from: vec![
+                ImportSite {
+                    path: PathBuf::from("b.ts"),
+                    line: 10,
+                    col: 0,
+                },
+                ImportSite {
+                    path: PathBuf::from("a.ts"),
+                    line: 1,
+                    col: 0,
+                },
+            ],
+        });
+        r.unlisted_dependencies.push(UnlistedDependency {
+            package_name: "axios".to_string(),
+            imported_from: vec![ImportSite {
+                path: PathBuf::from("c.ts"),
+                line: 1,
+                col: 0,
+            }],
+        });
+        r.sort();
+
+        // Outer sort: by package_name
+        assert_eq!(r.unlisted_dependencies[0].package_name, "axios");
+        assert_eq!(r.unlisted_dependencies[1].package_name, "zod");
+
+        // Inner sort: imported_from sorted by path, then line
+        let zod_sites: Vec<_> = r.unlisted_dependencies[1]
+            .imported_from
+            .iter()
+            .map(|s| s.path.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(zod_sites, vec!["a.ts", "b.ts"]);
+    }
+
+    // ── sort: duplicate_exports + inner locations ───────────────
+
+    #[test]
+    fn sort_duplicate_exports_by_name_and_inner_locations() {
+        let mut r = AnalysisResults::default();
+        r.duplicate_exports.push(DuplicateExport {
+            export_name: "z".to_string(),
+            locations: vec![
+                DuplicateLocation {
+                    path: PathBuf::from("c.ts"),
+                    line: 1,
+                    col: 0,
+                },
+                DuplicateLocation {
+                    path: PathBuf::from("a.ts"),
+                    line: 5,
+                    col: 0,
+                },
+            ],
+        });
+        r.duplicate_exports.push(DuplicateExport {
+            export_name: "a".to_string(),
+            locations: vec![DuplicateLocation {
+                path: PathBuf::from("b.ts"),
+                line: 1,
+                col: 0,
+            }],
+        });
+        r.sort();
+
+        // Outer sort: by export_name
+        assert_eq!(r.duplicate_exports[0].export_name, "a");
+        assert_eq!(r.duplicate_exports[1].export_name, "z");
+
+        // Inner sort: locations sorted by path, then line
+        let z_locs: Vec<_> = r.duplicate_exports[1]
+            .locations
+            .iter()
+            .map(|l| l.path.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(z_locs, vec!["a.ts", "c.ts"]);
+    }
+
+    // ── sort: type_only_dependencies ────────────────────────────
+
+    #[test]
+    fn sort_type_only_dependencies() {
+        let mut r = AnalysisResults::default();
+        r.type_only_dependencies.push(TypeOnlyDependency {
+            package_name: "zod".to_string(),
+            path: PathBuf::from("package.json"),
+            line: 10,
+        });
+        r.type_only_dependencies.push(TypeOnlyDependency {
+            package_name: "ajv".to_string(),
+            path: PathBuf::from("package.json"),
+            line: 5,
+        });
+        r.sort();
+        assert_eq!(r.type_only_dependencies[0].package_name, "ajv");
+        assert_eq!(r.type_only_dependencies[1].package_name, "zod");
+    }
+
+    // ── sort: test_only_dependencies ────────────────────────────
+
+    #[test]
+    fn sort_test_only_dependencies() {
+        let mut r = AnalysisResults::default();
+        r.test_only_dependencies.push(TestOnlyDependency {
+            package_name: "vitest".to_string(),
+            path: PathBuf::from("package.json"),
+            line: 15,
+        });
+        r.test_only_dependencies.push(TestOnlyDependency {
+            package_name: "jest".to_string(),
+            path: PathBuf::from("package.json"),
+            line: 10,
+        });
+        r.sort();
+        assert_eq!(r.test_only_dependencies[0].package_name, "jest");
+        assert_eq!(r.test_only_dependencies[1].package_name, "vitest");
+    }
+
+    // ── sort: circular_dependencies by files, then length ───────
+
+    #[test]
+    fn sort_circular_dependencies_by_files_then_length() {
+        let mut r = AnalysisResults::default();
+        r.circular_dependencies.push(CircularDependency {
+            files: vec![PathBuf::from("b.ts"), PathBuf::from("c.ts")],
+            length: 2,
+            line: 1,
+            col: 0,
+            is_cross_package: false,
+        });
+        r.circular_dependencies.push(CircularDependency {
+            files: vec![PathBuf::from("a.ts"), PathBuf::from("b.ts")],
+            length: 2,
+            line: 1,
+            col: 0,
+            is_cross_package: true,
+        });
+        r.sort();
+        assert_eq!(r.circular_dependencies[0].files[0], PathBuf::from("a.ts"));
+        assert_eq!(r.circular_dependencies[1].files[0], PathBuf::from("b.ts"));
+    }
+
+    // ── sort: boundary_violations by from_path, line, col, to_path
+
+    #[test]
+    fn sort_boundary_violations() {
+        let mut r = AnalysisResults::default();
+        let mk = |from: &str, line: u32, col: u32, to: &str| BoundaryViolation {
+            from_path: PathBuf::from(from),
+            to_path: PathBuf::from(to),
+            from_zone: "a".to_string(),
+            to_zone: "b".to_string(),
+            import_specifier: to.to_string(),
+            line,
+            col,
+        };
+        r.boundary_violations.push(mk("z.ts", 1, 0, "a.ts"));
+        r.boundary_violations.push(mk("a.ts", 5, 0, "b.ts"));
+        r.boundary_violations.push(mk("a.ts", 1, 0, "c.ts"));
+        r.sort();
+        let from_paths: Vec<_> = r
+            .boundary_violations
+            .iter()
+            .map(|v| format!("{}:{}", v.from_path.to_string_lossy(), v.line))
+            .collect();
+        assert_eq!(from_paths, vec!["a.ts:1", "a.ts:5", "z.ts:1"]);
+    }
+
+    // ── sort: export_usages + inner reference_locations ─────────
+
+    #[test]
+    fn sort_export_usages_and_inner_reference_locations() {
+        let mut r = AnalysisResults::default();
+        r.export_usages.push(ExportUsage {
+            path: PathBuf::from("z.ts"),
+            export_name: "foo".to_string(),
+            line: 1,
+            col: 0,
+            reference_count: 2,
+            reference_locations: vec![
+                ReferenceLocation {
+                    path: PathBuf::from("c.ts"),
+                    line: 10,
+                    col: 0,
+                },
+                ReferenceLocation {
+                    path: PathBuf::from("a.ts"),
+                    line: 5,
+                    col: 0,
+                },
+            ],
+        });
+        r.export_usages.push(ExportUsage {
+            path: PathBuf::from("a.ts"),
+            export_name: "bar".to_string(),
+            line: 1,
+            col: 0,
+            reference_count: 1,
+            reference_locations: vec![ReferenceLocation {
+                path: PathBuf::from("b.ts"),
+                line: 1,
+                col: 0,
+            }],
+        });
+        r.sort();
+
+        // Outer sort: by path, then line, then export_name
+        assert_eq!(r.export_usages[0].path, PathBuf::from("a.ts"));
+        assert_eq!(r.export_usages[1].path, PathBuf::from("z.ts"));
+
+        // Inner sort: reference_locations sorted by path, line, col
+        let refs: Vec<_> = r.export_usages[1]
+            .reference_locations
+            .iter()
+            .map(|l| l.path.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(refs, vec!["a.ts", "c.ts"]);
+    }
+
+    // ── sort: empty results does not panic ──────────────────────
+
+    #[test]
+    fn sort_empty_results_is_noop() {
+        let mut r = AnalysisResults::default();
+        r.sort(); // should not panic
+        assert_eq!(r.total_issues(), 0);
+    }
+
+    // ── sort: single-element lists remain stable ────────────────
+
+    #[test]
+    fn sort_single_element_lists_stable() {
+        let mut r = AnalysisResults::default();
+        r.unused_files.push(UnusedFile {
+            path: PathBuf::from("only.ts"),
+        });
+        r.sort();
+        assert_eq!(r.unused_files[0].path, PathBuf::from("only.ts"));
+    }
+
+    // ── serialization ──────────────────────────────────────────
+
+    #[test]
+    fn serialize_empty_results() {
+        let r = AnalysisResults::default();
+        let json = serde_json::to_value(&r).unwrap();
+
+        // All arrays should be present and empty
+        assert!(json["unused_files"].as_array().unwrap().is_empty());
+        assert!(json["unused_exports"].as_array().unwrap().is_empty());
+        assert!(json["circular_dependencies"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+
+        // Skipped fields should be absent
+        assert!(json.get("export_usages").is_none());
+        assert!(json.get("entry_point_summary").is_none());
+    }
+
+    #[test]
+    fn serialize_unused_file_path() {
+        let r = UnusedFile {
+            path: PathBuf::from("src/utils/index.ts"),
+        };
+        let json = serde_json::to_value(&r).unwrap();
+        assert_eq!(json["path"], "src/utils/index.ts");
+    }
+
+    #[test]
+    fn serialize_dependency_location_camel_case() {
+        let dep = UnusedDependency {
+            package_name: "react".to_string(),
+            location: DependencyLocation::DevDependencies,
+            path: PathBuf::from("package.json"),
+            line: 5,
+        };
+        let json = serde_json::to_value(&dep).unwrap();
+        assert_eq!(json["location"], "devDependencies");
+
+        let dep2 = UnusedDependency {
+            package_name: "react".to_string(),
+            location: DependencyLocation::Dependencies,
+            path: PathBuf::from("package.json"),
+            line: 3,
+        };
+        let json2 = serde_json::to_value(&dep2).unwrap();
+        assert_eq!(json2["location"], "dependencies");
+
+        let dep3 = UnusedDependency {
+            package_name: "fsevents".to_string(),
+            location: DependencyLocation::OptionalDependencies,
+            path: PathBuf::from("package.json"),
+            line: 7,
+        };
+        let json3 = serde_json::to_value(&dep3).unwrap();
+        assert_eq!(json3["location"], "optionalDependencies");
+    }
+
+    #[test]
+    fn serialize_circular_dependency_skips_false_cross_package() {
+        let cd = CircularDependency {
+            files: vec![PathBuf::from("a.ts"), PathBuf::from("b.ts")],
+            length: 2,
+            line: 1,
+            col: 0,
+            is_cross_package: false,
+        };
+        let json = serde_json::to_value(&cd).unwrap();
+        // skip_serializing_if = "std::ops::Not::not" means false is skipped
+        assert!(json.get("is_cross_package").is_none());
+    }
+
+    #[test]
+    fn serialize_circular_dependency_includes_true_cross_package() {
+        let cd = CircularDependency {
+            files: vec![PathBuf::from("a.ts"), PathBuf::from("b.ts")],
+            length: 2,
+            line: 1,
+            col: 0,
+            is_cross_package: true,
+        };
+        let json = serde_json::to_value(&cd).unwrap();
+        assert_eq!(json["is_cross_package"], true);
+    }
+
+    #[test]
+    fn serialize_unused_export_fields() {
+        let e = UnusedExport {
+            path: PathBuf::from("src/mod.ts"),
+            export_name: "helper".to_string(),
+            is_type_only: true,
+            line: 42,
+            col: 7,
+            span_start: 100,
+            is_re_export: true,
+        };
+        let json = serde_json::to_value(&e).unwrap();
+        assert_eq!(json["path"], "src/mod.ts");
+        assert_eq!(json["export_name"], "helper");
+        assert_eq!(json["is_type_only"], true);
+        assert_eq!(json["line"], 42);
+        assert_eq!(json["col"], 7);
+        assert_eq!(json["span_start"], 100);
+        assert_eq!(json["is_re_export"], true);
+    }
+
+    #[test]
+    fn serialize_boundary_violation_fields() {
+        let v = BoundaryViolation {
+            from_path: PathBuf::from("src/ui/button.tsx"),
+            to_path: PathBuf::from("src/db/queries.ts"),
+            from_zone: "ui".to_string(),
+            to_zone: "db".to_string(),
+            import_specifier: "../db/queries".to_string(),
+            line: 3,
+            col: 0,
+        };
+        let json = serde_json::to_value(&v).unwrap();
+        assert_eq!(json["from_path"], "src/ui/button.tsx");
+        assert_eq!(json["to_path"], "src/db/queries.ts");
+        assert_eq!(json["from_zone"], "ui");
+        assert_eq!(json["to_zone"], "db");
+        assert_eq!(json["import_specifier"], "../db/queries");
+    }
+
+    #[test]
+    fn serialize_unlisted_dependency_with_import_sites() {
+        let d = UnlistedDependency {
+            package_name: "chalk".to_string(),
+            imported_from: vec![
+                ImportSite {
+                    path: PathBuf::from("a.ts"),
+                    line: 1,
+                    col: 0,
+                },
+                ImportSite {
+                    path: PathBuf::from("b.ts"),
+                    line: 5,
+                    col: 3,
+                },
+            ],
+        };
+        let json = serde_json::to_value(&d).unwrap();
+        assert_eq!(json["package_name"], "chalk");
+        let sites = json["imported_from"].as_array().unwrap();
+        assert_eq!(sites.len(), 2);
+        assert_eq!(sites[0]["path"], "a.ts");
+        assert_eq!(sites[1]["line"], 5);
+    }
+
+    #[test]
+    fn serialize_duplicate_export_with_locations() {
+        let d = DuplicateExport {
+            export_name: "Button".to_string(),
+            locations: vec![
+                DuplicateLocation {
+                    path: PathBuf::from("src/a.ts"),
+                    line: 10,
+                    col: 0,
+                },
+                DuplicateLocation {
+                    path: PathBuf::from("src/b.ts"),
+                    line: 20,
+                    col: 5,
+                },
+            ],
+        };
+        let json = serde_json::to_value(&d).unwrap();
+        assert_eq!(json["export_name"], "Button");
+        let locs = json["locations"].as_array().unwrap();
+        assert_eq!(locs.len(), 2);
+        assert_eq!(locs[0]["line"], 10);
+        assert_eq!(locs[1]["col"], 5);
+    }
+
+    #[test]
+    fn serialize_type_only_dependency() {
+        let d = TypeOnlyDependency {
+            package_name: "@types/react".to_string(),
+            path: PathBuf::from("package.json"),
+            line: 12,
+        };
+        let json = serde_json::to_value(&d).unwrap();
+        assert_eq!(json["package_name"], "@types/react");
+        assert_eq!(json["line"], 12);
+    }
+
+    #[test]
+    fn serialize_test_only_dependency() {
+        let d = TestOnlyDependency {
+            package_name: "vitest".to_string(),
+            path: PathBuf::from("package.json"),
+            line: 8,
+        };
+        let json = serde_json::to_value(&d).unwrap();
+        assert_eq!(json["package_name"], "vitest");
+        assert_eq!(json["line"], 8);
+    }
+
+    #[test]
+    fn serialize_unused_member() {
+        let m = UnusedMember {
+            path: PathBuf::from("enums.ts"),
+            parent_name: "Status".to_string(),
+            member_name: "Pending".to_string(),
+            kind: MemberKind::EnumMember,
+            line: 3,
+            col: 4,
+        };
+        let json = serde_json::to_value(&m).unwrap();
+        assert_eq!(json["parent_name"], "Status");
+        assert_eq!(json["member_name"], "Pending");
+        assert_eq!(json["line"], 3);
+    }
+
+    #[test]
+    fn serialize_unresolved_import() {
+        let i = UnresolvedImport {
+            path: PathBuf::from("app.ts"),
+            specifier: "./missing-module".to_string(),
+            line: 7,
+            col: 0,
+            specifier_col: 21,
+        };
+        let json = serde_json::to_value(&i).unwrap();
+        assert_eq!(json["specifier"], "./missing-module");
+        assert_eq!(json["specifier_col"], 21);
+    }
+
+    // ── deserialize: CircularDependency serde(default) fields ──
+
+    #[test]
+    fn deserialize_circular_dependency_with_defaults() {
+        // CircularDependency derives Deserialize; line/col/is_cross_package have #[serde(default)]
+        let json = r#"{"files":["a.ts","b.ts"],"length":2}"#;
+        let cd: CircularDependency = serde_json::from_str(json).unwrap();
+        assert_eq!(cd.files.len(), 2);
+        assert_eq!(cd.length, 2);
+        assert_eq!(cd.line, 0);
+        assert_eq!(cd.col, 0);
+        assert!(!cd.is_cross_package);
+    }
+
+    #[test]
+    fn deserialize_circular_dependency_with_all_fields() {
+        let json = r#"{"files":["a.ts","b.ts"],"length":2,"line":5,"col":10,"is_cross_package":true}"#;
+        let cd: CircularDependency = serde_json::from_str(json).unwrap();
+        assert_eq!(cd.line, 5);
+        assert_eq!(cd.col, 10);
+        assert!(cd.is_cross_package);
+    }
+
+    // ── clone produces independent copies ───────────────────────
+
+    #[test]
+    fn clone_results_are_independent() {
+        let mut r = AnalysisResults::default();
+        r.unused_files.push(UnusedFile {
+            path: PathBuf::from("a.ts"),
+        });
+        let mut cloned = r.clone();
+        cloned.unused_files.push(UnusedFile {
+            path: PathBuf::from("b.ts"),
+        });
+        assert_eq!(r.total_issues(), 1);
+        assert_eq!(cloned.total_issues(), 2);
+    }
+
+    // ── export_usages not counted in total_issues ───────────────
+
+    #[test]
+    fn export_usages_not_counted_in_total_issues() {
+        let mut r = AnalysisResults::default();
+        r.export_usages.push(ExportUsage {
+            path: PathBuf::from("mod.ts"),
+            export_name: "foo".to_string(),
+            line: 1,
+            col: 0,
+            reference_count: 3,
+            reference_locations: vec![],
+        });
+        // export_usages is metadata, not an issue type
+        assert_eq!(r.total_issues(), 0);
+        assert!(!r.has_issues());
+    }
+
+    // ── entry_point_summary not counted in total_issues ─────────
+
+    #[test]
+    fn entry_point_summary_not_counted_in_total_issues() {
+        let r = AnalysisResults {
+            entry_point_summary: Some(EntryPointSummary {
+                total: 10,
+                by_source: vec![("config".to_string(), 10)],
+            }),
+            ..AnalysisResults::default()
+        };
+        assert_eq!(r.total_issues(), 0);
+        assert!(!r.has_issues());
+    }
 }

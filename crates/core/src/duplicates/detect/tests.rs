@@ -1525,3 +1525,332 @@ mod proptests {
         }
     }
 }
+
+// ── Coverage improvement tests ────────────────────────────
+
+#[test]
+fn all_files_empty_tokens_returns_empty_report() {
+    // Files with zero tokens: passes the `file_data.is_empty()` check.
+    // With 2 files, concatenation inserts a sentinel between them so
+    // `text` is not empty. The pipeline runs but finds no clones.
+    // Exercises `map_or(0, ...)` None branch (no ranks to max over).
+    let detector = CloneDetector::new(3, 1, false);
+    let ft_a = make_file_tokens("", 0);
+    let ft_b = make_file_tokens("", 0);
+    let report = detector.detect(vec![
+        (PathBuf::from("a.ts"), vec![], ft_a),
+        (PathBuf::from("b.ts"), vec![], ft_b),
+    ]);
+    assert!(report.clone_groups.is_empty());
+    assert_eq!(report.stats.total_files, 2);
+    assert_eq!(report.stats.total_tokens, 0);
+    // make_file_tokens("", 0) has line_count=1, so total_lines = 2.
+    assert_eq!(report.stats.total_lines, 2);
+}
+
+#[test]
+fn single_empty_token_file_returns_empty_report() {
+    // One file with no tokens: still passes `file_data.is_empty()` (len=1)
+    // but concatenation produces empty text.
+    let detector = CloneDetector::new(3, 1, false);
+    let ft = make_file_tokens("", 0);
+    let report = detector.detect(vec![(PathBuf::from("a.ts"), vec![], ft)]);
+    assert!(report.clone_groups.is_empty());
+    assert_eq!(report.stats.total_files, 1);
+}
+
+#[test]
+fn mixed_empty_and_nonempty_files() {
+    // One file with tokens, one without. Exercises accumulation where some
+    // files contribute 0 to total_lines/total_tokens.
+    let detector = CloneDetector::new(3, 1, false);
+    let hashes = vec![10, 20, 30, 40, 50];
+    let source = "a\nb\nc\nd\ne";
+    let report = detector.detect(vec![
+        (
+            PathBuf::from("a.ts"),
+            make_hashed_tokens(&hashes),
+            make_file_tokens(source, 5),
+        ),
+        (PathBuf::from("b.ts"), vec![], make_file_tokens("", 0)),
+    ]);
+    // No clones because only one file has tokens.
+    assert!(report.clone_groups.is_empty());
+    assert_eq!(report.stats.total_files, 2);
+    assert_eq!(report.stats.total_tokens, 5);
+    // make_file_tokens("", 0) has line_count=1 (min 1), so 5 + 1 = 6.
+    assert_eq!(report.stats.total_lines, 6);
+}
+
+#[test]
+fn min_lines_filters_short_clones() {
+    // Two identical files but with min_lines set high enough to filter out
+    // the detected clones. This exercises the `build_groups` min_lines filter
+    // path through the full detector pipeline.
+    let detector = CloneDetector::new(3, 10, false);
+    let hashes = vec![10, 20, 30];
+    // Source is only 3 lines, so clone spans < 10 lines.
+    let source = "aa\nbb\ncc";
+    let report = detector.detect(vec![
+        (
+            PathBuf::from("a.ts"),
+            make_hashed_tokens(&hashes),
+            make_file_tokens(source, 3),
+        ),
+        (
+            PathBuf::from("b.ts"),
+            make_hashed_tokens(&hashes),
+            make_file_tokens(source, 3),
+        ),
+    ]);
+    assert!(
+        report.clone_groups.is_empty(),
+        "Clones spanning fewer lines than min_lines should be filtered"
+    );
+}
+
+#[test]
+fn min_lines_allows_long_enough_clones() {
+    // Verify that clones meeting the min_lines threshold are retained.
+    let detector = CloneDetector::new(3, 3, false);
+    let hashes = vec![10, 20, 30, 40, 50];
+    // 5 lines, so clone should span >= 3 lines.
+    let source = "a\nb\nc\nd\ne";
+    let report = detector.detect(vec![
+        (
+            PathBuf::from("a.ts"),
+            make_hashed_tokens(&hashes),
+            make_file_tokens(source, 5),
+        ),
+        (
+            PathBuf::from("b.ts"),
+            make_hashed_tokens(&hashes),
+            make_file_tokens(source, 5),
+        ),
+    ]);
+    assert!(
+        !report.clone_groups.is_empty(),
+        "Clones meeting min_lines should be retained"
+    );
+}
+
+#[test]
+fn many_files_with_shared_prefix() {
+    // 5 files that share the first 4 tokens but differ in the last.
+    // Exercises the pipeline with multiple files, cross-file grouping, and
+    // stats accumulation.
+    let detector = CloneDetector::new(3, 1, false);
+    let data: Vec<(PathBuf, Vec<HashedToken>, FileTokens)> = (0..5)
+        .map(|i| {
+            let mut hashes: Vec<u64> = vec![10, 20, 30, 40];
+            hashes.push(100 + i); // unique suffix per file
+            let source = "a\nb\nc\nd\ne";
+            (
+                PathBuf::from(format!("dir{i}/file.ts")),
+                make_hashed_tokens(&hashes),
+                make_file_tokens(source, 5),
+            )
+        })
+        .collect();
+
+    let report = detector.detect(data);
+    assert!(!report.clone_groups.is_empty());
+    assert_eq!(report.stats.total_files, 5);
+    assert_eq!(report.stats.total_tokens, 25);
+    assert_eq!(report.stats.total_lines, 25);
+    // The largest group should have at least 4 tokens (the shared prefix).
+    let max_tokens = report
+        .clone_groups
+        .iter()
+        .map(|g| g.token_count)
+        .max()
+        .unwrap_or(0);
+    assert!(max_tokens >= 4);
+}
+
+#[test]
+fn three_empty_files_early_return() {
+    // Multiple empty-token files: concatenation inserts sentinels between them
+    // so text is non-empty. The pipeline runs but finds no clones.
+    let detector = CloneDetector::new(5, 1, false);
+    let data: Vec<(PathBuf, Vec<HashedToken>, FileTokens)> = (0..3)
+        .map(|i| {
+            (
+                PathBuf::from(format!("f{i}.ts")),
+                vec![],
+                make_file_tokens("", 0),
+            )
+        })
+        .collect();
+    let report = detector.detect(data);
+    assert!(report.clone_groups.is_empty());
+    assert_eq!(report.stats.total_files, 3);
+    assert_eq!(report.stats.total_tokens, 0);
+    // Each file has line_count=1 (min 1), so 3 total.
+    assert_eq!(report.stats.total_lines, 3);
+    assert!((report.stats.duplication_percentage - 0.0).abs() < f64::EPSILON);
+}
+
+#[test]
+fn skip_local_with_root_level_files() {
+    // Files with no parent directory (root-level). When skip_local is true,
+    // files at root level have empty-string parent, exercising the `filter_map`
+    // branch in the skip_local logic.
+    let detector = CloneDetector::new(3, 1, true);
+    let hashes = vec![10, 20, 30, 40, 50];
+    let source = "a\nb\nc\nd\ne";
+    let report = detector.detect(vec![
+        (
+            PathBuf::from("a.ts"),
+            make_hashed_tokens(&hashes),
+            make_file_tokens(source, 5),
+        ),
+        (
+            PathBuf::from("b.ts"),
+            make_hashed_tokens(&hashes),
+            make_file_tokens(source, 5),
+        ),
+    ]);
+    // Root-level files have empty parent (""), so all in same "directory" -> filtered.
+    assert!(
+        report.clone_groups.is_empty(),
+        "Root-level files with skip_local should be filtered (same implicit directory)"
+    );
+}
+
+#[test]
+fn partial_overlap_between_two_files() {
+    // Two files that share a middle portion but differ at start and end.
+    let detector = CloneDetector::new(3, 1, false);
+    let hashes_a: Vec<u64> = vec![1, 2, 10, 20, 30, 40, 7, 8];
+    let hashes_b: Vec<u64> = vec![3, 4, 10, 20, 30, 40, 9, 11];
+    let source = "a\nb\nc\nd\ne\nf\ng\nh";
+    let report = detector.detect(vec![
+        (
+            PathBuf::from("a.ts"),
+            make_hashed_tokens(&hashes_a),
+            make_file_tokens(source, 8),
+        ),
+        (
+            PathBuf::from("b.ts"),
+            make_hashed_tokens(&hashes_b),
+            make_file_tokens(source, 8),
+        ),
+    ]);
+    assert!(!report.clone_groups.is_empty());
+    // The shared block [10,20,30,40] should be detected.
+    let has_shared = report.clone_groups.iter().any(|g| g.token_count >= 4);
+    assert!(has_shared, "Should detect the shared [10,20,30,40] block");
+}
+
+#[test]
+fn report_clone_families_and_mirrored_directories_empty() {
+    // Verify that the report always has empty clone_families and
+    // mirrored_directories (they are populated by the caller).
+    let detector = CloneDetector::new(3, 1, false);
+    let hashes = vec![10, 20, 30, 40, 50];
+    let source = "a\nb\nc\nd\ne";
+    let report = detector.detect(vec![
+        (
+            PathBuf::from("a.ts"),
+            make_hashed_tokens(&hashes),
+            make_file_tokens(source, 5),
+        ),
+        (
+            PathBuf::from("b.ts"),
+            make_hashed_tokens(&hashes),
+            make_file_tokens(source, 5),
+        ),
+    ]);
+    assert!(report.clone_families.is_empty());
+    assert!(report.mirrored_directories.is_empty());
+}
+
+#[test]
+fn large_min_tokens_no_clones() {
+    // min_tokens larger than any file's token count. Files are non-empty
+    // so we pass the empty checks, but extraction produces no groups.
+    let detector = CloneDetector::new(100, 1, false);
+    let hashes = vec![10, 20, 30];
+    let source = "a\nb\nc";
+    let report = detector.detect(vec![
+        (
+            PathBuf::from("a.ts"),
+            make_hashed_tokens(&hashes),
+            make_file_tokens(source, 3),
+        ),
+        (
+            PathBuf::from("b.ts"),
+            make_hashed_tokens(&hashes),
+            make_file_tokens(source, 3),
+        ),
+    ]);
+    assert!(report.clone_groups.is_empty());
+    assert_eq!(report.stats.total_files, 2);
+    assert_eq!(report.stats.total_tokens, 6);
+}
+
+#[test]
+fn unique_ranks_computation_single_file() {
+    // One file with tokens exercises `unique_ranks` map_or with Some.
+    let detector = CloneDetector::new(3, 1, false);
+    let hashes = vec![10, 20, 30];
+    let source = "a\nb\nc";
+    let report = detector.detect(vec![(
+        PathBuf::from("a.ts"),
+        make_hashed_tokens(&hashes),
+        make_file_tokens(source, 3),
+    )]);
+    // Single file, no clones possible.
+    assert!(report.clone_groups.is_empty());
+    assert_eq!(report.stats.total_files, 1);
+}
+
+#[test]
+fn skip_local_false_keeps_same_directory() {
+    // Opposite of skip_local_filters_same_directory: when skip_local is false,
+    // same-directory clones should be kept.
+    let detector = CloneDetector::new(3, 1, false);
+    let hashes = vec![10, 20, 30, 40, 50];
+    let source = "a\nb\nc\nd\ne";
+    let report = detector.detect(vec![
+        (
+            PathBuf::from("src/a.ts"),
+            make_hashed_tokens(&hashes),
+            make_file_tokens(source, 5),
+        ),
+        (
+            PathBuf::from("src/b.ts"),
+            make_hashed_tokens(&hashes),
+            make_file_tokens(source, 5),
+        ),
+    ]);
+    assert!(
+        !report.clone_groups.is_empty(),
+        "Same-directory clones should be kept when skip_local is false"
+    );
+}
+
+#[test]
+fn stats_duplication_percentage_within_bounds() {
+    // Verify duplication_percentage is always in [0.0, 100.0] for various configs.
+    for min_tokens in [1, 3, 5] {
+        let detector = CloneDetector::new(min_tokens, 1, false);
+        let hashes: Vec<u64> = (1..=10).collect();
+        let source = "a\nb\nc\nd\ne\nf\ng\nh\ni\nj";
+        let report = detector.detect(vec![
+            (
+                PathBuf::from("dir_a/a.ts"),
+                make_hashed_tokens(&hashes),
+                make_file_tokens(source, 10),
+            ),
+            (
+                PathBuf::from("dir_b/b.ts"),
+                make_hashed_tokens(&hashes),
+                make_file_tokens(source, 10),
+            ),
+        ]);
+        assert!(report.stats.duplication_percentage >= 0.0);
+        assert!(report.stats.duplication_percentage <= 100.0);
+    }
+}

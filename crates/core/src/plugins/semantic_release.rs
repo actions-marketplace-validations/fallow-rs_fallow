@@ -69,3 +69,123 @@ impl Plugin for SemanticReleasePlugin {
         result
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_config_plugins_shallow_strings() {
+        let source = r#"
+            module.exports = {
+                plugins: [
+                    "@semantic-release/commit-analyzer",
+                    "@semantic-release/release-notes-generator",
+                    "@semantic-release/npm",
+                    "@semantic-release/github"
+                ]
+            };
+        "#;
+        let plugin = SemanticReleasePlugin;
+        let result = plugin.resolve_config(
+            Path::new("release.config.js"),
+            source,
+            Path::new("/project"),
+        );
+        let deps = &result.referenced_dependencies;
+        assert!(deps.contains(&"@semantic-release/commit-analyzer".to_string()));
+        assert!(deps.contains(&"@semantic-release/release-notes-generator".to_string()));
+        assert!(deps.contains(&"@semantic-release/npm".to_string()));
+        assert!(deps.contains(&"@semantic-release/github".to_string()));
+    }
+
+    #[test]
+    fn resolve_config_plugins_with_options_skipped() {
+        // Shallow extraction should pick up string elements but skip array/object elements
+        let source = r#"
+            module.exports = {
+                plugins: [
+                    "@semantic-release/commit-analyzer",
+                    ["@semantic-release/release-notes-generator", { preset: "angular" }],
+                    "@semantic-release/npm"
+                ]
+            };
+        "#;
+        let plugin = SemanticReleasePlugin;
+        let result = plugin.resolve_config(
+            Path::new("release.config.js"),
+            source,
+            Path::new("/project"),
+        );
+        let deps = &result.referenced_dependencies;
+        assert!(deps.contains(&"@semantic-release/commit-analyzer".to_string()));
+        assert!(deps.contains(&"@semantic-release/npm".to_string()));
+    }
+
+    #[test]
+    fn resolve_config_imports() {
+        let source = r#"
+            import { createConfig } from 'semantic-release';
+            module.exports = {
+                plugins: ["@semantic-release/npm"]
+            };
+        "#;
+        let plugin = SemanticReleasePlugin;
+        let result = plugin.resolve_config(
+            Path::new("release.config.mjs"),
+            source,
+            Path::new("/project"),
+        );
+        let deps = &result.referenced_dependencies;
+        assert!(deps.contains(&"semantic-release".to_string()));
+        assert!(deps.contains(&"@semantic-release/npm".to_string()));
+    }
+
+    #[test]
+    fn resolve_config_empty() {
+        let source = r"module.exports = {};";
+        let plugin = SemanticReleasePlugin;
+        let result = plugin.resolve_config(
+            Path::new("release.config.js"),
+            source,
+            Path::new("/project"),
+        );
+        assert!(result.referenced_dependencies.is_empty());
+    }
+
+    #[test]
+    fn resolve_config_no_plugins() {
+        let source = r#"
+            module.exports = {
+                branches: ["main", "next"]
+            };
+        "#;
+        let plugin = SemanticReleasePlugin;
+        let result = plugin.resolve_config(
+            Path::new("release.config.js"),
+            source,
+            Path::new("/project"),
+        );
+        assert!(result.referenced_dependencies.is_empty());
+    }
+
+    #[test]
+    fn resolve_config_scoped_plugin_name() {
+        let source = r#"
+            module.exports = {
+                plugins: ["@semantic-release/git"]
+            };
+        "#;
+        let plugin = SemanticReleasePlugin;
+        let result = plugin.resolve_config(
+            Path::new("release.config.cjs"),
+            source,
+            Path::new("/project"),
+        );
+        assert!(
+            result
+                .referenced_dependencies
+                .contains(&"@semantic-release/git".to_string())
+        );
+    }
+}

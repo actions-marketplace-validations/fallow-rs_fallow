@@ -766,6 +766,7 @@ dependencies = [
  "bitcode",
  "oxc_span",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

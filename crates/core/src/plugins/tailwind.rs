@@ -83,3 +83,157 @@ impl Plugin for TailwindPlugin {
         result
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_config_content_globs() {
+        let source = r#"
+            module.exports = {
+                content: ["./src/**/*.{js,ts,jsx,tsx}", "./index.html"]
+            };
+        "#;
+        let plugin = TailwindPlugin;
+        let result = plugin.resolve_config(
+            Path::new("tailwind.config.js"),
+            source,
+            Path::new("/project"),
+        );
+        assert_eq!(
+            result.always_used_files,
+            vec!["./src/**/*.{js,ts,jsx,tsx}", "./index.html"]
+        );
+    }
+
+    #[test]
+    fn resolve_config_plugins_require() {
+        let source = r#"
+            module.exports = {
+                plugins: [require("@tailwindcss/typography"), require("@tailwindcss/forms")]
+            };
+        "#;
+        let plugin = TailwindPlugin;
+        let result = plugin.resolve_config(
+            Path::new("tailwind.config.js"),
+            source,
+            Path::new("/project"),
+        );
+        let deps = &result.referenced_dependencies;
+        assert!(deps.contains(&"@tailwindcss/typography".to_string()));
+        assert!(deps.contains(&"@tailwindcss/forms".to_string()));
+    }
+
+    #[test]
+    fn resolve_config_plugins_string_array() {
+        let source = r#"
+            module.exports = {
+                plugins: ["@tailwindcss/typography", "@tailwindcss/forms"]
+            };
+        "#;
+        let plugin = TailwindPlugin;
+        let result = plugin.resolve_config(
+            Path::new("tailwind.config.js"),
+            source,
+            Path::new("/project"),
+        );
+        let deps = &result.referenced_dependencies;
+        assert!(deps.contains(&"@tailwindcss/typography".to_string()));
+        assert!(deps.contains(&"@tailwindcss/forms".to_string()));
+    }
+
+    #[test]
+    fn resolve_config_presets() {
+        let source = r#"
+            module.exports = {
+                presets: ["@acme/tailwind-preset", "my-preset"]
+            };
+        "#;
+        let plugin = TailwindPlugin;
+        let result = plugin.resolve_config(
+            Path::new("tailwind.config.js"),
+            source,
+            Path::new("/project"),
+        );
+        let deps = &result.referenced_dependencies;
+        assert!(deps.contains(&"@acme/tailwind-preset".to_string()));
+        assert!(deps.contains(&"my-preset".to_string()));
+    }
+
+    #[test]
+    fn resolve_config_imports() {
+        let source = r#"
+            import defaultTheme from 'tailwindcss/defaultTheme';
+            import forms from '@tailwindcss/forms';
+            module.exports = {
+                content: ["./src/**/*.tsx"]
+            };
+        "#;
+        let plugin = TailwindPlugin;
+        let result = plugin.resolve_config(
+            Path::new("tailwind.config.ts"),
+            source,
+            Path::new("/project"),
+        );
+        let deps = &result.referenced_dependencies;
+        assert!(deps.contains(&"tailwindcss".to_string()));
+        assert!(deps.contains(&"@tailwindcss/forms".to_string()));
+    }
+
+    #[test]
+    fn resolve_config_combined() {
+        let source = r#"
+            import defaultTheme from 'tailwindcss/defaultTheme';
+            module.exports = {
+                content: ["./src/**/*.tsx"],
+                plugins: [require("@tailwindcss/typography")],
+                presets: ["my-preset"]
+            };
+        "#;
+        let plugin = TailwindPlugin;
+        let result = plugin.resolve_config(
+            Path::new("tailwind.config.js"),
+            source,
+            Path::new("/project"),
+        );
+        assert_eq!(result.always_used_files, vec!["./src/**/*.tsx"]);
+        let deps = &result.referenced_dependencies;
+        assert!(deps.contains(&"tailwindcss".to_string()));
+        assert!(deps.contains(&"@tailwindcss/typography".to_string()));
+        assert!(deps.contains(&"my-preset".to_string()));
+    }
+
+    #[test]
+    fn resolve_config_empty() {
+        let source = r"module.exports = {};";
+        let plugin = TailwindPlugin;
+        let result = plugin.resolve_config(
+            Path::new("tailwind.config.js"),
+            source,
+            Path::new("/project"),
+        );
+        assert!(result.always_used_files.is_empty());
+        assert!(result.referenced_dependencies.is_empty());
+    }
+
+    #[test]
+    fn resolve_config_scoped_package_in_plugins() {
+        let source = r#"
+            module.exports = {
+                plugins: [require("@scope/plugin/nested")]
+            };
+        "#;
+        let plugin = TailwindPlugin;
+        let result = plugin.resolve_config(
+            Path::new("tailwind.config.js"),
+            source,
+            Path::new("/project"),
+        );
+        assert!(
+            result
+                .referenced_dependencies
+                .contains(&"@scope/plugin".to_string())
+        );
+    }
+}
