@@ -1417,6 +1417,7 @@ fn specifier_pascal_scope_alias_returns_unresolvable() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore)] // oxc_resolver uses statx syscall unsupported by Miri
 fn specifier_plugin_alias_match_returns_unresolvable() {
     // Plugin-provided path aliases that fail resolution should also be Unresolvable
     let resolver = specifier::create_resolver(&[]);
@@ -1558,15 +1559,18 @@ fn specifier_at_at_slash_returns_unresolvable() {
 
 // -----------------------------------------------------------------------
 // create_resolver: React Native plugin configuration
+// oxc_resolver uses statx syscall unsupported by Miri — skip all.
 // -----------------------------------------------------------------------
 
 #[test]
+#[cfg_attr(miri, ignore)]
 fn create_resolver_without_plugins() {
     // Should create a resolver without panicking
     let _resolver = specifier::create_resolver(&[]);
 }
 
 #[test]
+#[cfg_attr(miri, ignore)]
 fn create_resolver_with_react_native_plugin() {
     // Should create a resolver with RN extensions without panicking
     let plugins = vec!["react-native".to_string()];
@@ -1574,12 +1578,14 @@ fn create_resolver_with_react_native_plugin() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore)]
 fn create_resolver_with_expo_plugin() {
     let plugins = vec!["expo".to_string()];
     let _resolver = specifier::create_resolver(&plugins);
 }
 
 #[test]
+#[cfg_attr(miri, ignore)]
 fn create_resolver_with_multiple_plugins() {
     let plugins = vec![
         "react-native".to_string(),
