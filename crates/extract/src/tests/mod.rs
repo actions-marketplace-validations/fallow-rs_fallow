@@ -2,6 +2,7 @@ mod astro;
 mod css;
 mod js_ts;
 mod mdx;
+mod regex_compile;
 mod sfc;
 
 use std::path::Path;
