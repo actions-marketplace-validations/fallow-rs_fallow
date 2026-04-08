@@ -164,6 +164,19 @@ impl PackageJson {
         entries
     }
 
+    /// Extract unique subdirectory names referenced by the `exports` field keys.
+    ///
+    /// For exports like `"./compat": { ... }`, `"./hooks/client": { ... }`,
+    /// this returns `["compat", "hooks"]`. Used to discover sub-packages in
+    /// projects that define their internal package structure via the exports map
+    /// (e.g., preact with `compat/`, `hooks/`, `debug/` sub-packages).
+    #[must_use]
+    pub fn exports_subdirectories(&self) -> Vec<String> {
+        self.exports
+            .as_ref()
+            .map_or_else(Vec::new, extract_exports_subdirectories)
+    }
+
     /// Extract workspace patterns from package.json.
     #[must_use]
     pub fn workspace_patterns(&self) -> Vec<String> {
@@ -184,6 +197,36 @@ impl PackageJson {
             _ => Vec::new(),
         }
     }
+}
+
+/// Extract unique subdirectory names referenced by the `exports` field keys.
+///
+/// For exports like `"./compat": { ... }`, `"./hooks/client": { ... }`,
+/// this returns `["compat", "hooks"]`. Used to discover sub-packages in
+/// projects that use the exports map to define their internal package structure
+/// (e.g., preact with `compat/`, `hooks/`, `debug/` sub-packages).
+fn extract_exports_subdirectories(exports: &serde_json::Value) -> Vec<String> {
+    let Some(map) = exports.as_object() else {
+        return Vec::new();
+    };
+
+    let skip_dirs = ["dist", "build", "out", "esm", "cjs", "lib", "node_modules"];
+    let mut dirs = rustc_hash::FxHashSet::default();
+
+    for key in map.keys() {
+        // Keys are like "./compat", "./hooks/client", "."
+        let stripped = key.strip_prefix("./").unwrap_or(key);
+        if let Some(first_segment) = stripped.split('/').next()
+            && !first_segment.is_empty()
+            && first_segment != "."
+            && first_segment != "package.json"
+            && !skip_dirs.contains(&first_segment)
+        {
+            dirs.insert(first_segment.to_owned());
+        }
+    }
+
+    dirs.into_iter().collect()
 }
 
 /// Recursively extract file paths from package.json exports field.
@@ -629,5 +672,58 @@ mod tests {
         assert!(pkg.entry_points().is_empty());
         assert!(pkg.all_dependency_names().is_empty());
         assert!(pkg.workspace_patterns().is_empty());
+    }
+
+    // ── Exports subdirectories ─────────────────────────────────────
+
+    #[test]
+    fn exports_subdirectories_preact_style() {
+        let pkg: PackageJson = serde_json::from_str(
+            r#"{
+            "exports": {
+                ".": "./dist/index.js",
+                "./compat": { "import": "./compat/dist/compat.mjs" },
+                "./hooks": { "import": "./hooks/dist/hooks.mjs" },
+                "./debug": { "import": "./debug/dist/debug.mjs" },
+                "./jsx-runtime": { "import": "./jsx-runtime/dist/jsx.mjs" },
+                "./package.json": "./package.json"
+            }
+        }"#,
+        )
+        .unwrap();
+        let mut dirs = pkg.exports_subdirectories();
+        dirs.sort();
+        assert_eq!(dirs, vec!["compat", "debug", "hooks", "jsx-runtime"]);
+    }
+
+    #[test]
+    fn exports_subdirectories_skips_dist_dirs() {
+        let pkg: PackageJson = serde_json::from_str(
+            r#"{
+            "exports": {
+                "./dist/index.js": "./dist/index.js",
+                "./build/bundle.js": "./build/bundle.js",
+                "./lib/utils": "./lib/utils.js",
+                "./compat": "./compat/index.js"
+            }
+        }"#,
+        )
+        .unwrap();
+        let dirs = pkg.exports_subdirectories();
+        // dist, build, lib are skipped
+        assert_eq!(dirs, vec!["compat"]);
+    }
+
+    #[test]
+    fn exports_subdirectories_no_exports() {
+        let pkg: PackageJson = serde_json::from_str(r#"{"main": "index.js"}"#).unwrap();
+        assert!(pkg.exports_subdirectories().is_empty());
+    }
+
+    #[test]
+    fn exports_subdirectories_dot_only() {
+        let pkg: PackageJson =
+            serde_json::from_str(r#"{"exports": {".": "./dist/index.js"}}"#).unwrap();
+        assert!(pkg.exports_subdirectories().is_empty());
     }
 }

@@ -273,7 +273,8 @@ pub fn discover_entry_points(config: &ResolvedConfig, files: &[DiscoveredFile]) 
     // Pre-compute canonical root once for all resolve_entry_path calls
     let canonical_root = dunce::canonicalize(&config.root).unwrap_or_else(|_| config.root.clone());
     let pkg_path = config.root.join("package.json");
-    if let Ok(pkg) = PackageJson::load(&pkg_path) {
+    let root_pkg = PackageJson::load(&pkg_path).ok();
+    if let Some(pkg) = &root_pkg {
         for entry_path in pkg.entry_points() {
             if let Some(ep) = resolve_entry_path(
                 &config.root,
@@ -307,7 +308,16 @@ pub fn discover_entry_points(config: &ResolvedConfig, files: &[DiscoveredFile]) 
     // 4. Auto-discover nested package.json entry points
     // For monorepo-like structures without explicit workspace config, scan for
     // package.json files in subdirectories and use their main/exports as entries.
-    discover_nested_package_entries(&config.root, files, &mut entries, &canonical_root);
+    let exports_dirs = root_pkg
+        .map(|pkg| pkg.exports_subdirectories())
+        .unwrap_or_default();
+    discover_nested_package_entries(
+        &config.root,
+        files,
+        &mut entries,
+        &canonical_root,
+        &exports_dirs,
+    );
 
     // 5. Default index files (if no other entries found)
     if entries.is_empty() {
@@ -323,16 +333,23 @@ pub fn discover_entry_points(config: &ResolvedConfig, files: &[DiscoveredFile]) 
 
 /// Discover entry points from nested package.json files in subdirectories.
 ///
-/// When a project has subdirectories with their own package.json (e.g., `packages/foo/package.json`),
-/// the `main`, `module`, `exports`, and `bin` fields of those package.json files should be treated
-/// as entry points. This handles monorepos without explicit workspace configuration.
+/// Scans two sources for sub-packages:
+/// 1. Common monorepo directory patterns (`packages/`, `apps/`, `libs/`, etc.)
+/// 2. Directories derived from the root package.json `exports` map keys
+///    (e.g., `"./compat": {...}` implies `compat/` may be a sub-package)
+///
+/// For each discovered sub-package with a `package.json`, the `main`, `module`,
+/// `source`, `exports`, and `bin` fields are treated as entry points.
 fn discover_nested_package_entries(
     root: &Path,
     _files: &[DiscoveredFile],
     entries: &mut Vec<EntryPoint>,
     canonical_root: &Path,
+    exports_subdirectories: &[String],
 ) {
-    // Walk common monorepo patterns to find nested package.json files
+    let mut visited = rustc_hash::FxHashSet::default();
+
+    // 1. Walk common monorepo patterns
     let search_dirs = [
         "packages", "apps", "libs", "modules", "plugins", "services", "tools", "utils",
     ];
@@ -345,37 +362,55 @@ fn discover_nested_package_entries(
             continue;
         };
         for entry in read_dir.flatten() {
-            let pkg_path = entry.path().join("package.json");
-            if !pkg_path.exists() {
-                continue;
-            }
-            let Ok(pkg) = PackageJson::load(&pkg_path) else {
-                continue;
-            };
             let pkg_dir = entry.path();
-            for entry_path in pkg.entry_points() {
+            if visited.insert(pkg_dir.clone()) {
+                collect_nested_package_entries(&pkg_dir, entries, canonical_root);
+            }
+        }
+    }
+
+    // 2. Scan directories derived from the root exports map
+    for dir_name in exports_subdirectories {
+        let pkg_dir = root.join(dir_name);
+        if pkg_dir.is_dir() && visited.insert(pkg_dir.clone()) {
+            collect_nested_package_entries(&pkg_dir, entries, canonical_root);
+        }
+    }
+}
+
+/// Collect entry points from a single sub-package directory.
+fn collect_nested_package_entries(
+    pkg_dir: &Path,
+    entries: &mut Vec<EntryPoint>,
+    canonical_root: &Path,
+) {
+    let pkg_path = pkg_dir.join("package.json");
+    if !pkg_path.exists() {
+        return;
+    }
+    let Ok(pkg) = PackageJson::load(&pkg_path) else {
+        return;
+    };
+    for entry_path in pkg.entry_points() {
+        if let Some(ep) = resolve_entry_path(
+            pkg_dir,
+            &entry_path,
+            canonical_root,
+            EntryPointSource::PackageJsonExports,
+        ) {
+            entries.push(ep);
+        }
+    }
+    if let Some(scripts) = &pkg.scripts {
+        for script_value in scripts.values() {
+            for file_ref in extract_script_file_refs(script_value) {
                 if let Some(ep) = resolve_entry_path(
-                    &pkg_dir,
-                    &entry_path,
+                    pkg_dir,
+                    &file_ref,
                     canonical_root,
-                    EntryPointSource::PackageJsonExports,
+                    EntryPointSource::PackageJsonScript,
                 ) {
                     entries.push(ep);
-                }
-            }
-            // Also check scripts in nested package.json
-            if let Some(scripts) = &pkg.scripts {
-                for script_value in scripts.values() {
-                    for file_ref in extract_script_file_refs(script_value) {
-                        if let Some(ep) = resolve_entry_path(
-                            &pkg_dir,
-                            &file_ref,
-                            canonical_root,
-                            EntryPointSource::PackageJsonScript,
-                        ) {
-                            entries.push(ep);
-                        }
-                    }
                 }
             }
         }
