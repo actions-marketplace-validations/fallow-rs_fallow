@@ -24,12 +24,16 @@ pub(super) fn build_suffix_array(text: &[i64]) -> Vec<usize> {
     let mut k: usize = 1;
     let mut iterations = 0u32;
 
-    // Scratch buffers for radix sort (reused across iterations).
+    // Scratch buffers reused across all iterations to avoid per-iteration allocations.
     let mut sa_tmp: Vec<usize> = vec![0; n];
+    let mut counts: Vec<usize> = Vec::new();
+
+    // Track max rank across iterations: the rank update already computes it
+    // as tmp[sa[n-1]], so we only need the initial scan once.
+    let mut max_rank = rank.iter().copied().max().unwrap_or(0) as usize;
 
     while k < n {
         iterations += 1;
-        let max_rank = rank.iter().copied().max().unwrap_or(0) as usize;
 
         // Two-pass radix sort: sort by secondary key (rank[i+k]) first,
         // then by primary key (rank[i]). Each pass is O(N + K) where
@@ -37,7 +41,8 @@ pub(super) fn build_suffix_array(text: &[i64]) -> Vec<usize> {
         let bucket_count = max_rank + 2; // ranks 0..=max_rank plus -1 mapped to 0
 
         // Pass 1: sort by secondary key (rank at offset k).
-        let mut counts = vec![0usize; bucket_count + 1];
+        counts.clear();
+        counts.resize(bucket_count + 1, 0);
         for &i in &sa {
             let r2 = if i + k < n {
                 rank[i + k] as usize + 1
@@ -106,6 +111,8 @@ pub(super) fn build_suffix_array(text: &[i64]) -> Vec<usize> {
             break;
         }
 
+        // Carry forward max rank for next iteration (avoids O(n) rescan).
+        max_rank = new_max_rank as usize;
         k *= 2;
     }
 
