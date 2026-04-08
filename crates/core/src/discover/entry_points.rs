@@ -93,6 +93,12 @@ pub fn resolve_entry_path(
     canonical_root: &Path,
     source: EntryPointSource,
 ) -> Option<EntryPoint> {
+    // Wildcard exports (e.g., `./src/themes/*.css`) can't be resolved to a single
+    // file. Return None and let the caller expand them separately.
+    if entry.contains('*') {
+        return None;
+    }
+
     let resolved = base.join(entry);
     // Security: ensure resolved path stays within the allowed root
     let canonical_resolved = dunce::canonicalize(&resolved).unwrap_or_else(|_| resolved.clone());
@@ -392,7 +398,9 @@ fn collect_nested_package_entries(
         return;
     };
     for entry_path in pkg.entry_points() {
-        if let Some(ep) = resolve_entry_path(
+        if entry_path.contains('*') {
+            expand_wildcard_entries(pkg_dir, &entry_path, canonical_root, entries);
+        } else if let Some(ep) = resolve_entry_path(
             pkg_dir,
             &entry_path,
             canonical_root,
@@ -417,6 +425,36 @@ fn collect_nested_package_entries(
     }
 }
 
+/// Expand wildcard subpath exports to matching files on disk.
+///
+/// Handles patterns like `./src/themes/*.css` from package.json exports maps
+/// (`"./themes/*": { "import": "./src/themes/*.css" }`). Expands the `*` to
+/// match actual files in the target directory.
+fn expand_wildcard_entries(
+    base: &Path,
+    pattern: &str,
+    canonical_root: &Path,
+    entries: &mut Vec<EntryPoint>,
+) {
+    let full_pattern = base.join(pattern).to_string_lossy().to_string();
+    let Ok(matches) = glob::glob(&full_pattern) else {
+        return;
+    };
+    for path_result in matches {
+        let Ok(path) = path_result else {
+            continue;
+        };
+        if let Ok(canonical) = dunce::canonicalize(&path)
+            && canonical.starts_with(canonical_root)
+        {
+            entries.push(EntryPoint {
+                path,
+                source: EntryPointSource::PackageJsonExports,
+            });
+        }
+    }
+}
+
 /// Discover entry points for a workspace package.
 #[must_use]
 pub fn discover_workspace_entry_points(
@@ -431,7 +469,9 @@ pub fn discover_workspace_entry_points(
         let canonical_ws_root =
             dunce::canonicalize(ws_root).unwrap_or_else(|_| ws_root.to_path_buf());
         for entry_path in pkg.entry_points() {
-            if let Some(ep) = resolve_entry_path(
+            if entry_path.contains('*') {
+                expand_wildcard_entries(ws_root, &entry_path, &canonical_ws_root, &mut entries);
+            } else if let Some(ep) = resolve_entry_path(
                 ws_root,
                 &entry_path,
                 &canonical_ws_root,
