@@ -250,8 +250,11 @@ jobs:
       - name: fallow-graph
         run: cargo +"$MIRI_TOOLCHAIN" miri test -p fallow-graph --lib --tests -- --skip proptests
 
+      # Only suppress, css, and visitor/helpers run under Miri (pure data logic).
+      # Parser-heavy modules (visitor::tests, sfc_template, html, template_usage)
+      # have no unsafe code and are too slow under Miri interpretation.
       - name: fallow-extract
-        run: cargo +"$MIRI_TOOLCHAIN" miri test -p fallow-extract --lib --tests -- --skip cache
+        run: cargo +"$MIRI_TOOLCHAIN" miri test -p fallow-extract --lib --tests -- --skip cache --skip visitor::tests --skip sfc_template --skip html --skip template_usage
 
   ci-ok:
     name: CI
