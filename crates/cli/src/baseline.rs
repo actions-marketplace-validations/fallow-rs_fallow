@@ -1093,4 +1093,283 @@ mod tests {
             super::circular_dep_key(&dep_cab),
         );
     }
+
+    // ── filter_new_issues: extended issue types ────────────────
+
+    fn make_full_results() -> AnalysisResults {
+        use fallow_core::extract::MemberKind;
+        use fallow_core::results::*;
+
+        let mut r = make_results();
+        r.circular_dependencies.push(CircularDependency {
+            files: vec![PathBuf::from("src/a.ts"), PathBuf::from("src/b.ts")],
+            length: 2,
+            line: 1,
+            col: 0,
+            is_cross_package: false,
+        });
+        r.unused_optional_dependencies.push(UnusedDependency {
+            package_name: "fsevents".to_string(),
+            location: DependencyLocation::OptionalDependencies,
+            path: PathBuf::from("package.json"),
+            line: 15,
+        });
+        r.unused_enum_members.push(UnusedMember {
+            path: PathBuf::from("src/enums.ts"),
+            parent_name: "Status".to_string(),
+            member_name: "Deprecated".to_string(),
+            kind: MemberKind::EnumMember,
+            line: 8,
+            col: 0,
+        });
+        r.unused_class_members.push(UnusedMember {
+            path: PathBuf::from("src/service.ts"),
+            parent_name: "UserService".to_string(),
+            member_name: "legacy".to_string(),
+            kind: MemberKind::ClassMethod,
+            line: 42,
+            col: 0,
+        });
+        r.unresolved_imports.push(fallow_core::results::UnresolvedImport {
+            path: PathBuf::from("src/app.ts"),
+            specifier: "./missing".to_string(),
+            line: 3,
+            col: 0,
+            specifier_col: 0,
+        });
+        r.unlisted_dependencies
+            .push(fallow_core::results::UnlistedDependency {
+                package_name: "chalk".to_string(),
+                imported_from: vec![],
+            });
+        r.duplicate_exports
+            .push(fallow_core::results::DuplicateExport {
+                export_name: "Config".to_string(),
+                locations: vec![
+                    fallow_core::results::DuplicateLocation {
+                        path: PathBuf::from("src/a.ts"),
+                        line: 1,
+                        col: 0,
+                    },
+                    fallow_core::results::DuplicateLocation {
+                        path: PathBuf::from("src/b.ts"),
+                        line: 5,
+                        col: 0,
+                    },
+                ],
+            });
+        r.type_only_dependencies
+            .push(fallow_core::results::TypeOnlyDependency {
+                package_name: "zod".to_string(),
+                path: PathBuf::from("package.json"),
+                line: 8,
+            });
+        r.test_only_dependencies
+            .push(fallow_core::results::TestOnlyDependency {
+                package_name: "vitest".to_string(),
+                path: PathBuf::from("package.json"),
+                line: 10,
+            });
+        r.boundary_violations
+            .push(fallow_core::results::BoundaryViolation {
+                from_path: PathBuf::from("src/ui/btn.ts"),
+                to_path: PathBuf::from("src/db/query.ts"),
+                from_zone: "ui".to_string(),
+                to_zone: "db".to_string(),
+                import_specifier: "../db/query".to_string(),
+                line: 1,
+                col: 0,
+            });
+        r
+    }
+
+    #[test]
+    fn baseline_from_results_captures_all_extended_fields() {
+        let results = make_full_results();
+        let baseline = BaselineData::from_results(&results);
+        assert_eq!(baseline.circular_dependencies.len(), 1);
+        assert_eq!(baseline.unused_optional_dependencies, vec!["fsevents"]);
+        assert_eq!(baseline.unused_enum_members.len(), 1);
+        assert!(baseline.unused_enum_members[0].contains("Status.Deprecated"));
+        assert_eq!(baseline.unused_class_members.len(), 1);
+        assert!(baseline.unused_class_members[0].contains("UserService.legacy"));
+        assert_eq!(baseline.unresolved_imports.len(), 1);
+        assert!(baseline.unresolved_imports[0].contains("./missing"));
+        assert_eq!(baseline.unlisted_dependencies, vec!["chalk"]);
+        assert_eq!(baseline.duplicate_exports.len(), 1);
+        assert!(baseline.duplicate_exports[0].starts_with("Config|"));
+        assert_eq!(baseline.type_only_dependencies, vec!["zod"]);
+        assert_eq!(baseline.test_only_dependencies, vec!["vitest"]);
+        assert_eq!(baseline.boundary_violations.len(), 1);
+        assert!(baseline.boundary_violations[0].contains("->"));
+    }
+
+    #[test]
+    fn filter_removes_all_extended_baseline_issues() {
+        let results = make_full_results();
+        let baseline = BaselineData::from_results(&results);
+        let filtered = filter_new_issues(results, &baseline);
+        assert!(filtered.circular_dependencies.is_empty());
+        assert!(filtered.unused_optional_dependencies.is_empty());
+        assert!(filtered.unused_enum_members.is_empty());
+        assert!(filtered.unused_class_members.is_empty());
+        assert!(filtered.unresolved_imports.is_empty());
+        assert!(filtered.unlisted_dependencies.is_empty());
+        assert!(filtered.duplicate_exports.is_empty());
+        assert!(filtered.type_only_dependencies.is_empty());
+        assert!(filtered.test_only_dependencies.is_empty());
+        assert!(filtered.boundary_violations.is_empty());
+    }
+
+    #[test]
+    fn filter_keeps_new_circular_deps() {
+        use fallow_core::results::CircularDependency;
+        let baseline = BaselineData {
+            circular_dependencies: vec!["src/a.ts->src/b.ts".to_string()],
+            ..BaselineData::from_results(&AnalysisResults::default())
+        };
+        let mut results = AnalysisResults::default();
+        // One in baseline, one new
+        results.circular_dependencies.push(CircularDependency {
+            files: vec![PathBuf::from("src/a.ts"), PathBuf::from("src/b.ts")],
+            length: 2,
+            line: 1,
+            col: 0,
+            is_cross_package: false,
+        });
+        results.circular_dependencies.push(CircularDependency {
+            files: vec![PathBuf::from("src/x.ts"), PathBuf::from("src/y.ts")],
+            length: 2,
+            line: 5,
+            col: 0,
+            is_cross_package: false,
+        });
+        let filtered = filter_new_issues(results, &baseline);
+        assert_eq!(filtered.circular_dependencies.len(), 1);
+    }
+
+    #[test]
+    fn filter_keeps_new_boundary_violations() {
+        use fallow_core::results::BoundaryViolation;
+        let baseline = BaselineData {
+            boundary_violations: vec!["src/a.ts->src/b.ts".to_string()],
+            ..BaselineData::from_results(&AnalysisResults::default())
+        };
+        let mut results = AnalysisResults::default();
+        results.boundary_violations.push(BoundaryViolation {
+            from_path: PathBuf::from("src/a.ts"),
+            to_path: PathBuf::from("src/b.ts"),
+            from_zone: "a".to_string(),
+            to_zone: "b".to_string(),
+            import_specifier: "../b".to_string(),
+            line: 1,
+            col: 0,
+        });
+        results.boundary_violations.push(BoundaryViolation {
+            from_path: PathBuf::from("src/new.ts"),
+            to_path: PathBuf::from("src/secret.ts"),
+            from_zone: "new".to_string(),
+            to_zone: "secret".to_string(),
+            import_specifier: "../secret".to_string(),
+            line: 1,
+            col: 0,
+        });
+        let filtered = filter_new_issues(results, &baseline);
+        assert_eq!(filtered.boundary_violations.len(), 1);
+    }
+
+    // ── filter_new_health_targets ──────────────────────────────
+
+    #[test]
+    fn health_targets_baseline_filters_known() {
+        let root = PathBuf::from("/project");
+        let targets = vec![
+            crate::health_types::RefactoringTarget {
+                path: root.join("src/complex.ts"),
+                priority: 80.0,
+                efficiency: 40.0,
+                recommendation: "Split file".to_string(),
+                category: crate::health_types::RecommendationCategory::SplitHighImpact,
+                effort: crate::health_types::EffortEstimate::Medium,
+                confidence: crate::health_types::Confidence::Medium,
+                factors: vec![],
+                evidence: None,
+            },
+            crate::health_types::RefactoringTarget {
+                path: root.join("src/new-issue.ts"),
+                priority: 60.0,
+                efficiency: 30.0,
+                recommendation: "Extract function".to_string(),
+                category: crate::health_types::RecommendationCategory::ExtractComplexFunctions,
+                effort: crate::health_types::EffortEstimate::Low,
+                confidence: crate::health_types::Confidence::High,
+                factors: vec![],
+                evidence: None,
+            },
+        ];
+        let baseline =
+            HealthBaselineData::from_findings(&[], &targets[..1], &root);
+        let filtered = filter_new_health_targets(targets, &baseline, &root);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].path, root.join("src/new-issue.ts"));
+    }
+
+    // ── duplicate_export_key ───────────────────────────────────
+
+    #[test]
+    fn duplicate_export_key_is_sorted() {
+        use fallow_core::results::{DuplicateExport, DuplicateLocation};
+        let dup_ab = DuplicateExport {
+            export_name: "foo".to_string(),
+            locations: vec![
+                DuplicateLocation {
+                    path: PathBuf::from("src/a.ts"),
+                    line: 1,
+                    col: 0,
+                },
+                DuplicateLocation {
+                    path: PathBuf::from("src/b.ts"),
+                    line: 5,
+                    col: 0,
+                },
+            ],
+        };
+        let dup_ba = DuplicateExport {
+            export_name: "foo".to_string(),
+            locations: vec![
+                DuplicateLocation {
+                    path: PathBuf::from("src/b.ts"),
+                    line: 5,
+                    col: 0,
+                },
+                DuplicateLocation {
+                    path: PathBuf::from("src/a.ts"),
+                    line: 1,
+                    col: 0,
+                },
+            ],
+        };
+        assert_eq!(
+            super::duplicate_export_key(&dup_ab),
+            super::duplicate_export_key(&dup_ba),
+        );
+    }
+
+    // ── boundary_violation_key ─────────────────────────────────
+
+    #[test]
+    fn boundary_violation_key_format() {
+        use fallow_core::results::BoundaryViolation;
+        let v = BoundaryViolation {
+            from_path: PathBuf::from("src/ui/btn.ts"),
+            to_path: PathBuf::from("src/db/query.ts"),
+            from_zone: "ui".to_string(),
+            to_zone: "db".to_string(),
+            import_specifier: "../db/query".to_string(),
+            line: 1,
+            col: 0,
+        };
+        let key = super::boundary_violation_key(&v);
+        assert_eq!(key, "src/ui/btn.ts->src/db/query.ts");
+    }
 }
