@@ -138,18 +138,29 @@ impl PluginRegistry {
             })
             .collect();
 
-        // Build relative paths for matching (used by Phase 3 and 4)
-        let relative_files: Vec<(&PathBuf, String)> = discovered_files
-            .iter()
-            .map(|f| {
-                let rel = f
-                    .strip_prefix(root)
-                    .unwrap_or(f)
-                    .to_string_lossy()
-                    .into_owned();
-                (f, rel)
-            })
-            .collect();
+        // Build relative paths lazily: only needed when config matchers exist
+        // or plugins have package_json_config_key. Skip entirely for projects
+        // with no config-parsing plugins (e.g., only React), avoiding O(files)
+        // String allocations.
+        let needs_relative_files = !config_matchers.is_empty()
+            || active
+                .iter()
+                .any(|p| p.package_json_config_key().is_some());
+        let relative_files: Vec<(&PathBuf, String)> = if needs_relative_files {
+            discovered_files
+                .iter()
+                .map(|f| {
+                    let rel = f
+                        .strip_prefix(root)
+                        .unwrap_or(f)
+                        .to_string_lossy()
+                        .into_owned();
+                    (f, rel)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         if !config_matchers.is_empty() {
             // Phase 3a: Match config files from discovered source files

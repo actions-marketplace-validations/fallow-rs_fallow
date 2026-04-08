@@ -10,7 +10,7 @@ mod re_exports;
 mod reachability;
 pub mod types;
 
-use std::path::PathBuf;
+use std::path::Path;
 
 use fixedbitset::FixedBitSet;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -78,15 +78,15 @@ const _: () = assert!(std::mem::size_of::<ImportedSymbol>() == 64);
 impl ModuleGraph {
     fn resolve_entry_point_ids(
         entry_points: &[EntryPoint],
-        path_to_id: &FxHashMap<PathBuf, FileId>,
+        path_to_id: &FxHashMap<&Path, FileId>,
     ) -> FxHashSet<FileId> {
         entry_points
             .iter()
             .filter_map(|ep| {
-                path_to_id.get(&ep.path).copied().or_else(|| {
+                path_to_id.get(ep.path.as_path()).copied().or_else(|| {
                     dunce::canonicalize(&ep.path)
                         .ok()
-                        .and_then(|path| path_to_id.get(&path).copied())
+                        .and_then(|path| path_to_id.get(path.as_path()).copied())
                 })
             })
             .collect()
@@ -128,9 +128,9 @@ impl ModuleGraph {
             .map_or(0, |m| m + 1);
         let total_capacity = max_file_id.max(module_count);
 
-        // Build path -> FileId index
-        let path_to_id: FxHashMap<PathBuf, FileId> =
-            files.iter().map(|f| (f.path.clone(), f.id)).collect();
+        // Build path -> FileId index (borrows paths from files slice to avoid cloning)
+        let path_to_id: FxHashMap<&Path, FileId> =
+            files.iter().map(|f| (f.path.as_path(), f.id)).collect();
 
         // Build FileId -> ResolvedModule index
         let module_by_id: FxHashMap<FileId, &ResolvedModule> =
