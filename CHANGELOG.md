@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.21.0] - 2026-04-08
+
+### Added
+
+- **Istanbul match-rate stats** -- `istanbul_matched` and `istanbul_total` fields in JSON `summary` when using Istanbul coverage model. Human output footer shows function match count. Helps detect path mismatches or naming gaps in coverage data.
+- **Coverage model in snapshots** -- `VitalSignsSnapshot` now persists `coverage_model` (schema v3). Trend output warns with a yellow note when comparing snapshots with different CRAP models, preventing misattribution of score changes.
+- **CI auto-detection note** -- when `CI=true` is set and coverage data is auto-detected (not explicit `--coverage`), emits a note on stderr suggesting explicit `--coverage` for deterministic scores.
+- **`--coverage-root` flag** -- rebases file paths in Istanbul coverage data by stripping a prefix and prepending the project root. Enables cross-environment coverage matching (CI runner paths vs local checkout). Also available as `coverage_root` MCP parameter.
+
 ## [2.20.0] - 2026-04-08
 
 ### Added
@@ -1035,7 +1044,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `--changed-since` and `--fail-on-issues` for CI
 - Cross-workspace resolution for npm/yarn/pnpm workspaces
 
-[Unreleased]: https://github.com/fallow-rs/fallow/compare/v2.20.0...HEAD
+[Unreleased]: https://github.com/fallow-rs/fallow/compare/v2.21.0...HEAD
+[2.21.0]: https://github.com/fallow-rs/fallow/compare/v2.20.0...v2.21.0
 [2.20.0]: https://github.com/fallow-rs/fallow/compare/v2.19.3...v2.20.0
 [2.19.3]: https://github.com/fallow-rs/fallow/compare/v2.19.2...v2.19.3
 [2.19.2]: https://github.com/fallow-rs/fallow/compare/v2.19.1...v2.19.2
