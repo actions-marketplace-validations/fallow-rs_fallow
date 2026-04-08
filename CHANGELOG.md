@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.19.3] - 2026-04-08
+
+### Fixed
+
+- **`ignorePatterns` now correctly filters files during discovery** -- user-configured relative glob patterns (e.g. `src/api/generated/**`) were matched against absolute walker paths, so only patterns with `**/` prefix worked. Now strips the project root before matching, consistent with all other glob filters. ([#83](https://github.com/fallow-rs/fallow/issues/83))
+
 ## [2.19.2] - 2026-04-08
 
 ### Fixed
@@ -1015,7 +1021,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `--changed-since` and `--fail-on-issues` for CI
 - Cross-workspace resolution for npm/yarn/pnpm workspaces
 
-[Unreleased]: https://github.com/fallow-rs/fallow/compare/v2.19.2...HEAD
+[Unreleased]: https://github.com/fallow-rs/fallow/compare/v2.19.3...HEAD
+[2.19.3]: https://github.com/fallow-rs/fallow/compare/v2.19.2...v2.19.3
 [2.19.2]: https://github.com/fallow-rs/fallow/compare/v2.19.1...v2.19.2
 [2.19.1]: https://github.com/fallow-rs/fallow/compare/v2.19.0...v2.19.1
 [2.19.0]: https://github.com/fallow-rs/fallow/compare/v2.18.3...v2.19.0
