@@ -46,6 +46,9 @@ editors/vscode/.test-dist/
 # IDE
 .vscode/
 
+# Playwright MCP artifacts
+.playwright-mcp/
+
 # Claude
 .claude/*
 !.claude/settings.json
