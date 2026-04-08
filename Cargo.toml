@@ -49,14 +49,14 @@ dunce = "1"
 ignore = "0.4"
 glob = "0.3"
 globset = { version = "0.4", features = ["serde1"] }
-regex = "1"
+regex = { version = "1", default-features = false, features = ["std", "perf", "unicode-perl"] }
 
 # Hashing
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 rustc-hash = "2"
 
 # HTTP
-ureq = { version = "3", features = ["rustls"] }
+ureq = { version = "3", default-features = false, features = ["native-tls"] }
 
 # Caching
 bitcode = "0.6"
@@ -187,3 +187,25 @@ codegen-units = 1
 strip = "symbols"
 opt-level = 3
 panic = "abort"                         # Smaller binary — no unwind tables needed
+
+# Optimize heavy deps for size — not in the hot path
+[profile.release.package.regex-syntax]
+opt-level = "z"
+[profile.release.package.clap_builder]
+opt-level = "z"
+[profile.release.package.schemars]
+opt-level = "z"
+[profile.release.package.ureq]
+opt-level = "z"
+[profile.release.package.miette]
+opt-level = "z"
+[profile.release.package.toml]
+opt-level = "z"
+[profile.release.package.toml_parser]
+opt-level = "z"
+[profile.release.package.url]
+opt-level = "z"
+[profile.release.package.indicatif]
+opt-level = "z"
+[profile.release.package.tracing-subscriber]
+opt-level = "z"
