@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.22.1] - 2026-04-08
+
+### Fixed
+
+- **Astro frontmatter extraction on Windows** -- the regex for extracting code between `---` delimiters required LF line endings, silently failing on Windows where git checks out CRLF. All `.astro` file exports were invisible on Windows. Now handles both LF and CRLF.
+
 ## [2.22.0] - 2026-04-08
 
 ### Added
@@ -1054,7 +1060,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `--changed-since` and `--fail-on-issues` for CI
 - Cross-workspace resolution for npm/yarn/pnpm workspaces
 
-[Unreleased]: https://github.com/fallow-rs/fallow/compare/v2.22.0...HEAD
+[Unreleased]: https://github.com/fallow-rs/fallow/compare/v2.22.1...HEAD
+[2.22.1]: https://github.com/fallow-rs/fallow/compare/v2.22.0...v2.22.1
 [2.22.0]: https://github.com/fallow-rs/fallow/compare/v2.21.0...v2.22.0
 [2.21.0]: https://github.com/fallow-rs/fallow/compare/v2.20.0...v2.21.0
 [2.20.0]: https://github.com/fallow-rs/fallow/compare/v2.19.3...v2.20.0
