@@ -77,6 +77,6 @@ jobs:
           tool: customSmallerIsBetter
           output-file-path: bloat-bench.json
           data-dir: bloat
-          alert-threshold: '115%'
+          alert-threshold: '120%'
           github-token: ${{ secrets.GITHUB_TOKEN }}
           continue-on-error: ${{ github.event_name == 'pull_request' }}

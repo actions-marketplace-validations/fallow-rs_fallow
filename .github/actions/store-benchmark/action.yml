@@ -39,6 +39,7 @@ runs:
         comment-always: ${{ github.event_name == 'pull_request' }}
         alert-threshold: ${{ inputs.alert-threshold }}
         fail-on-alert: false
+        max-items-in-chart: 100
         save-data-file: ${{ github.event_name != 'pull_request' }}
         gh-pages-branch: gh-pages
         benchmark-data-dir-path: dev/${{ inputs.data-dir }}

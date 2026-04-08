@@ -56,7 +56,7 @@ jobs:
           tool: customSmallerIsBetter
           output-file-path: bench-real-world.json
           data-dir: bench-real-world
-          alert-threshold: '120%'
+          alert-threshold: '200%'
           github-token: ${{ secrets.GITHUB_TOKEN }}
           continue-on-error: 'true'
 

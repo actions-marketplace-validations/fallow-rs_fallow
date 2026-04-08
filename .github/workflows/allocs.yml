@@ -117,5 +117,6 @@ jobs:
           tool: customSmallerIsBetter
           output-file-path: alloc-bench.json
           data-dir: allocs
+          alert-threshold: '120%'
           github-token: ${{ secrets.GITHUB_TOKEN }}
           continue-on-error: ${{ github.event_name == 'pull_request' }}
