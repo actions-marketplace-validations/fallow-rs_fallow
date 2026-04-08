@@ -4,6 +4,9 @@
 //! plugins, composables, and utils as entry points. Recognizes conventional
 //! server API and middleware exports. Parses nuxt.config.ts to extract modules,
 //! CSS files, plugins, and other configuration.
+//!
+//! Also detects Nuxt **module** authoring projects (using `@nuxt/kit`) and marks
+//! `src/runtime/` components, composables, plugins, and utils as entry points.
 
 use std::path::Path;
 
@@ -11,6 +14,10 @@ use super::config_parser;
 use super::{Plugin, PluginResult};
 
 const ENABLERS: &[&str] = &["nuxt"];
+
+/// Secondary enabler for Nuxt module authoring projects.
+/// `@nuxt/kit` is the standard API for building Nuxt modules.
+const MODULE_AUTHORING_ENABLER: &str = "@nuxt/kit";
 
 const ENTRY_PATTERNS: &[&str] = &[
     // Standard Nuxt directories
@@ -54,7 +61,11 @@ const SRC_DIR_ENTRY_PATTERNS: &[&str] = &[
     "components/**/*.{vue,ts,tsx,js,jsx}",
 ];
 
-const CONFIG_PATTERNS: &[&str] = &["nuxt.config.{ts,js}"];
+const CONFIG_PATTERNS: &[&str] = &[
+    "nuxt.config.{ts,js}",
+    // Nuxt module entry point: triggers runtime directory discovery
+    "src/module.{ts,js}",
+];
 
 const ALWAYS_USED: &[&str] = &[
     "nuxt.config.{ts,js}",
@@ -65,6 +76,8 @@ const ALWAYS_USED: &[&str] = &[
     "app/app.vue",
     "app/app.config.{ts,js}",
     "app/error.vue",
+    // Nuxt module entry point
+    "src/module.{ts,js}",
 ];
 
 const SRC_DIR_ALWAYS_USED: &[&str] = &["app.vue", "app.config.{ts,js}", "error.vue"];
@@ -156,6 +169,14 @@ impl Plugin for NuxtPlugin {
         ENABLERS
     }
 
+    /// Also activate for Nuxt module authoring projects that depend on `@nuxt/kit`.
+    fn is_enabled_with_deps(&self, deps: &[String], root: &Path) -> bool {
+        deps.iter()
+            .any(|d| d == "nuxt" || d == MODULE_AUTHORING_ENABLER)
+            || root.join("nuxt.config.ts").exists()
+            || root.join("nuxt.config.js").exists()
+    }
+
     fn entry_patterns(&self) -> &'static [&'static str] {
         ENTRY_PATTERNS
     }
@@ -221,6 +242,23 @@ impl Plugin for NuxtPlugin {
 
     fn resolve_config(&self, config_path: &Path, source: &str, root: &Path) -> PluginResult {
         let mut result = PluginResult::default();
+
+        // Nuxt module authoring: src/module.{ts,js} → add src/runtime/ patterns.
+        // Nuxt modules place their runtime code (components, composables, plugins,
+        // utils) in src/runtime/ and register them programmatically via @nuxt/kit
+        // APIs (addComponentsDir, addImportsDir, addPlugin).
+        if config_path.file_stem().is_some_and(|stem| stem == "module") {
+            add_module_runtime_patterns(&mut result, root);
+
+            // Extract import sources as referenced dependencies
+            let imports = config_parser::extract_imports(source, config_path);
+            for imp in &imports {
+                let dep = crate::resolve::extract_package_name(imp);
+                result.referenced_dependencies.push(dep);
+            }
+
+            return result;
+        }
 
         // Nuxt aliases resolve against srcDir, which defaults to `app/` when it exists
         // and can be overridden explicitly via config.
@@ -356,6 +394,64 @@ impl Plugin for NuxtPlugin {
         }
 
         result
+    }
+}
+
+/// Add entry patterns for the Nuxt module authoring convention.
+///
+/// Nuxt modules use `src/runtime/` for components, composables, plugins, and
+/// utils that are programmatically registered via `@nuxt/kit` APIs. We detect
+/// two common layouts:
+///   - `src/runtime/{components,composables,plugins,utils,locale}/`
+///   - `runtime/{components,composables,plugins,utils,locale}/` (less common)
+fn add_module_runtime_patterns(result: &mut PluginResult, root: &Path) {
+    let runtime_dir = if root.join("src/runtime").is_dir() {
+        "src/runtime"
+    } else if root.join("runtime").is_dir() {
+        "runtime"
+    } else {
+        return;
+    };
+
+    // Components (Vue SFCs and TS/JS)
+    let components = format!("{runtime_dir}/components/**/*.{{{COMPONENT_ENTRY_GLOB}}}");
+    add_default_used_export(result, &components);
+    result.entry_patterns.push(components);
+
+    // Composables (top-level only, matching Nuxt convention)
+    let composables = format!("{runtime_dir}/composables/*.{{{SCRIPT_ENTRY_GLOB}}}");
+    result.entry_patterns.push(composables);
+
+    // Utils (top-level only)
+    let utils = format!("{runtime_dir}/utils/*.{{{SCRIPT_ENTRY_GLOB}}}");
+    result.entry_patterns.push(utils);
+
+    // Plugins
+    let plugins = format!("{runtime_dir}/plugins/*.{{{SCRIPT_ENTRY_GLOB}}}");
+    add_default_used_export(result, &plugins);
+    result.entry_patterns.push(plugins);
+
+    // Locale files (common in i18n-aware modules like Nuxt UI)
+    let locale_dir = root.join(runtime_dir).join("locale");
+    if locale_dir.is_dir() {
+        let locale = format!("{runtime_dir}/locale/*.{{{SCRIPT_ENTRY_GLOB}}}");
+        result.entry_patterns.push(locale);
+    }
+
+    // Types directory (re-exported types)
+    let types_dir = root.join(runtime_dir).join("types");
+    if types_dir.is_dir() {
+        let types = format!("{runtime_dir}/types/*.{{{SCRIPT_ENTRY_GLOB}}}");
+        result.entry_patterns.push(types);
+    }
+
+    // Vue-specific runtime directory: mirrors the main runtime structure with
+    // its own components, composables, plugins, and stubs subdirectories.
+    let vue_dir = root.join(runtime_dir).join("vue");
+    if vue_dir.is_dir() {
+        let vue_components = format!("{runtime_dir}/vue/**/*.{{{COMPONENT_ENTRY_GLOB}}}");
+        add_default_used_export(result, &vue_components);
+        result.entry_patterns.push(vue_components);
     }
 }
 
@@ -519,6 +615,16 @@ mod tests {
         let plugin = NuxtPlugin;
         let deps = vec!["nuxt".to_string()];
         assert!(plugin.is_enabled_with_deps(&deps, Path::new("/project")));
+    }
+
+    #[test]
+    fn is_enabled_with_nuxt_kit_dep() {
+        let plugin = NuxtPlugin;
+        let deps = vec!["@nuxt/kit".to_string()];
+        assert!(
+            plugin.is_enabled_with_deps(&deps, Path::new("/project")),
+            "@nuxt/kit should activate the Nuxt plugin for module authoring"
+        );
     }
 
     #[test]
@@ -1033,5 +1139,143 @@ mod tests {
         assert!(patterns.contains(&"plugins/*.{ts,tsx,js,jsx,mts,cts,mjs,cjs}"));
         assert!(patterns.contains(&"plugins/**/index.{ts,tsx,js,jsx,mts,cts,mjs,cjs}"));
         assert!(!patterns.contains(&"plugins/**/*.{ts,js}"));
+    }
+
+    // ── Nuxt module authoring tests ──────────────────────────────
+
+    #[test]
+    fn module_authoring_resolve_config_adds_runtime_patterns() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = temp.path().join("src/runtime");
+        std::fs::create_dir_all(runtime.join("components")).unwrap();
+        std::fs::create_dir_all(runtime.join("composables")).unwrap();
+        std::fs::create_dir_all(runtime.join("plugins")).unwrap();
+        std::fs::create_dir_all(runtime.join("utils")).unwrap();
+
+        let source = r"
+            import { defineNuxtModule, addComponentsDir } from '@nuxt/kit';
+            export default defineNuxtModule({ setup() {} });
+        ";
+        let plugin = NuxtPlugin;
+        let result = plugin.resolve_config(&temp.path().join("src/module.ts"), source, temp.path());
+
+        assert!(
+            result
+                .entry_patterns
+                .iter()
+                .any(|p| p.starts_with("src/runtime/components/")),
+            "should add runtime components: {:?}",
+            result.entry_patterns
+        );
+        assert!(
+            result
+                .entry_patterns
+                .iter()
+                .any(|p| p.starts_with("src/runtime/composables/")),
+            "should add runtime composables: {:?}",
+            result.entry_patterns
+        );
+        assert!(
+            result
+                .entry_patterns
+                .iter()
+                .any(|p| p.starts_with("src/runtime/plugins/")),
+            "should add runtime plugins: {:?}",
+            result.entry_patterns
+        );
+        assert!(
+            result
+                .entry_patterns
+                .iter()
+                .any(|p| p.starts_with("src/runtime/utils/")),
+            "should add runtime utils: {:?}",
+            result.entry_patterns
+        );
+    }
+
+    #[test]
+    fn module_authoring_detects_locale_and_types_dirs() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = temp.path().join("src/runtime");
+        std::fs::create_dir_all(runtime.join("components")).unwrap();
+        std::fs::create_dir_all(runtime.join("locale")).unwrap();
+        std::fs::create_dir_all(runtime.join("types")).unwrap();
+
+        let source = "";
+        let plugin = NuxtPlugin;
+        let result = plugin.resolve_config(&temp.path().join("src/module.ts"), source, temp.path());
+
+        assert!(
+            result
+                .entry_patterns
+                .iter()
+                .any(|p| p.starts_with("src/runtime/locale/")),
+            "should detect locale dir: {:?}",
+            result.entry_patterns
+        );
+        assert!(
+            result
+                .entry_patterns
+                .iter()
+                .any(|p| p.starts_with("src/runtime/types/")),
+            "should detect types dir: {:?}",
+            result.entry_patterns
+        );
+    }
+
+    #[test]
+    fn module_authoring_no_runtime_dir_is_noop() {
+        let temp = tempfile::tempdir().unwrap();
+        // No src/runtime/ directory
+        let source = "";
+        let plugin = NuxtPlugin;
+        let result = plugin.resolve_config(&temp.path().join("src/module.ts"), source, temp.path());
+        assert!(
+            result.entry_patterns.is_empty(),
+            "no runtime dir should produce no patterns"
+        );
+    }
+
+    #[test]
+    fn module_authoring_extracts_import_deps() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = r"
+            import { defineNuxtModule, addComponentsDir } from '@nuxt/kit';
+            import defu from 'defu';
+        ";
+        let plugin = NuxtPlugin;
+        let result = plugin.resolve_config(&temp.path().join("src/module.ts"), source, temp.path());
+        assert!(
+            result
+                .referenced_dependencies
+                .contains(&"@nuxt/kit".to_string()),
+            "@nuxt/kit should be a referenced dependency"
+        );
+        assert!(
+            result.referenced_dependencies.contains(&"defu".to_string()),
+            "defu should be a referenced dependency"
+        );
+    }
+
+    #[test]
+    fn nuxt_config_not_treated_as_module() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("src/runtime/components")).unwrap();
+
+        let source = r#"
+            export default defineNuxtConfig({
+                modules: ["@nuxtjs/tailwindcss"]
+            });
+        "#;
+        let plugin = NuxtPlugin;
+        let result =
+            plugin.resolve_config(&temp.path().join("nuxt.config.ts"), source, temp.path());
+
+        // nuxt.config.ts should NOT add runtime patterns
+        assert!(
+            !result.entry_patterns.iter().any(|p| p.contains("runtime")),
+            "nuxt.config.ts should not add runtime patterns: {:?}",
+            result.entry_patterns
+        );
     }
 }
