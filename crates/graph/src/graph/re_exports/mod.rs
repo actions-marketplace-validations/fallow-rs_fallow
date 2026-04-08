@@ -4,7 +4,7 @@ mod propagate;
 #[cfg(test)]
 mod tests;
 
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use fallow_types::discover::FileId;
 
@@ -52,6 +52,16 @@ impl ModuleGraph {
             })
             .collect();
 
+        // Pre-build reverse edge index: target FileId → edge indices.
+        // This avoids O(all_edges) scans per star re-export in the hot loop.
+        // For barrel-heavy monorepos (Vue/Nuxt), star re-exports dominate the
+        // iteration cost — without this index, each call to propagate_star_re_export
+        // linearly scans all edges to find those targeting the barrel.
+        let mut edges_by_target: FxHashMap<FileId, Vec<usize>> = FxHashMap::default();
+        for (idx, edge) in self.edges.iter().enumerate() {
+            edges_by_target.entry(edge.target).or_default().push(idx);
+        }
+
         // For each re-export, if the barrel's exported symbol has references,
         // propagate those references to the source module's original export.
         // We iterate until no new references are added (handles chains).
@@ -79,6 +89,7 @@ impl ModuleGraph {
                     changed |= propagate_star_re_export(
                         &mut self.modules,
                         &self.edges,
+                        &edges_by_target,
                         barrel_id,
                         barrel_idx,
                         source_idx,

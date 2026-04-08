@@ -3,7 +3,7 @@
 //! Handles both star (`export * from`) and named (`export { foo } from`) re-exports,
 //! including entry-point special cases where exports are consumed externally.
 
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use fallow_types::discover::FileId;
 use fallow_types::extract::ExportName;
@@ -21,6 +21,7 @@ use crate::graph::{Edge, ImportedName};
 pub(in crate::graph) fn propagate_star_re_export(
     modules: &mut [ModuleNode],
     edges: &[Edge],
+    edges_by_target: &rustc_hash::FxHashMap<FileId, Vec<usize>>,
     barrel_id: FileId,
     barrel_idx: usize,
     source_idx: usize,
@@ -39,35 +40,42 @@ pub(in crate::graph) fn propagate_star_re_export(
         return propagate_entry_point_star(modules, barrel_id, source_idx);
     }
 
-    // Collect named imports that target the barrel from ALL edges
+    // Collect named imports that target the barrel using the pre-built reverse index.
+    // Previously this scanned ALL edges O(E) per call — now O(incoming edges to barrel).
     let barrel_file_id = modules[barrel_idx].file_id;
-    let named_refs: Vec<(String, SymbolReference)> = edges
-        .iter()
-        .filter(|edge| edge.target == barrel_file_id)
-        .flat_map(|edge| {
-            edge.symbols.iter().filter_map(move |sym| {
-                if let ImportedName::Named(name) = &sym.imported_name {
-                    Some((
-                        name.clone(),
-                        SymbolReference {
-                            from_file: edge.source,
-                            kind: ReferenceKind::NamedImport,
-                            import_span: sym.import_span,
-                        },
-                    ))
-                } else {
-                    None
-                }
-            })
+    let named_refs: Vec<(String, SymbolReference)> = edges_by_target
+        .get(&barrel_file_id)
+        .map(|indices| {
+            indices
+                .iter()
+                .flat_map(|&idx| {
+                    let edge = &edges[idx];
+                    edge.symbols.iter().filter_map(move |sym| {
+                        if let ImportedName::Named(name) = &sym.imported_name {
+                            Some((
+                                name.clone(),
+                                SymbolReference {
+                                    from_file: edge.source,
+                                    kind: ReferenceKind::NamedImport,
+                                    import_span: sym.import_span,
+                                },
+                            ))
+                        } else {
+                            None
+                        }
+                    })
+                })
+                .collect()
         })
-        .collect();
+        .unwrap_or_default();
 
-    // Also check for references already on barrel exports from
-    // prior chain propagation (handles multi-level barrel chains)
-    let barrel_export_refs: Vec<(String, SymbolReference)> = modules[barrel_idx]
+    // Collect barrel exports with references: one entry per export (not per reference).
+    // Previously this was O(exports × refs) String allocations; now O(exports_with_refs).
+    let barrel_refs: Vec<(String, Vec<SymbolReference>)> = modules[barrel_idx]
         .exports
         .iter()
-        .flat_map(|e| e.references.iter().map(move |r| (e.name.to_string(), *r)))
+        .filter(|e| !e.references.is_empty())
+        .map(|e| (e.name.to_string(), e.references.clone()))
         .collect();
 
     // Check if the source module itself has star re-exports (for multi-level chains).
@@ -78,40 +86,43 @@ pub(in crate::graph) fn propagate_star_re_export(
         .iter()
         .any(|re| re.exported_name == "*");
 
-    // Propagate each named import to the matching source export.
-    // For multi-level star re-export chains (e.g., index -> intermediate -> source),
-    // intermediate barrels may not have ExportSymbol entries for the names being
-    // imported. When the source has its own star re-exports, create synthetic
-    // ExportSymbol entries so the iterative loop can propagate further on the
-    // next pass.
+    // Group all references by name: combine named edge imports with barrel export refs.
+    // This looks up each export in the source at most once instead of per-reference.
+    let mut refs_by_name: FxHashMap<String, Vec<SymbolReference>> = FxHashMap::default();
+    for (name, ref_item) in named_refs {
+        refs_by_name.entry(name).or_default().push(ref_item);
+    }
+    for (name, refs) in barrel_refs {
+        refs_by_name.entry(name).or_default().extend(refs);
+    }
+
     let mut changed = false;
+    let mut existing_files: FxHashSet<FileId> = FxHashSet::default();
     let source = &mut modules[source_idx];
-    for (name, ref_item) in named_refs.iter().chain(barrel_export_refs.iter()) {
+    for (name, refs) in &refs_by_name {
         let export_name = if name == "default" {
             ExportName::Default
         } else {
             ExportName::Named(name.clone())
         };
         if let Some(export) = source.exports.iter_mut().find(|e| e.name == export_name) {
-            if export
-                .references
-                .iter()
-                .all(|r| r.from_file != ref_item.from_file)
-            {
-                export.references.push(*ref_item);
-                changed = true;
+            // Use a HashSet for O(1) duplicate detection instead of O(n) linear scan.
+            // Reference lists grow across iterations, making the linear check quadratic.
+            existing_files.clear();
+            existing_files.extend(export.references.iter().map(|r| r.from_file));
+            for ref_item in refs {
+                if existing_files.insert(ref_item.from_file) {
+                    export.references.push(*ref_item);
+                    changed = true;
+                }
             }
         } else if source_has_star_re_exports {
-            // The source module doesn't have this export directly but
-            // it has star re-exports — create a synthetic ExportSymbol
-            // so the name can propagate through the chain on the next
-            // iteration.
             source.exports.push(ExportSymbol {
                 name: export_name,
                 is_type_only: false,
                 is_public: false,
                 span: oxc_span::Span::new(0, 0),
-                references: vec![*ref_item],
+                references: refs.clone(),
                 members: Vec::new(),
             });
             changed = true;
