@@ -105,6 +105,10 @@ impl PluginRegistry {
             "active plugins"
         );
 
+        // Warn when meta-frameworks are active but their generated configs are missing.
+        // Without these, tsconfig extends chains break and import resolution fails.
+        check_meta_framework_prerequisites(&active, root);
+
         // Phase 2: Collect static patterns from active plugins
         for plugin in &active {
             process_static_patterns(*plugin, root, &mut result);
@@ -421,6 +425,31 @@ impl PluginRegistry {
 impl Default for PluginRegistry {
     fn default() -> Self {
         Self::new(vec![])
+    }
+}
+
+/// Warn when meta-frameworks are active but their generated configs are missing.
+///
+/// Meta-frameworks like Nuxt and Astro generate tsconfig/types files during a
+/// "prepare" step. Without these, the tsconfig extends chain breaks and
+/// extensionless imports fail wholesale (e.g. 2000+ unresolved imports).
+fn check_meta_framework_prerequisites(active_plugins: &[&dyn Plugin], root: &Path) {
+    for plugin in active_plugins {
+        match plugin.name() {
+            "nuxt" if !root.join(".nuxt/tsconfig.json").exists() => {
+                tracing::warn!(
+                    "Nuxt project missing .nuxt/tsconfig.json \u{2014} run `nuxt prepare` \
+                     before fallow for accurate analysis"
+                );
+            }
+            "astro" if !root.join(".astro").exists() => {
+                tracing::warn!(
+                    "Astro project missing .astro/ types \u{2014} run `astro sync` \
+                     before fallow for accurate analysis"
+                );
+            }
+            _ => {}
+        }
     }
 }
 

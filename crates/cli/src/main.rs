@@ -701,23 +701,24 @@ fn resolve_format(cli: &Cli) -> FormatConfig {
 /// In non-TTY (piped/CI), keep INFO level since there are no spinners to conflict with.
 /// Watch mode always uses WARN since spinners replace the per-run INFO noise.
 fn setup_tracing(quiet: bool, is_watch: bool) {
-    if !quiet {
-        let stderr_is_tty = std::io::IsTerminal::is_terminal(&std::io::stderr());
-        let default_level = if is_watch || stderr_is_tty {
-            tracing::Level::WARN
-        } else {
-            tracing::Level::INFO
-        };
-        tracing_subscriber::fmt()
-            .with_writer(std::io::stderr)
-            .with_env_filter(
-                tracing_subscriber::EnvFilter::from_default_env()
-                    .add_directive(default_level.into()),
-            )
-            .with_target(false)
-            .with_timer(tracing_subscriber::fmt::time::uptime())
-            .init();
-    }
+    let stderr_is_tty = std::io::IsTerminal::is_terminal(&std::io::stderr());
+    let default_level = if quiet {
+        // Even in quiet mode, show warnings (e.g., missing meta-framework configs)
+        tracing::Level::WARN
+    } else if is_watch || stderr_is_tty {
+        tracing::Level::WARN
+    } else {
+        tracing::Level::INFO
+    };
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::from_default_env()
+                .add_directive(default_level.into()),
+        )
+        .with_target(false)
+        .with_timer(tracing_subscriber::fmt::time::uptime())
+        .init();
 }
 
 // ── Input validation ──────────────────────────────────────────────
