@@ -145,21 +145,22 @@ pub(super) fn expand_workspace_glob(
     pattern: &str,
     canonical_root: &Path,
 ) -> Vec<(PathBuf, PathBuf)> {
+    // For patterns with `**`, use a manual walk that prunes node_modules
+    // during traversal. The glob crate walks into node_modules before
+    // filtering, which is catastrophic with pnpm's deep symlink trees
+    // (50,000+ entries for `packages/**/*` in starlight).
+    if pattern.contains("**") {
+        return expand_recursive_workspace_pattern(root, pattern, canonical_root);
+    }
+
     let full_pattern = root.join(pattern).to_string_lossy().to_string();
     match glob::glob(&full_pattern) {
         Ok(paths) => paths
             .filter_map(Result::ok)
             .filter(|p| p.is_dir())
-            // Exclude nested node_modules — glob patterns like `playground/*`
-            // or `packages/**` can match dirs inside node_modules, causing
-            // their dependencies to be analyzed as workspace packages.
             .filter(|p| !p.components().any(|c| c.as_os_str() == "node_modules"))
-            // Fast pre-filter: skip directories without package.json before
-            // paying the cost of canonicalize() (the P0 perf fix — avoids
-            // canonicalizing 759+ non-workspace dirs in large monorepos).
             .filter(|p| p.join("package.json").exists())
             .filter_map(|p| {
-                // Security: ensure workspace directory is within project root
                 dunce::canonicalize(&p)
                     .ok()
                     .filter(|cp| cp.starts_with(canonical_root))
@@ -170,6 +171,67 @@ pub(super) fn expand_workspace_glob(
             tracing::warn!("invalid workspace glob pattern '{pattern}': {e}");
             Vec::new()
         }
+    }
+}
+
+/// Expand a recursive workspace glob pattern (containing `**`) by walking the
+/// directory tree manually, pruning `node_modules` during traversal.
+///
+/// This avoids the `glob` crate's O(n) expansion where n includes all files
+/// inside `node_modules/` (catastrophic with pnpm's deep symlink trees).
+fn expand_recursive_workspace_pattern(
+    root: &Path,
+    pattern: &str,
+    canonical_root: &Path,
+) -> Vec<(PathBuf, PathBuf)> {
+    let full_pattern = root.join(pattern).to_string_lossy().to_string();
+    let Ok(matcher) = glob::Pattern::new(&full_pattern) else {
+        tracing::warn!("invalid workspace glob pattern '{pattern}'");
+        return Vec::new();
+    };
+
+    // Extract the base directory before the first `*` to avoid scanning from root
+    let base_dir = match pattern.find('*') {
+        Some(idx) => root.join(&pattern[..idx]),
+        None => root.join(pattern),
+    };
+
+    let mut results = Vec::new();
+    walk_workspace_dirs(&base_dir, &matcher, canonical_root, &mut results);
+    results
+}
+
+/// Recursively walk directories, skipping `node_modules` and `.git`, collecting
+/// directories that match the glob pattern and contain a `package.json`.
+fn walk_workspace_dirs(
+    dir: &Path,
+    matcher: &glob::Pattern,
+    canonical_root: &Path,
+    results: &mut Vec<(PathBuf, PathBuf)>,
+) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        // Prune node_modules and hidden directories during traversal
+        if name == "node_modules" || name == ".git" {
+            continue;
+        }
+        // Check if this directory matches the pattern and has package.json
+        if matcher.matches_path(&path)
+            && path.join("package.json").exists()
+            && let Ok(cp) = dunce::canonicalize(&path)
+            && cp.starts_with(canonical_root)
+        {
+            results.push((path.clone(), cp));
+        }
+        // Continue recursing into subdirectories
+        walk_workspace_dirs(&path, matcher, canonical_root, results);
     }
 }
 
