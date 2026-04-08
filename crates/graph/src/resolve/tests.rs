@@ -1594,3 +1594,103 @@ fn create_resolver_with_multiple_plugins() {
     ];
     let _resolver = specifier::create_resolver(&plugins);
 }
+
+// -----------------------------------------------------------------------
+// .d.ts extension priority: runtime files resolve before declarations
+// -----------------------------------------------------------------------
+
+#[test]
+#[cfg_attr(miri, ignore)] // oxc_resolver uses statx syscall unsupported by Miri
+fn resolve_prefers_js_over_dts_when_both_exist() {
+    // When both `utils.js` and `utils.d.ts` exist side-by-side, resolving
+    // `./utils` should find the runtime file (`utils.js`), not the type
+    // declaration (`utils.d.ts`). Declaration files provide types for their
+    // companion .js files but are not standalone modules.
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let root = dir.path();
+
+    // Create both files
+    std::fs::write(root.join("utils.js"), "export const helper = 1;").unwrap();
+    std::fs::write(
+        root.join("utils.d.ts"),
+        "export declare const helper: number;",
+    )
+    .unwrap();
+    // The importing file must exist for resolve_file to work
+    std::fs::write(root.join("app.ts"), "import { helper } from './utils';").unwrap();
+
+    let resolver = specifier::create_resolver(&[]);
+    let from_file = root.join("app.ts");
+    let result = resolver.resolve_file(&from_file, "./utils");
+
+    assert!(result.is_ok(), "should resolve ./utils successfully");
+    let resolved_path = result.unwrap().into_path_buf();
+    let resolved_name = resolved_path
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    assert_eq!(
+        resolved_name, "utils.js",
+        "should resolve to utils.js (runtime), not utils.d.ts (declaration)"
+    );
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn resolve_prefers_ts_over_dts_when_both_exist() {
+    // .ts should also resolve before .d.ts
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let root = dir.path();
+
+    std::fs::write(root.join("utils.ts"), "export const helper = 1;").unwrap();
+    std::fs::write(
+        root.join("utils.d.ts"),
+        "export declare const helper: number;",
+    )
+    .unwrap();
+    std::fs::write(root.join("app.ts"), "import { helper } from './utils';").unwrap();
+
+    let resolver = specifier::create_resolver(&[]);
+    let from_file = root.join("app.ts");
+    let result = resolver.resolve_file(&from_file, "./utils");
+
+    assert!(result.is_ok(), "should resolve ./utils successfully");
+    let resolved_path = result.unwrap().into_path_buf();
+    let resolved_name = resolved_path
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    assert_eq!(
+        resolved_name, "utils.ts",
+        "should resolve to utils.ts (runtime), not utils.d.ts (declaration)"
+    );
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn resolve_falls_back_to_dts_when_no_runtime_file() {
+    // When only .d.ts exists (no runtime companion), it should still resolve
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let root = dir.path();
+
+    std::fs::write(root.join("types.d.ts"), "export declare const x: number;").unwrap();
+    std::fs::write(root.join("app.ts"), "import { x } from './types';").unwrap();
+
+    let resolver = specifier::create_resolver(&[]);
+    let from_file = root.join("app.ts");
+    let result = resolver.resolve_file(&from_file, "./types");
+
+    assert!(result.is_ok(), "should resolve ./types to .d.ts fallback");
+    let resolved_path = result.unwrap().into_path_buf();
+    let resolved_name = resolved_path
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    assert_eq!(
+        resolved_name, "types.d.ts",
+        "should resolve to types.d.ts when no runtime file exists"
+    );
+}

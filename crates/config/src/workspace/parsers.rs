@@ -827,4 +827,104 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
+
+    // ── expand_workspace_glob prunes node_modules with ** patterns ───
+
+    #[test]
+    fn expand_recursive_glob_prunes_node_modules() {
+        // When using `packages/**/*` the manual walk should prune
+        // `node_modules` during traversal, so a package.json inside
+        // `packages/app/node_modules/dep/` is never returned.
+        let temp_dir = std::env::temp_dir().join("fallow-test-expand-recursive-prune");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+
+        // Legitimate workspace packages
+        std::fs::create_dir_all(temp_dir.join("packages/app")).unwrap();
+        std::fs::write(
+            temp_dir.join("packages/app/package.json"),
+            r#"{"name": "app"}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(temp_dir.join("packages/lib")).unwrap();
+        std::fs::write(
+            temp_dir.join("packages/lib/package.json"),
+            r#"{"name": "lib"}"#,
+        )
+        .unwrap();
+
+        // Nested node_modules dependency (should be pruned)
+        let nm_dep = temp_dir.join("packages/app/node_modules/dep");
+        std::fs::create_dir_all(&nm_dep).unwrap();
+        std::fs::write(nm_dep.join("package.json"), r#"{"name": "dep"}"#).unwrap();
+
+        let canonical_root = dunce::canonicalize(&temp_dir).unwrap();
+        let results = expand_workspace_glob(&temp_dir, "packages/**/*", &canonical_root);
+
+        // Should find exactly the two legitimate workspace packages
+        let found_names: Vec<String> = results
+            .iter()
+            .map(|(orig, _)| orig.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert!(
+            found_names.contains(&"app".to_string()),
+            "should find packages/app"
+        );
+        assert!(
+            found_names.contains(&"lib".to_string()),
+            "should find packages/lib"
+        );
+        assert!(
+            !results
+                .iter()
+                .any(|(_, cp)| cp.to_string_lossy().contains("node_modules")),
+            "should NOT include packages inside node_modules"
+        );
+        assert_eq!(
+            results.len(),
+            2,
+            "should find exactly 2 workspace packages (node_modules pruned)"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn expand_recursive_glob_prunes_deeply_nested_node_modules() {
+        // Even deeply nested node_modules (e.g., pnpm's deep symlink trees)
+        // should be pruned during the walk.
+        let temp_dir = std::env::temp_dir().join("fallow-test-expand-deep-prune");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+
+        // Legitimate workspace package
+        std::fs::create_dir_all(temp_dir.join("packages/core")).unwrap();
+        std::fs::write(
+            temp_dir.join("packages/core/package.json"),
+            r#"{"name": "core"}"#,
+        )
+        .unwrap();
+
+        // Deeply nested node_modules (simulates pnpm virtual store)
+        let deep_nm = temp_dir.join("packages/core/node_modules/.pnpm/react@18/node_modules/react");
+        std::fs::create_dir_all(&deep_nm).unwrap();
+        std::fs::write(deep_nm.join("package.json"), r#"{"name": "react"}"#).unwrap();
+
+        let canonical_root = dunce::canonicalize(&temp_dir).unwrap();
+        let results = expand_workspace_glob(&temp_dir, "packages/**/*", &canonical_root);
+
+        assert_eq!(
+            results.len(),
+            1,
+            "should find exactly 1 workspace package, pruning deep node_modules"
+        );
+        assert!(
+            results[0]
+                .0
+                .to_string_lossy()
+                .replace('\\', "/")
+                .ends_with("packages/core"),
+            "the single result should be packages/core"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
 }

@@ -1180,4 +1180,77 @@ mod tests {
             assert_eq!(entries[0].path, index_a);
         }
     }
+
+    // expand_wildcard_entries unit tests
+    mod wildcard_entry_tests {
+        use super::*;
+
+        #[test]
+        fn expands_wildcard_css_entries() {
+            // Wildcard subpath exports like `"./themes/*": { "import": "./src/themes/*.css" }`
+            // should expand to actual CSS files on disk.
+            let dir = tempfile::tempdir().expect("create temp dir");
+            let themes = dir.path().join("src").join("themes");
+            std::fs::create_dir_all(&themes).unwrap();
+            std::fs::write(themes.join("dark.css"), ":root { --bg: #000; }").unwrap();
+            std::fs::write(themes.join("light.css"), ":root { --bg: #fff; }").unwrap();
+
+            let canonical = dunce::canonicalize(dir.path()).unwrap();
+            let mut entries = Vec::new();
+            expand_wildcard_entries(dir.path(), "./src/themes/*.css", &canonical, &mut entries);
+
+            assert_eq!(entries.len(), 2, "should expand wildcard to 2 CSS files");
+            let paths: Vec<String> = entries
+                .iter()
+                .map(|ep| ep.path.file_name().unwrap().to_string_lossy().to_string())
+                .collect();
+            assert!(paths.contains(&"dark.css".to_string()));
+            assert!(paths.contains(&"light.css".to_string()));
+            assert!(
+                entries
+                    .iter()
+                    .all(|ep| matches!(ep.source, EntryPointSource::PackageJsonExports))
+            );
+        }
+
+        #[test]
+        fn wildcard_does_not_match_nonexistent_files() {
+            let dir = tempfile::tempdir().expect("create temp dir");
+            // No files matching the pattern
+            std::fs::create_dir_all(dir.path().join("src/themes")).unwrap();
+
+            let canonical = dunce::canonicalize(dir.path()).unwrap();
+            let mut entries = Vec::new();
+            expand_wildcard_entries(dir.path(), "./src/themes/*.css", &canonical, &mut entries);
+
+            assert!(
+                entries.is_empty(),
+                "should return empty when no files match the wildcard"
+            );
+        }
+
+        #[test]
+        fn wildcard_only_matches_specified_extension() {
+            // Wildcard pattern `*.css` should not match `.ts` files
+            let dir = tempfile::tempdir().expect("create temp dir");
+            let themes = dir.path().join("src").join("themes");
+            std::fs::create_dir_all(&themes).unwrap();
+            std::fs::write(themes.join("dark.css"), ":root {}").unwrap();
+            std::fs::write(themes.join("index.ts"), "export {};").unwrap();
+
+            let canonical = dunce::canonicalize(dir.path()).unwrap();
+            let mut entries = Vec::new();
+            expand_wildcard_entries(dir.path(), "./src/themes/*.css", &canonical, &mut entries);
+
+            assert_eq!(entries.len(), 1, "should only match CSS files");
+            assert!(
+                entries[0]
+                    .path
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .ends_with(".css")
+            );
+        }
+    }
 }
