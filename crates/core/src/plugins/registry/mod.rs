@@ -438,13 +438,13 @@ fn check_meta_framework_prerequisites(active_plugins: &[&dyn Plugin], root: &Pat
         match plugin.name() {
             "nuxt" if !root.join(".nuxt/tsconfig.json").exists() => {
                 tracing::warn!(
-                    "Nuxt project missing .nuxt/tsconfig.json \u{2014} run `nuxt prepare` \
+                    "Nuxt project missing .nuxt/tsconfig.json: run `nuxt prepare` \
                      before fallow for accurate analysis"
                 );
             }
             "astro" if !root.join(".astro").exists() => {
                 tracing::warn!(
-                    "Astro project missing .astro/ types \u{2014} run `astro sync` \
+                    "Astro project missing .astro/ types: run `astro sync` \
                      before fallow for accurate analysis"
                 );
             }
