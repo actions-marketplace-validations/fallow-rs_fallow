@@ -37,6 +37,21 @@ impl ModuleGraph {
             return;
         }
 
+        // Precompute barrels that are star-re-exported from entry points.
+        // These get entry-point-like treatment: all source exports are marked used.
+        // Computing this once avoids O(modules) per call inside the hot loop.
+        let entry_star_targets: FxHashSet<FileId> = self
+            .modules
+            .iter()
+            .filter(|m| m.is_entry_point())
+            .flat_map(|m| {
+                m.re_exports
+                    .iter()
+                    .filter(|re| re.exported_name == "*")
+                    .map(|re| re.source_file)
+            })
+            .collect();
+
         // For each re-export, if the barrel's exported symbol has references,
         // propagate those references to the source module's original export.
         // We iterate until no new references are added (handles chains).
@@ -67,6 +82,7 @@ impl ModuleGraph {
                         barrel_id,
                         barrel_idx,
                         source_idx,
+                        &entry_star_targets,
                     );
                 } else {
                     changed |= propagate_named_re_export(

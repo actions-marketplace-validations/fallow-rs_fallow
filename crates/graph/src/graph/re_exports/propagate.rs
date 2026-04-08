@@ -24,6 +24,7 @@ pub(in crate::graph) fn propagate_star_re_export(
     barrel_id: FileId,
     barrel_idx: usize,
     source_idx: usize,
+    entry_star_targets: &FxHashSet<FileId>,
 ) -> bool {
     // Entry point barrels with star re-exports: all source exports are
     // transitively exposed to external consumers — mark them as used.
@@ -33,7 +34,7 @@ pub(in crate::graph) fn propagate_star_re_export(
     // types accessible only via multi-level star re-export chains get zero
     // references and are falsely reported as unused.
     if modules[barrel_idx].is_entry_point()
-        || is_star_re_exported_from_entry_or_public(modules, barrel_id)
+        || entry_star_targets.contains(&modules[barrel_idx].file_id)
     {
         return propagate_entry_point_star(modules, barrel_id, source_idx);
     }
@@ -237,22 +238,4 @@ fn propagate_entry_point_named(
         }
     }
     changed
-}
-
-/// Check if a barrel is star-re-exported from an entry point.
-///
-/// Detects multi-level star re-export chains like:
-///   entry_point -> `export * from './types'` -> types/index.ts -> `export * from './Component.vue'`
-/// where types/index.ts is not itself an entry point but is part of a public API
-/// chain because the entry point star-re-exports from it.
-fn is_star_re_exported_from_entry_or_public(
-    modules: &[ModuleNode],
-    barrel_file_id: FileId,
-) -> bool {
-    modules.iter().any(|m| {
-        m.is_entry_point()
-            && m.re_exports
-                .iter()
-                .any(|re| re.source_file == barrel_file_id && re.exported_name == "*")
-    })
 }
