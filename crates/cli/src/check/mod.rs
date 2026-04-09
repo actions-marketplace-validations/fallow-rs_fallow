@@ -152,6 +152,8 @@ pub struct CheckResult {
     pub fail_on_issues: bool,
     pub regression: Option<RegressionOutcome>,
     pub baseline_deltas: Option<crate::baseline::BaselineDeltas>,
+    /// When a baseline was loaded: (total entries in baseline, entries that matched current issues).
+    pub baseline_matched: Option<(usize, usize)>,
 }
 
 /// Run analysis, filtering, and baseline handling. Returns results without printing.
@@ -239,16 +241,14 @@ pub fn execute_check(opts: &CheckOptions<'_>) -> Result<CheckResult, ExitCode> {
     opts.filters.apply(&mut results);
 
     // Baseline handling
-    if let Some(exit) = handle_baseline(
+    let baseline_matched = handle_baseline(
         &mut results,
         opts.save_baseline,
         opts.baseline,
         &config.root,
         opts.quiet,
         opts.output,
-    ) {
-        return Err(exit);
-    }
+    )?;
 
     // Warn if saving a baseline from scoped results (would produce misleading counts)
     if !matches!(
@@ -314,6 +314,7 @@ pub fn execute_check(opts: &CheckOptions<'_>) -> Result<CheckResult, ExitCode> {
         fail_on_issues: opts.fail_on_issues,
         regression: regression_outcome,
         baseline_deltas: None,
+        baseline_matched,
     })
 }
 
@@ -344,6 +345,7 @@ pub fn print_check_result(
         group_by,
         top,
         summary,
+        baseline_matched: result.baseline_matched,
     };
     let report_code = report::print_results(
         &result.results,
@@ -420,7 +422,8 @@ pub fn run_check(opts: &CheckOptions<'_>) -> ExitCode {
 /// Save baseline and/or compare against an existing baseline.
 ///
 /// Returns `Some(ExitCode)` on fatal errors (serialization/IO failure),
-/// `None` on success.
+/// `Ok(None)` when no baseline was loaded, `Ok(Some((entries, matched)))` when
+/// a baseline was loaded, or `Err(ExitCode)` on fatal errors.
 fn handle_baseline(
     results: &mut fallow_core::results::AnalysisResults,
     save_path: Option<&std::path::Path>,
@@ -428,14 +431,14 @@ fn handle_baseline(
     root: &std::path::Path,
     quiet: bool,
     output: OutputFormat,
-) -> Option<ExitCode> {
+) -> Result<Option<(usize, usize)>, ExitCode> {
     // Save baseline if requested
     if let Some(baseline_path) = save_path {
         let baseline_data = BaselineData::from_results(results, root);
         match serde_json::to_string_pretty(&baseline_data) {
             Ok(json) => {
                 if let Err(e) = std::fs::write(baseline_path, json) {
-                    return Some(emit_error(
+                    return Err(emit_error(
                         &format!("failed to save baseline: {e}"),
                         2,
                         output,
@@ -446,7 +449,7 @@ fn handle_baseline(
                 }
             }
             Err(e) => {
-                return Some(emit_error(
+                return Err(emit_error(
                     &format!("failed to serialize baseline: {e}"),
                     2,
                     output,
@@ -460,13 +463,24 @@ fn handle_baseline(
         match std::fs::read_to_string(baseline_path) {
             Ok(content) => match serde_json::from_str::<BaselineData>(&content) {
                 Ok(baseline_data) => {
+                    let baseline_entries = baseline_data.total_entries();
+                    let before = results.total_issues();
                     *results = filter_new_issues(std::mem::take(results), &baseline_data, root);
+                    let matched = before - results.total_issues();
                     if !quiet {
                         eprintln!("Comparing against baseline: {}", baseline_path.display());
                     }
+                    if baseline_entries > 0 && matched == 0 && !quiet {
+                        eprintln!(
+                            "Warning: baseline has {baseline_entries} entries but matched \
+                             0 current issues. The baseline may be stale or saved from a \
+                             different project root. Re-save with --save-baseline",
+                        );
+                    }
+                    return Ok(Some((baseline_entries, matched)));
                 }
                 Err(e) => {
-                    return Some(emit_error(
+                    return Err(emit_error(
                         &format!("failed to parse baseline: {e}"),
                         2,
                         output,
@@ -474,7 +488,7 @@ fn handle_baseline(
                 }
             },
             Err(e) => {
-                return Some(emit_error(
+                return Err(emit_error(
                     &format!("failed to read baseline: {e}"),
                     2,
                     output,
@@ -483,7 +497,7 @@ fn handle_baseline(
         }
     }
 
-    None
+    Ok(None)
 }
 
 #[cfg(test)]

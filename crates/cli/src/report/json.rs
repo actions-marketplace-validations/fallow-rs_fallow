@@ -15,6 +15,7 @@ pub(super) fn print_json(
     elapsed: Duration,
     explain: bool,
     regression: Option<&crate::regression::RegressionOutcome>,
+    baseline_matched: Option<(usize, usize)>,
 ) -> ExitCode {
     match build_json(results, root, elapsed) {
         Ok(mut output) => {
@@ -22,6 +23,17 @@ pub(super) fn print_json(
                 && let serde_json::Value::Object(ref mut map) = output
             {
                 map.insert("regression".to_string(), outcome.to_json());
+            }
+            if let Some((entries, matched)) = baseline_matched
+                && let serde_json::Value::Object(ref mut map) = output
+            {
+                map.insert(
+                    "baseline".to_string(),
+                    serde_json::json!({
+                        "entries": entries,
+                        "matched": matched,
+                    }),
+                );
             }
             if explain {
                 insert_meta(&mut output, explain::check_meta());

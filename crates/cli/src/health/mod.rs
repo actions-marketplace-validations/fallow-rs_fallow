@@ -839,6 +839,7 @@ pub fn print_health_result(
         group_by: None,
         top: None,
         summary,
+        baseline_matched: None,
     };
     let report_code = report::print_health_report(&result.report, &ctx, result.config.output);
     if report_code != ExitCode::SUCCESS {

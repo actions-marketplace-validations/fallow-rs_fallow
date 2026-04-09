@@ -4,11 +4,22 @@ use std::path::Path;
 use fallow_core::duplicates::DuplicationReport;
 
 /// Strip the project root from a path to produce a portable relative key.
+///
+/// Both `path` and `root` must be in the same form (both canonicalized or both
+/// not) for `strip_prefix` to succeed. The analysis pipeline keeps all paths
+/// non-canonicalized, so this invariant holds in practice.
 fn relative_path(path: &Path, root: &Path) -> String {
-    path.strip_prefix(root)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .replace('\\', "/")
+    match path.strip_prefix(root) {
+        Ok(relative) => relative.to_string_lossy().replace('\\', "/"),
+        Err(_) => {
+            tracing::debug!(
+                path = %path.display(),
+                root = %root.display(),
+                "baseline key: path is not under project root, using absolute path as key"
+            );
+            path.to_string_lossy().replace('\\', "/")
+        }
+    }
 }
 
 /// Baseline data for comparison.
@@ -144,6 +155,25 @@ impl BaselineData {
                 .map(|v| boundary_violation_key(v, root))
                 .collect(),
         }
+    }
+
+    /// Total number of entries across all categories.
+    pub fn total_entries(&self) -> usize {
+        self.unused_files.len()
+            + self.unused_exports.len()
+            + self.unused_types.len()
+            + self.unused_dependencies.len()
+            + self.unused_dev_dependencies.len()
+            + self.circular_dependencies.len()
+            + self.unused_optional_dependencies.len()
+            + self.unused_enum_members.len()
+            + self.unused_class_members.len()
+            + self.unresolved_imports.len()
+            + self.unlisted_dependencies.len()
+            + self.duplicate_exports.len()
+            + self.type_only_dependencies.len()
+            + self.test_only_dependencies.len()
+            + self.boundary_violations.len()
     }
 }
 
@@ -1350,20 +1380,19 @@ mod tests {
 
     // ── cross-machine baseline portability (#87) ──────────────
 
-    /// Regression test: baseline saved on one machine (different absolute root)
-    /// must match issues found on another machine.
-    #[test]
-    fn baseline_keys_are_relative_to_root() {
-        use fallow_core::results::BoundaryViolation;
+    /// Build results with absolute paths rooted at the given prefix.
+    fn make_absolute_results(root: &str) -> AnalysisResults {
+        use fallow_core::extract::MemberKind;
+        use fallow_core::results::*;
 
-        // Simulate saving baseline on a developer's machine
-        let local_root = Path::new("/Users/dev/project");
-        let mut results = AnalysisResults {
+        let p = |rel: &str| PathBuf::from(format!("{root}/{rel}"));
+
+        AnalysisResults {
             unused_files: vec![UnusedFile {
-                path: PathBuf::from("/Users/dev/project/src/old.ts"),
+                path: p("src/old.ts"),
             }],
             unused_exports: vec![UnusedExport {
-                path: PathBuf::from("/Users/dev/project/src/utils.ts"),
+                path: p("src/utils.ts"),
                 export_name: "helper".to_string(),
                 is_type_only: false,
                 line: 5,
@@ -1371,9 +1400,54 @@ mod tests {
                 span_start: 40,
                 is_re_export: false,
             }],
+            circular_dependencies: vec![CircularDependency {
+                files: vec![p("src/a.ts"), p("src/b.ts")],
+                length: 2,
+                line: 1,
+                col: 0,
+                is_cross_package: false,
+            }],
+            unused_enum_members: vec![UnusedMember {
+                path: p("src/enums.ts"),
+                parent_name: "Status".to_string(),
+                member_name: "Deprecated".to_string(),
+                kind: MemberKind::EnumMember,
+                line: 8,
+                col: 0,
+            }],
+            unused_class_members: vec![UnusedMember {
+                path: p("src/service.ts"),
+                parent_name: "UserService".to_string(),
+                member_name: "legacy".to_string(),
+                kind: MemberKind::ClassMethod,
+                line: 42,
+                col: 0,
+            }],
+            unresolved_imports: vec![UnresolvedImport {
+                path: p("src/app.ts"),
+                specifier: "./missing".to_string(),
+                line: 3,
+                col: 0,
+                specifier_col: 0,
+            }],
+            duplicate_exports: vec![DuplicateExport {
+                export_name: "Config".to_string(),
+                locations: vec![
+                    DuplicateLocation {
+                        path: p("src/a.ts"),
+                        line: 1,
+                        col: 0,
+                    },
+                    DuplicateLocation {
+                        path: p("src/b.ts"),
+                        line: 5,
+                        col: 0,
+                    },
+                ],
+            }],
             boundary_violations: vec![BoundaryViolation {
-                from_path: PathBuf::from("/Users/dev/project/src/ui/btn.ts"),
-                to_path: PathBuf::from("/Users/dev/project/src/db/query.ts"),
+                from_path: p("src/ui/btn.ts"),
+                to_path: p("src/db/query.ts"),
                 from_zone: "ui".to_string(),
                 to_zone: "db".to_string(),
                 import_specifier: "../db/query".to_string(),
@@ -1381,8 +1455,15 @@ mod tests {
                 col: 0,
             }],
             ..Default::default()
-        };
+        }
+    }
 
+    /// Regression test: baseline saved on one machine (different absolute root)
+    /// must match issues found on another machine across all path-based types.
+    #[test]
+    fn baseline_keys_are_relative_to_root() {
+        let local_root = Path::new("/Users/dev/project");
+        let results = make_absolute_results("/Users/dev/project");
         let baseline = BaselineData::from_results(&results, local_root);
 
         // Keys should be relative
@@ -1392,30 +1473,33 @@ mod tests {
             baseline.boundary_violations,
             vec!["src/ui/btn.ts->src/db/query.ts"]
         );
+        assert_eq!(baseline.circular_dependencies, vec!["src/a.ts->src/b.ts"]);
+        assert_eq!(
+            baseline.unused_enum_members,
+            vec!["src/enums.ts:Status.Deprecated"]
+        );
+        assert_eq!(
+            baseline.unused_class_members,
+            vec!["src/service.ts:UserService.legacy"]
+        );
+        assert_eq!(baseline.unresolved_imports, vec!["src/app.ts:./missing"]);
+        assert_eq!(baseline.duplicate_exports, vec!["Config|src/a.ts|src/b.ts"]);
 
         // Simulate loading baseline on CI (different absolute root, same relative structure)
         let ci_root = Path::new("/home/runner/work/project/project");
-        results.unused_files[0].path =
-            PathBuf::from("/home/runner/work/project/project/src/old.ts");
-        results.unused_exports[0].path =
-            PathBuf::from("/home/runner/work/project/project/src/utils.ts");
-        results.boundary_violations[0].from_path =
-            PathBuf::from("/home/runner/work/project/project/src/ui/btn.ts");
-        results.boundary_violations[0].to_path =
-            PathBuf::from("/home/runner/work/project/project/src/db/query.ts");
+        let ci_results = make_absolute_results("/home/runner/work/project/project");
 
-        let filtered = filter_new_issues(results, &baseline, ci_root);
-        assert!(
-            filtered.unused_files.is_empty(),
-            "baseline should filter unused files across different roots"
-        );
-        assert!(
-            filtered.unused_exports.is_empty(),
-            "baseline should filter unused exports across different roots"
-        );
+        let filtered = filter_new_issues(ci_results, &baseline, ci_root);
+        assert!(filtered.unused_files.is_empty(), "unused files");
+        assert!(filtered.unused_exports.is_empty(), "unused exports");
         assert!(
             filtered.boundary_violations.is_empty(),
-            "baseline should filter boundary violations across different roots"
+            "boundary violations"
         );
+        assert!(filtered.circular_dependencies.is_empty(), "circular deps");
+        assert!(filtered.unused_enum_members.is_empty(), "enum members");
+        assert!(filtered.unused_class_members.is_empty(), "class members");
+        assert!(filtered.unresolved_imports.is_empty(), "unresolved imports");
+        assert!(filtered.duplicate_exports.is_empty(), "duplicate exports");
     }
 }

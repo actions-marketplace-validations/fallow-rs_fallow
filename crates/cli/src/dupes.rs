@@ -263,6 +263,7 @@ pub fn print_dupes_result(
         group_by: None,
         top: None,
         summary,
+        baseline_matched: None,
     };
     let report_code = report::print_duplication_report(&result.report, &ctx, result.config.output);
     if report_code != ExitCode::SUCCESS {
@@ -315,6 +316,7 @@ fn print_dupes_result_with_grouping(
         group_by,
         top: None,
         summary,
+        baseline_matched: None,
     };
     report::print_duplication_report(&result.report, &ctx, result.config.output)
 }

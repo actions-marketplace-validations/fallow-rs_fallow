@@ -41,6 +41,8 @@ pub struct ReportContext<'a> {
     pub top: Option<usize>,
     /// When set, print a concise summary instead of the full report.
     pub summary: bool,
+    /// When a baseline was loaded: (total entries in baseline, entries that matched).
+    pub baseline_matched: Option<(usize, usize)>,
 }
 
 /// Strip the project root prefix from a path for display, falling back to the full path.
@@ -173,9 +175,14 @@ pub fn print_results(
             }
             ExitCode::SUCCESS
         }
-        OutputFormat::Json => {
-            json::print_json(results, ctx.root, ctx.elapsed, ctx.explain, regression)
-        }
+        OutputFormat::Json => json::print_json(
+            results,
+            ctx.root,
+            ctx.elapsed,
+            ctx.explain,
+            regression,
+            ctx.baseline_matched,
+        ),
         OutputFormat::Compact => {
             compact::print_compact(results, ctx.root);
             ExitCode::SUCCESS
