@@ -225,7 +225,7 @@ fn render_health_score(lines: &mut Vec<String>, report: &crate::health_types::He
     if p.duplication.is_some_and(|dp| dp >= 5.0) {
         lines.push(format!(
             "  {}",
-            "Tip: use health.ignore to exclude generated or test directories from duplication analysis"
+            "Tip: add \"dist\" or \"__generated__\" to health.ignore in your config to exclude from duplication analysis"
                 .dimmed()
         ));
     }
@@ -520,7 +520,7 @@ fn render_large_functions(
     if shown < total {
         lines.push(format!(
             "  {}",
-            format!("use --top {total} to see all {total}").dimmed()
+            format!("use --top {total} to see all").dimmed()
         ));
     }
     lines.push(String::new());
@@ -607,7 +607,7 @@ fn render_findings(
         let total = report.summary.functions_above_threshold;
         lines.push(format!(
             "  {}",
-            format!("use --top {total} to see all {total}").dimmed()
+            format!("use --top {total} to see all").dimmed()
         ));
     }
     lines.push(String::new());
