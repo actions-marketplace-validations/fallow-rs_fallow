@@ -224,6 +224,22 @@ mod tests {
         }
     }
 
+    fn fix_single_member(
+        root: &Path,
+        file: &Path,
+        enum_name: &str,
+        member_name: &str,
+        line: u32,
+        dry_run: bool,
+    ) -> Vec<serde_json::Value> {
+        let member = make_enum_member(file, enum_name, member_name, line);
+        let mut map: FxHashMap<PathBuf, Vec<&UnusedMember>> = FxHashMap::default();
+        map.insert(file.to_path_buf(), vec![&member]);
+        let mut fixes = Vec::new();
+        apply_enum_member_fixes(root, &map, OutputFormat::Human, dry_run, &mut fixes);
+        fixes
+    }
+
     #[test]
     fn enum_fix_removes_single_member_from_multi_member_enum() {
         let dir = tempfile::tempdir().unwrap();
@@ -235,20 +251,8 @@ mod tests {
         )
         .unwrap();
 
-        let member = make_enum_member(&file, "Status", "Inactive", 3);
-        let mut members_by_file: FxHashMap<PathBuf, Vec<&UnusedMember>> = FxHashMap::default();
-        members_by_file.insert(file.clone(), vec![&member]);
+        let fixes = fix_single_member(root, &file, "Status", "Inactive", 3, false);
 
-        let mut fixes = Vec::new();
-        let had_error = apply_enum_member_fixes(
-            root,
-            &members_by_file,
-            OutputFormat::Human,
-            false,
-            &mut fixes,
-        );
-
-        assert!(!had_error);
         let content = std::fs::read_to_string(&file).unwrap();
         assert_eq!(content, "export enum Status {\n  Active,\n  Pending,\n}\n");
         assert_eq!(fixes.len(), 1);
@@ -325,18 +329,7 @@ mod tests {
         )
         .unwrap();
 
-        let member = make_enum_member(&file, "Status", "Inactive", 3);
-        let mut members_by_file: FxHashMap<PathBuf, Vec<&UnusedMember>> = FxHashMap::default();
-        members_by_file.insert(file.clone(), vec![&member]);
-
-        let mut fixes = Vec::new();
-        apply_enum_member_fixes(
-            root,
-            &members_by_file,
-            OutputFormat::Human,
-            false,
-            &mut fixes,
-        );
+        fix_single_member(root, &file, "Status", "Inactive", 3, false);
 
         let content = std::fs::read_to_string(&file).unwrap();
         assert_eq!(
@@ -352,18 +345,7 @@ mod tests {
         let file = root.join("status.ts");
         std::fs::write(&file, "enum Status { Active, Inactive, Pending }\n").unwrap();
 
-        let member = make_enum_member(&file, "Status", "Inactive", 1);
-        let mut members_by_file: FxHashMap<PathBuf, Vec<&UnusedMember>> = FxHashMap::default();
-        members_by_file.insert(file.clone(), vec![&member]);
-
-        let mut fixes = Vec::new();
-        apply_enum_member_fixes(
-            root,
-            &members_by_file,
-            OutputFormat::Human,
-            false,
-            &mut fixes,
-        );
+        fix_single_member(root, &file, "Status", "Inactive", 1, false);
 
         let content = std::fs::read_to_string(&file).unwrap();
         assert_eq!(content, "enum Status { Active, Pending }\n");
@@ -376,18 +358,7 @@ mod tests {
         let file = root.join("status.ts");
         std::fs::write(&file, "enum Status { Active }\n").unwrap();
 
-        let member = make_enum_member(&file, "Status", "Active", 1);
-        let mut members_by_file: FxHashMap<PathBuf, Vec<&UnusedMember>> = FxHashMap::default();
-        members_by_file.insert(file.clone(), vec![&member]);
-
-        let mut fixes = Vec::new();
-        apply_enum_member_fixes(
-            root,
-            &members_by_file,
-            OutputFormat::Human,
-            false,
-            &mut fixes,
-        );
+        fix_single_member(root, &file, "Status", "Active", 1, false);
 
         let content = std::fs::read_to_string(&file).unwrap();
         assert_eq!(content, "enum Status {}\n");
@@ -404,18 +375,7 @@ mod tests {
         )
         .unwrap();
 
-        let member = make_enum_member(&file, "Status", "Active", 1);
-        let mut members_by_file: FxHashMap<PathBuf, Vec<&UnusedMember>> = FxHashMap::default();
-        members_by_file.insert(file.clone(), vec![&member]);
-
-        let mut fixes = Vec::new();
-        apply_enum_member_fixes(
-            root,
-            &members_by_file,
-            OutputFormat::Human,
-            false,
-            &mut fixes,
-        );
+        fix_single_member(root, &file, "Status", "Active", 1, false);
 
         let content = std::fs::read_to_string(&file).unwrap();
         assert_eq!(content, "enum Status { Inactive = \"inactive\" }\n");
@@ -454,18 +414,7 @@ mod tests {
         )
         .unwrap();
 
-        let member = make_enum_member(&file, "Status", "Inactive", 3);
-        let mut members_by_file: FxHashMap<PathBuf, Vec<&UnusedMember>> = FxHashMap::default();
-        members_by_file.insert(file.clone(), vec![&member]);
-
-        let mut fixes = Vec::new();
-        apply_enum_member_fixes(
-            root,
-            &members_by_file,
-            OutputFormat::Human,
-            false,
-            &mut fixes,
-        );
+        fix_single_member(root, &file, "Status", "Inactive", 3, false);
 
         let content = std::fs::read_to_string(&file).unwrap();
         assert_eq!(
@@ -485,18 +434,7 @@ mod tests {
         )
         .unwrap();
 
-        let member = make_enum_member(&file, "Status", "Active", 2);
-        let mut members_by_file: FxHashMap<PathBuf, Vec<&UnusedMember>> = FxHashMap::default();
-        members_by_file.insert(file.clone(), vec![&member]);
-
-        let mut fixes = Vec::new();
-        apply_enum_member_fixes(
-            root,
-            &members_by_file,
-            OutputFormat::Human,
-            false,
-            &mut fixes,
-        );
+        fix_single_member(root, &file, "Status", "Active", 2, false);
 
         let content = std::fs::read_to_string(&file).unwrap();
         assert_eq!(
@@ -514,18 +452,7 @@ mod tests {
         let original = "enum Status {\n  Active,\n  Inactive,\n}\n";
         std::fs::write(&outside_file, original).unwrap();
 
-        let member = make_enum_member(&outside_file, "Status", "Active", 2);
-        let mut members_by_file: FxHashMap<PathBuf, Vec<&UnusedMember>> = FxHashMap::default();
-        members_by_file.insert(outside_file.clone(), vec![&member]);
-
-        let mut fixes = Vec::new();
-        apply_enum_member_fixes(
-            &root,
-            &members_by_file,
-            OutputFormat::Human,
-            false,
-            &mut fixes,
-        );
+        let fixes = fix_single_member(&root, &outside_file, "Status", "Active", 2, false);
 
         assert_eq!(std::fs::read_to_string(&outside_file).unwrap(), original);
         assert!(fixes.is_empty());
@@ -540,18 +467,7 @@ mod tests {
         std::fs::write(&file, original).unwrap();
 
         // Point at line 2 (Active), but claim the member name is "Missing"
-        let member = make_enum_member(&file, "Status", "Missing", 2);
-        let mut members_by_file: FxHashMap<PathBuf, Vec<&UnusedMember>> = FxHashMap::default();
-        members_by_file.insert(file.clone(), vec![&member]);
-
-        let mut fixes = Vec::new();
-        apply_enum_member_fixes(
-            root,
-            &members_by_file,
-            OutputFormat::Human,
-            false,
-            &mut fixes,
-        );
+        let fixes = fix_single_member(root, &file, "Status", "Missing", 2, false);
 
         assert_eq!(std::fs::read_to_string(&file).unwrap(), original);
         assert!(fixes.is_empty());
@@ -565,18 +481,7 @@ mod tests {
         let original = "enum Status {\n  Active,\n}\n";
         std::fs::write(&file, original).unwrap();
 
-        let member = make_enum_member(&file, "Status", "Active", 999);
-        let mut members_by_file: FxHashMap<PathBuf, Vec<&UnusedMember>> = FxHashMap::default();
-        members_by_file.insert(file.clone(), vec![&member]);
-
-        let mut fixes = Vec::new();
-        apply_enum_member_fixes(
-            root,
-            &members_by_file,
-            OutputFormat::Human,
-            false,
-            &mut fixes,
-        );
+        let fixes = fix_single_member(root, &file, "Status", "Active", 999, false);
 
         assert_eq!(std::fs::read_to_string(&file).unwrap(), original);
         assert!(fixes.is_empty());
@@ -590,18 +495,7 @@ mod tests {
         std::fs::write(&file, "enum Status {\n  Active,\n  Inactive,\n}\n").unwrap();
 
         // Remove the last member
-        let member = make_enum_member(&file, "Status", "Inactive", 3);
-        let mut members_by_file: FxHashMap<PathBuf, Vec<&UnusedMember>> = FxHashMap::default();
-        members_by_file.insert(file.clone(), vec![&member]);
-
-        let mut fixes = Vec::new();
-        apply_enum_member_fixes(
-            root,
-            &members_by_file,
-            OutputFormat::Human,
-            false,
-            &mut fixes,
-        );
+        fix_single_member(root, &file, "Status", "Inactive", 3, false);
 
         let content = std::fs::read_to_string(&file).unwrap();
         assert_eq!(content, "enum Status {\n  Active,\n}\n");
@@ -618,18 +512,7 @@ mod tests {
         )
         .unwrap();
 
-        let member = make_enum_member(&file, "Priority", "Medium", 3);
-        let mut members_by_file: FxHashMap<PathBuf, Vec<&UnusedMember>> = FxHashMap::default();
-        members_by_file.insert(file.clone(), vec![&member]);
-
-        let mut fixes = Vec::new();
-        apply_enum_member_fixes(
-            root,
-            &members_by_file,
-            OutputFormat::Human,
-            false,
-            &mut fixes,
-        );
+        fix_single_member(root, &file, "Priority", "Medium", 3, false);
 
         let content = std::fs::read_to_string(&file).unwrap();
         assert_eq!(content, "enum Priority {\n  Low = 0,\n  High = 2,\n}\n");
@@ -716,18 +599,7 @@ mod tests {
         )
         .unwrap();
 
-        let member = make_enum_member(&file, "Status", "Active", 2);
-        let mut members_by_file: FxHashMap<PathBuf, Vec<&UnusedMember>> = FxHashMap::default();
-        members_by_file.insert(file.clone(), vec![&member]);
-
-        let mut fixes = Vec::new();
-        apply_enum_member_fixes(
-            root,
-            &members_by_file,
-            OutputFormat::Human,
-            false,
-            &mut fixes,
-        );
+        fix_single_member(root, &file, "Status", "Active", 2, false);
 
         let content = std::fs::read_to_string(&file).unwrap();
         assert_eq!(content, "enum Status {\n  Inactive,\n  Pending,\n}\n");
@@ -739,20 +611,8 @@ mod tests {
         let root = dir.path();
         let file = root.join("missing.ts"); // Does not exist
 
-        let member = make_enum_member(&file, "Status", "Active", 2);
-        let mut members_by_file: FxHashMap<PathBuf, Vec<&UnusedMember>> = FxHashMap::default();
-        members_by_file.insert(file, vec![&member]);
+        let fixes = fix_single_member(root, &file, "Status", "Active", 2, false);
 
-        let mut fixes = Vec::new();
-        let had_error = apply_enum_member_fixes(
-            root,
-            &members_by_file,
-            OutputFormat::Human,
-            false,
-            &mut fixes,
-        );
-
-        assert!(!had_error);
         assert!(fixes.is_empty());
     }
 
@@ -767,18 +627,7 @@ mod tests {
         )
         .unwrap();
 
-        let member = make_enum_member(&file, "Bits", "B", 3);
-        let mut members_by_file: FxHashMap<PathBuf, Vec<&UnusedMember>> = FxHashMap::default();
-        members_by_file.insert(file.clone(), vec![&member]);
-
-        let mut fixes = Vec::new();
-        apply_enum_member_fixes(
-            root,
-            &members_by_file,
-            OutputFormat::Human,
-            false,
-            &mut fixes,
-        );
+        fix_single_member(root, &file, "Bits", "B", 3, false);
 
         let content = std::fs::read_to_string(&file).unwrap();
         assert_eq!(content, "enum Bits {\n  A = 1 << 0,\n  C = 1 << 2,\n}\n");

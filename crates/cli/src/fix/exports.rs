@@ -266,6 +266,27 @@ mod tests {
         }
     }
 
+    /// Run export fix for a single export. Returns (had_error, fixes).
+    fn fix_single(
+        root: &Path,
+        file: &Path,
+        name: &str,
+        line: u32,
+        dry_run: bool,
+    ) -> (bool, Vec<serde_json::Value>) {
+        let format = if dry_run {
+            OutputFormat::Json
+        } else {
+            OutputFormat::Human
+        };
+        let export = make_export(file, name, line);
+        let mut map: FxHashMap<PathBuf, Vec<&UnusedExport>> = FxHashMap::default();
+        map.insert(file.to_path_buf(), vec![&export]);
+        let mut fixes = Vec::new();
+        let had_error = apply_export_fixes(root, &map, format, dry_run, &mut fixes);
+        (had_error, fixes)
+    }
+
     #[test]
     fn dry_run_export_fix_does_not_modify_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -275,12 +296,7 @@ mod tests {
         let original = "export function foo() {}\nexport function bar() {}\n";
         std::fs::write(&file, original).unwrap();
 
-        let export = make_export(&file, "foo", 1);
-        let mut exports_by_file: FxHashMap<PathBuf, Vec<&UnusedExport>> = FxHashMap::default();
-        exports_by_file.insert(file.clone(), vec![&export]);
-
-        let mut fixes = Vec::new();
-        apply_export_fixes(root, &exports_by_file, OutputFormat::Json, true, &mut fixes);
+        let (_, fixes) = fix_single(root, &file, "foo", 1, true);
 
         // File should not be modified
         assert_eq!(std::fs::read_to_string(&file).unwrap(), original);
@@ -298,18 +314,7 @@ mod tests {
         let file = root.join("utils.ts");
         std::fs::write(&file, "export function foo() {}\nexport const bar = 1;\n").unwrap();
 
-        let export = make_export(&file, "foo", 1);
-        let mut exports_by_file: FxHashMap<PathBuf, Vec<&UnusedExport>> = FxHashMap::default();
-        exports_by_file.insert(file.clone(), vec![&export]);
-
-        let mut fixes = Vec::new();
-        let had_error = apply_export_fixes(
-            root,
-            &exports_by_file,
-            OutputFormat::Human,
-            false,
-            &mut fixes,
-        );
+        let (had_error, fixes) = fix_single(root, &file, "foo", 1, false);
 
         assert!(!had_error);
         let content = std::fs::read_to_string(&file).unwrap();
@@ -325,18 +330,7 @@ mod tests {
         let file = root.join("component.ts");
         std::fs::write(&file, "export default function App() {}\n").unwrap();
 
-        let export = make_export(&file, "default", 1);
-        let mut exports_by_file: FxHashMap<PathBuf, Vec<&UnusedExport>> = FxHashMap::default();
-        exports_by_file.insert(file.clone(), vec![&export]);
-
-        let mut fixes = Vec::new();
-        apply_export_fixes(
-            root,
-            &exports_by_file,
-            OutputFormat::Human,
-            false,
-            &mut fixes,
-        );
+        let (_, _) = fix_single(root, &file, "default", 1, false);
 
         let content = std::fs::read_to_string(&file).unwrap();
         assert_eq!(content, "function App() {}\n");
@@ -349,18 +343,7 @@ mod tests {
         let file = root.join("service.ts");
         std::fs::write(&file, "export default class MyService {}\n").unwrap();
 
-        let export = make_export(&file, "default", 1);
-        let mut exports_by_file: FxHashMap<PathBuf, Vec<&UnusedExport>> = FxHashMap::default();
-        exports_by_file.insert(file.clone(), vec![&export]);
-
-        let mut fixes = Vec::new();
-        apply_export_fixes(
-            root,
-            &exports_by_file,
-            OutputFormat::Human,
-            false,
-            &mut fixes,
-        );
+        let (_, _) = fix_single(root, &file, "default", 1, false);
 
         let content = std::fs::read_to_string(&file).unwrap();
         assert_eq!(content, "class MyService {}\n");
@@ -373,18 +356,7 @@ mod tests {
         let file = root.join("base.ts");
         std::fs::write(&file, "export default abstract class Base {}\n").unwrap();
 
-        let export = make_export(&file, "default", 1);
-        let mut exports_by_file: FxHashMap<PathBuf, Vec<&UnusedExport>> = FxHashMap::default();
-        exports_by_file.insert(file.clone(), vec![&export]);
-
-        let mut fixes = Vec::new();
-        apply_export_fixes(
-            root,
-            &exports_by_file,
-            OutputFormat::Human,
-            false,
-            &mut fixes,
-        );
+        let (_, _) = fix_single(root, &file, "default", 1, false);
 
         let content = std::fs::read_to_string(&file).unwrap();
         assert_eq!(content, "abstract class Base {}\n");
@@ -397,18 +369,7 @@ mod tests {
         let file = root.join("handler.ts");
         std::fs::write(&file, "export default async function handler() {}\n").unwrap();
 
-        let export = make_export(&file, "default", 1);
-        let mut exports_by_file: FxHashMap<PathBuf, Vec<&UnusedExport>> = FxHashMap::default();
-        exports_by_file.insert(file.clone(), vec![&export]);
-
-        let mut fixes = Vec::new();
-        apply_export_fixes(
-            root,
-            &exports_by_file,
-            OutputFormat::Human,
-            false,
-            &mut fixes,
-        );
+        let (_, _) = fix_single(root, &file, "default", 1, false);
 
         let content = std::fs::read_to_string(&file).unwrap();
         assert_eq!(content, "async function handler() {}\n");
@@ -422,18 +383,7 @@ mod tests {
         let original = "export default { key: 'value' };\n";
         std::fs::write(&file, original).unwrap();
 
-        let export = make_export(&file, "default", 1);
-        let mut exports_by_file: FxHashMap<PathBuf, Vec<&UnusedExport>> = FxHashMap::default();
-        exports_by_file.insert(file.clone(), vec![&export]);
-
-        let mut fixes = Vec::new();
-        apply_export_fixes(
-            root,
-            &exports_by_file,
-            OutputFormat::Human,
-            false,
-            &mut fixes,
-        );
+        let (_, fixes) = fix_single(root, &file, "default", 1, false);
 
         // File unchanged — expression defaults are not safely removable
         assert_eq!(std::fs::read_to_string(&file).unwrap(), original);
@@ -447,18 +397,7 @@ mod tests {
         let file = root.join("mod.ts");
         std::fs::write(&file, "  export const x = 1;\n").unwrap();
 
-        let export = make_export(&file, "x", 1);
-        let mut exports_by_file: FxHashMap<PathBuf, Vec<&UnusedExport>> = FxHashMap::default();
-        exports_by_file.insert(file.clone(), vec![&export]);
-
-        let mut fixes = Vec::new();
-        apply_export_fixes(
-            root,
-            &exports_by_file,
-            OutputFormat::Human,
-            false,
-            &mut fixes,
-        );
+        let (_, _) = fix_single(root, &file, "x", 1, false);
 
         let content = std::fs::read_to_string(&file).unwrap();
         assert_eq!(content, "  const x = 1;\n");
@@ -475,18 +414,7 @@ mod tests {
         )
         .unwrap();
 
-        let export = make_export(&file, "foo", 1);
-        let mut exports_by_file: FxHashMap<PathBuf, Vec<&UnusedExport>> = FxHashMap::default();
-        exports_by_file.insert(file.clone(), vec![&export]);
-
-        let mut fixes = Vec::new();
-        apply_export_fixes(
-            root,
-            &exports_by_file,
-            OutputFormat::Human,
-            false,
-            &mut fixes,
-        );
+        let (_, _) = fix_single(root, &file, "foo", 1, false);
 
         let content = std::fs::read_to_string(&file).unwrap();
         assert_eq!(content, "function foo() {}\r\nexport function bar() {}\r\n");
@@ -527,18 +455,7 @@ mod tests {
         let original = "const foo = 'export something';\n";
         std::fs::write(&file, original).unwrap();
 
-        let export = make_export(&file, "foo", 1);
-        let mut exports_by_file: FxHashMap<PathBuf, Vec<&UnusedExport>> = FxHashMap::default();
-        exports_by_file.insert(file.clone(), vec![&export]);
-
-        let mut fixes = Vec::new();
-        apply_export_fixes(
-            root,
-            &exports_by_file,
-            OutputFormat::Human,
-            false,
-            &mut fixes,
-        );
+        let (_, fixes) = fix_single(root, &file, "foo", 1, false);
 
         assert_eq!(std::fs::read_to_string(&file).unwrap(), original);
         assert!(fixes.is_empty());
@@ -585,18 +502,7 @@ mod tests {
         std::fs::write(&file, "export function a() {}\n").unwrap();
 
         // Line 999 is way out of bounds
-        let export = make_export(&file, "ghost", 999);
-        let mut exports_by_file: FxHashMap<PathBuf, Vec<&UnusedExport>> = FxHashMap::default();
-        exports_by_file.insert(file.clone(), vec![&export]);
-
-        let mut fixes = Vec::new();
-        apply_export_fixes(
-            root,
-            &exports_by_file,
-            OutputFormat::Human,
-            false,
-            &mut fixes,
-        );
+        let (_, fixes) = fix_single(root, &file, "ghost", 999, false);
 
         // File unchanged, no fixes
         let content = std::fs::read_to_string(&file).unwrap();
@@ -611,18 +517,7 @@ mod tests {
         let file = root.join("constants.ts");
         std::fs::write(&file, "export const MAX = 100;\n").unwrap();
 
-        let export = make_export(&file, "MAX", 1);
-        let mut exports_by_file: FxHashMap<PathBuf, Vec<&UnusedExport>> = FxHashMap::default();
-        exports_by_file.insert(file.clone(), vec![&export]);
-
-        let mut fixes = Vec::new();
-        apply_export_fixes(
-            root,
-            &exports_by_file,
-            OutputFormat::Human,
-            false,
-            &mut fixes,
-        );
+        let (_, _) = fix_single(root, &file, "MAX", 1, false);
 
         let content = std::fs::read_to_string(&file).unwrap();
         assert_eq!(content, "const MAX = 100;\n");
@@ -635,18 +530,7 @@ mod tests {
         let file = root.join("state.ts");
         std::fs::write(&file, "export let counter = 0;\n").unwrap();
 
-        let export = make_export(&file, "counter", 1);
-        let mut exports_by_file: FxHashMap<PathBuf, Vec<&UnusedExport>> = FxHashMap::default();
-        exports_by_file.insert(file.clone(), vec![&export]);
-
-        let mut fixes = Vec::new();
-        apply_export_fixes(
-            root,
-            &exports_by_file,
-            OutputFormat::Human,
-            false,
-            &mut fixes,
-        );
+        let (_, _) = fix_single(root, &file, "counter", 1, false);
 
         let content = std::fs::read_to_string(&file).unwrap();
         assert_eq!(content, "let counter = 0;\n");
@@ -659,18 +543,7 @@ mod tests {
         let file = root.join("types.ts");
         std::fs::write(&file, "export type Foo = string;\n").unwrap();
 
-        let export = make_export(&file, "Foo", 1);
-        let mut exports_by_file: FxHashMap<PathBuf, Vec<&UnusedExport>> = FxHashMap::default();
-        exports_by_file.insert(file.clone(), vec![&export]);
-
-        let mut fixes = Vec::new();
-        apply_export_fixes(
-            root,
-            &exports_by_file,
-            OutputFormat::Human,
-            false,
-            &mut fixes,
-        );
+        let (_, _) = fix_single(root, &file, "Foo", 1, false);
 
         let content = std::fs::read_to_string(&file).unwrap();
         assert_eq!(content, "type Foo = string;\n");
@@ -683,18 +556,7 @@ mod tests {
         let file = root.join("types.ts");
         std::fs::write(&file, "export interface Bar {\n  name: string;\n}\n").unwrap();
 
-        let export = make_export(&file, "Bar", 1);
-        let mut exports_by_file: FxHashMap<PathBuf, Vec<&UnusedExport>> = FxHashMap::default();
-        exports_by_file.insert(file.clone(), vec![&export]);
-
-        let mut fixes = Vec::new();
-        apply_export_fixes(
-            root,
-            &exports_by_file,
-            OutputFormat::Human,
-            false,
-            &mut fixes,
-        );
+        let (_, _) = fix_single(root, &file, "Bar", 1, false);
 
         let content = std::fs::read_to_string(&file).unwrap();
         assert_eq!(content, "interface Bar {\n  name: string;\n}\n");
@@ -707,18 +569,7 @@ mod tests {
         let file = root.join("enums.ts");
         std::fs::write(&file, "export enum Status { Active, Inactive }\n").unwrap();
 
-        let export = make_export(&file, "Status", 1);
-        let mut exports_by_file: FxHashMap<PathBuf, Vec<&UnusedExport>> = FxHashMap::default();
-        exports_by_file.insert(file.clone(), vec![&export]);
-
-        let mut fixes = Vec::new();
-        apply_export_fixes(
-            root,
-            &exports_by_file,
-            OutputFormat::Human,
-            false,
-            &mut fixes,
-        );
+        let (_, _) = fix_single(root, &file, "Status", 1, false);
 
         let content = std::fs::read_to_string(&file).unwrap();
         assert_eq!(content, "enum Status { Active, Inactive }\n");
@@ -759,18 +610,7 @@ mod tests {
         let file = root.join("tabbed.ts");
         std::fs::write(&file, "\texport const x = 1;\n").unwrap();
 
-        let export = make_export(&file, "x", 1);
-        let mut exports_by_file: FxHashMap<PathBuf, Vec<&UnusedExport>> = FxHashMap::default();
-        exports_by_file.insert(file.clone(), vec![&export]);
-
-        let mut fixes = Vec::new();
-        apply_export_fixes(
-            root,
-            &exports_by_file,
-            OutputFormat::Human,
-            false,
-            &mut fixes,
-        );
+        let (_, _) = fix_single(root, &file, "x", 1, false);
 
         let content = std::fs::read_to_string(&file).unwrap();
         assert_eq!(content, "\tconst x = 1;\n");
@@ -784,18 +624,7 @@ mod tests {
         let file = root.join("zero.ts");
         std::fs::write(&file, "export function first() {}\n").unwrap();
 
-        let export = make_export(&file, "first", 0);
-        let mut exports_by_file: FxHashMap<PathBuf, Vec<&UnusedExport>> = FxHashMap::default();
-        exports_by_file.insert(file.clone(), vec![&export]);
-
-        let mut fixes = Vec::new();
-        apply_export_fixes(
-            root,
-            &exports_by_file,
-            OutputFormat::Human,
-            false,
-            &mut fixes,
-        );
+        let (_, _) = fix_single(root, &file, "first", 0, false);
 
         let content = std::fs::read_to_string(&file).unwrap();
         assert_eq!(content, "function first() {}\n");
@@ -808,18 +637,7 @@ mod tests {
         let file = root.join("empty.ts");
         std::fs::write(&file, "").unwrap();
 
-        let export = make_export(&file, "x", 1);
-        let mut exports_by_file: FxHashMap<PathBuf, Vec<&UnusedExport>> = FxHashMap::default();
-        exports_by_file.insert(file.clone(), vec![&export]);
-
-        let mut fixes = Vec::new();
-        apply_export_fixes(
-            root,
-            &exports_by_file,
-            OutputFormat::Human,
-            false,
-            &mut fixes,
-        );
+        let (_, fixes) = fix_single(root, &file, "x", 1, false);
 
         let content = std::fs::read_to_string(&file).unwrap();
         assert_eq!(content, "");
@@ -863,18 +681,7 @@ mod tests {
         let original = "export default someVariable;\n";
         std::fs::write(&file, original).unwrap();
 
-        let export = make_export(&file, "default", 1);
-        let mut exports_by_file: FxHashMap<PathBuf, Vec<&UnusedExport>> = FxHashMap::default();
-        exports_by_file.insert(file.clone(), vec![&export]);
-
-        let mut fixes = Vec::new();
-        apply_export_fixes(
-            root,
-            &exports_by_file,
-            OutputFormat::Human,
-            false,
-            &mut fixes,
-        );
+        let (_, fixes) = fix_single(root, &file, "default", 1, false);
 
         assert_eq!(std::fs::read_to_string(&file).unwrap(), original);
         assert!(fixes.is_empty());
@@ -886,18 +693,7 @@ mod tests {
         let root = dir.path();
         let file = root.join("missing.ts"); // Does not exist
 
-        let export = make_export(&file, "foo", 1);
-        let mut exports_by_file: FxHashMap<PathBuf, Vec<&UnusedExport>> = FxHashMap::default();
-        exports_by_file.insert(file, vec![&export]);
-
-        let mut fixes = Vec::new();
-        let had_error = apply_export_fixes(
-            root,
-            &exports_by_file,
-            OutputFormat::Human,
-            false,
-            &mut fixes,
-        );
+        let (had_error, fixes) = fix_single(root, &file, "foo", 1, false);
 
         assert!(!had_error);
         assert!(fixes.is_empty());
@@ -911,18 +707,7 @@ mod tests {
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(&file, "export const x = 1;\n").unwrap();
 
-        let export = make_export(&file, "x", 1);
-        let mut exports_by_file: FxHashMap<PathBuf, Vec<&UnusedExport>> = FxHashMap::default();
-        exports_by_file.insert(file, vec![&export]);
-
-        let mut fixes = Vec::new();
-        apply_export_fixes(
-            root,
-            &exports_by_file,
-            OutputFormat::Human,
-            false,
-            &mut fixes,
-        );
+        let (_, fixes) = fix_single(root, &file, "x", 1, false);
 
         let path_str = fixes[0]["path"].as_str().unwrap().replace('\\', "/");
         assert_eq!(path_str, "src/utils.ts");
@@ -935,18 +720,7 @@ mod tests {
         let file = root.join("index.ts");
         std::fs::write(&file, "export { Foo, Bar, Baz } from \"./mod\";\n").unwrap();
 
-        let export = make_export(&file, "Bar", 1);
-        let mut exports_by_file: FxHashMap<PathBuf, Vec<&UnusedExport>> = FxHashMap::default();
-        exports_by_file.insert(file.clone(), vec![&export]);
-
-        let mut fixes = Vec::new();
-        apply_export_fixes(
-            root,
-            &exports_by_file,
-            OutputFormat::Human,
-            false,
-            &mut fixes,
-        );
+        let (_, _) = fix_single(root, &file, "Bar", 1, false);
 
         let content = std::fs::read_to_string(&file).unwrap();
         assert_eq!(content, "export { Foo, Baz } from \"./mod\";\n");
@@ -992,18 +766,7 @@ mod tests {
         )
         .unwrap();
 
-        let export = make_export(&file, "B", 4);
-        let mut exports_by_file: FxHashMap<PathBuf, Vec<&UnusedExport>> = FxHashMap::default();
-        exports_by_file.insert(file.clone(), vec![&export]);
-
-        let mut fixes = Vec::new();
-        apply_export_fixes(
-            root,
-            &exports_by_file,
-            OutputFormat::Human,
-            false,
-            &mut fixes,
-        );
+        let (_, _) = fix_single(root, &file, "B", 4, false);
 
         let content = std::fs::read_to_string(&file).unwrap();
         assert_eq!(
@@ -1019,18 +782,7 @@ mod tests {
         let file = root.join("types.ts");
         std::fs::write(&file, "export type { Foo, Bar } from \"./types\";\n").unwrap();
 
-        let export = make_export(&file, "Foo", 1);
-        let mut exports_by_file: FxHashMap<PathBuf, Vec<&UnusedExport>> = FxHashMap::default();
-        exports_by_file.insert(file.clone(), vec![&export]);
-
-        let mut fixes = Vec::new();
-        apply_export_fixes(
-            root,
-            &exports_by_file,
-            OutputFormat::Human,
-            false,
-            &mut fixes,
-        );
+        let (_, _) = fix_single(root, &file, "Foo", 1, false);
 
         let content = std::fs::read_to_string(&file).unwrap();
         assert_eq!(content, "export type { Bar } from \"./types\";\n");
@@ -1044,18 +796,7 @@ mod tests {
         std::fs::write(&file, "export { Foo as MyFoo, Bar } from \"./mod\";\n").unwrap();
 
         // The export name reported by fallow is the original name
-        let export = make_export(&file, "Foo", 1);
-        let mut exports_by_file: FxHashMap<PathBuf, Vec<&UnusedExport>> = FxHashMap::default();
-        exports_by_file.insert(file.clone(), vec![&export]);
-
-        let mut fixes = Vec::new();
-        apply_export_fixes(
-            root,
-            &exports_by_file,
-            OutputFormat::Human,
-            false,
-            &mut fixes,
-        );
+        let (_, _) = fix_single(root, &file, "Foo", 1, false);
 
         let content = std::fs::read_to_string(&file).unwrap();
         assert_eq!(content, "export { Bar } from \"./mod\";\n");
@@ -1072,18 +813,7 @@ mod tests {
         )
         .unwrap();
 
-        let export = make_export(&file, "Foo", 1);
-        let mut exports_by_file: FxHashMap<PathBuf, Vec<&UnusedExport>> = FxHashMap::default();
-        exports_by_file.insert(file.clone(), vec![&export]);
-
-        let mut fixes = Vec::new();
-        apply_export_fixes(
-            root,
-            &exports_by_file,
-            OutputFormat::Human,
-            false,
-            &mut fixes,
-        );
+        let (_, _) = fix_single(root, &file, "Foo", 1, false);
 
         let content = std::fs::read_to_string(&file).unwrap();
         assert_eq!(content, "export { Bar } from \"./bar\";\n");
