@@ -105,6 +105,7 @@ pub fn find_dead_code_with_resolved(
 }
 
 /// Find all dead code, with optional resolved module data, plugin context, and workspace info.
+#[expect(clippy::too_many_lines, reason = "orchestration function calling all detectors; split candidate for sig-audit-loop")]
 pub fn find_dead_code_full(
     graph: &ModuleGraph,
     config: &ResolvedConfig,

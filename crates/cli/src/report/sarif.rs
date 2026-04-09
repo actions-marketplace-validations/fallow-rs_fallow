@@ -254,6 +254,7 @@ fn build_sarif_rules(rules: &RulesConfig) -> Vec<serde_json::Value> {
 }
 
 #[must_use]
+#[expect(clippy::too_many_lines, reason = "SARIF builder mapping all issue types to SARIF schema")]
 pub fn build_sarif(
     results: &AnalysisResults,
     root: &Path,

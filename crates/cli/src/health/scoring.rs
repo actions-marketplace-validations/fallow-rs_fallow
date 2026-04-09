@@ -616,6 +616,7 @@ pub(super) fn compute_maintainability_index(
 /// The caller provides an `AnalysisOutput` (with graph and dead code results)
 /// so this function does not need to re-run the analysis pipeline. Complexity
 /// density is derived from the already-parsed modules.
+#[expect(clippy::too_many_lines, reason = "file scoring aggregates many metrics per file")]
 pub(super) fn compute_file_scores(
     modules: &[fallow_core::extract::ModuleInfo],
     file_paths: &rustc_hash::FxHashMap<fallow_core::discover::FileId, &std::path::PathBuf>,

@@ -1003,6 +1003,7 @@ fn dispatch_bare_command(
     clippy::too_many_arguments,
     reason = "CLI dispatch forwards many flags"
 )]
+#[expect(clippy::too_many_lines, reason = "CLI dispatch handles all subcommands")]
 fn dispatch_subcommand(
     command: Command,
     cli: &Cli,

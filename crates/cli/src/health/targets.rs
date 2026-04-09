@@ -136,6 +136,7 @@ fn compute_target_priority(
     clippy::cast_possible_truncation,
     reason = "f64 percentile and ratio values are bounded by collection sizes"
 )]
+#[expect(clippy::too_many_lines, reason = "target computation applies 7 refactoring rules sequentially")]
 pub(super) fn compute_refactoring_targets(
     file_scores: &[FileHealthScore],
     aux: &TargetAuxData,

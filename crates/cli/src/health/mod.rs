@@ -70,6 +70,7 @@ pub struct HealthOptions<'a> {
 }
 
 /// Run health analysis and return results without printing.
+#[expect(clippy::too_many_lines, reason = "health pipeline orchestration with many optional features")]
 pub fn execute_health(opts: &HealthOptions<'_>) -> Result<HealthResult, ExitCode> {
     let start = Instant::now();
 

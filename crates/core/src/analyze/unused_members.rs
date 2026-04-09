@@ -14,6 +14,7 @@ use super::{LineOffsetsMap, byte_offset_to_line_col};
 ///
 /// Collects all `Identifier.member` static member accesses from all modules,
 /// maps them to their imported names, and filters out members that are accessed.
+#[expect(clippy::too_many_lines, reason = "member tracking requires many graph traversal steps; split candidate for sig-audit-loop")]
 pub fn find_unused_members(
     graph: &ModuleGraph,
     resolved_modules: &[ResolvedModule],

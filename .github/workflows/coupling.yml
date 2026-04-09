@@ -1,0 +1,73 @@
+name: Module Coupling
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'crates/**/*.rs'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/coupling.yml'
+      - '.github/scripts/coupling-check.py'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'crates/**/*.rs'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/coupling.yml'
+      - '.github/scripts/coupling-check.py'
+
+concurrency:
+  group: coupling-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  coupling:
+    name: Module coupling analysis
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      pull-requests: write
+      deployments: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: coupling
+
+      - name: Install cargo-modules
+        run: cargo install cargo-modules --locked
+
+      - name: Collect module dependency graphs
+        run: |
+          for crate in fallow-config fallow-types fallow-extract fallow-graph fallow-core fallow-cli; do
+            cargo modules dependencies --lib -p "$crate" \
+              --no-externs --no-fns --no-sysroot --no-traits --no-types --no-owns 2>/dev/null
+          done > coupling-dot.txt
+
+      - name: Analyze coupling metrics
+        run: |
+          python3 .github/scripts/coupling-check.py \
+            --max-fan-in 20 --max-fan-out 20 \
+            --json coupling-bench.json \
+            --warn-only \
+            < coupling-dot.txt | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Store coupling metrics
+        uses: ./.github/actions/store-benchmark
+        with:
+          name: Module Coupling
+          tool: customSmallerIsBetter
+          output-file-path: coupling-bench.json
+          data-dir: coupling
+          alert-threshold: '150%'
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          continue-on-error: ${{ github.event_name == 'pull_request' }}

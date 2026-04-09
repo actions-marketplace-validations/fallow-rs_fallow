@@ -291,6 +291,7 @@ pub fn analyze_with_parse_result(
     clippy::unnecessary_wraps,
     reason = "Result kept for future error handling"
 )]
+#[expect(clippy::too_many_lines, reason = "main pipeline function; split candidate for sig-audit-loop")]
 fn analyze_full(
     config: &ResolvedConfig,
     retain: bool,

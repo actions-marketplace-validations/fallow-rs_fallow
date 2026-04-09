@@ -558,6 +558,7 @@ const TREND_TOLERANCE: f64 = 0.5;
 ///
 /// Uses the stored `score` field from the snapshot (never re-derives it).
 /// Returns `None` if no snapshots are available.
+#[expect(clippy::too_many_lines, reason = "trend computation compares many metric dimensions")]
 pub fn compute_trend(
     current_vs: &VitalSigns,
     current_counts: &VitalSignsCounts,

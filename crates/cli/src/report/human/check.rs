@@ -153,6 +153,7 @@ pub(in crate::report) fn print_human(
 ///
 /// Each section (unused files, exports, etc.) produces a header line followed by
 /// detail lines. Empty sections are omitted entirely.
+#[expect(clippy::too_many_lines, reason = "report builder formatting all issue types")]
 pub(in crate::report) fn build_human_lines(
     results: &AnalysisResults,
     root: &Path,

@@ -180,6 +180,7 @@ fn bench_full_pipeline_1000(c: &mut Criterion) {
     clippy::cast_possible_truncation,
     reason = "bench file/span counts are trivially small"
 )]
+#[expect(clippy::too_many_lines, reason = "benchmark with extensive fixture setup")]
 fn bench_resolve_re_export_chains(c: &mut Criterion) {
     use fallow_core::discover::{DiscoveredFile, EntryPoint, EntryPointSource, FileId};
     use fallow_core::extract::{ExportInfo, ExportName, ImportInfo, ImportedName, ReExportInfo};
@@ -380,6 +381,7 @@ fn bench_resolve_re_export_chains(c: &mut Criterion) {
     });
 }
 
+#[expect(clippy::too_many_lines, reason = "benchmark with extensive fixture setup")]
 fn bench_cache_round_trip(c: &mut Criterion) {
     use fallow_core::cache::{cached_to_module, module_to_cached};
     use fallow_core::discover::FileId;

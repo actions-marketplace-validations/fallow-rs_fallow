@@ -103,6 +103,7 @@ fn push_dep_cc_issues(
 
 /// Build CodeClimate JSON array from dead-code analysis results.
 #[must_use]
+#[expect(clippy::too_many_lines, reason = "report builder mapping all issue types to CodeClimate format")]
 pub fn build_codeclimate(
     results: &AnalysisResults,
     root: &Path,

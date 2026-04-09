@@ -72,6 +72,7 @@ pub(in crate::report) fn print_duplication_human(
 }
 
 /// Build human-readable output lines for duplication report.
+#[expect(clippy::too_many_lines, reason = "report builder with grouped output formatting")]
 pub(in crate::report) fn build_duplication_human_lines(
     report: &DuplicationReport,
     root: &Path,
