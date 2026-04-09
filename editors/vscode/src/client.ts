@@ -22,11 +22,6 @@ const resolveBinaryPath = async (
   context: vscode.ExtensionContext,
   outputChannel?: vscode.OutputChannel
 ): Promise<string | null> => {
-  const local = findLocalBinary("fallow-lsp");
-  if (local) {
-    return local;
-  }
-
   const configPath = getLspPath();
   if (configPath) {
     if (fs.existsSync(configPath)) {
@@ -36,6 +31,11 @@ const resolveBinaryPath = async (
       `Fallow: configured LSP path "${configPath}" does not exist.`
     );
     return null;
+  }
+
+  const local = findLocalBinary("fallow-lsp");
+  if (local) {
+    return local;
   }
 
   const inPath = findBinaryInPath("fallow-lsp");

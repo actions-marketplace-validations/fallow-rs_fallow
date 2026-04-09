@@ -43,7 +43,7 @@ This allows agents to parse errors the same way they parse normal output.
 |----------|-------------|
 | `FALLOW_FORMAT` | Default output format (`json`, `human`, `sarif`, `compact`, `markdown`, `codeclimate`, `badge`). CLI `--format` flag overrides this. |
 | `FALLOW_QUIET` | Set to `1` or `true` to suppress progress output. CLI `--quiet` flag overrides this. |
-| `FALLOW_BIN` | Path to fallow binary (used by the `fallow-mcp` server). |
+| `FALLOW_BIN` | Path to fallow binary (used by the `fallow-mcp` server). If a project has fallow as a devDependency, `node_modules/.bin/fallow` is available without this variable. |
 | `FALLOW_TIMEOUT_SECS` | Subprocess timeout for the MCP server in seconds (default: 120). Increase for large monorepos with cold caches. |
 | `FALLOW_EXTENDS_TIMEOUT_SECS` | Timeout for fetching remote configs via `https://` URL extends in seconds (default: 5). |
 

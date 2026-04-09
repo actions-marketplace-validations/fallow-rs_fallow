@@ -20,11 +20,6 @@ import type {
 } from "./types.js";
 
 const findCliBinary = (context: vscode.ExtensionContext): string | null => {
-  const local = findLocalBinary("fallow");
-  if (local) {
-    return local;
-  }
-
   const lspPath = getLspPath();
   if (lspPath) {
     const dir = path.dirname(lspPath);
@@ -32,6 +27,11 @@ const findCliBinary = (context: vscode.ExtensionContext): string | null => {
     if (fs.existsSync(cliPath)) {
       return cliPath;
     }
+  }
+
+  const local = findLocalBinary("fallow");
+  if (local) {
+    return local;
   }
 
   const inPath = findBinaryInPath("fallow");
