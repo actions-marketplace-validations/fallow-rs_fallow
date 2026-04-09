@@ -498,6 +498,7 @@ async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter("fallow=info")
         .with_writer(std::io::stderr)
+        .with_ansi(false)
         .init();
 
     let stdin = tokio::io::stdin();
