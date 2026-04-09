@@ -7,11 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.23.1] - 2026-04-09
+
+### Fixed
+
+- **VS Code extension: explicit `lspPath` setting now takes priority over local `node_modules`** -- the `fallow.lspPath` setting represents explicit user intent and should not be silently overridden by an implicitly discovered devDependency binary. Resolution order is now: `lspPath` > `node_modules/.bin` > PATH > global storage > auto-download.
+
 ## [2.23.0] - 2026-04-09
 
 ### Added
 
-- **VS Code extension: local devDependency binary resolution** -- the extension now checks `node_modules/.bin/` in the workspace root before any other resolution method (`fallow.lspPath`, system PATH, auto-download). Teams can pin fallow as a devDependency for consistent versions across developers. ([#86](https://github.com/fallow-rs/fallow/discussions/86))
+- **VS Code extension: local devDependency binary resolution** -- the extension now checks `node_modules/.bin/` in the workspace root for locally installed binaries. Teams can pin fallow as a devDependency for consistent versions across developers. ([#86](https://github.com/fallow-rs/fallow/discussions/86))
 
 ### Fixed
 
@@ -1115,7 +1121,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `--changed-since` and `--fail-on-issues` for CI
 - Cross-workspace resolution for npm/yarn/pnpm workspaces
 
-[Unreleased]: https://github.com/fallow-rs/fallow/compare/v2.23.0...HEAD
+[Unreleased]: https://github.com/fallow-rs/fallow/compare/v2.23.1...HEAD
+[2.23.1]: https://github.com/fallow-rs/fallow/compare/v2.23.0...v2.23.1
 [2.23.0]: https://github.com/fallow-rs/fallow/compare/v2.22.4...v2.23.0
 [2.22.4]: https://github.com/fallow-rs/fallow/compare/v2.22.3...v2.22.4
 [2.22.3]: https://github.com/fallow-rs/fallow/compare/v2.22.2...v2.22.3
