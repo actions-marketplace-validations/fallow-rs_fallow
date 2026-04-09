@@ -221,6 +221,14 @@ fn render_health_score(lines: &mut Vec<String>, report: &crate::health_types::He
             .dimmed()
         ));
     }
+    // Hint for high duplication penalty
+    if p.duplication.is_some_and(|dp| dp >= 5.0) {
+        lines.push(format!(
+            "  {}",
+            "Tip: use health.ignore to exclude generated or test directories from duplication analysis"
+                .dimmed()
+        ));
+    }
     lines.push(String::new());
 }
 
@@ -509,6 +517,12 @@ fn render_large_functions(
         format!("Functions exceeding 60 lines of code (very high risk): {DOCS_HEALTH}#unit-size")
             .dimmed()
     ));
+    if shown < total {
+        lines.push(format!(
+            "  {}",
+            format!("use --top {total} to see all {total}").dimmed()
+        ));
+    }
     lines.push(String::new());
 }
 
@@ -589,6 +603,13 @@ fn render_findings(
         )
         .dimmed()
     ));
+    if report.findings.len() < report.summary.functions_above_threshold {
+        let total = report.summary.functions_above_threshold;
+        lines.push(format!(
+            "  {}",
+            format!("use --top {total} to see all {total}").dimmed()
+        ));
+    }
     lines.push(String::new());
 }
 

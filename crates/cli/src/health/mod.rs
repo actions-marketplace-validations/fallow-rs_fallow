@@ -243,8 +243,15 @@ pub fn execute_health(opts: &HealthOptions<'_>) -> Result<HealthResult, ExitCode
 
     // Run duplication analysis when --score is active to populate the duplication penalty.
     if opts.score {
+        let dupes_start = Instant::now();
         let dupes_report =
             fallow_core::duplicates::find_duplicates(&config.root, &files, &config.duplicates);
+        if !opts.quiet {
+            eprintln!(
+                "Duplication analysis completed in {:.2}s",
+                dupes_start.elapsed().as_secs_f64()
+            );
+        }
         let pct = dupes_report.stats.duplication_percentage;
         vital_signs.duplication_pct = Some((pct * 10.0).round() / 10.0);
         // Update both the snapshot counts and the embedded vital signs counts
