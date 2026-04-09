@@ -131,6 +131,7 @@ pub fn execute_health(opts: &HealthOptions<'_>) -> Result<HealthResult, ExitCode
             load_path,
             &mut findings,
             &config.root,
+            opts.quiet,
             opts.output,
         )?)
     } else {
@@ -779,13 +780,32 @@ fn load_health_baseline(
     baseline_path: &std::path::Path,
     findings: &mut Vec<HealthFinding>,
     root: &std::path::Path,
+    quiet: bool,
     output: OutputFormat,
 ) -> Result<HealthBaselineData, ExitCode> {
     let json = std::fs::read_to_string(baseline_path)
         .map_err(|e| emit_error(&format!("failed to read health baseline: {e}"), 2, output))?;
     let baseline: HealthBaselineData = serde_json::from_str(&json)
         .map_err(|e| emit_error(&format!("failed to parse health baseline: {e}"), 2, output))?;
+    let baseline_entries = baseline.findings.len();
+    let before = findings.len();
     *findings = filter_new_health_findings(std::mem::take(findings), &baseline, root);
+    let matched = before.saturating_sub(findings.len());
+    if !quiet {
+        eprintln!(
+            "Comparing against health baseline: {}",
+            baseline_path.display()
+        );
+    }
+    if baseline_entries > 0 && matched == 0 && !quiet {
+        eprintln!(
+            "Warning: health baseline has {baseline_entries} entries but matched \
+             0 current findings. Your paths may have changed, or the baseline \
+             was saved on a different machine. Re-save with: \
+             --save-baseline {}",
+            baseline_path.display(),
+        );
+    }
     Ok(baseline)
 }
 

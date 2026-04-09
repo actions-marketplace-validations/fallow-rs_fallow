@@ -196,7 +196,22 @@ pub fn execute_dupes(opts: &DupesOptions<'_>) -> Result<DupesResult, ExitCode> {
         match std::fs::read_to_string(path) {
             Ok(json) => match serde_json::from_str::<DuplicationBaselineData>(&json) {
                 Ok(baseline_data) => {
+                    let baseline_entries = baseline_data.clone_groups.len();
+                    let before = report.clone_groups.len();
                     report = filter_new_clone_groups(report, &baseline_data, &config.root);
+                    let matched = before.saturating_sub(report.clone_groups.len());
+                    if !opts.quiet {
+                        eprintln!("Comparing against duplication baseline: {}", path.display());
+                    }
+                    if baseline_entries > 0 && matched == 0 && !opts.quiet {
+                        eprintln!(
+                            "Warning: duplication baseline has {baseline_entries} entries but \
+                             matched 0 current clone groups. Your paths may have changed, or \
+                             the baseline was saved on a different machine. Re-save with: \
+                             --save-baseline {}",
+                            path.display(),
+                        );
+                    }
                 }
                 Err(e) => {
                     return Err(emit_error(

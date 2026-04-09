@@ -473,8 +473,10 @@ fn handle_baseline(
                     if baseline_entries > 0 && matched == 0 && !quiet {
                         eprintln!(
                             "Warning: baseline has {baseline_entries} entries but matched \
-                             0 current issues. The baseline may be stale or saved from a \
-                             different project root. Re-save with --save-baseline",
+                             0 current issues. Your paths may have changed, or the baseline \
+                             was saved on a different machine. Re-save with: \
+                             --save-baseline {}",
+                            baseline_path.display(),
                         );
                     }
                     return Ok(Some((baseline_entries, matched)));
