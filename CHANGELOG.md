@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.26.0] - 2026-04-09
+
+### Added
+
+- **Expo Router plugin** -- new `expo-router` plugin (85th built-in) detects Expo Router projects, reads the configured route root from `app.json` / `app.config.ts`, and marks route files plus special-file exports as framework-used. Covers `+api` (HTTP methods), `+middleware`, `+html`, `+not-found`, and `+native-intent` conventions. Contributed by [@M-Hassan-Raza](https://github.com/M-Hassan-Raza). ([#88](https://github.com/fallow-rs/fallow/pull/88))
+- **TanStack Router config parsing** -- the `tanstack-router` plugin now reads `tsr.config.json` to support custom route directories (`routesDirectory`), route file prefixes (`routeFilePrefix`), ignore patterns (`routeFileIgnorePrefix`, `routeFileIgnorePattern`), generated route tree location (`generatedRouteTree`), and lazy route files (`.lazy.tsx`). Config-driven routes replace static defaults instead of layering. Contributed by [@M-Hassan-Raza](https://github.com/M-Hassan-Raza). ([#88](https://github.com/fallow-rs/fallow/pull/88))
+- **Path rule exclusions** -- plugin entry-point and used-export rules now support glob, regex, and segment-regex exclusions for strict file matching. Prevents false negatives from overly broad patterns.
+
+### Fixed
+
+- **GitHub Action: fork PR CI failures** -- the `analyze.sh` script inherited `set -e` (errexit) from the composite action runner shell, causing silent failures on fork PRs where intermediate commands (git diff, grep) return non-zero as part of normal flow.
+- **LSP: workspace diagnostic merging** -- `test_only_dependencies`, `boundary_violations`, and `export_usages` are now correctly merged across workspace roots instead of being dropped.
+
 ## [2.25.1] - 2026-04-09
 
 ### Fixed
@@ -1160,7 +1173,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `--changed-since` and `--fail-on-issues` for CI
 - Cross-workspace resolution for npm/yarn/pnpm workspaces
 
-[Unreleased]: https://github.com/fallow-rs/fallow/compare/v2.25.1...HEAD
+[Unreleased]: https://github.com/fallow-rs/fallow/compare/v2.26.0...HEAD
+[2.26.0]: https://github.com/fallow-rs/fallow/compare/v2.25.1...v2.26.0
 [2.25.1]: https://github.com/fallow-rs/fallow/compare/v2.25.0...v2.25.1
 [2.25.0]: https://github.com/fallow-rs/fallow/compare/v2.24.0...v2.25.0
 [2.24.0]: https://github.com/fallow-rs/fallow/compare/v2.23.1...v2.24.0
