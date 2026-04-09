@@ -1727,9 +1727,9 @@ dependencies = [
 
 [[package]]
 name = "oxc_coverage_instrument"
-version = "0.2.7"
+version = "0.2.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "55cfb81ca632ece690157141848c8c092aad385e2cc42e78e853d8807992eafe"
+checksum = "b384f46ceed381c2229368892d97fe6a47fcc0a9acfd2b074e080a1ebfd5f85b"
 dependencies = [
  "oxc_allocator",
  "oxc_ast",
