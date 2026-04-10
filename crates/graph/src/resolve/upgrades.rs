@@ -144,6 +144,7 @@ mod tests {
                 imported_name: "*".to_string(),
                 exported_name: "*".to_string(),
                 is_type_only: false,
+                span: oxc_span::Span::default(),
             },
             target,
         }

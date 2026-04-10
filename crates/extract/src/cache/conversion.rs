@@ -82,6 +82,7 @@ pub fn cached_to_module(
             imported_name: r.imported_name.clone(),
             exported_name: r.exported_name.clone(),
             is_type_only: r.is_type_only,
+            span: Span::new(r.span_start, r.span_end),
         })
         .collect();
 
@@ -224,6 +225,8 @@ pub fn module_to_cached(
                 imported_name: r.imported_name.clone(),
                 exported_name: r.exported_name.clone(),
                 is_type_only: r.is_type_only,
+                span_start: r.span.start,
+                span_end: r.span.end,
             })
             .collect(),
         dynamic_imports: module

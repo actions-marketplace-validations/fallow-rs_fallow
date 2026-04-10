@@ -459,6 +459,7 @@ mod tests {
             imported_name: "helper".to_string(),
             exported_name: "helper".to_string(),
             is_type_only: false,
+            span: oxc_span::Span::default(),
         }];
         // Add a local export with a real span (non-zero)
         graph.modules[1].exports = vec![ExportSymbol {
@@ -486,6 +487,7 @@ mod tests {
             imported_name: "helper".to_string(),
             exported_name: "helper".to_string(),
             is_type_only: false,
+            span: oxc_span::Span::default(),
         }];
         graph.modules[1].set_cjs_exports(true);
         assert!(!is_barrel_with_reachable_sources(&graph.modules[1], &graph));
@@ -506,6 +508,7 @@ mod tests {
             imported_name: "helper".to_string(),
             exported_name: "helper".to_string(),
             is_type_only: false,
+            span: oxc_span::Span::default(),
         }];
         // Only synthetic exports (span 0..0), which are from re-exports
         graph.modules[1].exports = vec![ExportSymbol {
@@ -533,6 +536,7 @@ mod tests {
             imported_name: "helper".to_string(),
             exported_name: "helper".to_string(),
             is_type_only: false,
+            span: oxc_span::Span::default(),
         }];
         assert!(!is_barrel_with_reachable_sources(&graph.modules[1], &graph));
     }
@@ -546,6 +550,7 @@ mod tests {
             imported_name: "helper".to_string(),
             exported_name: "helper".to_string(),
             is_type_only: false,
+            span: oxc_span::Span::default(),
         }];
         // Should not panic, should return false
         assert!(!is_barrel_with_reachable_sources(&graph.modules[1], &graph));

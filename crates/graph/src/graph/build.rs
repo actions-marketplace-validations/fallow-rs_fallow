@@ -205,7 +205,9 @@ fn build_module_node(
                 name: export_name,
                 is_type_only: re.info.is_type_only,
                 is_public: false,
-                span: oxc_span::Span::new(0, 0), // re-exports don't have a meaningful span on the barrel
+                // Use the real span from the visitor when available; falls back
+                // to (0, 0) for re-exports synthesized inside the graph layer.
+                span: re.info.span,
                 references: Vec::new(),
                 members: Vec::new(),
             });
@@ -229,6 +231,7 @@ fn build_module_node(
                             imported_name: re.info.imported_name.clone(),
                             exported_name: re.info.exported_name.clone(),
                             is_type_only: re.info.is_type_only,
+                            span: re.info.span,
                         })
                     } else {
                         None
@@ -754,6 +757,7 @@ mod tests {
                     imported_name: "foo".to_string(),
                     exported_name: "foo".to_string(),
                     is_type_only: false,
+                    span: oxc_span::Span::default(),
                 },
                 target: ResolveResult::InternalModule(FileId(1)),
             }],
@@ -781,6 +785,7 @@ mod tests {
                     imported_name: "useState".to_string(),
                     exported_name: "useState".to_string(),
                     is_type_only: false,
+                    span: oxc_span::Span::default(),
                 },
                 target: ResolveResult::NpmPackage("react".to_string()),
             }],
@@ -845,6 +850,7 @@ mod tests {
                         imported_name: "*".to_string(),
                         exported_name: "*".to_string(),
                         is_type_only: false,
+                        span: oxc_span::Span::default(),
                     },
                     target: ResolveResult::InternalModule(FileId(1)),
                 }],
@@ -909,6 +915,7 @@ mod tests {
                     imported_name: "foo".to_string(),
                     exported_name: "foo".to_string(),
                     is_type_only: false,
+                    span: oxc_span::Span::default(),
                 },
                 target: ResolveResult::InternalModule(FileId(1)),
             }],

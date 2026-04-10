@@ -543,6 +543,7 @@ mod tests {
             imported_name: "*".to_string(),
             exported_name: "*".to_string(),
             is_type_only: false,
+            span: oxc_span::Span::default(),
         }];
         let accessed = vec!["missing".to_string()];
         let found = FxHashSet::default(); // nothing found among own exports
@@ -569,6 +570,7 @@ mod tests {
             imported_name: "*".to_string(),
             exported_name: "*".to_string(),
             is_type_only: false,
+            span: oxc_span::Span::default(),
         }];
         let accessed = vec!["already".to_string()];
         let mut found = FxHashSet::default();
@@ -597,6 +599,7 @@ mod tests {
             imported_name: "foo".to_string(),
             exported_name: "foo".to_string(),
             is_type_only: false,
+            span: oxc_span::Span::default(),
         }];
         let accessed = vec!["missing".to_string()];
         let found = FxHashSet::default();
@@ -1149,6 +1152,7 @@ mod tests {
             imported_name: "*".to_string(),
             exported_name: "*".to_string(),
             is_type_only: false,
+            span: oxc_span::Span::default(),
         }];
         let accessed = vec!["default".to_string()];
         let found = FxHashSet::default();

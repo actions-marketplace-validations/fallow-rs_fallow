@@ -277,6 +277,7 @@ fn bench_resolve_re_export_chains(c: &mut Criterion) {
                         imported_name: format!("value{e}"),
                         exported_name: format!("value{e}"),
                         is_type_only: false,
+                        span: oxc_span::Span::default(),
                     },
                     target: ResolveResult::InternalModule(chained_id),
                 });
@@ -295,6 +296,7 @@ fn bench_resolve_re_export_chains(c: &mut Criterion) {
                         imported_name: format!("value{e}"),
                         exported_name: format!("value{e}"),
                         is_type_only: false,
+                        span: oxc_span::Span::default(),
                     },
                     target: ResolveResult::InternalModule(src_a_id),
                 });
@@ -304,6 +306,7 @@ fn bench_resolve_re_export_chains(c: &mut Criterion) {
                         imported_name: format!("fn{e}"),
                         exported_name: format!("fn{e}"),
                         is_type_only: false,
+                        span: oxc_span::Span::default(),
                     },
                     target: ResolveResult::InternalModule(src_b_id),
                 });
@@ -544,12 +547,14 @@ fn bench_cache_round_trip(c: &mut Criterion) {
                 imported_name: "capitalize".to_string(),
                 exported_name: "capitalize".to_string(),
                 is_type_only: false,
+                span: oxc_span::Span::default(),
             },
             ReExportInfo {
                 source: "./helpers".to_string(),
                 imported_name: "*".to_string(),
                 exported_name: "*".to_string(),
                 is_type_only: false,
+                span: oxc_span::Span::default(),
             },
         ],
         dynamic_imports: vec![DynamicImportInfo {

@@ -104,6 +104,7 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
                     imported_name: spec.local.name().to_string(),
                     exported_name: spec.exported.name().to_string(),
                     is_type_only: is_type_only || spec.export_kind.is_type(),
+                    span: spec.span,
                 });
             }
         } else {
@@ -148,6 +149,7 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
                         imported_name: imported_name_str,
                         exported_name: spec.exported.name().to_string(),
                         is_type_only: spec_type_only || import.is_type_only,
+                        span: spec.span,
                     });
                 } else {
                     self.exports.push(ExportInfo {
@@ -214,6 +216,7 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
             imported_name: "*".to_string(),
             exported_name,
             is_type_only: decl.export_kind.is_type(),
+            span: decl.span,
         });
 
         walk::walk_export_all_declaration(self, decl);

@@ -7,7 +7,7 @@ use bitcode::{Decode, Encode};
 use crate::MemberKind;
 
 /// Cache version — bump when the cache format or cached extraction semantics change.
-pub(super) const CACHE_VERSION: u32 = 31;
+pub(super) const CACHE_VERSION: u32 = 32;
 
 /// Maximum cache file size to deserialize (256 MB).
 pub(super) const MAX_CACHE_SIZE: usize = 256 * 1024 * 1024;
@@ -155,6 +155,10 @@ pub struct CachedReExport {
     pub exported_name: String,
     /// Whether this is a type-only re-export.
     pub is_type_only: bool,
+    /// Byte offset of the re-export span start (for line-number reporting).
+    pub span_start: u32,
+    /// Byte offset of the re-export span end.
+    pub span_end: u32,
 }
 
 /// Cached enum or class member data.

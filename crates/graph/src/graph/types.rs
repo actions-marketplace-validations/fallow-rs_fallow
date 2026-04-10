@@ -147,6 +147,10 @@ pub struct ReExportEdge {
     pub exported_name: String,
     /// Whether this is a type-only re-export.
     pub is_type_only: bool,
+    /// Source span of the re-export declaration on this module, used for
+    /// line-number reporting. `(0, 0)` for re-exports synthesized inside the
+    /// graph layer (e.g., `export *` chain propagation, namespace narrowing).
+    pub span: oxc_span::Span,
 }
 
 /// An export with reference tracking.
@@ -204,7 +208,7 @@ const _: () = assert!(std::mem::size_of::<ExportSymbol>() == 88);
 #[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<SymbolReference>() == 16);
 #[cfg(target_pointer_width = "64")]
-const _: () = assert!(std::mem::size_of::<ReExportEdge>() == 56);
+const _: () = assert!(std::mem::size_of::<ReExportEdge>() == 64);
 // `ModuleNode` is stored in a Vec — one per discovered file.
 // PathBuf has different sizes on Unix vs Windows, so restrict to Unix.
 #[cfg(all(target_pointer_width = "64", unix))]
@@ -296,6 +300,7 @@ mod tests {
             imported_name: "*".to_string(),
             exported_name: "*".to_string(),
             is_type_only: false,
+            span: oxc_span::Span::default(),
         };
         assert_eq!(edge.source_file, FileId(3));
         assert_eq!(edge.imported_name, "*");
@@ -310,6 +315,7 @@ mod tests {
             imported_name: "MyType".to_string(),
             exported_name: "MyType".to_string(),
             is_type_only: true,
+            span: oxc_span::Span::default(),
         };
         assert!(edge.is_type_only);
     }
@@ -321,6 +327,7 @@ mod tests {
             imported_name: "internal".to_string(),
             exported_name: "public".to_string(),
             is_type_only: false,
+            span: oxc_span::Span::default(),
         };
         assert_ne!(edge.imported_name, edge.exported_name);
         assert_eq!(edge.imported_name, "internal");
@@ -483,6 +490,7 @@ mod tests {
                 imported_name: "*".to_string(),
                 exported_name: "*".to_string(),
                 is_type_only: false,
+                span: oxc_span::Span::default(),
             }],
             flags: ModuleNode::flags_from(false, true, false),
         };

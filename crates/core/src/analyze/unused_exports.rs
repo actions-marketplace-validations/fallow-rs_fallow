@@ -182,8 +182,15 @@ pub fn find_unused_exports(
             let (line, col) =
                 byte_offset_to_line_col(line_offsets_by_file, module.file_id, export.span.start);
 
-            // Barrel re-exports are synthesized in graph.rs with Span::new(0, 0) as a sentinel.
-            let is_re_export = export.span.start == 0 && export.span.end == 0;
+            // Detect re-exports semantically by looking up the export name in the
+            // module's re_exports list, rather than relying on a span sentinel.
+            // This catches both synthesized re-exports (which still use Span::default()
+            // for narrowing/star cases) and real re-exports (which carry the visitor's
+            // span for accurate line-number reporting).
+            let is_re_export = module
+                .re_exports
+                .iter()
+                .any(|re| re.exported_name == export_str);
 
             // Check inline suppression
             let issue_kind = if export.is_type_only {
@@ -734,6 +741,7 @@ mod tests {
             imported_name: "helper".to_string(),
             exported_name: "helper".to_string(),
             is_type_only: false,
+            span: oxc_span::Span::default(),
         }];
         graph.modules[2].set_reachable(true);
         graph.modules[2].exports = vec![make_export("helper", 5, 15)];
@@ -1493,17 +1501,26 @@ mod tests {
         assert_eq!(exports.len(), 1, "invalid plugin glob should be skipped");
     }
 
-    // -- find_unused_exports: re-export sentinel detection --
+    // -- find_unused_exports: re-export semantic detection --
 
     #[test]
-    fn unused_exports_marks_re_export_sentinel() {
+    fn unused_exports_marks_re_export_semantically() {
         let mut graph = build_graph(&[
             ("/tmp/test/src/entry.ts", true),
             ("/tmp/test/src/barrel.ts", false),
         ]);
         graph.modules[1].set_reachable(true);
-        // Span 0..0 is the re-export sentinel
-        graph.modules[1].exports = vec![make_export("reexported", 0, 0)];
+        graph.modules[1].exports = vec![make_export("reexported", 100, 120)];
+        // The export must have a matching ReExportEdge for the unused-export
+        // detector to classify it as a re-export. This mirrors how the graph
+        // builder synthesizes ExportSymbol entries from ReExportInfo.
+        graph.modules[1].re_exports = vec![ReExportEdge {
+            source_file: FileId(0),
+            imported_name: "reexported".to_string(),
+            exported_name: "reexported".to_string(),
+            is_type_only: false,
+            span: oxc_span::Span::default(),
+        }];
         let config = test_config();
         let suppressions = FxHashMap::default();
         let (exports, _) =
@@ -1511,8 +1528,11 @@ mod tests {
         assert_eq!(exports.len(), 1);
         assert!(
             exports[0].is_re_export,
-            "span 0..0 should be flagged as re-export"
+            "export with matching ReExportEdge should be flagged as re-export"
         );
+        // span_start carries the original byte offset (100), not the (0,0) sentinel
+        // — confirms that the re-export reporting uses the visitor's real span.
+        assert_eq!(exports[0].span_start, 100);
     }
 
     // ---- collect_export_usages tests ----

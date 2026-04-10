@@ -394,6 +394,11 @@ pub struct ReExportInfo {
     pub exported_name: String,
     /// Whether this is a type-only re-export.
     pub is_type_only: bool,
+    /// Source span of the re-export declaration on this module.
+    /// Used for line-number reporting when an unused re-export is detected.
+    /// Defaults to `Span::default()` (0, 0) for re-exports without a meaningful
+    /// source location (e.g., synthesized in the graph layer).
+    pub span: oxc_span::Span,
 }
 
 /// A dynamic `import()` call.

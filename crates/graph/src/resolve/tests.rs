@@ -78,6 +78,7 @@ fn make_re_export(source: &str, imported: &str, exported: &str) -> ReExportInfo 
         imported_name: imported.to_string(),
         exported_name: exported.to_string(),
         is_type_only: false,
+        span: oxc_span::Span::default(),
     }
 }
 
@@ -416,6 +417,7 @@ fn re_exports_preserves_type_only() {
             imported_name: "MyType".into(),
             exported_name: "MyType".into(),
             is_type_only: true,
+            span: oxc_span::Span::default(),
         }];
         let file = Path::new("/project/src/index.ts");
         let result = resolve_re_exports(ctx, file, &re_exports);

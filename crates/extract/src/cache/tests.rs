@@ -294,6 +294,7 @@ fn module_to_cached_roundtrip_re_exports() {
             imported_name: "foo".to_string(),
             exported_name: "bar".to_string(),
             is_type_only: true,
+            span: oxc_span::Span::default(),
         }],
         dynamic_imports: vec![],
         require_calls: vec![],
