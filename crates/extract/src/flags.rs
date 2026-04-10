@@ -364,7 +364,7 @@ fn extract_config_object_access(expr: &StaticMemberExpression<'_>) -> Option<(St
 
 /// Entry point: extract feature flag use sites from a parsed program.
 ///
-/// Called from `parse_source_to_module` when `need_flags` is true.
+/// Called unconditionally from `parse_source_to_module` for all parsed files.
 pub fn extract_flags(
     program: &Program<'_>,
     line_offsets: &[u32],

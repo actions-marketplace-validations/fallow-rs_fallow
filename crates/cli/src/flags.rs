@@ -445,6 +445,7 @@ fn print_flags_json(
         })
         .collect();
 
+    // Schema version must match SCHEMA_VERSION in report/json.rs
     let mut output = serde_json::json!({
         "schema_version": 3,
         "version": env!("CARGO_PKG_VERSION"),

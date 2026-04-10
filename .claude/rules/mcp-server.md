@@ -7,7 +7,7 @@ paths:
 
 MCP server exposing fallow analysis as tools for AI agents. Stdio transport, wraps `fallow` CLI via subprocess.
 
-## Tools (9 total)
+## Tools (10 total)
 - `analyze` — full dead code analysis (`fallow dead-code --format json`), supports `boundary_violations` convenience param
 - `check_changed` — incremental analysis (`fallow dead-code --changed-since`)
 - `find_dupes` — code duplication (`fallow dupes --format json`), supports `changed_since`
@@ -17,6 +17,7 @@ MCP server exposing fallow analysis as tools for AI agents. Stdio transport, wra
 - `fix_apply` — apply auto-fixes (`fallow fix --yes --format json`) — destructive
 - `project_info` — project metadata (`fallow list --format json`), supports section params (`entry_points`, `files`, `plugins`, `boundaries`)
 - `list_boundaries` — architecture boundary zones and rules (`fallow list --boundaries --format json`)
+- `feature_flags` — detect feature flag patterns (`fallow flags --format json`), supports `flag_type`, `confidence`, `dead_code_only` params
 
 ## Global flags (available on all tools)
 - `no_cache` (bool) — disable incremental parse cache
