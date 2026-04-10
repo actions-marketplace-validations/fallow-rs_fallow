@@ -209,16 +209,16 @@ fn print_flags_result(
 ) {
     match opts.output {
         OutputFormat::Human => print_flags_human(flags, config, elapsed, opts.quiet),
-        OutputFormat::Compact => print_flags_compact(flags, config),
         OutputFormat::Json => print_flags_json(flags, config, elapsed, opts.explain),
-        other => {
-            // Unsupported formats fall back to JSON with a warning
+        OutputFormat::Compact => print_flags_compact(flags, config),
+        OutputFormat::Sarif => print_flags_sarif(flags, config),
+        OutputFormat::Markdown => print_flags_markdown(flags, config),
+        OutputFormat::CodeClimate => print_flags_codeclimate(flags, config),
+        OutputFormat::Badge => {
+            // Badge format is health-only, not applicable to flags
             if !opts.quiet {
-                eprintln!(
-                    "warning: {other:?} format not yet supported for flags command, using JSON"
-                );
+                eprintln!("warning: badge format is only available for the health command");
             }
-            print_flags_json(flags, config, elapsed, opts.explain);
         }
     }
 }
@@ -383,6 +383,187 @@ fn print_flags_compact(flags: &[FeatureFlag], config: &ResolvedConfig) {
         };
         println!("{tag}:{relative}:{}:{}", flag.line, flag.flag_name);
     }
+}
+
+/// FNV-1a (64-bit) fingerprint for deterministic CodeClimate fingerprints.
+/// Matches the algorithm used in `report/codeclimate.rs`.
+fn fnv_fingerprint(parts: &[&str]) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for part in parts {
+        for byte in part.bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0100_0000_01b3);
+        }
+        hash ^= 0xff;
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
+/// Helper: get relative path string for a flag.
+fn relative_path(flag: &FeatureFlag, root: &std::path::Path) -> String {
+    flag.path
+        .strip_prefix(root)
+        .unwrap_or(&flag.path)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+/// Helper: human-readable kind label.
+fn kind_label(flag: &FeatureFlag) -> &'static str {
+    match flag.kind {
+        FlagKind::EnvironmentVariable => "environment variable",
+        FlagKind::SdkCall => "SDK call",
+        FlagKind::ConfigObject => "config object",
+    }
+}
+
+/// SARIF output for `fallow flags`.
+fn print_flags_sarif(flags: &[FeatureFlag], config: &ResolvedConfig) {
+    let rules = vec![serde_json::json!({
+        "id": "fallow/feature-flag",
+        "shortDescription": { "text": "Feature flag pattern detected" },
+        "helpUri": "https://docs.fallow.tools/explanations/feature-flags",
+        "defaultConfiguration": { "level": "note" },
+    })];
+
+    let results: Vec<serde_json::Value> = flags
+        .iter()
+        .map(|f| {
+            let path = relative_path(f, &config.root);
+            let mut msg = format!("Feature flag '{}' ({})", f.flag_name, kind_label(f));
+            if !f.guarded_dead_exports.is_empty() {
+                use std::fmt::Write;
+                let _ = write!(
+                    msg,
+                    " guards {} dead exports: {}",
+                    f.guarded_dead_exports.len(),
+                    f.guarded_dead_exports.join(", ")
+                );
+            }
+            serde_json::json!({
+                "ruleId": "fallow/feature-flag",
+                "level": "note",
+                "message": { "text": msg },
+                "locations": [{
+                    "physicalLocation": {
+                        "artifactLocation": { "uri": path },
+                        "region": { "startLine": f.line, "startColumn": f.col + 1 },
+                    }
+                }],
+            })
+        })
+        .collect();
+
+    let sarif = serde_json::json!({
+        "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/main/sarif-2.1/schema/sarif-schema-2.1.0.json",
+        "version": "2.1.0",
+        "runs": [{
+            "tool": {
+                "driver": {
+                    "name": "fallow",
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "informationUri": "https://github.com/fallow-rs/fallow",
+                    "rules": rules,
+                }
+            },
+            "results": results,
+        }]
+    });
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&sarif).expect("JSON serialization should not fail")
+    );
+}
+
+/// Markdown output for `fallow flags` (PR comments).
+fn print_flags_markdown(flags: &[FeatureFlag], config: &ResolvedConfig) {
+    if flags.is_empty() {
+        println!("No feature flags detected.");
+        return;
+    }
+
+    // Cross-reference section first
+    let dead_flags: Vec<&FeatureFlag> = flags
+        .iter()
+        .filter(|f| !f.guarded_dead_exports.is_empty())
+        .collect();
+
+    if !dead_flags.is_empty() {
+        println!("### Flags guarding dead code ({})\n", dead_flags.len());
+        println!("| File | Line | Flag | Dead exports |");
+        println!("|------|------|------|-------------|");
+        for f in &dead_flags {
+            let path = relative_path(f, &config.root);
+            println!(
+                "| `{}` | {} | `{}` | {} |",
+                path,
+                f.line,
+                f.flag_name,
+                f.guarded_dead_exports.join(", ")
+            );
+        }
+        println!();
+    }
+
+    // Full inventory
+    println!("### Feature flags ({})\n", flags.len());
+    println!("| File | Line | Flag | Kind |");
+    println!("|------|------|------|------|");
+    for f in flags {
+        let path = relative_path(f, &config.root);
+        let kind = match f.kind {
+            FlagKind::EnvironmentVariable => "env".to_string(),
+            FlagKind::SdkCall => f
+                .sdk_name
+                .as_ref()
+                .map_or_else(|| "SDK".to_string(), |sdk| format!("SDK: {sdk}")),
+            FlagKind::ConfigObject => "config".to_string(),
+        };
+        println!("| `{path}` | {} | `{}` | {kind} |", f.line, f.flag_name);
+    }
+}
+
+/// CodeClimate output for `fallow flags` (GitLab Code Quality).
+fn print_flags_codeclimate(flags: &[FeatureFlag], config: &ResolvedConfig) {
+    let issues: Vec<serde_json::Value> = flags
+        .iter()
+        .map(|f| {
+            let path = relative_path(f, &config.root);
+            let mut description = format!(
+                "Feature flag '{}' detected ({})",
+                f.flag_name,
+                kind_label(f)
+            );
+            if !f.guarded_dead_exports.is_empty() {
+                use std::fmt::Write;
+                let _ = write!(
+                    description,
+                    ". Guards {} dead exports",
+                    f.guarded_dead_exports.len()
+                );
+            }
+            let fingerprint =
+                fnv_fingerprint(&["feature-flag", &path, &f.line.to_string(), &f.flag_name]);
+            serde_json::json!({
+                "type": "issue",
+                "check_name": "fallow/feature-flag",
+                "description": description,
+                "categories": ["Clarity"],
+                "severity": "info",
+                "fingerprint": fingerprint,
+                "location": {
+                    "path": path,
+                    "lines": { "begin": f.line },
+                }
+            })
+        })
+        .collect();
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&issues).expect("JSON serialization should not fail")
+    );
 }
 
 /// JSON output for `fallow flags`.
