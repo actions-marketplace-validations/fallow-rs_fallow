@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.27.6] - 2026-04-11
+
+### Fixed
+
+- **Bare HTML / Vue / Svelte asset references without `./` prefix** -- HTML `<script src="app.js">`, `<link rel="stylesheet" href="styles.css">`, `<link rel="modulepreload" href="vendor.js">`, and Vue/Svelte `<script src="logic.ts">` now normalize bare filenames to `./`-prefixed relative paths before downstream resolution. Previously these were reported as unlisted npm dependencies because the resolver's specifier classifier treats anything without `./`, `/`, or `://` as a bare package. Browsers, Vite, Parcel, and the Vue/Svelte compilers all resolve these references relative to the document or component file whether or not the `./` prefix is present, so normalization matches real-world semantics. Scoped package paths (`@scope/header.html`), root-absolute paths (`/src/main.ts`), URLs, and `data:` URIs remain untouched. Same bug shape as the Angular `templateUrl` fix shipped in 2.27.5. ([#101](https://github.com/fallow-rs/fallow/pull/101))
+
 ## [2.27.5] - 2026-04-11
 
 ### Fixed
@@ -1251,7 +1257,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `--changed-since` and `--fail-on-issues` for CI
 - Cross-workspace resolution for npm/yarn/pnpm workspaces
 
-[Unreleased]: https://github.com/fallow-rs/fallow/compare/v2.27.5...HEAD
+[Unreleased]: https://github.com/fallow-rs/fallow/compare/v2.27.6...HEAD
+[2.27.6]: https://github.com/fallow-rs/fallow/compare/v2.27.5...v2.27.6
 [2.27.5]: https://github.com/fallow-rs/fallow/compare/v2.27.4...v2.27.5
 [2.27.4]: https://github.com/fallow-rs/fallow/compare/v2.27.3...v2.27.4
 [2.27.3]: https://github.com/fallow-rs/fallow/compare/v2.27.2...v2.27.3
