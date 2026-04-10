@@ -62,14 +62,36 @@ pub(super) fn resolve_specifier(
     }
 
     // In HTML files, root-relative paths (`/src/main.tsx`) are a web convention meaning
-    // "relative to the project root". Vite, Parcel, and other dev servers resolve them
-    // this way. Use `resolve(directory, specifier)` with the project root as the base
-    // directory, so resolution works regardless of where the HTML file lives (e.g.,
-    // `public/index.html` referencing `/src/main.tsx`).
+    // "relative to the project/workspace root". Vite, Parcel, and other dev servers
+    // resolve them this way. In monorepos, each workspace member has its own Vite root,
+    // so `site/index.html` referencing `/src/main.tsx` should resolve to `site/src/main.tsx`,
+    // not `<monorepo-root>/src/main.tsx`. Use the HTML file's parent directory as the base,
+    // which is correct for both workspace members (HTML at workspace root) and single projects.
     // Scoped to HTML files only — in JS/TS, `/foo` is an absolute filesystem path.
     if specifier.starts_with('/') && from_file.extension().is_some_and(|e| e == "html") {
         let relative = format!(".{specifier}");
-        if let Ok(resolved) = ctx.resolver.resolve(ctx.root, &relative) {
+        let html_dir = from_file.parent().unwrap_or(ctx.root);
+        if let Ok(resolved) = ctx.resolver.resolve(html_dir, &relative) {
+            let resolved_path = resolved.path();
+            if let Some(&file_id) = ctx.raw_path_to_id.get(resolved_path) {
+                return ResolveResult::InternalModule(file_id);
+            }
+            if let Ok(canonical) = dunce::canonicalize(resolved_path) {
+                if let Some(&file_id) = ctx.path_to_id.get(canonical.as_path()) {
+                    return ResolveResult::InternalModule(file_id);
+                }
+                if let Some(fallback) = ctx.canonical_fallback
+                    && let Some(file_id) = fallback.get(&canonical)
+                {
+                    return ResolveResult::InternalModule(file_id);
+                }
+            }
+        }
+        // Fall back to project root for non-workspace setups where HTML may be
+        // in a subdirectory (e.g., `public/index.html` referencing `/src/main.tsx`).
+        if html_dir != ctx.root
+            && let Ok(resolved) = ctx.resolver.resolve(ctx.root, &relative)
+        {
             let resolved_path = resolved.path();
             if let Some(&file_id) = ctx.raw_path_to_id.get(resolved_path) {
                 return ResolveResult::InternalModule(file_id);

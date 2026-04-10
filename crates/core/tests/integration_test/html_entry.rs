@@ -166,3 +166,67 @@ fn html_root_relative_no_unresolved_imports() {
         "root-relative HTML asset references should resolve, got unresolved: {html_unresolved:?}"
     );
 }
+
+// ── HTML root-relative in workspace member ────────────────────
+
+#[test]
+fn html_workspace_root_relative_script_is_reachable() {
+    let root = fixture_path("html-workspace-root-relative");
+    let config = create_config(root);
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+
+    let unused_file_names: Vec<String> = results
+        .unused_files
+        .iter()
+        .map(|f| f.path.file_name().unwrap().to_string_lossy().to_string())
+        .collect();
+
+    // main.ts is referenced by site/index.html via root-relative <script src="/src/main.ts">
+    // Resolution must use the HTML file's parent dir (site/), not the monorepo root
+    assert!(
+        !unused_file_names.contains(&"main.ts".to_string()),
+        "main.ts should be reachable via workspace root-relative HTML script src, unused files: {unused_file_names:?}"
+    );
+
+    // utils.ts is transitively imported by main.ts
+    assert!(
+        !unused_file_names.contains(&"utils.ts".to_string()),
+        "utils.ts should be transitively reachable, unused files: {unused_file_names:?}"
+    );
+}
+
+#[test]
+fn html_workspace_root_relative_stylesheet_is_reachable() {
+    let root = fixture_path("html-workspace-root-relative");
+    let config = create_config(root);
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+
+    let unused_file_names: Vec<String> = results
+        .unused_files
+        .iter()
+        .map(|f| f.path.file_name().unwrap().to_string_lossy().to_string())
+        .collect();
+
+    assert!(
+        !unused_file_names.contains(&"global.css".to_string()),
+        "global.css should be reachable via workspace root-relative HTML link href, unused files: {unused_file_names:?}"
+    );
+}
+
+#[test]
+fn html_workspace_root_relative_no_unresolved_imports() {
+    let root = fixture_path("html-workspace-root-relative");
+    let config = create_config(root);
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+
+    let html_unresolved: Vec<&str> = results
+        .unresolved_imports
+        .iter()
+        .filter(|u| u.path.to_string_lossy().ends_with(".html"))
+        .map(|u| u.specifier.as_str())
+        .collect();
+    assert!(
+        html_unresolved.is_empty(),
+        "workspace root-relative HTML asset references should resolve, got unresolved: {html_unresolved:?}"
+    );
+}

@@ -79,8 +79,17 @@ fn is_css_url_import(source: &str) -> bool {
 /// When `is_scss` is true, extensionless specifiers that are not SCSS built-in
 /// modules (`sass:*`) are treated as relative imports (SCSS partial convention).
 /// This handles `@use 'variables'` resolving to `./_variables.scss`.
+///
+/// Scoped npm packages (`@scope/pkg`) are always kept bare, even when they have
+/// CSS extensions (e.g., `@fontsource/monaspace-neon/400.css`). Bundlers like
+/// Vite resolve these from node_modules, not as relative paths.
 fn normalize_css_import_path(path: String, is_scss: bool) -> String {
     if path.starts_with('.') || path.starts_with('/') || path.contains("://") {
+        return path;
+    }
+    // Scoped npm packages (`@scope/...`) are always bare specifiers resolved
+    // from node_modules, regardless of file extension.
+    if path.starts_with('@') && path.contains('/') {
         return path;
     }
     // Paths with CSS/SCSS extensions are relative file imports
@@ -609,6 +618,40 @@ mod tests {
         assert_eq!(
             normalize_css_import_path("tailwindcss".to_string(), false),
             "tailwindcss"
+        );
+    }
+
+    // ── Scoped npm packages stay bare ───────────────────────────
+
+    #[test]
+    fn normalize_scoped_package_with_css_extension_stays_bare() {
+        assert_eq!(
+            normalize_css_import_path("@fontsource/monaspace-neon/400.css".to_string(), false),
+            "@fontsource/monaspace-neon/400.css"
+        );
+    }
+
+    #[test]
+    fn normalize_scoped_package_with_scss_extension_stays_bare() {
+        assert_eq!(
+            normalize_css_import_path("@company/design-system/tokens.scss".to_string(), true),
+            "@company/design-system/tokens.scss"
+        );
+    }
+
+    #[test]
+    fn normalize_scoped_package_without_extension_stays_bare() {
+        assert_eq!(
+            normalize_css_import_path("@fallow/design-system/styles".to_string(), false),
+            "@fallow/design-system/styles"
+        );
+    }
+
+    #[test]
+    fn normalize_scoped_package_extensionless_scss_stays_bare() {
+        assert_eq!(
+            normalize_css_import_path("@company/tokens".to_string(), true),
+            "@company/tokens"
         );
     }
 
