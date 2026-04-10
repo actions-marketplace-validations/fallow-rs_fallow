@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.27.0] - 2026-04-10
+
+### Added
+
+- **Feature flag detection** -- new `fallow flags` command detects static feature flags and environment gates in JavaScript/TypeScript code. Three detection categories: boolean flags (`if (FLAG)`), environment checks (`process.env.NODE_ENV`), and config-key guards (`config.featureX`). Cross-references with dead code analysis to surface flags guarding unused code. All 6 output formats supported (human, JSON, compact, SARIF, Markdown, CodeClimate). Available as MCP tool for AI agent integration.
+- **Deep Docusaurus convention coverage** -- the Docusaurus plugin now parses `docusaurus.config.*` to discover content plugin instances (docs, blog, pages), classic preset expansion, theme swizzle components, i18n/versioned docs, static directories, client modules, scripts, and stylesheets. Sidebar files are only marked as used when explicitly referenced via `sidebarPath`. Contributed by [@M-Hassan-Raza](https://github.com/M-Hassan-Raza). ([#91](https://github.com/fallow-rs/fallow/pull/91))
+
+### Changed
+
+- **Plugin infrastructure** -- 9 plugins migrated from manual `impl Plugin` to the `define_plugin!` macro, reducing boilerplate. Shared config parser helpers extracted for reuse across plugins (function body extraction for async config creators, property accessors, disabled-section detection).
+- **MCP server** -- shared CLI arg-building helpers extracted, reducing duplication across tool implementations.
+- **Internal visibility** -- core crate modules restricted to `pub(crate)` where cross-crate access was unnecessary.
+- **SFC template parser** -- deduplicated template tag parsing logic shared between Vue and Svelte extractors.
+
+### Fixed
+
+- **VS Code extension** -- version marker round-trip handling improved with additional test coverage.
+
 ## [2.26.1] - 2026-04-09
 
 ### Changed
@@ -1184,7 +1202,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `--changed-since` and `--fail-on-issues` for CI
 - Cross-workspace resolution for npm/yarn/pnpm workspaces
 
-[Unreleased]: https://github.com/fallow-rs/fallow/compare/v2.26.1...HEAD
+[Unreleased]: https://github.com/fallow-rs/fallow/compare/v2.27.0...HEAD
+[2.27.0]: https://github.com/fallow-rs/fallow/compare/v2.26.1...v2.27.0
 [2.26.1]: https://github.com/fallow-rs/fallow/compare/v2.26.0...v2.26.1
 [2.26.0]: https://github.com/fallow-rs/fallow/compare/v2.25.1...v2.26.0
 [2.25.1]: https://github.com/fallow-rs/fallow/compare/v2.25.0...v2.25.1
