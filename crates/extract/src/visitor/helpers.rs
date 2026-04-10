@@ -29,6 +29,7 @@ pub struct AngularComponentMetadata {
 const ANGULAR_SIGNAL_APIS: &[&str] = &[
     "input",
     "output",
+    "outputFromObservable",
     "model",
     "viewChild",
     "viewChildren",
@@ -267,8 +268,8 @@ pub fn has_angular_class_decorator(class: &Class<'_>) -> bool {
 
 /// Check if a property initializer is an Angular signal API call.
 ///
-/// Matches `input()`, `input.required()`, `output()`, `model()`,
-/// `viewChild()`, `viewChildren()`, `contentChild()`, `contentChildren()`.
+/// Matches `input()`, `input.required()`, `output()`, `outputFromObservable()`,
+/// `model()`, `viewChild()`, `viewChildren()`, `contentChild()`, `contentChildren()`.
 fn is_angular_signal_initializer(value: &Expression<'_>) -> bool {
     let Expression::CallExpression(call) = value else {
         return false;
@@ -292,7 +293,7 @@ fn is_angular_signal_initializer(value: &Expression<'_>) -> bool {
 /// Extract class members (methods and properties) from a class declaration.
 ///
 /// When `is_angular_class` is true, properties initialized with Angular signal
-/// APIs (`input()`, `output()`, `model()`, `viewChild()`, etc.) are treated as
+/// APIs (`input()`, `output()`, `outputFromObservable()`, `model()`, `viewChild()`, etc.) are treated as
 /// decorated (framework-managed) to prevent false unused-member reports.
 pub fn extract_class_members(class: &Class<'_>, is_angular_class: bool) -> Vec<MemberInfo> {
     let mut members = Vec::new();

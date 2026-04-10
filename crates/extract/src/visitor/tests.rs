@@ -2791,6 +2791,37 @@ fn angular_regular_property_not_marked_as_decorated() {
     );
 }
 
+#[test]
+fn angular_output_from_observable_marks_as_decorated() {
+    let info = parse(
+        r"
+        import { Component } from '@angular/core';
+        import { outputFromObservable } from '@angular/core/rxjs-interop';
+        import { Subject } from 'rxjs';
+
+        @Component({ selector: 'app', template: '' })
+        export class App {
+            private readonly save$ = new Subject<void>();
+            readonly saved = outputFromObservable(this.save$);
+        }
+        ",
+    );
+    let app_export = info
+        .exports
+        .iter()
+        .find(|e| e.name.to_string() == "App")
+        .unwrap();
+    let saved = app_export
+        .members
+        .iter()
+        .find(|m| m.name == "saved")
+        .unwrap();
+    assert!(
+        saved.has_decorator,
+        "outputFromObservable() should set has_decorator"
+    );
+}
+
 // ── Angular combined metadata extraction ──────────────────────
 
 #[test]

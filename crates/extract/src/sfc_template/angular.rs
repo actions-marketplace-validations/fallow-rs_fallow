@@ -5,6 +5,8 @@
 //! - `[prop]="expression"` / `(event)="statement"` / `[(prop)]="expression"` bindings
 //! - `*ngIf="expression"` / `*ngFor="let x of expr"` structural directives
 //! - `@if (expr)` / `@for (x of expr; track expr)` / `@switch (expr)` control flow (Angular 17+)
+//! - `@defer (when expr)` deferred loading blocks (Angular 17+)
+//! - `@let name = expr;` template-local variables (Angular 18+)
 //! - `| pipeName` pipe references
 //!
 //! Referenced identifiers are stored as `MemberAccess` entries with a sentinel object name
@@ -102,8 +104,9 @@ pub fn collect_angular_template_refs(source: &str) -> FxHashSet<String> {
     refs
 }
 
-/// Handle Angular 17+ control flow blocks (`@if`, `@for`, `@switch`, `@case`, etc.).
-/// Returns the index after the opening `{` of the block, or `None` if not a control flow keyword.
+/// Handle Angular 17+ control flow blocks (`@if`, `@else if`, `@for`, `@switch`, `@case`, `@defer`, `@let`, etc.).
+/// Returns the index after the opening `{` of the block (or after the `;` for `@let`),
+/// or `None` if not a control flow keyword.
 fn handle_control_flow(
     source: &str,
     start: usize,
@@ -171,8 +174,101 @@ fn handle_control_flow(
             let brace_pos = source[after_paren..].find('{')?;
             Some(after_paren + brace_pos + 1)
         }
-        // @else, @empty, @default, @placeholder, @loading, @error — no expression
-        "else" | "empty" | "default" | "placeholder" | "loading" | "error" => {
+        "defer" => {
+            // @defer (when condition) { ... }
+            // @defer (on viewport; when isReady) { ... }
+            // @defer (prefetch when shouldPrefetch) { ... }
+            let after_keyword = &source[start + 1 + keyword_end..];
+            let trimmed = after_keyword.trim_start();
+            let offset = after_keyword.len() - trimmed.len();
+            let abs_after_keyword = start + 1 + keyword_end + offset;
+
+            if trimmed.starts_with('(') {
+                let paren_content_start = abs_after_keyword;
+                let (paren_content, after_paren) = scan_parenthesized(source, paren_content_start)?;
+                let locals = current_locals(scopes);
+                // Extract `when <expr>` clauses from semicolon-separated parts
+                for part in paren_content.split(';') {
+                    let part = part.trim();
+                    // Match "when expr", "prefetch when expr", "hydrate when expr"
+                    if let Some(pos) = part.find("when") {
+                        let after_when = &part[pos + 4..];
+                        let expr = after_when.trim();
+                        if !expr.is_empty() {
+                            collect_expression_refs(expr, &locals, refs);
+                        }
+                    }
+                }
+                scopes.push(Vec::new());
+                let brace_pos = source[after_paren..].find('{')?;
+                Some(after_paren + brace_pos + 1)
+            } else {
+                // @defer { ... } with no parenthesized condition
+                scopes.push(Vec::new());
+                let rest_from = start + 1 + keyword_end;
+                let brace_pos = source[rest_from..].find('{')?;
+                Some(rest_from + brace_pos + 1)
+            }
+        }
+        "let" => {
+            // @let varName = expression;
+            // Introduces a template-local variable; no block scope.
+            let after_keyword = &source[start + 1 + keyword_end..];
+            let trimmed = after_keyword.trim_start();
+            let offset = after_keyword.len() - trimmed.len();
+
+            // Find the variable name (first identifier after whitespace)
+            let name_end = trimmed.find(|c: char| !c.is_ascii_alphanumeric() && c != '_')?;
+            let var_name = &trimmed[..name_end];
+
+            // Find '=' after the name
+            let rest_after_name = &trimmed[name_end..];
+            let eq_pos = rest_after_name.find('=')?;
+            let expr_start = eq_pos + 1;
+            let expr_rest = &rest_after_name[expr_start..];
+
+            // Find ';' that terminates the @let statement
+            let semi_pos = expr_rest.find(';')?;
+            let expr = expr_rest[..semi_pos].trim();
+
+            let locals = current_locals(scopes);
+            collect_expression_refs(expr, &locals, refs);
+
+            // Add the variable to the current scope (not a new scope)
+            if let Some(scope) = scopes.last_mut() {
+                scope.push(var_name.to_string());
+            }
+
+            // Return index after the ';'
+            let abs_semi = start + 1 + keyword_end + offset + name_end + expr_start + semi_pos + 1;
+            Some(abs_semi)
+        }
+        "else" => {
+            // @else { ... } or @else if (condition) { ... }
+            let rest_from = start + 1 + keyword_end;
+            let after_else = source[rest_from..].trim_start();
+            let trimmed_offset = source[rest_from..].len() - after_else.len();
+
+            if after_else.starts_with("if") {
+                // @else if (condition) { ... } — scan the condition
+                let if_keyword_end = rest_from + trimmed_offset + 2;
+                let after_if = &source[if_keyword_end..];
+                let paren_start = after_if.find('(')?;
+                let paren_content_start = if_keyword_end + paren_start;
+                let (expr, after_paren) = scan_parenthesized(source, paren_content_start)?;
+                let locals = current_locals(scopes);
+                collect_expression_refs(expr.trim(), &locals, refs);
+                scopes.push(Vec::new());
+                let brace_pos = source[after_paren..].find('{')?;
+                Some(after_paren + brace_pos + 1)
+            } else {
+                scopes.push(Vec::new());
+                let brace_pos = source[rest_from..].find('{')?;
+                Some(rest_from + brace_pos + 1)
+            }
+        }
+        // @empty, @default, @placeholder, @loading, @error — no expression
+        "empty" | "default" | "placeholder" | "loading" | "error" => {
             scopes.push(Vec::new());
             let rest_from = start + 1 + keyword_end;
             let brace_pos = source[rest_from..].find('{')?;
@@ -476,6 +572,28 @@ mod tests {
     }
 
     #[test]
+    fn control_flow_else_if_extracts_refs() {
+        let refs = collect_angular_template_refs(
+            r"@if (condA) { <p>A</p> } @else if (condB) { <p>B</p> } @else { <p>C</p> }",
+        );
+        assert!(refs.contains("condA"), "should contain @if condition");
+        assert!(refs.contains("condB"), "should contain @else if condition");
+    }
+
+    #[test]
+    fn control_flow_chained_else_if_extracts_refs() {
+        let refs = collect_angular_template_refs(
+            r"@if (a) { <p>{{ x }}</p> } @else if (b) { <p>{{ y }}</p> } @else if (c) { <p>{{ z }}</p> }",
+        );
+        assert!(refs.contains("a"));
+        assert!(refs.contains("b"));
+        assert!(refs.contains("c"));
+        assert!(refs.contains("x"));
+        assert!(refs.contains("y"));
+        assert!(refs.contains("z"));
+    }
+
+    #[test]
     fn control_flow_for_extracts_refs() {
         let refs = collect_angular_template_refs(
             r"@for (item of items; track item.id) { <li>{{ item.name }}</li> }",
@@ -556,6 +674,74 @@ mod tests {
             collect_angular_template_refs(r"@if (config.enabled) { <span>{{ label }}</span> }");
         assert!(refs.contains("config"));
         assert!(refs.contains("label"));
+    }
+
+    // ── @defer ──────────────────────────────────────────────────
+
+    #[test]
+    fn defer_when_extracts_refs() {
+        let refs = collect_angular_template_refs(
+            r"@defer (when isDataReady) { <app-heavy /> } @placeholder { <p>Wait</p> }",
+        );
+        assert!(refs.contains("isDataReady"));
+    }
+
+    #[test]
+    fn defer_on_and_when_extracts_refs() {
+        let refs =
+            collect_angular_template_refs(r"@defer (on viewport; when isReady) { <app-heavy /> }");
+        assert!(refs.contains("isReady"));
+    }
+
+    #[test]
+    fn defer_prefetch_when_extracts_refs() {
+        let refs = collect_angular_template_refs(
+            r"@defer (prefetch when shouldPrefetch) { <app-heavy /> }",
+        );
+        assert!(refs.contains("shouldPrefetch"));
+    }
+
+    #[test]
+    fn defer_without_condition() {
+        let refs = collect_angular_template_refs(
+            r"@defer { <app-heavy /> } @placeholder { <p>{{ label }}</p> }",
+        );
+        assert!(refs.contains("label"));
+    }
+
+    // ── @let ───────────────────────────────────────────────────
+
+    #[test]
+    fn let_extracts_expression_refs() {
+        let refs = collect_angular_template_refs(
+            r"@let fullName = firstName + ' ' + lastName;
+            <p>{{ fullName }}</p>",
+        );
+        assert!(refs.contains("firstName"));
+        assert!(refs.contains("lastName"));
+        // fullName is a local introduced by @let, not a component member
+        assert!(!refs.contains("fullName"));
+    }
+
+    #[test]
+    fn let_simple_alias() {
+        let refs = collect_angular_template_refs(
+            r"@let name = user.name;
+            <p>{{ name }}</p>",
+        );
+        assert!(refs.contains("user"));
+        assert!(!refs.contains("name"));
+    }
+
+    #[test]
+    fn let_with_pipe() {
+        let refs = collect_angular_template_refs(
+            r"@let formatted = rawDate | date;
+            <span>{{ formatted }}</span>",
+        );
+        assert!(refs.contains("rawDate"));
+        assert!(refs.contains("date"));
+        assert!(!refs.contains("formatted"));
     }
 
     // ── split_pipes ─────────────────────────────────────────────
