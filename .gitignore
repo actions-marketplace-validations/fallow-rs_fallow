@@ -4,15 +4,18 @@ node_modules/
 .DS_Store
 
 # Reference repos (for development only)
+reference
 reference/
 
 # Coverage reports
 coverage/
 
 # Benchmark fixtures (generated/downloaded for local benchmarking)
+benchmarks/fixtures
 benchmarks/fixtures/
 
 # Knip v6 local install for benchmarks
+benchmarks/knip6
 benchmarks/knip6/
 
 # Incremental cache
@@ -37,9 +40,11 @@ npm/linux-arm64-musl/fallow
 npm/win32-x64-msvc/fallow.exe
 
 # Internal planning docs
+.internal
 .internal/
 
 # Quality audit reports
+quality
 quality/
 
 # VS Code extension build artifacts
