@@ -118,6 +118,67 @@ pub fn find_config_object_pub<'a>(program: &'a Program) -> Option<&'a ObjectExpr
     find_config_object(program)
 }
 
+/// Get a top-level property expression from an object.
+pub(crate) fn property_expr<'a>(
+    obj: &'a ObjectExpression<'a>,
+    key: &str,
+) -> Option<&'a Expression<'a>> {
+    find_property(obj, key).map(|prop| &prop.value)
+}
+
+/// Get a top-level property object from an object.
+pub(crate) fn property_object<'a>(
+    obj: &'a ObjectExpression<'a>,
+    key: &str,
+) -> Option<&'a ObjectExpression<'a>> {
+    property_expr(obj, key).and_then(object_expression)
+}
+
+/// Get a string-like top-level property value from an object.
+pub(crate) fn property_string(obj: &ObjectExpression<'_>, key: &str) -> Option<String> {
+    property_expr(obj, key).and_then(expression_to_string)
+}
+
+/// Convert an expression to an object expression when it is statically recoverable.
+pub(crate) fn object_expression<'a>(expr: &'a Expression<'a>) -> Option<&'a ObjectExpression<'a>> {
+    match expr {
+        Expression::ObjectExpression(obj) => Some(obj),
+        Expression::ParenthesizedExpression(paren) => object_expression(&paren.expression),
+        Expression::TSSatisfiesExpression(ts_sat) => object_expression(&ts_sat.expression),
+        Expression::TSAsExpression(ts_as) => object_expression(&ts_as.expression),
+        _ => None,
+    }
+}
+
+/// Convert an expression to an array expression when it is statically recoverable.
+pub(crate) fn array_expression<'a>(expr: &'a Expression<'a>) -> Option<&'a ArrayExpression<'a>> {
+    match expr {
+        Expression::ArrayExpression(arr) => Some(arr),
+        Expression::ParenthesizedExpression(paren) => array_expression(&paren.expression),
+        Expression::TSSatisfiesExpression(ts_sat) => array_expression(&ts_sat.expression),
+        Expression::TSAsExpression(ts_as) => array_expression(&ts_as.expression),
+        _ => None,
+    }
+}
+
+/// Convert a path-like expression to zero or more statically recoverable path strings.
+pub(crate) fn expression_to_path_values(expr: &Expression<'_>) -> Vec<String> {
+    match expr {
+        Expression::ArrayExpression(arr) => arr
+            .elements
+            .iter()
+            .filter_map(|element| element.as_expression().and_then(expression_to_path_string))
+            .collect(),
+        _ => expression_to_path_string(expr).into_iter().collect(),
+    }
+}
+
+/// True when an expression explicitly disables a config section.
+pub(crate) fn is_disabled_expression(expr: &Expression<'_>) -> bool {
+    matches!(expr, Expression::BooleanLiteral(boolean) if !boolean.value)
+        || matches!(expr, Expression::NullLiteral(_))
+}
+
 /// Extract keys of an object property at a nested path.
 ///
 /// Useful for `PostCSS` config: `{ plugins: { autoprefixer: {}, tailwindcss: {} } }`
@@ -482,6 +543,9 @@ fn find_config_object<'a>(program: &'a Program) -> Option<&'a ObjectExpression<'
                     ExportDefaultDeclarationKind::ObjectExpression(obj) => {
                         return Some(obj);
                     }
+                    ExportDefaultDeclarationKind::FunctionDeclaration(func) => {
+                        return extract_object_from_function(func);
+                    }
                     _ => decl.declaration.as_expression(),
                 };
                 if let Some(expr) = expr {
@@ -564,8 +628,46 @@ fn extract_object_from_expression<'a>(
             extract_object_from_expression(&ts_sat.expression)
         }
         Expression::TSAsExpression(ts_as) => extract_object_from_expression(&ts_as.expression),
+        Expression::ArrowFunctionExpression(arrow) => extract_object_from_arrow_function(arrow),
+        Expression::FunctionExpression(func) => extract_object_from_function(func),
         _ => None,
     }
+}
+
+fn extract_object_from_arrow_function<'a>(
+    arrow: &'a ArrowFunctionExpression<'a>,
+) -> Option<&'a ObjectExpression<'a>> {
+    if arrow.expression {
+        arrow.body.statements.first().and_then(|stmt| {
+            if let Statement::ExpressionStatement(expr_stmt) = stmt {
+                extract_object_from_expression(&expr_stmt.expression)
+            } else {
+                None
+            }
+        })
+    } else {
+        extract_object_from_function_body(&arrow.body)
+    }
+}
+
+fn extract_object_from_function<'a>(func: &'a Function<'a>) -> Option<&'a ObjectExpression<'a>> {
+    func.body
+        .as_ref()
+        .and_then(|body| extract_object_from_function_body(body))
+}
+
+fn extract_object_from_function_body<'a>(
+    body: &'a FunctionBody<'a>,
+) -> Option<&'a ObjectExpression<'a>> {
+    for stmt in &body.statements {
+        if let Statement::ReturnStatement(ret) = stmt
+            && let Some(argument) = &ret.argument
+            && let Some(obj) = extract_object_from_expression(argument)
+        {
+            return Some(obj);
+        }
+    }
+    None
 }
 
 /// Check if an assignment target is `module.exports`.
@@ -614,7 +716,10 @@ fn find_variable_init_object<'a>(
 }
 
 /// Find a named property in an object expression.
-fn find_property<'a>(obj: &'a ObjectExpression<'a>, key: &str) -> Option<&'a ObjectProperty<'a>> {
+pub(crate) fn find_property<'a>(
+    obj: &'a ObjectExpression<'a>,
+    key: &str,
+) -> Option<&'a ObjectProperty<'a>> {
     for prop in &obj.properties {
         if let ObjectPropertyKind::ObjectProperty(p) = prop
             && property_key_matches(&p.key, key)
@@ -626,7 +731,7 @@ fn find_property<'a>(obj: &'a ObjectExpression<'a>, key: &str) -> Option<&'a Obj
 }
 
 /// Check if a property key matches a string.
-fn property_key_matches(key: &PropertyKey, name: &str) -> bool {
+pub(crate) fn property_key_matches(key: &PropertyKey, name: &str) -> bool {
     match key {
         PropertyKey::StaticIdentifier(id) => id.name == name,
         PropertyKey::StringLiteral(s) => s.value == name,
@@ -683,7 +788,7 @@ fn get_nested_string_from_object(obj: &ObjectExpression, path: &[&str]) -> Optio
 }
 
 /// Convert an expression to a string if it's a string literal.
-fn expression_to_string(expr: &Expression) -> Option<String> {
+pub(crate) fn expression_to_string(expr: &Expression) -> Option<String> {
     match expr {
         Expression::StringLiteral(s) => Some(s.value.to_string()),
         Expression::TemplateLiteral(t) if t.expressions.is_empty() => {
@@ -695,7 +800,7 @@ fn expression_to_string(expr: &Expression) -> Option<String> {
 }
 
 /// Convert an expression to a path-like string if it's statically recoverable.
-fn expression_to_path_string(expr: &Expression) -> Option<String> {
+pub(crate) fn expression_to_path_string(expr: &Expression) -> Option<String> {
     match expr {
         Expression::ParenthesizedExpression(paren) => expression_to_path_string(&paren.expression),
         Expression::TSAsExpression(ts_as) => expression_to_path_string(&ts_as.expression),
@@ -1552,6 +1657,52 @@ mod tests {
         "#;
         let include = extract_config_string_array(source, &ts_path(), &["test", "include"]);
         assert_eq!(include, vec!["**/*.test.ts"]);
+    }
+
+    #[test]
+    fn extract_config_from_default_export_function_declaration() {
+        let source = r#"
+            export default function createConfig() {
+                return {
+                    clientModules: ["./src/client/global.js"]
+                };
+            }
+        "#;
+
+        let client_modules = extract_config_string_array(source, &ts_path(), &["clientModules"]);
+        assert_eq!(client_modules, vec!["./src/client/global.js"]);
+    }
+
+    #[test]
+    fn extract_config_from_default_export_async_function_declaration() {
+        let source = r#"
+            export default async function createConfigAsync() {
+                return {
+                    docs: {
+                        path: "knowledge"
+                    }
+                };
+            }
+        "#;
+
+        let docs_path = extract_config_string(source, &ts_path(), &["docs", "path"]);
+        assert_eq!(docs_path, Some("knowledge".to_string()));
+    }
+
+    #[test]
+    fn extract_config_from_exported_arrow_function_identifier() {
+        let source = r#"
+            const config = async () => {
+                return {
+                    themes: ["classic"]
+                };
+            };
+
+            export default config;
+        "#;
+
+        let themes = extract_config_shallow_strings(source, &ts_path(), "themes");
+        assert_eq!(themes, vec!["classic"]);
     }
 
     // ── module.exports with nested properties ────────────────────
