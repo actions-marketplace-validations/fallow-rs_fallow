@@ -19,7 +19,7 @@ crates/
     report/     — Output formatting (mod.rs dispatch, human/, json.rs, sarif.rs, compact.rs, markdown.rs)
     migrate/    — Config migration (mod.rs, knip.rs, jscpd.rs)
   lsp/      — LSP server, split into modules
-    main.rs, diagnostics/, code_actions.rs, code_lens.rs, hover.rs
+    main.rs, diagnostics/, code_actions/, code_lens.rs, hover.rs
   mcp/      — MCP server for AI agent integration (stdio transport, wraps CLI)
 editors/
   vscode/   — VS Code extension (LSP client, tree views, status bar, auto-download)
@@ -35,6 +35,7 @@ ci/           — GitLab CI template and supporting scripts
   tests/      — Unit tests for jq scripts (92 tests, run: bash ci/tests/run.sh)
 tests/
   fixtures/ — Integration test fixtures
+decisions/ — Architecture Decision Records (ADRs)
 ```
 
 ## Architecture
@@ -66,12 +67,14 @@ cargo run --bin fallow -- fix --dry-run      # Auto-fix preview
 
 ## Key design decisions
 
-- **No TypeScript compiler**: Syntactic analysis via Oxc parser + `oxc_semantic` for scope-aware binding analysis. No type resolution, no tsc.
-- **Flat edge storage**: Contiguous `Vec<Edge>` with range indices for cache-friendly traversal.
-- **Re-export chain resolution**: Iterative propagation through barrel files with cycle detection.
-- **FileIds are path-sorted** (not insertion order) for stable cross-run identity.
-- **Hidden directory allowlist**: `.storybook`, `.vitepress`, `.well-known`, `.changeset`, `.github` — other dotdirs are skipped. Only root-level `build/` is ignored.
-- **FxHashMap/FxHashSet required**: Standard `HashMap`/`HashSet` are disallowed (enforced via `.clippy.toml`). Use `rustc_hash` types for deterministic, faster hashing.
+Documented as Architecture Decision Records in [`decisions/`](decisions/). Key decisions:
+
+- **No TypeScript compiler** ([ADR-001](decisions/001-no-typescript-compiler.md)): Syntactic analysis via Oxc parser + `oxc_semantic`. No type resolution, no tsc.
+- **Flat edge storage** ([ADR-002](decisions/002-flat-edge-storage.md)): Contiguous `Vec<Edge>` with range indices for cache-friendly traversal.
+- **FxHashMap/FxHashSet required** ([ADR-003](decisions/003-fxhashmap-over-std.md)): Standard `HashMap`/`HashSet` disallowed (enforced via `.clippy.toml`).
+- **Path-sorted FileIds** ([ADR-004](decisions/004-path-sorted-file-ids.md)): Stable cross-run identity, not insertion order.
+- **Re-export chain resolution** ([ADR-005](decisions/005-re-export-chain-resolution.md)): Iterative propagation through barrel files with cycle detection.
+- **Hidden directory allowlist** ([ADR-006](decisions/006-hidden-directory-allowlist.md)): `.storybook`, `.vitepress`, `.well-known`, `.changeset`, `.github` traversed; other dotdirs skipped.
 
 ## Git conventions
 

@@ -23,8 +23,23 @@ Review Rust code changes in the fallow project. Focus on:
 - Missing docs on internal items
 - Test organization choices
 
+## Veto rights
+
+Can **BLOCK** on:
+- Unsafe code without justification
+- Missing `--all-targets` in test/clippy commands
+- `HashMap`/`HashSet` instead of `FxHashMap`/`FxHashSet`
+- Panicking code (`unwrap`/`expect`) on user-facing paths
+
 ## Output format
+
 Only report issues with HIGH confidence. For each issue:
 - File and line
 - What's wrong
 - Suggested fix
+
+End with a verdict:
+
+```
+## Verdict: APPROVE | CONCERN | BLOCK
+```
