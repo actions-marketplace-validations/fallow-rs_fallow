@@ -87,7 +87,7 @@ describe("getBinaryVersion", () => {
     expect(getBinaryVersion("/bin/fallow-lsp")).toBeNull();
   });
 
-  it("returns null on unparseable output", () => {
+  it("returns null on unparsable output", () => {
     mockExecOutput = "unknown";
     expect(getBinaryVersion("/bin/fallow-lsp")).toBeNull();
   });
