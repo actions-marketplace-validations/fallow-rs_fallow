@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.27.3] - 2026-04-10
+
+### Fixed
+
+- **CSS scoped package imports** -- `@import` statements referencing scoped npm packages with CSS extensions (e.g., `@fontsource/monaspace-neon/400.css`, `@fallow/design-system/styles.css`) are now kept as bare specifiers for node_modules resolution. Previously, the extension-based heuristic incorrectly prepended `./`, causing all such imports to be reported as unresolved.
+- **HTML root-relative paths in workspace members** -- `<script src="/src/main.tsx">` in workspace member HTML files (e.g., `site/index.html`) now resolves relative to the workspace member root, not the monorepo root. Previously, `site/index.html` referencing `/src/main.tsx` looked for `<monorepo>/src/main.tsx` instead of `site/src/main.tsx`, leaving the entry point file and all its transitively reachable modules flagged as unused. Resolution now tries the HTML file's parent directory first, with fallback to the project root for the `public/index.html` pattern.
+- **SCSS directory index convention** -- `@use 'components'` now resolves to `components/_index.scss` or `components/index.scss` per SCSS directory-import convention, in addition to the existing `_components.scss` partial fallback.
+- **`export default class extends Foo` inheritance** -- default-exported classes with an `extends` clause now participate in the inheritance-aware class member detection introduced in 2.27.2, preventing false unused-member reports on child class overrides.
+
 ## [2.27.2] - 2026-04-10
 
 ### Fixed
@@ -1218,7 +1227,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `--changed-since` and `--fail-on-issues` for CI
 - Cross-workspace resolution for npm/yarn/pnpm workspaces
 
-[Unreleased]: https://github.com/fallow-rs/fallow/compare/v2.27.2...HEAD
+[Unreleased]: https://github.com/fallow-rs/fallow/compare/v2.27.3...HEAD
+[2.27.3]: https://github.com/fallow-rs/fallow/compare/v2.27.2...v2.27.3
 [2.27.2]: https://github.com/fallow-rs/fallow/compare/v2.27.1...v2.27.2
 [2.27.1]: https://github.com/fallow-rs/fallow/compare/v2.27.0...v2.27.1
 [2.27.0]: https://github.com/fallow-rs/fallow/compare/v2.26.1...v2.27.0
