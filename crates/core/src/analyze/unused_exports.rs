@@ -966,6 +966,8 @@ mod tests {
                     )
                 })
                 .collect(),
+            used_class_members: vec![],
+            scss_include_paths: vec![],
             entry_point_roles: FxHashMap::default(),
             referenced_dependencies: vec![],
             discovered_always_used: vec![],

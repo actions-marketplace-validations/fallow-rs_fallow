@@ -209,6 +209,7 @@ mod tests {
             no_cache: true,
             ignore_dependencies: vec![],
             ignore_export_rules: vec![],
+            used_class_members: vec![],
             duplicates: fallow_config::DuplicatesConfig::default(),
             health: fallow_config::HealthConfig::default(),
             rules: fallow_config::RulesConfig::default(),

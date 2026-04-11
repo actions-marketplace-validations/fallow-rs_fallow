@@ -99,6 +99,10 @@ pub(super) struct ResolveContext<'a> {
     pub workspace_roots: &'a FxHashMap<&'a str, &'a Path>,
     /// Plugin-provided path aliases (prefix, replacement).
     pub path_aliases: &'a [(String, String)],
+    /// Absolute directories to search when resolving bare SCSS/Sass
+    /// `@import` / `@use` specifiers. Populated from Angular's
+    /// `stylePreprocessorOptions.includePaths` and equivalent settings.
+    pub scss_include_paths: &'a [PathBuf],
     /// Project root directory.
     pub root: &'a Path,
     /// Lazy canonical path → FileId fallback for intra-project symlinks.

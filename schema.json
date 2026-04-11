@@ -72,6 +72,14 @@
       },
       "default": []
     },
+    "usedClassMembers": {
+      "description": "Class member method/property names that should never be flagged as\nunused. Extends the built-in lifecycle allowlist (Angular/React) with\nframework-invoked names from libraries that call interface methods at\nruntime (e.g. ag-Grid's `agInit`, `refresh`). Use this at the top level\nfor project-wide additions; use a plugin file's `usedClassMembers` when\nthe names should only apply when a specific package is installed.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "default": []
+    },
     "duplicates": {
       "description": "Duplication detection settings.",
       "$ref": "#/$defs/DuplicatesConfig",
@@ -262,6 +270,14 @@
           "type": "array",
           "items": {
             "$ref": "#/$defs/ExternalUsedExport"
+          },
+          "default": []
+        },
+        "usedClassMembers": {
+          "description": "Class member method/property names the framework invokes at runtime.\nListed names extend the built-in lifecycle allowlist, so members with\nthese names are never flagged as unused-class-members. Use for libraries\nthat call interface methods reflectively (e.g. ag-Grid's `agInit`,\n`refresh`; TypeORM's `MigrationInterface.up`/`down`; Web Components'\n`connectedCallback`).",
+          "type": "array",
+          "items": {
+            "type": "string"
           },
           "default": []
         }

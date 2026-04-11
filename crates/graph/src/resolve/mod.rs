@@ -56,6 +56,7 @@ pub fn resolve_all_imports(
     workspaces: &[fallow_config::WorkspaceInfo],
     active_plugins: &[String],
     path_aliases: &[(String, String)],
+    scss_include_paths: &[PathBuf],
     root: &Path,
 ) -> Vec<ResolvedModule> {
     // Build workspace name → root index for pnpm store fallback.
@@ -129,6 +130,7 @@ pub fn resolve_all_imports(
         raw_path_to_id: &raw_path_to_id,
         workspace_roots: &workspace_roots,
         path_aliases,
+        scss_include_paths,
         root,
         canonical_fallback: canonical_fallback.as_ref(),
         tsconfig_warned: &tsconfig_warned,

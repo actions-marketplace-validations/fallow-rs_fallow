@@ -38,6 +38,10 @@ pub struct AggregatedPluginResult {
     pub always_used: Vec<(String, String)>,
     /// All used export rules from active plugins.
     pub used_exports: Vec<PluginUsedExportRule>,
+    /// Class member names contributed by active plugins that should never be
+    /// flagged as unused. Extends the built-in Angular/React lifecycle allowlist
+    /// with framework-invoked method names (e.g. ag-Grid `agInit`, `refresh`).
+    pub used_class_members: Vec<String>,
     /// Dependencies referenced in config files (should not be flagged unused).
     pub referenced_dependencies: Vec<String>,
     /// Additional always-used files discovered from config parsing: (pattern, plugin_name).
@@ -61,6 +65,11 @@ pub struct AggregatedPluginResult {
     pub active_plugins: Vec<String>,
     /// Test fixture glob patterns from active plugins: (pattern, plugin_name).
     pub fixture_patterns: Vec<(String, String)>,
+    /// Absolute directories contributed by plugins that should be searched
+    /// when resolving SCSS/Sass `@import`/`@use` specifiers. Populated from
+    /// Angular's `stylePreprocessorOptions.includePaths` and equivalent
+    /// framework settings. See issue #103.
+    pub scss_include_paths: Vec<PathBuf>,
 }
 
 impl PluginRegistry {

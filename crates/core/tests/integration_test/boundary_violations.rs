@@ -18,6 +18,7 @@ fn create_boundary_config(
         workspaces: None,
         ignore_dependencies: vec![],
         ignore_exports: vec![],
+        used_class_members: vec![],
         duplicates: DuplicatesConfig::default(),
         health: HealthConfig::default(),
         rules: RulesConfig {
@@ -150,6 +151,7 @@ fn no_violations_when_rule_is_off() {
         workspaces: None,
         ignore_dependencies: vec![],
         ignore_exports: vec![],
+        used_class_members: vec![],
         duplicates: DuplicatesConfig::default(),
         health: HealthConfig::default(),
         rules: RulesConfig {
@@ -194,6 +196,7 @@ fn preset_detects_boundary_violation() {
         workspaces: None,
         ignore_dependencies: vec![],
         ignore_exports: vec![],
+        used_class_members: vec![],
         duplicates: DuplicatesConfig::default(),
         health: HealthConfig::default(),
         rules: RulesConfig {
@@ -254,6 +257,7 @@ fn bulletproof_preset_detects_violation() {
         workspaces: None,
         ignore_dependencies: vec![],
         ignore_exports: vec![],
+        used_class_members: vec![],
         duplicates: DuplicatesConfig::default(),
         health: HealthConfig::default(),
         rules: RulesConfig {

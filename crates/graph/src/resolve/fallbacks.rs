@@ -137,6 +137,145 @@ fn try_resolve_scss(
     None
 }
 
+/// Try SCSS `includePaths` fallback: resolve the specifier against each
+/// framework-contributed include directory.
+///
+/// Angular's `stylePreprocessorOptions.includePaths` (and Nx's equivalent via
+/// project.json) adds extra search paths that SCSS resolves against before
+/// falling back to node_modules. Bare `@use 'variables'` statements that were
+/// normalized to `./variables` at extraction time fail the usual file-local
+/// resolution, so when the importing file is `.scss`/`.sass` and the spec
+/// originated from such a bare specifier, we retry against each include path,
+/// applying the SCSS partial (`_variables`) and directory-index conventions.
+///
+/// The specifier arrives with a `./` prefix because `normalize_css_import_path`
+/// rewrites bare extensionless SCSS specifiers to relative ones. We strip that
+/// prefix here to re-enter the include-path search from the root of each
+/// directory. Relative specifiers that already escape the importing file
+/// (e.g. `../shared/variables`) are left untouched — include paths only
+/// disambiguate bare specifiers, not explicit relative paths.
+pub(super) fn try_scss_include_path_fallback(
+    ctx: &ResolveContext<'_>,
+    from_file: &Path,
+    specifier: &str,
+) -> Option<ResolveResult> {
+    if ctx.scss_include_paths.is_empty() {
+        return None;
+    }
+    if !from_file
+        .extension()
+        .is_some_and(|e| e == "scss" || e == "sass")
+    {
+        return None;
+    }
+    // SCSS built-in modules (`sass:math`) should not be retried
+    if specifier.contains(':') {
+        return None;
+    }
+    // Only bare (normalized) specifiers benefit from include-path search.
+    // Parent-relative specifiers like `../shared/vars` explicitly escape the
+    // importing file's directory and should not be silently redirected.
+    let bare = specifier.strip_prefix("./")?;
+    if bare.starts_with("..") || bare.starts_with('/') {
+        return None;
+    }
+
+    for include_dir in ctx.scss_include_paths {
+        if let Some(file_id) = find_scss_in_dir(include_dir, bare, ctx) {
+            return Some(ResolveResult::InternalModule(file_id));
+        }
+    }
+    None
+}
+
+/// Probe an SCSS include directory for a bare specifier, applying the standard
+/// SCSS resolution order: exact file, `_`-prefixed partial, `_index` / `index`
+/// directory conventions. Supports `.scss` and `.sass` extensions.
+fn find_scss_in_dir(include_dir: &Path, bare: &str, ctx: &ResolveContext<'_>) -> Option<FileId> {
+    let bare_path = Path::new(bare);
+    let has_scss_ext = matches!(
+        bare_path.extension().and_then(|e| e.to_str()),
+        Some(ext) if ext.eq_ignore_ascii_case("scss") || ext.eq_ignore_ascii_case("sass")
+    );
+
+    // Split bare spec so we can build the `_`-prefixed partial for the final
+    // component while preserving any leading directory segments.
+    let parent = bare_path.parent();
+    let stem_with_ext = bare_path.file_name()?.to_str()?;
+    let stem_without_ext = bare_path.file_stem().and_then(|s| s.to_str())?;
+
+    let build = |rel: &Path| -> std::path::PathBuf { include_dir.join(rel) };
+    let join_with_parent = |name: &str| -> std::path::PathBuf {
+        parent.map_or_else(|| build(Path::new(name)), |p| build(&p.join(name)))
+    };
+
+    let exts: &[&str] = if has_scss_ext {
+        &[""]
+    } else {
+        &["scss", "sass"]
+    };
+
+    for ext in exts {
+        let suffix = if ext.is_empty() {
+            String::new()
+        } else {
+            format!(".{ext}")
+        };
+        // 1. Direct file: include_dir/<bare><ext>
+        let direct = if ext.is_empty() {
+            build(bare_path)
+        } else {
+            join_with_parent(&format!("{stem_with_ext}{suffix}"))
+        };
+        if let Some(fid) = lookup_scss_path(&direct, ctx) {
+            return Some(fid);
+        }
+        // 2. Partial: include_dir/<parent>/_<stem><ext>
+        let partial_name = if ext.is_empty() {
+            format!("_{stem_with_ext}")
+        } else {
+            format!("_{stem_without_ext}{suffix}")
+        };
+        let partial = join_with_parent(&partial_name);
+        if let Some(fid) = lookup_scss_path(&partial, ctx) {
+            return Some(fid);
+        }
+        if ext.is_empty() {
+            // Already has extension; directory index candidates below don't apply.
+            continue;
+        }
+        // 3. Directory index: include_dir/<bare>/_index.<ext>
+        let idx_partial = build(bare_path).join(format!("_index{suffix}"));
+        if let Some(fid) = lookup_scss_path(&idx_partial, ctx) {
+            return Some(fid);
+        }
+        let idx_plain = build(bare_path).join(format!("index{suffix}"));
+        if let Some(fid) = lookup_scss_path(&idx_plain, ctx) {
+            return Some(fid);
+        }
+    }
+    None
+}
+
+/// Look up an absolute candidate path in the file index, falling back to
+/// canonical path lookup for intra-project symlinks.
+fn lookup_scss_path(candidate: &Path, ctx: &ResolveContext<'_>) -> Option<FileId> {
+    if let Some(&file_id) = ctx.raw_path_to_id.get(candidate) {
+        return Some(file_id);
+    }
+    if let Ok(canonical) = dunce::canonicalize(candidate) {
+        if let Some(&file_id) = ctx.path_to_id.get(canonical.as_path()) {
+            return Some(file_id);
+        }
+        if let Some(fallback) = ctx.canonical_fallback
+            && let Some(file_id) = fallback.get(&canonical)
+        {
+            return Some(file_id);
+        }
+    }
+    None
+}
+
 /// Try to map a resolved output path (e.g., `packages/ui/dist/utils.js`) back to
 /// the corresponding source file (e.g., `packages/ui/src/utils.ts`).
 ///

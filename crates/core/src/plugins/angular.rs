@@ -5,7 +5,6 @@
 //! Parses `angular.json` to extract styles, scripts, main, and polyfills
 //! from build targets as additional entry points.
 
-#[cfg(test)]
 use std::path::Path;
 
 use super::config_parser;
@@ -131,9 +130,44 @@ define_plugin!(
             result.push_entry_pattern(path.to_string());
         }
 
+        // angular.json: projects.*.architect.build.options.stylePreprocessorOptions.includePaths
+        // Angular CLI resolves bare SCSS imports (`@import 'variables'`) by
+        // searching these directories. Without threading them into fallow's
+        // SCSS resolver, the imports become false-positive unresolved imports.
+        // Paths are resolved relative to the workspace/project root per the
+        // Angular workspace configuration reference. See issue #103.
+        let include_paths = config_parser::extract_config_object_nested_string_or_array(
+            source,
+            config_path,
+            &["projects"],
+            &[
+                "architect",
+                "build",
+                "options",
+                "stylePreprocessorOptions",
+                "includePaths",
+            ],
+        );
+        result
+            .scss_include_paths
+            .extend(resolve_scss_include_paths(&include_paths, _root));
+
         result
     },
 );
+
+/// Resolve each SCSS include path entry to an absolute directory.
+///
+/// Skips entries whose resolved directory does not exist on disk — a missing
+/// include path cannot resolve anything and would only waste syscalls during
+/// SCSS resolution.
+fn resolve_scss_include_paths(entries: &[String], root: &Path) -> Vec<std::path::PathBuf> {
+    entries
+        .iter()
+        .map(|entry| root.join(entry.trim_start_matches("./")))
+        .filter(|path| path.is_dir())
+        .collect()
+}
 
 #[cfg(test)]
 mod tests {
@@ -246,6 +280,71 @@ mod tests {
         assert!(has_entry_pattern(&result, "apps/two/src/styles.css"));
         assert!(has_entry_pattern(&result, "apps/one/src/main.ts"));
         assert!(has_entry_pattern(&result, "apps/two/src/main.ts"));
+    }
+
+    #[test]
+    fn resolve_config_extracts_scss_include_paths() {
+        // Issue #103: stylePreprocessorOptions.includePaths must be threaded
+        // through to the SCSS resolver. On-disk existence is checked in the
+        // plugin so the test creates the directory.
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src/styles")).unwrap();
+        std::fs::create_dir_all(root.join("libs/shared/scss")).unwrap();
+
+        let source = r#"{
+            "projects": {
+                "my-app": {
+                    "architect": {
+                        "build": {
+                            "options": {
+                                "stylePreprocessorOptions": {
+                                    "includePaths": ["src/styles", "./libs/shared/scss"]
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }"#;
+        let plugin = AngularPlugin;
+        let result = plugin.resolve_config(Path::new("angular.json"), source, root);
+        assert_eq!(result.scss_include_paths.len(), 2);
+        assert!(result.scss_include_paths.contains(&root.join("src/styles")));
+        assert!(
+            result
+                .scss_include_paths
+                .contains(&root.join("libs/shared/scss"))
+        );
+    }
+
+    #[test]
+    fn resolve_config_scss_include_paths_skips_missing_dirs() {
+        // Missing directories are filtered out so they don't trigger pointless
+        // filesystem lookups during SCSS resolution.
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src/styles")).unwrap();
+
+        let source = r#"{
+            "projects": {
+                "my-app": {
+                    "architect": {
+                        "build": {
+                            "options": {
+                                "stylePreprocessorOptions": {
+                                    "includePaths": ["src/styles", "missing/dir"]
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }"#;
+        let plugin = AngularPlugin;
+        let result = plugin.resolve_config(Path::new("angular.json"), source, root);
+        assert_eq!(result.scss_include_paths.len(), 1);
+        assert_eq!(result.scss_include_paths[0], root.join("src/styles"));
     }
 
     #[test]

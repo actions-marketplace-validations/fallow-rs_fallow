@@ -205,6 +205,7 @@ fn external_plugin_detected_by_enablers() {
         always_used: vec!["my.config.ts".to_string()],
         tooling_dependencies: vec!["my-framework-cli".to_string()],
         used_exports: vec![],
+        used_class_members: vec![],
         entry_point_role: fallow_config::EntryPointRole::Runtime,
     };
     let registry = PluginRegistry::new(vec![ext]);
@@ -236,6 +237,7 @@ fn external_plugin_not_detected_when_dep_missing() {
         always_used: vec![],
         tooling_dependencies: vec![],
         used_exports: vec![],
+        used_class_members: vec![],
         entry_point_role: fallow_config::EntryPointRole::Runtime,
     };
     let registry = PluginRegistry::new(vec![ext]);
@@ -262,6 +264,7 @@ fn external_plugin_prefix_enabler() {
         always_used: vec![],
         tooling_dependencies: vec![],
         used_exports: vec![],
+        used_class_members: vec![],
         entry_point_role: fallow_config::EntryPointRole::Runtime,
     };
     let registry = PluginRegistry::new(vec![ext]);
@@ -284,6 +287,7 @@ fn external_plugin_detection_dependency() {
         always_used: vec![],
         tooling_dependencies: vec![],
         used_exports: vec![],
+        used_class_members: vec![],
         entry_point_role: fallow_config::EntryPointRole::Runtime,
     };
     let registry = PluginRegistry::new(vec![ext]);
@@ -317,6 +321,7 @@ fn external_plugin_detection_any_combinator() {
         always_used: vec![],
         tooling_dependencies: vec![],
         used_exports: vec![],
+        used_class_members: vec![],
         entry_point_role: fallow_config::EntryPointRole::Runtime,
     };
     let registry = PluginRegistry::new(vec![ext]);
@@ -347,6 +352,7 @@ fn external_plugin_detection_all_combinator_fails_partial() {
         always_used: vec![],
         tooling_dependencies: vec![],
         used_exports: vec![],
+        used_class_members: vec![],
         entry_point_role: fallow_config::EntryPointRole::Runtime,
     };
     let registry = PluginRegistry::new(vec![ext]);
@@ -371,6 +377,7 @@ fn external_plugin_used_exports_aggregated() {
             pattern: "pages/**/*.tsx".to_string(),
             exports: vec!["default".to_string(), "getServerSideProps".to_string()],
         }],
+        used_class_members: vec![],
         entry_point_role: fallow_config::EntryPointRole::Runtime,
     };
     let registry = PluginRegistry::new(vec![ext]);
@@ -394,6 +401,7 @@ fn external_plugin_without_enablers_or_detection_stays_inactive() {
         always_used: vec![],
         tooling_dependencies: vec![],
         used_exports: vec![],
+        used_class_members: vec![],
         entry_point_role: fallow_config::EntryPointRole::Runtime,
     };
     let registry = PluginRegistry::new(vec![ext]);
@@ -512,6 +520,7 @@ fn external_plugin_detection_overrides_enablers() {
         always_used: vec![],
         tooling_dependencies: vec![],
         used_exports: vec![],
+        used_class_members: vec![],
         entry_point_role: fallow_config::EntryPointRole::Runtime,
     };
     let registry = PluginRegistry::new(vec![ext]);
@@ -538,6 +547,7 @@ fn external_plugin_detection_overrides_enablers_positive() {
         always_used: vec![],
         tooling_dependencies: vec![],
         used_exports: vec![],
+        used_class_members: vec![],
         entry_point_role: fallow_config::EntryPointRole::Runtime,
     };
     let registry = PluginRegistry::new(vec![ext]);
@@ -563,6 +573,7 @@ fn external_plugin_config_patterns_added_to_always_used() {
         always_used: vec!["setup.ts".to_string()],
         tooling_dependencies: vec![],
         used_exports: vec![],
+        used_class_members: vec![],
         entry_point_role: fallow_config::EntryPointRole::Runtime,
     };
     let registry = PluginRegistry::new(vec![ext]);
@@ -605,6 +616,7 @@ fn external_plugin_detection_all_combinator_succeeds() {
         always_used: vec![],
         tooling_dependencies: vec![],
         used_exports: vec![],
+        used_class_members: vec![],
         entry_point_role: fallow_config::EntryPointRole::Runtime,
     };
     let registry = PluginRegistry::new(vec![ext]);
@@ -646,6 +658,7 @@ fn external_plugin_nested_any_inside_all() {
         always_used: vec![],
         tooling_dependencies: vec![],
         used_exports: vec![],
+        used_class_members: vec![],
         entry_point_role: fallow_config::EntryPointRole::Runtime,
     };
     let registry = PluginRegistry::new(vec![ext.clone()]);
@@ -686,6 +699,7 @@ fn external_plugin_detection_file_exists_against_discovered() {
         always_used: vec![],
         tooling_dependencies: vec![],
         used_exports: vec![],
+        used_class_members: vec![],
         entry_point_role: fallow_config::EntryPointRole::Runtime,
     };
     let registry = PluginRegistry::new(vec![ext]);
@@ -712,6 +726,7 @@ fn external_plugin_detection_file_exists_no_match() {
         always_used: vec![],
         tooling_dependencies: vec![],
         used_exports: vec![],
+        used_class_members: vec![],
         entry_point_role: fallow_config::EntryPointRole::Runtime,
     };
     let registry = PluginRegistry::new(vec![ext]);
@@ -833,11 +848,13 @@ fn process_config_result_merges_all_fields() {
         replace_entry_patterns: false,
         replace_used_export_rules: false,
         used_exports: vec![used_export_rule("src/routes/**/*.ts", &["loader"])],
+        used_class_members: vec!["agInit".to_string()],
         referenced_dependencies: vec!["lodash".to_string(), "axios".to_string()],
         always_used_files: vec!["setup.ts".to_string()],
         path_aliases: vec![],
         setup_files: vec![PathBuf::from("/project/test/setup.ts")],
         fixture_patterns: vec![],
+        scss_include_paths: vec![],
     };
     process_config_result("test-plugin", config_result, &mut aggregated);
 
@@ -889,22 +906,26 @@ fn process_config_result_accumulates_across_multiple_calls() {
         replace_entry_patterns: false,
         replace_used_export_rules: false,
         used_exports: vec![used_export_rule("a.ts", &["default"])],
+        used_class_members: vec![],
         referenced_dependencies: vec!["dep-a".to_string()],
         always_used_files: vec![],
         path_aliases: vec![],
         setup_files: vec![PathBuf::from("/project/setup-a.ts")],
         fixture_patterns: vec![],
+        scss_include_paths: vec![],
     };
     let result2 = PluginResult {
         entry_patterns: vec![path_rule("b.ts")],
         replace_entry_patterns: false,
         replace_used_export_rules: false,
         used_exports: vec![used_export_rule("b.ts", &["loader"])],
+        used_class_members: vec![],
         referenced_dependencies: vec!["dep-b".to_string()],
         always_used_files: vec!["c.ts".to_string()],
         path_aliases: vec![],
         setup_files: vec![],
         fixture_patterns: vec![],
+        scss_include_paths: vec![],
     };
 
     process_config_result("plugin-a", result1, &mut aggregated);
@@ -1325,6 +1346,7 @@ fn multiple_external_plugins_independently_activated() {
         always_used: vec![],
         tooling_dependencies: vec![],
         used_exports: vec![],
+        used_class_members: vec![],
         entry_point_role: fallow_config::EntryPointRole::Runtime,
     };
     let ext_b = ExternalPluginDef {
@@ -1337,6 +1359,7 @@ fn multiple_external_plugins_independently_activated() {
         always_used: vec![],
         tooling_dependencies: vec![],
         used_exports: vec![],
+        used_class_members: vec![],
         entry_point_role: fallow_config::EntryPointRole::Runtime,
     };
     let registry = PluginRegistry::new(vec![ext_a, ext_b]);
@@ -1372,6 +1395,7 @@ fn external_plugin_multiple_used_exports() {
                 exports: vec!["GET".to_string(), "POST".to_string()],
             },
         ],
+        used_class_members: vec![],
         entry_point_role: fallow_config::EntryPointRole::Runtime,
     };
     let registry = PluginRegistry::new(vec![ext]);
@@ -1499,6 +1523,7 @@ fn process_external_plugins_prefix_enabler_requires_slash() {
         always_used: vec![],
         tooling_dependencies: vec![],
         used_exports: vec![],
+        used_class_members: vec![],
         entry_point_role: fallow_config::EntryPointRole::Runtime,
     };
     let mut result = AggregatedPluginResult::default();
@@ -1522,6 +1547,7 @@ fn process_external_plugins_prefix_enabler_matches_scoped() {
         always_used: vec![],
         tooling_dependencies: vec![],
         used_exports: vec![],
+        used_class_members: vec![],
         entry_point_role: fallow_config::EntryPointRole::Runtime,
     };
     let mut result = AggregatedPluginResult::default();
@@ -1706,6 +1732,7 @@ fn external_plugin_detection_all_with_file_and_dep() {
         always_used: vec![],
         tooling_dependencies: vec![],
         used_exports: vec![],
+        used_class_members: vec![],
         entry_point_role: fallow_config::EntryPointRole::Runtime,
     };
     let registry = PluginRegistry::new(vec![ext]);
@@ -1739,6 +1766,7 @@ fn external_plugin_detection_all_dep_and_file_missing_file() {
         always_used: vec![],
         tooling_dependencies: vec![],
         used_exports: vec![],
+        used_class_members: vec![],
         entry_point_role: fallow_config::EntryPointRole::Runtime,
     };
     let registry = PluginRegistry::new(vec![ext]);
@@ -2048,6 +2076,7 @@ fn process_external_plugins_detection_dependency() {
         always_used: vec![],
         tooling_dependencies: vec![],
         used_exports: vec![],
+        used_class_members: vec![],
         entry_point_role: fallow_config::EntryPointRole::Runtime,
     };
     let mut result = AggregatedPluginResult::default();
@@ -2076,6 +2105,7 @@ fn process_external_plugins_detection_not_matched() {
         always_used: vec![],
         tooling_dependencies: vec![],
         used_exports: vec![],
+        used_class_members: vec![],
         entry_point_role: fallow_config::EntryPointRole::Runtime,
     };
     let mut result = AggregatedPluginResult::default();

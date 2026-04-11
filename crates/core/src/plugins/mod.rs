@@ -84,6 +84,11 @@ pub struct PluginResult {
     pub replace_used_export_rules: bool,
     /// Additional export-usage rules discovered from config.
     pub used_exports: Vec<UsedExportRule>,
+    /// Class member names that should never be flagged as unused. Contributed
+    /// by plugins that know their framework invokes these methods at runtime
+    /// (e.g. ag-Grid's `agInit`, `refresh`). Merged with the built-in Angular/React
+    /// lifecycle allowlist during unused-class-member analysis.
+    pub used_class_members: Vec<String>,
     /// Dependencies referenced in config files (should not be flagged as unused).
     pub referenced_dependencies: Vec<String>,
     /// Additional files that are always considered used.
@@ -94,6 +99,14 @@ pub struct PluginResult {
     pub setup_files: Vec<PathBuf>,
     /// Test fixture glob patterns discovered from config.
     pub fixture_patterns: Vec<String>,
+    /// Absolute directories to include when resolving SCSS/Sass `@import` and
+    /// `@use` specifiers. Contributed by framework plugins that read their
+    /// tool's equivalent of `includePaths` (e.g. Angular's
+    /// `stylePreprocessorOptions.includePaths` from `angular.json` /
+    /// `project.json`). Bare SCSS specifiers that fail to resolve relative to
+    /// the importing file retry against each include path using the SCSS
+    /// partial / directory-index conventions.
+    pub scss_include_paths: Vec<PathBuf>,
 }
 
 impl PluginResult {
@@ -123,11 +136,13 @@ impl PluginResult {
     pub const fn is_empty(&self) -> bool {
         self.entry_patterns.is_empty()
             && self.used_exports.is_empty()
+            && self.used_class_members.is_empty()
             && self.referenced_dependencies.is_empty()
             && self.always_used_files.is_empty()
             && self.path_aliases.is_empty()
             && self.setup_files.is_empty()
             && self.fixture_patterns.is_empty()
+            && self.scss_include_paths.is_empty()
     }
 }
 
@@ -583,6 +598,14 @@ pub trait Plugin: Send + Sync {
             .into_iter()
             .map(|(pattern, exports)| UsedExportRule::from_static(pattern, exports))
             .collect()
+    }
+
+    /// Class member names the framework invokes at runtime. Matching members
+    /// are skipped during `unused-class-members` analysis. Intended for
+    /// interface/contract patterns where the library calls methods on consumer
+    /// classes (e.g. ag-Grid's `agInit`, Web Components' `connectedCallback`).
+    fn used_class_members(&self) -> &'static [&'static str] {
+        &[]
     }
 
     /// Glob patterns for test fixture files consumed by this framework.

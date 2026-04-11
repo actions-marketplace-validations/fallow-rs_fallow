@@ -628,6 +628,7 @@ mod tests {
                 workspaces: None,
                 ignore_dependencies: vec![],
                 ignore_exports: vec![],
+                used_class_members: vec![],
                 duplicates: DuplicatesConfig::default(),
                 health: HealthConfig::default(),
                 rules: RulesConfig::default(),

@@ -13,6 +13,7 @@ fn external_plugin_config(root: &std::path::Path) -> fallow_config::ResolvedConf
         workspaces: None,
         ignore_dependencies: vec![],
         ignore_exports: vec![],
+        used_class_members: vec![],
         duplicates: fallow_config::DuplicatesConfig::default(),
         health: fallow_config::HealthConfig::default(),
         rules: RulesConfig::default(),

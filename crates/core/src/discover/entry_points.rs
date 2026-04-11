@@ -122,6 +122,29 @@ pub fn resolve_entry_path(
         }
     }
 
+    // When the entry lives under an output directory but has no direct src/ mirror
+    // (e.g. `./dist/esm2022/index.js` where `src/esm2022/index.ts` does not exist),
+    // probe the package root for a conventional source index. TypeScript libraries
+    // commonly point `main`/`module`/`exports` at compiled output while keeping the
+    // canonical source entry at `src/index.ts`. Without this fallback, the dist file
+    // becomes the entry point, gets filtered out by the default dist ignore pattern,
+    // and leaves the entire src/ tree unreachable. See issue #102.
+    if is_entry_in_output_dir(entry)
+        && let Some(source_path) = try_source_index_fallback(base)
+        && let Ok(canonical_source) = dunce::canonicalize(&source_path)
+        && canonical_source.starts_with(canonical_root)
+    {
+        tracing::info!(
+            entry = %entry,
+            fallback = %source_path.display(),
+            "package.json entry resolves to an ignored output directory; falling back to source index"
+        );
+        return Some(EntryPoint {
+            path: source_path,
+            source,
+        });
+    }
+
     if resolved.exists() {
         return Some(EntryPoint {
             path: resolved,
@@ -186,6 +209,42 @@ fn try_output_to_source_path(base: &Path, entry: &str) -> Option<PathBuf> {
         }
     }
 
+    None
+}
+
+/// Conventional source index file stems probed when a package.json entry lives
+/// in an ignored output directory. Ordered by preference.
+const SOURCE_INDEX_FALLBACK_STEMS: &[&str] = &["src/index", "src/main", "index", "main"];
+
+/// Return `true` when `entry` contains a known output directory component.
+///
+/// Matches any segment in `OUTPUT_DIRS`, e.g. `./dist/esm2022/index.js` →
+/// `true`, `src/main.ts` → `false`.
+fn is_entry_in_output_dir(entry: &str) -> bool {
+    Path::new(entry).components().any(|c| {
+        matches!(
+            c,
+            std::path::Component::Normal(s)
+                if s.to_str().is_some_and(|name| OUTPUT_DIRS.contains(&name))
+        )
+    })
+}
+
+/// Probe a package root for a conventional source index file.
+///
+/// Used when `package.json` points at compiled output but the canonical source
+/// entry is a standard TypeScript/JavaScript index file. Tries `src/index`,
+/// `src/main`, `index`, and `main` with each supported source extension, in
+/// that order.
+fn try_source_index_fallback(base: &Path) -> Option<PathBuf> {
+    for stem in SOURCE_INDEX_FALLBACK_STEMS {
+        for ext in SOURCE_EXTENSIONS {
+            let candidate = base.join(format!("{stem}.{ext}"));
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
     None
 }
 
@@ -844,6 +903,7 @@ mod tests {
             workspaces: None,
             ignore_dependencies: vec![],
             ignore_exports: vec![],
+            used_class_members: vec![],
             duplicates: fallow_config::DuplicatesConfig::default(),
             health: fallow_config::HealthConfig::default(),
             rules: RulesConfig::default(),
@@ -964,6 +1024,7 @@ mod tests {
             workspaces: None,
             ignore_dependencies: vec![],
             ignore_exports: vec![],
+            used_class_members: vec![],
             duplicates: fallow_config::DuplicatesConfig::default(),
             health: fallow_config::HealthConfig::default(),
             rules: RulesConfig::default(),
@@ -1216,6 +1277,159 @@ mod tests {
                     .replace('\\', "/")
                     .contains("modules/src/helper.ts")
             );
+        }
+    }
+
+    // Source index fallback unit tests (issue #102)
+    mod source_index_fallback_tests {
+        use super::*;
+
+        #[test]
+        fn detects_dist_entry_in_output_dir() {
+            assert!(is_entry_in_output_dir("./dist/esm2022/index.js"));
+            assert!(is_entry_in_output_dir("dist/index.js"));
+            assert!(is_entry_in_output_dir("./build/index.js"));
+            assert!(is_entry_in_output_dir("./out/main.js"));
+            assert!(is_entry_in_output_dir("./esm/index.js"));
+            assert!(is_entry_in_output_dir("./cjs/index.js"));
+        }
+
+        #[test]
+        fn rejects_non_output_entry_paths() {
+            assert!(!is_entry_in_output_dir("./src/index.ts"));
+            assert!(!is_entry_in_output_dir("src/main.ts"));
+            assert!(!is_entry_in_output_dir("./index.js"));
+            assert!(!is_entry_in_output_dir(""));
+        }
+
+        #[test]
+        fn rejects_substring_match_for_output_dir() {
+            // "distro" contains "dist" as a substring but is not an output dir
+            assert!(!is_entry_in_output_dir("./distro/index.js"));
+            assert!(!is_entry_in_output_dir("./build-scripts/run.js"));
+        }
+
+        #[test]
+        fn finds_src_index_ts() {
+            let dir = tempfile::tempdir().expect("create temp dir");
+            let src = dir.path().join("src");
+            std::fs::create_dir_all(&src).unwrap();
+            let index_path = src.join("index.ts");
+            std::fs::write(&index_path, "export const a = 1;").unwrap();
+
+            let result = try_source_index_fallback(dir.path());
+            assert_eq!(result.as_deref(), Some(index_path.as_path()));
+        }
+
+        #[test]
+        fn finds_src_index_tsx_when_ts_missing() {
+            let dir = tempfile::tempdir().expect("create temp dir");
+            let src = dir.path().join("src");
+            std::fs::create_dir_all(&src).unwrap();
+            let index_path = src.join("index.tsx");
+            std::fs::write(&index_path, "export default 1;").unwrap();
+
+            let result = try_source_index_fallback(dir.path());
+            assert_eq!(result.as_deref(), Some(index_path.as_path()));
+        }
+
+        #[test]
+        fn prefers_src_index_over_root_index() {
+            // Source index fallback must prefer `src/index.*` over root-level `index.*`
+            // because library conventions keep source under `src/`.
+            let dir = tempfile::tempdir().expect("create temp dir");
+            let src = dir.path().join("src");
+            std::fs::create_dir_all(&src).unwrap();
+            let src_index = src.join("index.ts");
+            std::fs::write(&src_index, "export const a = 1;").unwrap();
+            let root_index = dir.path().join("index.ts");
+            std::fs::write(&root_index, "export const b = 2;").unwrap();
+
+            let result = try_source_index_fallback(dir.path());
+            assert_eq!(result.as_deref(), Some(src_index.as_path()));
+        }
+
+        #[test]
+        fn falls_back_to_src_main() {
+            let dir = tempfile::tempdir().expect("create temp dir");
+            let src = dir.path().join("src");
+            std::fs::create_dir_all(&src).unwrap();
+            let main_path = src.join("main.ts");
+            std::fs::write(&main_path, "export const a = 1;").unwrap();
+
+            let result = try_source_index_fallback(dir.path());
+            assert_eq!(result.as_deref(), Some(main_path.as_path()));
+        }
+
+        #[test]
+        fn falls_back_to_root_index_when_no_src() {
+            let dir = tempfile::tempdir().expect("create temp dir");
+            let index_path = dir.path().join("index.js");
+            std::fs::write(&index_path, "module.exports = {};").unwrap();
+
+            let result = try_source_index_fallback(dir.path());
+            assert_eq!(result.as_deref(), Some(index_path.as_path()));
+        }
+
+        #[test]
+        fn returns_none_when_nothing_matches() {
+            let dir = tempfile::tempdir().expect("create temp dir");
+            let result = try_source_index_fallback(dir.path());
+            assert!(result.is_none());
+        }
+
+        #[test]
+        fn resolve_entry_path_falls_back_to_src_index_for_dist_entry() {
+            let dir = tempfile::tempdir().expect("create temp dir");
+            let canonical = dunce::canonicalize(dir.path()).unwrap();
+
+            // dist/esm2022/index.js exists but there's no src/esm2022/ mirror —
+            // only src/index.ts. Without the fallback, resolve_entry_path would
+            // return the dist file, which then gets filtered out by the ignore
+            // pattern.
+            let dist_dir = canonical.join("dist").join("esm2022");
+            std::fs::create_dir_all(&dist_dir).unwrap();
+            std::fs::write(dist_dir.join("index.js"), "export const x = 1;").unwrap();
+
+            let src = canonical.join("src");
+            std::fs::create_dir_all(&src).unwrap();
+            let src_index = src.join("index.ts");
+            std::fs::write(&src_index, "export const x = 1;").unwrap();
+
+            let result = resolve_entry_path(
+                &canonical,
+                "./dist/esm2022/index.js",
+                &canonical,
+                EntryPointSource::PackageJsonMain,
+            );
+            assert!(result.is_some());
+            let entry = result.unwrap();
+            assert_eq!(entry.path, src_index);
+        }
+
+        #[test]
+        fn resolve_entry_path_uses_direct_src_mirror_when_available() {
+            // When `src/esm2022/index.ts` exists, the existing mirror logic wins
+            // and the fallback should not fire.
+            let dir = tempfile::tempdir().expect("create temp dir");
+            let canonical = dunce::canonicalize(dir.path()).unwrap();
+
+            let src_mirror = canonical.join("src").join("esm2022");
+            std::fs::create_dir_all(&src_mirror).unwrap();
+            let mirror_index = src_mirror.join("index.ts");
+            std::fs::write(&mirror_index, "export const x = 1;").unwrap();
+
+            // Also create src/index.ts to confirm the mirror wins over the fallback.
+            let src_index = canonical.join("src").join("index.ts");
+            std::fs::write(&src_index, "export const y = 2;").unwrap();
+
+            let result = resolve_entry_path(
+                &canonical,
+                "./dist/esm2022/index.js",
+                &canonical,
+                EntryPointSource::PackageJsonMain,
+            );
+            assert_eq!(result.map(|e| e.path), Some(mirror_index));
         }
     }
 

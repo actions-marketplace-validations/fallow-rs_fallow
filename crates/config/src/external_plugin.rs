@@ -112,6 +112,15 @@ pub struct ExternalPluginDef {
     /// Exports that are always considered used for matching file patterns.
     #[serde(default)]
     pub used_exports: Vec<ExternalUsedExport>,
+
+    /// Class member method/property names the framework invokes at runtime.
+    /// Listed names extend the built-in lifecycle allowlist, so members with
+    /// these names are never flagged as unused-class-members. Use for libraries
+    /// that call interface methods reflectively (e.g. ag-Grid's `agInit`,
+    /// `refresh`; TypeORM's `MigrationInterface.up`/`down`; Web Components'
+    /// `connectedCallback`).
+    #[serde(default)]
+    pub used_class_members: Vec<String>,
 }
 
 /// Exports considered used for files matching a pattern.
@@ -351,6 +360,36 @@ enablers = ["my-pkg"]
         assert!(plugin.config_patterns.is_empty());
         assert!(plugin.tooling_dependencies.is_empty());
         assert!(plugin.used_exports.is_empty());
+        assert!(plugin.used_class_members.is_empty());
+    }
+
+    #[test]
+    fn deserialize_plugin_with_used_class_members_json() {
+        let json_str = r#"{
+            "name": "ag-grid",
+            "enablers": ["ag-grid-angular"],
+            "usedClassMembers": ["agInit", "refresh"]
+        }"#;
+        let plugin: ExternalPluginDef = serde_json::from_str(json_str).unwrap();
+        assert_eq!(plugin.name, "ag-grid");
+        assert_eq!(
+            plugin.used_class_members,
+            vec!["agInit".to_string(), "refresh".to_string()]
+        );
+    }
+
+    #[test]
+    fn deserialize_plugin_with_used_class_members_toml() {
+        let toml_str = r#"
+name = "ag-grid"
+enablers = ["ag-grid-angular"]
+usedClassMembers = ["agInit", "refresh"]
+"#;
+        let plugin: ExternalPluginDef = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            plugin.used_class_members,
+            vec!["agInit".to_string(), "refresh".to_string()]
+        );
     }
 
     #[test]

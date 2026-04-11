@@ -81,6 +81,24 @@ define_plugin!(
             result.always_used_files.push(path.to_string());
         }
 
+        // project.json: targets.*.options.stylePreprocessorOptions.includePaths
+        // Angular executors invoked through Nx consume the same
+        // stylePreprocessorOptions as the Angular CLI. Resolve paths relative
+        // to the workspace root so bare SCSS `@import '...'` specifiers can
+        // find shared partials. See issue #103.
+        let include_paths = config_parser::extract_config_object_nested_string_or_array(
+            source,
+            config_path,
+            &["targets"],
+            &["options", "stylePreprocessorOptions", "includePaths"],
+        );
+        for entry in &include_paths {
+            let absolute = _root.join(entry.trim_start_matches("./"));
+            if absolute.is_dir() {
+                result.scss_include_paths.push(absolute);
+            }
+        }
+
         result
     },
 );
@@ -161,6 +179,32 @@ mod tests {
                 .always_used_files
                 .contains(&"apps/client/tsconfig.app.json".to_string())
         );
+    }
+
+    #[test]
+    fn resolve_config_extracts_scss_include_paths() {
+        // Issue #103: Nx's project.json mirrors Angular's
+        // stylePreprocessorOptions.includePaths when an Angular executor is used.
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("libs/shared/scss")).unwrap();
+
+        let source = r#"{
+            "targets": {
+                "build": {
+                    "executor": "@angular/build:application",
+                    "options": {
+                        "stylePreprocessorOptions": {
+                            "includePaths": ["libs/shared/scss", "missing/dir"]
+                        }
+                    }
+                }
+            }
+        }"#;
+        let plugin = NxPlugin;
+        let result = plugin.resolve_config(Path::new("project.json"), source, root);
+        assert_eq!(result.scss_include_paths.len(), 1);
+        assert_eq!(result.scss_include_paths[0], root.join("libs/shared/scss"));
     }
 
     #[test]

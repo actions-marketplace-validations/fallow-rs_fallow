@@ -194,6 +194,7 @@ pub fn analyze_with_parse_result(
         workspaces,
         &plugin_result.active_plugins,
         &plugin_result.path_aliases,
+        &plugin_result.scss_include_paths,
         &config.root,
     );
     let resolve_ms = t.elapsed().as_secs_f64() * 1000.0;
@@ -405,6 +406,7 @@ fn analyze_full(
         workspaces,
         &plugin_result.active_plugins,
         &plugin_result.path_aliases,
+        &plugin_result.scss_include_paths,
         &config.root,
     );
     let resolve_ms = t.elapsed().as_secs_f64() * 1000.0;

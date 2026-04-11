@@ -38,6 +38,9 @@ pub fn process_static_patterns(
             .used_exports
             .push(PluginUsedExportRule::new(pname.clone(), rule));
     }
+    for member in plugin.used_class_members() {
+        result.used_class_members.push((*member).to_string());
+    }
     for dep in plugin.tooling_dependencies() {
         result.tooling_dependencies.push((*dep).to_string());
     }
@@ -110,6 +113,9 @@ pub fn process_external_plugins(
                     UsedExportRule::new(ue.pattern.clone(), ue.exports.clone()),
                 ));
             }
+            result
+                .used_class_members
+                .extend(ext.used_class_members.iter().cloned());
         }
     }
 }
@@ -199,6 +205,9 @@ pub fn process_config_result(
             .map(|rule| PluginUsedExportRule::new(pname.clone(), rule)),
     );
     result
+        .used_class_members
+        .extend(plugin_result.used_class_members);
+    result
         .referenced_dependencies
         .extend(plugin_result.referenced_dependencies);
     result.discovered_always_used.extend(
@@ -225,6 +234,9 @@ pub fn process_config_result(
             .into_iter()
             .map(|p| (p, pname.clone())),
     );
+    result
+        .scss_include_paths
+        .extend(plugin_result.scss_include_paths);
 }
 
 /// Check if a plugin already has a config file matched against discovered files.

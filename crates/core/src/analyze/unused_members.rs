@@ -14,6 +14,14 @@ use super::{LineOffsetsMap, byte_offset_to_line_col};
 ///
 /// Collects all `Identifier.member` static member accesses from all modules,
 /// maps them to their imported names, and filters out members that are accessed.
+///
+/// `user_class_member_allowlist` extends the built-in Angular/React lifecycle
+/// allowlist with framework-invoked method names contributed by plugins and
+/// top-level config (see `FallowConfig::used_class_members` and
+/// `Plugin::used_class_members`). Members whose name is in this set are never
+/// flagged as unused-class-members — used for third-party interface patterns
+/// where a library calls consumer methods reflectively (ag-Grid's `agInit`,
+/// Web Components' `connectedCallback`, etc.).
 #[expect(
     clippy::too_many_lines,
     reason = "member tracking requires many graph traversal steps; split candidate for sig-audit-loop"
@@ -23,6 +31,7 @@ pub fn find_unused_members(
     resolved_modules: &[ResolvedModule],
     suppressions_by_file: &FxHashMap<FileId, &[Suppression]>,
     line_offsets_by_file: &LineOffsetsMap<'_>,
+    user_class_member_allowlist: &FxHashSet<&str>,
 ) -> (Vec<UnusedMember>, Vec<UnusedMember>) {
     let mut unused_enum_members = Vec::new();
     let mut unused_class_members = Vec::new();
@@ -321,11 +330,14 @@ pub fn find_unused_members(
                 // Skip React class component lifecycle methods — they are called by the
                 // React runtime, not user code, so they should never be flagged as unused.
                 // Also skip Angular lifecycle hooks (OnInit, OnDestroy, etc.).
+                // The user allowlist extends these built-ins with framework-invoked names
+                // contributed by plugins and top-level config (ag-Grid's `agInit`, etc.).
                 if matches!(
                     member.kind,
                     MemberKind::ClassMethod | MemberKind::ClassProperty
                 ) && (is_react_lifecycle_method(&member.name)
-                    || is_angular_lifecycle_method(&member.name))
+                    || is_angular_lifecycle_method(&member.name)
+                    || user_class_member_allowlist.contains(member.name.as_str()))
                 {
                     continue;
                 }
@@ -458,8 +470,13 @@ mod tests {
     fn unused_members_empty_graph() {
         let graph = build_graph(&[]);
 
-        let (enum_members, class_members) =
-            find_unused_members(&graph, &[], &FxHashMap::default(), &FxHashMap::default());
+        let (enum_members, class_members) = find_unused_members(
+            &graph,
+            &[],
+            &FxHashMap::default(),
+            &FxHashMap::default(),
+            &FxHashSet::default(),
+        );
         assert!(enum_members.is_empty());
         assert!(class_members.is_empty());
     }
@@ -478,8 +495,13 @@ mod tests {
         )];
 
         // No member accesses at all — both should be unused
-        let (enum_members, class_members) =
-            find_unused_members(&graph, &[], &FxHashMap::default(), &FxHashMap::default());
+        let (enum_members, class_members) = find_unused_members(
+            &graph,
+            &[],
+            &FxHashMap::default(),
+            &FxHashMap::default(),
+            &FxHashSet::default(),
+        );
         assert_eq!(enum_members.len(), 2);
         assert!(class_members.is_empty());
         let names: FxHashSet<&str> = enum_members
@@ -530,6 +552,7 @@ mod tests {
             &resolved_modules,
             &FxHashMap::default(),
             &FxHashMap::default(),
+            &FxHashSet::default(),
         );
         // Only Inactive should be unused
         assert_eq!(enum_members.len(), 1);
@@ -573,6 +596,7 @@ mod tests {
             &resolved_modules,
             &FxHashMap::default(),
             &FxHashMap::default(),
+            &FxHashSet::default(),
         );
         assert!(enum_members.is_empty());
         assert!(class_members.is_empty());
@@ -593,8 +617,13 @@ mod tests {
             Some(0),
         )];
 
-        let (_, class_members) =
-            find_unused_members(&graph, &[], &FxHashMap::default(), &FxHashMap::default());
+        let (_, class_members) = find_unused_members(
+            &graph,
+            &[],
+            &FxHashMap::default(),
+            &FxHashMap::default(),
+            &FxHashSet::default(),
+        );
         assert!(class_members.is_empty());
     }
 
@@ -612,8 +641,13 @@ mod tests {
             Some(0),
         )];
 
-        let (_, class_members) =
-            find_unused_members(&graph, &[], &FxHashMap::default(), &FxHashMap::default());
+        let (_, class_members) = find_unused_members(
+            &graph,
+            &[],
+            &FxHashMap::default(),
+            &FxHashMap::default(),
+            &FxHashSet::default(),
+        );
         // Only customMethod should be flagged
         assert_eq!(class_members.len(), 1);
         assert_eq!(class_members[0].member_name, "customMethod");
@@ -633,10 +667,78 @@ mod tests {
             Some(0),
         )];
 
-        let (_, class_members) =
-            find_unused_members(&graph, &[], &FxHashMap::default(), &FxHashMap::default());
+        let (_, class_members) = find_unused_members(
+            &graph,
+            &[],
+            &FxHashMap::default(),
+            &FxHashMap::default(),
+            &FxHashSet::default(),
+        );
         assert_eq!(class_members.len(), 1);
         assert_eq!(class_members[0].member_name, "myHelper");
+    }
+
+    #[test]
+    fn user_class_member_allowlist_not_flagged() {
+        // Third-party framework contract: library calls `agInit` and `refresh`
+        // on the consumer class. The user allowlist (from config or a plugin)
+        // extends the built-in Angular/React lifecycle check so these names are
+        // treated as always-used. See issue #98 (ag-Grid `AgFrameworkComponent`).
+        let mut graph = build_graph(&[("/src/entry.ts", true), ("/src/renderer.ts", false)]);
+        graph.modules[1].set_reachable(true);
+        graph.modules[1].exports = vec![make_export_with_members(
+            "MyRendererComponent",
+            vec![
+                make_member("agInit", MemberKind::ClassMethod),
+                make_member("refresh", MemberKind::ClassMethod),
+                make_member("customHelper", MemberKind::ClassMethod),
+            ],
+            Some(0),
+        )];
+
+        let mut allowlist: FxHashSet<&str> = FxHashSet::default();
+        allowlist.insert("agInit");
+        allowlist.insert("refresh");
+
+        let (_, class_members) = find_unused_members(
+            &graph,
+            &[],
+            &FxHashMap::default(),
+            &FxHashMap::default(),
+            &allowlist,
+        );
+        assert_eq!(
+            class_members.len(),
+            1,
+            "only customHelper should remain unused"
+        );
+        assert_eq!(class_members[0].member_name, "customHelper");
+    }
+
+    #[test]
+    fn user_class_member_allowlist_does_not_affect_enums() {
+        // The allowlist is scoped to class members; matching enum member names
+        // must still be flagged as unused.
+        let mut graph = build_graph(&[("/src/entry.ts", true), ("/src/status.ts", false)]);
+        graph.modules[1].set_reachable(true);
+        graph.modules[1].exports = vec![make_export_with_members(
+            "Status",
+            vec![make_member("refresh", MemberKind::EnumMember)],
+            Some(0),
+        )];
+
+        let mut allowlist: FxHashSet<&str> = FxHashSet::default();
+        allowlist.insert("refresh");
+
+        let (enum_members, _) = find_unused_members(
+            &graph,
+            &[],
+            &FxHashMap::default(),
+            &FxHashMap::default(),
+            &allowlist,
+        );
+        assert_eq!(enum_members.len(), 1);
+        assert_eq!(enum_members[0].member_name, "refresh");
     }
 
     #[test]
@@ -668,6 +770,7 @@ mod tests {
             &resolved_modules,
             &FxHashMap::default(),
             &FxHashMap::default(),
+            &FxHashSet::default(),
         );
         // Only unused_prop should be flagged (label is accessed via this)
         assert_eq!(class_members.len(), 1);
@@ -685,8 +788,13 @@ mod tests {
             None, // no references
         )];
 
-        let (enum_members, _) =
-            find_unused_members(&graph, &[], &FxHashMap::default(), &FxHashMap::default());
+        let (enum_members, _) = find_unused_members(
+            &graph,
+            &[],
+            &FxHashMap::default(),
+            &FxHashMap::default(),
+            &FxHashSet::default(),
+        );
         // Member analysis skipped because export itself is unreferenced
         assert!(enum_members.is_empty());
     }
@@ -701,8 +809,13 @@ mod tests {
             Some(0),
         )];
 
-        let (enum_members, class_members) =
-            find_unused_members(&graph, &[], &FxHashMap::default(), &FxHashMap::default());
+        let (enum_members, class_members) = find_unused_members(
+            &graph,
+            &[],
+            &FxHashMap::default(),
+            &FxHashMap::default(),
+            &FxHashSet::default(),
+        );
         assert!(enum_members.is_empty());
         assert!(class_members.is_empty());
     }
@@ -716,8 +829,13 @@ mod tests {
             None,
         )];
 
-        let (enum_members, class_members) =
-            find_unused_members(&graph, &[], &FxHashMap::default(), &FxHashMap::default());
+        let (enum_members, class_members) = find_unused_members(
+            &graph,
+            &[],
+            &FxHashMap::default(),
+            &FxHashMap::default(),
+            &FxHashSet::default(),
+        );
         assert!(enum_members.is_empty());
         assert!(class_members.is_empty());
     }
@@ -732,8 +850,13 @@ mod tests {
             Some(0),
         )];
 
-        let (enum_members, class_members) =
-            find_unused_members(&graph, &[], &FxHashMap::default(), &FxHashMap::default());
+        let (enum_members, class_members) = find_unused_members(
+            &graph,
+            &[],
+            &FxHashMap::default(),
+            &FxHashMap::default(),
+            &FxHashSet::default(),
+        );
         assert_eq!(enum_members.len(), 1);
         assert_eq!(enum_members[0].kind, MemberKind::EnumMember);
         assert!(class_members.is_empty());
@@ -752,8 +875,13 @@ mod tests {
             Some(0),
         )];
 
-        let (enum_members, class_members) =
-            find_unused_members(&graph, &[], &FxHashMap::default(), &FxHashMap::default());
+        let (enum_members, class_members) = find_unused_members(
+            &graph,
+            &[],
+            &FxHashMap::default(),
+            &FxHashMap::default(),
+            &FxHashSet::default(),
+        );
         assert!(enum_members.is_empty());
         assert_eq!(class_members.len(), 2);
         assert!(
@@ -811,6 +939,7 @@ mod tests {
             &resolved_modules,
             &FxHashMap::default(),
             &FxHashMap::default(),
+            &FxHashSet::default(),
         );
         // Only unusedMethod should be flagged; greet is used via instance access
         assert_eq!(class_members.len(), 1);
@@ -848,6 +977,7 @@ mod tests {
             &resolved_modules,
             &FxHashMap::default(),
             &FxHashMap::default(),
+            &FxHashSet::default(),
         );
         // Both enum members should be flagged — `this` access doesn't apply to enums
         assert_eq!(enum_members.len(), 2);
@@ -870,8 +1000,13 @@ mod tests {
             ),
         ];
 
-        let (enum_members, class_members) =
-            find_unused_members(&graph, &[], &FxHashMap::default(), &FxHashMap::default());
+        let (enum_members, class_members) = find_unused_members(
+            &graph,
+            &[],
+            &FxHashMap::default(),
+            &FxHashMap::default(),
+            &FxHashSet::default(),
+        );
         assert_eq!(enum_members.len(), 1);
         assert_eq!(enum_members[0].parent_name, "Status");
         assert_eq!(class_members.len(), 1);
@@ -919,6 +1054,7 @@ mod tests {
             &resolved_modules,
             &FxHashMap::default(),
             &FxHashMap::default(),
+            &FxHashSet::default(),
         );
         // S.Active maps back to Status.Active, so only Inactive is unused
         assert_eq!(enum_members.len(), 1);
@@ -965,6 +1101,7 @@ mod tests {
             &resolved_modules,
             &FxHashMap::default(),
             &FxHashMap::default(),
+            &FxHashSet::default(),
         );
         // MyEnum.X maps to default.X, so only Y is unused
         assert_eq!(enum_members.len(), 1);
@@ -991,8 +1128,13 @@ mod tests {
         let mut suppressions: FxHashMap<FileId, &[Suppression]> = FxHashMap::default();
         suppressions.insert(FileId(1), &supps);
 
-        let (enum_members, _) =
-            find_unused_members(&graph, &[], &suppressions, &FxHashMap::default());
+        let (enum_members, _) = find_unused_members(
+            &graph,
+            &[],
+            &suppressions,
+            &FxHashMap::default(),
+            &FxHashSet::default(),
+        );
         assert!(
             enum_members.is_empty(),
             "suppressed enum member should not be flagged"
@@ -1018,8 +1160,13 @@ mod tests {
         let mut suppressions: FxHashMap<FileId, &[Suppression]> = FxHashMap::default();
         suppressions.insert(FileId(1), &supps);
 
-        let (_, class_members) =
-            find_unused_members(&graph, &[], &suppressions, &FxHashMap::default());
+        let (_, class_members) = find_unused_members(
+            &graph,
+            &[],
+            &suppressions,
+            &FxHashMap::default(),
+            &FxHashSet::default(),
+        );
         assert!(
             class_members.is_empty(),
             "suppressed class member should not be flagged"
@@ -1064,6 +1211,7 @@ mod tests {
             &resolved_modules,
             &FxHashMap::default(),
             &FxHashMap::default(),
+            &FxHashSet::default(),
         );
         // Object.values(S) maps S→Status, so all members of Status should be considered used
         assert!(
@@ -1118,6 +1266,7 @@ mod tests {
             &resolved_modules,
             &FxHashMap::default(),
             &FxHashMap::default(),
+            &FxHashSet::default(),
         );
         // Only unusedMethod should be flagged; doWork is used via this.service.doWork()
         assert_eq!(class_members.len(), 1);
@@ -1134,8 +1283,13 @@ mod tests {
             Some(0),
         )];
 
-        let (enum_members, class_members) =
-            find_unused_members(&graph, &[], &FxHashMap::default(), &FxHashMap::default());
+        let (enum_members, class_members) = find_unused_members(
+            &graph,
+            &[],
+            &FxHashMap::default(),
+            &FxHashMap::default(),
+            &FxHashSet::default(),
+        );
         assert!(enum_members.is_empty());
         assert!(class_members.is_empty());
     }

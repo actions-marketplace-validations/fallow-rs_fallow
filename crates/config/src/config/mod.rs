@@ -104,6 +104,15 @@ pub struct FallowConfig {
     #[serde(default)]
     pub ignore_exports: Vec<IgnoreExportRule>,
 
+    /// Class member method/property names that should never be flagged as
+    /// unused. Extends the built-in lifecycle allowlist (Angular/React) with
+    /// framework-invoked names from libraries that call interface methods at
+    /// runtime (e.g. ag-Grid's `agInit`, `refresh`). Use this at the top level
+    /// for project-wide additions; use a plugin file's `usedClassMembers` when
+    /// the names should only apply when a specific package is installed.
+    #[serde(default)]
+    pub used_class_members: Vec<String>,
+
     /// Duplication detection settings.
     #[serde(default)]
     pub duplicates: DuplicatesConfig,
@@ -237,6 +246,7 @@ mod tests {
         assert!(config.workspaces.is_none());
         assert!(config.ignore_dependencies.is_empty());
         assert!(config.ignore_exports.is_empty());
+        assert!(config.used_class_members.is_empty());
         assert!(config.plugins.is_empty());
         assert!(config.dynamically_loaded.is_empty());
         assert!(config.overrides.is_empty());

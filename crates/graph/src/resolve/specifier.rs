@@ -6,7 +6,8 @@ use oxc_resolver::{Resolution, ResolveError, ResolveOptions, Resolver};
 
 use super::fallbacks::{
     extract_package_name_from_node_modules_path, try_path_alias_fallback,
-    try_pnpm_workspace_fallback, try_scss_partial_fallback, try_source_fallback,
+    try_pnpm_workspace_fallback, try_scss_include_path_fallback, try_scss_partial_fallback,
+    try_source_fallback,
 };
 use super::path_info::{
     extract_package_name, is_bare_specifier, is_path_alias, is_valid_package_name,
@@ -272,9 +273,16 @@ pub(super) fn resolve_specifier(
             if from_file
                 .extension()
                 .is_some_and(|e| e == "scss" || e == "sass")
-                && let Some(result) = try_scss_partial_fallback(ctx, from_file, specifier)
             {
-                return result;
+                if let Some(result) = try_scss_partial_fallback(ctx, from_file, specifier) {
+                    return result;
+                }
+                // Framework-supplied SCSS include paths (Angular's
+                // stylePreprocessorOptions.includePaths, etc.): retry the bare
+                // specifier against each additional search directory. See #103.
+                if let Some(result) = try_scss_include_path_fallback(ctx, from_file, specifier) {
+                    return result;
+                }
             }
 
             if is_alias || matches_plugin_alias {
