@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.28.2] - 2026-04-11
+
+### Fixed
+
+- **`` html`...` `` tagged template literal asset references** -- `<script src="...">` and `<link rel="stylesheet|modulepreload" href="...">` inside the `html` tagged template literal (used by [Hono](https://hono.dev) via `hono/html`, [lit-html](https://lit.dev), and [htm](https://github.com/developit/htm)) now emit `SideEffect` imports via a new `visit_tagged_template_expression` override, mirroring the JSX `<script src>` / `<link href>` fix shipped in 2.28.1. The bare identifier tag `html` is matched only — `css`, `sql`, `gql`, `styled.div`, and member or call expressions are deliberately ignored so unrelated tagged templates in the same file are never misread as HTML. Each template quasi is scanned independently with the same regex pipeline used by the HTML file parser (extracted into a shared `collect_asset_refs` helper), so an asset reference split across an interpolation boundary (`` html`<script src="${base}/app.js">` ``) is skipped rather than producing a garbled, unresolvable specifier. Addresses till's follow-up comment on [#105](https://github.com/fallow-rs/fallow/issues/105) where `.ts` Hono layouts using the `html` tagged template (rather than JSX) still flagged sibling `static/*.js` files as unused.
+
 ## [2.28.1] - 2026-04-11
 
 ### Fixed
@@ -1277,7 +1283,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `--changed-since` and `--fail-on-issues` for CI
 - Cross-workspace resolution for npm/yarn/pnpm workspaces
 
-[Unreleased]: https://github.com/fallow-rs/fallow/compare/v2.28.1...HEAD
+[Unreleased]: https://github.com/fallow-rs/fallow/compare/v2.28.2...HEAD
+[2.28.2]: https://github.com/fallow-rs/fallow/compare/v2.28.1...v2.28.2
 [2.28.1]: https://github.com/fallow-rs/fallow/compare/v2.28.0...v2.28.1
 [2.28.0]: https://github.com/fallow-rs/fallow/compare/v2.27.6...v2.28.0
 [2.27.6]: https://github.com/fallow-rs/fallow/compare/v2.27.5...v2.27.6
