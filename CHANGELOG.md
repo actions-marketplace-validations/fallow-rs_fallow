@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.28.1] - 2026-04-11
+
+### Fixed
+
+- **JSDoc `import()` type references now tracked as type-only imports** -- types referenced only from JSDoc type annotations (e.g., `@param foo {import('./types.js').Foo}`, `@returns`, `@type`, `@typedef`, `@callback`) are no longer flagged as unused exports. A new comment scanner runs alongside the existing `@public` tag extractor in `parse_source_to_module`, pushing synthesized `ImportInfo` entries with `is_type_only: true` and empty `local_name` so the module graph treats the referenced exports as used and the referenced files as reachable. Covers all JSDoc tag contexts, union annotations (`{import('./a').A | import('./b').B}`), nested member access, bare specifiers, parent-relative paths, and side-effect-only `import('./types')` without a `.Member`. Only `/** */` JSDoc blocks are scanned; single-star `/* */` comments are ignored. Addresses the first gap raised by till on [#105](https://github.com/fallow-rs/fallow/issues/105).
+- **JSX `<script src>` / `<link href>` asset references inside JSX/TSX files** -- lowercase intrinsic `<script src="...">` and `<link rel="stylesheet|modulepreload" href="...">` inside JSX/TSX now emit `SideEffect` imports via a new `visit_jsx_opening_element` override, mirroring the HTML parser at the JSX level. Needed for SSR frameworks like [Hono](https://hono.dev) where layout components emit HTML via JSX and assets are referenced as plain string literals. Only `StringLiteral` attribute values are captured; `{expr}` containers and capitalized React-style components (`<Script>`, `<Link>`) are intentionally skipped. The web-root-relative resolver branch is also broadened from HTML-only to cover `jsx|tsx|js|ts|mjs|cjs|mts|cts` sources so `<link href="/static/style.css" />` resolves against the source file's parent directory first and the project root second. Addresses the second gap raised by till on [#105](https://github.com/fallow-rs/fallow/issues/105).
+
 ## [2.28.0] - 2026-04-11
 
 ### Added
@@ -1270,7 +1277,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `--changed-since` and `--fail-on-issues` for CI
 - Cross-workspace resolution for npm/yarn/pnpm workspaces
 
-[Unreleased]: https://github.com/fallow-rs/fallow/compare/v2.28.0...HEAD
+[Unreleased]: https://github.com/fallow-rs/fallow/compare/v2.28.1...HEAD
+[2.28.1]: https://github.com/fallow-rs/fallow/compare/v2.28.0...v2.28.1
 [2.28.0]: https://github.com/fallow-rs/fallow/compare/v2.27.6...v2.28.0
 [2.27.6]: https://github.com/fallow-rs/fallow/compare/v2.27.5...v2.27.6
 [2.27.5]: https://github.com/fallow-rs/fallow/compare/v2.27.4...v2.27.5
