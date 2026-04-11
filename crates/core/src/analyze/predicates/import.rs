@@ -18,6 +18,12 @@ pub fn is_builtin_module(name: &str) -> bool {
     if name.starts_with("cloudflare:") {
         return true;
     }
+    // Sass/SCSS built-in modules (e.g., `sass:math`, `sass:string`, `sass:color`).
+    // Imported via `@use 'sass:string'` and provided by the Sass compiler itself,
+    // never installed via npm. See issue #104.
+    if name.starts_with("sass:") {
+        return true;
+    }
     // Deno standard library — imported as bare `std` or subpaths like `std/path`
     // (Deno also uses `jsr:@std/` but that would be extracted differently)
     if name == "std" || name.starts_with("std/") {
@@ -561,6 +567,29 @@ mod tests {
         assert!(is_builtin_module("std"));
         assert!(is_builtin_module("std/path"));
         assert!(is_builtin_module("std/fs"));
+    }
+
+    /// Sass/SCSS built-in modules. Imported via `@use 'sass:math'` etc. and
+    /// provided by the Sass compiler. Never installed via npm. See issue #104.
+    #[test]
+    fn builtin_module_sass() {
+        assert!(is_builtin_module("sass:math"));
+        assert!(is_builtin_module("sass:string"));
+        assert!(is_builtin_module("sass:color"));
+        assert!(is_builtin_module("sass:list"));
+        assert!(is_builtin_module("sass:map"));
+        assert!(is_builtin_module("sass:meta"));
+        assert!(is_builtin_module("sass:selector"));
+    }
+
+    /// npm packages that merely start with `sass` (not the built-in prefix) must
+    /// still be treated as npm dependencies. The guard is the `sass:` prefix, not
+    /// the substring `sass`.
+    #[test]
+    fn not_builtin_module_sass_like_packages() {
+        assert!(!is_builtin_module("sass"));
+        assert!(!is_builtin_module("sass-loader"));
+        assert!(!is_builtin_module("@types/sass"));
     }
 
     /// Non-existent subpath builtins should not match.

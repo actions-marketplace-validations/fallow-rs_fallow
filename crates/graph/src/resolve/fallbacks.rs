@@ -435,6 +435,78 @@ pub(super) fn try_pnpm_workspace_fallback(
     try_source_fallback(&direct, path_to_id)
 }
 
+/// Try to resolve a bare specifier as a workspace package reference.
+///
+/// When the specifier's package name matches a workspace package, resolve the
+/// subpath against that package's root directory directly instead of going
+/// through `node_modules`. Covers two cases:
+///
+/// 1. **Self-referencing package imports**: Node.js v12+ lets a package import
+///    itself via its own name (`import { X } from '@org/pkg/subentry'` from
+///    inside `@org/pkg`). Angular libraries built with `ng-packagr` rely on
+///    this to declare secondary entry points.
+/// 2. **Cross-workspace imports without `node_modules` symlinks**: monorepos
+///    that have not been installed yet, or bundlers that bypass `node_modules`
+///    entirely, still need to resolve `@org/other-pkg/sub` to the sibling
+///    workspace's source file.
+///
+/// Strategy: strip the package name prefix and resolve the remainder as a
+/// relative path from inside the workspace root, so `oxc_resolver` applies
+/// directory indices, source extensions, and any workspace-local `tsconfig.json`
+/// path aliases. The `exports` field is intentionally bypassed — it points at
+/// compiled output (`dist/esm/button/index.js`) that does not exist in a
+/// source-only workspace.
+///
+/// See issue #106.
+pub(super) fn try_workspace_package_fallback(
+    ctx: &ResolveContext<'_>,
+    specifier: &str,
+) -> Option<ResolveResult> {
+    // Must look like a bare package specifier to avoid matching `./button`, etc.
+    if !super::path_info::is_bare_specifier(specifier) {
+        return None;
+    }
+    let pkg_name = super::path_info::extract_package_name(specifier);
+    let ws_root = *ctx.workspace_roots.get(pkg_name.as_str())?;
+
+    // Remainder after the package name. Empty for `@org/pkg`, `"button"` for
+    // `@org/pkg/button`, `"internal/base"` for `@org/pkg/internal/base`.
+    let subpath = specifier
+        .strip_prefix(pkg_name.as_str())
+        .and_then(|s| s.strip_prefix('/'))
+        .unwrap_or("");
+
+    // Synthetic importer inside the workspace root so tsconfig discovery walks
+    // up from the correct directory and relative specifiers anchor there.
+    let root_file = ws_root.join("__fallow_ws_self_resolve__");
+    let rel_spec = if subpath.is_empty() {
+        "./".to_string()
+    } else {
+        format!("./{subpath}")
+    };
+
+    let resolved = ctx.resolver.resolve_file(&root_file, &rel_spec).ok()?;
+    let resolved_path = resolved.path();
+
+    if let Some(&file_id) = ctx.raw_path_to_id.get(resolved_path) {
+        return Some(ResolveResult::InternalModule(file_id));
+    }
+    if let Ok(canonical) = dunce::canonicalize(resolved_path) {
+        if let Some(&file_id) = ctx.path_to_id.get(canonical.as_path()) {
+            return Some(ResolveResult::InternalModule(file_id));
+        }
+        if let Some(fallback) = ctx.canonical_fallback
+            && let Some(file_id) = fallback.get(&canonical)
+        {
+            return Some(ResolveResult::InternalModule(file_id));
+        }
+        if let Some(file_id) = try_source_fallback(&canonical, ctx.path_to_id) {
+            return Some(ResolveResult::InternalModule(file_id));
+        }
+    }
+    None
+}
+
 /// Convert a `DynamicImportPattern` to a glob string for file matching.
 pub(super) fn make_glob_from_pattern(
     pattern: &fallow_types::extract::DynamicImportPattern,

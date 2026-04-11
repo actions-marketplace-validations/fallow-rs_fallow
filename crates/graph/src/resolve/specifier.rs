@@ -7,7 +7,7 @@ use oxc_resolver::{Resolution, ResolveError, ResolveOptions, Resolver};
 use super::fallbacks::{
     extract_package_name_from_node_modules_path, try_path_alias_fallback,
     try_pnpm_workspace_fallback, try_scss_include_path_fallback, try_scss_partial_fallback,
-    try_source_fallback,
+    try_source_fallback, try_workspace_package_fallback,
 };
 use super::path_info::{
     extract_package_name, is_bare_specifier, is_path_alias, is_valid_package_name,
@@ -242,6 +242,15 @@ pub(super) fn resolve_specifier(
                     } else if let Some(pkg_name) =
                         extract_package_name_from_node_modules_path(&canonical)
                     {
+                        // Workspace package resolved through a node_modules symlink to
+                        // a built output (e.g. dist/esm/button/index.js) that has no
+                        // src/ mirror. Retry against the workspace root's source tree.
+                        // See issue #106.
+                        if ctx.workspace_roots.contains_key(pkg_name.as_str())
+                            && let Some(result) = try_workspace_package_fallback(ctx, specifier)
+                        {
+                            return result;
+                        }
                         ResolveResult::NpmPackage(pkg_name)
                     } else {
                         ResolveResult::ExternalFile(canonical)
@@ -260,6 +269,11 @@ pub(super) fn resolve_specifier(
                     } else if let Some(pkg_name) =
                         extract_package_name_from_node_modules_path(resolved_path)
                     {
+                        if ctx.workspace_roots.contains_key(pkg_name.as_str())
+                            && let Some(result) = try_workspace_package_fallback(ctx, specifier)
+                        {
+                            return result;
+                        }
                         ResolveResult::NpmPackage(pkg_name)
                     } else {
                         ResolveResult::ExternalFile(resolved_path.to_path_buf())
@@ -295,6 +309,12 @@ pub(super) fn resolve_specifier(
                 try_path_alias_fallback(ctx, specifier)
                     .unwrap_or_else(|| ResolveResult::Unresolvable(specifier.to_string()))
             } else if is_bare && is_valid_package_name(specifier) {
+                // Workspace package fallback: self-referencing and cross-workspace
+                // imports without node_modules symlinks. Resolves `@org/pkg/sub`
+                // against the workspace root's source tree. See issue #106.
+                if let Some(result) = try_workspace_package_fallback(ctx, specifier) {
+                    return result;
+                }
                 let pkg_name = extract_package_name(specifier);
                 ResolveResult::NpmPackage(pkg_name)
             } else {

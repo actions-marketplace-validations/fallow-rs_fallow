@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Self-referencing and cross-workspace package imports in monorepo libraries** -- when a workspace library uses its own name in import specifiers (a [Node.js v12+ feature](https://nodejs.org/api/packages.html#self-referencing-a-package-using-its-name) commonly used by Angular libraries built with `ng-packagr`), secondary entry point files are no longer reported as unused. A new workspace package fallback strips the matching package name prefix from any bare specifier whose package name is in the workspace registry and resolves the remainder against the library's source tree via `oxc_resolver::resolve_file`, bypassing the `package.json` `exports` map's pointers at compiled output. The fallback also covers cross-workspace imports in monorepos that haven't run `npm install`, where bare `@org/pkg/sub` specifiers would previously fall through to `NpmPackage` classification and create false-positive unused-file and unlisted-dependency reports. ([#106](https://github.com/fallow-rs/fallow/issues/106))
+- **SCSS `sass:*` built-in modules no longer reported as unlisted npm dependencies** -- the Sass compiler's [built-in modules](https://sass-lang.com/documentation/modules/) imported via `@use 'sass:string'`, `@use 'sass:math'`, etc. are now recognized alongside the existing `node:`, `bun:`, `cloudflare:`, and Deno `std` platform builtins. These are language-level Sass features, not npm packages, and cannot appear in `package.json`. Previously, every unique `sass:*` module used across a codebase produced a separate false-positive unlisted dependency report (up to 7 per Sass codebase for the full module set: `math`, `string`, `color`, `list`, `map`, `meta`, `selector`). The prefix guard is strict: `sass-loader`, `@types/sass`, and the `sass` compiler package itself remain normal npm packages. ([#104](https://github.com/fallow-rs/fallow/issues/104))
+
 ## [2.27.6] - 2026-04-11
 
 ### Fixed
