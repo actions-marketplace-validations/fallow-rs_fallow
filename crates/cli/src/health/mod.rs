@@ -896,6 +896,13 @@ fn collect_findings(
         files_analyzed += 1;
         for fc in &module.complexity {
             total_functions += 1;
+            if fallow_core::suppress::is_suppressed(
+                &module.suppressions,
+                fc.line,
+                fallow_core::suppress::IssueKind::Complexity,
+            ) {
+                continue;
+            }
             let exceeds_cyclomatic = fc.cyclomatic > max_cyclomatic;
             let exceeds_cognitive = fc.cognitive > max_cognitive;
             if exceeds_cyclomatic || exceeds_cognitive {

@@ -603,6 +603,12 @@ fn render_findings(
         )
         .dimmed()
     ));
+    if report.findings.len() >= 3 {
+        lines.push(format!(
+            "  {}",
+            "To suppress: // fallow-ignore-next-line complexity".dimmed()
+        ));
+    }
     if report.findings.len() < report.summary.functions_above_threshold {
         let total = report.summary.functions_above_threshold;
         lines.push(format!(

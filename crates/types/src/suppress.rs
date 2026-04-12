@@ -53,6 +53,8 @@ pub enum IssueKind {
     CoverageGaps,
     /// A detected feature flag pattern.
     FeatureFlag,
+    /// A function exceeding complexity thresholds (health command).
+    Complexity,
 }
 
 impl IssueKind {
@@ -77,6 +79,7 @@ impl IssueKind {
             "boundary-violation" => Some(Self::BoundaryViolation),
             "coverage-gaps" => Some(Self::CoverageGaps),
             "feature-flag" => Some(Self::FeatureFlag),
+            "complexity" => Some(Self::Complexity),
             _ => None,
         }
     }
@@ -102,6 +105,7 @@ impl IssueKind {
             Self::BoundaryViolation => 15,
             Self::CoverageGaps => 16,
             Self::FeatureFlag => 17,
+            Self::Complexity => 18,
         }
     }
 
@@ -126,6 +130,7 @@ impl IssueKind {
             15 => Some(Self::BoundaryViolation),
             16 => Some(Self::CoverageGaps),
             17 => Some(Self::FeatureFlag),
+            18 => Some(Self::Complexity),
             _ => None,
         }
     }
@@ -230,6 +235,7 @@ mod tests {
             IssueKind::parse("feature-flag"),
             Some(IssueKind::FeatureFlag)
         );
+        assert_eq!(IssueKind::parse("complexity"), Some(IssueKind::Complexity));
     }
 
     #[test]
@@ -251,7 +257,7 @@ mod tests {
     #[test]
     fn discriminant_out_of_range() {
         assert_eq!(IssueKind::from_discriminant(0), None);
-        assert_eq!(IssueKind::from_discriminant(18), None);
+        assert_eq!(IssueKind::from_discriminant(19), None);
         assert_eq!(IssueKind::from_discriminant(u8::MAX), None);
     }
 
@@ -275,6 +281,7 @@ mod tests {
             IssueKind::BoundaryViolation,
             IssueKind::CoverageGaps,
             IssueKind::FeatureFlag,
+            IssueKind::Complexity,
         ] {
             assert_eq!(
                 IssueKind::from_discriminant(kind.to_discriminant()),
@@ -282,7 +289,7 @@ mod tests {
             );
         }
         assert_eq!(IssueKind::from_discriminant(0), None);
-        assert_eq!(IssueKind::from_discriminant(18), None);
+        assert_eq!(IssueKind::from_discriminant(19), None);
     }
 
     // ── Discriminant uniqueness ─────────────────────────────────
@@ -307,6 +314,7 @@ mod tests {
             IssueKind::BoundaryViolation,
             IssueKind::CoverageGaps,
             IssueKind::FeatureFlag,
+            IssueKind::Complexity,
         ];
         let discriminants: Vec<u8> = all_kinds.iter().map(|k| k.to_discriminant()).collect();
         let mut sorted = discriminants.clone();

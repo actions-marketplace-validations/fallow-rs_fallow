@@ -92,6 +92,7 @@ mod tests {
             IssueKind::BoundaryViolation,
             IssueKind::CoverageGaps,
             IssueKind::FeatureFlag,
+            IssueKind::Complexity,
         ] {
             assert_eq!(
                 IssueKind::from_discriminant(kind.to_discriminant()),
@@ -99,7 +100,7 @@ mod tests {
             );
         }
         assert_eq!(IssueKind::from_discriminant(0), None);
-        assert_eq!(IssueKind::from_discriminant(18), None);
+        assert_eq!(IssueKind::from_discriminant(19), None);
     }
 
     #[test]
