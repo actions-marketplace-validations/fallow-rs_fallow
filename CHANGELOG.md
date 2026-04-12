@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.30.0] - 2026-04-12
+
+### Added
+
+- **Arrow-wrapped dynamic import detection** -- `React.lazy(() => import('./Foo'))`, `loadable(() => import('./Component'))`, `defineAsyncComponent(() => import('./View'))`, and any function call with an arrow or function expression argument whose body is a sole `import()` expression now credits the target module's default export as used. Handles expression body, block body with return, and function expressions. Covers all lazy loading wrappers generically without maintaining a list of known functions.
+- **JSDoc visibility tags** (`@internal`, `@beta`, `@alpha`) -- extends the existing `@public` tag support with three additional TSDoc lifecycle tags. All four tags suppress unused-export detection while preserving semantic distinction via a `VisibilityTag` enum (`Public`, `Internal`, `Alpha`, `Beta`). Priority when multiple tags present: Public > Internal > Alpha > Beta. Stored across the full pipeline (extraction, cache, graph, analysis). `#[repr(u8)]` with explicit discriminants for stable cache encoding.
+- **`--include-entry-exports` flag** -- makes entry file exports (package.json main/module/exports, framework convention files) subject to unused-export detection instead of automatically marking them as used. Catches typos in framework exports (e.g., `meatdata` instead of `metadata` in Next.js pages). Still respects plugin `used_exports` rules for partial checking.
+- **`--file <PATH>` flag** -- scopes check output to specified file(s) for lint-staged pre-commit integration. Accepts multiple paths. Full graph still builds (correct results require cross-file analysis), but only issues in matching files are reported. Dependency-level issues are suppressed in file mode. Warns when a path is not found (showing the resolved path).
+- **Script multiplexer support** -- `concurrently`, `npm-run-all`, `npm-run-all2`, `run-s`, `run-p`, `run-s2`, `run-p2` are recognized as script multiplexers. Their positional arguments are treated as script names (not binary dependencies), preventing false "unused dependency" reports for packages referenced only via `npm:` prefixed script delegation.
+
+### Fixed
+
+- **Arrow-wrapped dynamic imports now credit default export** -- `ImportedName::Named("default")` from the arrow-wrapped import extractor is now correctly resolved to `ImportedName::Default`, so lazy-loaded modules have their default export credited in the module graph. Previously, the default export appeared unused despite the file being reachable.
+
 ## [2.29.1] - 2026-04-12
 
 ### Fixed
@@ -1296,7 +1310,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `--changed-since` and `--fail-on-issues` for CI
 - Cross-workspace resolution for npm/yarn/pnpm workspaces
 
-[Unreleased]: https://github.com/fallow-rs/fallow/compare/v2.29.1...HEAD
+[Unreleased]: https://github.com/fallow-rs/fallow/compare/v2.30.0...HEAD
+[2.30.0]: https://github.com/fallow-rs/fallow/compare/v2.29.1...v2.30.0
 [2.29.1]: https://github.com/fallow-rs/fallow/compare/v2.29.0...v2.29.1
 [2.29.0]: https://github.com/fallow-rs/fallow/compare/v2.28.2...v2.29.0
 [2.28.2]: https://github.com/fallow-rs/fallow/compare/v2.28.1...v2.28.2
