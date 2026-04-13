@@ -30,7 +30,10 @@ fn git(root: &Path, args: &[&str]) {
     let status = std::process::Command::new("git")
         .args(args)
         .current_dir(root)
-        // Prevent global git config (commit signing, hooks) from breaking temp repo operations
+        // Isolate from parent git context (pre-push hook sets GIT_DIR to the main repo,
+        // which overrides current_dir and causes commits to leak into the real repo)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
         .status()

@@ -39,6 +39,12 @@ fn create_audit_fixture(_suffix: &str) -> TempDir {
         Command::new("git")
             .args(args)
             .current_dir(dir)
+            // Isolate from parent git context (pre-push hook sets GIT_DIR to the main repo,
+            // which overrides current_dir and causes commits to leak into the real repo)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
             .env("GIT_AUTHOR_NAME", "test")
             .env("GIT_AUTHOR_EMAIL", "test@test.com")
             .env("GIT_COMMITTER_NAME", "test")
