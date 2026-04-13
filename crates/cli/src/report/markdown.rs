@@ -557,6 +557,9 @@ fn write_vital_signs_section(out: &mut String, report: &crate::health_types::Hea
     out.push_str("## Vital Signs\n\n");
     out.push_str("| Metric | Value |\n");
     out.push_str("|:-------|------:|\n");
+    if vs.total_loc > 0 {
+        let _ = writeln!(out, "| Total LOC | {} |", vs.total_loc);
+    }
     let _ = writeln!(out, "| Avg Cyclomatic | {:.1} |", vs.avg_cyclomatic);
     let _ = writeln!(out, "| P90 Cyclomatic | {} |", vs.p90_cyclomatic);
     if let Some(v) = vs.dead_file_pct {
@@ -1510,12 +1513,14 @@ mod tests {
                 unit_interfacing_profile: None,
                 p95_fan_in: None,
                 coupling_high_pct: None,
+                total_loc: 15_200,
             }),
             ..Default::default()
         };
         let md = build_health_markdown(&report, &root);
         assert!(md.contains("## Vital Signs"));
         assert!(md.contains("| Metric | Value |"));
+        assert!(md.contains("| Total LOC | 15200 |"));
         assert!(md.contains("| Avg Cyclomatic | 3.5 |"));
         assert!(md.contains("| P90 Cyclomatic | 12 |"));
         assert!(md.contains("| Dead Files | 5.0% |"));

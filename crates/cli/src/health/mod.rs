@@ -317,13 +317,12 @@ pub fn execute_health(opts: &HealthOptions<'_>) -> Result<HealthResult, ExitCode
             fallow_core::duplicates::find_duplicates(&config.root, &files, &config.duplicates);
         let pct = dupes_report.stats.duplication_percentage;
         vital_signs.duplication_pct = Some((pct * 10.0).round() / 10.0);
-        // Update both the snapshot counts and the embedded vital signs counts
-        // so that JSON consumers can see raw numerator/denominator alongside the percentage.
+        // Update duplicated_lines on both the snapshot counts and the embedded vital signs
+        // counts so JSON consumers can see raw numerator alongside the percentage.
+        // total_lines is already populated unconditionally from parsed modules.
         counts.duplicated_lines = Some(dupes_report.stats.duplicated_lines);
-        counts.total_lines = Some(dupes_report.stats.total_lines);
         if let Some(ref mut vc) = vital_signs.counts {
             vc.duplicated_lines = Some(dupes_report.stats.duplicated_lines);
-            vc.total_lines = Some(dupes_report.stats.total_lines);
         }
     }
     let duplication_ms = t.elapsed().as_secs_f64() * 1000.0;

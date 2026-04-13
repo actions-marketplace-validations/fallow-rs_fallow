@@ -149,6 +149,9 @@ pub(super) fn print_health_compact(report: &crate::health_types::HealthReport, r
     }
     if let Some(ref vs) = report.vital_signs {
         let mut parts = Vec::new();
+        if vs.total_loc > 0 {
+            parts.push(format!("total_loc={}", vs.total_loc));
+        }
         parts.push(format!("avg_cyclomatic={:.1}", vs.avg_cyclomatic));
         parts.push(format!("p90_cyclomatic={}", vs.p90_cyclomatic));
         if let Some(v) = vs.dead_file_pct {

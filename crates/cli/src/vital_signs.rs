@@ -44,7 +44,7 @@ pub struct AnalysisCounts {
 /// Compute vital signs from available health data.
 #[expect(
     clippy::cast_possible_truncation,
-    reason = "percentile indices, dep counts, and hotspot counts are bounded by project size"
+    reason = "percentile indices, dep counts, hotspot counts, and LOC per file are bounded by project size"
 )]
 pub fn compute_vital_signs(input: &VitalSignsInput<'_>) -> VitalSigns {
     // Cyclomatic complexity: always available from parsed modules
@@ -113,6 +113,13 @@ pub fn compute_vital_signs(input: &VitalSignsInput<'_>) -> VitalSigns {
             .count() as u32
     });
 
+    // Total LOC: always available from parsed modules
+    let total_loc: u64 = input
+        .modules
+        .iter()
+        .map(|m| m.line_offsets.len() as u64)
+        .sum();
+
     // Build raw counts for percentage referents ("63.5% (N of M)")
     let counts = input.analysis_counts.as_ref().map(|ac| VitalSignsCounts {
         total_files: input.total_files,
@@ -120,7 +127,7 @@ pub fn compute_vital_signs(input: &VitalSignsInput<'_>) -> VitalSigns {
         dead_files: ac.dead_files,
         dead_exports: ac.dead_exports,
         duplicated_lines: None,
-        total_lines: None,
+        total_lines: Some(total_loc as usize),
         files_scored: input.file_scores.map(<[_]>::len),
         total_deps: ac.total_deps,
     });
@@ -171,6 +178,7 @@ pub fn compute_vital_signs(input: &VitalSignsInput<'_>) -> VitalSigns {
         unit_interfacing_profile,
         p95_fan_in,
         coupling_high_pct,
+        total_loc,
     }
 }
 
@@ -393,13 +401,15 @@ pub fn build_counts(input: &VitalSignsInput<'_>) -> VitalSignsCounts {
             )
         });
 
+    let total_lines: usize = input.modules.iter().map(|m| m.line_offsets.len()).sum();
+
     VitalSignsCounts {
         total_files: input.total_files,
         total_exports,
         dead_files,
         dead_exports,
         duplicated_lines: None,
-        total_lines: None,
+        total_lines: Some(total_lines),
         files_scored: input.file_scores.map(<[_]>::len),
         total_deps,
     }
@@ -1207,6 +1217,7 @@ mod tests {
             unit_interfacing_profile: None,
             p95_fan_in: None,
             coupling_high_pct: None,
+            total_loc: 0,
         };
         let score = compute_health_score(&vs, 100);
         assert_eq!(score.penalties.duplication, Some(5.0));

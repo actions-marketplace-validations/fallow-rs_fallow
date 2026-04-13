@@ -854,7 +854,8 @@
         "unit_size_profile": { "$ref": "#/definitions/RiskProfile", "description": "Function size risk profile. Null if no functions analyzed." },
         "unit_interfacing_profile": { "$ref": "#/definitions/RiskProfile", "description": "Parameter count risk profile. Null if no functions analyzed." },
         "p95_fan_in": { "type": ["integer", "null"], "description": "95th percentile fan-in across all files. Null if file scores not computed." },
-        "coupling_high_pct": { "type": ["number", "null"], "description": "Percentage of files with fan-in above the effective threshold. Null if file scores not computed." }
+        "coupling_high_pct": { "type": ["number", "null"], "description": "Percentage of files with fan-in above the effective threshold. Null if file scores not computed." },
+        "total_loc": { "type": "integer", "description": "Total lines of code across all parsed modules. 0 if no modules parsed.", "default": 0 }
       }
     },
 

@@ -1860,6 +1860,7 @@ fn markdown_health_with_vital_signs_snapshot() {
         unit_interfacing_profile: None,
         p95_fan_in: None,
         coupling_high_pct: None,
+        total_loc: 42_000,
     });
     let output = build_health_markdown(&report, &root);
     insta::assert_snapshot!("markdown_health_with_vital_signs", output);
@@ -1934,6 +1935,7 @@ fn health_report_with_score(root: &Path) -> HealthReport {
         unit_interfacing_profile: None,
         p95_fan_in: None,
         coupling_high_pct: None,
+        total_loc: 85_000,
     });
     report.health_score = Some(HealthScore {
         score: 76.9,

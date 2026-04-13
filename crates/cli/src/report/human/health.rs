@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use colored::Colorize;
 
-use super::{MAX_FLAT_ITEMS, format_path, plural, relative_path, split_dir_filename};
+use super::{MAX_FLAT_ITEMS, format_path, plural, relative_path, split_dir_filename, thousands};
 
 /// Docs base URL for health explanations.
 const DOCS_HEALTH: &str = "https://docs.fallow.tools/explanations/health";
@@ -139,65 +139,60 @@ fn render_health_score(lines: &mut Vec<String>, report: &crate::health_types::He
         score_colored,
     ));
 
-    // Penalty breakdown (dimmed, one line)
+    // Penalty breakdown: sorted by magnitude, top penalties highlighted
     let p = &hs.penalties;
-    let mut parts = Vec::new();
-    if let Some(df) = p.dead_files
-        && df > 0.0
-    {
-        parts.push(format!("dead files -{df:.1}"));
+    let mut penalties: Vec<(&str, f64)> = Vec::new();
+    if let Some(df) = p.dead_files {
+        penalties.push(("dead files", df));
     }
-    if let Some(de) = p.dead_exports
-        && de > 0.0
-    {
-        parts.push(format!("dead exports -{de:.1}"));
+    if let Some(de) = p.dead_exports {
+        penalties.push(("dead exports", de));
     }
-    if p.complexity > 0.0 {
-        parts.push(format!("complexity -{:.1}", p.complexity));
+    penalties.push(("complexity", p.complexity));
+    penalties.push(("p90", p.p90_complexity));
+    if let Some(mi) = p.maintainability {
+        penalties.push(("maintainability", mi));
     }
-    if p.p90_complexity > 0.0 {
-        parts.push(format!("p90 -{:.1}", p.p90_complexity));
+    if let Some(hp) = p.hotspots {
+        penalties.push(("hotspots", hp));
     }
-    if let Some(mi) = p.maintainability
-        && mi > 0.0
-    {
-        parts.push(format!("maintainability -{mi:.1}"));
+    if let Some(ud) = p.unused_deps {
+        penalties.push(("unused deps", ud));
     }
-    if let Some(hp) = p.hotspots
-        && hp > 0.0
-    {
-        parts.push(format!("hotspots -{hp:.1}"));
+    if let Some(cd) = p.circular_deps {
+        penalties.push(("circular deps", cd));
     }
-    if let Some(ud) = p.unused_deps
-        && ud > 0.0
-    {
-        parts.push(format!("unused dependencies -{ud:.1}"));
+    if let Some(us) = p.unit_size {
+        penalties.push(("unit size", us));
     }
-    if let Some(cd) = p.circular_deps
-        && cd > 0.0
-    {
-        parts.push(format!("circular dependencies -{cd:.1}"));
+    if let Some(cp) = p.coupling {
+        penalties.push(("coupling", cp));
     }
-    if let Some(us) = p.unit_size
-        && us > 0.0
-    {
-        parts.push(format!("unit size -{us:.1}"));
+    if let Some(dp) = p.duplication {
+        penalties.push(("duplication", dp));
     }
-    if let Some(cp) = p.coupling
-        && cp > 0.0
-    {
-        parts.push(format!("coupling -{cp:.1}"));
-    }
-    if let Some(dp) = p.duplication
-        && dp > 0.0
-    {
-        parts.push(format!("duplication -{dp:.1}"));
-    }
-    if !parts.is_empty() {
+    // Remove zero-valued penalties, then sort by magnitude (largest first)
+    penalties.retain(|&(_, v)| v > 0.0);
+    penalties.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    if !penalties.is_empty() {
+        // Highlight the top penalty; dim the rest
+        let parts: Vec<String> = penalties
+            .iter()
+            .enumerate()
+            .map(|(i, &(label, val))| {
+                let text = format!("{label} -{val:.1}");
+                if i == 0 {
+                    text.yellow().to_string()
+                } else {
+                    text.dimmed().to_string()
+                }
+            })
+            .collect();
         lines.push(format!(
             "  {} {}",
             "Deductions:".dimmed(),
-            parts.join(" \u{00b7} ").dimmed()
+            parts.join(&format!(" {} ", "\u{00b7}".dimmed()))
         ));
     }
     // Check for N/A components
@@ -316,7 +311,7 @@ fn render_health_trend(lines: &mut Vec<String>, report: &crate::health_types::He
         lines.push(format!(
             "  {}",
             format!(
-                "note: score formula updated in snapshot v{} (added unit size, coupling, and duplication penalties); score delta may reflect formula change, not code change",
+                "note: snapshot schema updated to v{} (added total LOC vital sign); score comparison still valid",
                 crate::health_types::SNAPSHOT_SCHEMA_VERSION
             )
                 .yellow()
@@ -375,6 +370,9 @@ fn render_vital_signs(lines: &mut Vec<String>, report: &crate::health_types::Hea
     };
 
     let mut parts = Vec::new();
+    if vs.total_loc > 0 {
+        parts.push(format!("{} LOC", thousands(vs.total_loc as usize)));
+    }
     if let Some(dfp) = vs.dead_file_pct {
         parts.push(format!("dead files {dfp:.1}%"));
     }
@@ -401,11 +399,7 @@ fn render_vital_signs(lines: &mut Vec<String>, report: &crate::health_types::Hea
     {
         parts.push(format!(
             "{cd} circular {}",
-            if cd == 1 {
-                "dependency"
-            } else {
-                "dependencies"
-            }
+            if cd == 1 { "dep" } else { "deps" }
         ));
     }
     if let Some(ud) = vs.unused_dep_count
@@ -413,11 +407,7 @@ fn render_vital_signs(lines: &mut Vec<String>, report: &crate::health_types::Hea
     {
         parts.push(format!(
             "{ud} unused {}",
-            if ud == 1 {
-                "dependency"
-            } else {
-                "dependencies"
-            }
+            if ud == 1 { "dep" } else { "deps" }
         ));
     }
     if let Some(dp) = vs.duplication_pct {
@@ -1451,10 +1441,12 @@ mod tests {
         let lines = build_health_human_lines(&report, &root);
         let text = plain(&lines);
         assert!(text.contains("76 B"));
+        // Penalties sorted by magnitude: dead exports -6.0 is the largest
+        assert!(text.contains("dead exports -6.0"));
         assert!(text.contains("maintainability -4.0"));
         assert!(text.contains("hotspots -2.0"));
-        assert!(text.contains("unused dependencies -1.0"));
-        assert!(text.contains("circular dependencies -1.0"));
+        assert!(text.contains("unused deps -1.0"));
+        assert!(text.contains("circular deps -1.0"));
     }
 
     #[test]
@@ -1780,17 +1772,19 @@ mod tests {
             unit_interfacing_profile: None,
             p95_fan_in: None,
             coupling_high_pct: None,
+            total_loc: 42_381,
         });
         let lines = build_health_human_lines(&report, &root);
         let text = plain(&lines);
+        assert!(text.contains("42,381 LOC"));
         assert!(text.contains("dead files 3.2%"));
         assert!(text.contains("dead exports 8.1%"));
         assert!(text.contains("avg cyclomatic 4.7"));
         assert!(text.contains("p90 cyclomatic 12"));
         assert!(text.contains("maintainability 72.4"));
         assert!(text.contains("2 churn hotspots"));
-        assert!(text.contains("3 unused dependencies"));
-        assert!(text.contains("1 circular dependency"));
+        assert!(text.contains("3 unused deps"));
+        assert!(text.contains("1 circular dep"));
     }
 
     #[test]
@@ -1812,6 +1806,7 @@ mod tests {
             unit_interfacing_profile: None,
             p95_fan_in: None,
             coupling_high_pct: None,
+            total_loc: 0,
         });
         report.health_trend = Some(crate::health_types::HealthTrend {
             compared_to: crate::health_types::TrendPoint {
@@ -1852,6 +1847,7 @@ mod tests {
             unit_interfacing_profile: None,
             p95_fan_in: None,
             coupling_high_pct: None,
+            total_loc: 0,
         });
         let lines = build_health_human_lines(&report, &root);
         let text = plain(&lines);
@@ -1882,12 +1878,13 @@ mod tests {
             unit_interfacing_profile: None,
             p95_fan_in: None,
             coupling_high_pct: None,
+            total_loc: 0,
         });
         let lines = build_health_human_lines(&report, &root);
         let text = plain(&lines);
         // Zero counts should not appear
-        assert!(!text.contains("unused dependenc"));
-        assert!(!text.contains("circular dependenc"));
+        assert!(!text.contains("unused dep"));
+        assert!(!text.contains("circular dep"));
     }
 
     #[test]
@@ -1909,14 +1906,15 @@ mod tests {
             unit_interfacing_profile: None,
             p95_fan_in: None,
             coupling_high_pct: None,
+            total_loc: 0,
         });
         let lines = build_health_human_lines(&report, &root);
         let text = plain(&lines);
         assert!(text.contains("1 churn hotspot"));
         assert!(!text.contains("1 churn hotspots"));
-        assert!(text.contains("1 unused dependency"));
-        assert!(!text.contains("1 unused dependencies"));
-        assert!(text.contains("2 circular dependencies"));
+        assert!(text.contains("1 unused dep"));
+        assert!(!text.contains("1 unused deps"));
+        assert!(text.contains("2 circular deps"));
     }
 
     // ── render_file_scores ───────────────────────────────────────

@@ -6,7 +6,8 @@
 /// v4: Added risk profiles (`unit_size_profile`, `unit_interfacing_profile`) and
 ///     coupling concentration (`p95_fan_in`, `coupling_high_pct`).
 /// v5: Added duplication penalty to health score formula.
-pub const SNAPSHOT_SCHEMA_VERSION: u32 = 5;
+/// v6: Added `total_loc` to vital signs (always computed from parsed modules).
+pub const SNAPSHOT_SCHEMA_VERSION: u32 = 6;
 
 /// Project-wide vital signs — a fixed set of metrics for trend tracking.
 ///
@@ -55,6 +56,9 @@ pub struct VitalSigns {
     /// Percentage of files with fan-in above the project's p95 threshold.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub coupling_high_pct: Option<f64>,
+    /// Total lines of code across all parsed modules.
+    #[serde(default)]
+    pub total_loc: u64,
 }
 
 /// Risk profile: percentage of functions in each risk bin.
@@ -153,6 +157,7 @@ mod tests {
             unit_interfacing_profile: None,
             p95_fan_in: None,
             coupling_high_pct: None,
+            total_loc: 42_000,
         };
         let json = serde_json::to_string(&vs).unwrap();
         let deserialized: VitalSigns = serde_json::from_str(&json).unwrap();
@@ -188,6 +193,7 @@ mod tests {
                 unit_interfacing_profile: None,
                 p95_fan_in: None,
                 coupling_high_pct: None,
+                total_loc: 42_000,
             },
             counts: VitalSignsCounts {
                 total_files: 1200,
@@ -230,6 +236,7 @@ mod tests {
             unit_interfacing_profile: None,
             p95_fan_in: None,
             coupling_high_pct: None,
+            total_loc: 0,
         };
         let json = serde_json::to_string(&vs).unwrap();
         assert!(!json.contains("dead_file_pct"));
@@ -245,8 +252,8 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_schema_version_is_five() {
-        assert_eq!(SNAPSHOT_SCHEMA_VERSION, 5);
+    fn snapshot_schema_version_is_six() {
+        assert_eq!(SNAPSHOT_SCHEMA_VERSION, 6);
     }
 
     #[test]

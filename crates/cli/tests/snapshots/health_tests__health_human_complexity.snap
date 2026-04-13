@@ -2,7 +2,7 @@
 source: crates/cli/tests/health_tests.rs
 expression: redacted
 ---
-■ Metrics: avg cyclomatic 7.0 · p90 cyclomatic 13
+■ Metrics: 21 LOC · avg cyclomatic 7.0 · p90 cyclomatic 13
 
 ● High complexity functions (1)
   src/complex.ts

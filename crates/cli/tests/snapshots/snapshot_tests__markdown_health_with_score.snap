@@ -8,6 +8,7 @@ expression: output
 
 | Metric | Value |
 |:-------|------:|
+| Total LOC | 85000 |
 | Avg Cyclomatic | 1.3 |
 | P90 Cyclomatic | 2 |
 | Dead Files | 15.5% |
