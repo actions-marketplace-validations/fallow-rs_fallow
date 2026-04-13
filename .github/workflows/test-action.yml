@@ -9,6 +9,8 @@ concurrency:
   group: test-action-${{ github.ref }}
   cancel-in-progress: true
 
+permissions: {}
+
 jobs:
   test-jq-scripts:
     name: Test jq scripts
