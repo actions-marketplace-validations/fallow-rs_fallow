@@ -4,8 +4,8 @@
 //! the duplicate can be safely removed without any refactoring. This module
 //! identifies such combined findings.
 
-use rustc_hash::{FxHashMap, FxHashSet};
-use std::path::{Path, PathBuf};
+use rustc_hash::FxHashSet;
+use std::path::PathBuf;
 
 use serde::Serialize;
 
@@ -57,10 +57,9 @@ pub fn cross_reference(
     duplication: &DuplicationReport,
     dead_code: &AnalysisResults,
 ) -> CrossReferenceResult {
-    // Build lookup indices for fast per-file checking
+    // Build lookup sets for fast checking
     let unused_files: FxHashSet<&PathBuf> =
         dead_code.unused_files.iter().map(|f| &f.path).collect();
-    let export_index = UnusedExportIndex::build(dead_code);
 
     let mut combined_findings = Vec::new();
     let mut clones_in_unused_files = 0usize;
@@ -80,9 +79,7 @@ pub fn cross_reference(
             }
 
             // Check 2: Does an unused export/type overlap with this clone's line range?
-            if let Some(finding) =
-                find_overlapping_unused_export(instance, group_idx, &export_index)
-            {
+            if let Some(finding) = find_overlapping_unused_export(instance, group_idx, dead_code) {
                 clones_with_unused_exports += 1;
                 combined_findings.push(finding);
             }
@@ -96,68 +93,41 @@ pub fn cross_reference(
     }
 }
 
-/// Per-file index of unused exports and types for O(1) file lookup.
-struct UnusedExportIndex<'a> {
-    exports_by_file: FxHashMap<&'a Path, Vec<(usize, &'a str)>>,
-    types_by_file: FxHashMap<&'a Path, Vec<(usize, &'a str)>>,
-}
-
-impl<'a> UnusedExportIndex<'a> {
-    fn build(dead_code: &'a AnalysisResults) -> Self {
-        let mut exports_by_file: FxHashMap<&Path, Vec<(usize, &str)>> = FxHashMap::default();
-        for export in &dead_code.unused_exports {
-            exports_by_file
-                .entry(export.path.as_path())
-                .or_default()
-                .push((export.line as usize, export.export_name.as_str()));
-        }
-        let mut types_by_file: FxHashMap<&Path, Vec<(usize, &str)>> = FxHashMap::default();
-        for type_export in &dead_code.unused_types {
-            types_by_file
-                .entry(type_export.path.as_path())
-                .or_default()
-                .push((type_export.line as usize, type_export.export_name.as_str()));
-        }
-        Self {
-            exports_by_file,
-            types_by_file,
-        }
-    }
-}
-
 /// Check if any unused export/type overlaps with the clone instance's line range.
 fn find_overlapping_unused_export(
     instance: &CloneInstance,
     group_index: usize,
-    index: &UnusedExportIndex<'_>,
+    dead_code: &AnalysisResults,
 ) -> Option<CombinedFinding> {
-    // Check unused exports in this file only
-    if let Some(exports) = index.exports_by_file.get(instance.file.as_path()) {
-        for &(line, name) in exports {
-            if line >= instance.start_line && line <= instance.end_line {
-                return Some(CombinedFinding {
-                    clone_instance: instance.clone(),
-                    dead_code_kind: DeadCodeKind::UnusedExport {
-                        export_name: name.to_owned(),
-                    },
-                    group_index,
-                });
-            }
+    // Check unused exports
+    for export in &dead_code.unused_exports {
+        if export.path == instance.file
+            && (export.line as usize) >= instance.start_line
+            && (export.line as usize) <= instance.end_line
+        {
+            return Some(CombinedFinding {
+                clone_instance: instance.clone(),
+                dead_code_kind: DeadCodeKind::UnusedExport {
+                    export_name: export.export_name.clone(),
+                },
+                group_index,
+            });
         }
     }
 
-    // Check unused types in this file only
-    if let Some(types) = index.types_by_file.get(instance.file.as_path()) {
-        for &(line, name) in types {
-            if line >= instance.start_line && line <= instance.end_line {
-                return Some(CombinedFinding {
-                    clone_instance: instance.clone(),
-                    dead_code_kind: DeadCodeKind::UnusedType {
-                        type_name: name.to_owned(),
-                    },
-                    group_index,
-                });
-            }
+    // Check unused types
+    for type_export in &dead_code.unused_types {
+        if type_export.path == instance.file
+            && (type_export.line as usize) >= instance.start_line
+            && (type_export.line as usize) <= instance.end_line
+        {
+            return Some(CombinedFinding {
+                clone_instance: instance.clone(),
+                dead_code_kind: DeadCodeKind::UnusedType {
+                    type_name: type_export.export_name.clone(),
+                },
+                group_index,
+            });
         }
     }
 

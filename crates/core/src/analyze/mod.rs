@@ -308,24 +308,15 @@ pub fn find_dead_code_full(
     // Filter out unused exports/types from public packages.
     // Public packages are workspace packages whose exports are intended for external consumers.
     if !config.public_packages.is_empty() && !workspaces.is_empty() {
-        // Pre-compile glob matchers once, not per-workspace.
-        let public_matchers: Vec<_> = config
-            .public_packages
-            .iter()
-            .filter_map(|pattern| {
-                globset::Glob::new(pattern)
-                    .ok()
-                    .map(|g| (pattern.as_str(), g.compile_matcher()))
-            })
-            .collect();
-
         let public_roots: Vec<&std::path::Path> = workspaces
             .iter()
             .filter(|ws| {
-                config.public_packages.contains(&ws.name)
-                    || public_matchers
-                        .iter()
-                        .any(|(_, matcher)| matcher.is_match(&ws.name))
+                config.public_packages.iter().any(|pattern| {
+                    ws.name == *pattern
+                        || globset::Glob::new(pattern)
+                            .ok()
+                            .is_some_and(|g| g.compile_matcher().is_match(&ws.name))
+                })
             })
             .map(|ws| ws.root.as_path())
             .collect();
