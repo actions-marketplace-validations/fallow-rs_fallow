@@ -26,18 +26,13 @@ pub fn group_into_families(clone_groups: &[CloneGroup], root: &Path) -> Vec<Clon
         return Vec::new();
     }
 
-    // Build a map from file-set -> list of clone groups
-    let mut family_map: Vec<(BTreeSet<PathBuf>, Vec<CloneGroup>)> = Vec::new();
+    // Build a map from file-set -> list of clone groups.
+    // Uses FxHashMap for O(1) lookup instead of O(N) linear scan per group.
+    let mut family_map: FxHashMap<BTreeSet<PathBuf>, Vec<CloneGroup>> = FxHashMap::default();
 
     for group in clone_groups {
         let file_set: BTreeSet<PathBuf> = group.instances.iter().map(|i| i.file.clone()).collect();
-
-        // Find or create the family for this file set
-        if let Some(entry) = family_map.iter_mut().find(|(fs, _)| *fs == file_set) {
-            entry.1.push(group.clone());
-        } else {
-            family_map.push((file_set, vec![group.clone()]));
-        }
+        family_map.entry(file_set).or_default().push(group.clone());
     }
 
     let mut families: Vec<CloneFamily> = family_map

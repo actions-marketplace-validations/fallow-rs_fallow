@@ -302,6 +302,11 @@ pub fn find_type_only_dependencies(
     let root_pkg_path = config.root.join("package.json");
     let root_pkg_content = read_pkg_json_content(&root_pkg_path);
     let workspace_names: FxHashSet<&str> = workspaces.iter().map(|ws| ws.name.as_str()).collect();
+    let ignore_deps: FxHashSet<&str> = config
+        .ignore_dependencies
+        .iter()
+        .map(String::as_str)
+        .collect();
 
     let mut type_only_deps = Vec::new();
 
@@ -312,7 +317,7 @@ pub fn find_type_only_dependencies(
             continue;
         }
         // Skip ignored dependencies
-        if config.ignore_dependencies.iter().any(|d| d == &dep) {
+        if ignore_deps.contains(dep.as_str()) {
             continue;
         }
 
