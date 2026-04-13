@@ -568,4 +568,63 @@ mod tests {
         assert_eq!(suppressions[0].line, 0);
         assert_eq!(suppressions[0].kind, Some(IssueKind::CircularDependency));
     }
+
+    /// Every `IssueKind` must be explicitly placed in either `NON_CORE_KINDS`
+    /// (not checked by core detectors) or handled by a core detector that
+    /// calls `SuppressionContext::is_suppressed` / `is_file_suppressed`.
+    /// This test fails when a new `IssueKind` variant is added without
+    /// being classified, preventing silent false-positive stale reports.
+    #[test]
+    fn all_issue_kinds_classified_for_stale_detection() {
+        // Kinds checked by core detectors via SuppressionContext
+        let core_kinds = [
+            IssueKind::UnusedFile,
+            IssueKind::UnusedExport,
+            IssueKind::UnusedType,
+            IssueKind::UnusedEnumMember,
+            IssueKind::UnusedClassMember,
+            IssueKind::UnresolvedImport,
+            IssueKind::DuplicateExport,
+            IssueKind::CircularDependency,
+            IssueKind::BoundaryViolation,
+        ];
+
+        // All variants that exist
+        let all_kinds = [
+            IssueKind::UnusedFile,
+            IssueKind::UnusedExport,
+            IssueKind::UnusedType,
+            IssueKind::UnusedDependency,
+            IssueKind::UnusedDevDependency,
+            IssueKind::UnusedEnumMember,
+            IssueKind::UnusedClassMember,
+            IssueKind::UnresolvedImport,
+            IssueKind::UnlistedDependency,
+            IssueKind::DuplicateExport,
+            IssueKind::CodeDuplication,
+            IssueKind::CircularDependency,
+            IssueKind::TypeOnlyDependency,
+            IssueKind::TestOnlyDependency,
+            IssueKind::BoundaryViolation,
+            IssueKind::CoverageGaps,
+            IssueKind::FeatureFlag,
+            IssueKind::Complexity,
+            IssueKind::StaleSuppression,
+        ];
+
+        for kind in all_kinds {
+            let in_core = core_kinds.contains(&kind);
+            let in_non_core = NON_CORE_KINDS.contains(&kind);
+            assert!(
+                in_core || in_non_core,
+                "IssueKind::{kind:?} is not classified in either core_kinds or NON_CORE_KINDS. \
+                 Add it to NON_CORE_KINDS if it is checked outside find_dead_code_full, \
+                 or to core_kinds in this test if a core detector checks it."
+            );
+            assert!(
+                !(in_core && in_non_core),
+                "IssueKind::{kind:?} is in BOTH core_kinds and NON_CORE_KINDS. Pick one."
+            );
+        }
+    }
 }
