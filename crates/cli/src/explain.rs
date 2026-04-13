@@ -247,10 +247,16 @@ pub fn health_meta() -> Value {
                 "interpretation": "lower is better; default threshold: 15"
             },
             "line_count": {
-                "name": "Line Count",
+                "name": "Function Line Count",
                 "description": "Number of lines in the function body.",
                 "range": "[1, \u{221e})",
                 "interpretation": "context-dependent; long functions may need splitting"
+            },
+            "lines": {
+                "name": "File Line Count",
+                "description": "Total lines of code in the file (from line offsets). Provides scale context for other metrics: a file with 0.4 complexity density at 80 LOC is different from 0.4 density at 800 LOC.",
+                "range": "[1, \u{221e})",
+                "interpretation": "context-dependent; large files may benefit from splitting even if individual functions are small"
             },
             "maintainability_index": {
                 "name": "Maintainability Index",
@@ -670,6 +676,7 @@ mod tests {
             "cyclomatic",
             "cognitive",
             "line_count",
+            "lines",
             "maintainability_index",
             "complexity_density",
             "dead_code_ratio",

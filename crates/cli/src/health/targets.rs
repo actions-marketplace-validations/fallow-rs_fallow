@@ -376,8 +376,8 @@ fn try_match_rules(
         return Some((
             RecommendationCategory::SplitHighImpact,
             format!(
-                "Split high-impact file \u{2014} {} dependents amplify every change",
-                score.fan_in
+                "Split high-impact file ({} LOC) \u{2014} {} dependents amplify every change",
+                score.lines, score.fan_in
             ),
         ));
     }
@@ -404,12 +404,12 @@ fn try_match_rules(
         if !high.is_empty() {
             let desc = match high.len() {
                 1 => format!(
-                    "Extract {} (cognitive: {}) into smaller functions",
-                    high[0].0, high[0].2
+                    "Extract {} (cognitive: {}) in {}-LOC file into smaller functions",
+                    high[0].0, high[0].2, score.lines
                 ),
                 _ => format!(
-                    "Extract {} (cognitive: {}) and {} (cognitive: {}) into smaller functions",
-                    high[0].0, high[0].2, high[1].0, high[1].2
+                    "Extract {} (cognitive: {}) and {} (cognitive: {}) in {}-LOC file into smaller functions",
+                    high[0].0, high[0].2, high[1].0, high[1].2, score.lines
                 ),
             };
             return Some((RecommendationCategory::ExtractComplexFunctions, desc));
@@ -421,8 +421,8 @@ fn try_match_rules(
         return Some((
             RecommendationCategory::ExtractDependencies,
             format!(
-                "Reduce coupling \u{2014} this file imports {} modules, limiting testability",
-                score.fan_out
+                "Reduce coupling \u{2014} {}-LOC file imports {} modules, limiting testability",
+                score.lines, score.fan_out
             ),
         ));
     }
@@ -941,8 +941,12 @@ mod tests {
         let t = default_thresholds();
         let result = try_match_rules(&score, None, false, false, None, 0, &t);
         assert!(result.is_some());
-        let (cat, _) = result.unwrap();
+        let (cat, rec) = result.unwrap();
         assert!(matches!(cat, RecommendationCategory::SplitHighImpact));
+        assert!(
+            rec.contains("100 LOC"),
+            "recommendation should include LOC: {rec}"
+        );
     }
 
     #[test]
@@ -978,6 +982,10 @@ mod tests {
             RecommendationCategory::ExtractComplexFunctions
         ));
         assert!(rec.contains("handleSubmit"));
+        assert!(
+            rec.contains("100-LOC"),
+            "recommendation should include LOC: {rec}"
+        );
     }
 
     #[test]
@@ -989,8 +997,12 @@ mod tests {
         let t = default_thresholds();
         let result = try_match_rules(&score, None, false, false, None, 0, &t);
         assert!(result.is_some());
-        let (cat, _) = result.unwrap();
+        let (cat, rec) = result.unwrap();
         assert!(matches!(cat, RecommendationCategory::ExtractDependencies));
+        assert!(
+            rec.contains("100-LOC"),
+            "recommendation should include LOC: {rec}"
+        );
     }
 
     #[test]
@@ -1275,6 +1287,10 @@ mod tests {
         ));
         assert!(rec.contains("processData"));
         assert!(rec.contains("handleEvent"));
+        assert!(
+            rec.contains("100-LOC"),
+            "two-function recommendation should include LOC: {rec}"
+        );
     }
 
     // --- contributing factors ---

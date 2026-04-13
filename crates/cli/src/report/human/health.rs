@@ -721,7 +721,8 @@ fn render_file_scores(
             String::new()
         };
         lines.push(format!(
-            "         {} fan-in  {} fan-out  {} dead  {} density{}",
+            "         {} LOC  {} fan-in  {} fan-out  {} dead  {} density{}",
+            format!("{:>6}", score.lines).dimmed(),
             format!("{:>3}", score.fan_in).dimmed(),
             format!("{:>3}", score.fan_out).dimmed(),
             format!("{:>3.0}%", score.dead_code_ratio * 100.0).dimmed(),
@@ -1943,6 +1944,7 @@ mod tests {
         assert!(text.contains("File health scores (1 files)"));
         assert!(text.contains("85.3"));
         assert!(text.contains("src/utils.ts"));
+        assert!(text.contains("200 LOC"));
         assert!(text.contains("5 fan-in"));
         assert!(text.contains("3 fan-out"));
         assert!(text.contains("15% dead"));
