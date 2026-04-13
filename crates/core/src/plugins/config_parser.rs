@@ -34,6 +34,38 @@ pub fn extract_imports(source: &str, path: &Path) -> Vec<String> {
     .unwrap_or_default()
 }
 
+/// Extract all import sources AND top-level `require('...')` expression statements.
+///
+/// Handles configs that load plugins via side-effect requires:
+/// ```js
+/// require("@nomiclabs/hardhat-waffle");
+/// import "@nomicfoundation/hardhat-toolbox";
+/// ```
+#[must_use]
+pub fn extract_imports_and_requires(source: &str, path: &Path) -> Vec<String> {
+    extract_from_source(source, path, |program| {
+        let mut sources = Vec::new();
+        for stmt in &program.body {
+            match stmt {
+                Statement::ImportDeclaration(decl) => {
+                    sources.push(decl.source.value.to_string());
+                }
+                Statement::ExpressionStatement(expr) => {
+                    if let Expression::CallExpression(call) = &expr.expression
+                        && is_require_call(call)
+                        && let Some(s) = get_require_source(call)
+                    {
+                        sources.push(s);
+                    }
+                }
+                _ => {}
+            }
+        }
+        Some(sources)
+    })
+    .unwrap_or_default()
+}
+
 /// Extract string array from a property at a nested path in a config's default export.
 #[must_use]
 pub fn extract_config_string_array(source: &str, path: &Path, prop_path: &[&str]) -> Vec<String> {

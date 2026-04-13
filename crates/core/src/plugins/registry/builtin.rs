@@ -6,26 +6,27 @@ use super::super::{
     Plugin, angular::AngularPlugin, astro::AstroPlugin, ava::AvaPlugin, babel::BabelPlugin,
     biome::BiomePlugin, bun::BunPlugin, c8::C8Plugin, capacitor::CapacitorPlugin,
     changesets::ChangesetsPlugin, commitizen::CommitizenPlugin, commitlint::CommitlintPlugin,
-    cspell::CspellPlugin, cucumber::CucumberPlugin, cypress::CypressPlugin,
+    convex::ConvexPlugin, cspell::CspellPlugin, cucumber::CucumberPlugin, cypress::CypressPlugin,
     dependency_cruiser::DependencyCruiserPlugin, docusaurus::DocusaurusPlugin,
     drizzle::DrizzlePlugin, electron::ElectronPlugin, eslint::EslintPlugin, expo::ExpoPlugin,
     expo_router::ExpoRouterPlugin, gatsby::GatsbyPlugin, graphql_codegen::GraphqlCodegenPlugin,
-    husky::HuskyPlugin, i18next::I18nextPlugin, jest::JestPlugin, karma::KarmaPlugin,
-    knex::KnexPlugin, kysely::KyselyPlugin, lefthook::LefthookPlugin,
+    hardhat::HardhatPlugin, husky::HuskyPlugin, i18next::I18nextPlugin, jest::JestPlugin,
+    karma::KarmaPlugin, knex::KnexPlugin, kysely::KyselyPlugin, lefthook::LefthookPlugin,
     lint_staged::LintStagedPlugin, markdownlint::MarkdownlintPlugin, mocha::MochaPlugin,
     msw::MswPlugin, nestjs::NestJsPlugin, next_intl::NextIntlPlugin, nextjs::NextJsPlugin,
     nitro::NitroPlugin, nodemon::NodemonPlugin, nuxt::NuxtPlugin, nx::NxPlugin, nyc::NycPlugin,
     openapi_ts::OpenapiTsPlugin, oxlint::OxlintPlugin, parcel::ParcelPlugin,
-    playwright::PlaywrightPlugin, plop::PlopPlugin, pm2::Pm2Plugin, postcss::PostCssPlugin,
-    prettier::PrettierPlugin, prisma::PrismaPlugin, react_native::ReactNativePlugin,
-    react_router::ReactRouterPlugin, relay::RelayPlugin, remark::RemarkPlugin, remix::RemixPlugin,
-    rolldown::RolldownPlugin, rollup::RollupPlugin, rsbuild::RsbuildPlugin, rspack::RspackPlugin,
-    sanity::SanityPlugin, semantic_release::SemanticReleasePlugin, sentry::SentryPlugin,
+    playwright::PlaywrightPlugin, plop::PlopPlugin, pm2::Pm2Plugin, pnpm::PnpmPlugin,
+    postcss::PostCssPlugin, prettier::PrettierPlugin, prisma::PrismaPlugin, qwik::QwikPlugin,
+    react_native::ReactNativePlugin, react_router::ReactRouterPlugin, relay::RelayPlugin,
+    remark::RemarkPlugin, remix::RemixPlugin, rolldown::RolldownPlugin, rollup::RollupPlugin,
+    rsbuild::RsbuildPlugin, rspack::RspackPlugin, sanity::SanityPlugin,
+    semantic_release::SemanticReleasePlugin, sentry::SentryPlugin,
     simple_git_hooks::SimpleGitHooksPlugin, storybook::StorybookPlugin, stylelint::StylelintPlugin,
     sveltekit::SvelteKitPlugin, svgo::SvgoPlugin, svgr::SvgrPlugin, swc::SwcPlugin,
     syncpack::SyncpackPlugin, tailwind::TailwindPlugin, tanstack_router::TanstackRouterPlugin,
     tsdown::TsdownPlugin, tsup::TsupPlugin, turborepo::TurborepoPlugin, typedoc::TypedocPlugin,
-    typeorm::TypeormPlugin, typescript::TypeScriptPlugin, vite::VitePlugin,
+    typeorm::TypeormPlugin, typescript::TypeScriptPlugin, unocss::UnoCssPlugin, vite::VitePlugin,
     vitepress::VitePressPlugin, vitest::VitestPlugin, webdriverio::WebdriverioPlugin,
     webpack::WebpackPlugin, wrangler::WranglerPlugin,
 };
@@ -56,6 +57,8 @@ pub fn create_builtin_plugins() -> Vec<Box<dyn Plugin>> {
         Box::new(RelayPlugin),
         Box::new(ElectronPlugin),
         Box::new(I18nextPlugin),
+        Box::new(QwikPlugin),
+        Box::new(ConvexPlugin),
         // Bundlers
         Box::new(VitePlugin),
         Box::new(WebpackPlugin),
@@ -93,6 +96,7 @@ pub fn create_builtin_plugins() -> Vec<Box<dyn Plugin>> {
         // CSS
         Box::new(TailwindPlugin),
         Box::new(PostCssPlugin),
+        Box::new(UnoCssPlugin),
         // Database & ORM
         Box::new(PrismaPlugin),
         Box::new(DrizzlePlugin),
@@ -108,6 +112,8 @@ pub fn create_builtin_plugins() -> Vec<Box<dyn Plugin>> {
         Box::new(CommitlintPlugin),
         Box::new(CommitizenPlugin),
         Box::new(SemanticReleasePlugin),
+        // Blockchain
+        Box::new(HardhatPlugin),
         // Deployment
         Box::new(WranglerPlugin),
         Box::new(SentryPlugin),
@@ -132,6 +138,8 @@ pub fn create_builtin_plugins() -> Vec<Box<dyn Plugin>> {
         Box::new(NodemonPlugin),
         Box::new(Pm2Plugin),
         Box::new(DependencyCruiserPlugin),
+        // Package managers
+        Box::new(PnpmPlugin),
         // Runtime
         Box::new(BunPlugin),
     ]

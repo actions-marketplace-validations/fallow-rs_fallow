@@ -1420,7 +1420,7 @@ fn external_plugin_multiple_used_exports() {
 #[test]
 fn default_registry_has_all_builtin_plugins() {
     let registry = PluginRegistry::default();
-    // Verify we have the expected number of built-in plugins (85 as per docs)
+    // Verify we have the expected number of built-in plugins (90 as per docs)
     // We test a representative sample to avoid brittle exact count checks.
     let pkg = make_pkg(&[
         "next",

@@ -4,13 +4,13 @@
 
 AI agents write more code than ever. They rarely clean up after themselves. Every generated file, every scaffolded export, every copied utility accumulates until your codebase is half dead weight.
 
-Fallow is the counterbalance: fast, framework-aware dead code detection that works at the speed AI generates code. One binary, sub-second analysis, 14 issue types, 85 framework plugins, auto-fix, and native integration with the tools agents already use.
+Fallow is the counterbalance: fast, framework-aware dead code detection that works at the speed AI generates code. One binary, sub-second analysis, 14 issue types, 90 framework plugins, auto-fix, and native integration with the tools agents already use.
 
 ---
 
 ## Where we are (v2.30.0)
 
-**Dead code analysis** -- 14 issue types: unused files, exports, types, dependencies, enum/class members, unresolved imports, unlisted deps, duplicate exports, circular dependencies, type-only dependencies, and test-only production dependencies. 85 framework plugins with auto-detection. Auto-fix for safe removals. Inline suppression. Severity rules (`error` / `warn` / `off`).
+**Dead code analysis** -- 14 issue types: unused files, exports, types, dependencies, enum/class members, unresolved imports, unlisted deps, duplicate exports, circular dependencies, type-only dependencies, and test-only production dependencies. 90 framework plugins with auto-detection. Auto-fix for safe removals. Inline suppression. Severity rules (`error` / `warn` / `off`).
 
 **Code duplication** -- 4 detection modes (strict, mild, weak, semantic) with cross-language TS/JS matching and cross-directory filtering.
 

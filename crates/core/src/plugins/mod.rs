@@ -28,17 +28,20 @@ const TEST_ENTRY_POINT_PLUGINS: &[&str] = &[
 const RUNTIME_ENTRY_POINT_PLUGINS: &[&str] = &[
     "angular",
     "astro",
+    "convex",
     "docusaurus",
     "electron",
     "expo",
     "expo-router",
     "gatsby",
+    "hardhat",
     "nestjs",
     "next-intl",
     "nextjs",
     "nitro",
     "nuxt",
     "parcel",
+    "qwik",
     "react-native",
     "react-router",
     "remix",
@@ -910,6 +913,7 @@ mod capacitor;
 mod changesets;
 mod commitizen;
 mod commitlint;
+mod convex;
 mod cspell;
 mod cucumber;
 mod cypress;
@@ -922,6 +926,7 @@ mod expo;
 mod expo_router;
 mod gatsby;
 mod graphql_codegen;
+mod hardhat;
 mod husky;
 mod i18next;
 mod jest;
@@ -947,9 +952,11 @@ mod parcel;
 mod playwright;
 mod plop;
 mod pm2;
+mod pnpm;
 mod postcss;
 mod prettier;
 mod prisma;
+mod qwik;
 mod react_native;
 mod react_router;
 mod relay;
@@ -978,6 +985,7 @@ mod turborepo;
 mod typedoc;
 mod typeorm;
 mod typescript;
+mod unocss;
 mod vite;
 mod vitepress;
 mod vitest;
