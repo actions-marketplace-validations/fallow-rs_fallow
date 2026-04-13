@@ -29,7 +29,7 @@ fn unresolved_import_detected() {
     }];
 
     let config = test_config(PathBuf::from("/project"));
-    let suppressions: FxHashMap<FileId, &[Suppression]> = FxHashMap::default();
+    let suppressions = SuppressionContext::empty();
     let line_offsets: LineOffsetsMap<'_> = FxHashMap::default();
 
     let unresolved = find_unresolved_imports(
@@ -72,7 +72,7 @@ fn unresolved_virtual_module_not_reported() {
     }];
 
     let config = test_config(PathBuf::from("/project"));
-    let suppressions: FxHashMap<FileId, &[Suppression]> = FxHashMap::default();
+    let suppressions = SuppressionContext::empty();
     let line_offsets: LineOffsetsMap<'_> = FxHashMap::default();
 
     let unresolved = find_unresolved_imports(
@@ -117,7 +117,7 @@ fn unresolved_import_with_virtual_prefix_not_reported() {
     }];
 
     let config = test_config(PathBuf::from("/project"));
-    let suppressions: FxHashMap<FileId, &[Suppression]> = FxHashMap::default();
+    let suppressions = SuppressionContext::empty();
     let line_offsets: LineOffsetsMap<'_> = FxHashMap::default();
 
     let unresolved = find_unresolved_imports(
@@ -186,7 +186,7 @@ fn unresolved_import_suppressed_by_generated_import_pattern() {
     }];
 
     let config = test_config(PathBuf::from("/project"));
-    let suppressions: FxHashMap<FileId, &[Suppression]> = FxHashMap::default();
+    let suppressions = SuppressionContext::empty();
     let line_offsets: LineOffsetsMap<'_> = FxHashMap::default();
 
     let unresolved = find_unresolved_imports(
@@ -234,10 +234,12 @@ fn unresolved_import_suppressed_by_inline_comment() {
     // Suppress unresolved imports on line 1 (byte offset 0 => line 1 without offsets)
     let supps = vec![Suppression {
         line: 1,
+        comment_line: 0,
         kind: Some(suppress::IssueKind::UnresolvedImport),
     }];
-    let mut suppressions: FxHashMap<FileId, &[Suppression]> = FxHashMap::default();
-    suppressions.insert(FileId(0), &supps);
+    let mut supp_map: FxHashMap<FileId, &[Suppression]> = FxHashMap::default();
+    supp_map.insert(FileId(0), &supps);
+    let suppressions = SuppressionContext::from_map(supp_map);
     let line_offsets: LineOffsetsMap<'_> = FxHashMap::default();
 
     let unresolved = find_unresolved_imports(
@@ -285,10 +287,12 @@ fn unresolved_import_file_level_suppression() {
     // File-level suppression (line 0)
     let supps = vec![Suppression {
         line: 0,
+        comment_line: 1,
         kind: Some(suppress::IssueKind::UnresolvedImport),
     }];
-    let mut suppressions: FxHashMap<FileId, &[Suppression]> = FxHashMap::default();
-    suppressions.insert(FileId(0), &supps);
+    let mut supp_map: FxHashMap<FileId, &[Suppression]> = FxHashMap::default();
+    supp_map.insert(FileId(0), &supps);
+    let suppressions = SuppressionContext::from_map(supp_map);
     let line_offsets: LineOffsetsMap<'_> = FxHashMap::default();
 
     let unresolved = find_unresolved_imports(
@@ -346,7 +350,7 @@ fn resolved_import_not_reported_as_unresolved() {
     }];
 
     let config = test_config(PathBuf::from("/project"));
-    let suppressions: FxHashMap<FileId, &[Suppression]> = FxHashMap::default();
+    let suppressions = SuppressionContext::empty();
     let line_offsets: LineOffsetsMap<'_> = FxHashMap::default();
 
     let unresolved = find_unresolved_imports(
@@ -370,7 +374,7 @@ fn resolved_import_not_reported_as_unresolved() {
 fn no_resolved_modules_produces_no_unresolved() {
     let resolved_modules: Vec<ResolvedModule> = vec![];
     let config = test_config(PathBuf::from("/project"));
-    let suppressions: FxHashMap<FileId, &[Suppression]> = FxHashMap::default();
+    let suppressions = SuppressionContext::empty();
     let line_offsets: LineOffsetsMap<'_> = FxHashMap::default();
 
     let unresolved = find_unresolved_imports(
@@ -417,13 +421,15 @@ fn unresolved_import_not_suppressed_by_wrong_kind() {
     }];
 
     let config = test_config(PathBuf::from("/project"));
-    // Suppress a DIFFERENT issue kind on line 1 — should NOT suppress unresolved import
+    // Suppress a DIFFERENT issue kind on line 1 -- should NOT suppress unresolved import
     let supps = vec![Suppression {
         line: 1,
+        comment_line: 0,
         kind: Some(suppress::IssueKind::UnusedExport),
     }];
-    let mut suppressions: FxHashMap<FileId, &[Suppression]> = FxHashMap::default();
-    suppressions.insert(FileId(0), &supps);
+    let mut supp_map: FxHashMap<FileId, &[Suppression]> = FxHashMap::default();
+    supp_map.insert(FileId(0), &supps);
+    let suppressions = SuppressionContext::from_map(supp_map);
     let line_offsets: LineOffsetsMap<'_> = FxHashMap::default();
 
     let unresolved = find_unresolved_imports(

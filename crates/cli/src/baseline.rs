@@ -60,6 +60,9 @@ pub struct BaselineData {
     /// Boundary violations, keyed by `from_path->to_path`.
     #[serde(default)]
     pub boundary_violations: Vec<String>,
+    /// Stale suppressions, keyed by `file:line`.
+    #[serde(default)]
+    pub stale_suppressions: Vec<String>,
 }
 
 impl BaselineData {
@@ -154,6 +157,11 @@ impl BaselineData {
                 .iter()
                 .map(|v| boundary_violation_key(v, root))
                 .collect(),
+            stale_suppressions: results
+                .stale_suppressions
+                .iter()
+                .map(|s| format!("{}:{}", relative_path(&s.path, root), s.line))
+                .collect(),
         }
     }
 
@@ -174,6 +182,7 @@ impl BaselineData {
             + self.type_only_dependencies.len()
             + self.test_only_dependencies.len()
             + self.boundary_violations.len()
+            + self.stale_suppressions.len()
     }
 }
 
@@ -349,6 +358,16 @@ pub fn filter_new_issues(
     results.boundary_violations.retain(|v| {
         let key = boundary_violation_key(v, root);
         !baseline_boundary.contains(key.as_str())
+    });
+
+    let baseline_stale: FxHashSet<&str> = baseline
+        .stale_suppressions
+        .iter()
+        .map(String::as_str)
+        .collect();
+    results.stale_suppressions.retain(|s| {
+        let key = format!("{}:{}", relative_path(&s.path, root), s.line);
+        !baseline_stale.contains(key.as_str())
     });
 
     results
@@ -699,6 +718,7 @@ mod tests {
             type_only_dependencies: vec![],
             test_only_dependencies: vec![],
             boundary_violations: vec![],
+            stale_suppressions: vec![],
         };
         let results = AnalysisResults {
             unused_files: vec![
@@ -737,6 +757,7 @@ mod tests {
             type_only_dependencies: vec![],
             test_only_dependencies: vec![],
             boundary_violations: vec![],
+            stale_suppressions: vec![],
         };
         let results = make_results();
         let filtered = filter_new_issues(results, &baseline, Path::new(""));
@@ -762,6 +783,7 @@ mod tests {
             type_only_dependencies: vec![],
             test_only_dependencies: vec![],
             boundary_violations: vec![],
+            stale_suppressions: vec![],
         };
         let results = AnalysisResults {
             unused_exports: vec![

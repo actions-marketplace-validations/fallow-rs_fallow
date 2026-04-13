@@ -414,7 +414,7 @@ fn multiple_unresolved_imports_collected() {
     }];
 
     let config = test_config(PathBuf::from("/project"));
-    let suppressions: FxHashMap<FileId, &[Suppression]> = FxHashMap::default();
+    let suppressions = SuppressionContext::empty();
     let line_offsets: LineOffsetsMap<'_> = FxHashMap::default();
 
     let unresolved = find_unresolved_imports(

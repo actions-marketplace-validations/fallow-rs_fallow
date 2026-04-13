@@ -45,6 +45,7 @@ pub fn cached_to_module(
                 2 => VisibilityTag::Internal,
                 3 => VisibilityTag::Beta,
                 4 => VisibilityTag::Alpha,
+                5 => VisibilityTag::ExpectedUnused,
                 _ => VisibilityTag::None,
             },
             span: Span::new(e.span_start, e.span_end),
@@ -130,6 +131,7 @@ pub fn cached_to_module(
         .iter()
         .map(|s| crate::suppress::Suppression {
             line: s.line,
+            comment_line: s.comment_line,
             kind: if s.kind == 0 {
                 None
             } else {
@@ -277,6 +279,7 @@ pub fn module_to_cached(
             .iter()
             .map(|s| CachedSuppression {
                 line: s.line,
+                comment_line: s.comment_line,
                 kind: s
                     .kind
                     .map_or(0, crate::suppress::IssueKind::to_discriminant),

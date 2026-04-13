@@ -105,6 +105,10 @@ fn section_footer_text(title: &str) -> Option<(&'static str, &'static str)> {
             "Imports that cross defined architecture zone boundaries",
             "https://docs.fallow.tools/explanations/dead-code#boundary-violations",
         )),
+        "Stale suppressions" => Some((
+            "Suppression comments or JSDoc tags that no longer match any issue",
+            "https://docs.fallow.tools/explanations/dead-code#stale-suppressions",
+        )),
         t if t.starts_with("Type-only") => Some((
             "Dependencies only used for type imports \u{2014} consider moving to devDependencies",
             "https://docs.fallow.tools/explanations/dead-code#type-only-dependencies",

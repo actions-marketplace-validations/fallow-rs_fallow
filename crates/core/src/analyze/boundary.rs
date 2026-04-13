@@ -4,7 +4,7 @@ use fallow_config::ResolvedConfig;
 
 use crate::discover::FileId;
 use crate::graph::ModuleGraph;
-use crate::suppress::{self, IssueKind, Suppression};
+use crate::suppress::{IssueKind, SuppressionContext};
 use fallow_types::results::BoundaryViolation;
 
 use super::{LineOffsetsMap, byte_offset_to_line_col};
@@ -17,7 +17,7 @@ use super::{LineOffsetsMap, byte_offset_to_line_col};
 pub fn find_boundary_violations(
     graph: &ModuleGraph,
     config: &ResolvedConfig,
-    suppressions_by_file: &FxHashMap<FileId, &[Suppression]>,
+    suppressions: &SuppressionContext<'_>,
     line_offsets_by_file: &LineOffsetsMap<'_>,
 ) -> Vec<BoundaryViolation> {
     let boundaries = &config.boundaries;
@@ -59,10 +59,7 @@ pub fn find_boundary_violations(
         }
 
         // Check file-level suppression.
-        if suppressions_by_file
-            .get(&node.file_id)
-            .is_some_and(|supps| suppress::is_file_suppressed(supps, IssueKind::BoundaryViolation))
-        {
+        if suppressions.is_file_suppressed(node.file_id, IssueKind::BoundaryViolation) {
             continue;
         }
 
@@ -82,12 +79,7 @@ pub fn find_boundary_violations(
                 byte_offset_to_line_col(line_offsets_by_file, node.file_id, s)
             });
 
-            if suppressions_by_file
-                .get(&node.file_id)
-                .is_some_and(|supps| {
-                    suppress::is_suppressed(supps, line, IssueKind::BoundaryViolation)
-                })
-            {
+            if suppressions.is_suppressed(node.file_id, line, IssueKind::BoundaryViolation) {
                 continue;
             }
 
@@ -226,7 +218,7 @@ mod tests {
         let root = PathBuf::from("/tmp/boundary-test");
         let config = make_config(root.clone(), BoundaryConfig::default());
         let (_, graph) = build_graph(&root, &["src/ui/Button.tsx", "src/db/query.ts"], &[(0, 1)]);
-        let suppressions = FxHashMap::default();
+        let suppressions = SuppressionContext::empty();
         let line_offsets = FxHashMap::default();
 
         let violations = find_boundary_violations(&graph, &config, &suppressions, &line_offsets);
@@ -261,7 +253,7 @@ mod tests {
             &["src/ui/Button.tsx", "src/shared/utils.ts"],
             &[(0, 1)],
         );
-        let suppressions = FxHashMap::default();
+        let suppressions = SuppressionContext::empty();
         let line_offsets = FxHashMap::default();
 
         let violations = find_boundary_violations(&graph, &config, &suppressions, &line_offsets);
@@ -297,7 +289,7 @@ mod tests {
         };
         let config = make_config(root.clone(), boundaries);
         let (_, graph) = build_graph(&root, &["src/ui/Button.tsx", "src/db/query.ts"], &[(0, 1)]);
-        let suppressions = FxHashMap::default();
+        let suppressions = SuppressionContext::empty();
         let line_offsets = FxHashMap::default();
 
         let violations = find_boundary_violations(&graph, &config, &suppressions, &line_offsets);
@@ -327,7 +319,7 @@ mod tests {
             &["src/ui/Button.tsx", "src/ui/helpers.ts"],
             &[(0, 1)],
         );
-        let suppressions = FxHashMap::default();
+        let suppressions = SuppressionContext::empty();
         let line_offsets = FxHashMap::default();
 
         let violations = find_boundary_violations(&graph, &config, &suppressions, &line_offsets);
@@ -352,7 +344,7 @@ mod tests {
         let config = make_config(root.clone(), boundaries);
         // src/utils.ts is unzoned — importing it from ui should be allowed
         let (_, graph) = build_graph(&root, &["src/ui/Button.tsx", "src/utils.ts"], &[(0, 1)]);
-        let suppressions = FxHashMap::default();
+        let suppressions = SuppressionContext::empty();
         let line_offsets = FxHashMap::default();
 
         let violations = find_boundary_violations(&graph, &config, &suppressions, &line_offsets);
@@ -387,10 +379,12 @@ mod tests {
         // File-level suppression (line 0)
         let supps = vec![Suppression {
             line: 0,
+            comment_line: 1,
             kind: Some(IssueKind::BoundaryViolation),
         }];
-        let mut suppressions = FxHashMap::default();
-        suppressions.insert(FileId(0), supps.as_slice());
+        let mut supp_map = FxHashMap::default();
+        supp_map.insert(FileId(0), supps.as_slice());
+        let suppressions = SuppressionContext::from_map(supp_map);
         let line_offsets = FxHashMap::default();
 
         let violations = find_boundary_violations(&graph, &config, &suppressions, &line_offsets);

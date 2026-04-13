@@ -68,6 +68,7 @@ const ISSUE_TYPE_TO_DIAGNOSTIC_CODE: &[(&str, &str)] = &[
     ("duplicate-exports", "duplicate-export"),
     ("type-only-dependencies", "type-only-dependency"),
     ("circular-dependencies", "circular-dependency"),
+    ("stale-suppressions", "stale-suppression"),
 ];
 
 struct FallowLspServer {

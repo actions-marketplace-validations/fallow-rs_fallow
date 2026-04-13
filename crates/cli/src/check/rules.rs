@@ -31,6 +31,9 @@ pub fn apply_rules(results: &mut fallow_core::results::AnalysisResults, config: 
         results
             .unresolved_imports
             .retain(|i| config.resolve_rules_for_path(&i.path).unresolved_imports != Severity::Off);
+        results
+            .stale_suppressions
+            .retain(|s| config.resolve_rules_for_path(&s.path).stale_suppressions != Severity::Off);
     } else {
         if rules.unused_files == Severity::Off {
             results.unused_files.clear();
@@ -49,6 +52,9 @@ pub fn apply_rules(results: &mut fallow_core::results::AnalysisResults, config: 
         }
         if rules.unresolved_imports == Severity::Off {
             results.unresolved_imports.clear();
+        }
+        if rules.stale_suppressions == Severity::Off {
+            results.stale_suppressions.clear();
         }
     }
 
@@ -117,6 +123,9 @@ pub fn has_error_severity_issues(
             || results.unresolved_imports.iter().any(|i| {
                 config.resolve_rules_for_path(&i.path).unresolved_imports == Severity::Error
             })
+            || results.stale_suppressions.iter().any(|s| {
+                config.resolve_rules_for_path(&s.path).stale_suppressions == Severity::Error
+            })
     } else {
         (rules.unused_files == Severity::Error && !results.unused_files.is_empty())
             || (rules.unused_exports == Severity::Error && !results.unused_exports.is_empty())
@@ -127,6 +136,8 @@ pub fn has_error_severity_issues(
                 && !results.unused_class_members.is_empty())
             || (rules.unresolved_imports == Severity::Error
                 && !results.unresolved_imports.is_empty())
+            || (rules.stale_suppressions == Severity::Error
+                && !results.stale_suppressions.is_empty())
     };
 
     // Non-file-scoped issue types: always use base rules
@@ -197,6 +208,9 @@ pub fn promote_warns_to_errors(rules: &mut RulesConfig) {
     }
     if rules.coverage_gaps == Severity::Warn {
         rules.coverage_gaps = Severity::Error;
+    }
+    if rules.stale_suppressions == Severity::Warn {
+        rules.stale_suppressions = Severity::Error;
     }
 }
 
@@ -388,6 +402,7 @@ mod tests {
             circular_dependencies: Severity::Off,
             coverage_gaps: Severity::Off,
             feature_flags: Severity::Off,
+            stale_suppressions: Severity::Off,
         };
         let config = config_with_rules(rules);
         apply_rules(&mut results, &config);
@@ -490,6 +505,7 @@ mod tests {
             circular_dependencies: Severity::Warn,
             coverage_gaps: Severity::Warn,
             feature_flags: Severity::Warn,
+            stale_suppressions: Severity::Warn,
         };
         assert!(!has_error_severity_issues(&results, &rules, None));
     }
@@ -518,6 +534,7 @@ mod tests {
             circular_dependencies: Severity::Warn,
             coverage_gaps: Severity::Warn,
             feature_flags: Severity::Warn,
+            stale_suppressions: Severity::Warn,
         };
         // Only unused_files present, but set to Warn — should not trigger
         assert!(!has_error_severity_issues(&results, &rules, None));
@@ -701,6 +718,7 @@ mod tests {
             circular_dependencies: Severity::Warn,
             coverage_gaps: Severity::Warn,
             feature_flags: Severity::Warn,
+            stale_suppressions: Severity::Warn,
         };
         promote_warns_to_errors(&mut rules);
 
@@ -741,6 +759,7 @@ mod tests {
             circular_dependencies: Severity::Off,
             coverage_gaps: Severity::Off,
             feature_flags: Severity::Off,
+            stale_suppressions: Severity::Off,
         };
         promote_warns_to_errors(&mut rules);
 

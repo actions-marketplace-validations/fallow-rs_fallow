@@ -1,8 +1,8 @@
 use rustc_hash::FxHashMap;
 
 use tower_lsp::lsp_types::{
-    CodeDescription, Diagnostic, DiagnosticRelatedInformation, DiagnosticSeverity, Location,
-    NumberOrString, Position, Range, Url,
+    CodeDescription, Diagnostic, DiagnosticRelatedInformation, DiagnosticSeverity, DiagnosticTag,
+    Location, NumberOrString, Position, Range, Url,
 };
 
 use fallow_core::duplicates::DuplicationReport;
@@ -151,6 +151,43 @@ pub fn push_duplication_diagnostics(
                 ..Default::default()
             });
         }
+    }
+}
+
+pub fn push_stale_suppression_diagnostics(
+    map: &mut FxHashMap<Url, Vec<Diagnostic>>,
+    results: &AnalysisResults,
+) {
+    for s in &results.stale_suppressions {
+        let Ok(uri) = Url::from_file_path(&s.path) else {
+            continue;
+        };
+        let line = s.line.saturating_sub(1);
+        let message = format!(
+            "Stale suppression: {} ({})",
+            s.description(),
+            s.explanation()
+        );
+
+        map.entry(uri).or_default().push(Diagnostic {
+            range: Range {
+                start: Position {
+                    line,
+                    character: s.col,
+                },
+                end: Position {
+                    line,
+                    character: u32::MAX,
+                },
+            },
+            severity: Some(DiagnosticSeverity::HINT),
+            source: Some("fallow".to_string()),
+            code: Some(NumberOrString::String("stale-suppression".to_string())),
+            code_description: doc_link("stale-suppressions"),
+            message,
+            tags: Some(vec![DiagnosticTag::UNNECESSARY]),
+            ..Default::default()
+        });
     }
 }
 

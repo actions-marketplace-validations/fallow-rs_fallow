@@ -18,7 +18,8 @@ pub struct AnalyzeParams {
     /// Issue types to include. When set, only these types are reported.
     /// Valid values: unused-files, unused-exports, unused-types, unused-deps,
     /// unused-enum-members, unused-class-members, unresolved-imports,
-    /// unlisted-deps, duplicate-exports, circular-deps, boundary-violations.
+    /// unlisted-deps, duplicate-exports, circular-deps, boundary-violations,
+    /// stale-suppressions.
     pub issue_types: Option<Vec<String>>,
 
     #[schemars(

@@ -22,7 +22,7 @@ pub(super) use crate::resolve::{ResolveResult, ResolvedImport, ResolvedModule};
 #[allow(unused_imports, reason = "shared re-export for sibling test modules")]
 pub(super) use crate::results::*;
 #[allow(unused_imports, reason = "shared re-export for sibling test modules")]
-pub(super) use crate::suppress::{self, Suppression};
+pub(super) use crate::suppress::{self, Suppression, SuppressionContext};
 
 #[allow(unused_imports, reason = "shared re-export for sibling test modules")]
 pub(super) use super::super::{

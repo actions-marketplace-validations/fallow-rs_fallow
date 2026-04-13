@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::extract::MemberKind;
 use crate::serde_path;
+use crate::suppress::IssueKind;
 
 /// Summary of detected entry points, grouped by discovery source.
 ///
@@ -73,6 +74,9 @@ pub struct AnalysisResults {
     /// Imports that cross architecture boundary rules.
     #[serde(default)]
     pub boundary_violations: Vec<BoundaryViolation>,
+    /// Suppression comments or JSDoc tags that no longer match any issue.
+    #[serde(default)]
+    pub stale_suppressions: Vec<StaleSuppression>,
     /// Detected feature flag patterns. Advisory output, not included in issue counts.
     /// Skipped during default serialization: injected separately in JSON output when enabled.
     #[serde(skip)]
@@ -130,6 +134,7 @@ impl AnalysisResults {
             + self.test_only_dependencies.len()
             + self.circular_dependencies.len()
             + self.boundary_violations.len()
+            + self.stale_suppressions.len()
     }
 
     /// Whether any issues were found.
@@ -243,6 +248,13 @@ impl AnalysisResults {
                 .then(a.line.cmp(&b.line))
                 .then(a.col.cmp(&b.col))
                 .then(a.to_path.cmp(&b.to_path))
+        });
+
+        self.stale_suppressions.sort_by(|a, b| {
+            a.path
+                .cmp(&b.path)
+                .then(a.line.cmp(&b.line))
+                .then(a.col.cmp(&b.col))
         });
 
         self.feature_flags.sort_by(|a, b| {
@@ -481,6 +493,100 @@ pub struct BoundaryViolation {
     pub line: u32,
     /// 0-based byte column offset of the import statement.
     pub col: u32,
+}
+
+/// The origin of a stale suppression: inline comment or JSDoc tag.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case", tag = "type")]
+pub enum SuppressionOrigin {
+    /// A `// fallow-ignore-next-line` or `// fallow-ignore-file` comment.
+    Comment {
+        /// The issue kind token from the comment (e.g., "unused-exports"), or None for blanket.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        issue_kind: Option<String>,
+        /// Whether this was a file-level suppression.
+        is_file_level: bool,
+    },
+    /// An `@expected-unused` JSDoc tag on an export.
+    JsdocTag {
+        /// The name of the export that was tagged.
+        export_name: String,
+    },
+}
+
+/// A suppression comment or JSDoc tag that no longer matches any issue.
+#[derive(Debug, Clone, Serialize)]
+pub struct StaleSuppression {
+    /// File containing the stale suppression.
+    #[serde(serialize_with = "serde_path::serialize")]
+    pub path: PathBuf,
+    /// 1-based line number of the suppression comment or tag.
+    pub line: u32,
+    /// 0-based byte column offset.
+    pub col: u32,
+    /// The origin and details of the stale suppression.
+    pub origin: SuppressionOrigin,
+}
+
+impl StaleSuppression {
+    /// Produce a human-readable description of this stale suppression.
+    #[must_use]
+    pub fn description(&self) -> String {
+        match &self.origin {
+            SuppressionOrigin::Comment {
+                issue_kind,
+                is_file_level,
+            } => {
+                let directive = if *is_file_level {
+                    "fallow-ignore-file"
+                } else {
+                    "fallow-ignore-next-line"
+                };
+                match issue_kind {
+                    Some(kind) => format!("// {directive} {kind}"),
+                    None => format!("// {directive}"),
+                }
+            }
+            SuppressionOrigin::JsdocTag { export_name } => {
+                format!("@expected-unused on {export_name}")
+            }
+        }
+    }
+
+    /// Produce an explanation of why this suppression is stale.
+    #[must_use]
+    pub fn explanation(&self) -> String {
+        match &self.origin {
+            SuppressionOrigin::Comment {
+                issue_kind,
+                is_file_level,
+            } => {
+                let scope = if *is_file_level {
+                    "in this file"
+                } else {
+                    "on the next line"
+                };
+                match issue_kind {
+                    Some(kind) => format!("no {kind} issue found {scope}"),
+                    None => format!("no issues found {scope}"),
+                }
+            }
+            SuppressionOrigin::JsdocTag { export_name } => {
+                format!("{export_name} is now used")
+            }
+        }
+    }
+
+    /// The suppressed `IssueKind`, if this was a comment suppression with a specific kind.
+    #[must_use]
+    pub fn suppressed_kind(&self) -> Option<IssueKind> {
+        match &self.origin {
+            SuppressionOrigin::Comment { issue_kind, .. } => {
+                issue_kind.as_deref().and_then(IssueKind::parse)
+            }
+            SuppressionOrigin::JsdocTag { .. } => None,
+        }
+    }
 }
 
 /// The detection method used to identify a feature flag.

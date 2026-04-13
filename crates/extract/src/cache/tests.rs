@@ -894,14 +894,17 @@ fn module_to_cached_roundtrip_suppressions_with_kinds() {
         suppressions: vec![
             Suppression {
                 line: 0,
+                comment_line: 1,
                 kind: None,
             },
             Suppression {
                 line: 5,
+                comment_line: 4,
                 kind: Some(IssueKind::UnusedExport),
             },
             Suppression {
                 line: 10,
+                comment_line: 9,
                 kind: Some(IssueKind::UnusedFile),
             },
         ],

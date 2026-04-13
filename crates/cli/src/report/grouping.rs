@@ -244,6 +244,13 @@ pub fn group_analysis_results(
             .boundary_violations
             .push(item.clone());
     }
+    for item in &results.stale_suppressions {
+        groups
+            .entry(key_for(&item.path))
+            .or_default()
+            .stale_suppressions
+            .push(item.clone());
+    }
 
     // ── Sort: most issues first, alphabetical tiebreaker, (unowned) last
     let mut sorted: Vec<_> = groups

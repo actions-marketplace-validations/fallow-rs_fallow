@@ -7,7 +7,7 @@ use bitcode::{Decode, Encode};
 use crate::MemberKind;
 
 /// Cache version — bump when the cache format or cached extraction semantics change.
-pub(super) const CACHE_VERSION: u32 = 39;
+pub(super) const CACHE_VERSION: u32 = 40;
 
 /// Maximum cache file size to deserialize (256 MB).
 pub(super) const MAX_CACHE_SIZE: usize = 256 * 1024 * 1024;
@@ -64,7 +64,9 @@ pub struct CachedModule {
 pub struct CachedSuppression {
     /// 1-based line this suppression applies to. 0 = file-wide.
     pub line: u32,
-    /// 0 = suppress all, 1-10 = `IssueKind` discriminant.
+    /// 1-based line where the comment itself appears.
+    pub comment_line: u32,
+    /// 0 = suppress all, 1-19 = `IssueKind` discriminant.
     pub kind: u8,
 }
 

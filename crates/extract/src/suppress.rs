@@ -42,31 +42,36 @@ pub fn parse_suppressions(comments: &[Comment], source: &str) -> Vec<Suppression
 
         if let Some(rest) = trimmed.strip_prefix("fallow-ignore-file") {
             let rest = rest.trim();
+            let src_comment_line = byte_offset_to_line(source, comment.span.start);
             if rest.is_empty() {
                 suppressions.push(Suppression {
                     line: 0,
+                    comment_line: src_comment_line,
                     kind: None,
                 });
             } else if let Some(kind) = IssueKind::parse(rest) {
                 suppressions.push(Suppression {
                     line: 0,
+                    comment_line: src_comment_line,
                     kind: Some(kind),
                 });
             }
             // Unknown kind token: silently ignore (no suppression created)
         } else if let Some(rest) = trimmed.strip_prefix("fallow-ignore-next-line") {
             let rest = rest.trim();
-            let comment_line = byte_offset_to_line(source, comment.span.start);
-            let suppressed_line = comment_line + 1;
+            let src_comment_line = byte_offset_to_line(source, comment.span.start);
+            let suppressed_line = src_comment_line + 1;
 
             if rest.is_empty() {
                 suppressions.push(Suppression {
                     line: suppressed_line,
+                    comment_line: src_comment_line,
                     kind: None,
                 });
             } else if let Some(kind) = IssueKind::parse(rest) {
                 suppressions.push(Suppression {
                     line: suppressed_line,
+                    comment_line: src_comment_line,
                     kind: Some(kind),
                 });
             }
@@ -104,29 +109,35 @@ pub fn parse_suppressions_from_source(source: &str) -> Vec<Suppression> {
 
         if let Some(rest) = text.strip_prefix("fallow-ignore-file") {
             let rest = rest.trim();
+            let src_comment_line = (line_idx as u32) + 1; // 1-based
             if rest.is_empty() {
                 suppressions.push(Suppression {
                     line: 0,
+                    comment_line: src_comment_line,
                     kind: None,
                 });
             } else if let Some(kind) = IssueKind::parse(rest) {
                 suppressions.push(Suppression {
                     line: 0,
+                    comment_line: src_comment_line,
                     kind: Some(kind),
                 });
             }
         } else if let Some(rest) = text.strip_prefix("fallow-ignore-next-line") {
             let rest = rest.trim();
-            let suppressed_line = (line_idx as u32) + 2; // 1-based, next line
+            let src_comment_line = (line_idx as u32) + 1; // 1-based
+            let suppressed_line = src_comment_line + 1; // next line
 
             if rest.is_empty() {
                 suppressions.push(Suppression {
                     line: suppressed_line,
+                    comment_line: src_comment_line,
                     kind: None,
                 });
             } else if let Some(kind) = IssueKind::parse(rest) {
                 suppressions.push(Suppression {
                     line: suppressed_line,
+                    comment_line: src_comment_line,
                     kind: Some(kind),
                 });
             }

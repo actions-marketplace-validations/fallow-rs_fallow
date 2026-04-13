@@ -250,6 +250,11 @@ fn build_sarif_rules(rules: &RulesConfig) -> Vec<serde_json::Value> {
             "Import crosses an architecture boundary",
             severity_to_sarif_level(rules.boundary_violation),
         ),
+        sarif_rule(
+            "fallow/stale-suppression",
+            "Suppression comment or tag no longer matches any issue",
+            severity_to_sarif_level(rules.stale_suppressions),
+        ),
     ]
 }
 
@@ -490,6 +495,19 @@ pub fn build_sarif(
                 },
                 properties: None,
             }
+        },
+    );
+
+    push_sarif_results(
+        &mut sarif_results,
+        &results.stale_suppressions,
+        |suppression| SarifFields {
+            rule_id: "fallow/stale-suppression",
+            level: severity_to_sarif_level(rules.stale_suppressions),
+            message: suppression.description(),
+            uri: relative_uri(&suppression.path, root),
+            region: Some((suppression.line, suppression.col + 1)),
+            properties: None,
         },
     );
 
@@ -816,7 +834,7 @@ mod tests {
         let rules = sarif["runs"][0]["tool"]["driver"]["rules"]
             .as_array()
             .expect("rules should be an array");
-        assert_eq!(rules.len(), 15);
+        assert_eq!(rules.len(), 16);
 
         let rule_ids: Vec<&str> = rules.iter().map(|r| r["id"].as_str().unwrap()).collect();
         assert!(rule_ids.contains(&"fallow/unused-file"));

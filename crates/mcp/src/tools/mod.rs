@@ -105,6 +105,7 @@ pub const ISSUE_TYPE_FLAGS: &[(&str, &str)] = &[
     ("duplicate-exports", "--duplicate-exports"),
     ("circular-deps", "--circular-deps"),
     ("boundary-violations", "--boundary-violations"),
+    ("stale-suppressions", "--stale-suppressions"),
 ];
 
 /// Valid detection modes for the `find_dupes` tool.

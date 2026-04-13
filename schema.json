@@ -124,7 +124,8 @@
         "circular-dependencies": "error",
         "boundary-violation": "error",
         "coverage-gaps": "off",
-        "feature-flags": "off"
+        "feature-flags": "off",
+        "stale-suppressions": "warn"
       }
     },
     "boundaries": {
@@ -653,6 +654,10 @@
         "feature-flags": {
           "$ref": "#/$defs/Severity",
           "default": "off"
+        },
+        "stale-suppressions": {
+          "$ref": "#/$defs/Severity",
+          "default": "warn"
         }
       }
     },
@@ -1021,6 +1026,16 @@
           ]
         },
         "feature-flags": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Severity"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "stale-suppressions": {
           "anyOf": [
             {
               "$ref": "#/$defs/Severity"

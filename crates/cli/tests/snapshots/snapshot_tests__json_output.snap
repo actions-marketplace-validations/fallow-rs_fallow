@@ -21,7 +21,8 @@ expression: "json_str.replace(&format!(\"\\\"version\\\": \\\"{}\\\"\", env!(\"C
     "type_only_dependencies": 1,
     "test_only_dependencies": 1,
     "circular_dependencies": 1,
-    "boundary_violations": 0
+    "boundary_violations": 0,
+    "stale_suppressions": 0
   },
   "unused_files": [
     {
@@ -354,5 +355,6 @@ expression: "json_str.replace(&format!(\"\\\"version\\\": \\\"{}\\\"\", env!(\"C
       ]
     }
   ],
-  "boundary_violations": []
+  "boundary_violations": [],
+  "stale_suppressions": []
 }

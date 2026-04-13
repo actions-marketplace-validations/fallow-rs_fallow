@@ -33,6 +33,7 @@ pub struct IssueFilters {
     pub duplicate_exports: bool,
     pub circular_deps: bool,
     pub boundary_violations: bool,
+    pub stale_suppressions: bool,
 }
 
 impl IssueFilters {
@@ -48,6 +49,7 @@ impl IssueFilters {
             || self.duplicate_exports
             || self.circular_deps
             || self.boundary_violations
+            || self.stale_suppressions
     }
 
     /// When any filter is active, clear issue types that were NOT requested.
@@ -90,6 +92,9 @@ impl IssueFilters {
         }
         if !self.boundary_violations {
             results.boundary_violations.clear();
+        }
+        if !self.stale_suppressions {
+            results.stale_suppressions.clear();
         }
     }
 }
@@ -568,6 +573,7 @@ mod tests {
             duplicate_exports: false,
             circular_deps: false,
             boundary_violations: false,
+            stale_suppressions: false,
         }
     }
 
@@ -900,6 +906,7 @@ mod tests {
             duplicate_exports: true,
             circular_deps: true,
             boundary_violations: true,
+            stale_suppressions: true,
         };
         let total_before = results.total_issues();
         f.apply(&mut results);

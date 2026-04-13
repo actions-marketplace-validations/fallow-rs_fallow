@@ -120,6 +120,15 @@ pub(super) fn sample_results(root: &Path) -> AnalysisResults {
         line: 2,
         col: 0,
     });
+    r.stale_suppressions.push(StaleSuppression {
+        path: root.join("src/utils.ts"),
+        line: 5,
+        col: 0,
+        origin: SuppressionOrigin::Comment {
+            issue_kind: Some("unused-exports".to_string()),
+            is_file_level: false,
+        },
+    });
 
     r
 }

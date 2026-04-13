@@ -31,5 +31,11 @@ def add_cmd(pkg): if pm == "pnpm" then "pnpm add \(pkg)" elif pm == "yarn" then 
   (.boundary_violations[]? |
     "::warning file=\(.from_path | san)\(if .line > 0 then ",line=\(.line),col=\(.col + 1)" else "" end),title=Boundary violation::Import from zone '\(.from_zone | san)' to zone '\(.to_zone | san)' is not allowed.\(nl)\(.from_path | san) -> \(.to_path | san)\(nl)\(nl)Route the import through an allowed zone or restructure the dependency."),
   (.type_only_dependencies[]? |
-    "::warning file=\(.path | san)\(if .line > 0 then ",line=\(.line)" else "" end),title=Type-only dependency::Package '\(.package_name | san)' is only used via type imports.\(nl)\(nl)Move it from dependencies to devDependencies to reduce production bundle size.")
+    "::warning file=\(.path | san)\(if .line > 0 then ",line=\(.line)" else "" end),title=Type-only dependency::Package '\(.package_name | san)' is only used via type imports.\(nl)\(nl)Move it from dependencies to devDependencies to reduce production bundle size."),
+  (.stale_suppressions[]? |
+    if .origin.type == "jsdoc_tag" then
+      "::warning file=\(.path | san),line=\(.line),col=\(.col + 1),title=Stale @expected-unused::The @expected-unused tag on '\(.origin.export_name | san)' is stale because the export is now used.\(nl)\(nl)Remove the @expected-unused tag."
+    else
+      "::warning file=\(.path | san),line=\(.line),col=\(.col + 1),title=Stale suppression::This '\(if .origin.is_file_level then "fallow-ignore-file" else "fallow-ignore-next-line" end)' comment\(if .origin.issue_kind then " for '\(.origin.issue_kind | san)'" else "" end) no longer matches any active issue.\(nl)\(nl)Remove the suppression comment to keep the codebase clean."
+    end)
 ] | .[]

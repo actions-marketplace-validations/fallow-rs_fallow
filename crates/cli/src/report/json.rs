@@ -205,6 +205,7 @@ pub fn build_json(
         "test_only_dependencies": results.test_only_dependencies.len(),
         "circular_dependencies": results.circular_dependencies.len(),
         "boundary_violations": results.boundary_violations.len(),
+        "stale_suppressions": results.stale_suppressions.len(),
     });
     map.insert("summary".to_string(), summary);
 

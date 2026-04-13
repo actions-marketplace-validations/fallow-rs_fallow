@@ -16,5 +16,6 @@
   "duplicate_exports": [],
   "circular_dependencies": [],
   "boundary_violations": [],
-  "type_only_dependencies": []
+  "type_only_dependencies": [],
+  "stale_suppressions": []
 }

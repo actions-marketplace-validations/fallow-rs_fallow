@@ -21,7 +21,8 @@ expression: redact_version(&json_str)
     "type_only_dependencies": 1,
     "test_only_dependencies": 1,
     "circular_dependencies": 1,
-    "boundary_violations": 0
+    "boundary_violations": 0,
+    "stale_suppressions": 0
   },
   "unused_files": [
     {
@@ -354,5 +355,6 @@ expression: redact_version(&json_str)
       ]
     }
   ],
-  "boundary_violations": []
+  "boundary_violations": [],
+  "stale_suppressions": []
 }

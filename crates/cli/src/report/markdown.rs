@@ -17,6 +17,10 @@ pub(super) fn print_markdown(results: &AnalysisResults, root: &Path) {
 }
 
 /// Build markdown output for analysis results.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one section per issue type; splitting would fragment the output builder"
+)]
 pub fn build_markdown(results: &AnalysisResults, root: &Path) -> String {
     let rel = |p: &Path| {
         escape_backticks(&normalize_uri(
@@ -197,6 +201,22 @@ pub fn build_markdown(results: &AnalysisResults, root: &Path) -> String {
                 rel(&v.to_path),
                 v.from_zone,
                 v.to_zone,
+            )]
+        },
+    );
+
+    // ── Stale suppressions ──
+    markdown_section(
+        &mut out,
+        &results.stale_suppressions,
+        "Stale suppressions",
+        |s| {
+            vec![format!(
+                "- `{}`:{} `{}` ({})",
+                rel(&s.path),
+                s.line,
+                escape_backticks(&s.description()),
+                escape_backticks(&s.explanation()),
             )]
         },
     );

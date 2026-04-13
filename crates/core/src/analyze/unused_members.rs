@@ -5,7 +5,7 @@ use crate::extract::{ANGULAR_TPL_SENTINEL, MemberKind};
 use crate::graph::ModuleGraph;
 use crate::resolve::{ResolveResult, ResolvedModule};
 use crate::results::UnusedMember;
-use crate::suppress::{self, IssueKind, Suppression};
+use crate::suppress::{IssueKind, SuppressionContext};
 
 use super::predicates::{is_angular_lifecycle_method, is_react_lifecycle_method};
 use super::{LineOffsetsMap, byte_offset_to_line_col};
@@ -29,7 +29,7 @@ use super::{LineOffsetsMap, byte_offset_to_line_col};
 pub fn find_unused_members(
     graph: &ModuleGraph,
     resolved_modules: &[ResolvedModule],
-    suppressions_by_file: &FxHashMap<FileId, &[Suppression]>,
+    suppressions: &SuppressionContext<'_>,
     line_offsets_by_file: &LineOffsetsMap<'_>,
     user_class_member_allowlist: &FxHashSet<&str>,
 ) -> (Vec<UnusedMember>, Vec<UnusedMember>) {
@@ -356,9 +356,7 @@ pub fn find_unused_members(
                     }
                     MemberKind::NamespaceMember => unreachable!(),
                 };
-                if let Some(supps) = suppressions_by_file.get(&module.file_id)
-                    && suppress::is_suppressed(supps, line, issue_kind)
-                {
+                if suppressions.is_suppressed(module.file_id, line, issue_kind) {
                     continue;
                 }
 
@@ -473,7 +471,7 @@ mod tests {
         let (enum_members, class_members) = find_unused_members(
             &graph,
             &[],
-            &FxHashMap::default(),
+            &SuppressionContext::empty(),
             &FxHashMap::default(),
             &FxHashSet::default(),
         );
@@ -498,7 +496,7 @@ mod tests {
         let (enum_members, class_members) = find_unused_members(
             &graph,
             &[],
-            &FxHashMap::default(),
+            &SuppressionContext::empty(),
             &FxHashMap::default(),
             &FxHashSet::default(),
         );
@@ -550,7 +548,7 @@ mod tests {
         let (enum_members, _) = find_unused_members(
             &graph,
             &resolved_modules,
-            &FxHashMap::default(),
+            &SuppressionContext::empty(),
             &FxHashMap::default(),
             &FxHashSet::default(),
         );
@@ -594,7 +592,7 @@ mod tests {
         let (enum_members, class_members) = find_unused_members(
             &graph,
             &resolved_modules,
-            &FxHashMap::default(),
+            &SuppressionContext::empty(),
             &FxHashMap::default(),
             &FxHashSet::default(),
         );
@@ -620,7 +618,7 @@ mod tests {
         let (_, class_members) = find_unused_members(
             &graph,
             &[],
-            &FxHashMap::default(),
+            &SuppressionContext::empty(),
             &FxHashMap::default(),
             &FxHashSet::default(),
         );
@@ -644,7 +642,7 @@ mod tests {
         let (_, class_members) = find_unused_members(
             &graph,
             &[],
-            &FxHashMap::default(),
+            &SuppressionContext::empty(),
             &FxHashMap::default(),
             &FxHashSet::default(),
         );
@@ -670,7 +668,7 @@ mod tests {
         let (_, class_members) = find_unused_members(
             &graph,
             &[],
-            &FxHashMap::default(),
+            &SuppressionContext::empty(),
             &FxHashMap::default(),
             &FxHashSet::default(),
         );
@@ -703,7 +701,7 @@ mod tests {
         let (_, class_members) = find_unused_members(
             &graph,
             &[],
-            &FxHashMap::default(),
+            &SuppressionContext::empty(),
             &FxHashMap::default(),
             &allowlist,
         );
@@ -733,7 +731,7 @@ mod tests {
         let (enum_members, _) = find_unused_members(
             &graph,
             &[],
-            &FxHashMap::default(),
+            &SuppressionContext::empty(),
             &FxHashMap::default(),
             &allowlist,
         );
@@ -768,7 +766,7 @@ mod tests {
         let (_, class_members) = find_unused_members(
             &graph,
             &resolved_modules,
-            &FxHashMap::default(),
+            &SuppressionContext::empty(),
             &FxHashMap::default(),
             &FxHashSet::default(),
         );
@@ -791,7 +789,7 @@ mod tests {
         let (enum_members, _) = find_unused_members(
             &graph,
             &[],
-            &FxHashMap::default(),
+            &SuppressionContext::empty(),
             &FxHashMap::default(),
             &FxHashSet::default(),
         );
@@ -812,7 +810,7 @@ mod tests {
         let (enum_members, class_members) = find_unused_members(
             &graph,
             &[],
-            &FxHashMap::default(),
+            &SuppressionContext::empty(),
             &FxHashMap::default(),
             &FxHashSet::default(),
         );
@@ -832,7 +830,7 @@ mod tests {
         let (enum_members, class_members) = find_unused_members(
             &graph,
             &[],
-            &FxHashMap::default(),
+            &SuppressionContext::empty(),
             &FxHashMap::default(),
             &FxHashSet::default(),
         );
@@ -853,7 +851,7 @@ mod tests {
         let (enum_members, class_members) = find_unused_members(
             &graph,
             &[],
-            &FxHashMap::default(),
+            &SuppressionContext::empty(),
             &FxHashMap::default(),
             &FxHashSet::default(),
         );
@@ -878,7 +876,7 @@ mod tests {
         let (enum_members, class_members) = find_unused_members(
             &graph,
             &[],
-            &FxHashMap::default(),
+            &SuppressionContext::empty(),
             &FxHashMap::default(),
             &FxHashSet::default(),
         );
@@ -937,7 +935,7 @@ mod tests {
         let (_, class_members) = find_unused_members(
             &graph,
             &resolved_modules,
-            &FxHashMap::default(),
+            &SuppressionContext::empty(),
             &FxHashMap::default(),
             &FxHashSet::default(),
         );
@@ -975,7 +973,7 @@ mod tests {
         let (enum_members, _) = find_unused_members(
             &graph,
             &resolved_modules,
-            &FxHashMap::default(),
+            &SuppressionContext::empty(),
             &FxHashMap::default(),
             &FxHashSet::default(),
         );
@@ -1003,7 +1001,7 @@ mod tests {
         let (enum_members, class_members) = find_unused_members(
             &graph,
             &[],
-            &FxHashMap::default(),
+            &SuppressionContext::empty(),
             &FxHashMap::default(),
             &FxHashSet::default(),
         );
@@ -1052,7 +1050,7 @@ mod tests {
         let (enum_members, _) = find_unused_members(
             &graph,
             &resolved_modules,
-            &FxHashMap::default(),
+            &SuppressionContext::empty(),
             &FxHashMap::default(),
             &FxHashSet::default(),
         );
@@ -1099,7 +1097,7 @@ mod tests {
         let (enum_members, _) = find_unused_members(
             &graph,
             &resolved_modules,
-            &FxHashMap::default(),
+            &SuppressionContext::empty(),
             &FxHashMap::default(),
             &FxHashSet::default(),
         );
@@ -1123,10 +1121,12 @@ mod tests {
         // Suppress on line 1 (byte offset 10 => line 1 with no offsets)
         let supps = vec![Suppression {
             line: 1,
+            comment_line: 0,
             kind: Some(IssueKind::UnusedEnumMember),
         }];
-        let mut suppressions: FxHashMap<FileId, &[Suppression]> = FxHashMap::default();
-        suppressions.insert(FileId(1), &supps);
+        let mut supp_map: FxHashMap<FileId, &[Suppression]> = FxHashMap::default();
+        supp_map.insert(FileId(1), &supps);
+        let suppressions = SuppressionContext::from_map(supp_map);
 
         let (enum_members, _) = find_unused_members(
             &graph,
@@ -1155,10 +1155,12 @@ mod tests {
 
         let supps = vec![Suppression {
             line: 1,
+            comment_line: 0,
             kind: Some(IssueKind::UnusedClassMember),
         }];
-        let mut suppressions: FxHashMap<FileId, &[Suppression]> = FxHashMap::default();
-        suppressions.insert(FileId(1), &supps);
+        let mut supp_map: FxHashMap<FileId, &[Suppression]> = FxHashMap::default();
+        supp_map.insert(FileId(1), &supps);
+        let suppressions = SuppressionContext::from_map(supp_map);
 
         let (_, class_members) = find_unused_members(
             &graph,
@@ -1209,7 +1211,7 @@ mod tests {
         let (enum_members, _) = find_unused_members(
             &graph,
             &resolved_modules,
-            &FxHashMap::default(),
+            &SuppressionContext::empty(),
             &FxHashMap::default(),
             &FxHashSet::default(),
         );
@@ -1264,7 +1266,7 @@ mod tests {
         let (_, class_members) = find_unused_members(
             &graph,
             &resolved_modules,
-            &FxHashMap::default(),
+            &SuppressionContext::empty(),
             &FxHashMap::default(),
             &FxHashSet::default(),
         );
@@ -1286,7 +1288,7 @@ mod tests {
         let (enum_members, class_members) = find_unused_members(
             &graph,
             &[],
-            &FxHashMap::default(),
+            &SuppressionContext::empty(),
             &FxHashMap::default(),
             &FxHashSet::default(),
         );

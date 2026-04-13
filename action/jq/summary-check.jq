@@ -37,7 +37,8 @@ else
     table_row("Circular dependencies"; "circular_dependencies"; "circular-dependencies"),
     table_row("Boundary violations"; "boundary_violations"; "boundary-violations"),
     table_row("Type-only dependencies"; "type_only_dependencies"; "type-only-dependencies"),
-    table_row("Test-only dependencies"; "test_only_dependencies"; "test-only-dependencies")
+    table_row("Test-only dependencies"; "test_only_dependencies"; "test-only-dependencies"),
+    table_row("Stale suppressions"; "stale_suppressions"; "stale-suppressions")
   ] | join("\n")) +
   "\n\n---\n" +
   section("Unused files"; "unused_files";
@@ -85,6 +86,9 @@ else
   section("Test-only dependencies"; "test_only_dependencies";
     "Production dependencies only imported by test files \u2014 consider moving to `devDependencies`.\n\n| Package |\n|---------|\n";
     "| `\(.package_name)` |") +
+  section("Stale suppressions"; "stale_suppressions";
+    "Suppression comments or JSDoc tags that no longer match any active issue.\n\n| File | Line | Description |\n|------|-----:|-------------|\n";
+    "| `\(.path)` | \(.line) | \(if .origin.type == "jsdoc_tag" then "`@expected-unused` on `\(.origin.export_name)`" elif .origin.issue_kind then "`\(.origin.issue_kind)`" else "blanket" end) |") +
   "\n\n> [!TIP]\n" +
   (if ((.unused_exports // []) + (.unused_dependencies // []) + (.unused_enum_members // [])) | length > 0 then
     "> Run `fallow fix --dry-run` to preview safe auto-fixes.\n"

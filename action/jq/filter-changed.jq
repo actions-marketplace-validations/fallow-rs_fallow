@@ -29,6 +29,9 @@ def filter_check:
   (if .boundary_violations then
     .boundary_violations |= map(select(.from_path | in_changed))
   else . end) |
+  (if .stale_suppressions then
+    .stale_suppressions |= map(select(.path | in_changed))
+  else . end) |
   # Recalculate total_issues from filtered arrays
   (if .total_issues != null then
     .total_issues = (
@@ -45,7 +48,8 @@ def filter_check:
       (.duplicate_exports // [] | length) +
       (.circular_dependencies // [] | length) +
       (.boundary_violations // [] | length) +
-      (.type_only_dependencies // [] | length)
+      (.type_only_dependencies // [] | length) +
+      (.stale_suppressions // [] | length)
     )
   else . end);
 

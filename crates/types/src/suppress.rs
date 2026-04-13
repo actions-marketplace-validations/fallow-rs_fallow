@@ -55,6 +55,8 @@ pub enum IssueKind {
     FeatureFlag,
     /// A function exceeding complexity thresholds (health command).
     Complexity,
+    /// A suppression comment or JSDoc tag that no longer matches any issue.
+    StaleSuppression,
 }
 
 impl IssueKind {
@@ -80,6 +82,7 @@ impl IssueKind {
             "coverage-gaps" => Some(Self::CoverageGaps),
             "feature-flag" => Some(Self::FeatureFlag),
             "complexity" => Some(Self::Complexity),
+            "stale-suppression" => Some(Self::StaleSuppression),
             _ => None,
         }
     }
@@ -106,6 +109,7 @@ impl IssueKind {
             Self::CoverageGaps => 16,
             Self::FeatureFlag => 17,
             Self::Complexity => 18,
+            Self::StaleSuppression => 19,
         }
     }
 
@@ -131,6 +135,7 @@ impl IssueKind {
             16 => Some(Self::CoverageGaps),
             17 => Some(Self::FeatureFlag),
             18 => Some(Self::Complexity),
+            19 => Some(Self::StaleSuppression),
             _ => None,
         }
     }
@@ -144,12 +149,13 @@ impl IssueKind {
 /// use fallow_types::suppress::{Suppression, IssueKind};
 ///
 /// // File-wide suppression (line 0, no specific kind)
-/// let file_wide = Suppression { line: 0, kind: None };
+/// let file_wide = Suppression { line: 0, comment_line: 1, kind: None };
 /// assert_eq!(file_wide.line, 0);
 ///
 /// // Line-specific suppression for unused exports
 /// let line_suppress = Suppression {
 ///     line: 42,
+///     comment_line: 41,
 ///     kind: Some(IssueKind::UnusedExport),
 /// };
 /// assert_eq!(line_suppress.kind, Some(IssueKind::UnusedExport));
@@ -158,13 +164,17 @@ impl IssueKind {
 pub struct Suppression {
     /// 1-based line this suppression applies to. 0 = file-wide suppression.
     pub line: u32,
+    /// 1-based line where the suppression comment itself appears.
+    /// For `fallow-ignore-next-line`, this is `line - 1`.
+    /// For `fallow-ignore-file`, this is the actual line of the comment in the source.
+    pub comment_line: u32,
     /// None = suppress all issue kinds on this line.
     pub kind: Option<IssueKind>,
 }
 
 // Size assertions to prevent memory regressions.
 // `Suppression` is stored in a Vec per file; `IssueKind` appears in every suppression.
-const _: () = assert!(std::mem::size_of::<Suppression>() == 8);
+const _: () = assert!(std::mem::size_of::<Suppression>() == 12);
 const _: () = assert!(std::mem::size_of::<IssueKind>() == 1);
 
 #[cfg(test)]
@@ -236,6 +246,10 @@ mod tests {
             Some(IssueKind::FeatureFlag)
         );
         assert_eq!(IssueKind::parse("complexity"), Some(IssueKind::Complexity));
+        assert_eq!(
+            IssueKind::parse("stale-suppression"),
+            Some(IssueKind::StaleSuppression)
+        );
     }
 
     #[test]
@@ -257,7 +271,7 @@ mod tests {
     #[test]
     fn discriminant_out_of_range() {
         assert_eq!(IssueKind::from_discriminant(0), None);
-        assert_eq!(IssueKind::from_discriminant(19), None);
+        assert_eq!(IssueKind::from_discriminant(20), None);
         assert_eq!(IssueKind::from_discriminant(u8::MAX), None);
     }
 
@@ -282,6 +296,7 @@ mod tests {
             IssueKind::CoverageGaps,
             IssueKind::FeatureFlag,
             IssueKind::Complexity,
+            IssueKind::StaleSuppression,
         ] {
             assert_eq!(
                 IssueKind::from_discriminant(kind.to_discriminant()),
@@ -289,7 +304,7 @@ mod tests {
             );
         }
         assert_eq!(IssueKind::from_discriminant(0), None);
-        assert_eq!(IssueKind::from_discriminant(19), None);
+        assert_eq!(IssueKind::from_discriminant(20), None);
     }
 
     // ── Discriminant uniqueness ─────────────────────────────────
@@ -315,6 +330,7 @@ mod tests {
             IssueKind::CoverageGaps,
             IssueKind::FeatureFlag,
             IssueKind::Complexity,
+            IssueKind::StaleSuppression,
         ];
         let discriminants: Vec<u8> = all_kinds.iter().map(|k| k.to_discriminant()).collect();
         let mut sorted = discriminants.clone();
@@ -340,6 +356,7 @@ mod tests {
     fn suppression_line_zero_is_file_wide() {
         let s = Suppression {
             line: 0,
+            comment_line: 1,
             kind: None,
         };
         assert_eq!(s.line, 0);
@@ -350,9 +367,11 @@ mod tests {
     fn suppression_with_specific_kind_and_line() {
         let s = Suppression {
             line: 42,
+            comment_line: 41,
             kind: Some(IssueKind::UnusedExport),
         };
         assert_eq!(s.line, 42);
+        assert_eq!(s.comment_line, 41);
         assert_eq!(s.kind, Some(IssueKind::UnusedExport));
     }
 }

@@ -457,6 +457,24 @@ pub(in crate::report) fn build_human_lines(
         total_issues,
     );
 
+    // ── Maintenance ──
+    if !results.stale_suppressions.is_empty() {
+        lines.push(
+            "\u{2500}\u{2500} Maintenance \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}"
+                .dimmed()
+                .to_string(),
+        );
+        lines.push(String::new());
+    }
+
+    build_stale_suppressions_section(
+        &mut lines,
+        &results.stale_suppressions,
+        severity_to_level(rules.stale_suppressions),
+        root,
+        total_issues,
+    );
+
     lines
 }
 
@@ -876,6 +894,42 @@ fn build_boundary_violations_section(
     lines.push(String::new());
 }
 
+fn build_stale_suppressions_section(
+    lines: &mut Vec<String>,
+    items: &[fallow_core::results::StaleSuppression],
+    level: Level,
+    root: &Path,
+    total_issues: usize,
+) {
+    if items.is_empty() {
+        return;
+    }
+    let title = "Stale suppressions";
+    lines.push(build_section_header(title, items.len(), level));
+
+    let shown = items.len().min(MAX_FLAT_ITEMS);
+    for s in &items[..shown] {
+        let path_str = relative_path(&s.path, root).display().to_string();
+        lines.push(format!(
+            "  {}:{}:{} {} {}",
+            path_str,
+            s.line,
+            s.col,
+            s.description().bold(),
+            format!("({})", s.explanation()).dimmed(),
+        ));
+    }
+    if items.len() > MAX_FLAT_ITEMS {
+        let remaining = items.len() - MAX_FLAT_ITEMS;
+        lines.push(format!(
+            "  {}",
+            truncation_hint(remaining, total_issues).dimmed()
+        ));
+    }
+    push_section_footer_with_count(lines, title, items.len());
+    lines.push(String::new());
+}
+
 /// Collect the unique CODEOWNERS patterns that matched files in a result set.
 ///
 /// Returns up to 3 sorted patterns. Only meaningful for `Owner` mode.
@@ -917,6 +971,9 @@ fn collect_matching_rules(
     }
     for b in &results.boundary_violations {
         check(&b.from_path);
+    }
+    for s in &results.stale_suppressions {
+        check(&s.path);
     }
 
     let mut sorted: Vec<String> = rules.into_iter().collect();
@@ -1172,6 +1229,7 @@ fn build_summary_footer(
     );
     add(results.circular_dependencies.len(), "circular dependencies");
     add(results.boundary_violations.len(), "violations");
+    add(results.stale_suppressions.len(), "stale suppressions");
 
     parts.join(" \u{00b7} ")
 }
@@ -1274,6 +1332,11 @@ pub(in crate::report) fn print_check_summary(
             "Boundary violations",
             results.boundary_violations.len(),
             severity_to_level(rules.boundary_violation),
+        ),
+        (
+            "Stale suppressions",
+            results.stale_suppressions.len(),
+            severity_to_level(rules.stale_suppressions),
         ),
     ];
 

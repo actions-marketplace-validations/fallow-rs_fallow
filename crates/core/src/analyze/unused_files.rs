@@ -1,9 +1,7 @@
-use rustc_hash::FxHashMap;
-
 use crate::discover::FileId;
 use crate::graph::ModuleGraph;
 use crate::results::UnusedFile;
-use crate::suppress::{self, IssueKind, Suppression};
+use crate::suppress::{IssueKind, SuppressionContext};
 
 use super::predicates::{
     is_barrel_with_reachable_sources, is_config_file, is_declaration_file, is_html_file,
@@ -27,7 +25,7 @@ use super::predicates::{
 /// import directly from the source files rather than through the barrel.
 pub fn find_unused_files(
     graph: &ModuleGraph,
-    suppressions_by_file: &FxHashMap<FileId, &[Suppression]>,
+    suppressions: &SuppressionContext<'_>,
 ) -> Vec<UnusedFile> {
     graph
         .modules
@@ -51,11 +49,7 @@ pub fn find_unused_files(
         // This can happen if a file was deleted between discovery and analysis, or if
         // a stale cache entry references a path that no longer exists.
         .filter(|m| m.path.exists())
-        .filter(|m| {
-            !suppressions_by_file
-                .get(&m.file_id)
-                .is_some_and(|supps| suppress::is_file_suppressed(supps, IssueKind::UnusedFile))
-        })
+        .filter(|m| !suppressions.is_file_suppressed(m.file_id, IssueKind::UnusedFile))
         .map(|m| UnusedFile {
             path: m.path.clone(),
         })
@@ -95,8 +89,9 @@ mod tests {
     use crate::extract::{ExportName, VisibilityTag};
     use crate::graph::{ExportSymbol, ModuleGraph, ReferenceKind, SymbolReference};
     use crate::resolve::ResolvedModule;
+    use crate::suppress::Suppression;
     use oxc_span::Span;
-    use rustc_hash::FxHashSet;
+    use rustc_hash::{FxHashMap, FxHashSet};
     use std::path::PathBuf;
 
     #[expect(
@@ -227,21 +222,21 @@ mod tests {
     #[test]
     fn find_unused_files_empty_graph() {
         let graph = build_graph(&[]);
-        let result = find_unused_files(&graph, &FxHashMap::default());
+        let result = find_unused_files(&graph, &SuppressionContext::empty());
         assert!(result.is_empty());
     }
 
     #[test]
     fn find_unused_files_entry_point_never_flagged() {
         let graph = build_graph(&[("/src/entry.ts", true)]);
-        let result = find_unused_files(&graph, &FxHashMap::default());
+        let result = find_unused_files(&graph, &SuppressionContext::empty());
         assert!(result.is_empty(), "entry point should never be flagged");
     }
 
     #[test]
     fn find_unused_files_skips_declaration_files() {
         let graph = build_graph(&[("/src/entry.ts", true), ("/src/types/global.d.ts", false)]);
-        let result = find_unused_files(&graph, &FxHashMap::default());
+        let result = find_unused_files(&graph, &SuppressionContext::empty());
         assert!(
             !result
                 .iter()
@@ -253,7 +248,7 @@ mod tests {
     #[test]
     fn find_unused_files_skips_config_files() {
         let graph = build_graph(&[("/src/entry.ts", true), ("/jest.config.ts", false)]);
-        let result = find_unused_files(&graph, &FxHashMap::default());
+        let result = find_unused_files(&graph, &SuppressionContext::empty());
         assert!(
             !result
                 .iter()
@@ -306,20 +301,22 @@ mod tests {
         // Suppress unused-file for file 1
         let supps = vec![Suppression {
             line: 0,
+            comment_line: 1,
             kind: Some(IssueKind::UnusedFile),
         }];
         let supps_slice: &[Suppression] = &supps;
-        let mut suppressions_by_file: FxHashMap<FileId, &[Suppression]> = FxHashMap::default();
-        suppressions_by_file.insert(FileId(1), supps_slice);
+        let mut supp_map: FxHashMap<FileId, &[Suppression]> = FxHashMap::default();
+        supp_map.insert(FileId(1), supps_slice);
+        let suppressions = SuppressionContext::from_map(supp_map);
 
-        let result = find_unused_files(&graph, &suppressions_by_file);
+        let result = find_unused_files(&graph, &suppressions);
         assert!(result.is_empty(), "suppressed file should not be flagged");
     }
 
     #[test]
     fn find_unused_files_skips_nonexistent_files() {
         let graph = build_graph(&[("/src/entry.ts", true), ("/nonexistent/phantom.ts", false)]);
-        let result = find_unused_files(&graph, &FxHashMap::default());
+        let result = find_unused_files(&graph, &SuppressionContext::empty());
         // phantom.ts doesn't exist on disk, should not be reported
         assert!(
             !result

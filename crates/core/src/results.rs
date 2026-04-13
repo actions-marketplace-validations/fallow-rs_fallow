@@ -2,8 +2,8 @@
 pub use fallow_types::results::{
     AnalysisResults, BoundaryViolation, CircularDependency, DependencyLocation, DuplicateExport,
     DuplicateLocation, EntryPointSummary, ExportUsage, ImportSite, ReferenceLocation,
-    TestOnlyDependency, TypeOnlyDependency, UnlistedDependency, UnresolvedImport, UnusedDependency,
-    UnusedExport, UnusedFile, UnusedMember,
+    StaleSuppression, SuppressionOrigin, TestOnlyDependency, TypeOnlyDependency,
+    UnlistedDependency, UnresolvedImport, UnusedDependency, UnusedExport, UnusedFile, UnusedMember,
 };
 
 #[cfg(test)]

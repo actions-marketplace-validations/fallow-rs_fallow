@@ -11,7 +11,7 @@ use crate::results::{
     DependencyLocation, ImportSite, TestOnlyDependency, TypeOnlyDependency, UnlistedDependency,
     UnresolvedImport, UnusedDependency,
 };
-use crate::suppress::{self, IssueKind, Suppression};
+use crate::suppress::{IssueKind, SuppressionContext};
 
 use super::package_json_utils::{find_dep_line_in_json, read_pkg_json_content};
 use super::predicates::{
@@ -637,7 +637,7 @@ pub fn find_unlisted_dependencies(
 pub fn find_unresolved_imports(
     resolved_modules: &[ResolvedModule],
     _config: &ResolvedConfig,
-    suppressions_by_file: &FxHashMap<FileId, &[Suppression]>,
+    suppressions: &SuppressionContext<'_>,
     virtual_prefixes: &[&str],
     generated_patterns: &[&str],
     line_offsets_by_file: &LineOffsetsMap<'_>,
@@ -698,9 +698,7 @@ pub fn find_unresolved_imports(
                 };
 
                 // Check inline suppression
-                if let Some(supps) = suppressions_by_file.get(&module.file_id)
-                    && suppress::is_suppressed(supps, line, IssueKind::UnresolvedImport)
-                {
+                if suppressions.is_suppressed(module.file_id, line, IssueKind::UnresolvedImport) {
                     continue;
                 }
 

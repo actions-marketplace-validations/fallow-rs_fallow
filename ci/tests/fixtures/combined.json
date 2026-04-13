@@ -103,7 +103,8 @@
     "duplicate_exports": [],
     "type_only_dependencies": [],
     "circular_dependencies": [],
-    "boundary_violations": []
+    "boundary_violations": [],
+    "stale_suppressions": []
   },
   "dupes": {
     "clone_groups": [

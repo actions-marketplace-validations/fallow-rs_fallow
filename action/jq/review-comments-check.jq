@@ -89,5 +89,15 @@ def footer(rule): "\n\n---\n<sub><a href=\"https://docs.fallow.tools/explanation
     path: (prefix + .path),
     line: (if .line > 0 then .line else 1 end),
     body: ":blue_book: **Type-only dependency**\n\n`\(.package_name)` is only used in `import type` statements \u2014 it\u2019s not needed at runtime.\n\n**Action:** Move it to `devDependencies`:\n\n```sh\n\(add_dev(.package_name)) && \(remove(.package_name))\n```\n\n> Publishing a library? If consumers need these types, keep it in `dependencies`.\(footer("type-only-dependencies"))"
+  }),
+  (.stale_suppressions[]? | {
+    type: "other",
+    path: (prefix + .path),
+    line: .line,
+    body: (if .origin.type == "jsdoc_tag" then
+      ":broom: **Stale @expected-unused**\n\nThe `@expected-unused` tag on `\(.origin.export_name)` is stale because the export is now used.\n\n**Action:** Remove the `@expected-unused` tag.\(footer("stale-suppressions"))"
+    else
+      ":broom: **Stale suppression**\n\nThis `\(if .origin.is_file_level then "fallow-ignore-file" else "fallow-ignore-next-line" end)` comment\(if .origin.issue_kind then " for `\(.origin.issue_kind)`" else "" end) no longer matches any active issue.\n\n**Action:** Remove the suppression comment to keep the codebase clean.\(footer("stale-suppressions"))"
+    end)
   })
 ] | .[:($ENV.MAX | tonumber)]

@@ -122,6 +122,13 @@ pub const CHECK_RULES: &[RuleDef] = &[
         full: "A cycle in the module import graph. Circular dependencies cause undefined behavior with CommonJS (partial modules) and initialization ordering issues with ESM. Break cycles by extracting shared code.",
         docs_path: "explanations/dead-code#circular-dependencies",
     },
+    RuleDef {
+        id: "fallow/stale-suppression",
+        name: "Stale Suppressions",
+        short: "Suppression comment or tag no longer matches any issue",
+        full: "A fallow-ignore-next-line, fallow-ignore-file, or @expected-unused suppression that no longer matches any active issue. The underlying problem was fixed but the suppression was left behind. Remove it to keep the codebase clean.",
+        docs_path: "explanations/dead-code#stale-suppressions",
+    },
 ];
 
 /// Look up a rule definition by its SARIF rule ID across all rule sets.
@@ -788,7 +795,7 @@ mod tests {
 
     #[test]
     fn check_rules_count() {
-        assert_eq!(CHECK_RULES.len(), 13);
+        assert_eq!(CHECK_RULES.len(), 14);
     }
 
     #[test]

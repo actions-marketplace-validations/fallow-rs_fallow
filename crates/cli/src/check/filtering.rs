@@ -60,6 +60,11 @@ pub fn filter_to_workspace(
     results
         .boundary_violations
         .retain(|v| v.from_path.starts_with(ws_root));
+
+    // Stale suppressions: keep if the file is in this workspace
+    results
+        .stale_suppressions
+        .retain(|s| s.path.starts_with(ws_root));
 }
 
 /// Resolve `--workspace <name>` to a workspace root path, or exit with an error.
@@ -149,6 +154,11 @@ pub(super) fn filter_changed_files(
     results
         .boundary_violations
         .retain(|v| changed_files.contains(&v.from_path));
+
+    // Stale suppressions: keep if the file changed
+    results
+        .stale_suppressions
+        .retain(|s| changed_files.contains(&s.path));
 }
 
 // ── Changed files ────────────────────────────────────────────────

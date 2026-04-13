@@ -239,6 +239,10 @@ enum Command {
         #[arg(long)]
         boundary_violations: bool,
 
+        /// Only report stale suppressions
+        #[arg(long)]
+        stale_suppressions: bool,
+
         /// Also run duplication analysis and cross-reference with dead code
         #[arg(long)]
         include_dupes: bool,
@@ -1057,6 +1061,7 @@ fn dispatch_subcommand(
             duplicate_exports,
             circular_deps,
             boundary_violations,
+            stale_suppressions,
             include_dupes,
             trace,
             trace_file,
@@ -1084,6 +1089,7 @@ fn dispatch_subcommand(
                 duplicate_exports,
                 circular_deps,
                 boundary_violations,
+                stale_suppressions,
             };
             let trace_opts = TraceOptions {
                 trace_export: trace,

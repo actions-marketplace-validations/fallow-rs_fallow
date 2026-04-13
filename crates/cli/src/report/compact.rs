@@ -120,6 +120,14 @@ pub fn build_compact_lines(results: &AnalysisResults, root: &Path) -> Vec<String
             v.to_zone,
         ));
     }
+    for s in &results.stale_suppressions {
+        lines.push(format!(
+            "stale-suppression:{}:{}:{}",
+            rel(&s.path),
+            s.line,
+            s.description(),
+        ));
+    }
 
     lines
 }
@@ -466,8 +474,8 @@ mod tests {
         let results = sample_results(&root);
         let lines = build_compact_lines(&results, &root);
 
-        // 15 issue types, one of each
-        assert_eq!(lines.len(), 15);
+        // 16 issue types, one of each
+        assert_eq!(lines.len(), 16);
 
         // Verify ordering matches output order
         assert!(lines[0].starts_with("unused-file:"));

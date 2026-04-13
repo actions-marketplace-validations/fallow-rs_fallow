@@ -16,7 +16,7 @@ use crate::extract::ModuleInfo;
 use crate::graph::ModuleGraph;
 use crate::resolve::ResolvedModule;
 use crate::results::{AnalysisResults, CircularDependency};
-use crate::suppress::{self, IssueKind, Suppression};
+use crate::suppress::IssueKind;
 
 use unused_deps::{
     find_test_only_dependencies, find_type_only_dependencies, find_unlisted_dependencies,
@@ -96,12 +96,8 @@ pub fn find_dead_code_full(
 ) -> AnalysisResults {
     let _span = tracing::info_span!("find_dead_code").entered();
 
-    // Build suppression index: FileId -> suppressions
-    let suppressions_by_file: FxHashMap<FileId, &[Suppression]> = modules
-        .iter()
-        .filter(|m| !m.suppressions.is_empty())
-        .map(|m| (m.file_id, m.suppressions.as_slice()))
-        .collect();
+    // Build suppression context: tracks which suppressions are consumed by detectors
+    let suppressions = crate::suppress::SuppressionContext::new(modules);
 
     // Build line offset index: FileId -> pre-computed line start offsets.
     // Eliminates redundant file reads for byte-to-line/col conversion.
@@ -114,15 +110,15 @@ pub fn find_dead_code_full(
     let mut results = AnalysisResults::default();
 
     if config.rules.unused_files != Severity::Off {
-        results.unused_files = find_unused_files(graph, &suppressions_by_file);
+        results.unused_files = find_unused_files(graph, &suppressions);
     }
 
     if config.rules.unused_exports != Severity::Off || config.rules.unused_types != Severity::Off {
-        let (exports, types) = find_unused_exports(
+        let (exports, types, stale_expected) = find_unused_exports(
             graph,
             config,
             plugin_result,
-            &suppressions_by_file,
+            &suppressions,
             &line_offsets_by_file,
         );
         if config.rules.unused_exports != Severity::Off {
@@ -130,6 +126,10 @@ pub fn find_dead_code_full(
         }
         if config.rules.unused_types != Severity::Off {
             results.unused_types = types;
+        }
+        // @expected-unused tags that became stale (export is now used)
+        if config.rules.stale_suppressions != Severity::Off {
+            results.stale_suppressions.extend(stale_expected);
         }
     }
 
@@ -153,7 +153,7 @@ pub fn find_dead_code_full(
         let (enum_members, class_members) = find_unused_members(
             graph,
             resolved_modules,
-            &suppressions_by_file,
+            &suppressions,
             &line_offsets_by_file,
             &user_class_members,
         );
@@ -219,7 +219,7 @@ pub fn find_dead_code_full(
         results.unresolved_imports = find_unresolved_imports(
             resolved_modules,
             config,
-            &suppressions_by_file,
+            &suppressions,
             &virtual_prefixes,
             &generated_patterns,
             &line_offsets_by_file,
@@ -228,7 +228,7 @@ pub fn find_dead_code_full(
 
     if config.rules.duplicate_exports != Severity::Off {
         results.duplicate_exports =
-            find_duplicate_exports(graph, &suppressions_by_file, &line_offsets_by_file);
+            find_duplicate_exports(graph, &suppressions, &line_offsets_by_file);
     }
 
     // In production mode, detect dependencies that are only used via type-only imports
@@ -250,12 +250,8 @@ pub fn find_dead_code_full(
 
     // Detect architecture boundary violations
     if config.rules.boundary_violation != Severity::Off && !config.boundaries.is_empty() {
-        results.boundary_violations = boundary::find_boundary_violations(
-            graph,
-            config,
-            &suppressions_by_file,
-            &line_offsets_by_file,
-        );
+        results.boundary_violations =
+            boundary::find_boundary_violations(graph, config, &suppressions, &line_offsets_by_file);
     }
 
     // Detect circular dependencies
@@ -265,11 +261,9 @@ pub fn find_dead_code_full(
             .into_iter()
             .filter(|cycle| {
                 // Skip cycles where any participating file has a file-level suppression
-                !cycle.iter().any(|&id| {
-                    suppressions_by_file.get(&id).is_some_and(|supps| {
-                        suppress::is_file_suppressed(supps, IssueKind::CircularDependency)
-                    })
-                })
+                !cycle
+                    .iter()
+                    .any(|&id| suppressions.is_file_suppressed(id, IssueKind::CircularDependency))
             })
             .map(|cycle| {
                 let files: Vec<std::path::PathBuf> = cycle
@@ -335,6 +329,11 @@ pub fn find_dead_code_full(
                 .unused_types
                 .retain(|e| !public_roots.iter().any(|root| e.path.starts_with(root)));
         }
+    }
+
+    // Detect stale suppression comments (must run after all detectors)
+    if config.rules.stale_suppressions != Severity::Off {
+        results.stale_suppressions.extend(suppressions.find_stale(graph));
     }
 
     // Sort all result arrays for deterministic output ordering.
@@ -526,6 +525,7 @@ mod tests {
                 boundary_violation: Severity::Off,
                 coverage_gaps: Severity::Off,
                 feature_flags: Severity::Off,
+                stale_suppressions: Severity::Off,
             };
             let config = make_config_with_rules(rules);
             let results = find_dead_code(&graph, &config);
@@ -720,6 +720,7 @@ mod tests {
                 content_hash: 0,
                 suppressions: vec![Suppression {
                     line: 0,
+                    comment_line: 1,
                     kind: Some(IssueKind::UnusedFile),
                 }],
                 unused_import_bindings: vec![],

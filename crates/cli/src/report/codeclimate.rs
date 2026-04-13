@@ -431,6 +431,23 @@ pub fn build_codeclimate(
         ));
     }
 
+    // Stale suppressions
+    let level = severity_to_codeclimate(rules.stale_suppressions);
+    for s in &results.stale_suppressions {
+        let path = cc_path(&s.path, root);
+        let line_str = s.line.to_string();
+        let fp = fingerprint_hash(&["fallow/stale-suppression", &path, &line_str]);
+        issues.push(cc_issue(
+            "fallow/stale-suppression",
+            &s.description(),
+            level,
+            "Bug Risk",
+            &path,
+            Some(s.line),
+            &fp,
+        ));
+    }
+
     serde_json::Value::Array(issues)
 }
 

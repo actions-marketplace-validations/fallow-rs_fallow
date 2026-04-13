@@ -190,6 +190,8 @@ fn apply_jsdoc_visibility_tags(exports: &mut [ExportInfo], comments: &[Comment],
                     VisibilityTag::Alpha
                 } else if has_beta_tag(text) {
                     VisibilityTag::Beta
+                } else if has_expected_unused_tag(text) {
+                    VisibilityTag::ExpectedUnused
                 } else {
                     continue;
                 };
@@ -262,6 +264,17 @@ fn has_beta_tag(comment_text: &str) -> bool {
 fn has_alpha_tag(comment_text: &str) -> bool {
     for (i, _) in comment_text.match_indices("@alpha") {
         let after = i + "@alpha".len();
+        if after >= comment_text.len() || !is_ident_char(comment_text.as_bytes()[after]) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Check if a JSDoc comment body contains an `@expected-unused` tag.
+fn has_expected_unused_tag(comment_text: &str) -> bool {
+    for (i, _) in comment_text.match_indices("@expected-unused") {
+        let after = i + "@expected-unused".len();
         if after >= comment_text.len() || !is_ident_char(comment_text.as_bytes()[after]) {
             return true;
         }

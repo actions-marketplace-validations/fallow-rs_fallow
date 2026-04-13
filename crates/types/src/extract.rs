@@ -196,12 +196,16 @@ pub enum VisibilityTag {
     Beta = 3,
     /// `@alpha` -- early preview, may change drastically without notice.
     Alpha = 4,
+    /// `@expected-unused` -- intentionally unused, should warn when it becomes used.
+    ExpectedUnused = 5,
 }
 
 impl VisibilityTag {
-    /// Whether this tag suppresses unused-export detection.
+    /// Whether this tag permanently suppresses unused-export detection.
+    /// `ExpectedUnused` is handled separately (conditionally suppresses,
+    /// reports stale when the export becomes used).
     pub const fn suppresses_unused(self) -> bool {
-        !matches!(self, Self::None)
+        matches!(self, Self::Public | Self::Internal | Self::Beta | Self::Alpha)
     }
 
     /// For serde `skip_serializing_if`.
