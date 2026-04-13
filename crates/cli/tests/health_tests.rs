@@ -30,6 +30,9 @@ fn git(root: &Path, args: &[&str]) {
     let status = std::process::Command::new("git")
         .args(args)
         .current_dir(root)
+        // Prevent global git config (commit signing, hooks) from breaking temp repo operations
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
         .status()
         .expect("run git");
     assert!(status.success(), "git {args:?} should succeed");
