@@ -22,7 +22,7 @@ use super::helpers::{
 };
 use super::{
     ModuleInfoExtractor, try_extract_arrow_wrapped_import, try_extract_dynamic_import,
-    try_extract_require,
+    try_extract_import_then_callback, try_extract_require,
 };
 
 impl<'a> Visit<'a> for ModuleInfoExtractor {
@@ -459,6 +459,22 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
                     span: expr.span,
                 });
             }
+        }
+
+        // Detect `import('./lib').then(m => m.foo)` — dynamic import with `.then()` callback.
+        // The callback parameter binds to the module namespace, and member accesses or
+        // destructured parameters indicate which exports are consumed.
+        if let Some(then_cb) = try_extract_import_then_callback(expr) {
+            self.dynamic_imports.push(DynamicImportInfo {
+                source: then_cb.source,
+                span: then_cb.import_span,
+                destructured_names: then_cb.destructured_names,
+                local_name: then_cb.local_name.clone(),
+            });
+            if let Some(ref local) = then_cb.local_name {
+                self.namespace_binding_names.push(local.clone());
+            }
+            self.handled_import_spans.insert(then_cb.import_span);
         }
 
         // Detect arrow-wrapped dynamic imports in call arguments:

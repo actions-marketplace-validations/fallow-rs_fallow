@@ -275,3 +275,119 @@ fn arrow_wrapped_template_literal_source() {
     // But it should produce a dynamic_import_pattern
     assert_eq!(info.dynamic_import_patterns.len(), 1);
 }
+
+// ── Dynamic import .then() callback patterns ────────────────
+
+#[test]
+fn then_callback_expression_body_member_access() {
+    // Angular lazy loading: `import('./x').then(m => m.Component)`
+    let info = parse_source("import('./dashboard').then(m => m.DashboardComponent);");
+    assert_eq!(info.dynamic_imports.len(), 1);
+    assert_eq!(info.dynamic_imports[0].source, "./dashboard");
+    assert_eq!(
+        info.dynamic_imports[0].destructured_names,
+        vec!["DashboardComponent"]
+    );
+    assert!(info.dynamic_imports[0].local_name.is_none());
+}
+
+#[test]
+fn then_callback_destructured_param() {
+    // Destructured: `import('./x').then(({ foo, bar }) => { ... })`
+    let info = parse_source("import('./lib').then(({ foo, bar }) => { console.log(foo, bar); });");
+    assert_eq!(info.dynamic_imports.len(), 1);
+    assert_eq!(info.dynamic_imports[0].source, "./lib");
+    assert_eq!(
+        info.dynamic_imports[0].destructured_names,
+        vec!["foo", "bar"]
+    );
+    assert!(info.dynamic_imports[0].local_name.is_none());
+}
+
+#[test]
+fn then_callback_namespace_block_body() {
+    // Block body with identifier param falls back to namespace binding
+    let info = parse_source("import('./service').then(m => { m.doStuff(); m.doMore(); });");
+    assert_eq!(info.dynamic_imports.len(), 1);
+    assert_eq!(info.dynamic_imports[0].source, "./service");
+    assert!(info.dynamic_imports[0].destructured_names.is_empty());
+    assert_eq!(info.dynamic_imports[0].local_name, Some("m".to_string()));
+}
+
+#[test]
+fn then_callback_angular_routes_pattern() {
+    // Real-world Angular routing pattern
+    let info = parse_source(
+        r"
+        const routes = [
+            {
+                path: 'dashboard',
+                loadComponent: () => import('./dashboard.component').then(m => m.DashboardComponent),
+            },
+            {
+                path: 'settings',
+                loadComponent: () => import('./settings.component').then(m => m.SettingsComponent),
+            },
+        ];
+        ",
+    );
+    assert_eq!(info.dynamic_imports.len(), 2);
+    assert_eq!(info.dynamic_imports[0].source, "./dashboard.component");
+    assert_eq!(
+        info.dynamic_imports[0].destructured_names,
+        vec!["DashboardComponent"]
+    );
+    assert_eq!(info.dynamic_imports[1].source, "./settings.component");
+    assert_eq!(
+        info.dynamic_imports[1].destructured_names,
+        vec!["SettingsComponent"]
+    );
+}
+
+#[test]
+fn then_callback_object_literal_body() {
+    // React.lazy .then pattern: `import('./x').then(m => ({ default: m.Foo }))`
+    let info = parse_source(
+        "const Comp = React.lazy(() => import('./Foo').then(m => ({ default: m.FooComponent })));",
+    );
+    // The outer React.lazy would normally capture this, but the .then() should also fire
+    assert!(
+        info.dynamic_imports
+            .iter()
+            .any(|d| d.source == "./Foo"
+                && d.destructured_names.contains(&"FooComponent".to_string()))
+    );
+}
+
+#[test]
+fn then_callback_no_duplicate_side_effect() {
+    // Should NOT produce a duplicate side-effect import alongside the .then() one
+    let info = parse_source("import('./lib').then(m => m.foo);");
+    assert_eq!(info.dynamic_imports.len(), 1);
+    assert_eq!(info.dynamic_imports[0].destructured_names, vec!["foo"]);
+}
+
+#[test]
+fn then_callback_function_expression() {
+    // Function expression callback
+    let info = parse_source("import('./lib').then(function(m) { return m.foo; });");
+    assert_eq!(info.dynamic_imports.len(), 1);
+    assert_eq!(info.dynamic_imports[0].source, "./lib");
+    assert_eq!(info.dynamic_imports[0].local_name, Some("m".to_string()));
+}
+
+#[test]
+fn then_callback_destructured_with_rest_is_namespace() {
+    // Rest element means we can't know all accessed names
+    let info = parse_source("import('./lib').then(({ foo, ...rest }) => { });");
+    assert_eq!(info.dynamic_imports.len(), 1);
+    assert!(info.dynamic_imports[0].destructured_names.is_empty());
+    assert!(info.dynamic_imports[0].local_name.is_none());
+}
+
+#[test]
+fn then_callback_non_import_callee_ignored() {
+    // `.then()` on a non-import should not produce a dynamic import
+    let info = parse_source("fetch('/api').then(r => r.json());");
+    assert!(info.dynamic_imports.is_empty());
+}

@@ -5,7 +5,8 @@ mod helpers;
 mod visit_impl;
 
 use oxc_ast::ast::{
-    Argument, CallExpression, Expression, ImportExpression, ObjectPattern, Statement,
+    Argument, BindingPattern, CallExpression, Expression, ImportExpression, ObjectPattern,
+    ObjectPropertyKind, Statement,
 };
 use oxc_span::Span;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -263,6 +264,158 @@ fn extract_import_from_return_body<'a, 'b>(
         }
     }
     None
+}
+
+/// Result from extracting a `.then()` callback on a dynamic import.
+struct ImportThenCallback {
+    /// The import specifier string (e.g., `"./lib"`).
+    source: String,
+    /// The span of the `import()` expression (for dedup).
+    import_span: oxc_span::Span,
+    /// Named exports accessed in the callback, if extractable.
+    destructured_names: Vec<String>,
+    /// The callback parameter name if it's a simple identifier binding,
+    /// for namespace-style narrowing when specific member names cannot
+    /// be statically extracted from the body.
+    local_name: Option<String>,
+}
+
+/// Try to extract a `.then()` callback on a dynamic `import()` expression.
+///
+/// Handles patterns like:
+/// - `import('./lib').then(m => m.foo)` — expression body member access
+/// - `import('./lib').then(({ foo, bar }) => { ... })` — param destructuring
+/// - `import('./lib').then(m => { ... m.foo ... })` — namespace binding
+///
+/// Returns extraction results on success.
+fn try_extract_import_then_callback(expr: &CallExpression<'_>) -> Option<ImportThenCallback> {
+    // Callee must be `<something>.then`
+    let Expression::StaticMemberExpression(member) = &expr.callee else {
+        return None;
+    };
+    if member.property.name != "then" {
+        return None;
+    }
+
+    // The object must be an `import('...')` expression with a string literal source
+    let Expression::ImportExpression(import_expr) = &member.object else {
+        return None;
+    };
+    let Expression::StringLiteral(lit) = &import_expr.source else {
+        return None;
+    };
+    let source = lit.value.to_string();
+    let import_span = import_expr.span;
+
+    // First argument must be a callback (arrow or function expression)
+    let first_arg = expr.arguments.first()?;
+
+    match first_arg {
+        Argument::ArrowFunctionExpression(arrow) => {
+            let param = arrow.params.items.first()?;
+            match &param.pattern {
+                // Destructured: `({ foo, bar }) => ...`
+                BindingPattern::ObjectPattern(obj_pat) => Some(ImportThenCallback {
+                    source,
+                    import_span,
+                    destructured_names: extract_destructured_names(obj_pat),
+                    local_name: None,
+                }),
+                // Identifier: `m => m.foo` or `m => { ... }`
+                BindingPattern::BindingIdentifier(id) => {
+                    let param_name = id.name.to_string();
+
+                    // For expression bodies, try to extract direct member access
+                    if arrow.expression
+                        && let Some(Statement::ExpressionStatement(expr_stmt)) =
+                            arrow.body.statements.first()
+                        && let Some(names) =
+                            extract_member_names_from_expr(&expr_stmt.expression, &param_name)
+                    {
+                        return Some(ImportThenCallback {
+                            source,
+                            import_span,
+                            destructured_names: names,
+                            local_name: None,
+                        });
+                    }
+
+                    // Fall back to namespace binding for narrowing
+                    Some(ImportThenCallback {
+                        source,
+                        import_span,
+                        destructured_names: Vec::new(),
+                        local_name: Some(param_name),
+                    })
+                }
+                _ => None,
+            }
+        }
+        Argument::FunctionExpression(func) => {
+            let param = func.params.items.first()?;
+            match &param.pattern {
+                BindingPattern::ObjectPattern(obj_pat) => Some(ImportThenCallback {
+                    source,
+                    import_span,
+                    destructured_names: extract_destructured_names(obj_pat),
+                    local_name: None,
+                }),
+                BindingPattern::BindingIdentifier(id) => Some(ImportThenCallback {
+                    source,
+                    import_span,
+                    destructured_names: Vec::new(),
+                    local_name: Some(id.name.to_string()),
+                }),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Extract member names from an expression that accesses the given parameter.
+///
+/// Handles:
+/// - `m.foo` → `["foo"]`
+/// - `({ default: m.Foo })` → `["Foo"]` (React.lazy `.then` pattern)
+fn extract_member_names_from_expr(expr: &Expression<'_>, param_name: &str) -> Option<Vec<String>> {
+    match expr {
+        // `m.foo`
+        Expression::StaticMemberExpression(member) => {
+            if let Expression::Identifier(obj) = &member.object
+                && obj.name == param_name
+            {
+                Some(vec![member.property.name.to_string()])
+            } else {
+                None
+            }
+        }
+        // `({ default: m.Foo })` — wrapped in parens as object literal
+        Expression::ObjectExpression(obj) => extract_member_names_from_object(obj, param_name),
+        // Parenthesized: `(expr)` — unwrap and recurse
+        Expression::ParenthesizedExpression(paren) => {
+            extract_member_names_from_expr(&paren.expression, param_name)
+        }
+        _ => None,
+    }
+}
+
+/// Extract member names from object literal properties that access the given parameter.
+fn extract_member_names_from_object(
+    obj: &oxc_ast::ast::ObjectExpression<'_>,
+    param_name: &str,
+) -> Option<Vec<String>> {
+    let mut names = Vec::new();
+    for prop in &obj.properties {
+        if let ObjectPropertyKind::ObjectProperty(p) = prop
+            && let Expression::StaticMemberExpression(member) = &p.value
+            && let Expression::Identifier(obj) = &member.object
+            && obj.name == param_name
+        {
+            names.push(member.property.name.to_string());
+        }
+    }
+    if names.is_empty() { None } else { Some(names) }
 }
 
 #[cfg(all(test, not(miri)))]
