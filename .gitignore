@@ -1,6 +1,7 @@
 target/
 .cargo/
 node_modules/
+!tests/fixtures/bin-script-deps/node_modules/
 .DS_Store
 
 # Reference repos (for development only)
