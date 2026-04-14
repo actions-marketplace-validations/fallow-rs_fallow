@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.34.0] - 2026-04-14
+
+### Added
+
+- **Per-file LOC in health output** -- surfaces lines of code per file in health analysis, enabling size-aware codebase navigation.
+- **Total LOC vital sign** -- adds total lines of code as a health vital sign with penalty breakdown visibility.
+
+### Changed
+
+- **Significant performance improvements** -- parallel file walker via `ignore` crate, O(1) export name dedup, O(n^2) elimination in analyze/cross-reference/families, shared parsed modules and analysis graph between check and health in combined mode, borrowed line offsets in complexity computation.
+
+### Fixed
+
+- **CLI binary names in scripts resolved via dependency `bin` fields** -- packages whose binary name diverges from the package name (e.g., `@arethetypeswrong/cli` provides `attw`) are no longer falsely flagged as unused dependencies when used in npm scripts. Builds a reverse map from dependency `package.json` `bin` entries, probing `node_modules/` at project root and workspace roots. ([#107](https://github.com/fallow-rs/fallow/discussions/107))
+- **Dynamic import `.then()` member access tracked** -- `import('./Foo').then(m => m.Bar)` now correctly credits `Bar` as a used export, preventing false unused-export reports for lazy-loaded named exports. ([#115](https://github.com/fallow-rs/fallow/issues/115))
+- **Nx workspace tokens expanded in all project.json fields** -- `{projectRoot}` and `{workspaceRoot}` tokens are now expanded in `main` and `tsConfig` fields, not just `includePaths`. ([#114](https://github.com/fallow-rs/fallow/issues/114))
+- **Deterministic clone family sort** -- added tiebreaker to clone family ordering to prevent non-deterministic output.
+
 ## [2.33.0] - 2026-04-13
 
 ### Added
@@ -1351,7 +1369,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `--changed-since` and `--fail-on-issues` for CI
 - Cross-workspace resolution for npm/yarn/pnpm workspaces
 
-[Unreleased]: https://github.com/fallow-rs/fallow/compare/v2.33.0...HEAD
+[Unreleased]: https://github.com/fallow-rs/fallow/compare/v2.34.0...HEAD
+[2.34.0]: https://github.com/fallow-rs/fallow/compare/v2.33.0...v2.34.0
 [2.33.0]: https://github.com/fallow-rs/fallow/compare/v2.32.1...v2.33.0
 [2.32.1]: https://github.com/fallow-rs/fallow/compare/v2.32.0...v2.32.1
 [2.32.0]: https://github.com/fallow-rs/fallow/compare/v2.31.0...v2.32.0
