@@ -13,6 +13,8 @@ mod css_modules;
 mod dependencies;
 #[path = "integration_test/duplicates.rs"]
 mod duplicates;
+#[path = "integration_test/dynamic_import_then.rs"]
+mod dynamic_import_then;
 #[path = "integration_test/dynamic_imports.rs"]
 mod dynamic_imports;
 #[path = "integration_test/external_plugins.rs"]
