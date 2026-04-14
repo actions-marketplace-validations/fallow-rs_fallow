@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.36.0] - 2026-04-14
+
 ### Added
 
 - **`fallow config` subcommand** -- prints the loaded config path on the first line followed by the JSON-serialized config (with `extends` resolved). Use `--path` to print only the path (scriptable). Exit code 0 if a config was found, 3 if only defaults are in effect. Mirrors `eslint --print-config` and `dprint output-resolved-config`.
@@ -1391,7 +1393,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `--changed-since` and `--fail-on-issues` for CI
 - Cross-workspace resolution for npm/yarn/pnpm workspaces
 
-[Unreleased]: https://github.com/fallow-rs/fallow/compare/v2.35.0...HEAD
+[Unreleased]: https://github.com/fallow-rs/fallow/compare/v2.36.0...HEAD
+[2.36.0]: https://github.com/fallow-rs/fallow/compare/v2.35.0...v2.36.0
 [2.35.0]: https://github.com/fallow-rs/fallow/compare/v2.34.0...v2.35.0
 [2.34.0]: https://github.com/fallow-rs/fallow/compare/v2.33.0...v2.34.0
 [2.33.0]: https://github.com/fallow-rs/fallow/compare/v2.32.1...v2.33.0
