@@ -7,7 +7,7 @@
 
 use std::path::Path;
 
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::{parse_script, resolve_binary_to_package};
 
@@ -15,14 +15,14 @@ use super::{parse_script, resolve_binary_to_package};
 ///
 /// Scans GitLab CI and GitHub Actions workflow files for shell commands,
 /// extracts binary names, and returns the set of npm package names used.
-pub fn analyze_ci_files(root: &Path) -> FxHashSet<String> {
+pub fn analyze_ci_files(root: &Path, bin_map: &FxHashMap<String, String>) -> FxHashSet<String> {
     let _span = tracing::info_span!("analyze_ci_files").entered();
     let mut used_packages = FxHashSet::default();
 
     // GitLab CI
     let gitlab_ci = root.join(".gitlab-ci.yml");
     if let Ok(content) = std::fs::read_to_string(&gitlab_ci) {
-        extract_ci_packages(&content, root, &mut used_packages);
+        extract_ci_packages(&content, root, bin_map, &mut used_packages);
     }
 
     // GitHub Actions workflows
@@ -34,7 +34,7 @@ pub fn analyze_ci_files(root: &Path) -> FxHashSet<String> {
             if (name_str.ends_with(".yml") || name_str.ends_with(".yaml"))
                 && let Ok(content) = std::fs::read_to_string(entry.path())
             {
-                extract_ci_packages(&content, root, &mut used_packages);
+                extract_ci_packages(&content, root, bin_map, &mut used_packages);
             }
         }
     }
@@ -49,12 +49,17 @@ pub fn analyze_ci_files(root: &Path) -> FxHashSet<String> {
 /// Since results only mark packages as "used" (never as "unused"), false
 /// positives from non-command YAML lines are safe — they only reduce
 /// false positive unused dependency reports.
-fn extract_ci_packages(content: &str, root: &Path, packages: &mut FxHashSet<String>) {
+fn extract_ci_packages(
+    content: &str,
+    root: &Path,
+    bin_map: &FxHashMap<String, String>,
+    packages: &mut FxHashSet<String>,
+) {
     for command in extract_ci_commands(content) {
         let parsed = parse_script(&command);
         for cmd in parsed {
             if !cmd.binary.is_empty() && !super::is_builtin_command(&cmd.binary) {
-                let pkg = resolve_binary_to_package(&cmd.binary, root);
+                let pkg = resolve_binary_to_package(&cmd.binary, root, bin_map);
                 packages.insert(pkg);
             }
         }
@@ -257,7 +262,12 @@ build:
     - npx @cyclonedx/cyclonedx-npm --output-file sbom.json
 ";
         let mut packages = FxHashSet::default();
-        extract_ci_packages(content, Path::new("/nonexistent"), &mut packages);
+        extract_ci_packages(
+            content,
+            Path::new("/nonexistent"),
+            &FxHashMap::default(),
+            &mut packages,
+        );
         assert!(
             packages.contains("@cyclonedx/cyclonedx-npm"),
             "packages: {packages:?}"
@@ -274,7 +284,12 @@ build:
     - tsc --noEmit
 ";
         let mut packages = FxHashSet::default();
-        extract_ci_packages(content, Path::new("/nonexistent"), &mut packages);
+        extract_ci_packages(
+            content,
+            Path::new("/nonexistent"),
+            &FxHashMap::default(),
+            &mut packages,
+        );
         assert!(packages.contains("eslint"));
         assert!(packages.contains("prettier"));
         assert!(packages.contains("typescript")); // tsc → typescript via resolve
@@ -290,7 +305,12 @@ build:
     - cp -r build/* dist/
 ";
         let mut packages = FxHashSet::default();
-        extract_ci_packages(content, Path::new("/nonexistent"), &mut packages);
+        extract_ci_packages(
+            content,
+            Path::new("/nonexistent"),
+            &FxHashMap::default(),
+            &mut packages,
+        );
         assert!(
             packages.is_empty(),
             "should not extract built-in commands: {packages:?}"
@@ -306,7 +326,12 @@ jobs:
       - run: npx @cyclonedx/cyclonedx-npm --output-file sbom.json
 ";
         let mut packages = FxHashSet::default();
-        extract_ci_packages(content, Path::new("/nonexistent"), &mut packages);
+        extract_ci_packages(
+            content,
+            Path::new("/nonexistent"),
+            &FxHashMap::default(),
+            &mut packages,
+        );
         assert!(packages.contains("@cyclonedx/cyclonedx-npm"));
     }
 

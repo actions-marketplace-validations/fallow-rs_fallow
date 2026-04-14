@@ -558,8 +558,42 @@ fn analyze_all_scripts(
     workspaces: &[fallow_config::WorkspaceInfo],
     plugin_result: &mut plugins::AggregatedPluginResult,
 ) {
+    // Load all package.jsons once: root + workspaces. Each is reused for both
+    // dep name collection (bin map) and script analysis (no double I/O).
     let pkg_path = config.root.join("package.json");
-    if let Ok(pkg) = PackageJson::load(&pkg_path)
+    let root_pkg = PackageJson::load(&pkg_path).ok();
+
+    let ws_pkgs: Vec<_> = workspaces
+        .iter()
+        .filter_map(|ws| {
+            PackageJson::load(&ws.root.join("package.json"))
+                .ok()
+                .map(|pkg| (ws, pkg))
+        })
+        .collect();
+
+    // Collect all dependency names to build the bin-name → package-name reverse map.
+    // This resolves binaries like "attw" to "@arethetypeswrong/cli" even without
+    // node_modules/.bin symlinks.
+    let mut all_dep_names: Vec<String> = Vec::new();
+    if let Some(ref pkg) = root_pkg {
+        all_dep_names.extend(pkg.all_dependency_names());
+    }
+    for (_, ws_pkg) in &ws_pkgs {
+        all_dep_names.extend(ws_pkg.all_dependency_names());
+    }
+    all_dep_names.sort_unstable();
+    all_dep_names.dedup();
+
+    // Probe node_modules/ at project root and each workspace root so non-hoisted
+    // deps (pnpm strict, Yarn workspaces) are also discovered.
+    let mut nm_roots: Vec<&std::path::Path> = vec![&config.root];
+    for ws in workspaces {
+        nm_roots.push(&ws.root);
+    }
+    let bin_map = scripts::build_bin_to_package_map(&nm_roots, &all_dep_names);
+
+    if let Some(ref pkg) = root_pkg
         && let Some(ref pkg_scripts) = pkg.scripts
     {
         let scripts_to_analyze = if config.production {
@@ -567,7 +601,7 @@ fn analyze_all_scripts(
         } else {
             pkg_scripts.clone()
         };
-        let script_analysis = scripts::analyze_scripts(&scripts_to_analyze, &config.root);
+        let script_analysis = scripts::analyze_scripts(&scripts_to_analyze, &config.root, &bin_map);
         plugin_result.script_used_packages = script_analysis.used_packages;
 
         for config_file in &script_analysis.config_files {
@@ -576,17 +610,14 @@ fn analyze_all_scripts(
                 .push((config_file.clone(), "scripts".to_string()));
         }
     }
-    for ws in workspaces {
-        let ws_pkg_path = ws.root.join("package.json");
-        if let Ok(ws_pkg) = PackageJson::load(&ws_pkg_path)
-            && let Some(ref ws_scripts) = ws_pkg.scripts
-        {
+    for (ws, ws_pkg) in &ws_pkgs {
+        if let Some(ref ws_scripts) = ws_pkg.scripts {
             let scripts_to_analyze = if config.production {
                 scripts::filter_production_scripts(ws_scripts)
             } else {
                 ws_scripts.clone()
             };
-            let ws_analysis = scripts::analyze_scripts(&scripts_to_analyze, &ws.root);
+            let ws_analysis = scripts::analyze_scripts(&scripts_to_analyze, &ws.root, &bin_map);
             plugin_result
                 .script_used_packages
                 .extend(ws_analysis.used_packages);
@@ -605,7 +636,7 @@ fn analyze_all_scripts(
     }
 
     // Scan CI config files for binary invocations
-    let ci_packages = scripts::ci::analyze_ci_files(&config.root);
+    let ci_packages = scripts::ci::analyze_ci_files(&config.root, &bin_map);
     plugin_result.script_used_packages.extend(ci_packages);
     plugin_result
         .entry_point_roles

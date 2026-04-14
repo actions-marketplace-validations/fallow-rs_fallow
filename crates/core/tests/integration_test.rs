@@ -84,6 +84,8 @@ mod scss_partials;
 
 #[path = "integration_test/arrow_wrapped_imports.rs"]
 mod arrow_wrapped_imports;
+#[path = "integration_test/bin_script_deps.rs"]
+mod bin_script_deps;
 #[path = "integration_test/entry_export_validation.rs"]
 mod entry_export_validation;
 #[path = "integration_test/script_multiplexers.rs"]

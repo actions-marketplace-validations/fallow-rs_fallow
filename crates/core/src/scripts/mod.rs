@@ -20,9 +20,9 @@ mod shell;
 use std::collections::HashMap;
 use std::path::Path;
 
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 
-pub use resolve::resolve_binary_to_package;
+pub use resolve::{build_bin_to_package_map, resolve_binary_to_package};
 
 /// Environment variable wrapper commands to strip before the actual binary.
 const ENV_WRAPPERS: &[&str] = &["cross-env", "dotenv", "env"];
@@ -114,7 +114,11 @@ fn is_production_script(name: &str) -> bool {
     clippy::disallowed_types,
     reason = "API matches serde-deserialized HashMap from package.json"
 )]
-pub fn analyze_scripts(scripts: &HashMap<String, String>, root: &Path) -> ScriptAnalysis {
+pub fn analyze_scripts(
+    scripts: &HashMap<String, String>,
+    root: &Path,
+    bin_map: &FxHashMap<String, String>,
+) -> ScriptAnalysis {
     let mut result = ScriptAnalysis::default();
 
     for script_value in scripts.values() {
@@ -124,7 +128,7 @@ pub fn analyze_scripts(scripts: &HashMap<String, String>, root: &Path) -> Script
                 .split_whitespace()
                 .any(|token| token == *wrapper)
             {
-                let pkg = resolve_binary_to_package(wrapper, root);
+                let pkg = resolve_binary_to_package(wrapper, root, bin_map);
                 if !is_builtin_command(wrapper) {
                     result.used_packages.insert(pkg);
                 }
@@ -139,11 +143,11 @@ pub fn analyze_scripts(scripts: &HashMap<String, String>, root: &Path) -> Script
                 if NODE_RUNNERS.contains(&cmd.binary.as_str()) {
                     // Node runners themselves are packages (node excluded)
                     if cmd.binary != "node" && cmd.binary != "bun" {
-                        let pkg = resolve_binary_to_package(&cmd.binary, root);
+                        let pkg = resolve_binary_to_package(&cmd.binary, root, bin_map);
                         result.used_packages.insert(pkg);
                     }
                 } else {
-                    let pkg = resolve_binary_to_package(&cmd.binary, root);
+                    let pkg = resolve_binary_to_package(&cmd.binary, root, bin_map);
                     result.used_packages.insert(pkg);
                 }
             }
@@ -565,31 +569,38 @@ mod tests {
 
     #[test]
     fn tsc_maps_to_typescript() {
-        let pkg = resolve_binary_to_package("tsc", Path::new("/nonexistent"));
+        let pkg =
+            resolve_binary_to_package("tsc", Path::new("/nonexistent"), &FxHashMap::default());
         assert_eq!(pkg, "typescript");
     }
 
     #[test]
     fn ng_maps_to_angular_cli() {
-        let pkg = resolve_binary_to_package("ng", Path::new("/nonexistent"));
+        let pkg = resolve_binary_to_package("ng", Path::new("/nonexistent"), &FxHashMap::default());
         assert_eq!(pkg, "@angular/cli");
     }
 
     #[test]
     fn biome_maps_to_biomejs() {
-        let pkg = resolve_binary_to_package("biome", Path::new("/nonexistent"));
+        let pkg =
+            resolve_binary_to_package("biome", Path::new("/nonexistent"), &FxHashMap::default());
         assert_eq!(pkg, "@biomejs/biome");
     }
 
     #[test]
     fn unknown_binary_is_identity() {
-        let pkg = resolve_binary_to_package("my-custom-tool", Path::new("/nonexistent"));
+        let pkg = resolve_binary_to_package(
+            "my-custom-tool",
+            Path::new("/nonexistent"),
+            &FxHashMap::default(),
+        );
         assert_eq!(pkg, "my-custom-tool");
     }
 
     #[test]
     fn run_s_maps_to_npm_run_all() {
-        let pkg = resolve_binary_to_package("run-s", Path::new("/nonexistent"));
+        let pkg =
+            resolve_binary_to_package("run-s", Path::new("/nonexistent"), &FxHashMap::default());
         assert_eq!(pkg, "npm-run-all");
     }
 
@@ -619,7 +630,7 @@ mod tests {
     fn builtin_commands_not_tracked() {
         let scripts: HashMap<String, String> =
             std::iter::once(("postinstall".to_string(), "echo done".to_string())).collect();
-        let result = analyze_scripts(&scripts, Path::new("/nonexistent"));
+        let result = analyze_scripts(&scripts, Path::new("/nonexistent"), &FxHashMap::default());
         assert!(result.used_packages.is_empty());
     }
 
@@ -634,7 +645,7 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let result = analyze_scripts(&scripts, Path::new("/nonexistent"));
+        let result = analyze_scripts(&scripts, Path::new("/nonexistent"), &FxHashMap::default());
         assert!(result.used_packages.contains("typescript"));
         assert!(result.used_packages.contains("webpack"));
         assert!(result.used_packages.contains("eslint"));
@@ -648,7 +659,7 @@ mod tests {
             "webpack --config webpack.prod.js".to_string(),
         ))
         .collect();
-        let result = analyze_scripts(&scripts, Path::new("/nonexistent"));
+        let result = analyze_scripts(&scripts, Path::new("/nonexistent"), &FxHashMap::default());
         assert!(result.config_files.contains(&"webpack.prod.js".to_string()));
     }
 
@@ -656,7 +667,7 @@ mod tests {
     fn analyze_extracts_entry_files() {
         let scripts: HashMap<String, String> =
             std::iter::once(("seed".to_string(), "ts-node scripts/seed.ts".to_string())).collect();
-        let result = analyze_scripts(&scripts, Path::new("/nonexistent"));
+        let result = analyze_scripts(&scripts, Path::new("/nonexistent"), &FxHashMap::default());
         assert!(result.entry_files.contains(&"scripts/seed.ts".to_string()));
         // ts-node should be tracked as a used package
         assert!(result.used_packages.contains("ts-node"));
@@ -669,7 +680,7 @@ mod tests {
             "cross-env NODE_ENV=production webpack --config webpack.prod.js".to_string(),
         ))
         .collect();
-        let result = analyze_scripts(&scripts, Path::new("/nonexistent"));
+        let result = analyze_scripts(&scripts, Path::new("/nonexistent"), &FxHashMap::default());
         assert!(result.used_packages.contains("cross-env"));
         assert!(result.used_packages.contains("webpack"));
         assert!(result.config_files.contains(&"webpack.prod.js".to_string()));
@@ -682,7 +693,7 @@ mod tests {
             "cross-env CI=true npm run build && jest --config jest.ci.js --coverage".to_string(),
         ))
         .collect();
-        let result = analyze_scripts(&scripts, Path::new("/nonexistent"));
+        let result = analyze_scripts(&scripts, Path::new("/nonexistent"), &FxHashMap::default());
         // cross-env is tracked, npm run is skipped, jest is tracked
         assert!(result.used_packages.contains("cross-env"));
         assert!(result.used_packages.contains("jest"));
@@ -1008,7 +1019,7 @@ mod tests {
     #[test]
     fn analyze_scripts_empty_scripts() {
         let scripts: HashMap<String, String> = HashMap::new();
-        let result = analyze_scripts(&scripts, Path::new("/nonexistent"));
+        let result = analyze_scripts(&scripts, Path::new("/nonexistent"), &FxHashMap::default());
         assert!(result.used_packages.is_empty());
         assert!(result.config_files.is_empty());
         assert!(result.entry_files.is_empty());
@@ -1041,7 +1052,7 @@ mod tests {
             "dev".to_string(),
             "concurrently \"npm:server\" \"npm:worker\"".to_string(),
         )]);
-        let result = analyze_scripts(&scripts, Path::new("/fake"));
+        let result = analyze_scripts(&scripts, Path::new("/fake"), &FxHashMap::default());
         // concurrently itself should be detected as a used package
         assert!(result.used_packages.contains("concurrently"));
         // npm:server and npm:worker are script references, not packages
@@ -1053,7 +1064,7 @@ mod tests {
     #[test]
     fn run_p_with_bare_script_names() {
         let scripts = HashMap::from([("dev".to_string(), "run-p server worker".to_string())]);
-        let result = analyze_scripts(&scripts, Path::new("/fake"));
+        let result = analyze_scripts(&scripts, Path::new("/fake"), &FxHashMap::default());
         // run-p maps to npm-run-all package
         assert!(result.used_packages.contains("npm-run-all"));
         // server and worker are script names, not packages
@@ -1064,7 +1075,7 @@ mod tests {
     #[test]
     fn run_s_with_bare_script_names() {
         let scripts = HashMap::from([("build".to_string(), "run-s clean compile".to_string())]);
-        let result = analyze_scripts(&scripts, Path::new("/fake"));
+        let result = analyze_scripts(&scripts, Path::new("/fake"), &FxHashMap::default());
         assert!(result.used_packages.contains("npm-run-all"));
         assert!(!result.used_packages.contains("clean"));
         assert!(!result.used_packages.contains("compile"));
@@ -1076,7 +1087,7 @@ mod tests {
             "dev".to_string(),
             "npm-run-all --parallel server worker".to_string(),
         )]);
-        let result = analyze_scripts(&scripts, Path::new("/fake"));
+        let result = analyze_scripts(&scripts, Path::new("/fake"), &FxHashMap::default());
         assert!(result.used_packages.contains("npm-run-all"));
         assert!(!result.used_packages.contains("server"));
         assert!(!result.used_packages.contains("worker"));
@@ -1088,7 +1099,7 @@ mod tests {
             "dev".to_string(),
             "concurrently --kill-others \"npm:server\" \"npm:worker\"".to_string(),
         )]);
-        let result = analyze_scripts(&scripts, Path::new("/fake"));
+        let result = analyze_scripts(&scripts, Path::new("/fake"), &FxHashMap::default());
         assert!(result.used_packages.contains("concurrently"));
         assert!(!result.used_packages.contains("server"));
         assert!(!result.used_packages.contains("worker"));
@@ -1102,7 +1113,7 @@ mod tests {
             "dev".to_string(),
             "concurrently npm:dev npm:test".to_string(),
         )]);
-        let result = analyze_scripts(&scripts, Path::new("/fake"));
+        let result = analyze_scripts(&scripts, Path::new("/fake"), &FxHashMap::default());
         assert!(result.used_packages.contains("concurrently"));
         assert!(!result.used_packages.contains("dev"));
         assert!(!result.used_packages.contains("test"));
@@ -1115,7 +1126,7 @@ mod tests {
             "dev".to_string(),
             "run-p \"npm:server\" \"npm:worker\"".to_string(),
         )]);
-        let result = analyze_scripts(&scripts, Path::new("/fake"));
+        let result = analyze_scripts(&scripts, Path::new("/fake"), &FxHashMap::default());
         assert!(result.used_packages.contains("npm-run-all"));
         assert!(!result.used_packages.contains("server"));
     }
@@ -1157,7 +1168,7 @@ mod tests {
                 value in "[a-zA-Z0-9 _./@&|;=-]{1,100}",
             ) {
                 let scripts: HashMap<String, String> = std::iter::once((name, value)).collect();
-                let _ = analyze_scripts(&scripts, Path::new("/nonexistent"));
+                let _ = analyze_scripts(&scripts, Path::new("/nonexistent"), &FxHashMap::default());
             }
 
             /// is_env_assignment should never panic on arbitrary input.
@@ -1169,7 +1180,7 @@ mod tests {
             /// resolve_binary_to_package should always return a non-empty string.
             #[test]
             fn resolve_binary_always_non_empty(binary in "[a-z][a-z0-9-]{0,20}") {
-                let result = resolve_binary_to_package(&binary, Path::new("/nonexistent"));
+                let result = resolve_binary_to_package(&binary, Path::new("/nonexistent"), &FxHashMap::default());
                 prop_assert!(!result.is_empty(), "Package name should never be empty");
             }
 
