@@ -41,7 +41,6 @@ oxc_coverage_instrument = { workspace = true }
 ureq = { workspace = true }
 http = "1"
 xxhash-rust = { workspace = true }
-base64 = "0.22"
 
 [lib]
 name = "fallow_cli"

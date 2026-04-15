@@ -19,7 +19,6 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use base64::Engine;
 use ed25519_dalek::VerifyingKey;
 use fallow_license::{
     DEFAULT_HARD_FAIL_DAYS, Feature, LicenseError, LicenseStatus, current_unix_seconds,
@@ -37,7 +36,6 @@ const DEFAULT_API_URL: &str = "https://api.fallow.cloud";
 const NETWORK_EXIT_CODE: u8 = 7;
 const CONNECT_TIMEOUT_SECS: u64 = 5;
 const TOTAL_TIMEOUT_SECS: u64 = 10;
-const PUBLIC_KEY_OVERRIDE_ENV: &str = "FALLOW_LICENSE_PUBLIC_KEY_BASE64";
 
 /// Subcommands for `fallow license`.
 #[derive(Debug)]
@@ -242,28 +240,8 @@ fn write_jwt(jwt: &str) -> Result<PathBuf, String> {
 /// Crate-internal so other CLI subcommands (e.g. `fallow coverage setup`)
 /// can also detect license state without re-implementing key construction.
 pub fn verifying_key() -> Result<VerifyingKey, String> {
-    VerifyingKey::from_bytes(&verifying_key_bytes()?)
-        .map_err(|err| format!("invalid license verification key: {err}"))
-}
-
-fn verifying_key_bytes() -> Result<[u8; 32], String> {
-    verifying_key_bytes_from_override(std::env::var(PUBLIC_KEY_OVERRIDE_ENV).ok().as_deref())
-}
-
-fn verifying_key_bytes_from_override(value: Option<&str>) -> Result<[u8; 32], String> {
-    match value {
-        Some(value) if !value.trim().is_empty() => decode_public_key_override(value),
-        _ => Ok(PUBLIC_KEY_BYTES),
-    }
-}
-
-fn decode_public_key_override(value: &str) -> Result<[u8; 32], String> {
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(value.trim())
-        .map_err(|err| format!("{PUBLIC_KEY_OVERRIDE_ENV} is not valid base64: {err}"))?;
-    bytes
-        .try_into()
-        .map_err(|_: Vec<u8>| format!("{PUBLIC_KEY_OVERRIDE_ENV} must decode to exactly 32 bytes"))
+    VerifyingKey::from_bytes(&PUBLIC_KEY_BYTES)
+        .map_err(|err| format!("invalid compiled-in public key: {err}"))
 }
 
 pub fn activate_trial(email: &str) -> Result<LicenseStatus, String> {
@@ -443,7 +421,6 @@ fn print_status(status: &LicenseStatus) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ed25519_dalek::SigningKey;
 
     #[test]
     fn read_jwt_prefers_raw_arg() {
@@ -473,23 +450,5 @@ mod tests {
     fn run_trial_without_email_errors() {
         let exit = run_trial(None);
         assert_eq!(format!("{exit:?}"), format!("{:?}", ExitCode::from(2)));
-    }
-
-    #[test]
-    fn verifying_key_bytes_use_override_when_present() {
-        let signing = SigningKey::from_bytes(&[7_u8; 32]);
-        let override_value =
-            base64::engine::general_purpose::STANDARD.encode(signing.verifying_key().to_bytes());
-        let key = verifying_key_bytes_from_override(Some(&override_value))
-            .expect("override should decode");
-        assert_eq!(key, signing.verifying_key().to_bytes());
-    }
-
-    #[test]
-    fn verifying_key_bytes_reject_invalid_override_length() {
-        let invalid = base64::engine::general_purpose::STANDARD.encode([1_u8; 31]);
-        let err = verifying_key_bytes_from_override(Some(&invalid))
-            .expect_err("31-byte override must fail");
-        assert!(err.contains("exactly 32 bytes"));
     }
 }
