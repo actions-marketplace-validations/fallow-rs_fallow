@@ -110,8 +110,7 @@
             "renovate*",
             "github-actions*",
             "svc-*",
-            "*-service-account*",
-            "*noreply*"
+            "*-service-account*"
           ],
           "emailMode": "handle"
         }
@@ -614,8 +613,7 @@
               "renovate*",
               "github-actions*",
               "svc-*",
-              "*-service-account*",
-              "*noreply*"
+              "*-service-account*"
             ],
             "emailMode": "handle"
           }
@@ -638,8 +636,7 @@
             "renovate*",
             "github-actions*",
             "svc-*",
-            "*-service-account*",
-            "*noreply*"
+            "*-service-account*"
           ]
         },
         "emailMode": {
@@ -663,7 +660,7 @@
           "const": "handle"
         },
         {
-          "description": "Show a stable SHA-256 pseudonym (first 12 hex chars).\nUse in regulated environments where even local-parts are sensitive.",
+          "description": "Show a stable `xxh3:<16hex>` pseudonym derived from the raw email.\nNon-cryptographic; suitable to keep raw emails out of CI artifacts\n(SARIF, code-scanning uploads) but not as a security primitive --\na known list of org emails can be brute-forced into a rainbow table.\nUse in regulated environments where even local-parts are sensitive.",
           "type": "string",
           "const": "hash"
         }

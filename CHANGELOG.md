@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.38.0] - 2026-04-15
+
+### Added
+
+- **Ownership risk analysis on hotspots** -- `fallow health --hotspots --ownership` surfaces per-file ownership signals derived from git author history and CODEOWNERS. For each hotspot: Avelino truck factor (`bus_factor`), contributor count, top contributor with stale-days and commits, up to three additional recent contributors, `suggested_reviewers` (recent contributors with `stale_days < 90` — first-class field for AI agent routing), declared CODEOWNERS owner, tristate `unowned` flag (`true`=no rule matches / `false`=rule matches / `null`=no CODEOWNERS file), drift detection with human-readable reason. Human output prepends a project-level summary line (`9/10 hotspots depend on a single recent contributor · top authors: @alice (6), @bob (4)`) so tech leads see the organizational pattern before scanning per-file rows. JSON gains three new action types: `low-bus-factor` (with file-specific candidate reviewers from `suggested_reviewers`), `unowned-hotspot` (with synthesized CODEOWNERS pattern + `heuristic: "directory-deepest"` discriminator for future evolution), and `ownership-drift`. Test-path hotspots tagged `[test]` in human output and `is_test_path: true` in JSON. Only the free tool combining dead code + complexity + ownership risk. Research-backed (Avelino et al., Thongtanunam et al. ICSE 2016). ([#116](https://github.com/fallow-rs/fallow/discussions/116))
+- **`--ownership-emails={raw|handle|hash}` privacy control** -- chooses how author emails are rendered in output. `handle` (default) shows the local-part only, unwrapping GitHub-style noreply prefixes (`12345+alice@users.noreply.github.com` → `alice`); `hash` emits stable non-cryptographic `xxh3:<16hex>` pseudonyms for regulated environments where author identities are sensitive in CI artifacts (SARIF, code-scanning uploads); `raw` shows full email addresses for public OSS repos. `ContributorEntry` gains a `format` discriminator so typed JSON consumers can branch without re-parsing the identifier. Configure the repo-wide default via `health.ownership.emailMode` in config.
+- **`health.ownership` config section** -- `botPatterns` (glob patterns matched against raw author emails; defaults cover `*\[bot\]*`, `dependabot*`, `renovate*`, `github-actions*`, `svc-*`, `*-service-account*` — `*noreply*` is deliberately NOT a default because it would filter real human contributors using GitHub's privacy-default email format), `emailMode` (raw/handle/hash).
+- **Ownership signals in MCP `check_health` tool** -- new `ownership: bool` and `ownership_email_mode: "raw"|"handle"|"hash"` params (typed enum so JSON Schema constrains input at the agent layer). Tool description updated.
+
+### Changed
+
+- **Churn layer tracks per-author contributions** -- `git log` now runs with `--use-mailmap` and the `%at|%ae` format to record commit authors. Per-file `FileChurn.authors` map (`u32` → `AuthorContribution { commits, weighted_commits, first_commit_ts, last_commit_ts }`) references interned author emails in a shared pool on `ChurnResult` to keep the bitcode cache compact. Cache schema version bumped to 2; older caches are automatically rejected on load.
+
 ## [2.37.0] - 2026-04-15
 
 ### Added
@@ -1405,7 +1418,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `--changed-since` and `--fail-on-issues` for CI
 - Cross-workspace resolution for npm/yarn/pnpm workspaces
 
-[Unreleased]: https://github.com/fallow-rs/fallow/compare/v2.37.0...HEAD
+[Unreleased]: https://github.com/fallow-rs/fallow/compare/v2.38.0...HEAD
+[2.38.0]: https://github.com/fallow-rs/fallow/compare/v2.37.0...v2.38.0
 [2.37.0]: https://github.com/fallow-rs/fallow/compare/v2.36.0...v2.37.0
 [2.36.0]: https://github.com/fallow-rs/fallow/compare/v2.35.0...v2.36.0
 [2.35.0]: https://github.com/fallow-rs/fallow/compare/v2.34.0...v2.35.0
