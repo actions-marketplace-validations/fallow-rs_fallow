@@ -49,7 +49,7 @@ impl PackageResolver {
                 (rel.to_path_buf(), w.name.clone())
             })
             .collect();
-        ws.sort_by(|a, b| b.0.as_os_str().len().cmp(&a.0.as_os_str().len()));
+        ws.sort_by_key(|b| std::cmp::Reverse(b.0.as_os_str().len()));
         Self { workspaces: ws }
     }
 

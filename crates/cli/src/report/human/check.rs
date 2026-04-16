@@ -520,7 +520,7 @@ fn build_dir_rollup_section(
             dir_counts.push((dir, 1, is_dir));
         }
     }
-    dir_counts.sort_by(|a, b| b.1.cmp(&a.1));
+    dir_counts.sort_by_key(|b| std::cmp::Reverse(b.1));
 
     // Second-level rollup: when one directory holds >80% of files, expand it
     // into two-level sub-directories (e.g. `packages/react-query/`) for clarity.
@@ -552,7 +552,7 @@ fn build_dir_rollup_section(
                 }
             }
         }
-        sub_counts.sort_by(|a, b| b.1.cmp(&a.1));
+        sub_counts.sort_by_key(|b| std::cmp::Reverse(b.1));
         // Combine: sub-entries for the dominant dir + remaining first-level entries
         let mut combined = sub_counts;
         for entry in &dir_counts {
@@ -707,7 +707,7 @@ fn build_duplicate_exports_section(
     }
 
     // Sort by count descending
-    pair_groups.sort_by(|a, b| b.2.len().cmp(&a.2.len()));
+    pair_groups.sort_by_key(|b| std::cmp::Reverse(b.2.len()));
 
     let shown = pair_groups.len().min(MAX_FLAT_ITEMS);
     for (file_a, file_b, exports) in &pair_groups[..shown] {
@@ -1005,7 +1005,7 @@ pub(in crate::report) fn print_grouped_human(
         .map(|g| (g.key.as_str(), g.results.total_issues()))
         .filter(|(_, count)| *count > 0)
         .collect();
-    group_counts.sort_by(|a, b| b.1.cmp(&a.1));
+    group_counts.sort_by_key(|b| std::cmp::Reverse(b.1));
 
     if !group_counts.is_empty() {
         let summary_parts: Vec<String> = group_counts

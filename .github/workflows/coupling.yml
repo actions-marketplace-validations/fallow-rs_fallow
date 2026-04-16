@@ -52,10 +52,19 @@ jobs:
         # Cycle detection is handled by fallow's own --circular-deps instead.
         run: |
           CARGO_MODULES_BIN="${CARGO_HOME:-$HOME/.cargo}/bin/cargo-modules"
+          : > coupling-dot.txt
           for crate in fallow-config fallow-types fallow-extract fallow-graph fallow-core fallow-cli; do
-            "$CARGO_MODULES_BIN" dependencies --lib -p "$crate" \
-              --no-externs --no-fns --no-sysroot --no-traits --no-types --no-owns 2>/dev/null
-          done > coupling-dot.txt
+            if "$CARGO_MODULES_BIN" dependencies --lib -p "$crate" \
+              --no-externs --no-fns --no-sysroot --no-traits --no-types --no-owns \
+              >> coupling-dot.txt 2>/tmp/cargo-modules.stderr; then
+              continue
+            fi
+            cat /tmp/cargo-modules.stderr >&2
+            echo "Retrying via cargo modules for $crate" >&2
+            cargo modules dependencies --lib -p "$crate" \
+              --no-externs --no-fns --no-sysroot --no-traits --no-types --no-owns \
+              >> coupling-dot.txt 2>/tmp/cargo-modules.stderr
+          done
 
       - name: Analyze coupling metrics
         run: |

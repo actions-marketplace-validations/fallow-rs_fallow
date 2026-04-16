@@ -791,7 +791,7 @@ fn render_file_scores(
         let (dir, filename) = split_dir_filename(&file_str);
 
         // Line 1: MI score + path
-        lines.push(format!("  {}    {}{}", mi_colored, dir.dimmed(), filename,));
+        lines.push(format!("  {}    {}{}", mi_colored, dir.dimmed(), filename));
 
         // Line 2: metrics (indented, dimmed) with optional CRAP risk
         let risk_suffix = if score.crap_max > 0.0 {
@@ -896,7 +896,7 @@ fn render_coverage_gaps(
         for item in &gaps.files[..shown_files] {
             let file_str = relative_path(&item.path, root).display().to_string();
             let (dir, filename) = split_dir_filename(&file_str);
-            lines.push(format!("  {}{}", dir.dimmed(), filename,));
+            lines.push(format!("  {}{}", dir.dimmed(), filename));
         }
         if gaps.files.len() > MAX_FLAT_ITEMS {
             lines.push(format!(
@@ -1013,7 +1013,7 @@ fn render_ownership_summary(report: &crate::health_types::HealthReport) -> Optio
             .or_insert(0) += 1;
     }
     let mut ranked: Vec<(String, u32)> = tally.into_iter().collect();
-    ranked.sort_by(|a, b| b.1.cmp(&a.1));
+    ranked.sort_by_key(|b| std::cmp::Reverse(b.1));
     let top_authors: Vec<String> = ranked
         .iter()
         .take(3)

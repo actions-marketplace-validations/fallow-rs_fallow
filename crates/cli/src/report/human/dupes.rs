@@ -89,7 +89,7 @@ pub(in crate::report) fn build_duplication_human_lines(
     // Sort clone groups by line count descending for most impactful first
     let mut sorted_groups: Vec<&fallow_core::duplicates::CloneGroup> =
         report.clone_groups.iter().collect();
-    sorted_groups.sort_by(|a, b| b.line_count.cmp(&a.line_count));
+    sorted_groups.sort_by_key(|b| std::cmp::Reverse(b.line_count));
 
     let total_groups = sorted_groups.len();
     let shown = total_groups.min(MAX_CLONE_GROUPS);
@@ -359,7 +359,7 @@ pub(super) fn detect_mirrored_families<'a>(
     }
 
     // Sort mirrors by total lines descending
-    mirrors.sort_by(|a, b| b.total_lines.cmp(&a.total_lines));
+    mirrors.sort_by_key(|b| std::cmp::Reverse(b.total_lines));
 
     let non_mirrored: Vec<&fallow_core::duplicates::CloneFamily> = families
         .iter()
