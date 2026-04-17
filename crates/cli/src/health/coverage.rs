@@ -43,13 +43,14 @@ use crate::license::verifying_key;
 /// (which matches the first `PUBLIC_KEY_BYTES: [u8; 32]` in the file) never
 /// misidentifies it as the license pubkey.
 ///
-/// PLACEHOLDER: the 32 zero bytes below will be replaced in Phase 2.5 step B2
-/// with the real binary-signing public key produced by the keypair generator
-/// in B1. A `cargo test` guard below refuses to let the all-zeros placeholder
-/// ship by asserting the constant differs from `[0u8; 32]`; the test is
-/// marked `#[ignore]` so local builds still pass, and the release skill runs
-/// `cargo test -- --include-ignored` to catch it before tagging v2.40.0.
-const BINARY_SIGNING_VERIFY_KEY: [u8; 32] = [0u8; 32];
+/// Must match the `ED25519_BINARY_SIGNING_PUBLIC_KEY` repository variable on
+/// `fallow-rs/fallow-cloud` byte-for-byte; the `binary-signing-parity.yml`
+/// workflow on fallow-cloud asserts this daily. If you rotate the key, update
+/// both sides in the same release cycle per the procedure in ADR 008.
+const BINARY_SIGNING_VERIFY_KEY: [u8; 32] = [
+    5, 202, 230, 77, 115, 122, 129, 242, 85, 243, 195, 194, 27, 191, 159, 53, 1, 24, 105, 203, 179,
+    88, 43, 113, 206, 186, 85, 115, 106, 103, 145, 124,
+];
 
 type FunctionLocations = FxHashMap<(String, String), Option<u32>>;
 
@@ -1532,18 +1533,15 @@ mod tests {
         assert_eq!(BINARY_SIGNING_VERIFY_KEY.len(), 32);
     }
 
-    // Hard-fail gate for the release process. This test stays ignored during
-    // normal `cargo test` (the constant is `[0u8; 32]` until Phase 2.5 B2
-    // rotates the real key in). The release skill runs
-    // `cargo test -- --include-ignored` before tagging v2.40.0, which will
-    // fail this test if the placeholder is still in place. See
-    // fallow-cloud/decisions/008-sidecar-key-rotation.md.
+    // Hard-fail gate for the release process. Asserts the constant is not the
+    // all-zeros placeholder that shipped in the Phase 2.5 A' commit. Now runs
+    // by default (no `#[ignore]`) so any accidental revert to the placeholder
+    // would break `cargo test` immediately.
     #[test]
-    #[ignore = "placeholder key; replace in Phase 2.5 B2 before v2.40.0 is tagged"]
     fn binary_signing_verify_key_must_not_be_placeholder() {
         assert_ne!(
             BINARY_SIGNING_VERIFY_KEY, [0u8; 32],
-            "BINARY_SIGNING_VERIFY_KEY is still the all-zeros placeholder. Generate a real keypair per fallow-cloud/decisions/008-sidecar-key-rotation.md and paste the public bytes here before cutting a release."
+            "BINARY_SIGNING_VERIFY_KEY is the all-zeros placeholder. Generate a real keypair per fallow-cloud/decisions/008-sidecar-key-rotation.md and paste the public bytes here before cutting a release."
         );
     }
 
