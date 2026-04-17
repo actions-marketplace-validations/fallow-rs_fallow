@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.40.2] - 2026-04-17
+
+### Fixed
+
+- **`super.method()` calls now credit the parent class's method as used.** Base-class methods only invoked via `super.method()` from subclasses were silently dropped by the AST visitor and surfaced as false-positive `unused-class-member` findings. A `class_super_stack` now tracks the nearest enclosing class's `extends` identifier while walking the class body; `super.<member>` expressions emit a member access against that identifier, and the existing `local_to_imported` resolver in `find_unused_members` maps it back to the parent's export name. Object-literal `super` (no enclosing class on the stack) is correctly dropped, and nested class expressions respect their own frame. Verified against svelte (13 false positives eliminated, each traced to a real `super.<member>` call in source) and vite (-2 false positives); zero new findings introduced on any benchmark fixture. Closes [#130](https://github.com/fallow-rs/fallow/issues/130).
+
 ## [2.40.1] - 2026-04-17
 
 ### Fixed
@@ -1466,7 +1472,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `--changed-since` and `--fail-on-issues` for CI
 - Cross-workspace resolution for npm/yarn/pnpm workspaces
 
-[Unreleased]: https://github.com/fallow-rs/fallow/compare/v2.40.1...HEAD
+[Unreleased]: https://github.com/fallow-rs/fallow/compare/v2.40.2...HEAD
+[2.40.2]: https://github.com/fallow-rs/fallow/compare/v2.40.1...v2.40.2
 [2.40.1]: https://github.com/fallow-rs/fallow/compare/v2.40.0...v2.40.1
 [2.40.0]: https://github.com/fallow-rs/fallow/compare/v2.39.0...v2.40.0
 [2.39.0]: https://github.com/fallow-rs/fallow/compare/v2.38.0...v2.39.0
