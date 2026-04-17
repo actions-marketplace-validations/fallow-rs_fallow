@@ -35,6 +35,7 @@ fn cache_roundtrip() {
         line_offsets: vec![],
         complexity: vec![],
         flag_uses: vec![],
+        class_heritage: vec![],
     };
 
     store.insert(std::path::Path::new("test.ts"), cached);
@@ -180,6 +181,7 @@ fn incremental_cache_prune_stale_entries() {
         line_offsets: vec![],
         complexity: vec![],
         flag_uses: vec![],
+        class_heritage: vec![],
     };
 
     store.insert(std::path::Path::new("/project/existing.ts"), make_module());

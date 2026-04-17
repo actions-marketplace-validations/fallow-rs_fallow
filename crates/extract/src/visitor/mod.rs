@@ -16,6 +16,14 @@ use crate::{
     DynamicImportInfo, DynamicImportPattern, ExportInfo, ExportName, ImportInfo, MemberAccess,
     MemberInfo, ModuleInfo, ReExportInfo, RequireCallInfo, VisibilityTag,
 };
+use fallow_types::extract::ClassHeritageInfo;
+
+#[derive(Debug, Clone)]
+struct LocalClassExportInfo {
+    members: Vec<MemberInfo>,
+    super_class: Option<String>,
+    implemented_interfaces: Vec<String>,
+}
 
 /// AST visitor that extracts all import/export information in a single pass.
 #[derive(Default)]
@@ -48,11 +56,74 @@ pub(crate) struct ModuleInfoExtractor {
     /// Members collected while walking a namespace body.
     /// Moved to the namespace's `ExportInfo.members` after the walk completes.
     pending_namespace_members: Vec<MemberInfo>,
+    /// Heritage metadata for exported classes.
+    pub(crate) class_heritage: Vec<ClassHeritageInfo>,
+    /// Module-scope local class declarations keyed by local binding name.
+    local_class_exports: FxHashMap<String, LocalClassExportInfo>,
+    /// Block nesting depth used to distinguish module-scope declarations.
+    block_depth: u32,
+    /// Function / arrow-function nesting depth used to distinguish module scope.
+    function_depth: u32,
 }
 
 impl ModuleInfoExtractor {
     pub(crate) fn new() -> Self {
         Self::default()
+    }
+
+    pub(crate) fn record_local_class_export(
+        &mut self,
+        name: String,
+        members: Vec<MemberInfo>,
+        super_class: Option<String>,
+        implemented_interfaces: Vec<String>,
+    ) {
+        self.local_class_exports.insert(
+            name,
+            LocalClassExportInfo {
+                members,
+                super_class,
+                implemented_interfaces,
+            },
+        );
+    }
+
+    fn enrich_local_class_exports(&mut self) {
+        if self.local_class_exports.is_empty() {
+            return;
+        }
+
+        for export in &mut self.exports {
+            let Some(local_name) = export.local_name.as_deref() else {
+                continue;
+            };
+            let Some(local_class) = self.local_class_exports.get(local_name) else {
+                continue;
+            };
+
+            if export.members.is_empty() {
+                export.members = local_class.members.clone();
+            }
+            if export.super_class.is_none() {
+                export.super_class = local_class.super_class.clone();
+            }
+
+            let export_name = export.name.to_string();
+            let already_has_heritage = self
+                .class_heritage
+                .iter()
+                .any(|heritage| heritage.export_name == export_name);
+            if !already_has_heritage
+                && (local_class.super_class.is_some()
+                    || !local_class.implemented_interfaces.is_empty())
+            {
+                self.class_heritage.push(ClassHeritageInfo {
+                    export_name,
+                    super_class: local_class.super_class.clone(),
+                    implements: local_class.implemented_interfaces.clone(),
+                });
+            }
+        }
     }
 
     /// Map instance member accesses to class member accesses.
@@ -105,6 +176,7 @@ impl ModuleInfoExtractor {
         content_hash: u64,
         suppressions: Vec<Suppression>,
     ) -> ModuleInfo {
+        self.enrich_local_class_exports();
         self.resolve_instance_member_accesses();
         ModuleInfo {
             file_id,
@@ -123,11 +195,13 @@ impl ModuleInfoExtractor {
             line_offsets: Vec::new(),
             complexity: Vec::new(),
             flag_uses: Vec::new(),
+            class_heritage: self.class_heritage,
         }
     }
 
     /// Merge this extractor's fields into an existing `ModuleInfo`.
     pub(crate) fn merge_into(mut self, info: &mut ModuleInfo) {
+        self.enrich_local_class_exports();
         self.resolve_instance_member_accesses();
         info.imports.extend(self.imports);
         info.exports.extend(self.exports);
@@ -139,6 +213,7 @@ impl ModuleInfoExtractor {
         info.member_accesses.extend(self.member_accesses);
         info.whole_object_uses.extend(self.whole_object_uses);
         info.has_cjs_exports |= self.has_cjs_exports;
+        info.class_heritage.extend(self.class_heritage);
     }
 }
 

@@ -157,6 +157,7 @@ pub fn cached_to_module(
         line_offsets: cached.line_offsets.clone(),
         complexity: cached.complexity.clone(),
         flag_uses: cached.flag_uses.clone(),
+        class_heritage: cached.class_heritage.clone(),
     }
 }
 
@@ -288,5 +289,6 @@ pub fn module_to_cached(
         line_offsets: module.line_offsets.clone(),
         complexity: module.complexity.clone(),
         flag_uses: module.flag_uses.clone(),
+        class_heritage: module.class_heritage.clone(),
     }
 }

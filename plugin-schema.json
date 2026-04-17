@@ -74,10 +74,10 @@
       "default": []
     },
     "usedClassMembers": {
-      "description": "Class member method/property names the framework invokes at runtime.\nListed names extend the built-in lifecycle allowlist, so members with\nthese names are never flagged as unused-class-members. Use for libraries\nthat call interface methods reflectively (e.g. ag-Grid's `agInit`,\n`refresh`; TypeORM's `MigrationInterface.up`/`down`; Web Components'\n`connectedCallback`).",
+      "description": "Class member method/property rules the framework invokes at runtime.\nSupports plain member names for global suppression and scoped objects\nwith `extends` / `implements` constraints when the method name is too\ncommon to suppress across the whole workspace.",
       "type": "array",
       "items": {
-        "type": "string"
+        "$ref": "#/$defs/UsedClassMemberRule"
       },
       "default": []
     }
@@ -204,6 +204,50 @@
       "required": [
         "pattern",
         "exports"
+      ]
+    },
+    "UsedClassMemberRule": {
+      "description": "A `usedClassMembers` entry from config or an external plugin.\n\nSupports either a plain member name (`\"agInit\"`) or a scoped rule that\nonly applies when a class matches specific `extends` / `implements`\nheritage clauses.",
+      "anyOf": [
+        {
+          "description": "Globally suppress this class member name for all classes.",
+          "type": "string"
+        },
+        {
+          "description": "Suppress these class member names only for matching classes.",
+          "$ref": "#/$defs/ScopedUsedClassMemberRule"
+        }
+      ]
+    },
+    "ScopedUsedClassMemberRule": {
+      "description": "A heritage-constrained `usedClassMembers` rule.",
+      "type": "object",
+      "properties": {
+        "extends": {
+          "description": "Only apply when the class extends this parent class name.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "implements": {
+          "description": "Only apply when the class implements this interface name.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "members": {
+          "description": "Member names that should be treated as framework-used.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "members"
       ]
     }
   }

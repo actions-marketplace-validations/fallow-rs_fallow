@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use rustc_hash::FxHashSet;
 
-use fallow_config::{ExternalPluginDef, PluginDetection};
+use fallow_config::{ExternalPluginDef, PluginDetection, UsedClassMemberRule};
 
 use super::super::{PathRule, Plugin, PluginResult, PluginUsedExportRule, UsedExportRule};
 use super::AggregatedPluginResult;
@@ -39,7 +39,9 @@ pub fn process_static_patterns(
             .push(PluginUsedExportRule::new(pname.clone(), rule));
     }
     for member in plugin.used_class_members() {
-        result.used_class_members.push((*member).to_string());
+        result
+            .used_class_members
+            .push(UsedClassMemberRule::from(*member));
     }
     for dep in plugin.tooling_dependencies() {
         result.tooling_dependencies.push((*dep).to_string());

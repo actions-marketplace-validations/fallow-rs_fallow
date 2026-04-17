@@ -12,9 +12,11 @@ use crate::{
     DynamicImportInfo, ExportInfo, ExportName, MemberInfo, MemberKind, RequireCallInfo,
     VisibilityTag,
 };
+use fallow_types::extract::ClassHeritageInfo;
 
 use super::helpers::{
-    extract_class_members, extract_super_class_name, has_angular_class_decorator,
+    extract_class_members, extract_implemented_interface_names, extract_super_class_name,
+    has_angular_class_decorator,
 };
 use super::{MemberAccess, ModuleInfoExtractor, extract_destructured_names};
 
@@ -55,6 +57,14 @@ impl ModuleInfoExtractor {
                 if let Some(id) = class.id.as_ref() {
                     let members = extract_class_members(class, has_angular_class_decorator(class));
                     let super_class = extract_super_class_name(class);
+                    let implemented_interfaces = extract_implemented_interface_names(class);
+                    if super_class.is_some() || !implemented_interfaces.is_empty() {
+                        self.class_heritage.push(ClassHeritageInfo {
+                            export_name: id.name.to_string(),
+                            super_class: super_class.clone(),
+                            implements: implemented_interfaces,
+                        });
+                    }
                     self.exports.push(ExportInfo {
                         name: ExportName::Named(id.name.to_string()),
                         local_name: Some(id.name.to_string()),

@@ -79,6 +79,8 @@ mod workspace_cross_imports;
 
 #[path = "integration_test/inheritance_members.rs"]
 mod inheritance_members;
+#[path = "integration_test/scoped_used_class_members.rs"]
+mod scoped_used_class_members;
 #[path = "integration_test/scss_partials.rs"]
 mod scss_partials;
 

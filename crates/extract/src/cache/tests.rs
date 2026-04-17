@@ -43,6 +43,7 @@ fn cache_store_insert_and_get() {
         line_offsets: vec![],
         complexity: vec![],
         flag_uses: vec![],
+        class_heritage: vec![],
     };
     store.insert(Path::new("test.ts"), module);
     assert_eq!(store.len(), 1);
@@ -71,6 +72,7 @@ fn cache_store_hash_mismatch_returns_none() {
         line_offsets: vec![],
         complexity: vec![],
         flag_uses: vec![],
+        class_heritage: vec![],
     };
     store.insert(Path::new("test.ts"), module);
     assert!(store.get(Path::new("test.ts"), 99).is_none());
@@ -103,6 +105,7 @@ fn cache_store_overwrite_entry() {
         line_offsets: vec![],
         complexity: vec![],
         flag_uses: vec![],
+        class_heritage: vec![],
     };
     let m2 = CachedModule {
         content_hash: 2,
@@ -122,6 +125,7 @@ fn cache_store_overwrite_entry() {
         line_offsets: vec![],
         complexity: vec![],
         flag_uses: vec![],
+        class_heritage: vec![],
     };
     store.insert(Path::new("test.ts"), m1);
     store.insert(Path::new("test.ts"), m2);
@@ -157,6 +161,7 @@ fn module_to_cached_roundtrip_named_export() {
         line_offsets: vec![],
         complexity: Vec::new(),
         flag_uses: Vec::new(),
+        class_heritage: vec![],
     };
 
     let cached = module_to_cached(&module, 0, 0);
@@ -200,6 +205,7 @@ fn module_to_cached_roundtrip_default_export() {
         line_offsets: vec![],
         complexity: Vec::new(),
         flag_uses: Vec::new(),
+        class_heritage: vec![],
     };
 
     let cached = module_to_cached(&module, 0, 0);
@@ -260,6 +266,7 @@ fn module_to_cached_roundtrip_imports() {
         line_offsets: vec![],
         complexity: Vec::new(),
         flag_uses: Vec::new(),
+        class_heritage: vec![],
     };
 
     let cached = module_to_cached(&module, 0, 0);
@@ -308,6 +315,7 @@ fn module_to_cached_roundtrip_re_exports() {
         line_offsets: vec![],
         complexity: Vec::new(),
         flag_uses: Vec::new(),
+        class_heritage: vec![],
     };
 
     let cached = module_to_cached(&module, 0, 0);
@@ -352,6 +360,7 @@ fn module_to_cached_roundtrip_dynamic_imports() {
         line_offsets: vec![],
         complexity: Vec::new(),
         flag_uses: Vec::new(),
+        class_heritage: vec![],
     };
 
     let cached = module_to_cached(&module, 0, 0);
@@ -417,6 +426,7 @@ fn module_to_cached_roundtrip_members() {
         line_offsets: vec![],
         complexity: Vec::new(),
         flag_uses: Vec::new(),
+        class_heritage: vec![],
     };
 
     let cached = module_to_cached(&module, 0, 0);
@@ -471,6 +481,7 @@ fn cache_save_and_load_roundtrip() {
         line_offsets: vec![],
         complexity: vec![],
         flag_uses: vec![],
+        class_heritage: vec![],
     };
     store.insert(Path::new("test.ts"), module);
     store.save(&dir).unwrap();
@@ -506,6 +517,7 @@ fn cache_version_mismatch_returns_none() {
         line_offsets: vec![],
         complexity: vec![],
         flag_uses: vec![],
+        class_heritage: vec![],
     };
     store.insert(Path::new("test.ts"), module);
     store.save(&dir).unwrap();
@@ -556,6 +568,7 @@ fn module_to_cached_roundtrip_type_only_import() {
         line_offsets: vec![],
         complexity: Vec::new(),
         flag_uses: Vec::new(),
+        class_heritage: vec![],
     };
 
     let cached = module_to_cached(&module, 0, 0);
@@ -587,6 +600,7 @@ fn get_by_path_only_returns_entry_regardless_of_hash() {
         line_offsets: vec![],
         complexity: vec![],
         flag_uses: vec![],
+        class_heritage: vec![],
     };
     store.insert(Path::new("test.ts"), module);
 
@@ -630,6 +644,7 @@ fn retain_paths_removes_stale_entries() {
         line_offsets: vec![],
         complexity: vec![],
         flag_uses: vec![],
+        class_heritage: vec![],
     };
 
     store.insert(Path::new("/project/a.ts"), m());
@@ -679,6 +694,7 @@ fn retain_paths_with_empty_files_clears_cache() {
         line_offsets: vec![],
         complexity: vec![],
         flag_uses: vec![],
+        class_heritage: vec![],
     };
     store.insert(Path::new("a.ts"), m);
     assert_eq!(store.len(), 1);
@@ -708,6 +724,7 @@ fn get_by_metadata_returns_entry_on_match() {
         line_offsets: vec![],
         complexity: vec![],
         flag_uses: vec![],
+        class_heritage: vec![],
     };
     store.insert(Path::new("test.ts"), module);
 
@@ -737,6 +754,7 @@ fn get_by_metadata_returns_none_on_mtime_mismatch() {
         line_offsets: vec![],
         complexity: vec![],
         flag_uses: vec![],
+        class_heritage: vec![],
     };
     store.insert(Path::new("test.ts"), module);
 
@@ -768,6 +786,7 @@ fn get_by_metadata_returns_none_on_size_mismatch() {
         line_offsets: vec![],
         complexity: vec![],
         flag_uses: vec![],
+        class_heritage: vec![],
     };
     store.insert(Path::new("test.ts"), module);
 
@@ -799,6 +818,7 @@ fn get_by_metadata_returns_none_for_zero_mtime() {
         line_offsets: vec![],
         complexity: vec![],
         flag_uses: vec![],
+        class_heritage: vec![],
     };
     store.insert(Path::new("test.ts"), module);
 
@@ -839,6 +859,7 @@ fn module_to_cached_stores_mtime_and_size() {
         line_offsets: vec![],
         complexity: Vec::new(),
         flag_uses: Vec::new(),
+        class_heritage: vec![],
     };
 
     let cached = module_to_cached(&module, 12345, 6789);
@@ -866,6 +887,7 @@ fn module_to_cached_roundtrip_line_offsets() {
         line_offsets: vec![0, 15, 30, 45],
         complexity: Vec::new(),
         flag_uses: Vec::new(),
+        class_heritage: vec![],
     };
     let cached = module_to_cached(&module, 0, 0);
     let restored = cached_to_module(&cached, FileId(0));
@@ -911,6 +933,7 @@ fn module_to_cached_roundtrip_suppressions_with_kinds() {
         line_offsets: vec![],
         complexity: Vec::new(),
         flag_uses: Vec::new(),
+        class_heritage: vec![],
     };
 
     let cached = module_to_cached(&module, 0, 0);
@@ -952,6 +975,7 @@ fn module_to_cached_roundtrip_visibility() {
         line_offsets: vec![],
         complexity: Vec::new(),
         flag_uses: Vec::new(),
+        class_heritage: vec![],
     };
 
     let cached = module_to_cached(&module, 0, 0);
@@ -987,6 +1011,7 @@ fn module_to_cached_roundtrip_visibility_internal() {
         line_offsets: vec![],
         complexity: Vec::new(),
         flag_uses: Vec::new(),
+        class_heritage: vec![],
     };
 
     let cached = module_to_cached(&module, 0, 0);
@@ -1022,6 +1047,7 @@ fn module_to_cached_roundtrip_visibility_beta() {
         line_offsets: vec![],
         complexity: Vec::new(),
         flag_uses: Vec::new(),
+        class_heritage: vec![],
     };
 
     let cached = module_to_cached(&module, 0, 0);
@@ -1057,6 +1083,7 @@ fn module_to_cached_roundtrip_visibility_alpha() {
         line_offsets: vec![],
         complexity: Vec::new(),
         flag_uses: Vec::new(),
+        class_heritage: vec![],
     };
 
     let cached = module_to_cached(&module, 0, 0);
@@ -1095,6 +1122,7 @@ fn module_to_cached_roundtrip_dynamic_import_patterns() {
         line_offsets: vec![],
         complexity: Vec::new(),
         flag_uses: Vec::new(),
+        class_heritage: vec![],
     };
 
     let cached = module_to_cached(&module, 0, 0);
@@ -1131,6 +1159,7 @@ fn module_to_cached_roundtrip_unused_import_bindings() {
         line_offsets: vec![],
         complexity: Vec::new(),
         flag_uses: Vec::new(),
+        class_heritage: vec![],
     };
 
     let cached = module_to_cached(&module, 0, 0);
@@ -1190,6 +1219,7 @@ fn module_to_cached_roundtrip_complexity() {
             },
         ],
         flag_uses: Vec::new(),
+        class_heritage: vec![],
     };
 
     let cached = module_to_cached(&module, 0, 0);
@@ -1229,6 +1259,7 @@ fn module_to_cached_roundtrip_require_with_destructured() {
         line_offsets: vec![],
         complexity: Vec::new(),
         flag_uses: Vec::new(),
+        class_heritage: vec![],
     };
 
     let cached = module_to_cached(&module, 0, 0);
@@ -1267,6 +1298,7 @@ fn module_to_cached_roundtrip_dynamic_import_with_local() {
         line_offsets: vec![],
         complexity: Vec::new(),
         flag_uses: Vec::new(),
+        class_heritage: vec![],
     };
 
     let cached = module_to_cached(&module, 0, 0);
@@ -1304,6 +1336,7 @@ fn module_to_cached_roundtrip_source_span() {
         line_offsets: vec![],
         complexity: Vec::new(),
         flag_uses: Vec::new(),
+        class_heritage: vec![],
     };
 
     let cached = module_to_cached(&module, 0, 0);
@@ -1345,6 +1378,7 @@ fn module_to_cached_roundtrip_member_decorators() {
         line_offsets: vec![],
         complexity: Vec::new(),
         flag_uses: Vec::new(),
+        class_heritage: vec![],
     };
 
     let cached = module_to_cached(&module, 0, 0);

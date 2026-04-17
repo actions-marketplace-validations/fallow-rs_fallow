@@ -6,19 +6,21 @@
 use oxc_ast::ast::*;
 use oxc_ast_visit::Visit;
 use oxc_ast_visit::walk;
+use oxc_semantic::ScopeFlags;
 
 use crate::{
     DynamicImportInfo, DynamicImportPattern, ExportInfo, ExportName, ImportInfo, ImportedName,
     MemberAccess, ReExportInfo, RequireCallInfo, VisibilityTag,
 };
+use fallow_types::extract::ClassHeritageInfo;
 
 use crate::asset_url::normalize_asset_url;
 use crate::html::is_remote_url;
 
 use super::helpers::{
     extract_angular_component_metadata, extract_class_members, extract_concat_parts,
-    extract_super_class_name, has_angular_class_decorator, is_meta_url_arg,
-    regex_pattern_to_suffix,
+    extract_implemented_interface_names, extract_super_class_name, has_angular_class_decorator,
+    is_meta_url_arg, regex_pattern_to_suffix,
 };
 use super::{
     ModuleInfoExtractor, try_extract_arrow_wrapped_import, try_extract_dynamic_import,
@@ -26,6 +28,42 @@ use super::{
 };
 
 impl<'a> Visit<'a> for ModuleInfoExtractor {
+    fn visit_block_statement(&mut self, stmt: &BlockStatement<'a>) {
+        self.block_depth += 1;
+        walk::walk_block_statement(self, stmt);
+        self.block_depth -= 1;
+    }
+
+    fn visit_declaration(&mut self, decl: &Declaration<'a>) {
+        if self.block_depth == 0
+            && self.function_depth == 0
+            && self.namespace_depth == 0
+            && let Declaration::ClassDeclaration(class) = decl
+            && let Some(id) = class.id.as_ref()
+        {
+            self.record_local_class_export(
+                id.name.to_string(),
+                extract_class_members(class, has_angular_class_decorator(class)),
+                extract_super_class_name(class),
+                extract_implemented_interface_names(class),
+            );
+        }
+
+        walk::walk_declaration(self, decl);
+    }
+
+    fn visit_function(&mut self, func: &Function<'a>, flags: ScopeFlags) {
+        self.function_depth += 1;
+        walk::walk_function(self, func, flags);
+        self.function_depth -= 1;
+    }
+
+    fn visit_arrow_function_expression(&mut self, expr: &ArrowFunctionExpression<'a>) {
+        self.function_depth += 1;
+        walk::walk_arrow_function_expression(self, expr);
+        self.function_depth -= 1;
+    }
+
     fn visit_import_declaration(&mut self, decl: &ImportDeclaration<'a>) {
         let source = decl.source.value.to_string();
         let is_type_only = decl.import_kind.is_type();
@@ -188,19 +226,34 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
 
     fn visit_export_default_declaration(&mut self, decl: &ExportDefaultDeclaration<'a>) {
         // Extract members and super_class for default-exported classes
-        let (members, super_class) =
+        let (members, super_class, implemented_interfaces) =
             if let ExportDefaultDeclarationKind::ClassDeclaration(class) = &decl.declaration {
                 (
                     extract_class_members(class, has_angular_class_decorator(class)),
                     extract_super_class_name(class),
+                    extract_implemented_interface_names(class),
                 )
             } else {
-                (vec![], None)
+                (vec![], None, vec![])
             };
+        let local_name =
+            if let ExportDefaultDeclarationKind::ClassDeclaration(class) = &decl.declaration {
+                class.id.as_ref().map(|id| id.name.to_string())
+            } else {
+                None
+            };
+
+        if super_class.is_some() || !implemented_interfaces.is_empty() {
+            self.class_heritage.push(ClassHeritageInfo {
+                export_name: "default".to_string(),
+                super_class: super_class.clone(),
+                implements: implemented_interfaces,
+            });
+        }
 
         self.exports.push(ExportInfo {
             name: ExportName::Default,
-            local_name: None,
+            local_name,
             is_type_only: false,
             visibility: VisibilityTag::None,
             span: decl.span,

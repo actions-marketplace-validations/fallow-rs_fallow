@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::config::UsedClassMemberRule;
+
 /// Supported plugin file extensions.
 const PLUGIN_EXTENSIONS: &[&str] = &["toml", "json", "jsonc"];
 
@@ -113,14 +115,12 @@ pub struct ExternalPluginDef {
     #[serde(default)]
     pub used_exports: Vec<ExternalUsedExport>,
 
-    /// Class member method/property names the framework invokes at runtime.
-    /// Listed names extend the built-in lifecycle allowlist, so members with
-    /// these names are never flagged as unused-class-members. Use for libraries
-    /// that call interface methods reflectively (e.g. ag-Grid's `agInit`,
-    /// `refresh`; TypeORM's `MigrationInterface.up`/`down`; Web Components'
-    /// `connectedCallback`).
+    /// Class member method/property rules the framework invokes at runtime.
+    /// Supports plain member names for global suppression and scoped objects
+    /// with `extends` / `implements` constraints when the method name is too
+    /// common to suppress across the whole workspace.
     #[serde(default)]
-    pub used_class_members: Vec<String>,
+    pub used_class_members: Vec<UsedClassMemberRule>,
 }
 
 /// Exports considered used for files matching a pattern.
@@ -345,6 +345,7 @@ fn load_plugin_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ScopedUsedClassMemberRule;
 
     #[test]
     fn deserialize_minimal_plugin() {
@@ -374,7 +375,40 @@ enablers = ["my-pkg"]
         assert_eq!(plugin.name, "ag-grid");
         assert_eq!(
             plugin.used_class_members,
-            vec!["agInit".to_string(), "refresh".to_string()]
+            vec![
+                UsedClassMemberRule::from("agInit"),
+                UsedClassMemberRule::from("refresh"),
+            ]
+        );
+    }
+
+    #[test]
+    fn deserialize_plugin_with_scoped_used_class_members_json() {
+        let json_str = r#"{
+            "name": "ag-grid",
+            "enablers": ["ag-grid-angular"],
+            "usedClassMembers": [
+                "agInit",
+                { "implements": "ICellRendererAngularComp", "members": ["refresh"] },
+                { "extends": "BaseCommand", "members": ["execute"] }
+            ]
+        }"#;
+        let plugin: ExternalPluginDef = serde_json::from_str(json_str).unwrap();
+        assert_eq!(
+            plugin.used_class_members,
+            vec![
+                UsedClassMemberRule::from("agInit"),
+                UsedClassMemberRule::Scoped(ScopedUsedClassMemberRule {
+                    extends: None,
+                    implements: Some("ICellRendererAngularComp".to_string()),
+                    members: vec!["refresh".to_string()],
+                }),
+                UsedClassMemberRule::Scoped(ScopedUsedClassMemberRule {
+                    extends: Some("BaseCommand".to_string()),
+                    implements: None,
+                    members: vec!["execute".to_string()],
+                }),
+            ]
         );
     }
 
@@ -388,7 +422,53 @@ usedClassMembers = ["agInit", "refresh"]
         let plugin: ExternalPluginDef = toml::from_str(toml_str).unwrap();
         assert_eq!(
             plugin.used_class_members,
-            vec!["agInit".to_string(), "refresh".to_string()]
+            vec![
+                UsedClassMemberRule::from("agInit"),
+                UsedClassMemberRule::from("refresh"),
+            ]
+        );
+    }
+
+    #[test]
+    fn deserialize_plugin_with_scoped_used_class_members_toml() {
+        let toml_str = r#"
+name = "ag-grid"
+enablers = ["ag-grid-angular"]
+usedClassMembers = [
+  { implements = "ICellRendererAngularComp", members = ["refresh"] },
+  { extends = "BaseCommand", members = ["execute"] }
+]
+"#;
+        let plugin: ExternalPluginDef = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            plugin.used_class_members,
+            vec![
+                UsedClassMemberRule::Scoped(ScopedUsedClassMemberRule {
+                    extends: None,
+                    implements: Some("ICellRendererAngularComp".to_string()),
+                    members: vec!["refresh".to_string()],
+                }),
+                UsedClassMemberRule::Scoped(ScopedUsedClassMemberRule {
+                    extends: Some("BaseCommand".to_string()),
+                    implements: None,
+                    members: vec!["execute".to_string()],
+                }),
+            ]
+        );
+    }
+
+    #[test]
+    fn deserialize_plugin_rejects_unconstrained_scoped_used_class_members() {
+        let result = serde_json::from_str::<ExternalPluginDef>(
+            r#"{
+                "name": "ag-grid",
+                "enablers": ["ag-grid-angular"],
+                "usedClassMembers": [{ "members": ["refresh"] }]
+            }"#,
+        );
+        assert!(
+            result.is_err(),
+            "unconstrained scoped rule should be rejected"
         );
     }
 

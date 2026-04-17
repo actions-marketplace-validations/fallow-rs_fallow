@@ -6,6 +6,7 @@ mod health;
 mod parsing;
 mod resolution;
 mod rules;
+mod used_class_members;
 
 pub use boundaries::{
     BoundaryConfig, BoundaryPreset, BoundaryRule, BoundaryZone, ResolvedBoundaryConfig,
@@ -19,6 +20,7 @@ pub use format::OutputFormat;
 pub use health::{EmailMode, HealthConfig, OwnershipConfig};
 pub use resolution::{ConfigOverride, IgnoreExportRule, ResolvedConfig, ResolvedOverride};
 pub use rules::{PartialRulesConfig, RulesConfig, Severity};
+pub use used_class_members::{ScopedUsedClassMemberRule, UsedClassMemberRule};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -104,14 +106,12 @@ pub struct FallowConfig {
     #[serde(default)]
     pub ignore_exports: Vec<IgnoreExportRule>,
 
-    /// Class member method/property names that should never be flagged as
-    /// unused. Extends the built-in lifecycle allowlist (Angular/React) with
-    /// framework-invoked names from libraries that call interface methods at
-    /// runtime (e.g. ag-Grid's `agInit`, `refresh`). Use this at the top level
-    /// for project-wide additions; use a plugin file's `usedClassMembers` when
-    /// the names should only apply when a specific package is installed.
+    /// Class member method/property rules that should never be flagged as
+    /// unused. Supports plain member names for global suppression and scoped
+    /// objects with `extends` / `implements` constraints for framework-invoked
+    /// methods that should only be suppressed on matching classes.
     #[serde(default)]
-    pub used_class_members: Vec<String>,
+    pub used_class_members: Vec<UsedClassMemberRule>,
 
     /// Duplication detection settings.
     #[serde(default)]
@@ -360,6 +360,34 @@ mod tests {
         assert!(config.dynamically_loaded.is_empty());
     }
 
+    #[test]
+    fn deserialize_json_used_class_members_supports_strings_and_scoped_rules() {
+        let json = r#"{
+            "usedClassMembers": [
+                "agInit",
+                { "implements": "ICellRendererAngularComp", "members": ["refresh"] },
+                { "extends": "BaseCommand", "implements": "CanActivate", "members": ["execute"] }
+            ]
+        }"#;
+        let config: FallowConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            config.used_class_members,
+            vec![
+                UsedClassMemberRule::from("agInit"),
+                UsedClassMemberRule::Scoped(ScopedUsedClassMemberRule {
+                    extends: None,
+                    implements: Some("ICellRendererAngularComp".to_string()),
+                    members: vec!["refresh".to_string()],
+                }),
+                UsedClassMemberRule::Scoped(ScopedUsedClassMemberRule {
+                    extends: Some("BaseCommand".to_string()),
+                    implements: Some("CanActivate".to_string()),
+                    members: vec!["execute".to_string()],
+                }),
+            ]
+        );
+    }
+
     // ── TOML deserialization ────────────────────────────────────────
 
     #[test]
@@ -414,6 +442,43 @@ exports = ["*"]
         assert_eq!(config.ignore_exports.len(), 1);
         assert_eq!(config.ignore_exports[0].file, "src/types/**/*.ts");
         assert_eq!(config.ignore_exports[0].exports, vec!["*"]);
+    }
+
+    #[test]
+    fn deserialize_toml_used_class_members_supports_scoped_rules() {
+        let toml_str = r#"
+usedClassMembers = [
+  { implements = "ICellRendererAngularComp", members = ["refresh"] },
+  { extends = "BaseCommand", members = ["execute"] },
+]
+"#;
+        let config: FallowConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            config.used_class_members,
+            vec![
+                UsedClassMemberRule::Scoped(ScopedUsedClassMemberRule {
+                    extends: None,
+                    implements: Some("ICellRendererAngularComp".to_string()),
+                    members: vec!["refresh".to_string()],
+                }),
+                UsedClassMemberRule::Scoped(ScopedUsedClassMemberRule {
+                    extends: Some("BaseCommand".to_string()),
+                    implements: None,
+                    members: vec!["execute".to_string()],
+                }),
+            ]
+        );
+    }
+
+    #[test]
+    fn deserialize_json_used_class_members_rejects_unconstrained_scoped_rules() {
+        let result = serde_json::from_str::<FallowConfig>(
+            r#"{"usedClassMembers":[{"members":["refresh"]}]}"#,
+        );
+        assert!(
+            result.is_err(),
+            "unconstrained scoped rule should be rejected"
+        );
     }
 
     #[test]

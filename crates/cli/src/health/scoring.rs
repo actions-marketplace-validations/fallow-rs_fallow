@@ -1152,6 +1152,7 @@ mod tests {
             line_offsets: vec![],
             complexity: vec![],
             flag_uses: vec![],
+            class_heritage: vec![],
         };
 
         let (cyc, cog, funcs, lines) = aggregate_complexity(&module);
@@ -1178,6 +1179,7 @@ mod tests {
             suppressions: vec![],
             unused_import_bindings: vec![],
             flag_uses: vec![],
+            class_heritage: vec![],
             line_offsets: vec![0, 10, 20, 30, 40], // 5 lines
             complexity: vec![fallow_types::extract::FunctionComplexity {
                 name: "doStuff".into(),
@@ -1214,6 +1216,7 @@ mod tests {
             suppressions: vec![],
             unused_import_bindings: vec![],
             flag_uses: vec![],
+            class_heritage: vec![],
             line_offsets: vec![0, 10, 20], // 3 lines
             complexity: vec![
                 fallow_types::extract::FunctionComplexity {
@@ -1480,6 +1483,7 @@ mod tests {
             line_offsets: (0..line_count).map(|i| (i * 10) as u32).collect(),
             complexity: functions,
             flag_uses: vec![],
+            class_heritage: vec![],
         }
     }
 

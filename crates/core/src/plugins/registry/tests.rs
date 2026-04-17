@@ -1,6 +1,9 @@
 use super::super::{PathRule, PluginResult, PluginUsedExportRule, UsedExportRule};
 use super::*;
-use fallow_config::{ExternalPluginDef, ExternalUsedExport, PluginDetection};
+use fallow_config::{
+    ExternalPluginDef, ExternalUsedExport, PluginDetection, ScopedUsedClassMemberRule,
+    UsedClassMemberRule,
+};
 use helpers::{check_plugin_detection, discover_json_config_files, process_config_result};
 
 /// Build a dependency object from names for JSON deserialization.
@@ -848,7 +851,7 @@ fn process_config_result_merges_all_fields() {
         replace_entry_patterns: false,
         replace_used_export_rules: false,
         used_exports: vec![used_export_rule("src/routes/**/*.ts", &["loader"])],
-        used_class_members: vec!["agInit".to_string()],
+        used_class_members: vec![fallow_config::UsedClassMemberRule::from("agInit")],
         referenced_dependencies: vec!["lodash".to_string(), "axios".to_string()],
         always_used_files: vec!["setup.ts".to_string()],
         path_aliases: vec![],
@@ -873,6 +876,11 @@ fn process_config_result_merges_all_fields() {
         vec!["loader".to_string()]
     );
 
+    assert_eq!(
+        aggregated.used_class_members,
+        vec![UsedClassMemberRule::from("agInit")]
+    );
+
     assert_eq!(aggregated.referenced_dependencies.len(), 2);
     assert!(
         aggregated
@@ -895,6 +903,30 @@ fn process_config_result_merges_all_fields() {
         PathBuf::from("/project/test/setup.ts")
     );
     assert_eq!(aggregated.setup_files[0].1, "test-plugin");
+}
+
+#[test]
+fn process_config_result_preserves_scoped_used_class_member_rules() {
+    let mut aggregated = AggregatedPluginResult::default();
+    let config_result = PluginResult {
+        used_class_members: vec![UsedClassMemberRule::Scoped(ScopedUsedClassMemberRule {
+            extends: Some("BaseCommand".to_string()),
+            implements: Some("CanActivate".to_string()),
+            members: vec!["execute".to_string()],
+        })],
+        ..PluginResult::default()
+    };
+
+    process_config_result("test-plugin", config_result, &mut aggregated);
+
+    assert_eq!(
+        aggregated.used_class_members,
+        vec![UsedClassMemberRule::Scoped(ScopedUsedClassMemberRule {
+            extends: Some("BaseCommand".to_string()),
+            implements: Some("CanActivate".to_string()),
+            members: vec!["execute".to_string()],
+        })]
+    );
 }
 
 #[test]

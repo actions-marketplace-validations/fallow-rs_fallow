@@ -136,23 +136,19 @@ pub fn find_dead_code_full(
     if config.rules.unused_enum_members != Severity::Off
         || config.rules.unused_class_members != Severity::Off
     {
-        // Merge the top-level config allowlist with any plugin-contributed
-        // class member names. Plugins extend the built-in Angular/React
-        // lifecycle check with framework-invoked names (e.g. ag-Grid `agInit`)
-        // so consumers don't have to enumerate every library's interface
-        // methods in their config.
-        let mut user_class_members: rustc_hash::FxHashSet<&str> = config
-            .used_class_members
-            .iter()
-            .map(String::as_str)
-            .collect();
+        // Merge the top-level config rules with any plugin-contributed rules.
+        // Plain string entries behave like the old global allowlist; scoped
+        // object entries only apply to classes that match `extends` /
+        // `implements` constraints.
+        let mut user_class_members = config.used_class_members.clone();
         if let Some(plugin_result) = plugin_result {
-            user_class_members.extend(plugin_result.used_class_members.iter().map(String::as_str));
+            user_class_members.extend(plugin_result.used_class_members.iter().cloned());
         }
 
         let (enum_members, class_members) = find_unused_members(
             graph,
             resolved_modules,
+            modules,
             &suppressions,
             &line_offsets_by_file,
             &user_class_members,
@@ -729,6 +725,7 @@ mod tests {
                 line_offsets: vec![],
                 complexity: vec![],
                 flag_uses: vec![],
+                class_heritage: vec![],
             }];
 
             let rules = RulesConfig {

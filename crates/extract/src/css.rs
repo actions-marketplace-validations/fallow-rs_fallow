@@ -250,6 +250,7 @@ pub(crate) fn parse_css_to_module(
         line_offsets: fallow_types::extract::compute_line_offsets(source),
         complexity: Vec::new(),
         flag_uses: Vec::new(),
+        class_heritage: vec![],
     }
 }
 

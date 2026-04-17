@@ -1,7 +1,8 @@
+use fallow_config::{ScopedUsedClassMemberRule, UsedClassMemberRule};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::discover::FileId;
-use crate::extract::{ANGULAR_TPL_SENTINEL, MemberKind};
+use crate::extract::{ANGULAR_TPL_SENTINEL, MemberKind, ModuleInfo};
 use crate::graph::ModuleGraph;
 use crate::resolve::{ResolveResult, ResolvedModule};
 use crate::results::UnusedMember;
@@ -18,10 +19,116 @@ use super::{LineOffsetsMap, byte_offset_to_line_col};
 /// `user_class_member_allowlist` extends the built-in Angular/React lifecycle
 /// allowlist with framework-invoked method names contributed by plugins and
 /// top-level config (see `FallowConfig::used_class_members` and
-/// `Plugin::used_class_members`). Members whose name is in this set are never
-/// flagged as unused-class-members — used for third-party interface patterns
-/// where a library calls consumer methods reflectively (ag-Grid's `agInit`,
-/// Web Components' `connectedCallback`, etc.).
+/// `Plugin::used_class_members`). Plain string entries suppress matching member
+/// names globally; scoped object entries only suppress classes whose heritage
+/// clause matches the configured `extends` / `implements` constraints.
+#[derive(Default)]
+struct ClassMemberAllowlist<'a> {
+    global: FxHashSet<&'a str>,
+    scoped: FxHashMap<&'a str, Vec<&'a ScopedUsedClassMemberRule>>,
+}
+
+impl<'a> ClassMemberAllowlist<'a> {
+    fn from_rules(rules: &'a [UsedClassMemberRule]) -> Self {
+        let mut allowlist = Self::default();
+        for rule in rules {
+            match rule {
+                UsedClassMemberRule::Name(name) => {
+                    allowlist.global.insert(name.as_str());
+                }
+                UsedClassMemberRule::Scoped(rule) => {
+                    for member in &rule.members {
+                        allowlist
+                            .scoped
+                            .entry(member.as_str())
+                            .or_default()
+                            .push(rule);
+                    }
+                }
+            }
+        }
+        allowlist
+    }
+
+    fn matches(
+        &self,
+        member_name: &str,
+        super_class: Option<&str>,
+        implemented_interfaces: &[String],
+    ) -> bool {
+        self.global.contains(member_name)
+            || self.scoped.get(member_name).is_some_and(|rules| {
+                rules
+                    .iter()
+                    .any(|rule| rule.matches_heritage(super_class, implemented_interfaces))
+            })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ExportKey {
+    file_id: FileId,
+    export_name: String,
+}
+
+impl ExportKey {
+    fn new(file_id: FileId, export_name: impl Into<String>) -> Self {
+        Self {
+            file_id,
+            export_name: export_name.into(),
+        }
+    }
+}
+
+fn imported_export_name(imported_name: &crate::extract::ImportedName) -> Option<&str> {
+    match imported_name {
+        crate::extract::ImportedName::Named(name) => Some(name.as_str()),
+        crate::extract::ImportedName::Default => Some("default"),
+        crate::extract::ImportedName::Namespace | crate::extract::ImportedName::SideEffect => None,
+    }
+}
+
+fn push_local_export_key<'a>(
+    local_to_export_keys: &mut FxHashMap<&'a str, Vec<ExportKey>>,
+    local_name: &'a str,
+    export_key: ExportKey,
+) {
+    let entry = local_to_export_keys.entry(local_name).or_default();
+    if !entry.contains(&export_key) {
+        entry.push(export_key);
+    }
+}
+
+fn build_local_to_export_keys(resolved: &ResolvedModule) -> FxHashMap<&str, Vec<ExportKey>> {
+    let mut local_to_export_keys = FxHashMap::default();
+
+    for import in &resolved.resolved_imports {
+        let Some(imported_name) = imported_export_name(&import.info.imported_name) else {
+            continue;
+        };
+        let ResolveResult::InternalModule(target_file_id) = &import.target else {
+            continue;
+        };
+        push_local_export_key(
+            &mut local_to_export_keys,
+            import.info.local_name.as_str(),
+            ExportKey::new(*target_file_id, imported_name),
+        );
+    }
+
+    for export in &resolved.exports {
+        if let Some(local_name) = export.local_name.as_deref() {
+            push_local_export_key(
+                &mut local_to_export_keys,
+                local_name,
+                ExportKey::new(resolved.file_id, export.name.to_string()),
+            );
+        }
+    }
+
+    local_to_export_keys
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "member tracking requires many graph traversal steps; split candidate for sig-audit-loop"
@@ -29,16 +136,28 @@ use super::{LineOffsetsMap, byte_offset_to_line_col};
 pub fn find_unused_members(
     graph: &ModuleGraph,
     resolved_modules: &[ResolvedModule],
+    modules: &[ModuleInfo],
     suppressions: &SuppressionContext<'_>,
     line_offsets_by_file: &LineOffsetsMap<'_>,
-    user_class_member_allowlist: &FxHashSet<&str>,
+    user_class_member_allowlist: &[UsedClassMemberRule],
 ) -> (Vec<UnusedMember>, Vec<UnusedMember>) {
     let mut unused_enum_members = Vec::new();
     let mut unused_class_members = Vec::new();
+    let allowlist = ClassMemberAllowlist::from_rules(user_class_member_allowlist);
 
-    // Map export_name -> set of member_names that are accessed across all modules.
-    // We map local import names back to the original imported names.
-    let mut accessed_members: FxHashMap<String, FxHashSet<String>> = FxHashMap::default();
+    let mut class_heritage_by_export: FxHashMap<ExportKey, (Option<String>, Vec<String>)> =
+        FxHashMap::default();
+    for module in modules {
+        class_heritage_by_export.extend(module.class_heritage.iter().map(|heritage| {
+            (
+                ExportKey::new(module.file_id, heritage.export_name.clone()),
+                (heritage.super_class.clone(), heritage.implements.clone()),
+            )
+        }));
+    }
+
+    // Map exported symbol identity -> set of member names that are accessed across all modules.
+    let mut accessed_members: FxHashMap<ExportKey, FxHashSet<String>> = FxHashMap::default();
 
     // Also build a per-file set of `this.member` accesses. These indicate internal usage
     // within a class body — class members accessed via `this.foo` are used internally
@@ -46,25 +165,13 @@ pub fn find_unused_members(
     let mut self_accessed_members: FxHashMap<crate::discover::FileId, FxHashSet<String>> =
         FxHashMap::default();
 
-    // Build a set of export names that are used as whole objects (Object.values, for..in, etc.).
-    // All members of these exports should be considered used.
-    let mut whole_object_used_exports: FxHashSet<String> = FxHashSet::default();
+    // Build a set of exported symbols that are used as whole objects
+    // (Object.values, for..in, etc.). All members of these exports should be
+    // considered used.
+    let mut whole_object_used_exports: FxHashSet<ExportKey> = FxHashSet::default();
 
     for resolved in resolved_modules {
-        // Build a map from local name -> imported name for this module's imports
-        let local_to_imported: FxHashMap<&str, &str> = resolved
-            .resolved_imports
-            .iter()
-            .filter_map(|imp| match &imp.info.imported_name {
-                crate::extract::ImportedName::Named(name) => {
-                    Some((imp.info.local_name.as_str(), name.as_str()))
-                }
-                crate::extract::ImportedName::Default => {
-                    Some((imp.info.local_name.as_str(), "default"))
-                }
-                _ => None,
-            })
-            .collect();
+        let local_to_export_keys = build_local_to_export_keys(resolved);
 
         for access in &resolved.member_accesses {
             // Track `this.member` accesses per-file for internal class usage
@@ -75,24 +182,21 @@ pub fn find_unused_members(
                     .insert(access.member.clone());
                 continue;
             }
-            // If the object is a local name for an import, map it to the original export name
-            let export_name = local_to_imported
-                .get(access.object.as_str())
-                .copied()
-                .unwrap_or(access.object.as_str());
-            accessed_members
-                .entry(export_name.to_string())
-                .or_default()
-                .insert(access.member.clone());
+
+            if let Some(export_keys) = local_to_export_keys.get(access.object.as_str()) {
+                for export_key in export_keys {
+                    accessed_members
+                        .entry(export_key.clone())
+                        .or_default()
+                        .insert(access.member.clone());
+                }
+            }
         }
 
-        // Map whole-object uses from local names to imported names
         for local_name in &resolved.whole_object_uses {
-            let export_name = local_to_imported
-                .get(local_name.as_str())
-                .copied()
-                .unwrap_or(local_name.as_str());
-            whole_object_used_exports.insert(export_name.to_string());
+            if let Some(export_keys) = local_to_export_keys.get(local_name.as_str()) {
+                whole_object_used_exports.extend(export_keys.iter().cloned());
+            }
         }
     }
 
@@ -103,47 +207,24 @@ pub fn find_unused_members(
     // - A parent class method accesses `this.member` (credits child overrides)
     // - A child class override is flagged unused when the parent method is used
     //
-    // Maps are scoped by (parent_name, parent_file_id) to avoid collisions
-    // when two files each export a class with the same name.
-    //
-    // parent_to_children: ("BaseShape", FileId) → ["Circle", "Rectangle"]
-    let mut parent_to_children: FxHashMap<(String, FileId), Vec<String>> = FxHashMap::default();
+    // parent_to_children: BaseShape@file_a → [Circle@file_b, Rectangle@file_c]
+    let mut parent_to_children: FxHashMap<ExportKey, Vec<ExportKey>> = FxHashMap::default();
 
     for resolved in resolved_modules {
-        // Build local→imported map for resolving super_class names
-        let local_to_imported: FxHashMap<&str, (&str, FileId)> = resolved
-            .resolved_imports
-            .iter()
-            .filter_map(|imp| {
-                let imported_name = match &imp.info.imported_name {
-                    crate::extract::ImportedName::Named(name) => name.as_str(),
-                    crate::extract::ImportedName::Default => "default",
-                    _ => return None,
-                };
-                if let ResolveResult::InternalModule(file_id) = &imp.target {
-                    Some((imp.info.local_name.as_str(), (imported_name, *file_id)))
-                } else {
-                    None
-                }
-            })
-            .collect();
+        let local_to_export_keys = build_local_to_export_keys(resolved);
 
         for export in &resolved.exports {
             if let Some(super_local) = &export.super_class {
-                let child_name = export.name.to_string();
-                if let Some(&(parent_name, parent_file_id)) =
-                    local_to_imported.get(super_local.as_str())
-                {
-                    parent_to_children
-                        .entry((parent_name.to_string(), parent_file_id))
-                        .or_default()
-                        .push(child_name);
-                } else {
-                    // Parent class defined in the same file (no import needed)
-                    parent_to_children
-                        .entry((super_local.clone(), resolved.file_id))
-                        .or_default()
-                        .push(child_name);
+                let Some(parent_keys) = local_to_export_keys.get(super_local.as_str()) else {
+                    continue;
+                };
+                let child_key = ExportKey::new(resolved.file_id, export.name.to_string());
+
+                for parent_key in parent_keys {
+                    let children = parent_to_children.entry(parent_key.clone()).or_default();
+                    if !children.contains(&child_key) {
+                        children.push(child_key.clone());
+                    }
                 }
             }
         }
@@ -153,49 +234,35 @@ pub fn find_unused_members(
     // When BaseShape.describe() calls `this.getArea()`, that should credit
     // Circle.getArea() and Rectangle.getArea() as used.
     if !parent_to_children.is_empty() {
-        // Build export-name → file_id index for O(1) child lookup
-        let export_name_to_file: FxHashMap<String, FileId> = graph
-            .modules
-            .iter()
-            .flat_map(|m| {
-                m.exports
-                    .iter()
-                    .map(move |e| (e.name.to_string(), m.file_id))
-            })
-            .collect();
-
         // Collect propagations first to avoid borrow conflicts
         let mut propagations: Vec<(FileId, Vec<String>)> = Vec::new();
 
-        for ((parent_name, parent_fid), children) in &parent_to_children {
+        for (parent_key, children) in &parent_to_children {
             // Propagate parent's this.* accesses to child files
-            if let Some(parent_self_accesses) = self_accessed_members.get(parent_fid) {
+            if let Some(parent_self_accesses) = self_accessed_members.get(&parent_key.file_id) {
                 let accesses: Vec<String> = parent_self_accesses.iter().cloned().collect();
-                for child_name in children {
-                    if let Some(&child_fid) = export_name_to_file.get(child_name.as_str()) {
-                        propagations.push((child_fid, accesses.clone()));
-                    }
+                for child_key in children {
+                    propagations.push((child_key.file_id, accesses.clone()));
                 }
             }
 
             // Also propagate accessed_members bidirectionally:
             // If parent's member is externally accessed, credit all children
             // If child's member is externally accessed, credit the parent
-            let parent_accesses: Option<FxHashSet<String>> =
-                accessed_members.get(parent_name.as_str()).cloned();
+            let parent_accesses = accessed_members.get(parent_key).cloned();
             let mut child_accesses_to_propagate: FxHashSet<String> = FxHashSet::default();
 
-            for child_name in children {
-                if let Some(child_accesses) = accessed_members.get(child_name.as_str()) {
+            for child_key in children {
+                if let Some(child_accesses) = accessed_members.get(child_key) {
                     child_accesses_to_propagate.extend(child_accesses.iter().cloned());
                 }
             }
 
             // Parent → children
             if let Some(ref parent_acc) = parent_accesses {
-                for child_name in children {
+                for child_key in children {
                     accessed_members
-                        .entry(child_name.clone())
+                        .entry(child_key.clone())
                         .or_default()
                         .extend(parent_acc.iter().cloned());
                 }
@@ -204,7 +271,7 @@ pub fn find_unused_members(
             // Children → parent
             if !child_accesses_to_propagate.is_empty() {
                 accessed_members
-                    .entry(parent_name.clone())
+                    .entry(parent_key.clone())
                     .or_default()
                     .extend(child_accesses_to_propagate);
             }
@@ -283,10 +350,16 @@ pub fn find_unused_members(
             }
 
             let export_name = export.name.to_string();
+            let export_key = ExportKey::new(module.file_id, export_name.clone());
+            let (super_class, implemented_interfaces) = class_heritage_by_export
+                .get(&export_key)
+                .map_or((None, &[][..]), |(super_class, interfaces)| {
+                    (super_class.as_deref(), interfaces.as_slice())
+                });
 
             // If this export is used as a whole object (Object.values, for..in, etc.),
             // all members are considered used — skip individual member analysis.
-            if whole_object_used_exports.contains(&export_name) {
+            if whole_object_used_exports.contains(&export_key) {
                 continue;
             }
 
@@ -303,7 +376,7 @@ pub fn find_unused_members(
 
                 // Check if this member is accessed anywhere via external import
                 if accessed_members
-                    .get(&export_name)
+                    .get(&export_key)
                     .is_some_and(|s| s.contains(&member.name))
                 {
                     continue;
@@ -337,7 +410,7 @@ pub fn find_unused_members(
                     MemberKind::ClassMethod | MemberKind::ClassProperty
                 ) && (is_react_lifecycle_method(&member.name)
                     || is_angular_lifecycle_method(&member.name)
-                    || user_class_member_allowlist.contains(member.name.as_str()))
+                    || allowlist.matches(member.name.as_str(), super_class, implemented_interfaces))
                 {
                     continue;
                 }
@@ -388,10 +461,13 @@ mod tests {
     use super::*;
     use crate::discover::{DiscoveredFile, EntryPoint, EntryPointSource, FileId};
     use crate::extract::{
-        ExportName, ImportInfo, ImportedName, MemberAccess, MemberInfo, MemberKind, VisibilityTag,
+        ExportName, ImportInfo, ImportedName, MemberAccess, MemberInfo, MemberKind, ModuleInfo,
+        VisibilityTag,
     };
     use crate::graph::{ExportSymbol, ModuleGraph, SymbolReference};
     use crate::resolve::{ResolveResult, ResolvedImport, ResolvedModule};
+    use fallow_config::{ScopedUsedClassMemberRule, UsedClassMemberRule};
+    use fallow_types::extract::ClassHeritageInfo;
     use oxc_span::Span;
     use std::path::PathBuf;
 
@@ -464,6 +540,37 @@ mod tests {
         }
     }
 
+    fn make_module_with_class_heritage(
+        file_id: u32,
+        export_name: &str,
+        super_class: Option<&str>,
+        implements: &[&str],
+    ) -> ModuleInfo {
+        ModuleInfo {
+            file_id: FileId(file_id),
+            exports: vec![],
+            imports: vec![],
+            re_exports: vec![],
+            dynamic_imports: vec![],
+            dynamic_import_patterns: vec![],
+            require_calls: vec![],
+            member_accesses: vec![],
+            whole_object_uses: vec![],
+            has_cjs_exports: false,
+            content_hash: 0,
+            suppressions: vec![],
+            unused_import_bindings: vec![],
+            line_offsets: vec![],
+            complexity: vec![],
+            flag_uses: vec![],
+            class_heritage: vec![ClassHeritageInfo {
+                export_name: export_name.to_string(),
+                super_class: super_class.map(str::to_string),
+                implements: implements.iter().map(ToString::to_string).collect(),
+            }],
+        }
+    }
+
     #[test]
     fn unused_members_empty_graph() {
         let graph = build_graph(&[]);
@@ -471,9 +578,10 @@ mod tests {
         let (enum_members, class_members) = find_unused_members(
             &graph,
             &[],
+            &[],
             &SuppressionContext::empty(),
             &FxHashMap::default(),
-            &FxHashSet::default(),
+            &[],
         );
         assert!(enum_members.is_empty());
         assert!(class_members.is_empty());
@@ -496,9 +604,10 @@ mod tests {
         let (enum_members, class_members) = find_unused_members(
             &graph,
             &[],
+            &[],
             &SuppressionContext::empty(),
             &FxHashMap::default(),
-            &FxHashSet::default(),
+            &[],
         );
         assert_eq!(enum_members.len(), 2);
         assert!(class_members.is_empty());
@@ -548,9 +657,10 @@ mod tests {
         let (enum_members, _) = find_unused_members(
             &graph,
             &resolved_modules,
+            &[],
             &SuppressionContext::empty(),
             &FxHashMap::default(),
-            &FxHashSet::default(),
+            &[],
         );
         // Only Inactive should be unused
         assert_eq!(enum_members.len(), 1);
@@ -592,9 +702,10 @@ mod tests {
         let (enum_members, class_members) = find_unused_members(
             &graph,
             &resolved_modules,
+            &[],
             &SuppressionContext::empty(),
             &FxHashMap::default(),
-            &FxHashSet::default(),
+            &[],
         );
         assert!(enum_members.is_empty());
         assert!(class_members.is_empty());
@@ -618,9 +729,10 @@ mod tests {
         let (_, class_members) = find_unused_members(
             &graph,
             &[],
+            &[],
             &SuppressionContext::empty(),
             &FxHashMap::default(),
-            &FxHashSet::default(),
+            &[],
         );
         assert!(class_members.is_empty());
     }
@@ -642,9 +754,10 @@ mod tests {
         let (_, class_members) = find_unused_members(
             &graph,
             &[],
+            &[],
             &SuppressionContext::empty(),
             &FxHashMap::default(),
-            &FxHashSet::default(),
+            &[],
         );
         // Only customMethod should be flagged
         assert_eq!(class_members.len(), 1);
@@ -668,9 +781,10 @@ mod tests {
         let (_, class_members) = find_unused_members(
             &graph,
             &[],
+            &[],
             &SuppressionContext::empty(),
             &FxHashMap::default(),
-            &FxHashSet::default(),
+            &[],
         );
         assert_eq!(class_members.len(), 1);
         assert_eq!(class_members[0].member_name, "myHelper");
@@ -694,12 +808,14 @@ mod tests {
             Some(0),
         )];
 
-        let mut allowlist: FxHashSet<&str> = FxHashSet::default();
-        allowlist.insert("agInit");
-        allowlist.insert("refresh");
+        let allowlist = vec![
+            UsedClassMemberRule::from("agInit"),
+            UsedClassMemberRule::from("refresh"),
+        ];
 
         let (_, class_members) = find_unused_members(
             &graph,
+            &[],
             &[],
             &SuppressionContext::empty(),
             &FxHashMap::default(),
@@ -725,11 +841,11 @@ mod tests {
             Some(0),
         )];
 
-        let mut allowlist: FxHashSet<&str> = FxHashSet::default();
-        allowlist.insert("refresh");
+        let allowlist = vec![UsedClassMemberRule::from("refresh")];
 
         let (enum_members, _) = find_unused_members(
             &graph,
+            &[],
             &[],
             &SuppressionContext::empty(),
             &FxHashMap::default(),
@@ -737,6 +853,82 @@ mod tests {
         );
         assert_eq!(enum_members.len(), 1);
         assert_eq!(enum_members[0].member_name, "refresh");
+    }
+
+    #[test]
+    fn scoped_allowlist_matches_implements_only() {
+        let mut graph = build_graph(&[("/src/entry.ts", true), ("/src/renderer.ts", false)]);
+        graph.modules[1].set_reachable(true);
+        graph.modules[1].exports = vec![make_export_with_members(
+            "MyRendererComponent",
+            vec![
+                make_member("refresh", MemberKind::ClassMethod),
+                make_member("customHelper", MemberKind::ClassMethod),
+            ],
+            Some(0),
+        )];
+
+        let modules = vec![make_module_with_class_heritage(
+            1,
+            "MyRendererComponent",
+            None,
+            &["ICellRendererAngularComp"],
+        )];
+        let allowlist = vec![UsedClassMemberRule::Scoped(ScopedUsedClassMemberRule {
+            extends: None,
+            implements: Some("ICellRendererAngularComp".to_string()),
+            members: vec!["refresh".to_string()],
+        })];
+
+        let (_, class_members) = find_unused_members(
+            &graph,
+            &[],
+            &modules,
+            &SuppressionContext::empty(),
+            &FxHashMap::default(),
+            &allowlist,
+        );
+
+        assert_eq!(class_members.len(), 1);
+        assert_eq!(class_members[0].member_name, "customHelper");
+    }
+
+    #[test]
+    fn scoped_allowlist_matches_extends_only() {
+        let mut graph = build_graph(&[("/src/entry.ts", true), ("/src/command.ts", false)]);
+        graph.modules[1].set_reachable(true);
+        graph.modules[1].exports = vec![make_export_with_members(
+            "GenerateReport",
+            vec![
+                make_member("execute", MemberKind::ClassMethod),
+                make_member("customHelper", MemberKind::ClassMethod),
+            ],
+            Some(0),
+        )];
+
+        let modules = vec![make_module_with_class_heritage(
+            1,
+            "GenerateReport",
+            Some("BaseCommand"),
+            &[],
+        )];
+        let allowlist = vec![UsedClassMemberRule::Scoped(ScopedUsedClassMemberRule {
+            extends: Some("BaseCommand".to_string()),
+            implements: None,
+            members: vec!["execute".to_string()],
+        })];
+
+        let (_, class_members) = find_unused_members(
+            &graph,
+            &[],
+            &modules,
+            &SuppressionContext::empty(),
+            &FxHashMap::default(),
+            &allowlist,
+        );
+
+        assert_eq!(class_members.len(), 1);
+        assert_eq!(class_members[0].member_name, "customHelper");
     }
 
     #[test]
@@ -766,9 +958,10 @@ mod tests {
         let (_, class_members) = find_unused_members(
             &graph,
             &resolved_modules,
+            &[],
             &SuppressionContext::empty(),
             &FxHashMap::default(),
-            &FxHashSet::default(),
+            &[],
         );
         // Only unused_prop should be flagged (label is accessed via this)
         assert_eq!(class_members.len(), 1);
@@ -789,9 +982,10 @@ mod tests {
         let (enum_members, _) = find_unused_members(
             &graph,
             &[],
+            &[],
             &SuppressionContext::empty(),
             &FxHashMap::default(),
-            &FxHashSet::default(),
+            &[],
         );
         // Member analysis skipped because export itself is unreferenced
         assert!(enum_members.is_empty());
@@ -810,9 +1004,10 @@ mod tests {
         let (enum_members, class_members) = find_unused_members(
             &graph,
             &[],
+            &[],
             &SuppressionContext::empty(),
             &FxHashMap::default(),
-            &FxHashSet::default(),
+            &[],
         );
         assert!(enum_members.is_empty());
         assert!(class_members.is_empty());
@@ -830,9 +1025,10 @@ mod tests {
         let (enum_members, class_members) = find_unused_members(
             &graph,
             &[],
+            &[],
             &SuppressionContext::empty(),
             &FxHashMap::default(),
-            &FxHashSet::default(),
+            &[],
         );
         assert!(enum_members.is_empty());
         assert!(class_members.is_empty());
@@ -851,9 +1047,10 @@ mod tests {
         let (enum_members, class_members) = find_unused_members(
             &graph,
             &[],
+            &[],
             &SuppressionContext::empty(),
             &FxHashMap::default(),
-            &FxHashSet::default(),
+            &[],
         );
         assert_eq!(enum_members.len(), 1);
         assert_eq!(enum_members[0].kind, MemberKind::EnumMember);
@@ -876,9 +1073,10 @@ mod tests {
         let (enum_members, class_members) = find_unused_members(
             &graph,
             &[],
+            &[],
             &SuppressionContext::empty(),
             &FxHashMap::default(),
-            &FxHashSet::default(),
+            &[],
         );
         assert!(enum_members.is_empty());
         assert_eq!(class_members.len(), 2);
@@ -935,9 +1133,10 @@ mod tests {
         let (_, class_members) = find_unused_members(
             &graph,
             &resolved_modules,
+            &[],
             &SuppressionContext::empty(),
             &FxHashMap::default(),
-            &FxHashSet::default(),
+            &[],
         );
         // Only unusedMethod should be flagged; greet is used via instance access
         assert_eq!(class_members.len(), 1);
@@ -973,9 +1172,10 @@ mod tests {
         let (enum_members, _) = find_unused_members(
             &graph,
             &resolved_modules,
+            &[],
             &SuppressionContext::empty(),
             &FxHashMap::default(),
-            &FxHashSet::default(),
+            &[],
         );
         // Both enum members should be flagged — `this` access doesn't apply to enums
         assert_eq!(enum_members.len(), 2);
@@ -1001,9 +1201,10 @@ mod tests {
         let (enum_members, class_members) = find_unused_members(
             &graph,
             &[],
+            &[],
             &SuppressionContext::empty(),
             &FxHashMap::default(),
-            &FxHashSet::default(),
+            &[],
         );
         assert_eq!(enum_members.len(), 1);
         assert_eq!(enum_members[0].parent_name, "Status");
@@ -1050,9 +1251,10 @@ mod tests {
         let (enum_members, _) = find_unused_members(
             &graph,
             &resolved_modules,
+            &[],
             &SuppressionContext::empty(),
             &FxHashMap::default(),
-            &FxHashSet::default(),
+            &[],
         );
         // S.Active maps back to Status.Active, so only Inactive is unused
         assert_eq!(enum_members.len(), 1);
@@ -1097,9 +1299,10 @@ mod tests {
         let (enum_members, _) = find_unused_members(
             &graph,
             &resolved_modules,
+            &[],
             &SuppressionContext::empty(),
             &FxHashMap::default(),
-            &FxHashSet::default(),
+            &[],
         );
         // MyEnum.X maps to default.X, so only Y is unused
         assert_eq!(enum_members.len(), 1);
@@ -1128,13 +1331,8 @@ mod tests {
         supp_map.insert(FileId(1), &supps);
         let suppressions = SuppressionContext::from_map(supp_map);
 
-        let (enum_members, _) = find_unused_members(
-            &graph,
-            &[],
-            &suppressions,
-            &FxHashMap::default(),
-            &FxHashSet::default(),
-        );
+        let (enum_members, _) =
+            find_unused_members(&graph, &[], &[], &suppressions, &FxHashMap::default(), &[]);
         assert!(
             enum_members.is_empty(),
             "suppressed enum member should not be flagged"
@@ -1162,13 +1360,8 @@ mod tests {
         supp_map.insert(FileId(1), &supps);
         let suppressions = SuppressionContext::from_map(supp_map);
 
-        let (_, class_members) = find_unused_members(
-            &graph,
-            &[],
-            &suppressions,
-            &FxHashMap::default(),
-            &FxHashSet::default(),
-        );
+        let (_, class_members) =
+            find_unused_members(&graph, &[], &[], &suppressions, &FxHashMap::default(), &[]);
         assert!(
             class_members.is_empty(),
             "suppressed class member should not be flagged"
@@ -1211,9 +1404,10 @@ mod tests {
         let (enum_members, _) = find_unused_members(
             &graph,
             &resolved_modules,
+            &[],
             &SuppressionContext::empty(),
             &FxHashMap::default(),
-            &FxHashSet::default(),
+            &[],
         );
         // Object.values(S) maps S→Status, so all members of Status should be considered used
         assert!(
@@ -1266,13 +1460,113 @@ mod tests {
         let (_, class_members) = find_unused_members(
             &graph,
             &resolved_modules,
+            &[],
             &SuppressionContext::empty(),
             &FxHashMap::default(),
-            &FxHashSet::default(),
+            &[],
         );
         // Only unusedMethod should be flagged; doWork is used via this.service.doWork()
         assert_eq!(class_members.len(), 1);
         assert_eq!(class_members[0].member_name, "unusedMethod");
+    }
+
+    #[test]
+    fn same_named_exports_do_not_share_member_usage() {
+        let mut graph = build_graph(&[
+            ("/src/entry.ts", true),
+            ("/src/one.ts", false),
+            ("/src/two.ts", false),
+        ]);
+        graph.modules[1].set_reachable(true);
+        graph.modules[2].set_reachable(true);
+        graph.modules[1].exports = vec![make_export_with_members(
+            "Widget",
+            vec![
+                make_member("refresh", MemberKind::ClassMethod),
+                make_member("unusedOne", MemberKind::ClassMethod),
+            ],
+            Some(0),
+        )];
+        graph.modules[2].exports = vec![make_export_with_members(
+            "Widget",
+            vec![
+                make_member("refresh", MemberKind::ClassMethod),
+                make_member("unusedTwo", MemberKind::ClassMethod),
+            ],
+            Some(0),
+        )];
+
+        let resolved_modules = vec![ResolvedModule {
+            file_id: FileId(0),
+            path: PathBuf::from("/src/entry.ts"),
+            resolved_imports: vec![
+                ResolvedImport {
+                    info: ImportInfo {
+                        source: "./one".to_string(),
+                        imported_name: ImportedName::Named("Widget".to_string()),
+                        local_name: "FirstWidget".to_string(),
+                        is_type_only: false,
+                        span: Span::new(0, 30),
+                        source_span: Span::default(),
+                    },
+                    target: ResolveResult::InternalModule(FileId(1)),
+                },
+                ResolvedImport {
+                    info: ImportInfo {
+                        source: "./two".to_string(),
+                        imported_name: ImportedName::Named("Widget".to_string()),
+                        local_name: "SecondWidget".to_string(),
+                        is_type_only: false,
+                        span: Span::new(31, 62),
+                        source_span: Span::default(),
+                    },
+                    target: ResolveResult::InternalModule(FileId(2)),
+                },
+            ],
+            member_accesses: vec![MemberAccess {
+                object: "FirstWidget".to_string(),
+                member: "refresh".to_string(),
+            }],
+            ..Default::default()
+        }];
+
+        let (_, class_members) = find_unused_members(
+            &graph,
+            &resolved_modules,
+            &[],
+            &SuppressionContext::empty(),
+            &FxHashMap::default(),
+            &[],
+        );
+
+        let unused_members: FxHashSet<(String, String)> = class_members
+            .iter()
+            .map(|member| {
+                (
+                    member.path.display().to_string(),
+                    format!("{}.{}", member.parent_name, member.member_name),
+                )
+            })
+            .collect();
+
+        assert_eq!(
+            unused_members.len(),
+            3,
+            "unexpected members: {unused_members:?}"
+        );
+        assert!(
+            unused_members.contains(&("/src/one.ts".to_string(), "Widget.unusedOne".to_string()))
+        );
+        assert!(
+            unused_members.contains(&("/src/two.ts".to_string(), "Widget.refresh".to_string()))
+        );
+        assert!(
+            unused_members.contains(&("/src/two.ts".to_string(), "Widget.unusedTwo".to_string()))
+        );
+        assert!(
+            !unused_members.contains(&("/src/one.ts".to_string(), "Widget.refresh".to_string())),
+            "member usage from /src/one.ts should not leak into /src/two.ts: {unused_members:?}"
+        );
     }
 
     #[test]
@@ -1288,9 +1582,10 @@ mod tests {
         let (enum_members, class_members) = find_unused_members(
             &graph,
             &[],
+            &[],
             &SuppressionContext::empty(),
             &FxHashMap::default(),
-            &FxHashSet::default(),
+            &[],
         );
         assert!(enum_members.is_empty());
         assert!(class_members.is_empty());

@@ -4,7 +4,7 @@
 
 use oxc_ast::ast::{
     Argument, ArrayExpressionElement, BinaryExpression, Class, ClassElement, Expression,
-    ObjectPropertyKind, Statement,
+    ObjectPropertyKind, Statement, TSTypeName,
 };
 
 use crate::{MemberInfo, MemberKind};
@@ -357,9 +357,40 @@ pub fn extract_class_members(class: &Class<'_>, is_angular_class: bool) -> Vec<M
 /// Only handles simple identifier references — complex expressions like
 /// `extends mixin(Base)` return `None`.
 pub fn extract_super_class_name(class: &Class<'_>) -> Option<String> {
-    match class.super_class.as_ref()? {
+    extract_static_expression_name(class.super_class.as_ref()?)
+}
+
+/// Extract implemented interface names from a class declaration.
+#[must_use]
+pub fn extract_implemented_interface_names(class: &Class<'_>) -> Vec<String> {
+    class
+        .implements
+        .iter()
+        .filter_map(|item| extract_type_name(&item.expression))
+        .collect()
+}
+
+fn extract_static_expression_name(expr: &Expression<'_>) -> Option<String> {
+    match expr {
         Expression::Identifier(ident) => Some(ident.name.to_string()),
+        Expression::StaticMemberExpression(member) => Some(format!(
+            "{}.{}",
+            extract_static_expression_name(&member.object)?,
+            member.property.name
+        )),
         _ => None,
+    }
+}
+
+fn extract_type_name(name: &TSTypeName<'_>) -> Option<String> {
+    match name {
+        TSTypeName::IdentifierReference(ident) => Some(ident.name.to_string()),
+        TSTypeName::QualifiedName(name) => Some(format!(
+            "{}.{}",
+            extract_type_name(&name.left)?,
+            name.right.name
+        )),
+        TSTypeName::ThisExpression(_) => None,
     }
 }
 

@@ -48,6 +48,9 @@ pub struct ModuleInfo {
     /// Feature flag use sites detected during AST traversal.
     /// Used by the `fallow flags` subcommand to report feature flag patterns.
     pub flag_uses: Vec<FlagUse>,
+    /// Heritage metadata for exported classes that declare `implements`.
+    /// Used to scope `usedClassMembers` rules during analysis.
+    pub class_heritage: Vec<ClassHeritageInfo>,
 }
 
 /// Compute a table of line-start byte offsets from source text.
@@ -242,6 +245,26 @@ pub struct ExportInfo {
     pub super_class: Option<String>,
 }
 
+/// Additional heritage metadata for an exported class.
+#[derive(
+    Debug,
+    Clone,
+    serde::Serialize,
+    serde::Deserialize,
+    bitcode::Encode,
+    bitcode::Decode,
+    PartialEq,
+    Eq,
+)]
+pub struct ClassHeritageInfo {
+    /// Export name (`default` for default-exported classes).
+    pub export_name: String,
+    /// Parent class name from the `extends` clause, if any.
+    pub super_class: Option<String>,
+    /// Interface names from the class `implements` clause.
+    pub implements: Vec<String>,
+}
+
 /// A member of an enum, class, or namespace.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct MemberInfo {
@@ -421,7 +444,7 @@ const _: () = assert!(std::mem::size_of::<ImportedName>() == 24);
 const _: () = assert!(std::mem::size_of::<MemberAccess>() == 48);
 // `ModuleInfo` is the per-file extraction result — stored in a Vec during parallel parsing.
 #[cfg(target_pointer_width = "64")]
-const _: () = assert!(std::mem::size_of::<ModuleInfo>() == 328);
+const _: () = assert!(std::mem::size_of::<ModuleInfo>() == 352);
 
 /// A re-export declaration.
 #[derive(Debug, Clone)]

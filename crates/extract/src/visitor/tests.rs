@@ -213,6 +213,55 @@ fn class_member_with_decorator_flagged() {
     );
 }
 
+#[test]
+fn local_class_export_specifier_keeps_members_and_heritage() {
+    let info = parse(
+        r"
+            interface Authorizable {
+                authorize(): boolean;
+            }
+
+            class SecureCommand implements Authorizable {
+                authorize(): boolean {
+                    return true;
+                }
+
+                cleanup(): void {}
+            }
+
+            export { SecureCommand };
+            ",
+    );
+
+    let class_export = info
+        .exports
+        .iter()
+        .find(|e| matches!(&e.name, ExportName::Named(n) if n == "SecureCommand"))
+        .expect("SecureCommand export should exist");
+    assert!(
+        class_export
+            .members
+            .iter()
+            .any(|m| m.name == "authorize" && m.kind == MemberKind::ClassMethod),
+        "export specifier should preserve class methods"
+    );
+    assert!(
+        class_export
+            .members
+            .iter()
+            .any(|m| m.name == "cleanup" && m.kind == MemberKind::ClassMethod),
+        "export specifier should preserve all public class methods"
+    );
+
+    assert!(
+        info.class_heritage.iter().any(|heritage| {
+            heritage.export_name == "SecureCommand"
+                && heritage.implements == vec!["Authorizable".to_string()]
+        }),
+        "export specifier should preserve implements metadata"
+    );
+}
+
 // ── Enum member extraction ───────────────────────────────────
 
 #[test]

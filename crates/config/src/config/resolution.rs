@@ -10,6 +10,7 @@ use super::flags::FlagsConfig;
 use super::format::OutputFormat;
 use super::health::HealthConfig;
 use super::rules::{PartialRulesConfig, RulesConfig, Severity};
+use super::used_class_members::UsedClassMemberRule;
 use crate::external_plugin::{ExternalPluginDef, discover_external_plugins};
 
 use super::FallowConfig;
@@ -56,7 +57,7 @@ pub struct ResolvedConfig {
     /// Class member names that should never be flagged as unused-class-members.
     /// Union of top-level config and active plugin contributions; merged during
     /// config resolution so analysis code reads a single list.
-    pub used_class_members: Vec<String>,
+    pub used_class_members: Vec<UsedClassMemberRule>,
     pub duplicates: DuplicatesConfig,
     pub health: HealthConfig,
     pub rules: RulesConfig,

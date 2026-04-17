@@ -11,7 +11,7 @@
 
 use std::path::{Path, PathBuf};
 
-use fallow_config::{EntryPointRole, PackageJson};
+use fallow_config::{EntryPointRole, PackageJson, UsedClassMemberRule};
 use regex::Regex;
 
 const TEST_ENTRY_POINT_PLUGINS: &[&str] = &[
@@ -87,11 +87,11 @@ pub struct PluginResult {
     pub replace_used_export_rules: bool,
     /// Additional export-usage rules discovered from config.
     pub used_exports: Vec<UsedExportRule>,
-    /// Class member names that should never be flagged as unused. Contributed
+    /// Class member rules that should never be flagged as unused. Contributed
     /// by plugins that know their framework invokes these methods at runtime
-    /// (e.g. ag-Grid's `agInit`, `refresh`). Merged with the built-in Angular/React
-    /// lifecycle allowlist during unused-class-member analysis.
-    pub used_class_members: Vec<String>,
+    /// and may scope suppression via `extends` / `implements` constraints when
+    /// the method name is too common to allowlist globally.
+    pub used_class_members: Vec<UsedClassMemberRule>,
     /// Dependencies referenced in config files (should not be flagged as unused).
     pub referenced_dependencies: Vec<String>,
     /// Additional files that are always considered used.

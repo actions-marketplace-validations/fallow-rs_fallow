@@ -1424,6 +1424,7 @@ mod tests {
             line_offsets: vec![0],
             complexity,
             flag_uses: vec![],
+            class_heritage: vec![],
         }
     }
 

@@ -594,6 +594,7 @@ fn bench_cache_round_trip(c: &mut Criterion) {
         line_offsets: vec![0],
         complexity: Vec::new(),
         flag_uses: vec![],
+        class_heritage: vec![],
     };
 
     c.bench_function("cache_round_trip", |b| {

@@ -7,7 +7,7 @@
 use rustc_hash::FxHashSet;
 use std::path::{Path, PathBuf};
 
-use fallow_config::{EntryPointRole, ExternalPluginDef, PackageJson};
+use fallow_config::{EntryPointRole, ExternalPluginDef, PackageJson, UsedClassMemberRule};
 
 use super::{PathRule, Plugin, PluginUsedExportRule};
 
@@ -38,10 +38,10 @@ pub struct AggregatedPluginResult {
     pub always_used: Vec<(String, String)>,
     /// All used export rules from active plugins.
     pub used_exports: Vec<PluginUsedExportRule>,
-    /// Class member names contributed by active plugins that should never be
+    /// Class member rules contributed by active plugins that should never be
     /// flagged as unused. Extends the built-in Angular/React lifecycle allowlist
-    /// with framework-invoked method names (e.g. ag-Grid `agInit`, `refresh`).
-    pub used_class_members: Vec<String>,
+    /// with framework-invoked method names, optionally scoped by class heritage.
+    pub used_class_members: Vec<UsedClassMemberRule>,
     /// Dependencies referenced in config files (should not be flagged unused).
     pub referenced_dependencies: Vec<String>,
     /// Additional always-used files discovered from config parsing: (pattern, plugin_name).
