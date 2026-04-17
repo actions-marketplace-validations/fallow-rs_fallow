@@ -178,7 +178,20 @@ pub(super) fn compute_hotspots(
     });
     let codeowners_owned: Option<crate::codeowners::CodeOwners> = opts
         .ownership
-        .then(|| crate::codeowners::CodeOwners::load(&config.root, None).ok())
+        .then(|| {
+            match crate::codeowners::CodeOwners::load(&config.root, None) {
+                Ok(co) => Some(co),
+                Err(e) => {
+                    // Don't hard-fail --ownership when CODEOWNERS is unparsable
+                    // or absent: the feature still works from git authorship alone.
+                    // Surface the error so silent nulls don't confuse users.
+                    if !opts.quiet && !e.contains("no CODEOWNERS file found") {
+                        eprintln!("Warning: failed to parse CODEOWNERS: {e}");
+                    }
+                    None
+                }
+            }
+        })
         .flatten();
     let now_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
