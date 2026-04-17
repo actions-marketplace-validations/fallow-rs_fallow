@@ -256,6 +256,17 @@ pub fn discover_sidecar(root: Option<&Path>) -> Result<PathBuf, String> {
         ));
     }
 
+    // Prefer the platform-specific package's real binary over the wrapper at
+    // `node_modules/.bin/fallow-cov`. The wrapper is a Node.js script that
+    // re-execs the platform binary; its path has no adjacent `.sig` file, so
+    // sig verification fails if we point at the wrapper. The real binary
+    // lives at `node_modules/@fallow-cli/fallow-cov-<platform>/fallow-cov`
+    // with its signature alongside.
+    if let Some(root) = root
+        && let Some(path) = find_platform_package_sidecar(root)
+    {
+        return Ok(path);
+    }
     if let Some(root) = root
         && let Some(path) = find_project_local_sidecar(root)
     {
@@ -333,6 +344,48 @@ fn find_project_local_sidecar(root: &Path) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Walks up from `root` looking for a platform-specific `fallow-cov` binary
+/// inside a `node_modules/@fallow-cli/fallow-cov-<platform>/` subdirectory.
+///
+/// After `npm install @fallow-cli/fallow-cov`, npm's `optionalDependencies`
+/// plus os/cpu/libc filtering installs exactly one platform subpackage. Its
+/// binary is the one with an adjacent `.sig` file, which is required for
+/// signature verification before spawning. This lookup prefers that real
+/// binary over the Node wrapper at `node_modules/.bin/fallow-cov`.
+fn find_platform_package_sidecar(root: &Path) -> Option<PathBuf> {
+    let binary_name = sidecar_binary_name();
+    for ancestor in root.ancestors() {
+        let fallow_cli_dir = ancestor.join("node_modules").join("@fallow-cli");
+        let Ok(entries) = fs::read_dir(&fallow_cli_dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name_str) = name.to_str() else {
+                continue;
+            };
+            // Match only `fallow-cov-<platform>` subpackages, not the
+            // pure-wrapper `fallow-cov` package.
+            if !name_str.starts_with("fallow-cov-") {
+                continue;
+            }
+            let candidate = entry.path().join(binary_name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+const fn sidecar_binary_name() -> &'static str {
+    if cfg!(windows) {
+        "fallow-cov.exe"
+    } else {
+        "fallow-cov"
+    }
 }
 
 fn find_package_manager_sidecar(root: &Path) -> Option<PathBuf> {
@@ -1713,6 +1766,53 @@ mod tests {
             .unwrap_or_else(|err| panic!("failed to discover local sidecar: {err}"));
 
         assert_eq!(resolved, sidecar);
+
+        std::fs::remove_dir_all(&root)
+            .unwrap_or_else(|err| panic!("failed to clean temp dir {}: {err}", root.display()));
+    }
+
+    // Regression test for the Phase 2.5 smoke-test finding: when both the
+    // `@fallow-cli/fallow-cov-<platform>/fallow-cov` real binary and the
+    // `node_modules/.bin/fallow-cov` Node wrapper exist (the usual layout
+    // after `npm install @fallow-cli/fallow-cov`), discovery must prefer
+    // the platform package's real binary. The wrapper has no adjacent
+    // `.sig` file, so pointing at it breaks signature verification.
+    #[test]
+    fn discovers_platform_package_sidecar_before_bin_wrapper() {
+        let root = make_temp_dir("sidecar-platform-pkg");
+        let platform_dir = root
+            .join("node_modules")
+            .join("@fallow-cli")
+            .join("fallow-cov-darwin-arm64");
+        let bin_dir = root.join("node_modules").join(".bin");
+        std::fs::create_dir_all(&platform_dir)
+            .unwrap_or_else(|err| panic!("failed to create {}: {err}", platform_dir.display()));
+        std::fs::create_dir_all(&bin_dir)
+            .unwrap_or_else(|err| panic!("failed to create {}: {err}", bin_dir.display()));
+
+        let binary_name = if cfg!(windows) {
+            "fallow-cov.exe"
+        } else {
+            "fallow-cov"
+        };
+        let real_binary = platform_dir.join(binary_name);
+        let wrapper = if cfg!(windows) {
+            bin_dir.join("fallow-cov.cmd")
+        } else {
+            bin_dir.join("fallow-cov")
+        };
+        std::fs::write(&real_binary, "")
+            .unwrap_or_else(|err| panic!("failed to write {}: {err}", real_binary.display()));
+        std::fs::write(&wrapper, "")
+            .unwrap_or_else(|err| panic!("failed to write {}: {err}", wrapper.display()));
+
+        let resolved = discover_sidecar(Some(&root))
+            .unwrap_or_else(|err| panic!("failed to discover platform sidecar: {err}"));
+
+        assert_eq!(
+            resolved, real_binary,
+            "discover_sidecar must prefer the platform package's real binary over the .bin wrapper so signature verification can find the adjacent .sig file"
+        );
 
         std::fs::remove_dir_all(&root)
             .unwrap_or_else(|err| panic!("failed to clean temp dir {}: {err}", root.display()));
