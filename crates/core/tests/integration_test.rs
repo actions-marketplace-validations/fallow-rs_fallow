@@ -83,6 +83,8 @@ mod inheritance_members;
 mod scoped_used_class_members;
 #[path = "integration_test/scss_partials.rs"]
 mod scss_partials;
+#[path = "integration_test/super_method_calls.rs"]
+mod super_method_calls;
 
 #[path = "integration_test/arrow_wrapped_imports.rs"]
 mod arrow_wrapped_imports;

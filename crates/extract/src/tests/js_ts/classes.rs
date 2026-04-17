@@ -945,3 +945,116 @@ fn class_mixed_members_comprehensive() {
         "handle should have has_decorator = false"
     );
 }
+
+// ── super.member access tracking ────────────────────────────
+
+#[test]
+fn super_method_access_attributed_to_parent_class() {
+    // `super.speak()` in a subclass is a use of the parent's `speak`.
+    // Must be recorded with `object` = the local `extends` identifier, so
+    // `local_to_imported` in unused-member analysis can map it to the
+    // parent's export name. See issue #130.
+    let info = parse_source(
+        r"import { Animal } from './animal';
+        export class Dog extends Animal {
+            bark(): string { return super.speak() + ' Woof!'; }
+        }",
+    );
+    assert!(
+        info.member_accesses
+            .iter()
+            .any(|a| a.object == "Animal" && a.member == "speak"),
+        "super.speak() should be recorded as Animal.speak, found: {:?}",
+        info.member_accesses
+    );
+}
+
+#[test]
+fn super_property_access_attributed_to_parent_class() {
+    // Property access through `super` should also be credited to the parent.
+    let info = parse_source(
+        r"import { Base } from './base';
+        export class Child extends Base {
+            read(): string { return super.name; }
+        }",
+    );
+    assert!(
+        info.member_accesses
+            .iter()
+            .any(|a| a.object == "Base" && a.member == "name"),
+        "super.name should be recorded as Base.name, found: {:?}",
+        info.member_accesses
+    );
+}
+
+#[test]
+fn super_access_same_file_parent_uses_local_name() {
+    // Parent class defined in the same file: the `extends` identifier is
+    // a local name, not an import. `find_unused_members` falls back to
+    // the raw object name when no import mapping exists.
+    let info = parse_source(
+        r"class Animal { speak(): string { return 'base'; } }
+        export class Dog extends Animal {
+            bark(): string { return super.speak() + '!'; }
+        }",
+    );
+    assert!(
+        info.member_accesses
+            .iter()
+            .any(|a| a.object == "Animal" && a.member == "speak"),
+        "super.speak() should resolve to Animal.speak even when Animal is local, found: {:?}",
+        info.member_accesses
+    );
+}
+
+#[test]
+fn super_access_in_object_literal_method_is_dropped() {
+    // `super.X` inside an object literal method is syntactically valid JS
+    // (refers to the prototype chain). We cannot attribute it to a class,
+    // so it must be silently dropped. This exercises the `None` branch of
+    // the `class_super_stack.last()` guard: the object method is visited
+    // without any class frame on the stack.
+    let info = parse_source(
+        r"export const obj = {
+            greet() { return super.toString(); }
+        };",
+    );
+    assert!(
+        !info.member_accesses.iter().any(|a| a.member == "toString"),
+        "super.toString() in an object method should not emit an access, found: {:?}",
+        info.member_accesses
+    );
+}
+
+#[test]
+fn super_access_respects_nested_class_boundary() {
+    // When a class expression is nested inside an outer class's method,
+    // `super` inside the INNER class must resolve to the INNER's parent,
+    // not the outer's. Tests the push/pop stack discipline.
+    let info = parse_source(
+        r"import { Outer } from './outer';
+        import { Inner } from './inner';
+        export class ChildOfOuter extends Outer {
+            make(): unknown {
+                return new (class extends Inner {
+                    call() { return super.run(); }
+                })();
+            }
+        }",
+    );
+    assert!(
+        info.member_accesses
+            .iter()
+            .any(|a| a.object == "Inner" && a.member == "run"),
+        "super.run() inside inner class should resolve to Inner.run, found: {:?}",
+        info.member_accesses
+    );
+    assert!(
+        !info
+            .member_accesses
+            .iter()
+            .any(|a| a.object == "Outer" && a.member == "run"),
+        "super.run() must not leak to Outer: {:?}",
+        info.member_accesses
+    );
+}

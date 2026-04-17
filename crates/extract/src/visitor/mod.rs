@@ -64,6 +64,12 @@ pub(crate) struct ModuleInfoExtractor {
     block_depth: u32,
     /// Function / arrow-function nesting depth used to distinguish module scope.
     function_depth: u32,
+    /// Stack of super-class names for classes currently being walked.
+    /// Each frame holds the local identifier from the `extends` clause, or `None`
+    /// when the class has no super class (or an unanalyzable one like `extends mixin()`).
+    /// Read when a `super.member` access is encountered, so it can be recorded as
+    /// `MemberAccess { object: <super_local>, member }`. Dropped when the entry is `None`.
+    pub(crate) class_super_stack: Vec<Option<String>>,
 }
 
 impl ModuleInfoExtractor {

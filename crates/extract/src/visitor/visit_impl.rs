@@ -677,6 +677,18 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
                 member: expr.property.name.to_string(),
             });
         }
+        // Capture `super.member` patterns inside a subclass body. `super.x()` in
+        // `class Dog extends Animal` is semantically a use of `Animal.x`, so we emit
+        // the access against the super class's local identifier. `local_to_imported`
+        // in `find_unused_members` maps it back to the parent's export name.
+        if matches!(expr.object, Expression::Super(_))
+            && let Some(Some(super_local)) = self.class_super_stack.last()
+        {
+            self.member_accesses.push(MemberAccess {
+                object: super_local.clone(),
+                member: expr.property.name.to_string(),
+            });
+        }
         walk::walk_static_member_expression(self, expr);
     }
 
@@ -812,7 +824,14 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
                 });
             }
         }
+        // Track the super class name so `super.member` accesses inside this class
+        // body can be attributed to the parent (see `visit_static_member_expression`).
+        // Pushed for every class (including ones without a super clause) so the stack
+        // depth matches the visit depth when nested classes appear.
+        self.class_super_stack
+            .push(super::helpers::extract_super_class_name(class));
         walk::walk_class(self, class);
+        self.class_super_stack.pop();
     }
 
     /// Track `<script src="...">` and `<link rel="stylesheet|modulepreload" href="...">`
