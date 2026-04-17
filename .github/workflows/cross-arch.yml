@@ -1,11 +1,13 @@
 name: Cross-Architecture
 
 on:
-  pull_request:
-    paths: ['crates/**', '.github/workflows/cross-arch.yml']
-  push:
-    branches: [main]
-    paths: ['crates/**', '.github/workflows/cross-arch.yml']
+  # Temporarily disabled to conserve CI minutes; run locally or via workflow_dispatch.
+  # pull_request:
+  #   paths: ['crates/**', '.github/workflows/cross-arch.yml']
+  # push:
+  #   branches: [main]
+  #   paths: ['crates/**', '.github/workflows/cross-arch.yml']
+  workflow_dispatch:
 
 concurrency:
   group: cross-arch-${{ github.ref }}

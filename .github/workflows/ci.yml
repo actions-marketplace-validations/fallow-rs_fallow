@@ -68,7 +68,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # Temporarily reduced to ubuntu-only to conserve CI minutes (macOS is 10x multiplier).
+        # Run macos + windows locally before release.
+        os: [ubuntu-latest]
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -208,7 +210,8 @@ jobs:
   msrv:
     name: MSRV (1.92)
     needs: changes
-    if: needs.changes.outputs.rust == 'true' || github.event_name == 'push'
+    # Temporarily disabled to conserve CI minutes; run `cargo +1.92.0 check --workspace` locally.
+    if: false && (needs.changes.outputs.rust == 'true' || github.event_name == 'push')
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -225,7 +228,8 @@ jobs:
   miri:
     name: Miri
     needs: changes
-    if: needs.changes.outputs.miri == 'true' || github.event_name == 'push'
+    # Temporarily disabled to conserve CI minutes; run `cargo +nightly miri test` locally.
+    if: false && (needs.changes.outputs.miri == 'true' || github.event_name == 'push')
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:

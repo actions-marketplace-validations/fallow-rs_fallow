@@ -1,8 +1,10 @@
 name: Coverage
 
 on:
-  push:
-    branches: [main]
+  # Temporarily disabled to conserve CI minutes; run locally or via workflow_dispatch.
+  # push:
+  #   branches: [main]
+  workflow_dispatch:
 
 concurrency:
   group: coverage-${{ github.ref }}

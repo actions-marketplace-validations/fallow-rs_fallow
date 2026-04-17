@@ -1,22 +1,24 @@
 name: Allocation Tracking
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'crates/**/*.rs'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'alloc-baseline.json'
-      - '.github/workflows/allocs.yml'
-  pull_request:
-    branches: [main]
-    paths:
-      - 'crates/**/*.rs'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'alloc-baseline.json'
-      - '.github/workflows/allocs.yml'
+  # Temporarily disabled to conserve CI minutes; run locally or via workflow_dispatch.
+  # push:
+  #   branches: [main]
+  #   paths:
+  #     - 'crates/**/*.rs'
+  #     - 'Cargo.toml'
+  #     - 'Cargo.lock'
+  #     - 'alloc-baseline.json'
+  #     - '.github/workflows/allocs.yml'
+  # pull_request:
+  #   branches: [main]
+  #   paths:
+  #     - 'crates/**/*.rs'
+  #     - 'Cargo.toml'
+  #     - 'Cargo.lock'
+  #     - 'alloc-baseline.json'
+  #     - '.github/workflows/allocs.yml'
+  workflow_dispatch:
 
 concurrency:
   group: allocs-${{ github.ref }}

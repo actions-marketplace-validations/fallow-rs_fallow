@@ -1,8 +1,9 @@
 name: Test GitHub Action
 
 on:
-  pull_request:
-    branches: [main]
+  # Temporarily disabled to conserve CI minutes; run locally or via workflow_dispatch.
+  # pull_request:
+  #   branches: [main]
   workflow_dispatch:
 
 concurrency:
