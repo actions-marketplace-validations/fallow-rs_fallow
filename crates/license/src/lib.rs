@@ -330,14 +330,31 @@ pub fn load_raw_jwt() -> Result<Option<String>, LicenseError> {
             return Ok(Some(trimmed));
         }
     }
-    if let Ok(path) = std::env::var("FALLOW_LICENSE_PATH") {
-        return Ok(Some(read_jwt_file(Path::new(&path))?));
+    if let Some(path) = resolve_license_path_env(std::env::var("FALLOW_LICENSE_PATH").ok()) {
+        return Ok(Some(read_jwt_file(&path)?));
     }
     let default = default_license_path();
     if default.exists() {
         return Ok(Some(read_jwt_file(&default)?));
     }
     Ok(None)
+}
+
+/// Normalize a raw `$FALLOW_LICENSE_PATH` env value. Returns `None` when the
+/// var is unset, empty, or whitespace-only so the caller falls through to
+/// default-path discovery; otherwise returns the trimmed path. Without this,
+/// shells that export `FALLOW_LICENSE_PATH=""` (empty-string) produced a
+/// cryptic `license I/O error: No such file or directory` on `health
+/// --production-coverage` because `read_jwt_file(Path::new(""))` fails at the
+/// fs layer.
+fn resolve_license_path_env(raw: Option<String>) -> Option<PathBuf> {
+    let raw = raw?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(trimmed))
+    }
 }
 
 fn read_jwt_file(path: &Path) -> Result<String, LicenseError> {
@@ -521,6 +538,21 @@ mod tests {
     }
 
     #[test]
+    fn normalize_jwt_empty_string_stays_empty() {
+        // Guards the `FALLOW_LICENSE=""` path in `load_raw_jwt`: a shell that
+        // exports an empty-string license must not be treated as a real JWT.
+        assert!(normalize_jwt("").is_empty());
+    }
+
+    #[test]
+    fn normalize_jwt_whitespace_only_becomes_empty() {
+        // Same guard as above for `FALLOW_LICENSE="   "` and tab/newline
+        // variants.
+        assert!(normalize_jwt("   ").is_empty());
+        assert!(normalize_jwt("\t\n\r ").is_empty());
+    }
+
+    #[test]
     fn grace_ladder_classifies_correctly() {
         let claims = make_claims(1_000_000_000);
         // Now equals exp: still valid (delta == 0).
@@ -647,5 +679,39 @@ mod tests {
     #[test]
     fn user_home_from_env_returns_none_when_nothing_set() {
         assert_eq!(user_home_from_env(|_| None), None);
+    }
+
+    #[test]
+    fn resolve_license_path_env_returns_none_for_unset() {
+        assert_eq!(resolve_license_path_env(None), None);
+    }
+
+    #[test]
+    fn resolve_license_path_env_returns_none_for_empty_string() {
+        // Shells that export `FALLOW_LICENSE_PATH=""` must fall through to
+        // default discovery rather than attempt to read `Path::new("")`.
+        assert_eq!(resolve_license_path_env(Some(String::new())), None);
+    }
+
+    #[test]
+    fn resolve_license_path_env_returns_none_for_whitespace_only() {
+        assert_eq!(resolve_license_path_env(Some("   ".to_owned())), None);
+        assert_eq!(resolve_license_path_env(Some("\t\n".to_owned())), None);
+    }
+
+    #[test]
+    fn resolve_license_path_env_trims_surrounding_whitespace() {
+        assert_eq!(
+            resolve_license_path_env(Some("  /tmp/license.jwt  ".to_owned())),
+            Some(PathBuf::from("/tmp/license.jwt"))
+        );
+    }
+
+    #[test]
+    fn resolve_license_path_env_returns_path_for_valid_value() {
+        assert_eq!(
+            resolve_license_path_env(Some("/etc/fallow/license.jwt".to_owned())),
+            Some(PathBuf::from("/etc/fallow/license.jwt"))
+        );
     }
 }
