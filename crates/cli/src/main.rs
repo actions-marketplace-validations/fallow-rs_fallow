@@ -1462,6 +1462,8 @@ fn dispatch_subcommand(
                 production: cli.production,
                 trace: trace.as_deref(),
                 changed_since: cli.changed_since.as_deref(),
+                workspace: cli.workspace.as_deref(),
+                changed_workspaces: cli.changed_workspaces.as_deref(),
                 explain: cli.explain,
                 summary: cli.summary,
                 group_by: cli.group_by,

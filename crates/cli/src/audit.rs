@@ -388,6 +388,8 @@ fn run_audit_dupes<'a>(
         production: opts.production,
         trace: None,
         changed_since,
+        workspace: opts.workspace,
+        changed_workspaces: opts.changed_workspaces,
         explain: opts.explain,
         summary: false,
         group_by: opts.group_by,

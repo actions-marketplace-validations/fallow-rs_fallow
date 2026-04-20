@@ -5,7 +5,7 @@ use fallow_config::{OutputFormat, ResolvedConfig};
 use fallow_core::duplicates::DuplicationReport;
 
 use crate::baseline::{DuplicationBaselineData, filter_new_clone_groups, recompute_stats};
-use crate::check::get_changed_files;
+use crate::check::{get_changed_files, resolve_workspace_scope};
 use crate::report;
 use crate::{error::emit_error, load_config};
 
@@ -48,6 +48,8 @@ pub struct DupesOptions<'a> {
     pub production: bool,
     pub trace: Option<&'a str>,
     pub changed_since: Option<&'a str>,
+    pub workspace: Option<&'a [String]>,
+    pub changed_workspaces: Option<&'a str>,
     pub explain: bool,
     /// When true, emit a condensed summary instead of full item-level output.
     #[allow(
@@ -114,6 +116,34 @@ fn filter_by_changed_files(
     report
         .clone_groups
         .retain(|g| g.instances.iter().any(|i| changed.contains(&i.file)));
+    report.clone_families =
+        fallow_core::duplicates::families::group_into_families(&report.clone_groups, root);
+    report.mirrored_directories = fallow_core::duplicates::families::detect_mirrored_directories(
+        &report.clone_families,
+        root,
+    );
+    report.stats = recompute_stats(report);
+}
+
+/// Filter a duplication report to only retain clone groups where at least one
+/// instance belongs to a file under one of the given workspace roots. Mirrors
+/// the `AnalysisResults` workspace-scoping behaviour in
+/// `crate::check::filtering::filter_to_workspaces`: the full cross-workspace
+/// graph is still built, only reported groups are narrowed.
+///
+/// Families and stats are rebuilt from the surviving groups so that the
+/// reported duplication percentage reflects the scoped slice, not the whole
+/// repo.
+fn filter_by_workspaces(
+    report: &mut fallow_core::duplicates::DuplicationReport,
+    ws_roots: &[std::path::PathBuf],
+    root: &std::path::Path,
+) {
+    report.clone_groups.retain(|g| {
+        g.instances
+            .iter()
+            .any(|i| ws_roots.iter().any(|r| i.file.starts_with(r)))
+    });
     report.clone_families =
         fallow_core::duplicates::families::group_into_families(&report.clone_groups, root);
     report.mirrored_directories = fallow_core::duplicates::families::detect_mirrored_directories(
@@ -238,6 +268,20 @@ pub fn execute_dupes(opts: &DupesOptions<'_>) -> Result<DupesResult, ExitCode> {
         && let Some(changed) = get_changed_files(opts.root, git_ref)
     {
         filter_by_changed_files(&mut report, &changed, &config.root);
+    }
+
+    // Workspace scoping (either --workspace or --changed-workspaces).
+    // Applied AFTER --changed-since so both can compose: in combined mode
+    // the user might pass --changed-workspaces origin/main (auto-derived
+    // workspace set) plus --changed-since origin/main (per-file filter
+    // within those workspaces).
+    if let Some(ws_roots) = resolve_workspace_scope(
+        opts.root,
+        opts.workspace,
+        opts.changed_workspaces,
+        opts.output,
+    )? {
+        filter_by_workspaces(&mut report, &ws_roots, &config.root);
     }
 
     // Apply --top
@@ -412,6 +456,8 @@ mod tests {
             production: false,
             trace: None,
             changed_since: None,
+            workspace: None,
+            changed_workspaces: None,
             explain: false,
             summary: false,
             group_by: None,
@@ -946,6 +992,101 @@ mod tests {
         let changed: rustc_hash::FxHashSet<PathBuf> = rustc_hash::FxHashSet::default();
 
         filter_by_changed_files(&mut report, &changed, Path::new(""));
+
+        assert!(report.clone_groups.is_empty());
+    }
+
+    // ── filter_by_workspaces ────────────────────────────────────────
+
+    #[test]
+    fn filter_by_workspaces_retains_group_with_instance_under_any_root() {
+        let group = make_group(
+            vec![
+                instance("/p/packages/ui/src/a.ts", 1, 10),
+                instance("/p/packages/api/src/b.ts", 1, 10),
+            ],
+            50,
+            10,
+        );
+        let mut report = make_report(vec![group], 10, 1000);
+        let roots = vec![PathBuf::from("/p/packages/ui")];
+
+        filter_by_workspaces(&mut report, &roots, Path::new("/p"));
+
+        assert_eq!(report.clone_groups.len(), 1);
+        assert_eq!(
+            report.clone_families.len(),
+            1,
+            "families rebuilt after scoping"
+        );
+    }
+
+    #[test]
+    fn filter_by_workspaces_drops_group_with_no_instance_under_any_root() {
+        let group = make_group(
+            vec![
+                instance("/p/packages/legacy/src/a.ts", 1, 10),
+                instance("/p/packages/legacy/src/b.ts", 1, 10),
+            ],
+            50,
+            10,
+        );
+        let mut report = make_report(vec![group], 10, 1000);
+        let roots = vec![PathBuf::from("/p/packages/ui")];
+
+        filter_by_workspaces(&mut report, &roots, Path::new("/p"));
+
+        assert!(report.clone_groups.is_empty());
+    }
+
+    #[test]
+    fn filter_by_workspaces_union_of_multiple_roots() {
+        let g_ui = make_group(
+            vec![
+                instance("/p/packages/ui/src/a.ts", 1, 10),
+                instance("/p/packages/ui/src/b.ts", 1, 10),
+            ],
+            50,
+            10,
+        );
+        let g_api = make_group(
+            vec![
+                instance("/p/packages/api/src/x.ts", 1, 10),
+                instance("/p/packages/api/src/y.ts", 1, 10),
+            ],
+            50,
+            10,
+        );
+        let g_legacy = make_group(
+            vec![
+                instance("/p/packages/legacy/src/c.ts", 1, 10),
+                instance("/p/packages/legacy/src/d.ts", 1, 10),
+            ],
+            50,
+            10,
+        );
+        let mut report = make_report(vec![g_ui, g_api, g_legacy], 30, 3000);
+        let roots = vec![
+            PathBuf::from("/p/packages/ui"),
+            PathBuf::from("/p/packages/api"),
+        ];
+
+        filter_by_workspaces(&mut report, &roots, Path::new("/p"));
+
+        assert_eq!(
+            report.clone_groups.len(),
+            2,
+            "ui + api retained, legacy dropped"
+        );
+    }
+
+    #[test]
+    fn filter_by_workspaces_empty_roots_drops_everything() {
+        let group = make_group(vec![instance("/p/packages/ui/src/a.ts", 1, 10)], 50, 10);
+        let mut report = make_report(vec![group], 10, 1000);
+        let roots: Vec<PathBuf> = vec![];
+
+        filter_by_workspaces(&mut report, &roots, Path::new("/p"));
 
         assert!(report.clone_groups.is_empty());
     }
