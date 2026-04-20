@@ -8,7 +8,8 @@
 
 <p align="center">
   <strong>Codebase intelligence for TypeScript & JavaScript.</strong><br>
-  Find unused code, duplication, complexity hotspots, and architecture drift. Optionally merge runtime evidence for hot-path review and runtime-backed deletion confidence.<br>
+  Free static analysis for unused code, duplication, complexity, and architecture drift.<br>
+  Optional runtime intelligence for hot paths, cold paths, and runtime-backed code decisions.<br>
   <strong>Rust-native. Zero config. Sub-second.</strong>
 </p>
 
@@ -34,11 +35,11 @@ npx fallow
  Total       26 issues across 847 files                             53ms
 ```
 
-90 framework plugins. No Node.js runtime. No config file needed.
+**Static analysis is free and open source. Runtime intelligence is optional.**
 
-Static analysis is free and open source. Runtime intelligence is the paid team layer.
+90 framework plugins. No Node.js runtime required for static analysis. No config needed for the first run.
 
-Delete and refactor with confidence: the static layer catches unused files, exports, and dependencies in milliseconds. The optional Fallow Runtime layer merges real production execution data, so you can delete cold code backed by runtime evidence instead of hoping your static graph was complete.
+Fallow builds a project-wide understanding of your TS/JS codebase instead of checking one file at a time. Use it to clean up dead code, reduce duplication, find risky complexity, and enforce architecture boundaries. Add the runtime layer when you want to know what actually executed in production.
 
 ## Install
 
@@ -48,30 +49,46 @@ npm install -g fallow       # Or install globally (macOS, Linux, Windows)
 cargo install fallow-cli    # Or via Cargo
 ```
 
-## Commands
-
-### Static analysis (free)
-
-Everything below runs on your source alone. No account, no network, no runtime required.
+## Start here
 
 ```bash
-fallow                      # Run all three analyses
-fallow dead-code            # Dead code only
-fallow dupes                # Duplication only
-fallow health               # Complexity only
-fallow audit                # Audit changed files (verdict: pass/warn/fail)
-fallow fix --dry-run        # Preview auto-removal of dead exports and deps
-fallow watch                # Re-analyze on file changes
+fallow                      # Dead code + duplication + health
+fallow dead-code            # Cleanup candidates
+fallow dupes                # Repeated logic
+fallow health               # Complexity + refactor targets
+fallow fix --dry-run        # Preview automatic cleanup
 ```
 
-### Runtime intelligence (optional, paid)
+## What it finds
 
-These commands add production execution data on top of the static analysis above. They are opt-in and require an active Fallow Runtime license. See [Runtime intelligence](#runtime-intelligence-fallow-runtime).
+- **Dead code**: unused files, exports, dependencies, types, cycles, boundaries, stale suppressions
+- **Duplication**: repeated blocks from exact to semantic clones
+- **Complexity**: high-risk functions, file scores, hotspots, and refactor targets
+- **Architecture drift**: boundary violations across layers and modules
+
+## Why Fallow exists
+
+Linters check files. TypeScript checks types. Fallow checks the codebase.
+
+It builds a module graph across the whole project so it can find problems that file-local tools cannot:
+
+| What | Linter | Fallow |
+|---|---|---|
+| Unused variable in a function | yes | no |
+| Unused export that nothing imports | no | yes |
+| File that nothing imports | no | yes |
+| Circular dependency across modules | no | yes |
+| Duplicate code blocks across files | no | yes |
+| Dependency in package.json never imported | no | yes |
+
+[Full comparison: fallow vs ESLint, Biome, knip, ts-prune](https://docs.fallow.tools/explanations/fallow-vs-linters)
+
+## More static commands
 
 ```bash
-fallow license activate --trial --email you@company.com
-fallow coverage setup                             # Guided first-run setup
-fallow health --production-coverage ./coverage    # Merge runtime coverage into health
+fallow audit                # Audit changed files (verdict: pass/warn/fail)
+fallow watch                # Re-analyze on file changes
+fallow fix                  # Apply automatic cleanup after previewing
 ```
 
 ## Dead code
@@ -130,16 +147,26 @@ fallow health --trend                     # Compare against saved snapshot
 fallow health --changed-since main        # Only changed files
 ```
 
-## Runtime intelligence (Fallow Runtime)
+## Runtime intelligence (optional)
 
-Static analysis answers: "is this code referenced anywhere in the source graph?" Runtime intelligence answers: "does this code actually execute in production?"
+Static analysis answers: **what is connected to what?**
 
-Fallow Runtime is the paid team layer. The engine is production coverage: V8 dumps (`NODE_V8_COVERAGE=...`) and Istanbul `coverage-final.json` files merged into the `health` surface. The product on top is runtime-backed decisions: hot/cold path review, runtime-weighted health scoring, stale-flag evidence, trends, alerts, and shared team workflows.
+Runtime intelligence answers: **what actually ran?**
+
+Fallow Runtime is the optional paid team layer. It uses production coverage as the collection engine (V8 dumps via `NODE_V8_COVERAGE=...` and Istanbul `coverage-final.json` files), then merges that evidence into `fallow health` so teams can:
+
+- identify cold code with more confidence
+- review changes on hot paths more carefully
+- weight refactors by real execution importance
+- spot stale feature-flag branches
+
+```bash
+fallow license activate --trial --email you@company.com
+fallow coverage setup
+fallow health --production-coverage ./coverage
+```
 
 Static `coverage_gaps` and runtime `production_coverage` are separate layers in the same `health` surface:
-- `coverage_gaps` is graph-based and answers which runtime files or exports have no test dependency path
-- `production_coverage` is runtime-based and answers which functions actually executed in production-like coverage input
-- `coverage_gaps` can appear either because you passed `--coverage-gaps`, or because top-level `health` enabled it from config severity when no narrower section flags were selected
 
 | Surface | Flag | Input | Answers | License |
 |:--|:--|:--|:--|:--|
@@ -147,11 +174,7 @@ Static `coverage_gaps` and runtime `production_coverage` are separate layers in 
 | Exact CRAP scoring | `--coverage` | Istanbul JSON file or `coverage-final.json` directory | how covered each function is for CRAP computation | no |
 | Runtime production coverage | `--production-coverage` | V8 directory, V8 JSON file, or Istanbul JSON file | which functions actually executed, which stayed cold, which are hot | yes |
 
-```bash
-fallow license activate --trial --email you@company.com
-fallow coverage setup
-fallow health --production-coverage ./coverage
-```
+Setup details:
 
 - `fallow license activate --trial --email ...` starts a trial and stores the signed license locally
 - `fallow license refresh` refreshes the stored license before the hard-fail window
@@ -164,6 +187,8 @@ fallow health --production-coverage ./coverage
 - `fallow health --changed-since <ref> --production-coverage <path>` promotes touched hot paths to a `hot-path-changes-needed` verdict during change review
 
 Production coverage is merged into the same human, JSON, SARIF, compact, markdown, and CodeClimate outputs as the rest of the health report.
+
+Read more: [Static vs runtime intelligence](https://docs.fallow.tools/explanations/static-vs-runtime) | [Production coverage](https://docs.fallow.tools/analysis/production-coverage)
 
 ## Audit
 
@@ -302,25 +327,6 @@ See the [full configuration reference](https://docs.fallow.tools/configuration/o
 - **MCP server** -- AI agent integration for Claude Code, Cursor, Windsurf ([fallow-skills](https://github.com/fallow-rs/fallow-skills))
 - **JSON `actions` array** -- every issue in `--format json` output includes fix suggestions with `auto_fixable` flag, so agents can self-correct
 
-## Fallow vs linters
-
-Linters enforce style. Formatters enforce consistency. Fallow enforces relevance.
-
-ESLint, Biome, and oxlint analyze one file at a time. They catch bad patterns within a file boundary. Fallow builds a module dependency graph across the entire project and finds issues that only appear when you see the whole picture.
-
-| What | Linter | Fallow |
-|---|---|---|
-| Unused variable in a function | yes | no |
-| Unused export that nothing imports | no | yes |
-| File that nothing imports | no | yes |
-| Circular dependency across modules | no | yes |
-| Duplicate code blocks across files | no | yes |
-| Dependency in package.json never imported | no | yes |
-
-They're complementary -- run your linter on every save, fallow on every commit.
-
-[Full comparison: fallow vs ESLint, Biome, knip, ts-prune](https://docs.fallow.tools/explanations/fallow-vs-linters)
-
 ## Performance
 
 Benchmarked on real open-source projects (median of 5 runs, Apple M5).
@@ -346,7 +352,7 @@ knip errors out on next.js. fallow completes in under 2 seconds.
 | [vue/core](https://github.com/vuejs/core) | 522 | **124ms** | 3.11s | 25x |
 | [next.js](https://github.com/vercel/next.js) | 20,416 | **2.89s** | 24.37s | 8x |
 
-No TypeScript compiler, no Node.js runtime. [How it works](https://docs.fallow.tools/explanations/architecture) | [Reproduce benchmarks](https://github.com/fallow-rs/fallow/tree/main/benchmarks)
+No TypeScript compiler, no Node.js runtime needed to analyze your code. [Fallow vs linters](https://docs.fallow.tools/explanations/fallow-vs-linters) | [Reproduce benchmarks](https://github.com/fallow-rs/fallow/tree/main/benchmarks)
 
 ## Suppressing findings
 
