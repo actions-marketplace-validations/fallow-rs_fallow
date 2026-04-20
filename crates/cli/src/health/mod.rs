@@ -1769,6 +1769,7 @@ mod tests {
             trace_count: 512,
             period_days: 7,
             deployments_seen: 2,
+            capture_quality: None,
         }
     }
 

@@ -97,6 +97,10 @@ mod gated {
         }
 
         fn health_args(&self) -> Vec<String> {
+            self.health_args_with_format("json")
+        }
+
+        fn health_args_with_format(&self, format: &str) -> Vec<String> {
             let fixture = fixture_path("coverage-gaps");
             vec![
                 "health".to_owned(),
@@ -105,7 +109,7 @@ mod gated {
                 "--production-coverage".to_owned(),
                 self.coverage_file.to_string_lossy().into_owned(),
                 "--format".to_owned(),
-                "json".to_owned(),
+                format.to_owned(),
                 "--quiet".to_owned(),
             ]
         }
@@ -324,6 +328,109 @@ mod gated {
         assert!(
             watermark.is_none_or(serde_json::Value::is_null),
             "fresh license must not emit a watermark; got {watermark:?}"
+        );
+    }
+
+    /// ADR 009 step 6b: a short-window capture must show both the warning
+    /// banner and the quantified trial CTA in human output. The stub returns
+    /// a 12-minute capture with `lazy_parse_warning: true`.
+    #[test]
+    fn capture_quality_short_renders_warning_and_upgrade_prompt_in_human_output() {
+        let harness = Harness::new();
+        let mut cmd = harness.fallow();
+        cmd.env("FALLOW_LICENSE", sign::mint_production_coverage_jwt());
+        cmd.env("FALLOW_STUB_MODE", "capture-quality-short");
+        for arg in harness.health_args_with_format("human") {
+            cmd.arg(arg);
+        }
+        let (stdout, stderr, code) = run_with(cmd);
+        let combined = format!("{stdout}{stderr}");
+        assert_eq!(
+            code, 0,
+            "short-capture happy path must exit 0; combined={combined}"
+        );
+        assert!(
+            combined.contains("note: short capture (12 min from 1 instance)"),
+            "short-capture warning banner missing; combined={combined}"
+        );
+        assert!(
+            combined.contains("lazy-parsed scripts may not appear"),
+            "lazy-parse guidance missing; combined={combined}"
+        );
+        assert!(
+            combined.contains("captured 12 min from 1 instance."),
+            "quantified upgrade prompt header missing; combined={combined}"
+        );
+        assert!(
+            combined.contains("continuous monitoring over 30 days"),
+            "upgrade prompt body missing; combined={combined}"
+        );
+        assert!(
+            combined.contains("fallow license activate --trial"),
+            "trial CTA command missing; combined={combined}"
+        );
+    }
+
+    /// ADR 009 step 6b: a long-window capture must be quiet. No warning, no CTA.
+    #[test]
+    fn capture_quality_long_shows_neither_warning_nor_upgrade_prompt() {
+        let harness = Harness::new();
+        let mut cmd = harness.fallow();
+        cmd.env("FALLOW_LICENSE", sign::mint_production_coverage_jwt());
+        cmd.env("FALLOW_STUB_MODE", "capture-quality-long");
+        for arg in harness.health_args_with_format("human") {
+            cmd.arg(arg);
+        }
+        let (stdout, stderr, code) = run_with(cmd);
+        let combined = format!("{stdout}{stderr}");
+        assert_eq!(
+            code, 0,
+            "long-capture happy path must exit 0; combined={combined}"
+        );
+        assert!(
+            !combined.contains("short capture"),
+            "long capture must not emit the short-capture warning; combined={combined}"
+        );
+        assert!(
+            !combined.contains("start a trial"),
+            "long capture must not emit the trial CTA; combined={combined}"
+        );
+    }
+
+    /// The trial CTA is a human-format sales touchpoint. It must never land in
+    /// machine-readable formats (JSON, SARIF, etc.); those feed agent pipelines
+    /// and scripted consumers that would choke on free text.
+    #[test]
+    fn capture_quality_short_does_not_emit_upgrade_prompt_in_json() {
+        let harness = Harness::new();
+        let mut cmd = harness.fallow();
+        cmd.env("FALLOW_LICENSE", sign::mint_production_coverage_jwt());
+        cmd.env("FALLOW_STUB_MODE", "capture-quality-short");
+        for arg in harness.health_args_with_format("json") {
+            cmd.arg(arg);
+        }
+        let (stdout, stderr, code) = run_with(cmd);
+        assert_eq!(
+            code, 0,
+            "json short-capture run must exit 0; stderr={stderr}"
+        );
+        assert!(
+            !stdout.contains("start a trial"),
+            "JSON format must never include the trial CTA free text; stdout={stdout}"
+        );
+        let json: serde_json::Value =
+            serde_json::from_str(&stdout).expect("json output must parse");
+        let quality = json
+            .pointer("/production_coverage/summary/capture_quality")
+            .expect("capture_quality absent from json summary");
+        assert_eq!(
+            quality.get("lazy_parse_warning"),
+            Some(&serde_json::json!(true))
+        );
+        assert_eq!(quality.get("window_seconds"), Some(&serde_json::json!(720)));
+        assert_eq!(
+            quality.get("instances_observed"),
+            Some(&serde_json::json!(1))
         );
     }
 

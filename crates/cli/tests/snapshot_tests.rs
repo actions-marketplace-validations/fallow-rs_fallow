@@ -1814,6 +1814,7 @@ fn health_report_with_production_coverage(root: &Path) -> HealthReport {
             trace_count: 2_847_291,
             period_days: 30,
             deployments_seen: 14,
+            capture_quality: None,
         },
         findings: vec![
             ProductionCoverageFinding {

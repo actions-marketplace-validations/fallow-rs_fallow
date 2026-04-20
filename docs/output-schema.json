@@ -348,7 +348,7 @@
     "ProductionCoverageReport": {
       "type": "object",
       "required": ["verdict", "summary"],
-      "description": "Production coverage findings merged into the health report. Present only when --production-coverage is used. Shape mirrors fallow-cov-protocol 0.2.",
+      "description": "Production coverage findings merged into the health report. Present only when --production-coverage is used. Shape mirrors fallow-cov-protocol 0.3.",
       "properties": {
         "verdict": {
           "$ref": "#/definitions/ProductionCoverageReportVerdict",
@@ -424,6 +424,38 @@
           "type": "integer",
           "minimum": 0,
           "description": "Distinct deployments contributing to the supplied dump (Phase 2 local analysis emits 0)."
+        },
+        "capture_quality": {
+          "$ref": "#/definitions/ProductionCoverageCaptureQuality",
+          "description": "Capture-quality telemetry. Present on protocol-0.3+ sidecar responses; omitted when the sidecar predates protocol 0.3. Signals whether the capture window was long enough to produce trustworthy coverage numbers."
+        }
+      }
+    },
+
+    "ProductionCoverageCaptureQuality": {
+      "type": "object",
+      "required": ["window_seconds", "instances_observed", "lazy_parse_warning", "untracked_ratio_percent"],
+      "description": "Quality-of-capture signals emitted by the sidecar so the CLI can explain short-window captures honestly instead of letting users blame the tool.",
+      "properties": {
+        "window_seconds": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Total observation window in seconds. Finer-grained than period_days (which rounds up to whole days)."
+        },
+        "instances_observed": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Number of distinct production instances that contributed to the dump."
+        },
+        "lazy_parse_warning": {
+          "type": "boolean",
+          "description": "True when the untracked-function ratio exceeds the sidecar's lazy-parse threshold (30%). Signals that many untracked functions likely reflect lazy-parsed code rather than unreachable code."
+        },
+        "untracked_ratio_percent": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 100,
+          "description": "functions_untracked / functions_tracked as a percentage, rounded to 2 decimal places."
         }
       }
     },
@@ -640,7 +672,7 @@
 
     "SchemaVersion": {
       "type": "integer",
-      "description": "Schema version for this output format (independent of tool version). Adding new fields does not bump the version. Consumers should check this field to detect structural changes. v4 reshapes the production-coverage block to fallow-cov-protocol 0.2 (per-finding verdict, stable IDs, evidence block, renamed summary fields).",
+      "description": "Schema version for this output format (independent of tool version). Adding new fields does not bump the version. Consumers should check this field to detect structural changes. v4 was introduced alongside fallow-cov-protocol 0.2 (per-finding verdict, stable IDs, evidence block, renamed summary fields); the production-coverage block is extended additively as the protocol evolves (currently 0.3, which adds an optional capture_quality summary field).",
       "examples": [4]
     },
     "ToolVersion": {

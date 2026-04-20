@@ -8,8 +8,8 @@ use std::{collections::BTreeMap, fs};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use fallow_config::OutputFormat;
 use fallow_cov_protocol::{
-    Confidence, CoverageSource, Evidence, PROTOCOL_VERSION, ReportVerdict, Request, Response,
-    StaticFile, StaticFindings, StaticFunction, Verdict, Watermark,
+    CaptureQuality, Confidence, CoverageSource, Evidence, PROTOCOL_VERSION, ReportVerdict, Request,
+    Response, StaticFile, StaticFindings, StaticFunction, Verdict, Watermark,
 };
 use fallow_license::{
     DEFAULT_HARD_FAIL_DAYS, Feature, LicenseStatus, load_and_verify, load_raw_jwt,
@@ -680,6 +680,15 @@ fn build_request(
                 trace_count: None,
                 period_days: None,
                 deployments_seen: None,
+                // Window/instance hints feed `CaptureQuality` on the sidecar.
+                // In Phase 2 single-dump local mode all four of trace_count,
+                // period_days, deployments_seen, window_seconds, and
+                // instances_observed are None; the sidecar derives
+                // `CaptureQuality.instances_observed` from the count of
+                // distinct deployments it sees in the dump itself.
+                // Populated by the beacon transport in Phase 3.
+                window_seconds: None,
+                instances_observed: None,
             },
         },
         locations,
@@ -1493,6 +1502,11 @@ fn convert_response(
             trace_count: response.summary.trace_count,
             period_days: response.summary.period_days,
             deployments_seen: response.summary.deployments_seen,
+            capture_quality: response
+                .summary
+                .capture_quality
+                .as_ref()
+                .map(map_capture_quality),
         },
         findings,
         hot_paths,
@@ -1558,6 +1572,17 @@ fn map_watermark(watermark: &Watermark) -> ProductionCoverageWatermark {
         Watermark::TrialExpired => ProductionCoverageWatermark::TrialExpired,
         Watermark::LicenseExpiredGrace => ProductionCoverageWatermark::LicenseExpiredGrace,
         Watermark::Unknown => ProductionCoverageWatermark::Unknown,
+    }
+}
+
+fn map_capture_quality(
+    quality: &CaptureQuality,
+) -> crate::health_types::ProductionCoverageCaptureQuality {
+    crate::health_types::ProductionCoverageCaptureQuality {
+        window_seconds: quality.window_seconds,
+        instances_observed: quality.instances_observed,
+        lazy_parse_warning: quality.lazy_parse_warning,
+        untracked_ratio_percent: quality.untracked_ratio_percent,
     }
 }
 
@@ -2001,6 +2026,7 @@ mod tests {
                     trace_count: 512,
                     period_days: 7,
                     deployments_seen: 2,
+                    capture_quality: None,
                 },
                 findings: vec![Finding {
                     id: "fallow:prod:abc12345".to_owned(),

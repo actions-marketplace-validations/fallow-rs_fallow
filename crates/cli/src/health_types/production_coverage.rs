@@ -133,7 +133,7 @@ impl fmt::Display for ProductionCoverageWatermark {
     }
 }
 
-/// Summary block mirroring `fallow_cov_protocol::Summary` (0.2 shape).
+/// Summary block mirroring `fallow_cov_protocol::Summary` (0.3 shape).
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct ProductionCoverageSummary {
     pub functions_tracked: usize,
@@ -144,6 +144,21 @@ pub struct ProductionCoverageSummary {
     pub trace_count: u64,
     pub period_days: u32,
     pub deployments_seen: u32,
+    /// Capture-quality telemetry. `None` for protocol-0.2 sidecars; protocol-0.3+
+    /// sidecars always populate it. Fuels the human-output short-window warning
+    /// and the quantified trial CTA, and is passed through to JSON consumers so
+    /// agent pipelines can surface the same signal.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capture_quality: Option<ProductionCoverageCaptureQuality>,
+}
+
+/// Capture-quality telemetry (mirrors `fallow_cov_protocol::CaptureQuality`).
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct ProductionCoverageCaptureQuality {
+    pub window_seconds: u64,
+    pub instances_observed: u32,
+    pub lazy_parse_warning: bool,
+    pub untracked_ratio_percent: f64,
 }
 
 /// Supporting evidence for a finding (mirrors `fallow_cov_protocol::Evidence`).

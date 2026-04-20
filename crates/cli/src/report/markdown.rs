@@ -506,6 +506,16 @@ fn write_production_coverage_section(
     if let Some(watermark) = production.watermark {
         let _ = writeln!(out, "- Watermark: {watermark}\n");
     }
+    if let Some(ref quality) = production.summary.capture_quality
+        && quality.lazy_parse_warning
+    {
+        let window = super::human::health::format_window(quality.window_seconds);
+        let _ = writeln!(
+            out,
+            "- Capture quality: short window ({} from {} instance(s), {:.1}% of functions untracked); lazy-parsed scripts may not appear.\n",
+            window, quality.instances_observed, quality.untracked_ratio_percent,
+        );
+    }
     let rel = |p: &Path| {
         escape_backticks(&normalize_uri(
             &relative_path(p, root).display().to_string(),

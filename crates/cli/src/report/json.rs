@@ -1133,6 +1133,12 @@ mod tests {
                     trace_count: 2_847_291,
                     period_days: 30,
                     deployments_seen: 14,
+                    capture_quality: Some(crate::health_types::ProductionCoverageCaptureQuality {
+                        window_seconds: 720,
+                        instances_observed: 1,
+                        lazy_parse_warning: true,
+                        untracked_ratio_percent: 42.5,
+                    }),
                 },
                 findings: vec![ProductionCoverageFinding {
                     id: "fallow:prod:deadbeef".to_owned(),

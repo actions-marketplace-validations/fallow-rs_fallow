@@ -16,6 +16,10 @@
 //!   with that code
 //! - `"malformed-stdout"`: writes non-JSON bytes, exit 0
 //! - `"empty-stdout"`: writes nothing, exit 0
+//! - `"capture-quality-short"`: clean response with a short-window
+//!   `capture_quality` (`lazy_parse_warning = true`), exit 0
+//! - `"capture-quality-long"`: clean response with a long-window
+//!   `capture_quality` (`lazy_parse_warning = false`), exit 0
 
 #![expect(
     clippy::print_stderr,
@@ -25,7 +29,9 @@
 use std::io::{Read, Write};
 use std::process::ExitCode;
 
-use fallow_cov_protocol::{PROTOCOL_VERSION, ReportVerdict, Request, Response, Summary};
+use fallow_cov_protocol::{
+    CaptureQuality, PROTOCOL_VERSION, ReportVerdict, Request, Response, Summary,
+};
 
 fn main() -> ExitCode {
     // Drain stdin so the parent CLI's writer does not get EPIPE on close.
@@ -37,8 +43,26 @@ fn main() -> ExitCode {
 
     let mode = std::env::var("FALLOW_STUB_MODE").unwrap_or_default();
     match mode.as_str() {
-        "" | "ok" => emit_clean_response(PROTOCOL_VERSION),
-        "protocol-mismatch" => emit_clean_response("99.0.0"),
+        "" | "ok" => emit_clean_response(PROTOCOL_VERSION, None),
+        "protocol-mismatch" => emit_clean_response("99.0.0", None),
+        "capture-quality-short" => emit_clean_response(
+            PROTOCOL_VERSION,
+            Some(CaptureQuality {
+                window_seconds: 720,
+                instances_observed: 1,
+                lazy_parse_warning: true,
+                untracked_ratio_percent: 42.5,
+            }),
+        ),
+        "capture-quality-long" => emit_clean_response(
+            PROTOCOL_VERSION,
+            Some(CaptureQuality {
+                window_seconds: 7 * 24 * 3600,
+                instances_observed: 4,
+                lazy_parse_warning: false,
+                untracked_ratio_percent: 3.1,
+            }),
+        ),
         "malformed-stdout" => emit_bytes(b"definitely not JSON\n"),
         "empty-stdout" => ExitCode::SUCCESS,
         "exit-4" => {
@@ -60,7 +84,10 @@ fn main() -> ExitCode {
     }
 }
 
-fn emit_clean_response(protocol_version: &str) -> ExitCode {
+fn emit_clean_response(
+    protocol_version: &str,
+    capture_quality: Option<CaptureQuality>,
+) -> ExitCode {
     let response = Response {
         protocol_version: protocol_version.to_owned(),
         verdict: ReportVerdict::Clean,
@@ -73,6 +100,7 @@ fn emit_clean_response(protocol_version: &str) -> ExitCode {
             trace_count: 0,
             period_days: 0,
             deployments_seen: 0,
+            capture_quality,
         },
         findings: Vec::new(),
         hot_paths: Vec::new(),

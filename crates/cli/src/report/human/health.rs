@@ -178,6 +178,7 @@ fn render_production_coverage(
             "  license expired grace active; refresh with `fallow license refresh`".to_owned(),
         );
     }
+    render_capture_quality_warning(lines, production);
     let shown_findings = production.findings.len().min(MAX_FLAT_ITEMS);
     for finding in &production.findings[..shown_findings] {
         let relative = format_path(&relative_path(&finding.path, root).display().to_string());
@@ -215,7 +216,100 @@ fn render_production_coverage(
     for warning in &production.warnings {
         lines.push(format!("  warning [{}]: {}", warning.code, warning.message));
     }
+    render_upgrade_prompt(lines, production);
     lines.push(String::new());
+}
+
+/// Format `seconds` as a human-readable window label like "12 min" or "6 h".
+///
+/// Used by both the terminal and markdown renderers so a multi-day window
+/// consistently reads as "N d" in both surfaces instead of diverging to
+/// "N h" in one of them.
+pub(in crate::report) fn format_window(seconds: u64) -> String {
+    if seconds < 60 {
+        return format!("{seconds} s");
+    }
+    let minutes = seconds / 60;
+    if minutes < 120 {
+        return format!("{minutes} min");
+    }
+    let hours = minutes / 60;
+    if hours < 48 {
+        format!("{hours} h")
+    } else {
+        format!("{} d", hours / 24)
+    }
+}
+
+/// Render the "short window" warning when the sidecar flagged a lazy-parse risk.
+///
+/// Triggered by `CaptureQuality::lazy_parse_warning`, which the sidecar sets
+/// when the untracked-function ratio crosses its threshold. Matches the
+/// existing `note: ...` idiom used elsewhere in the health renderer for
+/// inline caveats on summary numbers; fully yellow, no prefix glyph.
+fn render_capture_quality_warning(
+    lines: &mut Vec<String>,
+    production: &crate::health_types::ProductionCoverageReport,
+) {
+    let Some(ref quality) = production.summary.capture_quality else {
+        return;
+    };
+    if !quality.lazy_parse_warning {
+        return;
+    }
+    let instances = quality.instances_observed;
+    let instance_label = if instances == 1 {
+        "instance"
+    } else {
+        "instances"
+    };
+    let window = format_window(quality.window_seconds);
+    lines.push(format!(
+        "  {}",
+        format!(
+            "note: short capture ({window} from {instances} {instance_label}); {:.1}% of functions untracked, lazy-parsed scripts may not appear.",
+            quality.untracked_ratio_percent,
+        )
+        .yellow()
+    ));
+    lines.push(
+        "  extend the capture or switch to continuous monitoring for a trustworthy reading."
+            .to_owned(),
+    );
+}
+
+/// Render the quantified trial CTA at the end of a local-mode run.
+///
+/// Sales touchpoint per ADR 009 step 6b. Human-format only; never emitted
+/// from JSON / SARIF / CodeClimate / compact. Fires alongside the short-
+/// capture warning so long, clean captures do not see CTA spam on every run.
+fn render_upgrade_prompt(
+    lines: &mut Vec<String>,
+    production: &crate::health_types::ProductionCoverageReport,
+) {
+    let Some(ref quality) = production.summary.capture_quality else {
+        return;
+    };
+    if !quality.lazy_parse_warning {
+        return;
+    }
+    let window = format_window(quality.window_seconds);
+    let instances = quality.instances_observed;
+    let instance_label = if instances == 1 {
+        "instance"
+    } else {
+        "instances"
+    };
+    lines.push(format!(
+        "  captured {window} from {instances} {instance_label}."
+    ));
+    lines.push(
+        "  continuous monitoring over 30 days evaluates more paths and surfaces additional candidates the local capture missed."
+            .to_owned(),
+    );
+    lines.push(
+        "  start a trial: `fallow license activate --trial --email you@company.com`".to_owned(),
+    );
 }
 
 // ── Section renderers ────
@@ -1656,6 +1750,7 @@ mod tests {
                 trace_count: 2_847_291,
                 period_days: 30,
                 deployments_seen: 14,
+                capture_quality: None,
             },
             findings: vec![crate::health_types::ProductionCoverageFinding {
                 id: "fallow:prod:deadbeef".to_owned(),
@@ -1694,6 +1789,101 @@ mod tests {
         assert!(text.contains("license expired grace active"));
         assert!(text.contains("hot paths:"));
         assert!(text.contains("src/hot.ts:3 hotPath (250 invocations, p99)"));
+        // No capture_quality => no short-window warning, no trial CTA.
+        assert!(!text.contains("short capture:"));
+        assert!(!text.contains("start a trial"));
+    }
+
+    fn production_coverage_report_with_quality(
+        quality: Option<crate::health_types::ProductionCoverageCaptureQuality>,
+    ) -> crate::health_types::ProductionCoverageReport {
+        crate::health_types::ProductionCoverageReport {
+            verdict: crate::health_types::ProductionCoverageReportVerdict::Clean,
+            summary: crate::health_types::ProductionCoverageSummary {
+                functions_tracked: 10,
+                functions_hit: 7,
+                functions_unhit: 0,
+                functions_untracked: 3,
+                coverage_percent: 70.0,
+                trace_count: 1_000,
+                period_days: 1,
+                deployments_seen: 1,
+                capture_quality: quality,
+            },
+            findings: vec![],
+            hot_paths: vec![],
+            watermark: None,
+            warnings: vec![],
+        }
+    }
+
+    #[test]
+    fn health_production_coverage_short_capture_shows_warning_and_prompt() {
+        let root = PathBuf::from("/project");
+        let mut report = empty_report();
+        report.production_coverage = Some(production_coverage_report_with_quality(Some(
+            crate::health_types::ProductionCoverageCaptureQuality {
+                window_seconds: 720, // 12 min
+                instances_observed: 1,
+                lazy_parse_warning: true,
+                untracked_ratio_percent: 42.5,
+            },
+        )));
+        let text = plain(&build_health_human_lines(&report, &root));
+        assert!(
+            text.contains(
+                "note: short capture (12 min from 1 instance); 42.5% of functions untracked, lazy-parsed scripts may not appear."
+            ),
+            "warning banner missing or malformed in:\n{text}"
+        );
+        assert!(
+            text.contains("extend the capture or switch to continuous monitoring"),
+            "warning follow-up line missing in:\n{text}"
+        );
+        assert!(
+            text.contains("captured 12 min from 1 instance."),
+            "upgrade prompt header missing in:\n{text}"
+        );
+        assert!(
+            text.contains("continuous monitoring over 30 days evaluates more paths"),
+            "upgrade prompt body missing in:\n{text}"
+        );
+        assert!(
+            text.contains("fallow license activate --trial --email you@company.com"),
+            "trial CTA command missing in:\n{text}"
+        );
+    }
+
+    #[test]
+    fn health_production_coverage_long_capture_shows_neither_warning_nor_prompt() {
+        let root = PathBuf::from("/project");
+        let mut report = empty_report();
+        report.production_coverage = Some(production_coverage_report_with_quality(Some(
+            crate::health_types::ProductionCoverageCaptureQuality {
+                window_seconds: 7 * 24 * 3600, // 7 days
+                instances_observed: 4,
+                lazy_parse_warning: false,
+                untracked_ratio_percent: 3.1,
+            },
+        )));
+        let text = plain(&build_health_human_lines(&report, &root));
+        assert!(
+            !text.contains("short capture"),
+            "long capture should not emit short-capture warning:\n{text}"
+        );
+        assert!(
+            !text.contains("start a trial"),
+            "long capture should not emit trial CTA:\n{text}"
+        );
+    }
+
+    #[test]
+    fn format_window_labels() {
+        assert_eq!(super::format_window(30), "30 s");
+        assert_eq!(super::format_window(60), "1 min");
+        assert_eq!(super::format_window(720), "12 min");
+        assert_eq!(super::format_window(3600 * 3), "3 h");
+        assert_eq!(super::format_window(3600 * 24 * 3), "3 d");
     }
 
     #[test]
