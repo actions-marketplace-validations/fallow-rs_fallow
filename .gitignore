@@ -4,6 +4,9 @@ node_modules/
 !tests/fixtures/bin-script-deps/node_modules/
 !tests/fixtures/scss-node-modules-resolution/node_modules/
 .DS_Store
+# macOS Spotlight index control markers (written into build output dirs)
+.metadata_never_index
+.metadata_never_index_unless_rootfs
 
 # Reference repos (for development only)
 reference

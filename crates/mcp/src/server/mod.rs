@@ -5,12 +5,13 @@ use rmcp::{ErrorData as McpError, ServerHandler, tool, tool_router};
 
 use crate::params::{
     AnalyzeParams, AuditParams, CheckChangedParams, FeatureFlagsParams, FindDupesParams, FixParams,
-    HealthParams, ListBoundariesParams, ProjectInfoParams,
+    HealthParams, HealthProductionCoverageParams, ListBoundariesParams, ProjectInfoParams,
 };
 use crate::tools::{
     build_analyze_args, build_audit_args, build_check_changed_args, build_feature_flags_args,
     build_find_dupes_args, build_fix_apply_args, build_fix_preview_args, build_health_args,
-    build_list_boundaries_args, build_project_info_args, run_fallow,
+    build_health_production_coverage_args, build_list_boundaries_args, build_project_info_args,
+    run_fallow,
 };
 
 #[cfg(test)]
@@ -171,6 +172,18 @@ impl FallowMcp {
         let args = build_feature_flags_args(&params.0);
         run_fallow(&self.binary, &args).await
     }
+
+    #[tool(
+        description = "Merge runtime production-coverage data into the health report (paid feature). Focused entry point for the production-coverage pipeline: pass a V8 coverage directory (`NODE_V8_COVERAGE=<dir>`), a single V8 coverage JSON file, or an Istanbul `coverage-final.json` via the required `coverage` field. Requires an active license JWT (start a 30-day trial with `fallow license activate --trial --email <addr>`). Returns structured JSON with a `production_coverage` block containing per-finding `verdict` (`safe_to_delete` / `review_required` / `low_traffic` / `coverage_unavailable` / `active`), stable content-hash IDs (`fallow:prod:<hash>`), evidence, percentile-ranked hot paths, and on protocol-0.3+ sidecars a `summary.capture_quality` block that flags short-window captures. Tunable via `min_invocations_hot` (hot-path threshold), `min_observation_volume` (high-confidence verdict floor), and `low_traffic_threshold` (active/low_traffic split). Production coverage can exceed the default 120s MCP subprocess timeout on multi-megabyte dumps; raise `FALLOW_TIMEOUT_SECS` accordingly. For general complexity / hotspot / CRAP analysis without a production dump, use `check_health` instead.",
+        annotations(read_only_hint = true, open_world_hint = true)
+    )]
+    async fn health_production_coverage(
+        &self,
+        params: Parameters<HealthProductionCoverageParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let args = build_health_production_coverage_args(&params.0);
+        run_fallow(&self.binary, &args).await
+    }
 }
 
 // ── ServerHandler ──────────────────────────────────────────────────
@@ -184,11 +197,12 @@ impl ServerHandler for FallowMcp {
                     .with_description("Codebase analysis for TypeScript/JavaScript projects"),
             )
             .with_instructions(
-                "Fallow MCP server — codebase analysis for TypeScript/JavaScript projects. \
+                "Fallow MCP server, codebase analysis for TypeScript/JavaScript projects. \
                  Tools: analyze (full analysis), check_changed (incremental/PR analysis), \
                  find_dupes (code duplication), fix_preview/fix_apply (auto-fix), \
                  project_info (plugins, files, entry points, boundary zones), \
                  check_health (code complexity metrics), \
+                 health_production_coverage (paid; merges a V8 or Istanbul production coverage dump into the health report), \
                  audit (combined dead-code + complexity + duplication for changed files, returns verdict), \
                  list_boundaries (architecture boundary zones and access rules), \
                  feature_flags (detect feature flag patterns).",

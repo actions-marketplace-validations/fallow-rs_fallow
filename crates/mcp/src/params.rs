@@ -375,6 +375,60 @@ pub struct HealthParams {
     pub min_invocations_hot: Option<u64>,
 }
 
+/// Parameters for `health_production_coverage`, the focused paid-tier
+/// production-coverage entry point. A thin wrapper around
+/// `fallow health --production-coverage <path>` with a narrow surface area
+/// so agents can pick the right tool by name and pass exactly the knobs
+/// that apply to production coverage. Requires an active license JWT
+/// (`fallow license activate --trial --email <addr>` to start a 30-day
+/// trial). Long V8 dumps can exceed the default 120s MCP subprocess
+/// timeout; raise `FALLOW_TIMEOUT_SECS` for multi-megabyte inputs.
+#[derive(Deserialize, JsonSchema)]
+pub struct HealthProductionCoverageParams {
+    /// Path to production coverage input. Accepts a V8 coverage directory
+    /// (`NODE_V8_COVERAGE=<dir>`), a single V8 coverage JSON file, or an
+    /// Istanbul `coverage-final.json`. Required.
+    pub coverage: String,
+
+    /// Root directory of the project to analyze. Defaults to current working directory.
+    pub root: Option<String>,
+
+    /// Path to fallow config file (.fallowrc.json or fallow.toml).
+    pub config: Option<String>,
+
+    /// Only analyze production code (excludes tests, stories, dev files).
+    pub production: Option<bool>,
+
+    /// Scope analysis to one or more workspaces. Accepts a single package name
+    /// for the common case, or a comma-separated list with globs and `!` negation
+    /// (e.g. `"web,admin"`, `"apps/*"`, `"apps/*,!apps/legacy"`). Patterns match
+    /// against both the package name and the workspace path relative to the repo
+    /// root. Passed through to the CLI's `--workspace` flag.
+    pub workspace: Option<String>,
+
+    /// Minimum invocation count for a function to be classified as a hot
+    /// path. Inherits the CLI default (100) when omitted.
+    pub min_invocations_hot: Option<u64>,
+
+    /// Minimum total trace volume before the sidecar may emit high-confidence
+    /// `safe_to_delete` or `review_required` verdicts. Below this threshold,
+    /// confidence is capped at `medium` to protect against overconfident
+    /// verdicts on new or low-traffic services. Inherits the sidecar default
+    /// (5000) when omitted.
+    pub min_observation_volume: Option<u32>,
+
+    /// Fraction of `trace_count` below which an invoked function is
+    /// classified `low_traffic` rather than `active`. Expressed as a
+    /// decimal (0.001 = 0.1%). Inherits the sidecar default when omitted.
+    pub low_traffic_threshold: Option<f64>,
+
+    /// Disable the incremental parse cache. Forces a full re-parse of all files.
+    pub no_cache: Option<bool>,
+
+    /// Number of parser threads. Defaults to available CPU cores.
+    pub threads: Option<usize>,
+}
+
 #[derive(Default, Deserialize, JsonSchema)]
 pub struct AuditParams {
     /// Root directory of the project to analyze. Defaults to current working directory.

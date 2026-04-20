@@ -27,7 +27,8 @@ fn all_tools_registered() {
     assert!(names.contains(&"audit".to_string()));
     assert!(names.contains(&"list_boundaries".to_string()));
     assert!(names.contains(&"feature_flags".to_string()));
-    assert_eq!(tools.len(), 10);
+    assert!(names.contains(&"health_production_coverage".to_string()));
+    assert_eq!(tools.len(), 11);
 }
 
 #[test]
@@ -44,6 +45,7 @@ fn read_only_tools_have_annotations() {
         "audit",
         "list_boundaries",
         "feature_flags",
+        "health_production_coverage",
     ];
     for tool in &tools {
         let name = tool.name.to_string();
@@ -105,6 +107,7 @@ fn open_world_hint_on_analysis_tools() {
         "audit",
         "list_boundaries",
         "feature_flags",
+        "health_production_coverage",
     ];
     for tool in &tools {
         let name = tool.name.to_string();
@@ -158,6 +161,7 @@ fn server_instructions_mention_all_tools() {
     assert!(instructions.contains("audit"));
     assert!(instructions.contains("list_boundaries"));
     assert!(instructions.contains("feature_flags"));
+    assert!(instructions.contains("health_production_coverage"));
 }
 
 #[test]
