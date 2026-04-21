@@ -26,14 +26,32 @@
 ---
 
 ```bash
-npx fallow
+npx fallow --summary
 ```
 
 ```
- Dead code   3 unused files, 12 unused exports, 2 unused deps       18ms
- Duplication 4 clone groups (2.1% of codebase)                      31ms
- Complexity  7 functions exceed thresholds                           4ms
- Total       26 issues across 847 files                             53ms
+Dead Code Summary
+
+      12  Unused files
+      47  Unused exports
+       8  Unused types
+       3  Unused dependencies
+       2  Circular dependencies
+
+      72  Total
+
+Duplication Summary
+
+      18  Clone families
+      53  Clone groups
+   2,140  Duplicated lines
+    4.2%  Duplication rate
+
+Health Summary
+
+     612  Functions analyzed
+       9  Above threshold
+    89.4  Average maintainability (good)
 ```
 
 **Static analysis is free and open source. Runtime intelligence is optional.**
