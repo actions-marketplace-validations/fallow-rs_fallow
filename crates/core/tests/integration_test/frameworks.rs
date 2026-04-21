@@ -450,10 +450,16 @@ fn nuxt_default_scan_keeps_nested_plugin_index_but_not_nested_helpers() {
         );
     }
 
-    assert!(
-        !unused_file_names.contains(&"index.ts".to_string()),
-        "nested plugin index.ts should stay reachable via Nuxt plugin scanning: {unused_file_names:?}"
-    );
+    for expected_used in [
+        "index.ts",
+        "format-shared-greeting.ts",
+        "shared-greeting.ts",
+    ] {
+        assert!(
+            !unused_file_names.contains(&expected_used.to_string()),
+            "{expected_used} should stay reachable via Nuxt default scanning: {unused_file_names:?}"
+        );
+    }
 }
 
 #[test]
