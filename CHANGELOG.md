@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.44.1] - 2026-04-21
+
+### Fixed
+
+- **Istanbul `--coverage` now matches arrow-function exports against `(anonymous_N)` entries.** Istanbul records arrow functions bound to a `const` (e.g. `export const handler = () => {...}`) as `(anonymous_0)`, while fallow extracts the binding identifier (`handler`). Neither the exact `(name, line)` match nor the name-only fuzzy match succeeded, so arrow-heavy codebases silently fell through to the estimated coverage model with `istanbul_matched: 0`, and `--max-crap` ran against estimates instead of real coverage. `IstanbulFileCoverage::lookup` now has a third fallback: when no name-based match exists and exactly one `(anonymous_N)` entry starts within ±2 lines of the requested line, use it. The single-candidate guard keeps the match unambiguous (multiple candidates return `None` rather than risk mis-attribution). Closes [#155](https://github.com/fallow-rs/fallow/issues/155).
+
 ## [2.44.0] - 2026-04-21
 
 ### Added
@@ -1523,7 +1529,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `--changed-since` and `--fail-on-issues` for CI
 - Cross-workspace resolution for npm/yarn/pnpm workspaces
 
-[Unreleased]: https://github.com/fallow-rs/fallow/compare/v2.44.0...HEAD
+[Unreleased]: https://github.com/fallow-rs/fallow/compare/v2.44.1...HEAD
+[2.44.1]: https://github.com/fallow-rs/fallow/compare/v2.44.0...v2.44.1
 [2.44.0]: https://github.com/fallow-rs/fallow/compare/v2.43.0...v2.44.0
 [2.43.0]: https://github.com/fallow-rs/fallow/compare/v2.42.0...v2.43.0
 [2.42.0]: https://github.com/fallow-rs/fallow/compare/v2.41.0...v2.42.0
