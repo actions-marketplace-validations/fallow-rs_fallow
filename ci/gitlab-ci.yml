@@ -379,6 +379,8 @@ variables:
           [ "$FALLOW_DRY_RUN" = "true" ] && ARGS+=(--dry-run) || ARGS+=(--yes)
           ;;
         "")
+          ARGS+=(--dupes-mode "$FALLOW_DUPES_MODE")
+          [ -n "$FALLOW_THRESHOLD" ]         && ARGS+=(--dupes-threshold "$FALLOW_THRESHOLD")
           [ "$FALLOW_SCORE" = "true" ]        && ARGS+=(--score)
           [ "$FALLOW_TREND" = "true" ]        && ARGS+=(--trend)
           if [ -n "$FALLOW_SAVE_SNAPSHOT" ]; then
