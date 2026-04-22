@@ -30,6 +30,8 @@ use rayon::prelude::*;
 use results::AnalysisResults;
 use trace::PipelineTimings;
 
+const UNDECLARED_WORKSPACE_WARNING_PREVIEW: usize = 5;
+
 /// Result of the full analysis pipeline, including optional performance timings.
 pub struct AnalysisOutput {
     pub results: AnalysisResults,
@@ -76,6 +78,75 @@ fn file_mtime_and_size(path: &std::path::Path) -> (u64, u64) {
             .map_or(0, |d| d.as_secs());
         (mt, m.len())
     })
+}
+
+fn format_undeclared_workspace_warning(
+    root: &Path,
+    undeclared: &[fallow_config::WorkspaceDiagnostic],
+) -> Option<String> {
+    if undeclared.is_empty() {
+        return None;
+    }
+
+    let preview = undeclared
+        .iter()
+        .take(UNDECLARED_WORKSPACE_WARNING_PREVIEW)
+        .map(|diag| {
+            diag.path
+                .strip_prefix(root)
+                .unwrap_or(&diag.path)
+                .display()
+                .to_string()
+                .replace('\\', "/")
+        })
+        .collect::<Vec<_>>();
+    let remaining = undeclared
+        .len()
+        .saturating_sub(UNDECLARED_WORKSPACE_WARNING_PREVIEW);
+    let tail = if remaining > 0 {
+        format!(" (and {remaining} more)")
+    } else {
+        String::new()
+    };
+    let noun = if undeclared.len() == 1 {
+        "directory with package.json is"
+    } else {
+        "directories with package.json are"
+    };
+    let guidance = if undeclared.len() == 1 {
+        "Add that path to package.json workspaces or pnpm-workspace.yaml if it should be analyzed as a workspace."
+    } else {
+        "Add those paths to package.json workspaces or pnpm-workspace.yaml if they should be analyzed as workspaces."
+    };
+
+    Some(format!(
+        "{} {} not declared as {}: {}{}. {}",
+        undeclared.len(),
+        noun,
+        if undeclared.len() == 1 {
+            "a workspace"
+        } else {
+            "workspaces"
+        },
+        preview.join(", "),
+        tail,
+        guidance
+    ))
+}
+
+fn warn_undeclared_workspaces(
+    root: &Path,
+    workspaces_vec: &[fallow_config::WorkspaceInfo],
+    quiet: bool,
+) {
+    if quiet {
+        return;
+    }
+
+    let undeclared = find_undeclared_workspaces(root, workspaces_vec);
+    if let Some(message) = format_undeclared_workspace_warning(root, &undeclared) {
+        tracing::warn!("{message}");
+    }
 }
 
 /// Run the full analysis pipeline.
@@ -166,12 +237,7 @@ pub fn analyze_with_parse_result(
     }
 
     // Warn about directories with package.json not declared as workspaces
-    if !config.quiet {
-        let undeclared = find_undeclared_workspaces(&config.root, &workspaces_vec);
-        for diag in &undeclared {
-            tracing::warn!("{}", diag.message);
-        }
-    }
+    warn_undeclared_workspaces(&config.root, &workspaces_vec, config.quiet);
 
     // Stage 1: Discover files (cheap — needed for file registry and resolution)
     let t = Instant::now();
@@ -365,12 +431,7 @@ fn analyze_full(
     }
 
     // Warn about directories with package.json not declared as workspaces
-    if !config.quiet {
-        let undeclared = find_undeclared_workspaces(&config.root, &workspaces_vec);
-        for diag in &undeclared {
-            tracing::warn!("{}", diag.message);
-        }
-    }
+    warn_undeclared_workspaces(&config.root, &workspaces_vec, config.quiet);
 
     // Stage 1: Discover all source files
     let t = Instant::now();
@@ -902,4 +963,55 @@ pub(crate) fn default_config(root: &Path) -> ResolvedConfig {
 
 fn num_cpus() -> usize {
     std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_undeclared_workspace_warning;
+    use std::path::{Path, PathBuf};
+
+    use fallow_config::WorkspaceDiagnostic;
+
+    fn diag(root: &Path, relative: &str) -> WorkspaceDiagnostic {
+        WorkspaceDiagnostic {
+            path: root.join(relative),
+            message: String::new(),
+        }
+    }
+
+    #[test]
+    fn undeclared_workspace_warning_is_singular_for_one_path() {
+        let root = Path::new("/repo");
+        let warning = format_undeclared_workspace_warning(root, &[diag(root, "packages/api")])
+            .expect("warning should be rendered");
+
+        assert_eq!(
+            warning,
+            "1 directory with package.json is not declared as a workspace: packages/api. Add that path to package.json workspaces or pnpm-workspace.yaml if it should be analyzed as a workspace."
+        );
+    }
+
+    #[test]
+    fn undeclared_workspace_warning_summarizes_many_paths() {
+        let root = PathBuf::from("/repo");
+        let diagnostics = [
+            "examples/a",
+            "examples/b",
+            "examples/c",
+            "examples/d",
+            "examples/e",
+            "examples/f",
+        ]
+        .into_iter()
+        .map(|path| diag(&root, path))
+        .collect::<Vec<_>>();
+
+        let warning = format_undeclared_workspace_warning(&root, &diagnostics)
+            .expect("warning should be rendered");
+
+        assert_eq!(
+            warning,
+            "6 directories with package.json are not declared as workspaces: examples/a, examples/b, examples/c, examples/d, examples/e (and 1 more). Add those paths to package.json workspaces or pnpm-workspace.yaml if they should be analyzed as workspaces."
+        );
+    }
 }

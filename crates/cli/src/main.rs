@@ -1089,25 +1089,35 @@ fn resolve_format(cli: &Cli) -> FormatConfig {
 
 // ── Tracing setup ─────────────────────────────────────────────────
 
-/// Set up tracing — use WARN level when progress spinners will be active (TTY + not quiet)
-/// to prevent tracing INFO lines from corrupting spinner output on stderr.
-/// In non-TTY (piped/CI), keep INFO level since there are no spinners to conflict with.
-/// Watch mode always uses WARN since spinners replace the per-run INFO noise.
-fn setup_tracing(quiet: bool, is_watch: bool) {
-    let stderr_is_tty = std::io::IsTerminal::is_terminal(&std::io::stderr());
-    let default_level = if quiet {
-        // Even in quiet mode, show warnings (e.g., missing meta-framework configs)
-        tracing::Level::WARN
-    } else if is_watch || stderr_is_tty {
-        tracing::Level::WARN
-    } else {
-        tracing::Level::INFO
-    };
+/// Build the tracing filter for the CLI.
+///
+/// Human output should stay clean by default, even when stderr is redirected to a
+/// file or captured by an agent. Internal INFO-level tracing is therefore opt-in
+/// via `RUST_LOG`, while warnings remain visible. An explicitly empty `RUST_LOG`
+/// disables tracing entirely, which keeps the test harness deterministic.
+fn build_tracing_filter(rust_log: Option<&str>) -> tracing_subscriber::EnvFilter {
+    use tracing_subscriber::filter::LevelFilter;
+
+    let builder = tracing_subscriber::EnvFilter::builder();
+    match rust_log.map(str::trim) {
+        Some("") => builder
+            .with_default_directive(LevelFilter::OFF.into())
+            .parse_lossy("off"),
+        Some(value) => builder
+            .with_default_directive(LevelFilter::OFF.into())
+            .parse_lossy(value),
+        None => builder
+            .with_default_directive(LevelFilter::WARN.into())
+            .parse_lossy(""),
+    }
+}
+
+/// Set up tracing for the CLI.
+fn setup_tracing() {
+    let rust_log = std::env::var("RUST_LOG").ok();
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env().add_directive(default_level.into()),
-        )
+        .with_env_filter(build_tracing_filter(rust_log.as_deref()))
         .with_target(false)
         .with_timer(tracing_subscriber::fmt::time::uptime())
         .init();
@@ -1269,10 +1279,7 @@ fn main() -> ExitCode {
     }
 
     let fmt = resolve_format(&cli);
-    setup_tracing(
-        fmt.quiet,
-        matches!(cli.command, Some(Command::Watch { .. })),
-    );
+    setup_tracing();
 
     let (root, threads) = match validate_inputs(&cli, fmt.output) {
         Ok(v) => v,
@@ -2034,5 +2041,21 @@ mod tests {
         assert!(!parse("0"));
         assert!(!parse("false"));
         assert!(!parse("yes"));
+    }
+
+    #[test]
+    fn tracing_filter_defaults_to_warn_without_env() {
+        assert_eq!(build_tracing_filter(None).to_string(), "warn");
+    }
+
+    #[test]
+    fn tracing_filter_respects_explicit_env_directives() {
+        assert_eq!(build_tracing_filter(Some("info")).to_string(), "info");
+    }
+
+    #[test]
+    fn tracing_filter_treats_empty_env_as_off() {
+        assert_eq!(build_tracing_filter(Some("")).to_string(), "off");
+        assert_eq!(build_tracing_filter(Some("   ")).to_string(), "off");
     }
 }
