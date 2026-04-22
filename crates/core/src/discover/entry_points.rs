@@ -4,11 +4,61 @@ use super::parse_scripts::extract_script_file_refs;
 use super::walk::SOURCE_EXTENSIONS;
 use fallow_config::{EntryPointRole, PackageJson, ResolvedConfig};
 use fallow_types::discover::{DiscoveredFile, EntryPoint, EntryPointSource};
+use rustc_hash::FxHashMap;
 
 /// Known output directory names from exports maps.
 /// When an entry point path is inside one of these directories, we also try
 /// the `src/` equivalent to find the tracked source file.
 const OUTPUT_DIRS: &[&str] = &["dist", "build", "out", "esm", "cjs"];
+const SKIPPED_ENTRY_WARNING_PREVIEW: usize = 5;
+
+fn format_skipped_entry_warning(skipped_entries: &FxHashMap<String, usize>) -> Option<String> {
+    if skipped_entries.is_empty() {
+        return None;
+    }
+
+    let mut entries = skipped_entries
+        .iter()
+        .map(|(path, count)| (path.as_str(), *count))
+        .collect::<Vec<_>>();
+    entries.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+
+    let preview = entries
+        .iter()
+        .take(SKIPPED_ENTRY_WARNING_PREVIEW)
+        .map(|(path, count)| {
+            if *count > 1 {
+                format!("{path} ({count}x)")
+            } else {
+                (*path).to_owned()
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let omitted = entries.len().saturating_sub(SKIPPED_ENTRY_WARNING_PREVIEW);
+    let tail = if omitted > 0 {
+        format!(" (and {omitted} more)")
+    } else {
+        String::new()
+    };
+    let total = entries.iter().map(|(_, count)| *count).sum::<usize>();
+    let noun = if total == 1 {
+        "package.json entry point"
+    } else {
+        "package.json entry points"
+    };
+
+    Some(format!(
+        "Skipped {total} {noun} outside project root or containing parent directory traversal: {}{tail}",
+        preview.join(", ")
+    ))
+}
+
+pub fn warn_skipped_entry_summary(skipped_entries: &FxHashMap<String, usize>) {
+    if let Some(message) = format_skipped_entry_warning(skipped_entries) {
+        tracing::warn!("{message}");
+    }
+}
 
 /// Entry points grouped by reachability role.
 #[derive(Debug, Clone, Default)]
@@ -80,17 +130,24 @@ fn dedup_entry_paths(entries: &mut Vec<EntryPoint>) {
     entries.dedup_by(|a, b| a.path == b.path);
 }
 
+#[derive(Debug, Default)]
+pub struct EntryPointDiscovery {
+    pub entries: Vec<EntryPoint>,
+    pub skipped_entries: FxHashMap<String, usize>,
+}
+
 /// Resolve a path relative to a base directory, with security check and extension fallback.
 ///
 /// Returns `Some(EntryPoint)` if the path resolves to an existing file within `canonical_root`,
 /// trying source extensions as fallback when the exact path doesn't exist.
 /// Also handles exports map targets in output directories (e.g., `./dist/utils.js`)
 /// by trying to map back to the source file (e.g., `./src/utils.ts`).
-pub fn resolve_entry_path(
+fn resolve_entry_path_with_tracking(
     base: &Path,
     entry: &str,
     canonical_root: &Path,
     source: EntryPointSource,
+    mut skipped_entries: Option<&mut FxHashMap<String, usize>>,
 ) -> Option<EntryPoint> {
     // Wildcard exports (e.g., `./src/themes/*.css`) can't be resolved to a single
     // file. Return None and let the caller expand them separately.
@@ -99,7 +156,11 @@ pub fn resolve_entry_path(
     }
 
     if entry_has_parent_dir(entry) {
-        tracing::warn!(path = %entry, "Skipping entry point containing parent directory traversal");
+        if let Some(skipped_entries) = skipped_entries.as_mut() {
+            *skipped_entries.entry(entry.to_owned()).or_default() += 1;
+        } else {
+            tracing::warn!(path = %entry, "Skipping entry point containing parent directory traversal");
+        }
         return None;
     }
 
@@ -110,7 +171,13 @@ pub fn resolve_entry_path(
     // We check this BEFORE the exists() check because even if the dist file exists,
     // fallow ignores dist/ by default, so we need the source file instead.
     if let Some(source_path) = try_output_to_source_path(base, entry) {
-        return validated_entry_point(&source_path, canonical_root, entry, source);
+        return validated_entry_point(
+            &source_path,
+            canonical_root,
+            entry,
+            source,
+            skipped_entries.as_deref_mut(),
+        );
     }
 
     // When the entry lives under an output directory but has no direct src/ mirror
@@ -128,18 +195,36 @@ pub fn resolve_entry_path(
             fallback = %source_path.display(),
             "package.json entry resolves to an ignored output directory; falling back to source index"
         );
-        return validated_entry_point(&source_path, canonical_root, entry, source);
+        return validated_entry_point(
+            &source_path,
+            canonical_root,
+            entry,
+            source,
+            skipped_entries.as_deref_mut(),
+        );
     }
 
     if resolved.is_file() {
-        return validated_entry_point(&resolved, canonical_root, entry, source);
+        return validated_entry_point(
+            &resolved,
+            canonical_root,
+            entry,
+            source,
+            skipped_entries.as_deref_mut(),
+        );
     }
 
     // Try with source extensions
     for ext in SOURCE_EXTENSIONS {
         let with_ext = resolved.with_extension(ext);
         if with_ext.is_file() {
-            return validated_entry_point(&with_ext, canonical_root, entry, source);
+            return validated_entry_point(
+                &with_ext,
+                canonical_root,
+                entry,
+                source,
+                skipped_entries.as_deref_mut(),
+            );
         }
     }
     None
@@ -156,6 +241,7 @@ fn validated_entry_point(
     canonical_root: &Path,
     entry: &str,
     source: EntryPointSource,
+    mut skipped_entries: Option<&mut FxHashMap<String, usize>>,
 ) -> Option<EntryPoint> {
     let canonical_candidate = match dunce::canonicalize(candidate) {
         Ok(path) => path,
@@ -171,11 +257,15 @@ fn validated_entry_point(
     };
 
     if !canonical_candidate.starts_with(canonical_root) {
-        tracing::warn!(
-            path = %candidate.display(),
-            %entry,
-            "Skipping entry point outside project root"
-        );
+        if let Some(skipped_entries) = skipped_entries.as_mut() {
+            *skipped_entries.entry(entry.to_owned()).or_default() += 1;
+        } else {
+            tracing::warn!(
+                path = %candidate.display(),
+                %entry,
+                "Skipping entry point outside project root"
+            );
+        }
         return None;
     }
 
@@ -185,6 +275,14 @@ fn validated_entry_point(
     })
 }
 
+pub fn resolve_entry_path(
+    base: &Path,
+    entry: &str,
+    canonical_root: &Path,
+    source: EntryPointSource,
+) -> Option<EntryPoint> {
+    resolve_entry_path_with_tracking(base, entry, canonical_root, source, None)
+}
 /// Try to map an entry path from an output directory to its source equivalent.
 ///
 /// Given `base=/project/packages/ui` and `entry=./dist/utils.js`, this tries:
@@ -315,9 +413,12 @@ fn apply_default_fallback(
 }
 
 /// Discover entry points from package.json, framework rules, and defaults.
-pub fn discover_entry_points(config: &ResolvedConfig, files: &[DiscoveredFile]) -> Vec<EntryPoint> {
+pub fn discover_entry_points_with_warnings(
+    config: &ResolvedConfig,
+    files: &[DiscoveredFile],
+) -> EntryPointDiscovery {
     let _span = tracing::info_span!("discover_entry_points").entered();
-    let mut entries = Vec::new();
+    let mut discovery = EntryPointDiscovery::default();
 
     // Pre-compute relative paths for all files (once, not per pattern)
     let relative_paths: Vec<String> = files
@@ -345,7 +446,7 @@ pub fn discover_entry_points(config: &ResolvedConfig, files: &[DiscoveredFile]) 
         {
             for (idx, rel) in relative_paths.iter().enumerate() {
                 if glob_set.is_match(rel) {
-                    entries.push(EntryPoint {
+                    discovery.entries.push(EntryPoint {
                         path: files[idx].path.clone(),
                         source: EntryPointSource::ManualEntry,
                     });
@@ -361,13 +462,14 @@ pub fn discover_entry_points(config: &ResolvedConfig, files: &[DiscoveredFile]) 
     let root_pkg = PackageJson::load(&pkg_path).ok();
     if let Some(pkg) = &root_pkg {
         for entry_path in pkg.entry_points() {
-            if let Some(ep) = resolve_entry_path(
+            if let Some(ep) = resolve_entry_path_with_tracking(
                 &config.root,
                 &entry_path,
                 &canonical_root,
                 EntryPointSource::PackageJsonMain,
+                Some(&mut discovery.skipped_entries),
             ) {
-                entries.push(ep);
+                discovery.entries.push(ep);
             }
         }
 
@@ -375,13 +477,14 @@ pub fn discover_entry_points(config: &ResolvedConfig, files: &[DiscoveredFile]) 
         if let Some(scripts) = &pkg.scripts {
             for script_value in scripts.values() {
                 for file_ref in extract_script_file_refs(script_value) {
-                    if let Some(ep) = resolve_entry_path(
+                    if let Some(ep) = resolve_entry_path_with_tracking(
                         &config.root,
                         &file_ref,
                         &canonical_root,
                         EntryPointSource::PackageJsonScript,
+                        Some(&mut discovery.skipped_entries),
                     ) {
-                        entries.push(ep);
+                        discovery.entries.push(ep);
                     }
                 }
             }
@@ -399,21 +502,28 @@ pub fn discover_entry_points(config: &ResolvedConfig, files: &[DiscoveredFile]) 
     discover_nested_package_entries(
         &config.root,
         files,
-        &mut entries,
+        &mut discovery.entries,
         &canonical_root,
         &exports_dirs,
+        &mut discovery.skipped_entries,
     );
 
     // 5. Default index files (if no other entries found)
-    if entries.is_empty() {
-        entries = apply_default_fallback(files, &config.root, None);
+    if discovery.entries.is_empty() {
+        discovery.entries = apply_default_fallback(files, &config.root, None);
     }
 
     // Deduplicate by path
-    entries.sort_by(|a, b| a.path.cmp(&b.path));
-    entries.dedup_by(|a, b| a.path == b.path);
+    discovery.entries.sort_by(|a, b| a.path.cmp(&b.path));
+    discovery.entries.dedup_by(|a, b| a.path == b.path);
 
-    entries
+    discovery
+}
+
+pub fn discover_entry_points(config: &ResolvedConfig, files: &[DiscoveredFile]) -> Vec<EntryPoint> {
+    let discovery = discover_entry_points_with_warnings(config, files);
+    warn_skipped_entry_summary(&discovery.skipped_entries);
+    discovery.entries
 }
 
 /// Discover entry points from nested package.json files in subdirectories.
@@ -431,6 +541,7 @@ fn discover_nested_package_entries(
     entries: &mut Vec<EntryPoint>,
     canonical_root: &Path,
     exports_subdirectories: &[String],
+    skipped_entries: &mut FxHashMap<String, usize>,
 ) {
     let mut visited = rustc_hash::FxHashSet::default();
 
@@ -449,7 +560,7 @@ fn discover_nested_package_entries(
         for entry in read_dir.flatten() {
             let pkg_dir = entry.path();
             if visited.insert(pkg_dir.clone()) {
-                collect_nested_package_entries(&pkg_dir, entries, canonical_root);
+                collect_nested_package_entries(&pkg_dir, entries, canonical_root, skipped_entries);
             }
         }
     }
@@ -458,7 +569,7 @@ fn discover_nested_package_entries(
     for dir_name in exports_subdirectories {
         let pkg_dir = root.join(dir_name);
         if pkg_dir.is_dir() && visited.insert(pkg_dir.clone()) {
-            collect_nested_package_entries(&pkg_dir, entries, canonical_root);
+            collect_nested_package_entries(&pkg_dir, entries, canonical_root, skipped_entries);
         }
     }
 }
@@ -468,6 +579,7 @@ fn collect_nested_package_entries(
     pkg_dir: &Path,
     entries: &mut Vec<EntryPoint>,
     canonical_root: &Path,
+    skipped_entries: &mut FxHashMap<String, usize>,
 ) {
     let pkg_path = pkg_dir.join("package.json");
     if !pkg_path.exists() {
@@ -479,11 +591,12 @@ fn collect_nested_package_entries(
     for entry_path in pkg.entry_points() {
         if entry_path.contains('*') {
             expand_wildcard_entries(pkg_dir, &entry_path, canonical_root, entries);
-        } else if let Some(ep) = resolve_entry_path(
+        } else if let Some(ep) = resolve_entry_path_with_tracking(
             pkg_dir,
             &entry_path,
             canonical_root,
             EntryPointSource::PackageJsonExports,
+            Some(&mut *skipped_entries),
         ) {
             entries.push(ep);
         }
@@ -491,11 +604,12 @@ fn collect_nested_package_entries(
     if let Some(scripts) = &pkg.scripts {
         for script_value in scripts.values() {
             for file_ref in extract_script_file_refs(script_value) {
-                if let Some(ep) = resolve_entry_path(
+                if let Some(ep) = resolve_entry_path_with_tracking(
                     pkg_dir,
                     &file_ref,
                     canonical_root,
                     EntryPointSource::PackageJsonScript,
+                    Some(&mut *skipped_entries),
                 ) {
                     entries.push(ep);
                 }
@@ -536,12 +650,12 @@ fn expand_wildcard_entries(
 
 /// Discover entry points for a workspace package.
 #[must_use]
-pub fn discover_workspace_entry_points(
+pub fn discover_workspace_entry_points_with_warnings(
     ws_root: &Path,
     _config: &ResolvedConfig,
     all_files: &[DiscoveredFile],
-) -> Vec<EntryPoint> {
-    let mut entries = Vec::new();
+) -> EntryPointDiscovery {
+    let mut discovery = EntryPointDiscovery::default();
 
     let pkg_path = ws_root.join("package.json");
     if let Ok(pkg) = PackageJson::load(&pkg_path) {
@@ -549,14 +663,20 @@ pub fn discover_workspace_entry_points(
             dunce::canonicalize(ws_root).unwrap_or_else(|_| ws_root.to_path_buf());
         for entry_path in pkg.entry_points() {
             if entry_path.contains('*') {
-                expand_wildcard_entries(ws_root, &entry_path, &canonical_ws_root, &mut entries);
-            } else if let Some(ep) = resolve_entry_path(
+                expand_wildcard_entries(
+                    ws_root,
+                    &entry_path,
+                    &canonical_ws_root,
+                    &mut discovery.entries,
+                );
+            } else if let Some(ep) = resolve_entry_path_with_tracking(
                 ws_root,
                 &entry_path,
                 &canonical_ws_root,
                 EntryPointSource::PackageJsonMain,
+                Some(&mut discovery.skipped_entries),
             ) {
-                entries.push(ep);
+                discovery.entries.push(ep);
             }
         }
 
@@ -564,13 +684,14 @@ pub fn discover_workspace_entry_points(
         if let Some(scripts) = &pkg.scripts {
             for script_value in scripts.values() {
                 for file_ref in extract_script_file_refs(script_value) {
-                    if let Some(ep) = resolve_entry_path(
+                    if let Some(ep) = resolve_entry_path_with_tracking(
                         ws_root,
                         &file_ref,
                         &canonical_ws_root,
                         EntryPointSource::PackageJsonScript,
+                        Some(&mut discovery.skipped_entries),
                     ) {
-                        entries.push(ep);
+                        discovery.entries.push(ep);
                     }
                 }
             }
@@ -580,13 +701,24 @@ pub fn discover_workspace_entry_points(
     }
 
     // Fall back to default index files if no entry points found for this workspace
-    if entries.is_empty() {
-        entries = apply_default_fallback(all_files, ws_root, Some(ws_root));
+    if discovery.entries.is_empty() {
+        discovery.entries = apply_default_fallback(all_files, ws_root, Some(ws_root));
     }
 
-    entries.sort_by(|a, b| a.path.cmp(&b.path));
-    entries.dedup_by(|a, b| a.path == b.path);
-    entries
+    discovery.entries.sort_by(|a, b| a.path.cmp(&b.path));
+    discovery.entries.dedup_by(|a, b| a.path == b.path);
+    discovery
+}
+
+#[must_use]
+pub fn discover_workspace_entry_points(
+    ws_root: &Path,
+    config: &ResolvedConfig,
+    all_files: &[DiscoveredFile],
+) -> Vec<EntryPoint> {
+    let discovery = discover_workspace_entry_points_with_warnings(ws_root, config, all_files);
+    warn_skipped_entry_summary(&discovery.skipped_entries);
+    discovery.entries
 }
 
 /// Discover entry points from plugin results (dynamic config parsing).
@@ -1242,6 +1374,42 @@ mod tests {
             assert!(
                 matches!(result.unwrap().source, EntryPointSource::PackageJsonScript),
                 "should preserve the source kind"
+            );
+        }
+        #[test]
+        fn tracks_skipped_entries_without_logging_each_repeat() {
+            let dir = tempfile::tempdir().expect("create temp dir");
+            let canonical = dunce::canonicalize(dir.path()).unwrap();
+            let mut skipped_entries = FxHashMap::default();
+
+            let result = resolve_entry_path_with_tracking(
+                dir.path(),
+                "../scripts/build.js",
+                &canonical,
+                EntryPointSource::PackageJsonScript,
+                Some(&mut skipped_entries),
+            );
+
+            assert!(result.is_none(), "unsafe entry should be skipped");
+            assert_eq!(
+                skipped_entries.get("../scripts/build.js"),
+                Some(&1),
+                "warning tracker should count the skipped path"
+            );
+        }
+
+        #[test]
+        fn formats_skipped_entry_warning_with_counts() {
+            let mut skipped_entries = FxHashMap::default();
+            skipped_entries.insert("../../scripts/rm.mjs".to_owned(), 8);
+            skipped_entries.insert("../utils/bar.js".to_owned(), 2);
+
+            let warning =
+                format_skipped_entry_warning(&skipped_entries).expect("warning should be rendered");
+
+            assert_eq!(
+                warning,
+                "Skipped 10 package.json entry points outside project root or containing parent directory traversal: ../../scripts/rm.mjs (8x), ../utils/bar.js (2x)"
             );
         }
 

@@ -12,6 +12,10 @@ pub use entry_points::{
     discover_entry_points, discover_plugin_entry_point_sets, discover_plugin_entry_points,
     discover_workspace_entry_points,
 };
+pub(crate) use entry_points::{
+    EntryPointDiscovery, discover_entry_points_with_warnings,
+    discover_workspace_entry_points_with_warnings, warn_skipped_entry_summary,
+};
 pub use infrastructure::discover_infrastructure_entry_points;
 pub use walk::{PRODUCTION_EXCLUDE_PATTERNS, SOURCE_EXTENSIONS, discover_files};
 

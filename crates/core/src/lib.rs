@@ -726,12 +726,25 @@ fn discover_all_entry_points(
     plugin_result: &plugins::AggregatedPluginResult,
 ) -> discover::CategorizedEntryPoints {
     let mut entry_points = discover::CategorizedEntryPoints::default();
-    entry_points.extend_runtime(discover::discover_entry_points(config, files));
+    let root_discovery = discover::discover_entry_points_with_warnings(config, files);
 
-    let ws_entries: Vec<_> = workspaces
+    let workspace_discovery: Vec<discover::EntryPointDiscovery> = workspaces
         .par_iter()
-        .flat_map(|ws| discover::discover_workspace_entry_points(&ws.root, config, files))
+        .map(|ws| discover::discover_workspace_entry_points_with_warnings(&ws.root, config, files))
         .collect();
+    let mut skipped_entries = rustc_hash::FxHashMap::default();
+    entry_points.extend_runtime(root_discovery.entries);
+    for (path, count) in root_discovery.skipped_entries {
+        *skipped_entries.entry(path).or_insert(0) += count;
+    }
+    let mut ws_entries = Vec::new();
+    for workspace in workspace_discovery {
+        ws_entries.extend(workspace.entries);
+        for (path, count) in workspace.skipped_entries {
+            *skipped_entries.entry(path).or_insert(0) += count;
+        }
+    }
+    discover::warn_skipped_entry_summary(&skipped_entries);
     entry_points.extend_runtime(ws_entries);
 
     let plugin_entries = discover::discover_plugin_entry_point_sets(plugin_result, config, files);
