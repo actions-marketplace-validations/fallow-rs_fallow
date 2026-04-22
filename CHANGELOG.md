@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.45.0] - 2026-04-22
+
+### Added
+
+- **Static inventory extractor (`fallow-extract`).** New extraction phase that produces a per-file list of exported functions keyed by `(path, name, line)`. Feeds the line-aware production-coverage matcher so runtime samples can be joined against the AST view of "every function that exists" without collisions on overloaded names.
+- **`fallow coverage upload-inventory`.** Uploads the static function inventory to fallow cloud so the Production Coverage dashboard can filter `untracked` functions (the AST side of the join: functions that exist in the code but were never observed at runtime). Requires a valid license. See <https://fallow.tools/coverage>.
+
+### Fixed
+
+- **External CSS packages imported from Vue SFC `<style>` blocks are credited as used.** CSS-only design-system packages imported only through `<style src="pkg/dist/style.css">` or an `@import "pkg/..."` inside a Vue SFC `<style>` block used to be reported as `unused-dependencies` because the Vue plugin only walked script imports. A new external-style scanner now recognizes style-side package imports declared in `.vue` SFCs and credits the npm package, eliminating the false positive for Vue + Vite design-system codebases.
+- **`compilerOptions.paths` aliases in `tsconfig.json` are honored.** Path aliases like `"@/*": ["src/*"]` declared in `compilerOptions.paths` are now extracted by the TypeScript plugin and registered as resolver path aliases, so `@/foo` imports resolve to `src/foo` in projects that rely on alias-only paths without a matching `vite.config` / `webpack.config` rewrite.
+- **`tsconfig.references` entries pointing at a `.json` file directly are followed.** References of the form `{ "path": "./tsconfig.app.json" }` are now resolved to the literal file rather than getting `tsconfig.json` concatenated onto them, fixing reference-chain walking for the common "one tsconfig per build" pattern.
+- **Coverage inventory upload aligned with line-aware function identity.** `fallow coverage upload-inventory` now emits records keyed by `(file, name, line)` to match the line-aware sidecar protocol introduced alongside v2.44.x, replacing the older line-less identity that could collide on overloaded / re-declared names. Upload integration hardened against CI-only path normalization regressions that surfaced on Linux runners.
+
 ## [2.44.2] - 2026-04-21
 
 ### Fixed
@@ -1537,7 +1551,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `--changed-since` and `--fail-on-issues` for CI
 - Cross-workspace resolution for npm/yarn/pnpm workspaces
 
-[Unreleased]: https://github.com/fallow-rs/fallow/compare/v2.44.2...HEAD
+[Unreleased]: https://github.com/fallow-rs/fallow/compare/v2.45.0...HEAD
+[2.45.0]: https://github.com/fallow-rs/fallow/compare/v2.44.2...v2.45.0
 [2.44.2]: https://github.com/fallow-rs/fallow/compare/v2.44.1...v2.44.2
 [2.44.1]: https://github.com/fallow-rs/fallow/compare/v2.44.0...v2.44.1
 [2.44.0]: https://github.com/fallow-rs/fallow/compare/v2.43.0...v2.44.0
