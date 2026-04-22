@@ -54,13 +54,22 @@ pub(super) fn mark_all_exports_referenced(
     kind: ReferenceKind,
 ) {
     for export in exports {
-        if export.references.iter().all(|r| r.from_file != source_id) {
-            export.references.push(SymbolReference {
-                from_file: source_id,
-                kind,
-                import_span,
-            });
-        }
+        attach_reference(export, source_id, kind, import_span);
+    }
+}
+
+fn attach_reference(
+    export: &mut ExportSymbol,
+    source_id: FileId,
+    kind: ReferenceKind,
+    import_span: oxc_span::Span,
+) {
+    if export.references.iter().all(|r| r.from_file != source_id) {
+        export.references.push(SymbolReference {
+            from_file: source_id,
+            kind,
+            import_span,
+        });
     }
 }
 
@@ -83,13 +92,7 @@ pub(super) fn mark_member_exports_referenced(
         };
         if member_set.contains(name_str) {
             found_members.insert(name_str.to_owned());
-            if export.references.iter().all(|r| r.from_file != source_id) {
-                export.references.push(SymbolReference {
-                    from_file: source_id,
-                    kind,
-                    import_span,
-                });
-            }
+            attach_reference(export, source_id, kind, import_span);
         }
     }
     found_members
@@ -251,6 +254,120 @@ pub(super) const fn reference_kind_for(imported_name: &ImportedName) -> Referenc
     }
 }
 
+fn import_binding_has_type_usage(source_mod: Option<&&ResolvedModule>, local_name: &str) -> bool {
+    !local_name.is_empty()
+        && source_mod.is_some_and(|m| {
+            m.type_referenced_import_bindings
+                .iter()
+                .any(|binding| binding == local_name)
+        })
+}
+
+fn import_binding_has_value_usage(source_mod: Option<&&ResolvedModule>, local_name: &str) -> bool {
+    !local_name.is_empty()
+        && source_mod.is_some_and(|m| {
+            m.value_referenced_import_bindings
+                .iter()
+                .any(|binding| binding == local_name)
+        })
+}
+
+fn attach_direct_export_references(
+    target_module: &mut ModuleNode,
+    source_id: FileId,
+    sym: &ImportedSymbol,
+    source_mod: Option<&&ResolvedModule>,
+    ref_kind: ReferenceKind,
+) {
+    let matching_exports: Vec<usize> = target_module
+        .exports
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, export)| export_matches(&export.name, &sym.imported_name).then_some(idx))
+        .collect();
+
+    if matching_exports.is_empty() {
+        return;
+    }
+
+    let type_exports: Vec<usize> = matching_exports
+        .iter()
+        .copied()
+        .filter(|idx| target_module.exports[*idx].is_type_only)
+        .collect();
+    let value_exports: Vec<usize> = matching_exports
+        .iter()
+        .copied()
+        .filter(|idx| !target_module.exports[*idx].is_type_only)
+        .collect();
+
+    let has_type_usage = import_binding_has_type_usage(source_mod, &sym.local_name);
+    let has_value_usage = import_binding_has_value_usage(source_mod, &sym.local_name);
+
+    let attach_type_exports = if type_exports.is_empty() {
+        false
+    } else if value_exports.is_empty() || sym.is_type_only {
+        true
+    } else {
+        has_type_usage
+    };
+
+    let attach_value_exports = if value_exports.is_empty() {
+        false
+    } else if type_exports.is_empty() {
+        true
+    } else {
+        has_value_usage
+    };
+
+    if attach_type_exports || attach_value_exports {
+        for idx in &type_exports {
+            if attach_type_exports {
+                attach_reference(
+                    &mut target_module.exports[*idx],
+                    source_id,
+                    ref_kind,
+                    sym.import_span,
+                );
+            }
+        }
+        for idx in &value_exports {
+            if attach_value_exports {
+                attach_reference(
+                    &mut target_module.exports[*idx],
+                    source_id,
+                    ref_kind,
+                    sym.import_span,
+                );
+            }
+        }
+        return;
+    }
+
+    // No usage split available. Preserve the old behavior as a fallback, but
+    // bias `import type` toward type exports when both namespaces exist.
+    let fallback_idx = if sym.is_type_only {
+        type_exports
+            .first()
+            .copied()
+            .or_else(|| value_exports.first().copied())
+    } else {
+        value_exports
+            .first()
+            .copied()
+            .or_else(|| type_exports.first().copied())
+    };
+
+    if let Some(idx) = fallback_idx {
+        attach_reference(
+            &mut target_module.exports[idx],
+            source_id,
+            ref_kind,
+            sym.import_span,
+        );
+    }
+}
+
 /// Process a single imported symbol, attaching references to the target module's exports.
 ///
 /// Handles: direct export matching, namespace import narrowing, and CSS module narrowing.
@@ -262,28 +379,14 @@ pub(super) fn attach_symbol_reference(
     entry_point_ids: &FxHashSet<FileId>,
 ) {
     let ref_kind = reference_kind_for(&sym.imported_name);
+    let source_mod = module_by_id.get(&source_id);
 
     // Skip references for import bindings that are never used in the importing file.
-    if is_unused_import_binding(
-        &sym.local_name,
-        &sym.imported_name,
-        module_by_id.get(&source_id),
-    ) {
+    if is_unused_import_binding(&sym.local_name, &sym.imported_name, source_mod) {
         return;
     }
 
-    // Match to specific export
-    if let Some(export) = target_module
-        .exports
-        .iter_mut()
-        .find(|e| export_matches(&e.name, &sym.imported_name))
-    {
-        export.references.push(SymbolReference {
-            from_file: source_id,
-            kind: ref_kind,
-            import_span: sym.import_span,
-        });
-    }
+    attach_direct_export_references(target_module, source_id, sym, source_mod, ref_kind);
 
     // Namespace imports: narrow to specific member accesses when possible,
     // otherwise conservatively mark all exports as used.
@@ -340,6 +443,8 @@ mod tests {
         let resolved = ResolvedModule {
             path: std::path::PathBuf::from("/project/entry.ts"),
             unused_import_bindings: FxHashSet::from_iter(["unusedVar".to_string()]),
+            type_referenced_import_bindings: vec![],
+            value_referenced_import_bindings: vec![],
             ..Default::default()
         };
         assert!(is_unused_import_binding(
@@ -354,6 +459,8 @@ mod tests {
         let resolved = ResolvedModule {
             path: std::path::PathBuf::from("/project/entry.ts"),
             unused_import_bindings: FxHashSet::from_iter(["otherVar".to_string()]),
+            type_referenced_import_bindings: vec![],
+            value_referenced_import_bindings: vec![],
             ..Default::default()
         };
         assert!(!is_unused_import_binding(
@@ -368,6 +475,8 @@ mod tests {
         let resolved = ResolvedModule {
             path: std::path::PathBuf::from("/project/entry.ts"),
             unused_import_bindings: FxHashSet::from_iter(["x".to_string()]),
+            type_referenced_import_bindings: vec![],
+            value_referenced_import_bindings: vec![],
             ..Default::default()
         };
         // SideEffect imports are never "unused bindings"
@@ -690,6 +799,8 @@ mod tests {
                     target: ResolveResult::InternalModule(FileId(1)),
                 }],
                 unused_import_bindings: FxHashSet::from_iter(["foo".to_string()]),
+                type_referenced_import_bindings: vec![],
+                value_referenced_import_bindings: vec![],
                 ..Default::default()
             },
             ResolvedModule {

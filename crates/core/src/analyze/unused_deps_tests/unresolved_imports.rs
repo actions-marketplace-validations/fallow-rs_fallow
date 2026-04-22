@@ -26,6 +26,8 @@ fn unresolved_import_detected() {
         whole_object_uses: vec![],
         has_cjs_exports: false,
         unused_import_bindings: FxHashSet::default(),
+        type_referenced_import_bindings: vec![],
+        value_referenced_import_bindings: vec![],
     }];
 
     let config = test_config(PathBuf::from("/project"));
@@ -69,6 +71,8 @@ fn unresolved_virtual_module_not_reported() {
         whole_object_uses: vec![],
         has_cjs_exports: false,
         unused_import_bindings: FxHashSet::default(),
+        type_referenced_import_bindings: vec![],
+        value_referenced_import_bindings: vec![],
     }];
 
     let config = test_config(PathBuf::from("/project"));
@@ -114,6 +118,8 @@ fn unresolved_import_with_virtual_prefix_not_reported() {
         whole_object_uses: vec![],
         has_cjs_exports: false,
         unused_import_bindings: FxHashSet::default(),
+        type_referenced_import_bindings: vec![],
+        value_referenced_import_bindings: vec![],
     }];
 
     let config = test_config(PathBuf::from("/project"));
@@ -183,6 +189,8 @@ fn unresolved_import_suppressed_by_generated_import_pattern() {
         whole_object_uses: vec![],
         has_cjs_exports: false,
         unused_import_bindings: FxHashSet::default(),
+        type_referenced_import_bindings: vec![],
+        value_referenced_import_bindings: vec![],
     }];
 
     let config = test_config(PathBuf::from("/project"));
@@ -228,6 +236,8 @@ fn unresolved_import_suppressed_by_inline_comment() {
         whole_object_uses: vec![],
         has_cjs_exports: false,
         unused_import_bindings: FxHashSet::default(),
+        type_referenced_import_bindings: vec![],
+        value_referenced_import_bindings: vec![],
     }];
 
     let config = test_config(PathBuf::from("/project"));
@@ -281,6 +291,8 @@ fn unresolved_import_file_level_suppression() {
         whole_object_uses: vec![],
         has_cjs_exports: false,
         unused_import_bindings: FxHashSet::default(),
+        type_referenced_import_bindings: vec![],
+        value_referenced_import_bindings: vec![],
     }];
 
     let config = test_config(PathBuf::from("/project"));
@@ -347,6 +359,8 @@ fn resolved_import_not_reported_as_unresolved() {
         whole_object_uses: vec![],
         has_cjs_exports: false,
         unused_import_bindings: FxHashSet::default(),
+        type_referenced_import_bindings: vec![],
+        value_referenced_import_bindings: vec![],
     }];
 
     let config = test_config(PathBuf::from("/project"));
@@ -418,6 +432,8 @@ fn unresolved_import_not_suppressed_by_wrong_kind() {
         whole_object_uses: vec![],
         has_cjs_exports: false,
         unused_import_bindings: FxHashSet::default(),
+        type_referenced_import_bindings: vec![],
+        value_referenced_import_bindings: vec![],
     }];
 
     let config = test_config(PathBuf::from("/project"));

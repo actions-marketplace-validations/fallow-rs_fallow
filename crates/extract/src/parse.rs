@@ -31,7 +31,7 @@ pub fn parse_source_to_module(
     need_complexity: bool,
 ) -> ModuleInfo {
     if is_sfc_file(path) {
-        return parse_sfc_to_module(file_id, path, source, content_hash);
+        return parse_sfc_to_module(file_id, path, source, content_hash, need_complexity);
     }
     if is_astro_file(path) {
         return parse_astro_to_module(file_id, source, content_hash);
@@ -59,9 +59,10 @@ pub fn parse_source_to_module(
     let mut extractor = ModuleInfoExtractor::new();
     extractor.visit_program(&parser_return.program);
 
-    // Detect unused import bindings via oxc_semantic scope analysis
-    let mut unused_bindings =
-        compute_unused_import_bindings(&parser_return.program, &extractor.imports);
+    // Track unused imports plus whether each binding is referenced as a type,
+    // a runtime value, or both.
+    let mut import_binding_usage =
+        compute_import_binding_usage(&parser_return.program, &extractor.imports);
 
     // Line offsets are always needed (error location reporting in analysis).
     let line_offsets = fallow_types::extract::compute_line_offsets(source);
@@ -103,8 +104,8 @@ pub fn parse_source_to_module(
             + retry_extractor.imports.len()
             + retry_extractor.re_exports.len();
         if retry_total > total_extracted {
-            unused_bindings =
-                compute_unused_import_bindings(&retry_return.program, &retry_extractor.imports);
+            import_binding_usage =
+                compute_import_binding_usage(&retry_return.program, &retry_extractor.imports);
             // Recompute complexity from the successful retry parse (only if requested)
             if need_complexity {
                 complexity =
@@ -148,7 +149,9 @@ pub fn parse_source_to_module(
     }
 
     let mut info = extractor.into_module_info(file_id, content_hash, suppressions);
-    info.unused_import_bindings = unused_bindings;
+    info.unused_import_bindings = import_binding_usage.unused;
+    info.type_referenced_import_bindings = import_binding_usage.type_referenced;
+    info.value_referenced_import_bindings = import_binding_usage.value_referenced;
     info.line_offsets = line_offsets;
     info.complexity = complexity;
     info.flag_uses = flag_uses;
@@ -441,7 +444,14 @@ fn has_public_tag(comment_text: &str) -> bool {
     false
 }
 
-/// Use `oxc_semantic` to find import bindings that are never referenced in the file.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ImportBindingUsage {
+    pub unused: Vec<String>,
+    pub type_referenced: Vec<String>,
+    pub value_referenced: Vec<String>,
+}
+
+/// Use `oxc_semantic` to summarize how import bindings are referenced in the file.
 ///
 /// An import like `import { foo } from './utils'` where `foo` is never used
 /// anywhere in the file should not count as a reference to the `foo` export.
@@ -451,15 +461,16 @@ fn has_public_tag(comment_text: &str) -> bool {
 /// references. A value import used only as a type annotation (`const x: Foo`)
 /// will have a type-position reference and will NOT appear in the unused list.
 /// This is correct: `import { Foo }` (without `type`) may be needed at runtime.
-pub fn compute_unused_import_bindings(
+pub fn compute_import_binding_usage(
     program: &Program<'_>,
     imports: &[ImportInfo],
-) -> Vec<String> {
+) -> ImportBindingUsage {
     use oxc_semantic::SemanticBuilder;
+    use rustc_hash::FxHashSet;
 
     // Skip files with no imports
     if imports.is_empty() {
-        return Vec::new();
+        return ImportBindingUsage::default();
     }
 
     let semantic_ret = SemanticBuilder::new().build(program);
@@ -468,6 +479,8 @@ pub fn compute_unused_import_bindings(
     let root_scope = scoping.root_scope_id();
 
     let mut unused = Vec::new();
+    let mut type_referenced_bindings: FxHashSet<String> = FxHashSet::default();
+    let mut value_referenced_bindings: FxHashSet<String> = FxHashSet::default();
     for import in imports {
         // Side-effect imports have no binding
         if import.local_name.is_empty() {
@@ -475,13 +488,45 @@ pub fn compute_unused_import_bindings(
         }
         // Look up the import binding in the module scope
         let name = oxc_str::Ident::from(import.local_name.as_str());
-        if let Some(symbol_id) = scoping.get_binding(root_scope, name)
-            && scoping.get_resolved_references(symbol_id).count() == 0
-        {
-            unused.push(import.local_name.clone());
+        if let Some(symbol_id) = scoping.get_binding(root_scope, name) {
+            let mut has_references = false;
+            let mut has_type_references = false;
+            let mut has_value_references = false;
+
+            for reference in scoping.get_resolved_references(symbol_id) {
+                has_references = true;
+                has_type_references |= reference.is_type();
+                has_value_references |= reference.is_value();
+            }
+
+            if !has_references {
+                unused.push(import.local_name.clone());
+                continue;
+            }
+
+            if has_type_references {
+                type_referenced_bindings.insert(import.local_name.clone());
+            }
+            if has_value_references {
+                value_referenced_bindings.insert(import.local_name.clone());
+            }
         }
     }
-    unused
+
+    unused.sort_unstable();
+
+    let mut type_referenced_bindings: Vec<String> = type_referenced_bindings.into_iter().collect();
+    type_referenced_bindings.sort_unstable();
+
+    let mut value_referenced_bindings: Vec<String> =
+        value_referenced_bindings.into_iter().collect();
+    value_referenced_bindings.sort_unstable();
+
+    ImportBindingUsage {
+        unused,
+        type_referenced: type_referenced_bindings,
+        value_referenced: value_referenced_bindings,
+    }
 }
 
 #[cfg(test)]

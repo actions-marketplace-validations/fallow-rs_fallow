@@ -198,6 +198,8 @@ impl ModuleInfoExtractor {
             content_hash,
             suppressions,
             unused_import_bindings: Vec::new(),
+            type_referenced_import_bindings: Vec::new(),
+            value_referenced_import_bindings: Vec::new(),
             line_offsets: Vec::new(),
             complexity: Vec::new(),
             flag_uses: Vec::new(),

@@ -162,3 +162,38 @@ fn scss_bare_specifiers_resolve_from_node_modules() {
         "animate.css imported via SCSS must not be reported as unused: {unused_dep_names:?}"
     );
 }
+
+#[test]
+fn external_package_scss_subpaths_credit_nested_style_dependencies() {
+    // Real-world styleguide packages often expose raw SCSS entrypoints from
+    // node_modules. When the consumer imports that SCSS, nested imports like
+    // `bootstrap/scss/functions` and `/node_modules/@vuepic/vue-datepicker/dist/main`
+    // are build-time requirements of the app even though they live inside the
+    // external package source tree.
+    let root = fixture_path("external-style-package-deps");
+    let config = create_config(root);
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+
+    let unused_dep_names: Vec<&str> = results
+        .unused_dependencies
+        .iter()
+        .map(|d| d.package_name.as_str())
+        .collect();
+
+    assert!(
+        !unused_dep_names.contains(&"@acme/style-lib"),
+        "external SCSS entrypoint owner package must be treated as used: {unused_dep_names:?}"
+    );
+    assert!(
+        !unused_dep_names.contains(&"bootstrap"),
+        "bootstrap imported inside external SCSS must not be reported as unused: {unused_dep_names:?}"
+    );
+    assert!(
+        !unused_dep_names.contains(&"@vuepic/vue-datepicker"),
+        "@vuepic/vue-datepicker imported via external SCSS must not be reported as unused: {unused_dep_names:?}"
+    );
+    assert!(
+        unused_dep_names.contains(&"unused-package"),
+        "real unused dependencies should still be reported: {unused_dep_names:?}"
+    );
+}

@@ -134,3 +134,50 @@ fn non_production_mode_includes_test_files() {
         "test-only.ts should be detected as unused in non-production mode, found: {unused_file_names:?}"
     );
 }
+
+#[test]
+fn production_mode_still_parses_vite_config_aliases() {
+    let root = fixture_path("vite-alias-project");
+    let config = create_production_config(root);
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+
+    let unresolved_specs: Vec<&str> = results
+        .unresolved_imports
+        .iter()
+        .map(|u| u.specifier.as_str())
+        .collect();
+
+    assert!(
+        unresolved_specs.is_empty(),
+        "vite.config.ts aliases should still resolve in production mode: {unresolved_specs:?}"
+    );
+}
+
+#[test]
+fn production_mode_resolves_solution_style_tsconfig_paths() {
+    let root = fixture_path("vite-solution-tsconfig-paths");
+    let config = create_production_config(root);
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+
+    let unresolved_specs: Vec<&str> = results
+        .unresolved_imports
+        .iter()
+        .map(|u| u.specifier.as_str())
+        .collect();
+
+    assert!(
+        unresolved_specs.is_empty(),
+        "solution-style tsconfig references should still provide path aliases in production mode: {unresolved_specs:?}"
+    );
+
+    let unused_file_names: Vec<String> = results
+        .unused_files
+        .iter()
+        .map(|f| f.path.file_name().unwrap().to_string_lossy().to_string())
+        .collect();
+
+    assert!(
+        !unused_file_names.contains(&"messages.ts".to_string()),
+        "messages.ts should be reachable via tsconfig.app.json paths alias: {unused_file_names:?}"
+    );
+}

@@ -132,6 +132,8 @@ mod tests {
                 whole_object_uses: vec![],
                 has_cjs_exports: false,
                 unused_import_bindings: FxHashSet::default(),
+                type_referenced_import_bindings: vec![],
+                value_referenced_import_bindings: vec![],
             })
             .collect();
 
@@ -294,6 +296,8 @@ mod tests {
                 whole_object_uses: vec![],
                 has_cjs_exports: false,
                 unused_import_bindings: FxHashSet::default(),
+                type_referenced_import_bindings: vec![],
+                value_referenced_import_bindings: vec![],
             })
             .collect();
         let graph = ModuleGraph::build(&resolved_modules, &entry_points, &files);

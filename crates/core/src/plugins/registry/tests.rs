@@ -4,7 +4,7 @@ use fallow_config::{
     ExternalPluginDef, ExternalUsedExport, PluginDetection, ScopedUsedClassMemberRule,
     UsedClassMemberRule,
 };
-use helpers::{check_plugin_detection, discover_json_config_files, process_config_result};
+use helpers::{check_plugin_detection, discover_config_files, process_config_result};
 
 /// Build a dependency object from names for JSON deserialization.
 fn deps_json(names: &[&str]) -> serde_json::Value {
@@ -101,6 +101,66 @@ fn multiple_plugins_detected_simultaneously() {
     assert!(result.active_plugins.contains(&"nextjs".to_string()));
     assert!(result.active_plugins.contains(&"vitest".to_string()));
     assert!(result.active_plugins.contains(&"typescript".to_string()));
+}
+
+#[test]
+fn registry_discovers_tsconfig_app_path_aliases() {
+    let registry = PluginRegistry::default();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("src/utils")).unwrap();
+    std::fs::write(
+        root.join("package.json"),
+        r#"{
+            "name": "fixture",
+            "private": true,
+            "devDependencies": {
+                "@vue/tsconfig": "^0.7.0",
+                "typescript": "^5.8.0",
+                "vite": "^6.0.0"
+            }
+        }"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("tsconfig.json"),
+        r#"{
+            "files": [],
+            "references": [{ "path": "./tsconfig.app.json" }]
+        }"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("tsconfig.app.json"),
+        r#"{
+            "compilerOptions": {
+                "paths": {
+                    "@/*": ["./src/*"]
+                }
+            }
+        }"#,
+    )
+    .unwrap();
+    std::fs::write(root.join("src/main.ts"), "import '@/utils/messages';").unwrap();
+    std::fs::write(
+        root.join("src/utils/messages.ts"),
+        "export const message = 'hi';",
+    )
+    .unwrap();
+
+    let pkg =
+        PackageJson::load(&root.join("package.json")).expect("fixture package.json should load");
+    let discovered_files = vec![root.join("src/main.ts"), root.join("src/utils/messages.ts")];
+    let result = registry.run(&pkg, root, &discovered_files);
+
+    assert!(
+        result
+            .path_aliases
+            .iter()
+            .any(|(prefix, replacement)| prefix == "@/" && replacement == "src"),
+        "registry should discover @/ -> src from tsconfig.app.json: {:?}",
+        result.path_aliases
+    );
 }
 
 #[test]
@@ -1281,10 +1341,10 @@ fn check_has_config_file_returns_false_for_plugin_without_config_patterns() {
     );
 }
 
-// ── discover_json_config_files ───────────────────────────────
+// ── discover_config_files ────────────────────────────────────
 
 #[test]
-fn discover_json_config_files_skips_resolved_plugins() {
+fn discover_config_files_skips_resolved_plugins() {
     let registry = PluginRegistry::default();
     let matchers = registry.precompile_config_matchers();
 
@@ -1294,28 +1354,27 @@ fn discover_json_config_files_skips_resolved_plugins() {
         resolved.insert(plugin.name());
     }
 
-    let json_configs = discover_json_config_files(&matchers, &resolved, &[], Path::new("/project"));
+    let json_configs = discover_config_files(&matchers, &resolved, &[Path::new("/project")]);
     assert!(
         json_configs.is_empty(),
-        "discover_json_config_files should skip all resolved plugins"
+        "discover_config_files should skip all resolved plugins"
     );
 }
 
 #[test]
-fn discover_json_config_files_returns_empty_for_nonexistent_root() {
+fn discover_config_files_returns_empty_for_nonexistent_root() {
     let registry = PluginRegistry::default();
     let matchers = registry.precompile_config_matchers();
     let resolved: FxHashSet<&str> = FxHashSet::default();
 
-    let json_configs = discover_json_config_files(
+    let json_configs = discover_config_files(
         &matchers,
         &resolved,
-        &[],
-        Path::new("/nonexistent-root-xyz-abc"),
+        &[Path::new("/nonexistent-root-xyz-abc")],
     );
     assert!(
         json_configs.is_empty(),
-        "discover_json_config_files should return empty for nonexistent root"
+        "discover_config_files should return empty for nonexistent root"
     );
 }
 
@@ -1845,13 +1904,12 @@ fn eslint_activates_by_config_file_existence() {
     );
 }
 
-// ── discover_json_config_files: glob pattern in subdirectories
+// ── discover_config_files: glob pattern in subdirectories
 
 #[test]
-fn discover_json_config_files_finds_in_subdirectory() {
-    // Nx plugin has "**/project.json" config pattern — glob-based discovery
-    // should check directories where discovered source files live.
-    // The function checks the parent directory of each discovered source file.
+fn discover_config_files_finds_in_subdirectory() {
+    // Nx plugin has "**/project.json" config pattern — filesystem glob discovery
+    // should find config files beneath the project root.
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     let subdir = root.join("packages").join("app");
@@ -1862,20 +1920,34 @@ fn discover_json_config_files_finds_in_subdirectory() {
     let matchers = registry.precompile_config_matchers();
     let resolved: FxHashSet<&str> = FxHashSet::default();
 
-    // The source file's parent must be packages/app/ so that project.json
-    // is found via dir.join("project.json")
-    let src_file = subdir.join("index.ts");
-    let relative_files: Vec<(&PathBuf, String)> =
-        vec![(&src_file, "packages/app/index.ts".to_string())];
-
-    let json_configs = discover_json_config_files(&matchers, &resolved, &relative_files, root);
+    let json_configs = discover_config_files(&matchers, &resolved, &[root]);
     // Check if any nx project.json was discovered
     let found_project_json = json_configs
         .iter()
         .any(|(path, _)| path.ends_with("project.json"));
     assert!(
         found_project_json,
-        "discover_json_config_files should find project.json in parent dir of discovered source file"
+        "discover_config_files should find project.json below the project root"
+    );
+}
+
+#[test]
+fn discover_config_files_expands_root_brace_patterns() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::write(root.join("vite.config.ts"), "export default {};").unwrap();
+
+    let registry = PluginRegistry::default();
+    let matchers = registry.precompile_config_matchers();
+    let resolved: FxHashSet<&str> = FxHashSet::default();
+
+    let configs = discover_config_files(&matchers, &resolved, &[root]);
+    let found_vite_config = configs
+        .iter()
+        .any(|(path, plugin)| plugin.name() == "vite" && path.ends_with("vite.config.ts"));
+    assert!(
+        found_vite_config,
+        "discover_config_files should expand vite.config.{{ts,js,mts,mjs}} at the root"
     );
 }
 

@@ -923,7 +923,7 @@ fn expression_to_alias_pairs(expr: &Expression) -> Vec<(String, String)> {
                     return None;
                 };
                 let find = property_key_to_string(&prop.key)?;
-                let replacement = expression_to_path_string(&prop.value)?;
+                let replacement = expression_to_path_values(&prop.value).into_iter().next()?;
                 Some((find, replacement))
             })
             .collect(),
@@ -1510,6 +1510,29 @@ mod tests {
             vec![
                 ("@".to_string(), "./src".to_string()),
                 ("$utils".to_string(), "src/lib/utils".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn extract_aliases_from_object_with_array_values() {
+        let source = r#"
+            ({
+                compilerOptions: {
+                    paths: {
+                        "@/*": ["./src/*"],
+                        "@shared/*": ["./shared/*", "./fallback/*"]
+                    }
+                }
+            })
+        "#;
+
+        let aliases = extract_config_aliases(source, &js_path(), &["compilerOptions", "paths"]);
+        assert_eq!(
+            aliases,
+            vec![
+                ("@/*".to_string(), "./src/*".to_string()),
+                ("@shared/*".to_string(), "./shared/*".to_string())
             ]
         );
     }

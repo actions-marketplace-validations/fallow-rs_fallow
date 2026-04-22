@@ -154,7 +154,43 @@ fn try_scss_fallbacks(
     try_scss_node_modules_fallback(ctx, from_file, specifier)
 }
 
+fn is_style_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| matches!(ext, "css" | "scss" | "sass"))
+}
+
+fn is_node_modules_path(path: &Path) -> bool {
+    path.components().any(|component| match component {
+        std::path::Component::Normal(segment) => segment == "node_modules",
+        _ => false,
+    })
+}
+
+fn should_preserve_node_modules_style_file(
+    specifier: &str,
+    from_file: &Path,
+    resolved_path: &Path,
+) -> bool {
+    if !is_style_file(resolved_path) || !is_node_modules_path(resolved_path) {
+        return false;
+    }
+
+    let is_bare_subpath =
+        is_bare_specifier(specifier) && extract_package_name(specifier).as_str() != specifier;
+    if is_bare_subpath {
+        return true;
+    }
+
+    is_node_modules_path(from_file) && (specifier.starts_with('.') || specifier.starts_with('/'))
+}
+
 /// Resolve a single import specifier to a target.
+#[expect(
+    clippy::too_many_lines,
+    reason = "central import resolver keeps fallback order visible; style-preservation logic is \
+              intentionally local to the resolution decision tree"
+)]
 pub(super) fn resolve_specifier(
     ctx: &ResolveContext<'_>,
     from_file: &Path,
@@ -272,7 +308,15 @@ pub(super) fn resolve_specifier(
                 && let Some(pkg_name) = extract_package_name_from_node_modules_path(resolved_path)
                 && !ctx.workspace_roots.contains_key(pkg_name.as_str())
             {
-                return ResolveResult::NpmPackage(pkg_name);
+                return if should_preserve_node_modules_style_file(
+                    specifier,
+                    from_file,
+                    resolved_path,
+                ) {
+                    ResolveResult::ExternalFile(resolved_path.to_path_buf())
+                } else {
+                    ResolveResult::NpmPackage(pkg_name)
+                };
             }
 
             // Fall back to canonical path lookup
@@ -306,7 +350,12 @@ pub(super) fn resolve_specifier(
                         {
                             return result;
                         }
-                        ResolveResult::NpmPackage(pkg_name)
+                        if should_preserve_node_modules_style_file(specifier, from_file, &canonical)
+                        {
+                            ResolveResult::ExternalFile(canonical)
+                        } else {
+                            ResolveResult::NpmPackage(pkg_name)
+                        }
                     } else {
                         ResolveResult::ExternalFile(canonical)
                     }
@@ -329,7 +378,15 @@ pub(super) fn resolve_specifier(
                         {
                             return result;
                         }
-                        ResolveResult::NpmPackage(pkg_name)
+                        if should_preserve_node_modules_style_file(
+                            specifier,
+                            from_file,
+                            resolved_path,
+                        ) {
+                            ResolveResult::ExternalFile(resolved_path.to_path_buf())
+                        } else {
+                            ResolveResult::NpmPackage(pkg_name)
+                        }
                     } else {
                         ResolveResult::ExternalFile(resolved_path.to_path_buf())
                     }

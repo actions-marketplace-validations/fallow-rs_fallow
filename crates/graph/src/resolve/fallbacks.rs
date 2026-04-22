@@ -35,10 +35,11 @@ pub(super) fn try_path_alias_fallback(
             format!("./{replacement}/{remainder}")
         };
 
-        // Resolve from a synthetic file at the project root so relative paths work.
-        // Use a dummy file path in the root directory.
-        let root_file = ctx.root.join("__resolve_root__");
-        if let Ok(resolved) = ctx.resolver.resolve_file(&root_file, &substituted) {
+        // Resolve relative to the project root directly. These plugin-provided
+        // aliases have already been normalized to root-relative paths, so
+        // tsconfig discovery is not needed here and can actually hurt for
+        // solution-style roots (`tsconfig.json` with only `references`).
+        if let Ok(resolved) = ctx.resolver.resolve(ctx.root, &substituted) {
             let resolved_path = resolved.path();
             // Try raw path lookup first
             if let Some(&file_id) = ctx.raw_path_to_id.get(resolved_path) {
@@ -464,7 +465,7 @@ pub(super) fn try_source_fallback(
 /// Given a path like `/project/node_modules/react/index.js`, returns `Some("react")`.
 /// Given a path like `/project/node_modules/@scope/pkg/dist/index.js`, returns `Some("@scope/pkg")`.
 /// Returns `None` if the path doesn't contain a `node_modules` segment.
-pub(super) fn extract_package_name_from_node_modules_path(path: &Path) -> Option<String> {
+pub fn extract_package_name_from_node_modules_path(path: &Path) -> Option<String> {
     let components: Vec<&str> = path
         .components()
         .filter_map(|c| match c {

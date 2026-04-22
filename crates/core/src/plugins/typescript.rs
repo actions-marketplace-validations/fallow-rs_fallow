@@ -85,6 +85,21 @@ define_plugin!(
             result.referenced_dependencies.push(jsx_source);
         }
 
+        for (find, replacement) in config_parser::extract_config_aliases(
+            &parse_source,
+            parse_path,
+            &["compilerOptions", "paths"],
+        ) {
+            let Some((normalized_find, normalized_replacement)) =
+                normalize_tsconfig_path_alias(&find, &replacement, parse_path, root)
+            else {
+                continue;
+            };
+            result
+                .path_aliases
+                .push((normalized_find, normalized_replacement));
+        }
+
         // compilerOptions.plugins → referenced dependencies (TS language service plugins)
         parse_tsconfig_plugins(&parse_source, parse_path, &mut result);
 
@@ -94,6 +109,23 @@ define_plugin!(
         result
     },
 );
+
+fn normalize_tsconfig_path_alias(
+    find: &str,
+    replacement: &str,
+    config_path: &Path,
+    root: &Path,
+) -> Option<(String, String)> {
+    let normalized_find = find.strip_suffix('*').unwrap_or(find).to_string();
+    let normalized_replacement = replacement
+        .strip_suffix("/*")
+        .or_else(|| replacement.strip_suffix('*'))
+        .unwrap_or(replacement);
+    let normalized_replacement =
+        config_parser::normalize_config_path(normalized_replacement, config_path, root)?;
+
+    Some((normalized_find, normalized_replacement))
+}
 
 /// Extract `compilerOptions.plugins[].name` from a tsconfig as referenced dependencies.
 fn parse_tsconfig_plugins(source: &str, path: &Path, result: &mut PluginResult) {
@@ -203,9 +235,15 @@ fn parse_tsconfig_references(source: &str, path: &Path, root: &Path, result: &mu
                                 };
                                 if is_path && let Expression::StringLiteral(s) = &rp.value {
                                     let ref_path = s.value.to_string();
-                                    let tsconfig_path = root
-                                        .join(ref_path.trim_start_matches("./"))
-                                        .join("tsconfig.json");
+                                    let ref_target = root.join(ref_path.trim_start_matches("./"));
+                                    let tsconfig_path = if ref_target
+                                        .extension()
+                                        .is_some_and(|ext| ext == "json")
+                                    {
+                                        ref_target
+                                    } else {
+                                        ref_target.join("tsconfig.json")
+                                    };
                                     result.setup_files.push(tsconfig_path);
                                 }
                             }
@@ -308,6 +346,32 @@ mod tests {
     }
 
     #[test]
+    fn resolve_config_extracts_path_aliases_from_paths() {
+        let source = r#"{
+            "compilerOptions": {
+                "paths": {
+                    "@/*": ["./src/*"],
+                    "@shared/*": ["./shared/*", "./fallback/*"]
+                }
+            }
+        }"#;
+        let plugin = TypeScriptPlugin;
+        let result = plugin.resolve_config(
+            std::path::Path::new("/project/tsconfig.app.json"),
+            source,
+            std::path::Path::new("/project"),
+        );
+
+        assert_eq!(
+            result.path_aliases,
+            vec![
+                ("@/".to_string(), "src".to_string()),
+                ("@shared/".to_string(), "shared".to_string())
+            ]
+        );
+    }
+
+    #[test]
     fn resolve_config_compiler_options_plugins() {
         let source =
             r#"{"compilerOptions": {"plugins": [{"name": "typescript-plugin-css-modules"}]}}"#;
@@ -336,6 +400,31 @@ mod tests {
         assert!(result.setup_files.contains(&std::path::PathBuf::from(
             "/project/packages/core/tsconfig.json"
         )));
+        assert!(result.setup_files.contains(&std::path::PathBuf::from(
+            "/project/packages/ui/tsconfig.json"
+        )));
+    }
+
+    #[test]
+    fn resolve_config_references_accept_direct_tsconfig_files() {
+        let source = r#"{
+            "references": [
+                {"path": "./tsconfig.app.json"},
+                {"path": "./packages/ui"}
+            ]
+        }"#;
+        let plugin = TypeScriptPlugin;
+        let result = plugin.resolve_config(
+            std::path::Path::new("tsconfig.json"),
+            source,
+            std::path::Path::new("/project"),
+        );
+
+        assert!(
+            result
+                .setup_files
+                .contains(&std::path::PathBuf::from("/project/tsconfig.app.json"))
+        );
         assert!(result.setup_files.contains(&std::path::PathBuf::from(
             "/project/packages/ui/tsconfig.json"
         )));

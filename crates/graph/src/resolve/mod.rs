@@ -28,6 +28,7 @@ mod tests;
 mod types;
 mod upgrades;
 
+pub use fallbacks::extract_package_name_from_node_modules_path;
 pub use path_info::{extract_package_name, is_bare_specifier, is_path_alias};
 pub use types::{ResolveResult, ResolvedImport, ResolvedModule, ResolvedReExport};
 
@@ -195,6 +196,8 @@ pub fn resolve_all_imports(
                 whole_object_uses: module.whole_object_uses.clone(),
                 has_cjs_exports: module.has_cjs_exports,
                 unused_import_bindings: module.unused_import_bindings.iter().cloned().collect(),
+                type_referenced_import_bindings: module.type_referenced_import_bindings.clone(),
+                value_referenced_import_bindings: module.value_referenced_import_bindings.clone(),
             })
         })
         .collect();

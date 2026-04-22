@@ -1614,6 +1614,8 @@ mod tests {
             content_hash: 0,
             suppressions: vec![],
             unused_import_bindings: vec![],
+            type_referenced_import_bindings: vec![],
+            value_referenced_import_bindings: vec![],
             line_offsets: vec![0],
             complexity,
             flag_uses: vec![],

@@ -154,6 +154,8 @@ pub fn cached_to_module(
         content_hash: cached.content_hash,
         suppressions,
         unused_import_bindings: cached.unused_import_bindings.clone(),
+        type_referenced_import_bindings: cached.type_referenced_import_bindings.clone(),
+        value_referenced_import_bindings: cached.value_referenced_import_bindings.clone(),
         line_offsets: cached.line_offsets.clone(),
         complexity: cached.complexity.clone(),
         flag_uses: cached.flag_uses.clone(),
@@ -275,6 +277,8 @@ pub fn module_to_cached(
             .collect(),
         has_cjs_exports: module.has_cjs_exports,
         unused_import_bindings: module.unused_import_bindings.clone(),
+        type_referenced_import_bindings: module.type_referenced_import_bindings.clone(),
+        value_referenced_import_bindings: module.value_referenced_import_bindings.clone(),
         suppressions: module
             .suppressions
             .iter()

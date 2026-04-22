@@ -431,6 +431,8 @@ mod tests {
                 whole_object_uses: vec![],
                 has_cjs_exports: false,
                 unused_import_bindings: rustc_hash::FxHashSet::default(),
+                type_referenced_import_bindings: vec![],
+                value_referenced_import_bindings: vec![],
             })
             .collect();
 

@@ -122,60 +122,72 @@ pub fn process_external_plugins(
     }
 }
 
-/// Discover JSON config files on the filesystem for plugins that weren't matched against
-/// discovered source files. Returns `(path, plugin)` pairs.
-pub fn discover_json_config_files<'a>(
+/// Discover config files on disk for plugins that were not matched against the
+/// discovered source set. Supports brace patterns like
+/// `vite.config.{ts,js,mts,mjs}` plus normal glob patterns like `**/project.json`.
+pub fn discover_config_files<'a>(
     config_matchers: &[(&'a dyn Plugin, Vec<globset::GlobMatcher>)],
     resolved_plugins: &FxHashSet<&str>,
-    relative_files: &[(&PathBuf, String)],
-    root: &Path,
+    roots: &[&Path],
 ) -> Vec<(PathBuf, &'a dyn Plugin)> {
-    let mut json_configs: Vec<(PathBuf, &'a dyn Plugin)> = Vec::new();
+    let mut config_files: Vec<(PathBuf, &'a dyn Plugin)> = Vec::new();
+    let mut seen: FxHashSet<(PathBuf, &'a str)> = FxHashSet::default();
+
     for (plugin, _) in config_matchers {
         if resolved_plugins.contains(plugin.name()) {
             continue;
         }
-        for pat in plugin.config_patterns() {
-            let has_glob = pat.contains("**") || pat.contains('*') || pat.contains('?');
-            if has_glob {
-                // Glob pattern (e.g., "**/project.json") — check directories
-                // that contain discovered source files
-                let filename = std::path::Path::new(pat)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or(pat);
-                let matcher = globset::Glob::new(pat).ok().map(|g| g.compile_matcher());
-                if let Some(matcher) = matcher {
-                    let mut checked_dirs: FxHashSet<&Path> = FxHashSet::default();
-                    checked_dirs.insert(root);
-                    for (abs_path, _) in relative_files {
-                        if let Some(parent) = abs_path.parent() {
-                            checked_dirs.insert(parent);
-                        }
-                    }
-                    for dir in checked_dirs {
-                        let candidate = dir.join(filename);
-                        if candidate.is_file() {
-                            let rel = candidate
-                                .strip_prefix(root)
-                                .map(|p| p.to_string_lossy())
-                                .unwrap_or_default();
-                            if matcher.is_match(rel.as_ref()) {
-                                json_configs.push((candidate, *plugin));
+
+        for root in roots {
+            for pat in plugin.config_patterns() {
+                for expanded in expand_brace_pattern(pat) {
+                    if pattern_has_glob(&expanded) {
+                        let glob_pattern = root.join(&expanded).to_string_lossy().to_string();
+                        let Ok(paths) = glob::glob(&glob_pattern) else {
+                            continue;
+                        };
+                        for path in paths.flatten().filter(|p| p.is_file()) {
+                            if seen.insert((path.clone(), plugin.name())) {
+                                config_files.push((path, *plugin));
                             }
                         }
+                    } else {
+                        let path = root.join(&expanded);
+                        if path.is_file() && seen.insert((path.clone(), plugin.name())) {
+                            config_files.push((path, *plugin));
+                        }
                     }
-                }
-            } else {
-                // Simple pattern (e.g., "angular.json") — check at root
-                let abs_path = root.join(pat);
-                if abs_path.is_file() {
-                    json_configs.push((abs_path, *plugin));
                 }
             }
         }
     }
-    json_configs
+
+    config_files
+}
+
+fn pattern_has_glob(pattern: &str) -> bool {
+    pattern.contains('*') || pattern.contains('?') || pattern.contains('[')
+}
+
+fn expand_brace_pattern(pattern: &str) -> Vec<String> {
+    let Some(open) = pattern.find('{') else {
+        return vec![pattern.to_string()];
+    };
+    let Some(close_rel) = pattern[open + 1..].find('}') else {
+        return vec![pattern.to_string()];
+    };
+    let close = open + 1 + close_rel;
+
+    let prefix = &pattern[..open];
+    let suffix = &pattern[close + 1..];
+    let inner = &pattern[open + 1..close];
+    let mut expanded = Vec::new();
+    for option in inner.split(',') {
+        for tail in expand_brace_pattern(suffix) {
+            expanded.push(format!("{prefix}{option}{tail}"));
+        }
+    }
+    expanded
 }
 
 /// Merge a `PluginResult` from config parsing into the aggregated result.

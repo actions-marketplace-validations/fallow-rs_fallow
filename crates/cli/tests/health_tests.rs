@@ -322,6 +322,63 @@ fn health_file_scores_flag() {
 }
 
 #[test]
+fn health_file_scores_include_vue_sfc_files() {
+    let output = run_fallow(
+        "health",
+        "vue-split-type-value-export",
+        &["--file-scores", "--format", "json", "--quiet"],
+    );
+    assert_eq!(output.code, 0, "health should score Vue SFC files");
+
+    let json = parse_json(&output);
+    let file_scores = json["file_scores"]
+        .as_array()
+        .expect("health --file-scores should include file_scores");
+
+    assert!(
+        file_scores.iter().any(|score| {
+            score.get("path").and_then(serde_json::Value::as_str) == Some("src/App.vue")
+        }),
+        "Vue SFC files should be included in file_scores: {file_scores:?}"
+    );
+}
+
+#[test]
+fn health_complexity_reports_vue_sfc_functions() {
+    let output = run_fallow(
+        "health",
+        "vue-split-type-value-export",
+        &[
+            "--complexity",
+            "--max-cyclomatic",
+            "0",
+            "--max-crap",
+            "10000",
+            "--format",
+            "json",
+            "--quiet",
+        ],
+    );
+    assert_eq!(
+        output.code, 1,
+        "health should report Vue SFC complexity findings"
+    );
+
+    let json = parse_json(&output);
+    let findings = json["findings"]
+        .as_array()
+        .expect("health --complexity should include findings");
+
+    assert!(
+        findings.iter().any(|finding| {
+            finding.get("path").and_then(serde_json::Value::as_str) == Some("src/App.vue")
+                && finding.get("name").and_then(serde_json::Value::as_str) == Some("isStatus")
+        }),
+        "Vue SFC functions should surface as health findings: {findings:?}"
+    );
+}
+
+#[test]
 fn health_coverage_gaps_flag_reports_runtime_gaps() {
     let output = run_fallow(
         "health",

@@ -502,6 +502,8 @@ mod tests {
                 whole_object_uses: vec![],
                 has_cjs_exports: false,
                 unused_import_bindings: FxHashSet::default(),
+                type_referenced_import_bindings: vec![],
+                value_referenced_import_bindings: vec![],
             }];
             let graph = ModuleGraph::build(&resolved, &entry_points, &files);
 
@@ -573,6 +575,8 @@ mod tests {
                 whole_object_uses: vec![],
                 has_cjs_exports: false,
                 unused_import_bindings: FxHashSet::default(),
+                type_referenced_import_bindings: vec![],
+                value_referenced_import_bindings: vec![],
             }];
             let mut graph = ModuleGraph::build(&resolved, &entry_points, &files);
             graph.modules[0].exports = vec![ExportSymbol {
@@ -650,6 +654,8 @@ mod tests {
                 whole_object_uses: vec![],
                 has_cjs_exports: false,
                 unused_import_bindings: FxHashSet::default(),
+                type_referenced_import_bindings: vec![],
+                value_referenced_import_bindings: vec![],
             }];
             let graph = ModuleGraph::build(&resolved, &entry_points, &files);
             let config = make_config_with_rules(RulesConfig::default());
@@ -699,6 +705,8 @@ mod tests {
                     whole_object_uses: vec![],
                     has_cjs_exports: false,
                     unused_import_bindings: FxHashSet::default(),
+                    type_referenced_import_bindings: vec![],
+                    value_referenced_import_bindings: vec![],
                 })
                 .collect::<Vec<_>>();
             let graph = ModuleGraph::build(&resolved, &entry_points, &files);
@@ -722,6 +730,8 @@ mod tests {
                     kind: Some(IssueKind::UnusedFile),
                 }],
                 unused_import_bindings: vec![],
+                type_referenced_import_bindings: vec![],
+                value_referenced_import_bindings: vec![],
                 line_offsets: vec![],
                 complexity: vec![],
                 flag_uses: vec![],

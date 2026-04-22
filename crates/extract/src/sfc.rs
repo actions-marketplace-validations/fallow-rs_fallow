@@ -13,11 +13,12 @@ use oxc_span::SourceType;
 use rustc_hash::FxHashSet;
 
 use crate::asset_url::normalize_asset_url;
-use crate::parse::compute_unused_import_bindings;
+use crate::parse::compute_import_binding_usage;
 use crate::sfc_template::{SfcKind, collect_template_usage};
 use crate::visitor::ModuleInfoExtractor;
 use crate::{ImportInfo, ImportedName, ModuleInfo};
 use fallow_types::discover::FileId;
+use fallow_types::extract::{FunctionComplexity, byte_offset_to_line_col, compute_line_offsets};
 use oxc_span::Span;
 
 /// Regex to extract `<script>` block content from Vue/Svelte SFCs.
@@ -131,6 +132,7 @@ pub(crate) fn parse_sfc_to_module(
     path: &Path,
     source: &str,
     content_hash: u64,
+    need_complexity: bool,
 ) -> ModuleInfo {
     let scripts = extract_sfc_scripts(source);
     let kind = sfc_kind(path);
@@ -138,12 +140,22 @@ pub(crate) fn parse_sfc_to_module(
     let mut template_visible_imports: FxHashSet<String> = FxHashSet::default();
 
     for script in &scripts {
-        merge_script_into_module(kind, script, &mut combined, &mut template_visible_imports);
+        merge_script_into_module(
+            kind,
+            script,
+            &mut combined,
+            &mut template_visible_imports,
+            need_complexity,
+        );
     }
 
     apply_template_usage(kind, source, &template_visible_imports, &mut combined);
     combined.unused_import_bindings.sort_unstable();
     combined.unused_import_bindings.dedup();
+    combined.type_referenced_import_bindings.sort_unstable();
+    combined.type_referenced_import_bindings.dedup();
+    combined.value_referenced_import_bindings.sort_unstable();
+    combined.value_referenced_import_bindings.dedup();
 
     combined
 }
@@ -175,7 +187,9 @@ fn empty_sfc_module(file_id: FileId, source: &str, content_hash: u64) -> ModuleI
         content_hash,
         suppressions,
         unused_import_bindings: Vec::new(),
-        line_offsets: fallow_types::extract::compute_line_offsets(source),
+        type_referenced_import_bindings: Vec::new(),
+        value_referenced_import_bindings: Vec::new(),
+        line_offsets: compute_line_offsets(source),
         complexity: Vec::new(),
         flag_uses: Vec::new(),
         class_heritage: vec![],
@@ -187,6 +201,7 @@ fn merge_script_into_module(
     script: &SfcScript,
     combined: &mut ModuleInfo,
     template_visible_imports: &mut FxHashSet<String>,
+    need_complexity: bool,
 ) {
     if let Some(src) = &script.src {
         add_script_src_import(combined, src);
@@ -198,11 +213,23 @@ fn merge_script_into_module(
     let mut extractor = ModuleInfoExtractor::new();
     extractor.visit_program(&parser_return.program);
 
-    let unused_import_bindings =
-        compute_unused_import_bindings(&parser_return.program, &extractor.imports);
+    let binding_usage = compute_import_binding_usage(&parser_return.program, &extractor.imports);
     combined
         .unused_import_bindings
-        .extend(unused_import_bindings.iter().cloned());
+        .extend(binding_usage.unused.iter().cloned());
+    combined
+        .type_referenced_import_bindings
+        .extend(binding_usage.type_referenced.iter().cloned());
+    combined
+        .value_referenced_import_bindings
+        .extend(binding_usage.value_referenced.iter().cloned());
+    if need_complexity {
+        combined.complexity.extend(translate_script_complexity(
+            script,
+            &parser_return.program,
+            &combined.line_offsets,
+        ));
+    }
 
     if is_template_visible_script(kind, script) {
         template_visible_imports.extend(
@@ -215,6 +242,26 @@ fn merge_script_into_module(
     }
 
     extractor.merge_into(combined);
+}
+
+fn translate_script_complexity(
+    script: &SfcScript,
+    program: &oxc_ast::ast::Program<'_>,
+    sfc_line_offsets: &[u32],
+) -> Vec<FunctionComplexity> {
+    let script_line_offsets = compute_line_offsets(&script.body);
+    let mut complexity = crate::complexity::compute_complexity(program, &script_line_offsets);
+    let (body_start_line, body_start_col) =
+        byte_offset_to_line_col(sfc_line_offsets, script.byte_offset as u32);
+
+    for function in &mut complexity {
+        function.line = body_start_line + function.line.saturating_sub(1);
+        if function.line == body_start_line {
+            function.col += body_start_col;
+        }
+    }
+
+    complexity
 }
 
 fn add_script_src_import(module: &mut ModuleInfo, source: &str) {
@@ -515,7 +562,7 @@ import { ref } from 'vue';
 const count = ref(0);
 </script>
 "#;
-        let info = parse_sfc_to_module(FileId(0), Path::new("Dual.vue"), source, 0);
+        let info = parse_sfc_to_module(FileId(0), Path::new("Dual.vue"), source, 0, false);
         // The non-setup block exports `version`
         assert!(
             info.exports
@@ -567,6 +614,7 @@ const count = ref(0);
             Path::new("External.vue"),
             r#"<script src="./external-logic.ts" lang="ts"></script>"#,
             0,
+            false,
         );
         assert!(
             info.imports
@@ -586,6 +634,7 @@ const count = ref(0);
             Path::new("Empty.vue"),
             "<template><div>Hello</div></template>",
             42,
+            false,
         );
         assert!(info.imports.is_empty());
         assert!(info.exports.is_empty());
@@ -600,6 +649,7 @@ const count = ref(0);
             Path::new("LineOffsets.vue"),
             r#"<script lang="ts">const x = 1;</script>"#,
             0,
+            false,
         );
         assert!(!info.line_offsets.is_empty());
     }
@@ -614,6 +664,7 @@ const count = ref(0);
 export const foo = 1;
 </script>"#,
             0,
+            false,
         );
         assert!(!info.suppressions.is_empty());
     }

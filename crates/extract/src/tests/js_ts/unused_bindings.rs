@@ -70,6 +70,30 @@ fn value_import_used_only_as_type_not_in_unused() {
 }
 
 #[test]
+fn value_import_used_only_as_type_records_type_usage() {
+    let info = parse_source("import { Foo } from './types';\nconst x = {} as Foo;");
+    assert_eq!(
+        info.type_referenced_import_bindings,
+        vec!["Foo".to_string()]
+    );
+    assert!(info.value_referenced_import_bindings.is_empty());
+}
+
+#[test]
+fn value_import_used_as_type_and_value_records_both_kinds() {
+    let info =
+        parse_source("import { Foo } from './types';\nconst x = {} as Foo;\nconsole.log(Foo);");
+    assert_eq!(
+        info.type_referenced_import_bindings,
+        vec!["Foo".to_string()]
+    );
+    assert_eq!(
+        info.value_referenced_import_bindings,
+        vec!["Foo".to_string()]
+    );
+}
+
+#[test]
 fn side_effect_import_not_in_unused() {
     let info = parse_source("import './side-effect';");
     assert!(

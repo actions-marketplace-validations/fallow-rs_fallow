@@ -352,6 +352,8 @@ fn path_alias_imports_not_reported_as_unlisted() {
         whole_object_uses: vec![],
         has_cjs_exports: false,
         unused_import_bindings: FxHashSet::default(),
+        type_referenced_import_bindings: vec![],
+        value_referenced_import_bindings: vec![],
     }];
     let graph = ModuleGraph::build(&resolved_modules, &entry_points, &files);
     let pkg = make_pkg(&[], &[], &[]);
@@ -411,6 +413,8 @@ fn multiple_unresolved_imports_collected() {
         whole_object_uses: vec![],
         has_cjs_exports: false,
         unused_import_bindings: FxHashSet::default(),
+        type_referenced_import_bindings: vec![],
+        value_referenced_import_bindings: vec![],
     }];
 
     let config = test_config(PathBuf::from("/project"));
@@ -490,6 +494,8 @@ fn workspace_dep_used_within_workspace_not_flagged() {
         whole_object_uses: vec![],
         has_cjs_exports: false,
         unused_import_bindings: FxHashSet::default(),
+        type_referenced_import_bindings: vec![],
+        value_referenced_import_bindings: vec![],
     }];
     let graph = ModuleGraph::build(&resolved_modules, &entry_points, &files);
 

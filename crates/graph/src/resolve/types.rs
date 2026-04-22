@@ -64,6 +64,10 @@ pub struct ResolvedModule {
     pub has_cjs_exports: bool,
     /// Local names of import bindings that are never referenced in this file.
     pub unused_import_bindings: FxHashSet<String>,
+    /// Local import bindings referenced from type positions.
+    pub type_referenced_import_bindings: Vec<String>,
+    /// Local import bindings referenced from runtime/value positions.
+    pub value_referenced_import_bindings: Vec<String>,
 }
 
 impl Default for ResolvedModule {
@@ -80,6 +84,8 @@ impl Default for ResolvedModule {
             whole_object_uses: vec![],
             has_cjs_exports: false,
             unused_import_bindings: FxHashSet::default(),
+            type_referenced_import_bindings: vec![],
+            value_referenced_import_bindings: vec![],
         }
     }
 }

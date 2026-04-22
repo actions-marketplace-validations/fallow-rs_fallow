@@ -15,8 +15,8 @@ pub(crate) mod builtin;
 mod helpers;
 
 use helpers::{
-    check_has_config_file, discover_json_config_files, process_config_result,
-    process_external_plugins, process_static_patterns,
+    check_has_config_file, discover_config_files, process_config_result, process_external_plugins,
+    process_static_patterns,
 };
 
 /// Registry of all available plugins (built-in + external).
@@ -199,12 +199,7 @@ impl PluginRegistry {
             // Phase 3b: Filesystem fallback for JSON config files.
             // JSON files (angular.json, project.json) are not in the discovered file set
             // because fallow only discovers JS/TS/CSS/Vue/etc. files.
-            let json_configs = discover_json_config_files(
-                &config_matchers,
-                &resolved_plugins,
-                &relative_files,
-                root,
-            );
+            let json_configs = discover_config_files(&config_matchers, &resolved_plugins, &[root]);
             for (abs_path, plugin) in &json_configs {
                 if let Ok(source) = std::fs::read_to_string(abs_path) {
                     let plugin_result = plugin.resolve_config(abs_path, &source, root);
@@ -308,6 +303,7 @@ impl PluginRegistry {
         let workspace_matchers: Vec<_> = precompiled_config_matchers
             .iter()
             .filter(|(p, _)| active_names.contains(p.name()))
+            .map(|(plugin, matchers)| (*plugin, matchers.clone()))
             .collect();
 
         let mut resolved_ws_plugins: FxHashSet<&str> = FxHashSet::default();
@@ -340,63 +336,15 @@ impl PluginRegistry {
         // Config files like angular.json live at the monorepo root, but Angular is
         // only active in workspace packages. Check the project root for unresolved
         // config patterns.
-        let mut ws_json_configs: Vec<(PathBuf, &dyn Plugin)> = Vec::new();
-        let mut ws_seen_paths: FxHashSet<PathBuf> = FxHashSet::default();
-        for plugin in &active {
-            if resolved_ws_plugins.contains(plugin.name()) || plugin.config_patterns().is_empty() {
-                continue;
-            }
-            for pat in plugin.config_patterns() {
-                let has_glob = pat.contains("**") || pat.contains('*') || pat.contains('?');
-                if has_glob {
-                    // Glob pattern (e.g., "**/project.json") — check directories
-                    // that contain discovered source files
-                    let filename = std::path::Path::new(pat)
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or(pat);
-                    let matcher = globset::Glob::new(pat).ok().map(|g| g.compile_matcher());
-                    if let Some(matcher) = matcher {
-                        let mut checked_dirs: FxHashSet<&Path> = FxHashSet::default();
-                        checked_dirs.insert(root);
-                        if root != project_root {
-                            checked_dirs.insert(project_root);
-                        }
-                        for (abs_path, _) in relative_files {
-                            if let Some(parent) = abs_path.parent() {
-                                checked_dirs.insert(parent);
-                            }
-                        }
-                        for dir in checked_dirs {
-                            let candidate = dir.join(filename);
-                            if candidate.is_file() && ws_seen_paths.insert(candidate.clone()) {
-                                let rel = candidate
-                                    .strip_prefix(project_root)
-                                    .map(|p| p.to_string_lossy())
-                                    .unwrap_or_default();
-                                if matcher.is_match(rel.as_ref()) {
-                                    ws_json_configs.push((candidate, *plugin));
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    // Check both workspace root and project root (deduplicate when equal)
-                    let check_roots: Vec<&Path> = if root == project_root {
-                        vec![root]
-                    } else {
-                        vec![root, project_root]
-                    };
-                    for check_root in check_roots {
-                        let abs_path = check_root.join(pat);
-                        if abs_path.is_file() && ws_seen_paths.insert(abs_path.clone()) {
-                            ws_json_configs.push((abs_path, *plugin));
-                            break; // Found it — don't check other roots for this pattern
-                        }
-                    }
-                }
-            }
-        }
+        let ws_json_configs = if root == project_root {
+            discover_config_files(&workspace_matchers, &resolved_ws_plugins, &[root])
+        } else {
+            discover_config_files(
+                &workspace_matchers,
+                &resolved_ws_plugins,
+                &[root, project_root],
+            )
+        };
         // Parse discovered JSON config files
         for (abs_path, plugin) in &ws_json_configs {
             if let Ok(source) = std::fs::read_to_string(abs_path) {

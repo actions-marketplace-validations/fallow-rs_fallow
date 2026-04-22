@@ -5,6 +5,7 @@ pub mod cross_reference;
 pub mod discover;
 pub mod duplicates;
 pub(crate) mod errors;
+mod external_style_usage;
 pub mod extract;
 pub mod plugins;
 pub(crate) mod progress;
@@ -208,7 +209,7 @@ pub fn analyze_with_parse_result(
     // Stage 4: Resolve imports to file IDs
     let t = Instant::now();
     let pb = progress.stage_spinner("Resolving imports...");
-    let resolved = resolve::resolve_all_imports(
+    let mut resolved = resolve::resolve_all_imports(
         modules,
         files,
         workspaces,
@@ -217,6 +218,12 @@ pub fn analyze_with_parse_result(
         &plugin_result.scss_include_paths,
         &config.root,
         &config.resolve.conditions,
+    );
+    external_style_usage::augment_external_style_package_usage(
+        &mut resolved,
+        config,
+        workspaces,
+        &plugin_result,
     );
     let resolve_ms = t.elapsed().as_secs_f64() * 1000.0;
     pb.finish_and_clear();
@@ -425,7 +432,7 @@ fn analyze_full(
     // Stage 4: Resolve imports to file IDs
     let t = Instant::now();
     let pb = progress.stage_spinner("Resolving imports...");
-    let resolved = resolve::resolve_all_imports(
+    let mut resolved = resolve::resolve_all_imports(
         &modules,
         files,
         workspaces,
@@ -434,6 +441,12 @@ fn analyze_full(
         &plugin_result.scss_include_paths,
         &config.root,
         &config.resolve.conditions,
+    );
+    external_style_usage::augment_external_style_package_usage(
+        &mut resolved,
+        config,
+        workspaces,
+        &plugin_result,
     );
     let resolve_ms = t.elapsed().as_secs_f64() * 1000.0;
     pb.finish_and_clear();

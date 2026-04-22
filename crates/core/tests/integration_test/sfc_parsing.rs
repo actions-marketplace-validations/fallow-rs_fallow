@@ -154,6 +154,37 @@ fn vue_template_edge_cases_mark_exports_used() {
     }
 }
 
+#[test]
+fn vue_split_value_type_exports_are_tracked_across_script_setup_usage() {
+    let root = fixture_path("vue-split-type-value-export");
+    let config = create_config(root);
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+
+    let unused_types: Vec<(String, String)> = results
+        .unused_types
+        .iter()
+        .map(|e| {
+            (
+                e.path.file_name().unwrap().to_string_lossy().to_string(),
+                e.export_name.clone(),
+            )
+        })
+        .collect();
+
+    assert!(
+        !unused_types
+            .iter()
+            .any(|(file, export)| file == "status.ts" && export == "Status"),
+        "Status type export should be preserved by Vue script-setup type usage: {unused_types:?}"
+    );
+    assert!(
+        unused_types
+            .iter()
+            .any(|(file, export)| file == "status.ts" && export == "UnusedStatus"),
+        "UnusedStatus should still be reported: {unused_types:?}"
+    );
+}
+
 // ── Svelte SFC parsing ─────────────────────────────────────────
 
 #[test]

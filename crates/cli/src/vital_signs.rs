@@ -883,6 +883,8 @@ mod tests {
             content_hash: 0,
             suppressions: Vec::new(),
             unused_import_bindings: Vec::new(),
+            type_referenced_import_bindings: vec![],
+            value_referenced_import_bindings: vec![],
             line_offsets: Vec::new(),
             flag_uses: Vec::new(),
             class_heritage: Vec::new(),

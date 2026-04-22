@@ -38,6 +38,8 @@ fn test_only_dep_from_root_test_file() {
         whole_object_uses: vec![],
         has_cjs_exports: false,
         unused_import_bindings: FxHashSet::default(),
+        type_referenced_import_bindings: vec![],
+        value_referenced_import_bindings: vec![],
     }];
 
     let graph = ModuleGraph::build(&resolved_modules, &entry_points, &files);
@@ -88,6 +90,8 @@ fn test_only_dep_from_root_config_file() {
         whole_object_uses: vec![],
         has_cjs_exports: false,
         unused_import_bindings: FxHashSet::default(),
+        type_referenced_import_bindings: vec![],
+        value_referenced_import_bindings: vec![],
     }];
 
     let graph = ModuleGraph::build(&resolved_modules, &entry_points, &files);
@@ -140,6 +144,8 @@ fn test_only_dep_from_workspace_config_file() {
         whole_object_uses: vec![],
         has_cjs_exports: false,
         unused_import_bindings: FxHashSet::default(),
+        type_referenced_import_bindings: vec![],
+        value_referenced_import_bindings: vec![],
     }];
 
     let graph = ModuleGraph::build(&resolved_modules, &entry_points, &files);
@@ -191,6 +197,8 @@ fn not_test_only_when_imported_from_app_config() {
         whole_object_uses: vec![],
         has_cjs_exports: false,
         unused_import_bindings: FxHashSet::default(),
+        type_referenced_import_bindings: vec![],
+        value_referenced_import_bindings: vec![],
     }];
 
     let graph = ModuleGraph::build(&resolved_modules, &entry_points, &files);
@@ -255,6 +263,8 @@ fn not_test_only_when_also_imported_from_source() {
             whole_object_uses: vec![],
             has_cjs_exports: false,
             unused_import_bindings: FxHashSet::default(),
+            type_referenced_import_bindings: vec![],
+            value_referenced_import_bindings: vec![],
         },
         ResolvedModule {
             file_id: FileId(1),
@@ -278,6 +288,8 @@ fn not_test_only_when_also_imported_from_source() {
             whole_object_uses: vec![],
             has_cjs_exports: false,
             unused_import_bindings: FxHashSet::default(),
+            type_referenced_import_bindings: vec![],
+            value_referenced_import_bindings: vec![],
         },
     ];
 
@@ -329,6 +341,8 @@ fn test_only_dep_from_workspace_jest_config() {
         whole_object_uses: vec![],
         has_cjs_exports: false,
         unused_import_bindings: FxHashSet::default(),
+        type_referenced_import_bindings: vec![],
+        value_referenced_import_bindings: vec![],
     }];
 
     let graph = ModuleGraph::build(&resolved_modules, &entry_points, &files);

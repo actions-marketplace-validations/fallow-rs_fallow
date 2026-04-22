@@ -38,6 +38,14 @@ pub struct ModuleInfo {
     /// to skip adding references for imports whose binding is never read,
     /// improving unused-export detection precision.
     pub unused_import_bindings: Vec<String>,
+    /// Local import bindings that are referenced from TypeScript type positions.
+    /// Used to distinguish value-namespace and type-namespace references when a
+    /// module exports both `const X` and `type X`.
+    pub type_referenced_import_bindings: Vec<String>,
+    /// Local import bindings that are referenced from runtime/value positions.
+    /// Used alongside `type_referenced_import_bindings` for TS namespace-split
+    /// exports that share the same name.
+    pub value_referenced_import_bindings: Vec<String>,
     /// Pre-computed byte offsets where each line starts, for O(log N) byte-to-line/col conversion.
     /// Entry `i` is the byte offset of the start of line `i` (0-indexed).
     /// Example: for "abc\ndef\n", `line_offsets` = \[0, 4\].
@@ -444,7 +452,7 @@ const _: () = assert!(std::mem::size_of::<ImportedName>() == 24);
 const _: () = assert!(std::mem::size_of::<MemberAccess>() == 48);
 // `ModuleInfo` is the per-file extraction result — stored in a Vec during parallel parsing.
 #[cfg(target_pointer_width = "64")]
-const _: () = assert!(std::mem::size_of::<ModuleInfo>() == 352);
+const _: () = assert!(std::mem::size_of::<ModuleInfo>() == 400);
 
 /// A re-export declaration.
 #[derive(Debug, Clone)]

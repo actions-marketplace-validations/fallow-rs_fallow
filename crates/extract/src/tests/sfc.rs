@@ -9,6 +9,10 @@ fn parse_sfc(source: &str, filename: &str) -> ModuleInfo {
     parse_source_to_module(FileId(0), Path::new(filename), source, 0, false)
 }
 
+fn parse_sfc_with_complexity(source: &str, filename: &str) -> ModuleInfo {
+    parse_source_to_module(FileId(0), Path::new(filename), source, 0, true)
+}
+
 #[test]
 fn extracts_vue_script_imports() {
     let info = parse_sfc(
@@ -822,6 +826,66 @@ import List from './List.vue';
         !info.unused_import_bindings.contains(&"List".to_string()),
         "List component should be used"
     );
+}
+
+#[test]
+fn vue_script_setup_records_split_type_and_value_usage() {
+    let info = parse_sfc(
+        r#"
+<script setup lang="ts">
+import { Status } from './status';
+
+const current = 'open' as Status;
+const options = Object.values(Status);
+</script>
+"#,
+        "SplitUsage.vue",
+    );
+
+    assert_eq!(
+        info.type_referenced_import_bindings,
+        vec!["Status".to_string()]
+    );
+    assert_eq!(
+        info.value_referenced_import_bindings,
+        vec!["Status".to_string()]
+    );
+}
+
+#[test]
+fn vue_script_setup_complexity_maps_to_sfc_lines() {
+    let info = parse_sfc_with_complexity(
+        r#"<template />
+<script setup lang="ts">
+const helper = () => {
+  if (flag) return 1;
+  return 0;
+};
+</script>
+"#,
+        "Complexity.vue",
+    );
+
+    assert_eq!(info.complexity.len(), 1);
+    let function = &info.complexity[0];
+    assert_eq!(function.name, "helper");
+    assert_eq!(function.line, 3);
+    assert_eq!(function.col, 15);
+    assert_eq!(function.cyclomatic, 2);
+}
+
+#[test]
+fn vue_inline_script_complexity_maps_columns_to_sfc_source() {
+    let info = parse_sfc_with_complexity(
+        r"<script>const helper = () => { if (flag) return 1; return 0; };</script>",
+        "InlineComplexity.vue",
+    );
+
+    assert_eq!(info.complexity.len(), 1);
+    let function = &info.complexity[0];
+    assert_eq!(function.name, "helper");
+    assert_eq!(function.line, 1);
+    assert_eq!(function.col, 23);
 }
 
 #[test]
