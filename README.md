@@ -236,6 +236,7 @@ Setup details:
 - `fallow license activate --trial --email ...` starts a trial and stores the signed license locally
 - `fallow license refresh` refreshes the stored license before the hard-fail window
 - `fallow coverage setup` detects your framework and package manager, installs the sidecar if needed, writes a collection recipe, and resumes from the current setup state on re-run
+- `fallow coverage upload-inventory` pushes a static function inventory to fallow cloud so the dashboard's `Untracked` filter (functions that exist but never run) lights up. Runs in CI, respects `.gitignore` + `--exclude-paths`, and fails fast if the current cloud join key would merge multiple same-named functions from one file into one row. For containerized deployments, pass `--path-prefix /app` (or your Dockerfile `WORKDIR`) so inventory paths match what the runtime beacon reports
 - The sidecar can be installed globally or as a project devDependency; fallow resolves `FALLOW_COV_BIN`, project-local shims, package-manager bin lookups, `~/.fallow/bin/fallow-cov`, and `PATH`
 - `fallow health --production-coverage <path>` accepts a V8 directory, a single V8 JSON file, or a single Istanbul coverage map JSON file (commonly `coverage-final.json`)
 - `fallow health --coverage <path>` accepts a single Istanbul coverage map JSON file or a directory containing `coverage-final.json`

@@ -10,6 +10,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use fallow_config::FallowConfig;
 
+mod api;
 mod audit;
 mod baseline;
 mod check;
@@ -703,6 +704,88 @@ enum CoverageCli {
         /// Print instructions instead of prompting.
         #[arg(long)]
         non_interactive: bool,
+    },
+    /// Upload a static function inventory to fallow cloud (Production
+    /// Coverage, paid). Unlocks the `untracked` filter on the dashboard by
+    /// pairing runtime coverage data with the AST view of "every function
+    /// that exists". See https://fallow.tools/coverage.
+    ///
+    /// This command is the only fallow subcommand that makes network calls
+    /// outside of `fallow license`. `fallow check` stays offline.
+    ///
+    /// Exit codes: 0 ok · 7 network · 10 validation · 11 payload too large
+    /// · 12 auth rejected · 13 server error.
+    UploadInventory {
+        /// Fallow cloud API key (bearer token).
+        ///
+        /// Precedence: this flag > $FALLOW_API_KEY. Generate at
+        /// https://fallow.cloud/settings#api-keys.
+        ///
+        /// Security: prefer $FALLOW_API_KEY on shared CI runners. Passing a
+        /// secret on the command line may be visible to other processes via
+        /// `ps` and can leak into shell history or process audit logs.
+        #[arg(long, value_name = "KEY")]
+        api_key: Option<String>,
+
+        /// Override the fallow cloud base URL.
+        ///
+        /// Useful for staging and on-premise deployments. Also respects
+        /// $FALLOW_API_URL when this flag is not set.
+        #[arg(long, value_name = "URL")]
+        api_endpoint: Option<String>,
+
+        /// Project identifier, `owner/repo` style.
+        ///
+        /// Defaults to $GITHUB_REPOSITORY, then $CI_PROJECT_PATH, then the
+        /// parsed origin URL from `git remote get-url origin`.
+        #[arg(long, value_name = "OWNER/REPO")]
+        project_id: Option<String>,
+
+        /// Explicit git SHA for this inventory.
+        ///
+        /// Default: `git rev-parse HEAD`. The inventory is keyed on this
+        /// value; the cloud back-fills hourly buckets with a matching SHA.
+        #[arg(long, value_name = "SHA")]
+        git_sha: Option<String>,
+
+        /// Proceed even when the working tree has uncommitted changes.
+        ///
+        /// Warning: the inventory is generated from the working copy, so it
+        /// may not match the uploaded git SHA. Commit or stash first if you
+        /// want a SHA-exact upload.
+        #[arg(long)]
+        allow_dirty: bool,
+
+        /// Additional glob patterns to exclude from the walk.
+        ///
+        /// Applied after the existing fallow ignore rules. Repeatable.
+        #[arg(long, value_name = "GLOB", num_args = 0..)]
+        exclude_paths: Vec<String>,
+
+        /// Prefix prepended to every emitted filePath so the static
+        /// inventory joins with the runtime beacon for your deployment.
+        /// Required for containerized deployments where the deployed
+        /// WORKDIR rebases paths at runtime. Default: none (paths emit
+        /// repo-relative, matching local runs and non-container CI).
+        ///
+        /// Common values: `/app` (typical Dockerfile), `/workspace`
+        /// (Buildpacks / Cloud Run), `/usr/src/app` (older Node images),
+        /// `/var/task` (Lambda), `/home/runner/work/<repo>/<repo>`
+        /// (GitHub Actions default checkout).
+        ///
+        /// Must start with `/` and use POSIX separators.
+        #[arg(long, value_name = "PREFIX")]
+        path_prefix: Option<String>,
+
+        /// Print what would be uploaded and exit. No network call.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Treat transient upload failures as warnings instead of errors
+        /// (exit 0). Validation and auth errors still fail hard; this only
+        /// downgrades transport and server errors.
+        #[arg(long)]
+        ignore_upload_errors: bool,
     },
 }
 
@@ -1734,6 +1817,27 @@ fn map_coverage_subcommand(sub: &CoverageCli) -> coverage::CoverageSubcommand {
         } => coverage::CoverageSubcommand::Setup(coverage::SetupArgs {
             yes: *yes,
             non_interactive: *non_interactive,
+        }),
+        CoverageCli::UploadInventory {
+            api_key,
+            api_endpoint,
+            project_id,
+            git_sha,
+            allow_dirty,
+            exclude_paths,
+            path_prefix,
+            dry_run,
+            ignore_upload_errors,
+        } => coverage::CoverageSubcommand::UploadInventory(coverage::UploadInventoryArgs {
+            api_key: api_key.clone(),
+            api_endpoint: api_endpoint.clone(),
+            project_id: project_id.clone(),
+            git_sha: git_sha.clone(),
+            allow_dirty: *allow_dirty,
+            exclude_paths: exclude_paths.clone(),
+            path_prefix: path_prefix.clone(),
+            dry_run: *dry_run,
+            ignore_upload_errors: *ignore_upload_errors,
         }),
     }
 }

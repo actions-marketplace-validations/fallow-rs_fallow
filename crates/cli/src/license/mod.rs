@@ -13,7 +13,6 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::Duration;
 
 use ed25519_dalek::VerifyingKey;
 use fallow_license::{
@@ -21,6 +20,8 @@ use fallow_license::{
     default_license_path, normalize_jwt, verify_jwt,
 };
 use serde::Deserialize;
+
+use crate::api::{NETWORK_EXIT_CODE, api_agent, api_url, http_status_message};
 
 /// Ed25519 verification key for fallow license JWT validation.
 #[cfg(not(feature = "test-sidecar-key"))]
@@ -38,11 +39,6 @@ pub const PUBLIC_KEY_BYTES: [u8; 32] = [
     0x7d, 0x59, 0xc5, 0x62, 0x3d, 0xd4, 0x0a, 0x74, 0xaa, 0x4d, 0x5a, 0x32, 0xac, 0x64, 0x5d, 0x3b,
     0x3f, 0x95, 0xda, 0xea, 0xe4, 0xc2, 0x2b, 0xe2, 0x54, 0x76, 0xdd, 0x6a, 0x48, 0x6f, 0x73, 0x82,
 ];
-const DEFAULT_API_URL: &str = "https://api.fallow.cloud";
-const NETWORK_EXIT_CODE: u8 = 7;
-const CONNECT_TIMEOUT_SECS: u64 = 5;
-const TOTAL_TIMEOUT_SECS: u64 = 10;
-
 /// Subcommands for `fallow license`.
 #[derive(Debug)]
 pub enum LicenseSubcommand {
@@ -304,23 +300,6 @@ pub fn refresh_active_license() -> Result<LicenseStatus, String> {
     store_verified_jwt(&mut response, "refresh")
 }
 
-fn api_agent() -> ureq::Agent {
-    ureq::Agent::config_builder()
-        .timeout_connect(Some(Duration::from_secs(CONNECT_TIMEOUT_SECS)))
-        .timeout_global(Some(Duration::from_secs(TOTAL_TIMEOUT_SECS)))
-        .http_status_as_error(false)
-        .build()
-        .new_agent()
-}
-
-fn api_url(path: &str) -> String {
-    let base = std::env::var("FALLOW_API_URL")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| DEFAULT_API_URL.to_owned());
-    format!("{}{path}", base.trim_end_matches('/'))
-}
-
 fn load_current_jwt() -> Result<String, String> {
     match fallow_license::load_raw_jwt() {
         Ok(Some(jwt)) => Ok(jwt),
@@ -333,7 +312,7 @@ fn load_current_jwt() -> Result<String, String> {
 }
 
 fn store_verified_jwt(
-    response: &mut impl ResponseBodyReader,
+    response: &mut impl crate::api::ResponseBodyReader,
     operation: &str,
 ) -> Result<LicenseStatus, String> {
     let payload: JwtResponse = response
@@ -351,73 +330,6 @@ fn store_verified_jwt(
         }
     }
     Ok(status)
-}
-
-#[derive(Debug, Deserialize, Default)]
-struct ErrorEnvelope {
-    #[serde(default)]
-    code: Option<String>,
-    #[serde(default)]
-    message: Option<String>,
-}
-
-/// Map a backend error-code + operation pair to an actionable user-facing
-/// hint. Returns `None` for unknown codes; callers fall back to the generic
-/// "HTTP N: body" shape.
-fn actionable_error_hint(operation: &str, code: &str) -> Option<&'static str> {
-    match (operation, code) {
-        ("refresh", "token_stale") => Some(
-            "your stored license is too stale to refresh. Reactivate with: fallow license activate --trial --email <addr>",
-        ),
-        ("refresh", "invalid_token") => Some(
-            "your stored license token is missing required claims. Reactivate with: fallow license activate --trial --email <addr>",
-        ),
-        ("refresh" | "trial", "unauthorized") => Some(
-            "authentication failed. Reactivate with: fallow license activate --trial --email <addr>",
-        ),
-        ("trial", "rate_limit_exceeded") => Some(
-            "trial creation is rate-limited to 5 per hour per IP. Wait an hour or retry from a different network (in CI, start the trial locally and set FALLOW_LICENSE on the runner).",
-        ),
-        _ => None,
-    }
-}
-
-fn http_status_message(response: &mut impl ResponseBodyReader, operation: &str) -> String {
-    let status = response.status();
-    let body = response.read_to_string().unwrap_or_else(|_| String::new());
-    let envelope: Option<ErrorEnvelope> = serde_json::from_str(&body).ok();
-    if let Some(envelope) = envelope.as_ref()
-        && let Some(code) = envelope.code.as_deref()
-        && let Some(hint) = actionable_error_hint(operation, code)
-    {
-        return format!("{hint} (HTTP {status}, code {code})");
-    }
-    let body_suffix = match envelope.as_ref().and_then(|e| e.message.as_deref()) {
-        Some(message) if !message.trim().is_empty() => format!(": {}", message.trim()),
-        _ if !body.trim().is_empty() => format!(": {}", body.trim()),
-        _ => String::new(),
-    };
-    format!("{operation} request failed with HTTP {status}{body_suffix}")
-}
-
-trait ResponseBodyReader {
-    fn status(&self) -> u16;
-    fn read_json(&mut self) -> Result<JwtResponse, ureq::Error>;
-    fn read_to_string(&mut self) -> Result<String, ureq::Error>;
-}
-
-impl ResponseBodyReader for http::Response<ureq::Body> {
-    fn status(&self) -> u16 {
-        self.status().as_u16()
-    }
-
-    fn read_json(&mut self) -> Result<JwtResponse, ureq::Error> {
-        self.body_mut().read_json()
-    }
-
-    fn read_to_string(&mut self) -> Result<String, ureq::Error> {
-        self.body_mut().read_to_string()
-    }
 }
 
 fn verify_downloaded_jwt(jwt: &str) -> Result<LicenseStatus, String> {
@@ -535,96 +447,5 @@ mod tests {
     fn run_trial_without_email_errors() {
         let exit = run_trial(None);
         assert_eq!(format!("{exit:?}"), format!("{:?}", ExitCode::from(2)));
-    }
-
-    struct StubResponse {
-        status: u16,
-        body: String,
-    }
-
-    impl ResponseBodyReader for StubResponse {
-        fn status(&self) -> u16 {
-            self.status
-        }
-
-        fn read_json(&mut self) -> Result<JwtResponse, ureq::Error> {
-            unreachable!("error-path tests do not read JSON")
-        }
-
-        fn read_to_string(&mut self) -> Result<String, ureq::Error> {
-            Ok(std::mem::take(&mut self.body))
-        }
-    }
-
-    #[test]
-    fn refresh_token_stale_hint_points_to_reactivation() {
-        let mut response = StubResponse {
-            status: 401,
-            body: r#"{"error":true,"message":"token stale","code":"token_stale"}"#.to_owned(),
-        };
-        let message = http_status_message(&mut response, "refresh");
-        assert!(
-            message.contains("Reactivate with: fallow license activate --trial"),
-            "expected reactivation hint, got: {message}"
-        );
-        assert!(message.contains("token_stale"));
-    }
-
-    #[test]
-    fn refresh_invalid_token_hint_points_to_reactivation() {
-        let mut response = StubResponse {
-            status: 401,
-            body: r#"{"error":true,"code":"invalid_token"}"#.to_owned(),
-        };
-        let message = http_status_message(&mut response, "refresh");
-        assert!(message.contains("missing required claims"));
-        assert!(message.contains("invalid_token"));
-    }
-
-    #[test]
-    fn trial_rate_limit_hint_mentions_five_per_hour() {
-        let mut response = StubResponse {
-            status: 429,
-            body: r#"{"error":true,"code":"rate_limit_exceeded"}"#.to_owned(),
-        };
-        let message = http_status_message(&mut response, "trial");
-        assert!(message.contains("5 per hour per IP"));
-        assert!(message.contains("FALLOW_LICENSE"));
-    }
-
-    #[test]
-    fn unknown_code_falls_back_to_backend_message_when_present() {
-        let mut response = StubResponse {
-            status: 500,
-            body: r#"{"error":true,"code":"checkout_error","message":"stripe returned no session url"}"#
-                .to_owned(),
-        };
-        let message = http_status_message(&mut response, "refresh");
-        assert!(message.starts_with("refresh request failed with HTTP 500"));
-        assert!(
-            message.ends_with(": stripe returned no session url"),
-            "expected backend message on fallback, got: {message}"
-        );
-    }
-
-    #[test]
-    fn unknown_code_without_message_falls_back_to_raw_body() {
-        let mut response = StubResponse {
-            status: 500,
-            body: r#"{"error":true,"code":"checkout_error"}"#.to_owned(),
-        };
-        let message = http_status_message(&mut response, "refresh");
-        assert!(message.starts_with("refresh request failed with HTTP 500"));
-        assert!(message.contains("checkout_error"));
-    }
-
-    #[test]
-    fn empty_body_still_produces_minimal_message() {
-        let mut response = StubResponse {
-            status: 502,
-            body: String::new(),
-        };
-        let message = http_status_message(&mut response, "trial");
-        assert_eq!(message, "trial request failed with HTTP 502");
     }
 }

@@ -1,5 +1,13 @@
-//! `fallow coverage setup` - resumable first-run state machine for the paid
-//! production-coverage analyzer.
+//! `fallow coverage` - paid Production Coverage onboarding and inventory
+//! upload.
+//!
+//! Today the subtree holds two commands:
+//!
+//! - `setup`: resumable first-run state machine (license + sidecar + recipe
+//!   + auto-handoff to `fallow health --production-coverage`).
+//! - `upload-inventory`: push a static function inventory to fallow cloud,
+//!   unlocking the `untracked` filter on the dashboard by pairing runtime
+//!   coverage data with the AST view of "every function that exists".
 
 use std::ffi::OsStr;
 use std::io::{self, Write};
@@ -12,6 +20,10 @@ use fallow_license::{DEFAULT_HARD_FAIL_DAYS, LicenseStatus};
 use crate::health::coverage as production_coverage;
 use crate::license;
 
+pub use upload_inventory::UploadInventoryArgs;
+
+mod upload_inventory;
+
 const COVERAGE_DOCS_URL: &str = "https://fallow.tools/coverage";
 
 /// Subcommands for `fallow coverage`.
@@ -19,6 +31,8 @@ const COVERAGE_DOCS_URL: &str = "https://fallow.tools/coverage";
 pub enum CoverageSubcommand {
     /// Resumable first-run setup flow.
     Setup(SetupArgs),
+    /// Upload a static function inventory to fallow cloud.
+    UploadInventory(UploadInventoryArgs),
 }
 
 /// Arguments for `fallow coverage setup`.
@@ -166,13 +180,10 @@ impl CoverageSetupContext {
 }
 
 /// Dispatch a `fallow coverage <sub>` invocation.
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "command dispatch consumes the mapped clap subcommand value"
-)]
 pub fn run(subcommand: CoverageSubcommand, root: &Path) -> ExitCode {
     match subcommand {
         CoverageSubcommand::Setup(args) => run_setup(args, root),
+        CoverageSubcommand::UploadInventory(args) => upload_inventory::run(&args, root),
     }
 }
 
@@ -220,7 +231,9 @@ fn run_setup(args: SetupArgs, root: &Path) -> ExitCode {
             "Step 4/4: Running fallow health --production-coverage {} ...",
             display_relative(root, &coverage_path)
         );
-        return run_health_analysis(root, &coverage_path);
+        let exit = run_health_analysis(root, &coverage_path);
+        print_upload_inventory_hint();
+        return exit;
     }
 
     println!("Step 3/4: Collecting coverage for your app.");
@@ -231,7 +244,21 @@ fn run_setup(args: SetupArgs, root: &Path) -> ExitCode {
         context.framework.label()
     );
     println!("  -> Run your app with the instrumentation on, then re-run this command.");
+    print_upload_inventory_hint();
     ExitCode::SUCCESS
+}
+
+/// Nudge the user toward `fallow coverage upload-inventory`. The runtime
+/// beacon gives the dashboard `called` / `never_called`; the static inventory
+/// upload gives it `untracked` (functions that exist but runtime never parsed).
+/// Without this hint, trial users finish setup with no signal that the
+/// dashboard's Untracked filter needs a second CI step to light up.
+fn print_upload_inventory_hint() {
+    println!();
+    println!("Next, in CI, upload the static function inventory so the dashboard's");
+    println!("Untracked filter lights up:");
+    println!("  fallow coverage upload-inventory");
+    println!("Set FALLOW_API_KEY on the runner. See {COVERAGE_DOCS_URL} for the full CI snippet.");
 }
 
 fn handle_license_step(
@@ -615,7 +642,7 @@ fn recipe_contents(context: &CoverageSetupContext) -> String {
         String::new(),
     ];
     lines.push("1. Remove any old dump directory: `rm -rf ./coverage`".to_owned());
-    if context.has_build_script || context.build_command().is_some() {
+    let final_step = if context.has_build_script || context.build_command().is_some() {
         if let Some(build_command) = context.build_command() {
             lines.push(format!("2. Build the app: `{build_command}`"));
         }
@@ -625,6 +652,7 @@ fn recipe_contents(context: &CoverageSetupContext) -> String {
         ));
         lines.push("4. Exercise the routes or jobs you care about.".to_owned());
         lines.push("5. Stop the app and run: `fallow coverage setup`".to_owned());
+        "6"
     } else {
         lines.push(format!(
             "2. Start the app with V8 coverage enabled: `NODE_V8_COVERAGE=./coverage {}`",
@@ -632,7 +660,16 @@ fn recipe_contents(context: &CoverageSetupContext) -> String {
         ));
         lines.push("3. Exercise the app traffic you want to analyze.".to_owned());
         lines.push("4. Stop the process and run: `fallow coverage setup`".to_owned());
-    }
+        "5"
+    };
+    lines.push(format!(
+        "{final_step}. In CI, after the build, run \
+         `fallow coverage upload-inventory` with `FALLOW_API_KEY` set. The \
+         upload is what enables the dashboard's Untracked filter (functions \
+         that exist but runtime coverage never parsed). Runtime coverage alone \
+         only answers `called` vs `never_called`; the static inventory adds \
+         the third state."
+    ));
     lines.push(String::new());
     lines.join("\n")
 }
@@ -749,6 +786,40 @@ mod tests {
 
         assert!(recipe.contains("`pnpm build`"));
         assert!(recipe.contains("`NODE_V8_COVERAGE=./coverage pnpm preview`"));
+    }
+
+    #[test]
+    fn recipe_contents_mentions_upload_inventory_ci_step() {
+        let context = CoverageSetupContext {
+            framework: FrameworkKind::SvelteKit,
+            package_manager: Some(PackageManager::Pnpm),
+            has_build_script: true,
+            has_start_script: false,
+            has_preview_script: true,
+        };
+        let recipe = recipe_contents(&context);
+        // Without this line the trial user finishes setup, wires the beacon,
+        // and has no idea the dashboard's Untracked filter needs a second
+        // CI step. Regression test for BLOCK 2 from the public-readiness
+        // panel (2026-04-22).
+        assert!(
+            recipe.contains("fallow coverage upload-inventory"),
+            "recipe missing upload-inventory CI instruction:\n{recipe}"
+        );
+        assert!(recipe.contains("FALLOW_API_KEY"));
+    }
+
+    #[test]
+    fn recipe_contents_mentions_upload_inventory_without_build_script() {
+        let context = CoverageSetupContext {
+            framework: FrameworkKind::PlainNode,
+            package_manager: Some(PackageManager::Npm),
+            has_build_script: false,
+            has_start_script: false,
+            has_preview_script: false,
+        };
+        let recipe = recipe_contents(&context);
+        assert!(recipe.contains("fallow coverage upload-inventory"));
     }
 
     #[test]

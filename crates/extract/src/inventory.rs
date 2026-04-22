@@ -172,10 +172,11 @@ pub fn walk_source(path: &Path, source: &str) -> Vec<InventoryEntry> {
     let mut visitor = InventoryVisitor::new(&line_offsets);
     visitor.visit_program(&parser_return.program);
 
-    // If the initial parse found nothing but the file has content, retry with
-    // JSX/TSX source type (matches parse.rs fallback for `.js` files that
-    // actually contain JSX).
-    if visitor.entries.is_empty() && source.len() > 100 && !source_type.is_jsx() {
+    // If the initial parse found nothing, retry with JSX/TSX source type
+    // (matches parse.rs fallback for `.js` files that actually contain JSX).
+    // Keep this independent of file length: tiny components such as
+    // `const A = () => <div />;` are common and still need inventory entries.
+    if visitor.entries.is_empty() && !source_type.is_jsx() {
         let jsx_type = if source_type.is_typescript() {
             SourceType::tsx()
         } else {
@@ -346,6 +347,14 @@ mod tests {
         let entries = walk("\n\nfunction atLineThree() {}");
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].line, 3);
+    }
+
+    #[test]
+    fn short_jsx_in_js_file_retries_with_jsx_parser() {
+        let entries = walk_source(&PathBuf::from("component.js"), "const A = () => <div />;");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "A");
+        assert_eq!(entries[0].line, 1);
     }
 
     #[test]
