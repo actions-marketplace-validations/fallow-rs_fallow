@@ -51,6 +51,9 @@ pub fn discover_workspaces(root: &Path) -> Vec<WorkspaceInfo> {
 
     let mut workspaces = expand_patterns_to_workspaces(root, &patterns, &canonical_root);
     workspaces.extend(collect_tsconfig_workspaces(root, &canonical_root));
+    if patterns.is_empty() {
+        workspaces.extend(collect_shallow_package_workspaces(root, &canonical_root));
+    }
 
     if workspaces.is_empty() {
         return Vec::new();
@@ -326,6 +329,82 @@ fn collect_tsconfig_workspaces(
     }
 
     workspaces
+}
+
+/// Discover shallow package workspaces when no explicit workspace config exists.
+///
+/// Scans direct children of the project root and their immediate children for
+/// `package.json` files. This catches repos that contain multiple standalone
+/// packages (for example `benchmarks/` or `editors/vscode/`) without declaring
+/// npm/pnpm workspaces at the root.
+fn collect_shallow_package_workspaces(
+    root: &Path,
+    canonical_root: &Path,
+) -> Vec<(WorkspaceInfo, Vec<String>)> {
+    let mut workspaces = Vec::new();
+    let Ok(top_entries) = std::fs::read_dir(root) else {
+        return workspaces;
+    };
+
+    for entry in top_entries.filter_map(Result::ok) {
+        let path = entry.path();
+        if !path.is_dir() || should_skip_workspace_scan_dir(&entry.file_name().to_string_lossy()) {
+            continue;
+        }
+
+        collect_shallow_workspace_candidate(&path, canonical_root, &mut workspaces);
+
+        let Ok(child_entries) = std::fs::read_dir(&path) else {
+            continue;
+        };
+        for child in child_entries.filter_map(Result::ok) {
+            let child_path = child.path();
+            if !child_path.is_dir()
+                || should_skip_workspace_scan_dir(&child.file_name().to_string_lossy())
+            {
+                continue;
+            }
+
+            collect_shallow_workspace_candidate(&child_path, canonical_root, &mut workspaces);
+        }
+    }
+
+    workspaces
+}
+
+fn collect_shallow_workspace_candidate(
+    dir: &Path,
+    canonical_root: &Path,
+    workspaces: &mut Vec<(WorkspaceInfo, Vec<String>)>,
+) {
+    let pkg_path = dir.join("package.json");
+    if !pkg_path.exists() {
+        return;
+    }
+
+    let canonical_dir = dunce::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    if canonical_dir == *canonical_root || !canonical_dir.starts_with(canonical_root) {
+        return;
+    }
+
+    let Ok(pkg) = PackageJson::load(&pkg_path) else {
+        return;
+    };
+    let dep_names = pkg.all_dependency_names();
+    let name = pkg.name.unwrap_or_else(|| dir_name(dir));
+
+    workspaces.push((
+        WorkspaceInfo {
+            root: dir.to_path_buf(),
+            name,
+            is_internal_dependency: false,
+        },
+        dep_names,
+    ));
+}
+
+fn should_skip_workspace_scan_dir(name: &str) -> bool {
+    name.starts_with('.') || name == "node_modules" || name == "build"
 }
 
 /// Deduplicate workspaces by canonical path and mark internal dependencies.
@@ -684,6 +763,37 @@ mod tests {
     }
 
     #[test]
+    fn discover_workspaces_falls_back_to_shallow_packages_without_workspace_config() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let benchmarks = dir.path().join("benchmarks");
+        let vscode = dir.path().join("editors").join("vscode");
+        let deep = dir.path().join("tests").join("fixtures").join("demo");
+        std::fs::create_dir_all(&benchmarks).unwrap();
+        std::fs::create_dir_all(&vscode).unwrap();
+        std::fs::create_dir_all(&deep).unwrap();
+
+        std::fs::write(benchmarks.join("package.json"), r#"{"name": "benchmarks"}"#).unwrap();
+        std::fs::write(vscode.join("package.json"), r#"{"name": "fallow-vscode"}"#).unwrap();
+        std::fs::write(deep.join("package.json"), r#"{"name": "deep-fixture"}"#).unwrap();
+
+        let workspaces = discover_workspaces(dir.path());
+        let names: Vec<&str> = workspaces.iter().map(|ws| ws.name.as_str()).collect();
+
+        assert!(
+            names.contains(&"benchmarks"),
+            "top-level nested package should be discovered: {workspaces:?}"
+        );
+        assert!(
+            names.contains(&"fallow-vscode"),
+            "second-level nested package should be discovered: {workspaces:?}"
+        );
+        assert!(
+            !names.contains(&"deep-fixture"),
+            "fallback should stay shallow and skip deep fixtures: {workspaces:?}"
+        );
+    }
+
+    #[test]
     fn discover_workspaces_with_negated_patterns() {
         let dir = tempfile::tempdir().expect("create temp dir");
         let pkg_a = dir.path().join("packages").join("a");
@@ -739,6 +849,33 @@ mod tests {
         let workspaces = discover_workspaces(dir.path());
         assert_eq!(workspaces.len(), 1);
         assert_eq!(workspaces[0].name, "my-app", "should fall back to dir name");
+    }
+
+    #[test]
+    fn discover_workspaces_explicit_patterns_disable_shallow_fallback() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let pkg_a = dir.path().join("packages").join("a");
+        let benchmarks = dir.path().join("benchmarks");
+        std::fs::create_dir_all(&pkg_a).unwrap();
+        std::fs::create_dir_all(&benchmarks).unwrap();
+
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"workspaces": ["packages/*"]}"#,
+        )
+        .unwrap();
+        std::fs::write(pkg_a.join("package.json"), r#"{"name": "a"}"#).unwrap();
+        std::fs::write(benchmarks.join("package.json"), r#"{"name": "benchmarks"}"#).unwrap();
+
+        let workspaces = discover_workspaces(dir.path());
+        let names: Vec<&str> = workspaces.iter().map(|ws| ws.name.as_str()).collect();
+
+        assert_eq!(workspaces.len(), 1);
+        assert!(names.contains(&"a"));
+        assert!(
+            !names.contains(&"benchmarks"),
+            "explicit workspace config should keep undeclared packages out: {workspaces:?}"
+        );
     }
 
     // ── find_undeclared_workspaces ─────────────────────────────────

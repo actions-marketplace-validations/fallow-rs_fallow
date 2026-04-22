@@ -394,3 +394,39 @@ fn tsconfig_references_analysis_detects_unused() {
         "index.ts should not be unused: {unused_file_names:?}"
     );
 }
+
+// ── Shallow nested package fallback ─────────────────────────────
+
+#[test]
+fn shallow_nested_package_scripts_become_entry_points_without_workspace_config() {
+    let root = fixture_path("shallow-package-scripts");
+    let config = create_config(root);
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+
+    let unused_file_names: Vec<String> = results
+        .unused_files
+        .iter()
+        .map(|f| {
+            f.path
+                .to_string_lossy()
+                .replace('\\', "/")
+                .rsplit('/')
+                .next()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect();
+
+    assert!(
+        !unused_file_names.contains(&"generate.mjs".to_string()),
+        "generate.mjs should be treated as a package.json script entry point: {unused_file_names:?}"
+    );
+    assert!(
+        !unused_file_names.contains(&"helper.mjs".to_string()),
+        "helper.mjs should be reachable from generate.mjs: {unused_file_names:?}"
+    );
+    assert!(
+        unused_file_names.contains(&"orphan.mjs".to_string()),
+        "orphan.mjs should remain unused: {unused_file_names:?}"
+    );
+}
