@@ -5,12 +5,12 @@
 //! Coverage story. The runtime coverage pipeline ships function hit-counts;
 //! the cloud computes `inventory minus runtime-seen = untracked`.
 //!
-//! The current cloud join key is `(filePath, functionName)`, so the walker in
-//! `fallow_core::extract::inventory` produces names that match the
-//! Istanbul/`oxc-coverage-instrument` naming path. To avoid silently wrong
-//! results, this command rejects uploads when a single file contains multiple
-//! distinct functions with the same emitted name, because the current backend
-//! would collapse them into one row.
+//! The cloud join key is `(filePath, functionName, lineNumber)` since the
+//! line-aware function-identity migration (`0010`), so distinct same-named
+//! functions at different lines in the same file are preserved and merged
+//! into their own rows. The walker in `fallow_core::extract::inventory`
+//! emits Istanbul / `oxc-coverage-instrument`-compatible names and unique
+//! 1-based line numbers per function declaration.
 //!
 //! This subcommand is a paid-tier workflow. It runs only when the user
 //! invokes it explicitly; no other fallow command touches the network.
@@ -22,7 +22,7 @@ use std::process::{Command, ExitCode};
 use fallow_config::{FallowConfig, ResolvedConfig};
 use fallow_core::extract::inventory::{InventoryEntry, walk_source};
 use globset::{Glob, GlobSet, GlobSetBuilder};
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashSet;
 use serde::{Deserialize, Serialize};
 
 use colored::Colorize as _;
@@ -70,8 +70,9 @@ pub struct UploadInventoryArgs {
     /// Explicit API endpoint base (e.g. staging, on-prem). Overrides
     /// `$FALLOW_API_URL` and the compiled-in default.
     pub api_endpoint: Option<String>,
-    /// Explicit project identifier (`owner/repo`). Overrides the auto-detected
-    /// git remote + `$GITHUB_REPOSITORY` / `$CI_PROJECT_PATH` heuristics.
+    /// Explicit project identifier (`fallow-cloud-api` or `owner/repo`).
+    /// Overrides the auto-detected git remote + `$GITHUB_REPOSITORY` /
+    /// `$CI_PROJECT_PATH` heuristics.
     pub project_id: Option<String>,
     /// Explicit git SHA. Overrides `git rev-parse HEAD`.
     pub git_sha: Option<String>,
@@ -178,8 +179,6 @@ fn run_inner(args: &UploadInventoryArgs, root: &Path) -> Result<(), UploadError>
         )));
     }
 
-    validate_join_key_uniqueness(&functions)?;
-
     let payload = InventoryRequest {
         git_sha: &git_sha,
         functions: &functions,
@@ -227,7 +226,7 @@ fn resolve_project_id(args: &UploadInventoryArgs, root: &Path) -> Result<String,
         return Ok(from_remote);
     }
     Err(UploadError::Validation(
-        "could not determine project id. Pass --project-id <owner/repo>, or set \
+        "could not determine project id. Pass --project-id <project-id>, or set \
          $GITHUB_REPOSITORY / $CI_PROJECT_PATH, or ensure `git remote get-url origin` \
          returns a recognizable URL."
             .to_owned(),
@@ -629,9 +628,11 @@ fn endpoint_url(override_endpoint: Option<&str>, project_id: &str) -> String {
     }
 }
 
-/// URL-encode a single path segment. We only allow `owner/repo` shapes so the
-/// set of characters is small; still treat slashes as the path separator
-/// (the server receives `{repo}` as a single pct-encoded segment).
+/// URL-encode the `{repo}` path segment.
+///
+/// Project IDs can be bare (`fallow-cloud-api`) or slash-scoped
+/// (`acme/widgets`), but the server receives them as a single percent-encoded
+/// segment under `/v1/coverage/{repo}/inventory`, so `/` must be encoded too.
 fn url_encode_path_segment(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for byte in value.bytes() {
@@ -875,64 +876,6 @@ fn count_digits(mut n: u32) -> usize {
     d
 }
 
-fn validate_join_key_uniqueness(functions: &[InventoryFunction]) -> Result<(), UploadError> {
-    let mut seen: FxHashMap<(&str, &str), Vec<u32>> = FxHashMap::default();
-    for function in functions {
-        seen.entry((&function.file_path, &function.function_name))
-            .or_default()
-            .push(function.line_number);
-    }
-
-    let mut collisions: Vec<(String, String, Vec<u32>)> = seen
-        .into_iter()
-        .filter_map(|((file_path, function_name), mut lines)| {
-            if lines.len() < 2 {
-                return None;
-            }
-            lines.sort_unstable();
-            lines.dedup();
-            if lines.len() < 2 {
-                return None;
-            }
-            Some((file_path.to_owned(), function_name.to_owned(), lines))
-        })
-        .collect();
-
-    if collisions.is_empty() {
-        return Ok(());
-    }
-
-    collisions.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
-    let examples = collisions
-        .iter()
-        .take(3)
-        .map(|(file_path, function_name, lines)| {
-            format!(
-                "{file_path}::{function_name} (lines {})",
-                format_line_list(lines)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("; ");
-
-    Err(UploadError::Validation(format!(
-        "inventory contains {} duplicate runtime join key(s). The current cloud \
-         join key is only (filePath, functionName), so distinct same-named \
-         functions in one file would be merged into one dashboard row. Examples: \
-         {examples}. Rename the conflicting functions, exclude the file(s) with \
-         --exclude-paths, or wait for backend support to include line numbers.",
-        collisions.len()
-    )))
-}
-
-fn format_line_list(lines: &[u32]) -> String {
-    lines
-        .iter()
-        .map(u32::to_string)
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -973,9 +916,9 @@ mod tests {
 
     #[test]
     fn parse_git_remote_nested_group_uses_last_two_segments() {
-        // GitLab supports nested groups; the server key is `owner/repo`. We
-        // take the trailing `(group-parent)/repo` pair; users with deeper
-        // nesting can pass --project-id explicitly.
+        // GitLab supports nested groups. Auto-detection keeps the familiar
+        // trailing `owner/repo` pair; repos that want the full namespace can
+        // pass --project-id explicitly.
         assert_eq!(
             parse_git_remote_to_project_id("https://gitlab.com/acme/team/widgets.git"),
             Some("team/widgets".to_owned())
@@ -1224,63 +1167,6 @@ mod tests {
             format!("{exit:?}"),
             format!("{:?}", ExitCode::from(EXIT_AUTH_REJECTED))
         );
-    }
-
-    #[test]
-    fn validate_join_key_uniqueness_rejects_same_name_in_same_file() {
-        let functions = vec![
-            InventoryFunction {
-                file_path: "src/a.ts".to_owned(),
-                function_name: "render".to_owned(),
-                line_number: 10,
-            },
-            InventoryFunction {
-                file_path: "src/a.ts".to_owned(),
-                function_name: "render".to_owned(),
-                line_number: 40,
-            },
-        ];
-        let err = validate_join_key_uniqueness(&functions).expect_err("must reject collisions");
-        let UploadError::Validation(message) = err else {
-            panic!("expected validation error, got {err:?}");
-        };
-        assert!(message.contains("duplicate runtime join key"));
-        assert!(message.contains("src/a.ts::render"));
-        assert!(message.contains("10, 40"));
-    }
-
-    #[test]
-    fn validate_join_key_uniqueness_allows_same_name_in_different_files() {
-        let functions = vec![
-            InventoryFunction {
-                file_path: "src/a.ts".to_owned(),
-                function_name: "render".to_owned(),
-                line_number: 10,
-            },
-            InventoryFunction {
-                file_path: "src/b.ts".to_owned(),
-                function_name: "render".to_owned(),
-                line_number: 10,
-            },
-        ];
-        assert!(validate_join_key_uniqueness(&functions).is_ok());
-    }
-
-    #[test]
-    fn validate_join_key_uniqueness_ignores_duplicate_line_repeats() {
-        let functions = vec![
-            InventoryFunction {
-                file_path: "src/a.ts".to_owned(),
-                function_name: "render".to_owned(),
-                line_number: 10,
-            },
-            InventoryFunction {
-                file_path: "src/a.ts".to_owned(),
-                function_name: "render".to_owned(),
-                line_number: 10,
-            },
-        ];
-        assert!(validate_join_key_uniqueness(&functions).is_ok());
     }
 
     #[test]

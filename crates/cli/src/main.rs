@@ -734,11 +734,11 @@ enum CoverageCli {
         #[arg(long, value_name = "URL")]
         api_endpoint: Option<String>,
 
-        /// Project identifier, `owner/repo` style.
+        /// Project identifier, for example `fallow-cloud-api` or `owner/repo`.
         ///
         /// Defaults to $GITHUB_REPOSITORY, then $CI_PROJECT_PATH, then the
         /// parsed origin URL from `git remote get-url origin`.
-        #[arg(long, value_name = "OWNER/REPO")]
+        #[arg(long, value_name = "PROJECT_ID")]
         project_id: Option<String>,
 
         /// Explicit git SHA for this inventory.

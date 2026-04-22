@@ -8,11 +8,12 @@
 //!
 //! # Naming contract
 //!
-//! The join key on the server is `(filePath, functionName)`. Anonymous
-//! functions are named `(anonymous_N)` where `N` is a file-scoped monotonic
-//! counter that starts at 0 and increments in pre-order AST traversal each
-//! time a function is entered without a resolvable explicit name. Name
-//! resolution precedence:
+//! The cloud stores function identity as
+//! `(filePath, functionName, lineNumber)`. This walker is responsible for the
+//! `functionName` and `lineNumber` parts of that contract. Anonymous functions
+//! are named `(anonymous_N)` where `N` is a file-scoped monotonic counter that
+//! starts at 0 and increments in pre-order AST traversal each time a function
+//! is entered without a resolvable explicit name. Name resolution precedence:
 //!
 //! 1. Parent-provided `pending_name` (from `MethodDefinition`,
 //!    `VariableDeclarator`), same pattern as the internal complexity visitor.
