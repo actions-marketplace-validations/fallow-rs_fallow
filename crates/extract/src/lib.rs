@@ -13,6 +13,7 @@ pub(crate) mod complexity;
 pub mod css;
 pub mod flags;
 pub mod html;
+pub mod inventory;
 pub mod mdx;
 mod parse;
 pub mod sfc;

@@ -21,6 +21,7 @@ pub use fallow_extract::{
 pub use fallow_extract::astro;
 pub use fallow_extract::css;
 pub use fallow_extract::flags;
+pub use fallow_extract::inventory;
 pub use fallow_extract::mdx;
 pub use fallow_extract::sfc;
 pub use fallow_extract::visitor;
