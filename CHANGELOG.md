@@ -12,7 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **Static inventory extractor (`fallow-extract`).** New extraction phase that produces a per-file list of exported functions keyed by `(path, name, line)`. Feeds the line-aware production-coverage matcher so runtime samples can be joined against the AST view of "every function that exists" without collisions on overloaded names.
-- **`fallow coverage upload-inventory`.** Uploads the static function inventory to fallow cloud so the Production Coverage dashboard can filter `untracked` functions (the AST side of the join: functions that exist in the code but were never observed at runtime). Requires a valid license. See <https://fallow.tools/coverage>.
+- **`fallow coverage upload-inventory`.** Uploads the static function inventory to fallow cloud so the Production Coverage dashboard can filter `untracked` functions (the AST side of the join: functions that exist in the code but were never observed at runtime). Requires a valid license. See <https://docs.fallow.tools/analysis/production-coverage>.
 
 ### Fixed
 

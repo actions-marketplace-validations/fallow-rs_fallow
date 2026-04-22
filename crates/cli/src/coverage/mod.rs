@@ -24,7 +24,7 @@ pub use upload_inventory::UploadInventoryArgs;
 
 mod upload_inventory;
 
-const COVERAGE_DOCS_URL: &str = "https://fallow.tools/coverage";
+const COVERAGE_DOCS_URL: &str = "https://docs.fallow.tools/analysis/production-coverage";
 
 /// Subcommands for `fallow coverage`.
 #[derive(Debug, Clone)]

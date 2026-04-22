@@ -708,7 +708,7 @@ enum CoverageCli {
     /// Upload a static function inventory to fallow cloud (Production
     /// Coverage, paid). Unlocks the `untracked` filter on the dashboard by
     /// pairing runtime coverage data with the AST view of "every function
-    /// that exists". See <https://fallow.tools/coverage>.
+    /// that exists". See <https://docs.fallow.tools/analysis/production-coverage>.
     ///
     /// This command is the only fallow subcommand that makes network calls
     /// outside of `fallow license`. `fallow check` stays offline.
