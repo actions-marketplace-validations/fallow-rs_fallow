@@ -108,17 +108,17 @@ fallow --format json
 If the repo is not ready for a full cleanup in one pass, stage adoption deliberately:
 
 ```bash
-fallow dead-code --save-baseline .fallow-dead-code-baseline.json
-fallow health    --save-baseline .fallow-health-baseline.json
-fallow dupes     --save-baseline .fallow-dupes-baseline.json
+fallow dead-code --save-baseline fallow-baselines/dead-code.json
+fallow health    --save-baseline fallow-baselines/health.json
+fallow dupes     --save-baseline fallow-baselines/dupes.json
 
 fallow audit \
-  --dead-code-baseline .fallow-dead-code-baseline.json \
-  --health-baseline    .fallow-health-baseline.json \
-  --dupes-baseline     .fallow-dupes-baseline.json
+  --dead-code-baseline fallow-baselines/dead-code.json \
+  --health-baseline    fallow-baselines/health.json \
+  --dupes-baseline     fallow-baselines/dupes.json
 ```
 
-Keep committed baselines outside `.fallow/`; that directory is usually gitignored cache/local state, not a good home for review gates that should travel with the repo.
+Keep committed baselines outside `.fallow/`; that directory is usually gitignored cache/local state, not a good home for review gates that should travel with the repo. `fallow-baselines/` is the recommended default.
 
 ## Notes On Health
 

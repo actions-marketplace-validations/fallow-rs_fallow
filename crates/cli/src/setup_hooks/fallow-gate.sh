@@ -58,4 +58,14 @@ if [ "$STATUS" -eq 2 ] || [ "$IS_ERROR" = "true" ]; then
   exit 0
 fi
 
+if [ "$STATUS" -ne 0 ]; then
+  ERR_LINE="$(sed -n '1p' "$TMP_ERR" 2>/dev/null || true)"
+  if [ -n "$ERR_LINE" ]; then
+    echo "fallow-gate: fallow audit exited $STATUS ($ERR_LINE), skipping." >&2
+  else
+    echo "fallow-gate: fallow audit exited $STATUS, skipping." >&2
+  fi
+  exit 0
+fi
+
 exit 0

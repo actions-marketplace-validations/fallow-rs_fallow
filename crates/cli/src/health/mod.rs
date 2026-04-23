@@ -1451,6 +1451,16 @@ fn save_health_baseline(
     );
     match serde_json::to_string_pretty(&baseline) {
         Ok(json) => {
+            if let Some(parent) = save_path.parent()
+                && !parent.as_os_str().is_empty()
+                && let Err(e) = std::fs::create_dir_all(parent)
+            {
+                return Err(emit_error(
+                    &format!("failed to create health baseline directory: {e}"),
+                    2,
+                    output,
+                ));
+            }
             if let Err(e) = std::fs::write(save_path, json) {
                 return Err(emit_error(
                     &format!("failed to save health baseline: {e}"),

@@ -3,6 +3,7 @@ mod common;
 
 use common::{fixture_path, parse_json, redact_all, run_fallow, run_fallow_in_root};
 use std::path::Path;
+use tempfile::tempdir;
 
 fn write_file(path: &Path, contents: &str) {
     if let Some(parent) = path.parent() {
@@ -72,6 +73,46 @@ fn health_json_has_findings() {
     assert!(
         json.get("findings").is_some(),
         "health JSON should have findings key"
+    );
+}
+
+#[test]
+fn health_save_baseline_creates_parent_directory() {
+    let dir = tempdir().unwrap();
+    write_file(
+        &dir.path().join("package.json"),
+        r#"{"name":"health-save","version":"1.0.0"}"#,
+    );
+    write_file(
+        &dir.path().join("src/index.ts"),
+        r"export function alpha(value: number): number {
+  if (value > 10) return value * 2;
+  return value + 1;
+}
+",
+    );
+
+    let baseline_path = dir.path().join("fallow-baselines/health.json");
+    let output = run_fallow_in_root(
+        "health",
+        dir.path(),
+        &[
+            "--targets",
+            "--save-baseline",
+            baseline_path.to_str().unwrap(),
+            "--format",
+            "json",
+            "--quiet",
+        ],
+    );
+    let rendered = redact_all(&format!("{}\n{}", output.stdout, output.stderr), dir.path());
+    assert_eq!(
+        output.code, 0,
+        "health save baseline should succeed: {rendered}"
+    );
+    assert!(
+        baseline_path.exists(),
+        "health save baseline should create nested file: {rendered}"
     );
 }
 

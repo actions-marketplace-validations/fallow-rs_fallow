@@ -267,18 +267,18 @@ Returns a verdict: **pass** (exit 0), **warn** (exit 0, warn-severity only), or 
 
 ```bash
 # Save once from a clean ref
-fallow dead-code --save-baseline .fallow-dead-code-baseline.json
-fallow health    --save-baseline .fallow-health-baseline.json
-fallow dupes     --save-baseline .fallow-dupes-baseline.json
+fallow dead-code --save-baseline fallow-baselines/dead-code.json
+fallow health    --save-baseline fallow-baselines/health.json
+fallow dupes     --save-baseline fallow-baselines/dupes.json
 
 # Feed into audit on every PR
 fallow audit \
-  --dead-code-baseline .fallow-dead-code-baseline.json \
-  --health-baseline    .fallow-health-baseline.json \
-  --dupes-baseline     .fallow-dupes-baseline.json
+  --dead-code-baseline fallow-baselines/dead-code.json \
+  --health-baseline    fallow-baselines/health.json \
+  --dupes-baseline     fallow-baselines/dupes.json
 ```
 
-Keep committed baselines outside `.fallow/`; that directory is for cache and local data and is typically gitignored. Configure defaults in `.fallowrc.json` under `audit.deadCodeBaseline` / `audit.healthBaseline` / `audit.dupesBaseline` so CI stays one command (`fallow audit`). CLI flags override config.
+Keep committed baselines outside `.fallow/`; that directory is for cache and local data and is typically gitignored. `fallow-baselines/` is the recommended default. Configure defaults in `.fallowrc.json` under `audit.deadCodeBaseline` / `audit.healthBaseline` / `audit.dupesBaseline` so CI stays one command (`fallow audit`). CLI flags override config.
 
 ## CI integration
 

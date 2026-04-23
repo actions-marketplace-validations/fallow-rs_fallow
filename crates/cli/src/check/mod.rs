@@ -519,6 +519,16 @@ fn handle_baseline(
         let baseline_data = BaselineData::from_results(results, root);
         match serde_json::to_string_pretty(&baseline_data) {
             Ok(json) => {
+                if let Some(parent) = baseline_path.parent()
+                    && !parent.as_os_str().is_empty()
+                    && let Err(e) = std::fs::create_dir_all(parent)
+                {
+                    return Err(emit_error(
+                        &format!("failed to create baseline directory: {e}"),
+                        2,
+                        output,
+                    ));
+                }
                 if let Err(e) = std::fs::write(baseline_path, json) {
                     return Err(emit_error(
                         &format!("failed to save baseline: {e}"),

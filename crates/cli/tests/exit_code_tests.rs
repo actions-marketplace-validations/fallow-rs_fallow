@@ -212,7 +212,7 @@ fn save_baseline_creates_file() {
     // Pre-clean to avoid false positives from previous runs
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::create_dir_all(&dir);
-    let baseline_path = dir.join("baseline.json");
+    let baseline_path = dir.join("fallow-baselines/dead-code.json");
 
     let output = run_fallow(
         "check",

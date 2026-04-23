@@ -13,7 +13,7 @@
 //! surfaces: `init --hooks` writes into `.git/hooks/`, and this one writes
 //! into `.claude/` / `AGENTS.md`.
 
-use std::io::Write;
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -324,7 +324,16 @@ fn merge_claude_settings(
     force: bool,
     dry_run: bool,
 ) -> Result<SettingsOutcome, String> {
-    let existing_raw = std::fs::read_to_string(path).ok();
+    let existing_raw = match read_optional_text(path) {
+        Ok(contents) => contents,
+        Err(_) if force => None,
+        Err(err) => {
+            return Err(format!(
+                "Failed to read {}: {err}; re-run with --force to overwrite.",
+                path.display()
+            ));
+        }
+    };
     let desired: serde_json::Value = serde_json::from_str(CLAUDE_SETTINGS_DEFAULT)
         .map_err(|e| format!("internal default settings.json is invalid: {e}"))?;
 
@@ -345,7 +354,7 @@ fn merge_claude_settings(
                 }
             };
             let (value, added, removed, preserved) = merge_settings_value(&current, &desired)?;
-            let outcome = if added == 0 && removed == 0 {
+            let outcome = if value == current {
                 SettingsOutcome::Unchanged {
                     handlers_preserved: preserved,
                 }
@@ -381,7 +390,9 @@ fn merge_claude_settings(
 /// scaffolding (`Bash` group, `PreToolUse`, `hooks`) as it drops to zero
 /// entries. Leaves non-fallow handlers and unrelated top-level keys alone.
 fn uninstall_claude_settings(path: &Path, dry_run: bool) -> Result<SettingsOutcome, String> {
-    let Ok(raw) = std::fs::read_to_string(path) else {
+    let Some(raw) =
+        read_optional_text(path).map_err(|e| format!("Failed to read {}: {e}", path.display()))?
+    else {
         return Ok(SettingsOutcome::NotPresent);
     };
     if raw.trim().is_empty() {
@@ -489,46 +500,50 @@ fn merge_settings_value(
         .cloned()
         .unwrap_or_default();
 
-    let group_idx = pretool_arr
-        .iter()
-        .position(|group| group.get("matcher").and_then(serde_json::Value::as_str) == Some("Bash"));
+    let mut removed_existing = 0usize;
+    let mut preserved = 0usize;
+    let mut first_bash_idx = None;
 
-    let (removed_existing, preserved, added_now) = match group_idx {
-        Some(idx) => {
-            let group = pretool_arr[idx]
-                .as_object_mut()
-                .ok_or_else(|| "PreToolUse group must be a JSON object".to_string())?;
-            let group_hooks = group
-                .entry("hooks".to_string())
-                .or_insert_with(|| serde_json::json!([]))
-                .as_array_mut()
-                .ok_or_else(|| "PreToolUse group `hooks` must be an array".to_string())?;
-
-            let fallow_before = group_hooks.iter().filter(|h| is_fallow_handler(h)).count();
-            group_hooks.retain(|handler| !is_fallow_handler(handler));
-            let preserved_count = group_hooks.len();
-            let added = desired_handlers.len();
-            group_hooks.extend(desired_handlers);
-            (fallow_before, preserved_count, added)
+    for (idx, group) in pretool_arr.iter_mut().enumerate() {
+        let Some(group_obj) = group.as_object_mut() else {
+            continue;
+        };
+        if group_obj.get("matcher").and_then(serde_json::Value::as_str) != Some("Bash") {
+            continue;
         }
-        None => {
-            let added = desired_handlers.len();
-            pretool_arr.push(serde_json::json!({
-                "matcher": "Bash",
-                "hooks": desired_handlers,
-            }));
-            (0, 0, added)
+        if first_bash_idx.is_none() {
+            first_bash_idx = Some(idx);
         }
-    };
+        let group_hooks = group_obj
+            .entry("hooks".to_string())
+            .or_insert_with(|| serde_json::json!([]))
+            .as_array_mut()
+            .ok_or_else(|| "PreToolUse group `hooks` must be an array".to_string())?;
+        let before = group_hooks.len();
+        group_hooks.retain(|handler| !is_fallow_handler(handler));
+        removed_existing += before - group_hooks.len();
+        preserved += group_hooks.len();
+    }
 
-    // Net `added` counts new handlers over what was already there; on a
-    // repeat run where the file already contains an identical canonical
-    // handler, `removed_existing == added_now` and the report reflects "no
-    // net change."
-    let net_added = added_now.saturating_sub(removed_existing);
-    let net_removed = removed_existing.saturating_sub(added_now);
+    let added_now = desired_handlers.len();
+    if let Some(idx) = first_bash_idx {
+        let group = pretool_arr[idx]
+            .as_object_mut()
+            .ok_or_else(|| "PreToolUse group must be a JSON object".to_string())?;
+        let group_hooks = group
+            .entry("hooks".to_string())
+            .or_insert_with(|| serde_json::json!([]))
+            .as_array_mut()
+            .ok_or_else(|| "PreToolUse group `hooks` must be an array".to_string())?;
+        group_hooks.extend(desired_handlers);
+    } else {
+        pretool_arr.push(serde_json::json!({
+            "matcher": "Bash",
+            "hooks": desired_handlers,
+        }));
+    }
 
-    Ok((out, net_added, net_removed, preserved))
+    Ok((out, added_now, removed_existing, preserved))
 }
 
 /// Strip fallow-owned handlers from a settings `serde_json::Value`,
@@ -607,7 +622,16 @@ fn is_fallow_handler(handler: &serde_json::Value) -> bool {
     handler
         .get("command")
         .and_then(serde_json::Value::as_str)
-        .is_some_and(|cmd| cmd.contains("/fallow-gate.sh") || cmd.contains("\\fallow-gate.sh"))
+        .is_some_and(|cmd| {
+            let trimmed = cmd.trim();
+            ["\"$CLAUDE_PROJECT_DIR\"", "$CLAUDE_PROJECT_DIR"]
+                .into_iter()
+                .filter_map(|prefix| trimmed.strip_prefix(prefix))
+                .any(|suffix| {
+                    suffix == "/.claude/hooks/fallow-gate.sh"
+                        || suffix == "\\.claude\\hooks\\fallow-gate.sh"
+                })
+        })
 }
 
 // ── Hook script write / remove ──────────────────────────────────────
@@ -706,7 +730,7 @@ fn set_executable_bit(_path: &Path) {
 /// that it is appended at the end with a horizontal-rule separator so the
 /// block reads as deliberate rather than orphaned prose.
 fn upsert_managed_block(path: &Path, dry_run: bool) -> std::io::Result<AgentsOutcome> {
-    let existing = std::fs::read_to_string(path).unwrap_or_default();
+    let existing = read_optional_text(path)?.unwrap_or_default();
     let new_block = format!("{AGENTS_BLOCK_START}\n{AGENTS_BLOCK_BODY}{AGENTS_BLOCK_END}\n");
 
     let (next, outcome) =
@@ -761,7 +785,7 @@ fn upsert_managed_block(path: &Path, dry_run: bool) -> std::io::Result<AgentsOut
 }
 
 fn remove_managed_block(path: &Path, dry_run: bool) -> std::io::Result<AgentsOutcome> {
-    let Ok(existing) = std::fs::read_to_string(path) else {
+    let Some(existing) = read_optional_text(path)? else {
         return Ok(AgentsOutcome::NotPresent);
     };
     let Some(start) = existing.find(AGENTS_BLOCK_START) else {
@@ -821,7 +845,7 @@ fn find_tooling_insertion_point(text: &str) -> Option<usize> {
 
 fn ensure_gitignore_entry(root: &Path, entry: &str) -> std::io::Result<()> {
     let gitignore_path = root.join(".gitignore");
-    let existing = std::fs::read_to_string(&gitignore_path).unwrap_or_default();
+    let existing = read_optional_text(&gitignore_path)?.unwrap_or_default();
     let target = entry.trim_end_matches('/');
     let already_ignored = existing.lines().any(|line| {
         let trimmed = line.trim();
@@ -841,6 +865,14 @@ fn ensure_gitignore_entry(root: &Path, entry: &str) -> std::io::Result<()> {
         contents.push('\n');
     }
     std::fs::write(&gitignore_path, contents)
+}
+
+fn read_optional_text(path: &Path) -> std::io::Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(contents) => Ok(Some(contents)),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err),
+    }
 }
 
 fn home_dir() -> Option<PathBuf> {
@@ -1068,6 +1100,31 @@ mod tests {
     }
 
     #[test]
+    fn settings_merge_errors_on_invalid_utf8_without_force() {
+        let tmp = tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".claude")).unwrap();
+        let path = tmp.path().join(".claude/settings.json");
+        std::fs::write(&path, [0xff, 0xfe, 0xfd]).unwrap();
+
+        let err = merge_claude_settings(&path, false, false)
+            .expect_err("invalid UTF-8 should not be silently replaced");
+        assert!(err.contains("re-run with --force"));
+    }
+
+    #[test]
+    fn settings_merge_force_overwrites_invalid_utf8() {
+        let tmp = tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".claude")).unwrap();
+        let path = tmp.path().join(".claude/settings.json");
+        std::fs::write(&path, [0xff, 0xfe, 0xfd]).unwrap();
+
+        let outcome = merge_claude_settings(&path, true, false).unwrap();
+        assert!(matches!(outcome, SettingsOutcome::Created));
+        let raw = std::fs::read_to_string(path).unwrap();
+        assert!(raw.contains("\"$schema\""));
+    }
+
+    #[test]
     fn script_refuses_to_clobber_user_edited_without_force() {
         let tmp = tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join(".claude/hooks")).unwrap();
@@ -1230,6 +1287,48 @@ mod tests {
     }
 
     #[test]
+    fn stale_fallow_handlers_are_removed_from_all_bash_groups() {
+        let tmp = tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".claude")).unwrap();
+        let existing = r#"{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          { "type": "command", "command": "bun run lint" }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          { "type": "command", "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/fallow-gate.sh" }
+        ]
+      }
+    ]
+  }
+}"#;
+        std::fs::write(tmp.path().join(".claude/settings.json"), existing).unwrap();
+
+        let mut o = opts(tmp.path());
+        o.agent = Some(HookAgentArg::Claude);
+        assert_eq!(run_setup_hooks(&o), ExitCode::SUCCESS);
+
+        let raw = std::fs::read_to_string(tmp.path().join(".claude/settings.json")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let groups = parsed["hooks"]["PreToolUse"].as_array().unwrap();
+        let fallow_count = groups
+            .iter()
+            .flat_map(|group| group["hooks"].as_array().into_iter().flatten())
+            .filter(|handler| is_fallow_handler(handler))
+            .count();
+        assert_eq!(
+            fallow_count, 1,
+            "expected a single canonical fallow handler"
+        );
+    }
+
+    #[test]
     fn agents_block_inserts_under_tooling_heading() {
         let tmp = tempdir().unwrap();
         let agents_path = tmp.path().join("AGENTS.md");
@@ -1273,10 +1372,34 @@ mod tests {
     fn is_fallow_handler_matches_both_path_separators() {
         let unix = serde_json::json!({ "type": "command", "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/fallow-gate.sh" });
         let windows = serde_json::json!({ "type": "command", "command": "$CLAUDE_PROJECT_DIR\\.claude\\hooks\\fallow-gate.sh" });
+        let quoted = serde_json::json!({ "type": "command", "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/fallow-gate.sh" });
         let unrelated = serde_json::json!({ "type": "command", "command": "bun run lint" });
+        let mentions_path = serde_json::json!({ "type": "command", "command": "bash -lc 'cp /tmp/fallow-gate.sh /tmp/fallow-gate.sh.bak && bun run lint'" });
         assert!(is_fallow_handler(&unix));
         assert!(is_fallow_handler(&windows));
+        assert!(is_fallow_handler(&quoted));
         assert!(!is_fallow_handler(&unrelated));
+        assert!(!is_fallow_handler(&mentions_path));
+    }
+
+    #[test]
+    fn agents_block_errors_on_invalid_utf8() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("AGENTS.md");
+        std::fs::write(&path, [0xff, 0xfe, 0xfd]).unwrap();
+
+        let err = upsert_managed_block(&path, false).expect_err("invalid UTF-8 should error");
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn gitignore_errors_on_invalid_utf8() {
+        let tmp = tempdir().unwrap();
+        std::fs::write(tmp.path().join(".gitignore"), [0xff, 0xfe, 0xfd]).unwrap();
+
+        let err =
+            ensure_gitignore_entry(tmp.path(), ".claude/").expect_err("invalid UTF-8 should error");
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
     }
 
     // ── Uninstall tests ──────────────────────────────────────────────

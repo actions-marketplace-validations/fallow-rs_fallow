@@ -1,7 +1,8 @@
 #[path = "common/mod.rs"]
 mod common;
 
-use common::{fixture_path, parse_json, redact_all, run_fallow};
+use common::{fixture_path, parse_json, redact_all, run_fallow, run_fallow_in_root};
+use tempfile::tempdir;
 
 // ---------------------------------------------------------------------------
 // JSON output structure
@@ -94,6 +95,42 @@ fn dupes_top_flag() {
     assert!(
         groups.len() <= 1,
         "--top 1 should return at most 1 clone group"
+    );
+}
+
+#[test]
+fn dupes_save_baseline_creates_parent_directory() {
+    let dir = tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("package.json"),
+        r#"{"name":"dupes-save","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    let clone = "export function shared(value) {\n  if (value > 1) {\n    return value * 2;\n  }\n  return value + 1;\n}\n";
+    std::fs::write(dir.path().join("src/one.ts"), clone).unwrap();
+    std::fs::write(dir.path().join("src/two.ts"), clone).unwrap();
+
+    let baseline_path = dir.path().join("fallow-baselines/dupes.json");
+    let output = run_fallow_in_root(
+        "dupes",
+        dir.path(),
+        &[
+            "--save-baseline",
+            baseline_path.to_str().unwrap(),
+            "--format",
+            "json",
+            "--quiet",
+        ],
+    );
+    let rendered = redact_all(&format!("{}\n{}", output.stdout, output.stderr), dir.path());
+    assert!(
+        output.code == 0 || output.code == 1,
+        "dupes save baseline should not crash: {rendered}"
+    );
+    assert!(
+        baseline_path.exists(),
+        "dupes save baseline should create nested file: {rendered}"
     );
 }
 

@@ -202,6 +202,16 @@ pub fn execute_dupes(opts: &DupesOptions<'_>) -> Result<DupesResult, ExitCode> {
         let baseline_data = DuplicationBaselineData::from_report(&report, &config.root);
         match serde_json::to_string_pretty(&baseline_data) {
             Ok(json) => {
+                if let Some(parent) = path.parent()
+                    && !parent.as_os_str().is_empty()
+                    && let Err(e) = std::fs::create_dir_all(parent)
+                {
+                    return Err(emit_error(
+                        &format!("failed to create duplication baseline directory: {e}"),
+                        2,
+                        opts.output,
+                    ));
+                }
                 if let Err(e) = std::fs::write(path, json) {
                     return Err(emit_error(
                         &format!("failed to write duplication baseline: {e}"),
