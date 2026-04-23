@@ -911,11 +911,13 @@ dependencies = [
  "fallow-types",
  "fixedbitset",
  "globset",
+ "json_comments",
  "oxc_resolver",
  "oxc_span 0.125.0",
  "proptest",
  "rayon",
  "rustc-hash 2.1.2",
+ "serde_json",
  "tempfile",
  "tracing",
 ]

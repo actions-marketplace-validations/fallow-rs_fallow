@@ -121,6 +121,33 @@ fn broken_tsconfig_extends_does_not_poison_sibling_resolution() {
     );
 }
 
+#[test]
+fn broken_tsconfig_path_alias_is_not_misclassified_as_unlisted_dependency() {
+    let root = fixture_path("tsconfig-broken-path-alias").join("app");
+    let config = create_config(root);
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+
+    let unlisted_names: Vec<&str> = results
+        .unlisted_dependencies
+        .iter()
+        .map(|dep| dep.package_name.as_str())
+        .collect();
+    let unresolved_specifiers: Vec<&str> = results
+        .unresolved_imports
+        .iter()
+        .map(|import| import.specifier.as_str())
+        .collect();
+
+    assert!(
+        !unlisted_names.contains(&"@gen/foo"),
+        "@gen/foo is a declared tsconfig path alias and should not be treated as an unlisted dependency: {unlisted_names:?}"
+    );
+    assert!(
+        unresolved_specifiers.contains(&"@gen/foo"),
+        "@gen/foo should remain unresolved when the tsconfig chain is broken: {unresolved_specifiers:?}"
+    );
+}
+
 // ── Interface-mediated class member usage (issue #132) ──────
 
 #[test]

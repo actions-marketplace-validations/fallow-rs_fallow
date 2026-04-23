@@ -1,8 +1,12 @@
 //! Main resolution engine: creates the oxc_resolver instance and resolves individual specifiers.
 
+use std::fs::File;
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 
+use json_comments::StripComments;
 use oxc_resolver::{Resolution, ResolveError, ResolveOptions, Resolver};
+use serde_json::Value;
 
 use super::fallbacks::{
     extract_package_name_from_node_modules_path, try_path_alias_fallback,
@@ -77,6 +81,11 @@ const fn is_tsconfig_error(err: &ResolveError) -> bool {
     )
 }
 
+enum ResolveFileAttempt {
+    Resolved(Resolution),
+    Failed { used_tsconfig_fallback: bool },
+}
+
 /// Try `resolve_file` first (honors per-file tsconfig discovery); on a
 /// tsconfig-loading failure, retry with `resolve(dir, specifier)` which skips
 /// tsconfig entirely. Emits a single `tracing::warn!` per unique error message
@@ -85,15 +94,22 @@ fn resolve_file_with_tsconfig_fallback(
     ctx: &ResolveContext<'_>,
     from_file: &Path,
     specifier: &str,
-) -> Result<Resolution, ResolveError> {
+) -> ResolveFileAttempt {
     match ctx.resolver.resolve_file(from_file, specifier) {
-        Ok(resolution) => Ok(resolution),
+        Ok(resolution) => ResolveFileAttempt::Resolved(resolution),
         Err(err) if is_tsconfig_error(&err) => {
             warn_once_tsconfig(ctx, &err);
             let dir = from_file.parent().unwrap_or(from_file);
-            ctx.resolver.resolve(dir, specifier)
+            match ctx.resolver.resolve(dir, specifier) {
+                Ok(resolution) => ResolveFileAttempt::Resolved(resolution),
+                Err(_) => ResolveFileAttempt::Failed {
+                    used_tsconfig_fallback: true,
+                },
+            }
         }
-        Err(err) => Err(err),
+        Err(_) => ResolveFileAttempt::Failed {
+            used_tsconfig_fallback: false,
+        },
     }
 }
 
@@ -117,6 +133,58 @@ fn warn_once_tsconfig(ctx: &ResolveContext<'_>, err: &ResolveError) {
              (e.g., `@/...`) will not. Fix the extends/references chain to restore alias support."
         );
     }
+}
+
+fn nearest_tsconfig_path(root: &Path, from_file: &Path) -> Option<PathBuf> {
+    let mut current = from_file.parent()?;
+    loop {
+        let candidate = current.join("tsconfig.json");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        if current == root {
+            return None;
+        }
+        current = current.parent()?;
+        if !current.starts_with(root) {
+            return None;
+        }
+    }
+}
+
+fn path_alias_pattern_matches(pattern: &str, specifier: &str) -> bool {
+    match pattern.split_once('*') {
+        Some((prefix, suffix)) if !prefix.is_empty() || !suffix.is_empty() => {
+            specifier.starts_with(prefix)
+                && specifier.ends_with(suffix)
+                && specifier.len() >= prefix.len() + suffix.len()
+        }
+        Some(_) => false,
+        None => specifier == pattern,
+    }
+}
+
+fn matches_nearest_tsconfig_path_alias(root: &Path, from_file: &Path, specifier: &str) -> bool {
+    let Some(tsconfig_path) = nearest_tsconfig_path(root, from_file) else {
+        return false;
+    };
+    let Ok(file) = File::open(tsconfig_path) else {
+        return false;
+    };
+    let reader = StripComments::new(BufReader::new(file));
+    let Ok(json) = serde_json::from_reader::<_, Value>(reader) else {
+        return false;
+    };
+    let Some(paths) = json
+        .get("compilerOptions")
+        .and_then(|compiler_options| compiler_options.get("paths"))
+        .and_then(Value::as_object)
+    else {
+        return false;
+    };
+    paths
+        .keys()
+        .any(|pattern| path_alias_pattern_matches(pattern, specifier))
 }
 
 /// Try the SCSS-specific resolution fallbacks in order: local partial,
@@ -285,7 +353,7 @@ pub(super) fn resolve_specifier(
     // the directory-only `resolve()` form so a broken sibling config does not poison
     // resolution for files covered by a healthy sibling. See issue #97.
     match resolve_file_with_tsconfig_fallback(ctx, from_file, specifier) {
-        Ok(resolved) => {
+        ResolveFileAttempt::Resolved(resolved) => {
             let resolved_path = resolved.path();
             // Try raw path lookup first (avoids canonicalize syscall in most cases)
             if let Some(&file_id) = ctx.raw_path_to_id.get(resolved_path) {
@@ -393,9 +461,19 @@ pub(super) fn resolve_specifier(
                 }
             }
         }
-        Err(_) => {
+        ResolveFileAttempt::Failed {
+            used_tsconfig_fallback,
+        } => {
             if let Some(result) = try_scss_fallbacks(ctx, from_file, specifier) {
                 return result;
+            }
+
+            if used_tsconfig_fallback
+                && matches_nearest_tsconfig_path_alias(ctx.root, from_file, specifier)
+            {
+                // The tsconfig chain was broken, so alias-aware resolution is unavailable.
+                // Keep these imports unresolved instead of misclassifying them as npm packages.
+                return ResolveResult::Unresolvable(specifier.to_string());
             }
 
             if is_alias || matches_plugin_alias {
@@ -425,11 +503,15 @@ pub(super) fn resolve_specifier(
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::path::PathBuf;
 
     use oxc_resolver::{JSONError, ResolveError};
+    use tempfile::tempdir;
 
-    use super::is_tsconfig_error;
+    use super::{
+        is_tsconfig_error, matches_nearest_tsconfig_path_alias, path_alias_pattern_matches,
+    };
 
     #[test]
     fn tsconfig_not_found_is_tsconfig_error() {
@@ -486,5 +568,57 @@ mod tests {
         assert!(!is_tsconfig_error(&ResolveError::Ignored(PathBuf::from(
             "/ignored"
         ))));
+    }
+
+    #[test]
+    fn wildcard_tsconfig_path_alias_pattern_matches() {
+        assert!(path_alias_pattern_matches("@gen/*", "@gen/foo"));
+        assert!(path_alias_pattern_matches("@gen/*", "@gen/nested/foo"));
+        assert!(!path_alias_pattern_matches("@gen/*", "@other/foo"));
+    }
+
+    #[test]
+    fn exact_tsconfig_path_alias_pattern_matches() {
+        assert!(path_alias_pattern_matches("$lib", "$lib"));
+        assert!(!path_alias_pattern_matches("$lib", "$lib/utils"));
+    }
+
+    #[test]
+    fn wildcard_only_tsconfig_path_alias_pattern_does_not_match_everything() {
+        assert!(!path_alias_pattern_matches("*", "@gen/foo"));
+    }
+
+    #[cfg_attr(miri, ignore = "tempdir is blocked by Miri isolation")]
+    #[test]
+    fn detects_alias_from_nearest_tsconfig_even_when_chain_is_broken() {
+        let temp = tempdir().unwrap();
+        let project_root = temp.path().join("app");
+        let src_dir = project_root.join("src");
+        fs::create_dir_all(&src_dir).unwrap();
+        let source_file = src_dir.join("index.ts");
+        fs::write(&source_file, "import '@gen/foo';").unwrap();
+        fs::write(
+            project_root.join("tsconfig.json"),
+            r#"{
+                "extends": "./.svelte-kit/tsconfig.json",
+                "compilerOptions": {
+                    "paths": {
+                        "@gen/*": ["../generated/build/ts/*"]
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert!(matches_nearest_tsconfig_path_alias(
+            &project_root,
+            &source_file,
+            "@gen/foo"
+        ));
+        assert!(!matches_nearest_tsconfig_path_alias(
+            &project_root,
+            &source_file,
+            "@other/foo"
+        ));
     }
 }
