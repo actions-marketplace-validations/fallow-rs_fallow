@@ -7,7 +7,7 @@ mod json;
 mod markdown;
 mod sarif;
 #[cfg(test)]
-mod test_helpers;
+pub mod test_helpers;
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -415,6 +415,11 @@ pub use codeclimate::build_health_codeclimate;
 )]
 pub use compact::build_compact_lines;
 pub use json::build_baseline_deltas_json;
+#[allow(
+    unused_imports,
+    reason = "target-dependent: used in lib, unused in bin"
+)]
+pub use json::build_duplication_json;
 #[allow(
     unused_imports,
     reason = "target-dependent: used in lib, unused in bin"

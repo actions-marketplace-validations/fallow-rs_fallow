@@ -413,9 +413,11 @@ fn apply_default_fallback(
 }
 
 /// Discover entry points from package.json, framework rules, and defaults.
-pub fn discover_entry_points_with_warnings(
+fn discover_entry_points_with_warnings_impl(
     config: &ResolvedConfig,
     files: &[DiscoveredFile],
+    root_pkg: Option<&PackageJson>,
+    include_nested_package_entries: bool,
 ) -> EntryPointDiscovery {
     let _span = tracing::info_span!("discover_entry_points").entered();
     let mut discovery = EntryPointDiscovery::default();
@@ -458,9 +460,7 @@ pub fn discover_entry_points_with_warnings(
     // 2. Package.json entries
     // Pre-compute canonical root once for all resolve_entry_path calls
     let canonical_root = dunce::canonicalize(&config.root).unwrap_or_else(|_| config.root.clone());
-    let pkg_path = config.root.join("package.json");
-    let root_pkg = PackageJson::load(&pkg_path).ok();
-    if let Some(pkg) = &root_pkg {
+    if let Some(pkg) = root_pkg {
         for entry_path in pkg.entry_points() {
             if let Some(ep) = resolve_entry_path_with_tracking(
                 &config.root,
@@ -496,17 +496,19 @@ pub fn discover_entry_points_with_warnings(
     // 4. Auto-discover nested package.json entry points
     // For monorepo-like structures without explicit workspace config, scan for
     // package.json files in subdirectories and use their main/exports as entries.
-    let exports_dirs = root_pkg
-        .map(|pkg| pkg.exports_subdirectories())
-        .unwrap_or_default();
-    discover_nested_package_entries(
-        &config.root,
-        files,
-        &mut discovery.entries,
-        &canonical_root,
-        &exports_dirs,
-        &mut discovery.skipped_entries,
-    );
+    if include_nested_package_entries {
+        let exports_dirs = root_pkg
+            .map(PackageJson::exports_subdirectories)
+            .unwrap_or_default();
+        discover_nested_package_entries(
+            &config.root,
+            files,
+            &mut discovery.entries,
+            &canonical_root,
+            &exports_dirs,
+            &mut discovery.skipped_entries,
+        );
+    }
 
     // 5. Default index files (if no other entries found)
     if discovery.entries.is_empty() {
@@ -518,6 +520,29 @@ pub fn discover_entry_points_with_warnings(
     discovery.entries.dedup_by(|a, b| a.path == b.path);
 
     discovery
+}
+
+pub fn discover_entry_points_with_warnings_from_pkg(
+    config: &ResolvedConfig,
+    files: &[DiscoveredFile],
+    root_pkg: Option<&PackageJson>,
+    include_nested_package_entries: bool,
+) -> EntryPointDiscovery {
+    discover_entry_points_with_warnings_impl(
+        config,
+        files,
+        root_pkg,
+        include_nested_package_entries,
+    )
+}
+
+pub fn discover_entry_points_with_warnings(
+    config: &ResolvedConfig,
+    files: &[DiscoveredFile],
+) -> EntryPointDiscovery {
+    let pkg_path = config.root.join("package.json");
+    let root_pkg = PackageJson::load(&pkg_path).ok();
+    discover_entry_points_with_warnings_impl(config, files, root_pkg.as_ref(), true)
 }
 
 pub fn discover_entry_points(config: &ResolvedConfig, files: &[DiscoveredFile]) -> Vec<EntryPoint> {
@@ -650,15 +675,14 @@ fn expand_wildcard_entries(
 
 /// Discover entry points for a workspace package.
 #[must_use]
-pub fn discover_workspace_entry_points_with_warnings(
+fn discover_workspace_entry_points_with_warnings_impl(
     ws_root: &Path,
-    _config: &ResolvedConfig,
     all_files: &[DiscoveredFile],
+    pkg: Option<&PackageJson>,
 ) -> EntryPointDiscovery {
     let mut discovery = EntryPointDiscovery::default();
 
-    let pkg_path = ws_root.join("package.json");
-    if let Ok(pkg) = PackageJson::load(&pkg_path) {
+    if let Some(pkg) = pkg {
         let canonical_ws_root =
             dunce::canonicalize(ws_root).unwrap_or_else(|_| ws_root.to_path_buf());
         for entry_path in pkg.entry_points() {
@@ -708,6 +732,25 @@ pub fn discover_workspace_entry_points_with_warnings(
     discovery.entries.sort_by(|a, b| a.path.cmp(&b.path));
     discovery.entries.dedup_by(|a, b| a.path == b.path);
     discovery
+}
+
+pub fn discover_workspace_entry_points_with_warnings_from_pkg(
+    ws_root: &Path,
+    all_files: &[DiscoveredFile],
+    pkg: Option<&PackageJson>,
+) -> EntryPointDiscovery {
+    discover_workspace_entry_points_with_warnings_impl(ws_root, all_files, pkg)
+}
+
+#[must_use]
+pub fn discover_workspace_entry_points_with_warnings(
+    ws_root: &Path,
+    _config: &ResolvedConfig,
+    all_files: &[DiscoveredFile],
+) -> EntryPointDiscovery {
+    let pkg_path = ws_root.join("package.json");
+    let pkg = PackageJson::load(&pkg_path).ok();
+    discover_workspace_entry_points_with_warnings_impl(ws_root, all_files, pkg.as_ref())
 }
 
 #[must_use]

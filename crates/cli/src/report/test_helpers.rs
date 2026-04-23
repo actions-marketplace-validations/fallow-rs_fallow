@@ -6,7 +6,7 @@ use fallow_core::results::*;
 /// Build an `AnalysisResults` populated with one issue of every type.
 ///
 /// Shared across all report format tests for consistency.
-pub(super) fn sample_results(root: &Path) -> AnalysisResults {
+pub fn sample_results(root: &Path) -> AnalysisResults {
     let mut r = AnalysisResults::default();
 
     r.unused_files.push(UnusedFile {

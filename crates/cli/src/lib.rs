@@ -4,8 +4,38 @@
     reason = "CLI binary produces intentional terminal output"
 )]
 
+#[allow(
+    dead_code,
+    unused_imports,
+    reason = "shared CLI library compiles bin-oriented support modules for reuse"
+)]
+mod api;
+#[allow(
+    dead_code,
+    unused_imports,
+    reason = "shared CLI library compiles bin-oriented support modules for reuse"
+)]
+mod baseline;
+#[allow(
+    dead_code,
+    unused_imports,
+    reason = "shared CLI library compiles bin-oriented support modules for reuse"
+)]
+mod check;
 /// CODEOWNERS file parser and ownership lookup.
 pub mod codeowners;
+#[allow(
+    dead_code,
+    unused_imports,
+    reason = "shared CLI library compiles bin-oriented support modules for reuse"
+)]
+mod combined;
+#[allow(
+    dead_code,
+    unused_imports,
+    reason = "shared CLI library compiles bin-oriented support modules for reuse"
+)]
+mod dupes;
 
 /// Structured error output for CLI and JSON formats.
 pub mod error;
@@ -13,8 +43,23 @@ pub mod error;
 /// Metric and rule definitions for explainable CLI output.
 pub mod explain;
 
+#[allow(
+    dead_code,
+    unused_imports,
+    reason = "shared CLI library compiles bin-oriented support modules for reuse"
+)]
+mod health;
 /// Health / complexity analysis report types.
 pub mod health_types;
+#[allow(
+    dead_code,
+    unused_imports,
+    reason = "shared CLI library compiles bin-oriented support modules for reuse"
+)]
+mod license;
+
+/// Programmatic Rust API reused by the NAPI bindings.
+pub mod programmatic;
 
 /// Regression detection: baseline comparison and tolerance checking.
 pub mod regression;
@@ -23,3 +68,25 @@ pub mod regression;
 ///
 /// Exposed for snapshot testing of output formats.
 pub mod report;
+
+#[allow(
+    dead_code,
+    unused_imports,
+    reason = "shared CLI library compiles bin-oriented support modules for reuse"
+)]
+mod runtime_support;
+#[allow(
+    dead_code,
+    unused_imports,
+    reason = "shared CLI library compiles bin-oriented support modules for reuse"
+)]
+mod validate;
+#[allow(
+    dead_code,
+    unused_imports,
+    reason = "shared CLI library compiles bin-oriented support modules for reuse"
+)]
+mod vital_signs;
+
+pub use runtime_support::{AnalysisKind, GroupBy};
+pub(crate) use runtime_support::{build_ownership_resolver, load_config};

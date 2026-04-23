@@ -19,6 +19,7 @@ fallow-config = { version = "2.46.0", path = "crates/config" }
 fallow-extract = { version = "2.46.0", path = "crates/extract" }
 fallow-graph = { version = "2.46.0", path = "crates/graph" }
 fallow-types = { version = "2.46.0", path = "crates/types" }
+fallow-cli = { version = "2.46.0", path = "crates/cli" }
 
 # Parsing & analysis
 oxc_allocator = "0.125"

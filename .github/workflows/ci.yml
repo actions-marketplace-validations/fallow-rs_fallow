@@ -82,6 +82,10 @@ jobs:
         with:
           components: clippy, rustfmt
 
+      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+        with:
+          node-version: '22'
+
       - name: Run tests
         run: cargo test --workspace --all-targets
 
@@ -96,6 +100,15 @@ jobs:
 
       - name: Format
         run: cargo fmt --all -- --check
+
+      - name: Install NAPI package dependencies
+        run: cd crates/napi && npm ci --omit=optional
+
+      - name: Build NAPI package
+        run: cd crates/napi && npm run build:debug
+
+      - name: Run NAPI smoke test
+        run: cd crates/napi && npm test
 
       - name: Check for uncommitted changes
         run: git diff --exit-code

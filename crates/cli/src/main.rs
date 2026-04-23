@@ -8,7 +8,6 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use fallow_config::FallowConfig;
 
 mod api;
 mod audit;
@@ -31,6 +30,7 @@ mod list;
 mod migrate;
 mod regression;
 mod report;
+mod runtime_support;
 mod schema;
 mod setup_hooks;
 mod validate;
@@ -42,6 +42,8 @@ use dupes::{DupesMode, DupesOptions};
 use error::emit_error;
 use health::{HealthOptions, SortBy};
 use list::ListOptions;
+pub use runtime_support::{AnalysisKind, GroupBy};
+pub(crate) use runtime_support::{build_ownership_resolver, load_config};
 
 // ── CLI definition ───────────────────────────────────────────────
 
@@ -877,33 +879,6 @@ impl From<Format> for fallow_config::OutputFormat {
     }
 }
 
-/// Analysis types for --only/--skip selection.
-#[derive(Clone, PartialEq, Eq, clap::ValueEnum)]
-pub enum AnalysisKind {
-    #[value(alias = "check")]
-    DeadCode,
-    Dupes,
-    Health,
-}
-
-/// Grouping mode for `--group-by`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
-pub enum GroupBy {
-    /// Group by CODEOWNERS file ownership (first owner, last matching rule).
-    #[value(alias = "team", alias = "codeowner")]
-    Owner,
-    /// Group by first directory component of the file path.
-    Directory,
-    /// Group by workspace package (monorepo).
-    #[value(alias = "workspace", alias = "pkg")]
-    Package,
-    /// Group by GitLab CODEOWNERS section name (`[Section]` headers).
-    /// Stable across reviewer rotation; produces distinct groups when
-    /// multiple sections share a common default owner.
-    #[value(alias = "gl-section")]
-    Section,
-}
-
 /// Filter refactoring targets by effort level.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum EffortFilter {
@@ -971,125 +946,6 @@ fn format_from_env() -> Option<Format> {
 /// Read `FALLOW_QUIET` env var: "1" or "true" (case-insensitive) means quiet.
 fn quiet_from_env() -> bool {
     std::env::var("FALLOW_QUIET").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-}
-
-// ── Group-by resolver ────────────────────────────────────────────
-
-/// Build an `OwnershipResolver` from CLI `--group-by` and config settings.
-///
-/// Returns `None` when no grouping is requested. Returns `Err(ExitCode)` when
-/// `--group-by owner` is requested but no CODEOWNERS file can be found.
-fn build_ownership_resolver(
-    group_by: Option<GroupBy>,
-    root: &std::path::Path,
-    codeowners_path: Option<&str>,
-    output: fallow_config::OutputFormat,
-) -> Result<Option<report::OwnershipResolver>, ExitCode> {
-    let Some(mode) = group_by else {
-        return Ok(None);
-    };
-    match mode {
-        GroupBy::Owner => match codeowners::CodeOwners::load(root, codeowners_path) {
-            Ok(co) => Ok(Some(report::OwnershipResolver::Owner(co))),
-            Err(e) => Err(emit_error(&e, 2, output)),
-        },
-        GroupBy::Section => match codeowners::CodeOwners::load(root, codeowners_path) {
-            Ok(co) => {
-                if co.has_sections() {
-                    Ok(Some(report::OwnershipResolver::Section(co)))
-                } else {
-                    Err(emit_error(
-                        "--group-by section requires a GitLab-style CODEOWNERS file \
-                         with `[Section]` headers. This CODEOWNERS has no sections; \
-                         use --group-by owner instead.",
-                        2,
-                        output,
-                    ))
-                }
-            }
-            Err(e) => Err(emit_error(&e, 2, output)),
-        },
-        GroupBy::Directory => Ok(Some(report::OwnershipResolver::Directory)),
-        GroupBy::Package => {
-            let workspaces = fallow_config::discover_workspaces(root);
-            if workspaces.is_empty() {
-                Err(emit_error(
-                    "--group-by package requires a monorepo with workspace packages \
-                     (package.json workspaces, pnpm-workspace.yaml, or tsconfig references)",
-                    2,
-                    output,
-                ))
-            } else {
-                Ok(Some(report::OwnershipResolver::Package(
-                    report::grouping::PackageResolver::new(root, &workspaces),
-                )))
-            }
-        }
-    }
-}
-
-// ── Config loading ───────────────────────────────────────────────
-
-/// Emit a terse `"loaded config: <path>"` line on stderr so users can verify
-/// which config was picked up. Suppressed for non-human output formats (so
-/// JSON/SARIF/markdown consumers get clean machine-readable output) and when
-/// `--quiet` is set.
-fn log_config_loaded(path: &std::path::Path, output: fallow_config::OutputFormat, quiet: bool) {
-    if quiet || !matches!(output, fallow_config::OutputFormat::Human) {
-        return;
-    }
-    eprintln!("loaded config: {}", path.display());
-}
-
-#[expect(clippy::ref_option, reason = "&Option matches clap's field type")]
-fn load_config(
-    root: &std::path::Path,
-    config_path: &Option<PathBuf>,
-    output: fallow_config::OutputFormat,
-    no_cache: bool,
-    threads: usize,
-    production: bool,
-    quiet: bool,
-) -> Result<fallow_config::ResolvedConfig, ExitCode> {
-    let user_config = if let Some(path) = config_path {
-        // Explicit --config: propagate errors
-        match FallowConfig::load(path) {
-            Ok(c) => {
-                log_config_loaded(path, output, quiet);
-                Some(c)
-            }
-            Err(e) => {
-                let msg = format!("failed to load config '{}': {e}", path.display());
-                return Err(emit_error(&msg, 2, output));
-            }
-        }
-    } else {
-        match FallowConfig::find_and_load(root) {
-            Ok(Some((config, found_path))) => {
-                log_config_loaded(&found_path, output, quiet);
-                Some(config)
-            }
-            Ok(None) => None,
-            Err(e) => {
-                return Err(emit_error(&e, 2, output));
-            }
-        }
-    };
-
-    Ok(match user_config {
-        Some(mut config) => {
-            // CLI --production flag overrides config
-            if production {
-                config.production = true;
-            }
-            config.resolve(root.to_path_buf(), output, threads, no_cache, quiet)
-        }
-        None => FallowConfig {
-            production,
-            ..FallowConfig::default()
-        }
-        .resolve(root.to_path_buf(), output, threads, no_cache, quiet),
-    })
 }
 
 /// Resolve an audit baseline path using CLI > config precedence.

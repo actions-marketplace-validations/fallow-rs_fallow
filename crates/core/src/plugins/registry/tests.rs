@@ -5,6 +5,7 @@ use fallow_config::{
     UsedClassMemberRule,
 };
 use helpers::{check_plugin_detection, discover_config_files, process_config_result};
+use rustc_hash::FxHashSet;
 
 /// Build a dependency object from names for JSON deserialization.
 fn deps_json(names: &[&str]) -> serde_json::Value {
@@ -1544,6 +1545,7 @@ fn run_workspace_fast_returns_empty_for_no_active_plugins() {
         Path::new("/workspace"),
         &matchers,
         &relative_files,
+        &FxHashSet::default(),
     );
     assert!(result.active_plugins.is_empty());
     assert!(result.entry_patterns.is_empty());
@@ -1563,6 +1565,7 @@ fn run_workspace_fast_detects_active_plugins() {
         Path::new("/workspace"),
         &matchers,
         &relative_files,
+        &FxHashSet::default(),
     );
     assert!(result.active_plugins.contains(&"nextjs".to_string()));
     assert!(!result.entry_patterns.is_empty());
@@ -1583,6 +1586,7 @@ fn run_workspace_fast_filters_matchers_to_active_plugins() {
         Path::new("/workspace"),
         &matchers,
         &relative_files,
+        &FxHashSet::default(),
     );
     // Only nextjs should be active
     assert!(result.active_plugins.contains(&"nextjs".to_string()));

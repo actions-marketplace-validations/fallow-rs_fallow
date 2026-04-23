@@ -151,6 +151,10 @@ jobs:
           targets: ${{ matrix.target }}
           cache-key: ${{ matrix.target }}
 
+      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6
+        with:
+          node-version: '22'
+
       - name: Install musl tools
         if: contains(matrix.target, 'musl')
         run: |
@@ -177,6 +181,15 @@ jobs:
 
       - name: Build MCP release binary
         run: cargo build --release --target ${{ matrix.target }} -p fallow-mcp
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
+
+      - name: Install NAPI package dependencies
+        run: cd crates/napi && npm ci --omit=optional
+
+      - name: Build NAPI addon
+        run: cd crates/napi && npx napi build --platform --release --target ${{ matrix.target }}
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
@@ -266,6 +279,12 @@ jobs:
             target/${{ matrix.target }}/release/${{ matrix.lsp_binary }}
             target/${{ matrix.target }}/release/${{ matrix.mcp_binary }}
 
+      - name: Upload NAPI addon
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: napi-${{ matrix.npm_dir }}
+          path: crates/napi/fallow-node.${{ matrix.npm_dir }}.node
+
   release:
     name: Create Release
     needs: build
@@ -323,6 +342,12 @@ jobs:
           pattern: npm-*
           path: npm-artifacts
 
+      - name: Download all NAPI addons
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: napi-*
+          path: napi-artifacts
+
       - name: Organize binaries into npm directories
         run: |
           for dir in npm-artifacts/npm-*; do
@@ -356,6 +381,41 @@ jobs:
             "
           done
 
+      - name: Install NAPI package dependencies
+        run: cd crates/napi && npm ci --omit=optional
+
+      - name: Update NAPI package version
+        run: |
+          VERSION="${TAG_REF#refs/tags/v}"
+          node -e "
+            const fs = require('fs');
+            const pkgPath = 'crates/napi/package.json';
+            const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+            pkg.version = '$VERSION';
+            if (pkg.optionalDependencies) {
+              for (const key of Object.keys(pkg.optionalDependencies)) {
+                if (key.startsWith('@fallow-cli/fallow-node')) {
+                  pkg.optionalDependencies[key] = '$VERSION';
+                }
+              }
+            }
+            fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + '\n');
+          "
+
+      - name: Prepare NAPI root package for publish
+        run: cd crates/napi && npm run publish:prepare
+
+      - name: Create NAPI platform package directories
+        run: cd crates/napi && npm run create-npm-dirs
+
+      - name: Organize NAPI addons into platform directories
+        run: |
+          for dir in napi-artifacts/napi-*; do
+            target="crates/napi/npm/$(basename "$dir" | sed 's/^napi-//')"
+            mkdir -p "$target"
+            cp "$dir"/* "$target"/
+          done
+
       - name: Publish platform packages
         run: |
           VERSION="${TAG_REF#refs/tags/v}"
@@ -387,6 +447,39 @@ jobs:
           else
             npm publish ./npm/fallow --access public --provenance --ignore-scripts || \
               npm publish ./npm/fallow --access public --ignore-scripts
+          fi
+
+      - name: Publish NAPI platform packages
+        run: |
+          VERSION="${TAG_REF#refs/tags/v}"
+          FAILED=0
+          for dir in ./crates/napi/npm/darwin-arm64 ./crates/napi/npm/darwin-x64 ./crates/napi/npm/linux-x64-gnu ./crates/napi/npm/linux-arm64-gnu ./crates/napi/npm/linux-x64-musl ./crates/napi/npm/linux-arm64-musl ./crates/napi/npm/win32-x64-msvc; do
+            PKG_NAME=$(node -e "console.log(require('$dir/package.json').name)")
+            echo "Publishing $PKG_NAME@$VERSION..."
+            if npm view "$PKG_NAME@$VERSION" version >/dev/null 2>&1; then
+              echo "  Already published, skipping"
+              continue
+            fi
+            if ! npm publish "$dir" --access public --provenance; then
+              echo "  Provenance publish failed, retrying without provenance..."
+              if ! npm publish "$dir" --access public; then
+                echo "::error::Failed to publish $PKG_NAME@$VERSION"
+                FAILED=1
+              fi
+            fi
+          done
+          if [ "$FAILED" -eq 1 ]; then
+            exit 1
+          fi
+
+      - name: Publish fallow-node
+        run: |
+          VERSION="${TAG_REF#refs/tags/v}"
+          if npm view "@fallow-cli/fallow-node@$VERSION" version >/dev/null 2>&1; then
+            echo "@fallow-cli/fallow-node@$VERSION already published, skipping"
+          else
+            npm publish ./crates/napi --access public --provenance --ignore-scripts || \
+              npm publish ./crates/napi --access public --ignore-scripts
           fi
 
   vscode-publish:

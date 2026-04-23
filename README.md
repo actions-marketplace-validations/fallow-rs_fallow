@@ -70,6 +70,20 @@ npm install -g fallow       # Or install globally (macOS, Linux, Windows)
 cargo install fallow-cli    # Or via Cargo
 ```
 
+Programmatic Node API:
+
+```bash
+npm install @fallow-cli/fallow-node
+```
+
+```ts
+import { detectDeadCode, detectDuplication, computeHealth } from '@fallow-cli/fallow-node';
+
+const deadCode = await detectDeadCode({ root: process.cwd() });
+const dupes = await detectDuplication({ root: process.cwd(), mode: 'mild', minTokens: 30 });
+const health = await computeHealth({ root: process.cwd(), score: true, ownershipEmails: 'handle' });
+```
+
 ## Start here
 
 ```bash
@@ -413,20 +427,22 @@ Fallow is not an AI assistant. It is the codebase truth layer your assistant can
 
 ## Performance
 
-Benchmarked on real open-source projects (median of 5 runs, Apple M5).
+Benchmarked on real open-source projects (median of 5 runs with 2 warmups, Apple M5).
 
 ### Dead code: fallow vs knip
 
 | Project | Files | fallow | knip v5 | knip v6 | vs v5 | vs v6 |
 |:--------|------:|-------:|--------:|--------:|------:|------:|
-| [zod](https://github.com/colinhacks/zod) | 174 | **17ms** | 577ms | 300ms | 34x | 18x |
-| [fastify](https://github.com/fastify/fastify) | 286 | **19ms** | 791ms | 232ms | 41x | 12x |
-| [preact](https://github.com/preactjs/preact) | 244 | **20ms** | 767ms | 2.02s | 39x | 103x |
-| [TanStack/query](https://github.com/TanStack/query) | 901 | **170ms** | 2.50s | 1.28s | 15x | 8x |
-| [svelte](https://github.com/sveltejs/svelte) | 3,337 | **359ms** | 1.73s | 749ms | 5x | 2x |
-| [next.js](https://github.com/vercel/next.js) | 20,416 | **1.66s** | -- | -- | -- | -- |
+| [zod](https://github.com/colinhacks/zod) | 174 | **25ms** | 650ms | 330ms | 26x | 13x |
+| [fastify](https://github.com/fastify/fastify) | 286 | **27ms** | 933ms | 222ms | 34x | 8x |
+| [preact](https://github.com/preactjs/preact) | 244 | **200ms** | 911ms | 2.15s | 5x | 11x |
+| [vue/core](https://github.com/vuejs/core) | 522 | **68ms** | ---* | ---* | --- | --- |
+| [TanStack/query](https://github.com/TanStack/query) | 901 | **330ms** | 2.66s | 1.08s | 8x | 3.3x |
+| [vite](https://github.com/vitejs/vite) | 1,420 | **378ms** | ---* | ---* | --- | --- |
+| [svelte](https://github.com/sveltejs/svelte) | 3,337 | **363ms** | 1.95s | 714ms | 5x | 2x |
+| [next.js](https://github.com/vercel/next.js) | 20,416 | **1.72s** | ---* | ---* | --- | --- |
 
-knip errors out on next.js. fallow completes in under 2 seconds.
+On the current benchmark fixtures, knip does not produce valid JSON results for vite, vue/core, and next.js. fallow completes on all three. See the [full comparison page](https://docs.fallow.tools/migration/comparison) for the complete matrix and current caveats. * knip exits without valid results on those fixtures.
 
 ### Duplication: fallow vs jscpd
 

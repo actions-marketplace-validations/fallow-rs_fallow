@@ -19,6 +19,13 @@ use helpers::{
     process_static_patterns,
 };
 
+fn must_parse_workspace_config_when_root_active(plugin_name: &str) -> bool {
+    matches!(
+        plugin_name,
+        "docusaurus" | "jest" | "tanstack-router" | "vitest"
+    )
+}
+
 /// Registry of all available plugins (built-in + external).
 pub struct PluginRegistry {
     plugins: Vec<Box<dyn Plugin>>,
@@ -282,6 +289,7 @@ impl PluginRegistry {
         project_root: &Path,
         precompiled_config_matchers: &[(&dyn Plugin, Vec<globset::GlobMatcher>)],
         relative_files: &[(&PathBuf, String)],
+        skip_config_plugins: &FxHashSet<&str>,
     ) -> AggregatedPluginResult {
         let _span = tracing::info_span!("run_plugins").entered();
         let mut result = AggregatedPluginResult::default();
@@ -319,7 +327,11 @@ impl PluginRegistry {
         let active_names: FxHashSet<&str> = active.iter().map(|p| p.name()).collect();
         let workspace_matchers: Vec<_> = precompiled_config_matchers
             .iter()
-            .filter(|(p, _)| active_names.contains(p.name()))
+            .filter(|(p, _)| {
+                active_names.contains(p.name())
+                    && (!skip_config_plugins.contains(p.name())
+                        || must_parse_workspace_config_when_root_active(p.name()))
+            })
             .map(|(plugin, matchers)| (*plugin, matchers.clone()))
             .collect();
 

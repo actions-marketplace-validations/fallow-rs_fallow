@@ -1052,19 +1052,19 @@ pub(super) fn print_health_json(
     }
 }
 
-pub(super) fn print_duplication_json(
+/// Build the JSON envelope + duplication payload shared by `print_duplication_json`
+/// and the programmatic API surface.
+///
+/// # Errors
+///
+/// Returns an error if the report cannot be serialized to JSON.
+pub fn build_duplication_json(
     report: &DuplicationReport,
     root: &Path,
     elapsed: Duration,
     explain: bool,
-) -> ExitCode {
-    let report_value = match serde_json::to_value(report) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("Error: failed to serialize duplication report: {e}");
-            return ExitCode::from(2);
-        }
-    };
+) -> Result<serde_json::Value, serde_json::Error> {
+    let report_value = serde_json::to_value(report)?;
 
     let mut output = build_json_envelope(report_value, elapsed);
     let root_prefix = format!("{}/", root.display());
@@ -1075,7 +1075,22 @@ pub(super) fn print_duplication_json(
         insert_meta(&mut output, explain::dupes_meta());
     }
 
-    emit_json(&output, "JSON")
+    Ok(output)
+}
+
+pub(super) fn print_duplication_json(
+    report: &DuplicationReport,
+    root: &Path,
+    elapsed: Duration,
+    explain: bool,
+) -> ExitCode {
+    match build_duplication_json(report, root, elapsed, explain) {
+        Ok(output) => emit_json(&output, "JSON"),
+        Err(e) => {
+            eprintln!("Error: failed to serialize duplication report: {e}");
+            ExitCode::from(2)
+        }
+    }
 }
 
 pub(super) fn print_trace_json<T: serde::Serialize>(value: &T) {

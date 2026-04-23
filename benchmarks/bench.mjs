@@ -53,7 +53,13 @@ function countSourceFiles(dir) {
 function timeRun(cmd, cmdArgs, cwd) {
   const start = performance.now();
   const result = spawnSync(cmd, cmdArgs, { cwd, stdio: 'pipe', timeout: 300000, maxBuffer: 50*1024*1024, env: { ...process.env, NO_COLOR: '1', FORCE_COLOR: '0' } });
-  return { elapsed: performance.now() - start, status: result.status, stdout: result.stdout?.toString() ?? '', stderr: result.stderr?.toString() ?? '' };
+  return {
+    elapsed: performance.now() - start,
+    status: result.status,
+    signal: result.signal,
+    stdout: result.stdout?.toString() ?? '',
+    stderr: result.stderr?.toString() ?? '',
+  };
 }
 
 function timeRunWithMemory(cmd, cmdArgs, cwd) {
@@ -79,12 +85,52 @@ function timeRunWithMemory(cmd, cmdArgs, cwd) {
   // stdout for fallow comes from the time wrapper's child process — it's on stdout
   const stdout = result.stdout?.toString() ?? '';
 
-  return { elapsed, status: result.status, stdout, stderr, peakRssBytes };
+  return { elapsed, status: result.status, signal: result.signal, stdout, stderr, peakRssBytes };
 }
 
-function parseIssueCount(stdout, status) {
-  if (status === 2) return 'error';
-  try { const data = JSON.parse(stdout); let count = 0; for (const v of Object.values(data)) { if (Array.isArray(v)) count += v.length; } return count; } catch { return '?'; }
+function firstDiagnosticLine(text) {
+  const lines = text.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+  return (
+    lines.find(line => /error|syntaxerror|exception|cannot|failed|timed out/i.test(line)) ??
+    lines.find(line => !line.startsWith('at ')) ??
+    null
+  );
+}
+
+function parseJsonReport(stdout) {
+  const trimmed = stdout.replace(/^\uFEFF/, '').trim();
+  if (!trimmed) return { ok: false, reason: 'no JSON output' };
+  try {
+    const data = JSON.parse(trimmed);
+    if (data === null || (typeof data !== 'object' && !Array.isArray(data))) {
+      return { ok: false, reason: 'unexpected JSON shape' };
+    }
+    return { ok: true, data };
+  } catch (error) {
+    return { ok: false, reason: `invalid JSON output (${String(error.message).split('\n')[0]})` };
+  }
+}
+
+function countIssues(data) {
+  if (Array.isArray(data)) return data.length;
+  let count = 0;
+  for (const value of Object.values(data)) {
+    if (Array.isArray(value)) count += value.length;
+  }
+  return count;
+}
+
+function summarizeBenchmarkRun(result) {
+  const parsed = parseJsonReport(result.stdout);
+  if (!parsed.ok) {
+    const detail = firstDiagnosticLine(result.stderr) ?? firstDiagnosticLine(result.stdout);
+    return { valid: false, issues: 'error', error: detail ? `${parsed.reason}; ${detail}` : parsed.reason };
+  }
+  if (result.status !== 0 && result.status !== 1) {
+    const detail = result.signal ? `terminated by ${result.signal}` : `exit ${result.status ?? 'unknown'}`;
+    return { valid: false, issues: 'error', error: detail };
+  }
+  return { valid: true, issues: countIssues(parsed.data), error: null };
 }
 
 function stats(times) {
@@ -116,19 +162,32 @@ function benchmarkProject(name, dir) {
   }
 
   const fTimesCold = [], kTimes = [], k6Times = [];
-  let fIssues = '?', kIssues = '?', k6Issues = '?', fPeakRss = 0, kPeakRss = 0, k6PeakRss = 0;
+  let fIssues = '?', kIssues = 'error', k6Issues = 'error', fPeakRss = 0, kPeakRss = 0, k6PeakRss = 0;
+  let kErrorReason = null, k6ErrorReason = null;
 
   for (let i = 0; i < RUNS; i++) {
     const fr = timeRunWithMemory(fallowBin, fArgsCold, dir);
+    const fSummary = summarizeBenchmarkRun(fr);
+    if (!fSummary.valid) throw new Error(`[${name}] fallow cold run failed: ${fSummary.error}`);
     fTimesCold.push(fr.elapsed);
-    if (i === 0) { fIssues = parseIssueCount(fr.stdout, fr.status); fPeakRss = fr.peakRssBytes; }
+    if (i === 0) { fIssues = fSummary.issues; fPeakRss = fr.peakRssBytes; }
     const kr = timeRunWithMemory(knipBin, kArgs, dir);
-    if (kr.status != null && kr.status !== 2) kTimes.push(kr.elapsed);
-    if (i === 0) { kIssues = parseIssueCount(kr.stdout, kr.status); kPeakRss = kr.peakRssBytes; }
+    const kSummary = summarizeBenchmarkRun(kr);
+    if (kSummary.valid) {
+      kTimes.push(kr.elapsed);
+      if (kIssues === 'error') { kIssues = kSummary.issues; kPeakRss = kr.peakRssBytes; }
+    } else if (kErrorReason == null) {
+      kErrorReason = kSummary.error;
+    }
     if (hasKnip6) {
       const k6r = timeRunWithMemory(knip6Bin, kArgs, dir);
-      if (k6r.status != null && k6r.status !== 2) k6Times.push(k6r.elapsed);
-      if (i === 0) { k6Issues = parseIssueCount(k6r.stdout, k6r.status); k6PeakRss = k6r.peakRssBytes; }
+      const k6Summary = summarizeBenchmarkRun(k6r);
+      if (k6Summary.valid) {
+        k6Times.push(k6r.elapsed);
+        if (k6Issues === 'error') { k6Issues = k6Summary.issues; k6PeakRss = k6r.peakRssBytes; }
+      } else if (k6ErrorReason == null) {
+        k6ErrorReason = k6Summary.error;
+      }
     }
   }
 
@@ -136,11 +195,15 @@ function benchmarkProject(name, dir) {
   clearFallowCache(dir);
   const fArgsWarm = ['check', '--quiet', '--format', 'json'];
   // Populate cache
-  timeRun(fallowBin, fArgsWarm, dir);
+  const populate = timeRun(fallowBin, fArgsWarm, dir);
+  const populateSummary = summarizeBenchmarkRun(populate);
+  if (!populateSummary.valid) throw new Error(`[${name}] fallow cache warm-up failed: ${populateSummary.error}`);
   // Benchmark warm runs
   const fTimesWarm = [];
   for (let i = 0; i < RUNS; i++) {
     const fr = timeRun(fallowBin, fArgsWarm, dir);
+    const fSummary = summarizeBenchmarkRun(fr);
+    if (!fSummary.valid) throw new Error(`[${name}] fallow warm run failed: ${fSummary.error}`);
     fTimesWarm.push(fr.elapsed);
   }
   clearFallowCache(dir);
@@ -175,11 +238,33 @@ function benchmarkProject(name, dir) {
   console.log(`  Cache speedup: ${cacheSpeedup.toFixed(2)}x (warm vs cold)`);
   console.log(`  fallow cold: [${fTimesCold.map(t=>t.toFixed(0)).join(', ')}]`);
   console.log(`  fallow warm: [${fTimesWarm.map(t=>t.toFixed(0)).join(', ')}]`);
-  console.log(`  knip v5:     ${kTimes.length > 0 ? `[${kTimes.map(t=>t.toFixed(0)).join(', ')}]` : `[error — ${kIssues}]`}`);
-  if (hasKnip6) console.log(`  knip v6:     ${k6Times.length > 0 ? `[${k6Times.map(t=>t.toFixed(0)).join(', ')}]` : `[error — ${k6Issues}]`}`);
+  console.log(`  knip v5:     ${kTimes.length > 0 ? `[${kTimes.map(t=>t.toFixed(0)).join(', ')}]` : `[error — ${kErrorReason ?? kIssues}]`}`);
+  if (hasKnip6) console.log(`  knip v6:     ${k6Times.length > 0 ? `[${k6Times.map(t=>t.toFixed(0)).join(', ')}]` : `[error — ${k6ErrorReason ?? k6Issues}]`}`);
   console.log('');
 
-  return { name, files, fallowCold: fsCold, fallowWarm: fsWarm, knip: ks, knip6: k6s, speedupColdV5, speedupWarmV5, speedupColdV6, speedupWarmV6, cacheSpeedup, fIssues, kIssues, k6Issues, fPeakRss, kPeakRss, k6PeakRss, kError: !ks, k6Error: !k6s };
+  return {
+    name,
+    files,
+    fallowCold: fsCold,
+    fallowWarm: fsWarm,
+    knip: ks,
+    knip6: k6s,
+    speedupColdV5,
+    speedupWarmV5,
+    speedupColdV6,
+    speedupWarmV6,
+    cacheSpeedup,
+    fIssues,
+    kIssues,
+    k6Issues,
+    fPeakRss,
+    kPeakRss,
+    k6PeakRss,
+    kError: !ks,
+    k6Error: !k6s,
+    kErrorReason,
+    k6ErrorReason,
+  };
 }
 
 const results = [];
@@ -215,7 +300,7 @@ if (results.length > 0) {
     ...(hasKnip6 ? { 'vs v6 (cold)': r.speedupColdV6 != null ? `${r.speedupColdV6.toFixed(1)}x` : '--' } : {}),
     'Cache effect': `${r.cacheSpeedup.toFixed(2)}x`,
     'Fallow RSS': fmtMem(r.fPeakRss),
-    'Knip v5 RSS': fmtMem(r.kPeakRss),
+    'Knip v5 RSS': r.kError ? '--' : fmtMem(r.kPeakRss),
     ...(hasKnip6 ? { 'Knip v6 RSS': r.k6Error ? '--' : fmtMem(r.k6PeakRss) } : {}),
   })));
   const v5Valid = results.filter(r => r.speedupColdV5 != null);
@@ -229,9 +314,17 @@ if (results.length > 0) {
       console.log(`Average speedup vs knip v6 (cold): ${(v6Valid.reduce((s,r) => s+r.speedupColdV6, 0)/v6Valid.length).toFixed(1)}x (${v6Valid.length}/${results.length} projects)`);
       console.log(`Average speedup vs knip v6 (warm): ${(v6Valid.reduce((s,r) => s+r.speedupWarmV6, 0)/v6Valid.length).toFixed(1)}x`);
     }
-    const errorProjects = results.filter(r => r.k6Error);
-    if (errorProjects.length > 0) {
-      console.log(`\nknip v6 errors: ${errorProjects.map(r => r.name).join(', ')}`);
+  }
+  const v5ErrorProjects = results.filter(r => r.kError);
+  if (v5ErrorProjects.length > 0) {
+    console.log(`\nknip v5 errors:`);
+    for (const project of v5ErrorProjects) console.log(`  ${project.name}: ${project.kErrorReason}`);
+  }
+  if (hasKnip6) {
+    const v6ErrorProjects = results.filter(r => r.k6Error);
+    if (v6ErrorProjects.length > 0) {
+      console.log(`\nknip v6 errors:`);
+      for (const project of v6ErrorProjects) console.log(`  ${project.name}: ${project.k6ErrorReason}`);
     }
   }
   console.log(`Average cache effect:              ${(results.reduce((s,r) => s+r.cacheSpeedup, 0)/results.length).toFixed(2)}x\n`);

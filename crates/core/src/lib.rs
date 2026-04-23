@@ -31,6 +31,7 @@ use results::AnalysisResults;
 use trace::PipelineTimings;
 
 const UNDECLARED_WORKSPACE_WARNING_PREVIEW: usize = 5;
+type LoadedWorkspacePackage<'a> = (&'a fallow_config::WorkspaceInfo, PackageJson);
 
 /// Result of the full analysis pipeline, including optional performance timings.
 pub struct AnalysisOutput {
@@ -205,6 +206,10 @@ pub fn analyze_retaining_modules(
 /// # Errors
 ///
 /// Returns an error if discovery, graph construction, or analysis fails.
+#[allow(
+    clippy::too_many_lines,
+    reason = "pipeline orchestration stays easier to audit in one place"
+)]
 pub fn analyze_with_parse_result(
     config: &ResolvedConfig,
     modules: &[extract::ModuleInfo],
@@ -249,24 +254,45 @@ pub fn analyze_with_parse_result(
     let project = project::ProjectState::new(discovered_files, workspaces_vec);
     let files = project.files();
     let workspaces = project.workspaces();
+    let root_pkg = load_root_package_json(config);
+    let workspace_pkgs = load_workspace_packages(workspaces);
 
     // Stage 1.5: Run plugin system
     let t = Instant::now();
     let pb = progress.stage_spinner("Detecting plugins...");
-    let mut plugin_result = run_plugins(config, files, workspaces);
+    let mut plugin_result = run_plugins(
+        config,
+        files,
+        workspaces,
+        root_pkg.as_ref(),
+        &workspace_pkgs,
+    );
     let plugins_ms = t.elapsed().as_secs_f64() * 1000.0;
     pb.finish_and_clear();
 
     // Stage 1.6: Analyze package.json scripts
     let t = Instant::now();
-    analyze_all_scripts(config, workspaces, &mut plugin_result);
+    analyze_all_scripts(
+        config,
+        workspaces,
+        root_pkg.as_ref(),
+        &workspace_pkgs,
+        &mut plugin_result,
+    );
     let scripts_ms = t.elapsed().as_secs_f64() * 1000.0;
 
     // Stage 2: SKIPPED — using pre-parsed modules from caller
 
     // Stage 3: Discover entry points
     let t = Instant::now();
-    let entry_points = discover_all_entry_points(config, files, workspaces, &plugin_result);
+    let entry_points = discover_all_entry_points(
+        config,
+        files,
+        workspaces,
+        root_pkg.as_ref(),
+        &workspace_pkgs,
+        &plugin_result,
+    );
     let entry_points_ms = t.elapsed().as_secs_f64() * 1000.0;
 
     // Compute entry-point summary before the graph consumes the entry_points vec
@@ -445,17 +471,31 @@ fn analyze_full(
     let project = project::ProjectState::new(discovered_files, workspaces_vec);
     let files = project.files();
     let workspaces = project.workspaces();
+    let root_pkg = load_root_package_json(config);
+    let workspace_pkgs = load_workspace_packages(workspaces);
 
     // Stage 1.5: Run plugin system — parse config files, discover dynamic entries
     let t = Instant::now();
     let pb = progress.stage_spinner("Detecting plugins...");
-    let mut plugin_result = run_plugins(config, files, workspaces);
+    let mut plugin_result = run_plugins(
+        config,
+        files,
+        workspaces,
+        root_pkg.as_ref(),
+        &workspace_pkgs,
+    );
     let plugins_ms = t.elapsed().as_secs_f64() * 1000.0;
     pb.finish_and_clear();
 
     // Stage 1.6: Analyze package.json scripts for binary usage and config file refs
     let t = Instant::now();
-    analyze_all_scripts(config, workspaces, &mut plugin_result);
+    analyze_all_scripts(
+        config,
+        workspaces,
+        root_pkg.as_ref(),
+        &workspace_pkgs,
+        &mut plugin_result,
+    );
     let scripts_ms = t.elapsed().as_secs_f64() * 1000.0;
 
     // Stage 2: Parse all files in parallel and extract imports/exports
@@ -487,7 +527,14 @@ fn analyze_full(
 
     // Stage 3: Discover entry points (static patterns + plugin-discovered patterns)
     let t = Instant::now();
-    let entry_points = discover_all_entry_points(config, files, workspaces, &plugin_result);
+    let entry_points = discover_all_entry_points(
+        config,
+        files,
+        workspaces,
+        root_pkg.as_ref(),
+        &workspace_pkgs,
+        &plugin_result,
+    );
     let entry_points_ms = t.elapsed().as_secs_f64() * 1000.0;
 
     // Stage 4: Resolve imports to file IDs
@@ -627,33 +674,38 @@ fn analyze_full(
 ///
 /// Populates the plugin result with script-used packages and config file
 /// entry patterns. Also scans CI config files for binary invocations.
-fn analyze_all_scripts(
-    config: &ResolvedConfig,
-    workspaces: &[fallow_config::WorkspaceInfo],
-    plugin_result: &mut plugins::AggregatedPluginResult,
-) {
-    // Load all package.jsons once: root + workspaces. Each is reused for both
-    // dep name collection (bin map) and script analysis (no double I/O).
-    let pkg_path = config.root.join("package.json");
-    let root_pkg = PackageJson::load(&pkg_path).ok();
+fn load_root_package_json(config: &ResolvedConfig) -> Option<PackageJson> {
+    PackageJson::load(&config.root.join("package.json")).ok()
+}
 
-    let ws_pkgs: Vec<_> = workspaces
+fn load_workspace_packages(
+    workspaces: &[fallow_config::WorkspaceInfo],
+) -> Vec<LoadedWorkspacePackage<'_>> {
+    workspaces
         .iter()
         .filter_map(|ws| {
             PackageJson::load(&ws.root.join("package.json"))
                 .ok()
                 .map(|pkg| (ws, pkg))
         })
-        .collect();
+        .collect()
+}
 
+fn analyze_all_scripts(
+    config: &ResolvedConfig,
+    workspaces: &[fallow_config::WorkspaceInfo],
+    root_pkg: Option<&PackageJson>,
+    workspace_pkgs: &[LoadedWorkspacePackage<'_>],
+    plugin_result: &mut plugins::AggregatedPluginResult,
+) {
     // Collect all dependency names to build the bin-name → package-name reverse map.
     // This resolves binaries like "attw" to "@arethetypeswrong/cli" even without
     // node_modules/.bin symlinks.
     let mut all_dep_names: Vec<String> = Vec::new();
-    if let Some(ref pkg) = root_pkg {
+    if let Some(pkg) = root_pkg {
         all_dep_names.extend(pkg.all_dependency_names());
     }
-    for (_, ws_pkg) in &ws_pkgs {
+    for (_, ws_pkg) in workspace_pkgs {
         all_dep_names.extend(ws_pkg.all_dependency_names());
     }
     all_dep_names.sort_unstable();
@@ -661,13 +713,18 @@ fn analyze_all_scripts(
 
     // Probe node_modules/ at project root and each workspace root so non-hoisted
     // deps (pnpm strict, Yarn workspaces) are also discovered.
-    let mut nm_roots: Vec<&std::path::Path> = vec![&config.root];
+    let mut nm_roots: Vec<&std::path::Path> = Vec::new();
+    if config.root.join("node_modules").is_dir() {
+        nm_roots.push(&config.root);
+    }
     for ws in workspaces {
-        nm_roots.push(&ws.root);
+        if ws.root.join("node_modules").is_dir() {
+            nm_roots.push(&ws.root);
+        }
     }
     let bin_map = scripts::build_bin_to_package_map(&nm_roots, &all_dep_names);
 
-    if let Some(ref pkg) = root_pkg
+    if let Some(pkg) = root_pkg
         && let Some(ref pkg_scripts) = pkg.scripts
     {
         let scripts_to_analyze = if config.production {
@@ -684,7 +741,7 @@ fn analyze_all_scripts(
                 .push((config_file.clone(), "scripts".to_string()));
         }
     }
-    for (ws, ws_pkg) in &ws_pkgs {
+    for (ws, ws_pkg) in workspace_pkgs {
         if let Some(ref ws_scripts) = ws_pkg.scripts {
             let scripts_to_analyze = if config.production {
                 scripts::filter_production_scripts(ws_scripts)
@@ -723,14 +780,30 @@ fn discover_all_entry_points(
     config: &ResolvedConfig,
     files: &[discover::DiscoveredFile],
     workspaces: &[fallow_config::WorkspaceInfo],
+    root_pkg: Option<&PackageJson>,
+    workspace_pkgs: &[LoadedWorkspacePackage<'_>],
     plugin_result: &plugins::AggregatedPluginResult,
 ) -> discover::CategorizedEntryPoints {
     let mut entry_points = discover::CategorizedEntryPoints::default();
-    let root_discovery = discover::discover_entry_points_with_warnings(config, files);
+    let root_discovery = discover::discover_entry_points_with_warnings_from_pkg(
+        config,
+        files,
+        root_pkg,
+        workspaces.is_empty(),
+    );
+
+    let workspace_pkg_by_root: rustc_hash::FxHashMap<std::path::PathBuf, &PackageJson> =
+        workspace_pkgs
+            .iter()
+            .map(|(ws, pkg)| (ws.root.clone(), pkg))
+            .collect();
 
     let workspace_discovery: Vec<discover::EntryPointDiscovery> = workspaces
         .par_iter()
-        .map(|ws| discover::discover_workspace_entry_points_with_warnings(&ws.root, config, files))
+        .map(|ws| {
+            let pkg = workspace_pkg_by_root.get(&ws.root).copied();
+            discover::discover_workspace_entry_points_with_warnings_from_pkg(&ws.root, files, pkg)
+        })
         .collect();
     let mut skipped_entries = rustc_hash::FxHashMap::default();
     entry_points.extend_runtime(root_discovery.entries);
@@ -794,6 +867,8 @@ fn run_plugins(
     config: &ResolvedConfig,
     files: &[discover::DiscoveredFile],
     workspaces: &[fallow_config::WorkspaceInfo],
+    root_pkg: Option<&PackageJson>,
+    workspace_pkgs: &[LoadedWorkspacePackage<'_>],
 ) -> plugins::AggregatedPluginResult {
     let registry = plugins::PluginRegistry::new(config.external_plugins.clone());
     let file_paths: Vec<std::path::PathBuf> = files.iter().map(|f| f.path.clone()).collect();
@@ -804,22 +879,21 @@ fn run_plugins(
         .collect();
 
     // Run plugins for root project (full run with external plugins, inline config, etc.)
-    let pkg_path = config.root.join("package.json");
-    let mut result = PackageJson::load(&pkg_path).map_or_else(
-        |_| plugins::AggregatedPluginResult::default(),
-        |pkg| {
-            registry.run_with_search_roots(
-                &pkg,
-                &config.root,
-                &file_paths,
-                &root_config_search_root_refs,
-            )
-        },
-    );
+    let mut result = root_pkg.map_or_else(plugins::AggregatedPluginResult::default, |pkg| {
+        registry.run_with_search_roots(
+            pkg,
+            &config.root,
+            &file_paths,
+            &root_config_search_root_refs,
+        )
+    });
 
     if workspaces.is_empty() {
         return result;
     }
+
+    let root_active_plugins: rustc_hash::FxHashSet<&str> =
+        result.active_plugins.iter().map(String::as_str).collect();
 
     // Pre-compile config matchers and relative files once for all workspace runs.
     // This avoids re-compiling glob patterns and re-computing relative paths per workspace
@@ -838,17 +912,16 @@ fn run_plugins(
         .collect();
 
     // Run plugins for each workspace package in parallel, then merge results.
-    let ws_results: Vec<_> = workspaces
+    let ws_results: Vec<_> = workspace_pkgs
         .par_iter()
-        .filter_map(|ws| {
-            let ws_pkg_path = ws.root.join("package.json");
-            let ws_pkg = PackageJson::load(&ws_pkg_path).ok()?;
+        .filter_map(|(ws, ws_pkg)| {
             let ws_result = registry.run_workspace_fast(
-                &ws_pkg,
+                ws_pkg,
                 &ws.root,
                 &config.root,
                 &precompiled_matchers,
                 &relative_files,
+                &root_active_plugins,
             );
             if ws_result.active_plugins.is_empty() {
                 return None;
