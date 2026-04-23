@@ -1,4 +1,5 @@
 use rustc_hash::{FxHashMap, FxHashSet};
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use fallow_core::duplicates::DuplicationReport;
@@ -487,17 +488,76 @@ pub fn recompute_stats(report: &DuplicationReport) -> fallow_core::duplicates::D
 
 /// Baseline data for health (complexity) comparison.
 ///
-/// Each finding is keyed by `relative_path:function_name:line` for stable comparison.
-/// Target keys use `relative_path:category` so category changes surface as new targets.
+/// New baselines store count-per-category-per-file data in `finding_counts` so
+/// line shifts do not leak pre-existing findings. Legacy baselines with
+/// `findings: ["path:name:line"]` still load so users can refresh them in
+/// place with `--save-baseline`.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct HealthBaselineData {
+    /// Legacy health baseline keys: `relative_path:function_name:line`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub findings: Vec<String>,
+    /// Count-per-category-per-file baseline buckets.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub finding_counts: HealthFindingCountMap,
+    /// Stable production-coverage finding IDs from the sidecar.
     #[serde(default)]
     pub production_coverage_findings: Vec<String>,
     /// Refactoring target keys: `relative_path:category`.
     #[serde(default)]
     pub target_keys: Vec<String>,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct HealthBaselineCount {
+    pub count: usize,
+}
+
+type HealthFindingCountMap = BTreeMap<String, BTreeMap<String, HealthBaselineCount>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HealthFindingDimension {
+    Complexity,
+    Crap,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HealthFindingCategory {
+    dimension: HealthFindingDimension,
+    severity: crate::health_types::FindingSeverity,
+}
+
+impl HealthFindingCategory {
+    const fn key(self) -> &'static str {
+        match (self.dimension, self.severity) {
+            (
+                HealthFindingDimension::Complexity,
+                crate::health_types::FindingSeverity::Moderate,
+            ) => "complexity_moderate",
+            (HealthFindingDimension::Complexity, crate::health_types::FindingSeverity::High) => {
+                "complexity_high"
+            }
+            (
+                HealthFindingDimension::Complexity,
+                crate::health_types::FindingSeverity::Critical,
+            ) => "complexity_critical",
+            (HealthFindingDimension::Crap, crate::health_types::FindingSeverity::Moderate) => {
+                "crap_moderate"
+            }
+            (HealthFindingDimension::Crap, crate::health_types::FindingSeverity::High) => {
+                "crap_high"
+            }
+            (HealthFindingDimension::Crap, crate::health_types::FindingSeverity::Critical) => {
+                "crap_critical"
+            }
+        }
+    }
+}
+
+const HEALTH_FINDING_DIMENSIONS: [HealthFindingDimension; 2] = [
+    HealthFindingDimension::Complexity,
+    HealthFindingDimension::Crap,
+];
 
 impl HealthBaselineData {
     /// Build a health baseline from findings and targets.
@@ -508,10 +568,8 @@ impl HealthBaselineData {
         root: &Path,
     ) -> Self {
         Self {
-            findings: findings
-                .iter()
-                .map(|f| health_finding_key(f, root))
-                .collect(),
+            findings: Vec::new(),
+            finding_counts: health_finding_counts(findings, root),
             production_coverage_findings: production_coverage_findings
                 .iter()
                 .map(|f| production_coverage_finding_key(f, root))
@@ -520,6 +578,37 @@ impl HealthBaselineData {
                 .iter()
                 .map(|t| target_baseline_key(t, root))
                 .collect(),
+        }
+    }
+
+    pub fn finding_entry_count(&self) -> usize {
+        if !self.finding_counts.is_empty() {
+            self.finding_counts
+                .values()
+                .flat_map(BTreeMap::values)
+                .map(|entry| entry.count)
+                .sum()
+        } else {
+            self.findings.len()
+        }
+    }
+
+    pub fn overlap_entry_count(
+        &self,
+        findings: &[crate::health_types::HealthFinding],
+        root: &Path,
+    ) -> usize {
+        if !self.finding_counts.is_empty() {
+            let current_counts = health_finding_counts(findings, root);
+            health_overlap_entry_count(&current_counts, &self.finding_counts)
+        } else {
+            let baseline_keys: FxHashSet<&str> = self.findings.iter().map(String::as_str).collect();
+            findings
+                .iter()
+                .filter(|finding| {
+                    baseline_keys.contains(health_finding_key(finding, root).as_str())
+                })
+                .count()
         }
     }
 }
@@ -543,6 +632,162 @@ fn health_finding_key(finding: &crate::health_types::HealthFinding, root: &Path)
     )
 }
 
+fn health_finding_counts(
+    findings: &[crate::health_types::HealthFinding],
+    root: &Path,
+) -> HealthFindingCountMap {
+    let mut counts = BTreeMap::new();
+    for finding in findings {
+        let path = relative_path(&finding.path, root);
+        let file_counts = counts.entry(path).or_insert_with(BTreeMap::new);
+        for category in health_finding_categories(finding).into_iter().flatten() {
+            file_counts
+                .entry(category.key().to_string())
+                .and_modify(|entry: &mut HealthBaselineCount| entry.count += 1)
+                .or_insert(HealthBaselineCount { count: 1 });
+        }
+    }
+    counts
+}
+
+fn health_finding_categories(
+    finding: &crate::health_types::HealthFinding,
+) -> [Option<HealthFindingCategory>; 2] {
+    let complexity_category = HealthFindingCategory {
+        dimension: HealthFindingDimension::Complexity,
+        severity: finding.severity,
+    };
+    let crap_category = HealthFindingCategory {
+        dimension: HealthFindingDimension::Crap,
+        severity: finding.severity,
+    };
+    let has_complexity =
+        finding.exceeded.includes_cyclomatic() || finding.exceeded.includes_cognitive();
+    let has_crap = finding.exceeded.includes_crap();
+    [
+        has_complexity.then_some(complexity_category),
+        has_crap.then_some(crap_category),
+    ]
+}
+
+fn severity_index(severity: crate::health_types::FindingSeverity) -> usize {
+    match severity {
+        crate::health_types::FindingSeverity::Moderate => 0,
+        crate::health_types::FindingSeverity::High => 1,
+        crate::health_types::FindingSeverity::Critical => 2,
+    }
+}
+
+fn severity_counts_for_dimension(
+    file_counts: Option<&BTreeMap<String, HealthBaselineCount>>,
+    dimension: HealthFindingDimension,
+) -> [usize; 3] {
+    let mut counts = [0; 3];
+    for severity in [
+        crate::health_types::FindingSeverity::Moderate,
+        crate::health_types::FindingSeverity::High,
+        crate::health_types::FindingSeverity::Critical,
+    ] {
+        let category = HealthFindingCategory {
+            dimension,
+            severity,
+        };
+        counts[severity_index(severity)] = file_counts
+            .and_then(|entries| entries.get(category.key()))
+            .map_or(0, |entry| entry.count);
+    }
+    counts
+}
+
+fn overflowing_severities(current: [usize; 3], baseline: [usize; 3]) -> [bool; 3] {
+    let mut available = baseline;
+    let mut overflow = [false; 3];
+
+    // Match lower severities first with the least-flexible compatible baseline
+    // slots so ambiguous cases still leave worse current severities visible.
+    for severity_idx in 0..3 {
+        let compatible = available[severity_idx..].iter().sum::<usize>();
+        overflow[severity_idx] = compatible < current[severity_idx];
+
+        let mut matched = current[severity_idx].min(compatible);
+        for slot in available.iter_mut().skip(severity_idx) {
+            let taken = matched.min(*slot);
+            *slot -= taken;
+            matched -= taken;
+            if matched == 0 {
+                break;
+            }
+        }
+    }
+
+    overflow
+}
+
+fn health_overflow_categories(
+    current_counts: &HealthFindingCountMap,
+    baseline_counts: &HealthFindingCountMap,
+) -> FxHashMap<String, FxHashSet<&'static str>> {
+    let mut overflow_by_path = FxHashMap::default();
+
+    for (path, current_file_counts) in current_counts {
+        let mut overflow_categories: FxHashSet<&'static str> = FxHashSet::default();
+        let baseline_file_counts = baseline_counts.get(path);
+
+        for dimension in HEALTH_FINDING_DIMENSIONS {
+            let current = severity_counts_for_dimension(Some(current_file_counts), dimension);
+            let baseline = severity_counts_for_dimension(baseline_file_counts, dimension);
+            let overflow = overflowing_severities(current, baseline);
+
+            for severity in [
+                crate::health_types::FindingSeverity::Moderate,
+                crate::health_types::FindingSeverity::High,
+                crate::health_types::FindingSeverity::Critical,
+            ] {
+                if overflow[severity_index(severity)] {
+                    overflow_categories.insert(
+                        HealthFindingCategory {
+                            dimension,
+                            severity,
+                        }
+                        .key(),
+                    );
+                }
+            }
+        }
+
+        if !overflow_categories.is_empty() {
+            overflow_by_path.insert(path.clone(), overflow_categories);
+        }
+    }
+
+    overflow_by_path
+}
+
+fn health_overlap_entry_count(
+    current_counts: &HealthFindingCountMap,
+    baseline_counts: &HealthFindingCountMap,
+) -> usize {
+    let mut overlap = 0;
+
+    for (path, baseline_file_counts) in baseline_counts {
+        let current_file_counts = current_counts.get(path);
+
+        for dimension in HEALTH_FINDING_DIMENSIONS {
+            let current_total: usize =
+                severity_counts_for_dimension(current_file_counts, dimension)
+                    .into_iter()
+                    .sum();
+            let baseline_total: usize =
+                severity_counts_for_dimension(Some(baseline_file_counts), dimension)
+                    .into_iter()
+                    .sum();
+            overlap += current_total.min(baseline_total);
+        }
+    }
+
+    overlap
+}
+
 fn production_coverage_finding_key(
     finding: &crate::health_types::ProductionCoverageFinding,
     _root: &Path,
@@ -560,6 +805,22 @@ pub fn filter_new_health_findings(
     baseline: &HealthBaselineData,
     root: &Path,
 ) -> Vec<crate::health_types::HealthFinding> {
+    if !baseline.finding_counts.is_empty() {
+        let current_counts = health_finding_counts(&findings, root);
+        let overflow_categories =
+            health_overflow_categories(&current_counts, &baseline.finding_counts);
+        findings.retain(|finding| {
+            let path = relative_path(&finding.path, root);
+            overflow_categories.get(&path).is_some_and(|categories| {
+                health_finding_categories(finding)
+                    .into_iter()
+                    .flatten()
+                    .any(|category| categories.contains(category.key()))
+            })
+        });
+        return findings;
+    }
+
     let baseline_keys: FxHashSet<&str> = baseline.findings.iter().map(String::as_str).collect();
     findings.retain(|f| {
         let key = health_finding_key(f, root);
@@ -1021,6 +1282,22 @@ mod tests {
         name: &str,
         line: u32,
     ) -> crate::health_types::HealthFinding {
+        make_health_finding_with(
+            root,
+            name,
+            line,
+            crate::health_types::ExceededThreshold::Both,
+            crate::health_types::FindingSeverity::High,
+        )
+    }
+
+    fn make_health_finding_with(
+        root: &Path,
+        name: &str,
+        line: u32,
+        exceeded: crate::health_types::ExceededThreshold,
+        severity: crate::health_types::FindingSeverity,
+    ) -> crate::health_types::HealthFinding {
         crate::health_types::HealthFinding {
             path: root.join("src/utils.ts"),
             name: name.to_string(),
@@ -1030,8 +1307,8 @@ mod tests {
             cognitive: 30,
             line_count: 80,
             param_count: 0,
-            exceeded: crate::health_types::ExceededThreshold::Both,
-            severity: crate::health_types::FindingSeverity::High,
+            exceeded,
+            severity,
             crap: None,
             coverage_pct: None,
         }
@@ -1045,20 +1322,195 @@ mod tests {
         let json = serde_json::to_string(&baseline).unwrap();
         let deserialized: HealthBaselineData = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.findings, baseline.findings);
-        assert_eq!(baseline.findings, vec!["src/utils.ts:parseExpression:42"]);
+        assert_eq!(baseline.findings, Vec::<String>::new());
+        assert_eq!(
+            deserialized.finding_counts["src/utils.ts"]["complexity_high"].count,
+            1
+        );
+        assert!(!json.contains("parseExpression"));
     }
 
     #[test]
     fn health_baseline_filters_known_findings() {
         let root = PathBuf::from("/project");
-        let findings = vec![
+        let mut findings = vec![
             make_health_finding(&root, "parseExpression", 42),
             make_health_finding(&root, "newFunction", 100),
         ];
+        findings[1].path = root.join("src/other.ts");
         let baseline = HealthBaselineData::from_findings(&findings[..1], &[], &[], &root);
         let filtered = filter_new_health_findings(findings, &baseline, &root);
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].name, "newFunction");
+    }
+
+    #[test]
+    fn health_baseline_filters_shifted_lines_with_same_category_count() {
+        let root = PathBuf::from("/project");
+        let baseline = HealthBaselineData::from_findings(
+            &[make_health_finding(&root, "parseExpression", 42)],
+            &[],
+            &[],
+            &root,
+        );
+        let filtered = filter_new_health_findings(
+            vec![make_health_finding(&root, "parseExpression", 43)],
+            &baseline,
+            &root,
+        );
+        assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn health_baseline_reports_full_category_when_count_increases() {
+        let root = PathBuf::from("/project");
+        let baseline = HealthBaselineData::from_findings(
+            &[make_health_finding(&root, "parseExpression", 42)],
+            &[],
+            &[],
+            &root,
+        );
+        let filtered = filter_new_health_findings(
+            vec![
+                make_health_finding(&root, "parseExpression", 43),
+                make_health_finding(&root, "newFunction", 100),
+            ],
+            &baseline,
+            &root,
+        );
+        assert_eq!(filtered.len(), 2);
+    }
+
+    #[test]
+    fn health_baseline_legacy_findings_still_load() {
+        let root = PathBuf::from("/project");
+        let baseline = HealthBaselineData {
+            findings: vec!["src/utils.ts:parseExpression:42".to_owned()],
+            finding_counts: BTreeMap::new(),
+            target_keys: vec![],
+            production_coverage_findings: vec![],
+        };
+        let filtered = filter_new_health_findings(
+            vec![make_health_finding(&root, "parseExpression", 42)],
+            &baseline,
+            &root,
+        );
+        assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn health_baseline_keeps_crap_categories_separate_from_complexity() {
+        let root = PathBuf::from("/project");
+        let baseline = HealthBaselineData::from_findings(
+            &[make_health_finding_with(
+                &root,
+                "parseExpression",
+                42,
+                crate::health_types::ExceededThreshold::Crap,
+                crate::health_types::FindingSeverity::High,
+            )],
+            &[],
+            &[],
+            &root,
+        );
+        let filtered = filter_new_health_findings(
+            vec![
+                make_health_finding_with(
+                    &root,
+                    "parseExpression",
+                    43,
+                    crate::health_types::ExceededThreshold::Crap,
+                    crate::health_types::FindingSeverity::High,
+                ),
+                make_health_finding(&root, "newComplexityOnlyFunction", 100),
+            ],
+            &baseline,
+            &root,
+        );
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].name, "newComplexityOnlyFunction");
+    }
+
+    #[test]
+    fn health_baseline_suppresses_findings_that_only_improve_in_severity() {
+        let root = PathBuf::from("/project");
+        let baseline = HealthBaselineData::from_findings(
+            &[make_health_finding_with(
+                &root,
+                "parseExpression",
+                42,
+                crate::health_types::ExceededThreshold::Both,
+                crate::health_types::FindingSeverity::Critical,
+            )],
+            &[],
+            &[],
+            &root,
+        );
+        let filtered = filter_new_health_findings(
+            vec![make_health_finding_with(
+                &root,
+                "parseExpression",
+                42,
+                crate::health_types::ExceededThreshold::Both,
+                crate::health_types::FindingSeverity::High,
+            )],
+            &baseline,
+            &root,
+        );
+        assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn health_baseline_still_reports_worse_current_severity_as_new() {
+        let root = PathBuf::from("/project");
+        let baseline = HealthBaselineData::from_findings(
+            &[make_health_finding_with(
+                &root,
+                "parseExpression",
+                42,
+                crate::health_types::ExceededThreshold::Both,
+                crate::health_types::FindingSeverity::High,
+            )],
+            &[],
+            &[],
+            &root,
+        );
+        let filtered = filter_new_health_findings(
+            vec![make_health_finding_with(
+                &root,
+                "parseExpression",
+                42,
+                crate::health_types::ExceededThreshold::Both,
+                crate::health_types::FindingSeverity::Critical,
+            )],
+            &baseline,
+            &root,
+        );
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].name, "parseExpression");
+        assert!(matches!(
+            filtered[0].severity,
+            crate::health_types::FindingSeverity::Critical
+        ));
+    }
+
+    #[test]
+    fn health_baseline_overlap_counts_partial_category_overflow() {
+        let root = PathBuf::from("/project");
+        let baseline = HealthBaselineData::from_findings(
+            &[make_health_finding(&root, "parseExpression", 42)],
+            &[],
+            &[],
+            &root,
+        );
+        let overlap = baseline.overlap_entry_count(
+            &[
+                make_health_finding(&root, "parseExpression", 42),
+                make_health_finding(&root, "newFunction", 100),
+            ],
+            &root,
+        );
+        assert_eq!(overlap, 1);
     }
 
     #[test]
@@ -1067,6 +1519,7 @@ mod tests {
         let findings = vec![make_health_finding(&root, "parseExpression", 42)];
         let baseline = HealthBaselineData {
             findings: vec![],
+            finding_counts: BTreeMap::new(),
             target_keys: vec![],
             production_coverage_findings: vec![],
         };
