@@ -797,12 +797,24 @@ fn run_plugins(
 ) -> plugins::AggregatedPluginResult {
     let registry = plugins::PluginRegistry::new(config.external_plugins.clone());
     let file_paths: Vec<std::path::PathBuf> = files.iter().map(|f| f.path.clone()).collect();
+    let root_config_search_roots = collect_config_search_roots(&config.root, &file_paths);
+    let root_config_search_root_refs: Vec<&Path> = root_config_search_roots
+        .iter()
+        .map(std::path::PathBuf::as_path)
+        .collect();
 
     // Run plugins for root project (full run with external plugins, inline config, etc.)
     let pkg_path = config.root.join("package.json");
     let mut result = PackageJson::load(&pkg_path).map_or_else(
         |_| plugins::AggregatedPluginResult::default(),
-        |pkg| registry.run(&pkg, &config.root, &file_paths),
+        |pkg| {
+            registry.run_with_search_roots(
+                &pkg,
+                &config.root,
+                &file_paths,
+                &root_config_search_root_refs,
+            )
+        },
     );
 
     if workspaces.is_empty() {
@@ -941,6 +953,32 @@ fn run_plugins(
     result
 }
 
+fn collect_config_search_roots(
+    root: &Path,
+    file_paths: &[std::path::PathBuf],
+) -> Vec<std::path::PathBuf> {
+    let mut roots: rustc_hash::FxHashSet<std::path::PathBuf> = rustc_hash::FxHashSet::default();
+    roots.insert(root.to_path_buf());
+
+    for file_path in file_paths {
+        let mut current = file_path.parent();
+        while let Some(dir) = current {
+            if !dir.starts_with(root) {
+                break;
+            }
+            roots.insert(dir.to_path_buf());
+            if dir == root {
+                break;
+            }
+            current = dir.parent();
+        }
+    }
+
+    let mut roots_vec: Vec<_> = roots.into_iter().collect();
+    roots_vec.sort();
+    roots_vec
+}
+
 /// Run analysis on a project directory (with export usages for LSP Code Lens).
 ///
 /// # Errors
@@ -980,7 +1018,7 @@ fn num_cpus() -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::format_undeclared_workspace_warning;
+    use super::{collect_config_search_roots, format_undeclared_workspace_warning};
     use std::path::{Path, PathBuf};
 
     use fallow_config::WorkspaceDiagnostic;
@@ -1025,6 +1063,31 @@ mod tests {
         assert_eq!(
             warning,
             "6 directories with package.json are not declared as workspaces: examples/a, examples/b, examples/c, examples/d, examples/e (and 1 more). Add those paths to package.json workspaces or pnpm-workspace.yaml if they should be analyzed as workspaces."
+        );
+    }
+
+    #[test]
+    fn collect_config_search_roots_includes_file_ancestors_once() {
+        let root = PathBuf::from("/repo");
+        let search_roots = collect_config_search_roots(
+            &root,
+            &[
+                root.join("apps/query/src/main.ts"),
+                root.join("packages/shared/lib/index.ts"),
+            ],
+        );
+
+        assert_eq!(
+            search_roots,
+            vec![
+                root.clone(),
+                root.join("apps"),
+                root.join("apps/query"),
+                root.join("apps/query/src"),
+                root.join("packages"),
+                root.join("packages/shared"),
+                root.join("packages/shared/lib"),
+            ]
         );
     }
 }

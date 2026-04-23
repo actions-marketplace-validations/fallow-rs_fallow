@@ -92,6 +92,22 @@ impl PluginRegistry {
         root: &Path,
         discovered_files: &[PathBuf],
     ) -> AggregatedPluginResult {
+        self.run_with_search_roots(pkg, root, discovered_files, &[root])
+    }
+
+    /// Run all plugins against a project with explicit config-file search roots.
+    ///
+    /// `config_search_roots` should stay narrowly focused to directories that are
+    /// already known to matter for this project. Broad recursive scans are
+    /// intentionally avoided because they become prohibitively expensive on
+    /// large monorepos with populated `node_modules` trees.
+    pub fn run_with_search_roots(
+        &self,
+        pkg: &PackageJson,
+        root: &Path,
+        discovered_files: &[PathBuf],
+        config_search_roots: &[&Path],
+    ) -> AggregatedPluginResult {
         let _span = tracing::info_span!("run_plugins").entered();
         let mut result = AggregatedPluginResult::default();
 
@@ -199,7 +215,8 @@ impl PluginRegistry {
             // Phase 3b: Filesystem fallback for JSON config files.
             // JSON files (angular.json, project.json) are not in the discovered file set
             // because fallow only discovers JS/TS/CSS/Vue/etc. files.
-            let json_configs = discover_config_files(&config_matchers, &resolved_plugins, &[root]);
+            let json_configs =
+                discover_config_files(&config_matchers, &resolved_plugins, config_search_roots);
             for (abs_path, plugin) in &json_configs {
                 if let Ok(source) = std::fs::read_to_string(abs_path) {
                     let plugin_result = plugin.resolve_config(abs_path, &source, root);

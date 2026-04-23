@@ -112,3 +112,9 @@ jobs:
             bench-real-world.json
             bench-real-world-stderr.txt
           retention-days: 30
+
+      - name: Enforce Benchmark Guard
+        if: always() && steps.bench.outcome == 'failure'
+        run: |
+          echo "Real-world benchmark guard failed. See bench-real-world-stderr.txt for details." >&2
+          exit 1

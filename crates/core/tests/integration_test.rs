@@ -45,6 +45,8 @@ mod html_entry;
 mod jsx_assets_and_jsdoc;
 #[path = "integration_test/member_detection.rs"]
 mod member_detection;
+#[path = "integration_test/nx_project_json.rs"]
+mod nx_project_json;
 #[path = "integration_test/rules_config.rs"]
 mod rules_config;
 #[path = "integration_test/sfc_parsing.rs"]

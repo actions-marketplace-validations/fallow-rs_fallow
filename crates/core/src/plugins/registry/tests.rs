@@ -1908,8 +1908,8 @@ fn eslint_activates_by_config_file_existence() {
 
 #[test]
 fn discover_config_files_finds_in_subdirectory() {
-    // Nx plugin has "**/project.json" config pattern — filesystem glob discovery
-    // should find config files beneath the project root.
+    // Nx plugin has "**/project.json" config pattern. Callers provide focused
+    // search roots rather than forcing a recursive whole-tree walk.
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     let subdir = root.join("packages").join("app");
@@ -1920,14 +1920,14 @@ fn discover_config_files_finds_in_subdirectory() {
     let matchers = registry.precompile_config_matchers();
     let resolved: FxHashSet<&str> = FxHashSet::default();
 
-    let json_configs = discover_config_files(&matchers, &resolved, &[root]);
+    let json_configs = discover_config_files(&matchers, &resolved, &[root, subdir.as_path()]);
     // Check if any nx project.json was discovered
     let found_project_json = json_configs
         .iter()
         .any(|(path, _)| path.ends_with("project.json"));
     assert!(
         found_project_json,
-        "discover_config_files should find project.json below the project root"
+        "discover_config_files should find project.json in the provided search roots"
     );
 }
 

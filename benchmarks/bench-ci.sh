@@ -20,6 +20,15 @@ FALLOW_BIN=""
 CLONE_DIR="/tmp/fallow-bench-ci"
 RUNS=3
 export FALLOW_QUIET="${FALLOW_QUIET:-1}"
+PROJECT_TIMEOUT_SECONDS="${PROJECT_TIMEOUT_SECONDS:-30}"
+QUERY_MAX_COLD_MS="${QUERY_MAX_COLD_MS:-5000}"
+TIMEOUT_BIN=""
+
+if command -v timeout >/dev/null 2>&1; then
+    TIMEOUT_BIN="timeout"
+elif command -v gtimeout >/dev/null 2>&1; then
+    TIMEOUT_BIN="gtimeout"
+fi
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -116,17 +125,34 @@ clear_cache() {
 
 # Returns elapsed time in milliseconds
 # Sets: ELAPSED_MS
+run_fallow() {
+    local dir="$1"; shift
+
+    if [[ -n "${TIMEOUT_BIN}" ]]; then
+        "${TIMEOUT_BIN}" "${PROJECT_TIMEOUT_SECONDS}" \
+            "${FALLOW_BIN}" --quiet --format json "$@" --root "${dir}" \
+            >/dev/null 2>/dev/null
+    else
+        "${FALLOW_BIN}" --quiet --format json "$@" --root "${dir}" \
+            >/dev/null 2>/dev/null
+    fi
+}
+
 time_fallow() {
     local dir="$1"; shift
-    local start end
+    local start end run_status
     start=$(date +%s%N 2>/dev/null || python3 -c "import time; print(int(time.time()*1e9))")
 
-    "${FALLOW_BIN}" --quiet --format json "$@" --root "${dir}" \
-        >/dev/null 2>/dev/null || true
+    if run_fallow "${dir}" "$@"; then
+        run_status=0
+    else
+        run_status=$?
+    fi
 
     end=$(date +%s%N 2>/dev/null || python3 -c "import time; print(int(time.time()*1e9))")
 
     ELAPSED_MS=$(( (end - start) / 1000000 ))
+    return "${run_status}"
 }
 
 median() {
@@ -186,7 +212,10 @@ for entry in "${PROJECTS[@]}"; do
     cold_times=()
     for (( i=0; i<RUNS; i++ )); do
         clear_cache "${dest}"
-        time_fallow "${dest}" --no-cache
+        if ! time_fallow "${dest}" --no-cache; then
+            echo "    FAIL: fallow timed out or errored during cold run after ${PROJECT_TIMEOUT_SECONDS}s" >&2
+            exit 1
+        fi
         cold_times+=("${ELAPSED_MS}")
     done
     cold_median=$(median "${cold_times[@]}")
@@ -194,11 +223,17 @@ for entry in "${PROJECTS[@]}"; do
     # --- Warm runs (with cache) ---
     clear_cache "${dest}"
     # Populate cache
-    "${FALLOW_BIN}" --quiet --format json --root "${dest}" >/dev/null 2>/dev/null || true
+    if ! run_fallow "${dest}"; then
+        echo "    FAIL: fallow timed out or errored while warming cache after ${PROJECT_TIMEOUT_SECONDS}s" >&2
+        exit 1
+    fi
     # Measure
     warm_times=()
     for (( i=0; i<RUNS; i++ )); do
-        time_fallow "${dest}"
+        if ! time_fallow "${dest}"; then
+            echo "    FAIL: fallow timed out or errored during warm run after ${PROJECT_TIMEOUT_SECONDS}s" >&2
+            exit 1
+        fi
         warm_times+=("${ELAPSED_MS}")
     done
     warm_median=$(median "${warm_times[@]}")
@@ -207,6 +242,10 @@ for entry in "${PROJECTS[@]}"; do
     echo "    Cold: $(fmt_ms "${cold_median}") (median of ${RUNS})" >&2
     echo "    Warm: $(fmt_ms "${warm_median}") (median of ${RUNS})" >&2
     echo "    Runs: cold=[${cold_times[*]}] warm=[${warm_times[*]}]" >&2
+    if [[ "${name}" == "query" && "${cold_median}" -gt "${QUERY_MAX_COLD_MS}" ]]; then
+        echo "    FAIL: query cold median ${cold_median}ms exceeds ${QUERY_MAX_COLD_MS}ms budget" >&2
+        exit 1
+    fi
     echo "" >&2
 
     # Append entries as JSONL

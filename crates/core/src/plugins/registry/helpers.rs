@@ -123,8 +123,13 @@ pub fn process_external_plugins(
 }
 
 /// Discover config files on disk for plugins that were not matched against the
-/// discovered source set. Supports brace patterns like
-/// `vite.config.{ts,js,mts,mjs}` plus normal glob patterns like `**/project.json`.
+/// discovered source set.
+///
+/// This intentionally probes only known search roots instead of recursively
+/// globbing the whole repository tree. Large monorepos often contain enormous
+/// `node_modules` directories, and a full `**/project.json` walk becomes
+/// pathological there. Callers should therefore pass a focused root list such
+/// as the repo root, workspace roots, and ancestors of discovered source files.
 pub fn discover_config_files<'a>(
     config_matchers: &[(&'a dyn Plugin, Vec<globset::GlobMatcher>)],
     resolved_plugins: &FxHashSet<&str>,
@@ -141,19 +146,8 @@ pub fn discover_config_files<'a>(
         for root in roots {
             for pat in plugin.config_patterns() {
                 for expanded in expand_brace_pattern(pat) {
-                    if pattern_has_glob(&expanded) {
-                        let glob_pattern = root.join(&expanded).to_string_lossy().to_string();
-                        let Ok(paths) = glob::glob(&glob_pattern) else {
-                            continue;
-                        };
-                        for path in paths.flatten().filter(|p| p.is_file()) {
-                            if seen.insert((path.clone(), plugin.name())) {
-                                config_files.push((path, *plugin));
-                            }
-                        }
-                    } else {
-                        let path = root.join(&expanded);
-                        if path.is_file() && seen.insert((path.clone(), plugin.name())) {
+                    for path in discover_pattern_matches(root, &expanded) {
+                        if seen.insert((path.clone(), plugin.name())) {
                             config_files.push((path, *plugin));
                         }
                     }
@@ -167,6 +161,50 @@ pub fn discover_config_files<'a>(
 
 fn pattern_has_glob(pattern: &str) -> bool {
     pattern.contains('*') || pattern.contains('?') || pattern.contains('[')
+}
+
+fn discover_pattern_matches(root: &Path, pattern: &str) -> Vec<PathBuf> {
+    if !pattern_has_glob(pattern) {
+        let path = root.join(pattern);
+        return if path.is_file() {
+            vec![path]
+        } else {
+            Vec::new()
+        };
+    }
+
+    if let Some(stripped) = pattern.strip_prefix("**/") {
+        return discover_pattern_matches(root, stripped);
+    }
+
+    let (dir, file_pattern) = match pattern.rsplit_once('/') {
+        Some((parent, file_pattern)) if !pattern_has_glob(parent) => {
+            (root.join(parent), file_pattern)
+        }
+        Some(_) => return Vec::new(),
+        None => (root.to_path_buf(), pattern),
+    };
+
+    scan_dir_for_pattern(&dir, file_pattern)
+}
+
+fn scan_dir_for_pattern(dir: &Path, file_pattern: &str) -> Vec<PathBuf> {
+    let Ok(matcher) = globset::Glob::new(file_pattern).map(|g| g.compile_matcher()) else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+
+    entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file())
+        .filter(|path| {
+            path.file_name()
+                .is_some_and(|name| matcher.is_match(std::path::Path::new(name)))
+        })
+        .collect()
 }
 
 fn expand_brace_pattern(pattern: &str) -> Vec<String> {
