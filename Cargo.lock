@@ -912,9 +912,9 @@ dependencies = [
 
 [[package]]
 name = "fallow-cov-protocol"
-version = "0.3.0"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e94d6d7cac39ac0b4c26a4582023ca60fffad952d0da71874bf6a1b3664ef199"
+checksum = "67930bf898cb9aa41f458839a4b59dd5c457695d1964ed172ab88f79d4f2a4f2"
 dependencies = [
  "serde",
  "serde_json",
