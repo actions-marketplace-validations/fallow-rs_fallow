@@ -10,7 +10,7 @@ fn unused_export_names(results: &fallow_core::results::AnalysisResults) -> Vec<&
     results
         .unused_exports
         .iter()
-        .map(|e| e.export_name.as_str())
+        .map(|e| e.export.export_name.as_str())
         .collect()
 }
 
@@ -18,7 +18,14 @@ fn unused_file_names(results: &fallow_core::results::AnalysisResults) -> Vec<Str
     results
         .unused_files
         .iter()
-        .map(|f| f.path.file_name().unwrap().to_string_lossy().to_string())
+        .map(|f| {
+            f.file
+                .path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .to_string()
+        })
         .collect()
 }
 
@@ -27,7 +34,6 @@ fn unreachable_mixed_exports_flags_unused_export() {
     let results = analyze_fixture("unreachable-mixed-exports");
     let unused_export_names = unused_export_names(&results);
 
-    // unusedHelper is exported but never imported by anyone — should be flagged
     assert!(
         unused_export_names.contains(&"unusedHelper"),
         "unusedHelper should be detected as unused export, found: {unused_export_names:?}"
@@ -39,8 +45,6 @@ fn unreachable_mixed_exports_flags_export_only_used_by_unreachable() {
     let results = analyze_fixture("unreachable-mixed-exports");
     let unused_export_names = unused_export_names(&results);
 
-    // usedHelper is imported by setup.ts, but setup.ts is also unreachable,
-    // so the reference shouldn't count — usedHelper should be flagged
     assert!(
         unused_export_names.contains(&"usedHelper"),
         "usedHelper (only referenced by unreachable module) should be flagged, found: {unused_export_names:?}"

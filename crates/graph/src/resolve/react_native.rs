@@ -1,31 +1,273 @@
 //! React Native and Expo platform extension support.
 
-use super::types::RN_PLATFORM_PREFIXES;
+use std::path::Path;
 
-/// Check if React Native or Expo plugins are active.
-pub(super) fn has_react_native_plugin(active_plugins: &[String]) -> bool {
+use rustc_hash::FxHashMap;
+
+use super::types::{RN_PLATFORM_PREFIXES, ResolveResult, ResolvedImport, ResolvedModule};
+use fallow_types::discover::{DiscoveredFile, FileId};
+use fallow_types::extract::{ImportInfo, ImportedName};
+
+/// Whether the React Native or Expo plugin is active, the gate for every
+/// Metro platform-extension behavior in the resolver and its consumers.
+pub fn has_react_native_plugin(active_plugins: &[String]) -> bool {
     active_plugins
         .iter()
         .any(|p| p == "react-native" || p == "expo")
 }
 
+/// Source extensions that participate in Metro platform-extension resolution.
+const RN_SOURCE_EXTS: &[&str] = &[".ts", ".tsx", ".js", ".jsx"];
+
+/// Split a file or specifier basename into its stem and a Metro source
+/// extension, when one is present.
+fn split_source_ext(name: &str) -> (&str, Option<&str>) {
+    for ext in RN_SOURCE_EXTS {
+        if let Some(stem) = name.strip_suffix(ext) {
+            return (stem, Some(ext));
+        }
+    }
+    (name, None)
+}
+
+/// Strip a trailing platform segment (`.ios`, `.android`, ...) from a stem.
+/// Returns the family base stem and whether a platform segment was present.
+fn strip_platform_segment(stem: &str) -> (&str, bool) {
+    for platform in RN_PLATFORM_PREFIXES {
+        if let Some(base) = stem.strip_suffix(platform) {
+            return (base, true);
+        }
+    }
+    (stem, false)
+}
+
+/// Where a source file sits in a Metro platform-extension family: the
+/// directory and base stem shared by `<stem>.<platform><ext>` and
+/// `<stem><ext>`, plus whether this member carries a platform segment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlatformFamilyKey<'a> {
+    /// Directory containing the file.
+    pub parent: &'a Path,
+    /// File stem with the source extension and any platform segment removed.
+    pub base: &'a str,
+    /// Whether the file name carries a platform segment (`.ios`, `.web`, ...).
+    pub is_platform_variant: bool,
+}
+
+/// Classify `path` by its Metro platform-extension family.
+///
+/// Membership is syntactic: files sharing `parent` and `base` belong to the
+/// same family, and the caller decides whether enough members exist for the
+/// family to matter. Returns `None` for files outside the Metro source
+/// extensions, names without a stem, and paths without a parent directory.
+pub fn platform_family_key(path: &Path) -> Option<PlatformFamilyKey<'_>> {
+    let name = path.file_name()?.to_str()?;
+    let (stem, ext) = split_source_ext(name);
+    ext?;
+    let (base, is_platform_variant) = strip_platform_segment(stem);
+    if base.is_empty() {
+        return None;
+    }
+    let parent = path.parent()?;
+    Some(PlatformFamilyKey {
+        parent,
+        base,
+        is_platform_variant,
+    })
+}
+
+/// Whether an import specifier explicitly names a platform variant
+/// (e.g. `./UserMenu.ios` or `./UserMenu.ios.tsx`), in which case the author
+/// targeted one variant and the family must not be credited as a whole.
+fn specifier_names_platform_variant(specifier: &str) -> bool {
+    let basename = specifier.rsplit('/').next().unwrap_or(specifier);
+    let (stem, _) = split_source_ext(basename);
+    strip_platform_segment(stem).1
+}
+
+/// Metro platform-extension families among the discovered files, keyed by the
+/// member [`FileId`]. A family is every file in one directory sharing a base
+/// stem across `<stem>.<platform><ext>` and `<stem><ext>`, and only counts
+/// when at least one platform variant exists alongside another member.
+struct PlatformFamilies {
+    family_of: FxHashMap<FileId, usize>,
+    members: Vec<Vec<FileId>>,
+}
+
+impl PlatformFamilies {
+    fn build(files: &[DiscoveredFile]) -> Self {
+        let mut grouped: FxHashMap<(&Path, &str), Vec<(FileId, bool)>> = FxHashMap::default();
+        for file in files {
+            let Some(key) = platform_family_key(&file.path) else {
+                continue;
+            };
+            grouped
+                .entry((key.parent, key.base))
+                .or_default()
+                .push((file.id, key.is_platform_variant));
+        }
+
+        let mut family_of = FxHashMap::default();
+        let mut members = Vec::new();
+        for group in grouped.into_values() {
+            if group.len() < 2 || !group.iter().any(|(_, is_platform)| *is_platform) {
+                continue;
+            }
+            let mut ids: Vec<FileId> = group.into_iter().map(|(id, _)| id).collect();
+            ids.sort_unstable_by_key(|id| id.0);
+            let index = members.len();
+            for id in &ids {
+                family_of.insert(*id, index);
+            }
+            members.push(ids);
+        }
+        Self { family_of, members }
+    }
+
+    fn siblings(&self, target: FileId) -> Option<&[FileId]> {
+        self.family_of
+            .get(&target)
+            .map(|index| self.members[*index].as_slice())
+    }
+}
+
+/// Rebuild a project-internal [`ResolveResult`] against a sibling file,
+/// preserving the original edge kind and package attribution.
+fn retarget(result: &ResolveResult, sibling: FileId) -> Option<ResolveResult> {
+    match result {
+        ResolveResult::InternalModule(_) => Some(ResolveResult::InternalModule(sibling)),
+        ResolveResult::CommonJsInternalModule(_) => {
+            Some(ResolveResult::CommonJsInternalModule(sibling))
+        }
+        ResolveResult::SyntheticAutoImport(_) => Some(ResolveResult::SyntheticAutoImport(sibling)),
+        ResolveResult::InternalPackageModule { package_name, .. } => {
+            Some(ResolveResult::InternalPackageModule {
+                file_id: sibling,
+                package_name: package_name.clone(),
+            })
+        }
+        ResolveResult::CommonJsInternalPackageModule { package_name, .. } => {
+            Some(ResolveResult::CommonJsInternalPackageModule {
+                file_id: sibling,
+                package_name: package_name.clone(),
+            })
+        }
+        ResolveResult::ExternalFile(_)
+        | ResolveResult::NpmPackage(_)
+        | ResolveResult::CommonJsNpmPackage(_)
+        | ResolveResult::Unresolvable(_) => None,
+    }
+}
+
+/// Expand `imports` with sibling edges for every platform-extension family
+/// member, appending the extra edges to `extra`.
+fn expand_family_imports(
+    imports: &[ResolvedImport],
+    families: &PlatformFamilies,
+    extra: &mut Vec<ResolvedImport>,
+) {
+    for import in imports {
+        if specifier_names_platform_variant(&import.info.source) {
+            continue;
+        }
+        let Some(target) = import.target.internal_file_id() else {
+            continue;
+        };
+        let Some(siblings) = families.siblings(target) else {
+            continue;
+        };
+        for sibling in siblings {
+            if *sibling == target {
+                continue;
+            }
+            if let Some(retargeted) = retarget(&import.target, *sibling) {
+                extra.push(ResolvedImport {
+                    info: import.info.clone(),
+                    target: retargeted,
+                });
+            }
+        }
+    }
+}
+
+/// Credit whole Metro platform-extension families when the RN/Expo plugin is
+/// active.
+///
+/// Metro resolves `./UserMenu` to `UserMenu.ios.tsx` on iOS and to
+/// `UserMenu.tsx` (or `.android.tsx`, `.native.tsx`, ...) elsewhere, so a
+/// specifier that resolved to one family member reaches every member at
+/// runtime. The resolver picks a single winner per platform-extension order;
+/// this pass appends edges to the remaining family members so none are
+/// reported as unused files and their matching exports stay credited. Imports
+/// that explicitly name a platform variant keep their single edge.
+pub(super) fn synthesize_platform_family_edges(
+    resolved: &mut [ResolvedModule],
+    files: &[DiscoveredFile],
+    active_plugins: &[String],
+) {
+    if !has_react_native_plugin(active_plugins) {
+        return;
+    }
+    let families = PlatformFamilies::build(files);
+    if families.members.is_empty() {
+        return;
+    }
+
+    for module in resolved.iter_mut() {
+        let mut extra = Vec::new();
+        expand_family_imports(&module.resolved_imports, &families, &mut extra);
+        expand_family_imports(&module.resolved_dynamic_imports, &families, &mut extra);
+
+        for re_export in &module.re_exports {
+            if specifier_names_platform_variant(&re_export.info.source) {
+                continue;
+            }
+            let Some(target) = re_export.target.internal_file_id() else {
+                continue;
+            };
+            let Some(siblings) = families.siblings(target) else {
+                continue;
+            };
+            for sibling in siblings {
+                if *sibling == target {
+                    continue;
+                }
+                // Re-export propagation keeps its single resolved source; a
+                // side-effect edge is enough to keep the sibling reachable.
+                extra.push(ResolvedImport {
+                    info: ImportInfo {
+                        source: re_export.info.source.clone(),
+                        imported_name: ImportedName::SideEffect,
+                        local_name: String::new(),
+                        is_type_only: re_export.info.is_type_only,
+                        is_type_only_star: false,
+                        from_style: false,
+                        span: oxc_span::Span::default(),
+                        source_span: oxc_span::Span::default(),
+                    },
+                    target: ResolveResult::InternalModule(*sibling),
+                });
+            }
+        }
+
+        module.resolved_imports.extend(extra);
+    }
+}
+
 /// Build the resolver extension list, optionally prepending React Native platform
 /// extensions when the RN/Expo plugin is active.
 pub(super) fn build_extensions(active_plugins: &[String]) -> Vec<String> {
-    // Declaration files (.d.ts, .d.mts, .d.cts) must come AFTER runtime files
-    // (.js, .jsx, etc.). When both exist side-by-side (e.g. suspense.js +
-    // suspense.d.ts), the import should resolve to the runtime module, not the
-    // type declaration. Declarations provide types for their companion .js files
-    // but are not standalone modules.
     let base: Vec<String> = vec![
         ".ts".into(),
         ".tsx".into(),
         ".mts".into(),
         ".cts".into(),
+        ".gts".into(),
         ".js".into(),
         ".jsx".into(),
         ".mjs".into(),
         ".cjs".into(),
+        ".gjs".into(),
         ".d.ts".into(),
         ".d.mts".into(),
         ".d.cts".into(),
@@ -36,6 +278,8 @@ pub(super) fn build_extensions(active_plugins: &[String]) -> Vec<String> {
         ".mdx".into(),
         ".css".into(),
         ".scss".into(),
+        ".graphql".into(),
+        ".gql".into(),
     ];
 
     if has_react_native_plugin(active_plugins) {
@@ -82,15 +326,9 @@ pub(super) fn build_condition_names(
         names.insert(0, "react-native".into());
         names.insert(1, "browser".into());
     }
-    // User-supplied conditions win: prepend in reverse so the first entry in
-    // `extra_conditions` ends up first in the final list.
     for extra in extra_conditions.iter().rev() {
         names.insert(0, extra.clone());
     }
-    // Dedup while preserving order: a user explicitly listing a baseline
-    // condition (e.g. to document priority) should not produce a duplicate
-    // entry. `oxc_resolver` is first-match-wins, so duplicates are harmless
-    // functionally but noisy and confusing in traces.
     let mut seen: rustc_hash::FxHashSet<String> = rustc_hash::FxHashSet::default();
     names.retain(|name| seen.insert(name.clone()));
     names
@@ -124,16 +362,13 @@ mod tests {
         let rn_plugins = vec!["react-native".to_string()];
         let with_rn = build_extensions(&rn_plugins);
 
-        // Without RN, the first extension should be .ts
         assert_eq!(no_rn[0], ".ts");
 
-        // With RN, platform extensions should come first
         assert_eq!(with_rn[0], ".web.ts");
         assert_eq!(with_rn[1], ".web.tsx");
         assert_eq!(with_rn[2], ".web.js");
         assert_eq!(with_rn[3], ".web.jsx");
 
-        // Verify all 4 platforms (web, ios, android, native) x 4 exts = 16
         assert!(with_rn.len() > no_rn.len());
         assert_eq!(
             with_rn.len(),
@@ -148,10 +383,8 @@ mod tests {
         let rn_plugins = vec!["react-native".to_string()];
         let with_rn = build_condition_names(&rn_plugins, &[]);
 
-        // Without RN, first condition should be "development"
         assert_eq!(no_rn[0], "development");
 
-        // With RN, "react-native" and "browser" should be prepended
         assert_eq!(with_rn[0], "react-native");
         assert_eq!(with_rn[1], "browser");
         assert_eq!(with_rn[2], "development");
@@ -159,9 +392,6 @@ mod tests {
 
     #[test]
     fn test_development_condition_in_baseline() {
-        // `development` ships in the baseline so package.json exports that
-        // declare a development branch resolve to source files without
-        // requiring any user config. See issue #135.
         let names = build_condition_names(&[], &[]);
         assert!(
             names.contains(&"development".to_string()),
@@ -172,7 +402,6 @@ mod tests {
     #[test]
     fn test_extra_conditions_prepended_before_baseline() {
         let names = build_condition_names(&[], &["worker".to_string(), "edge-light".to_string()]);
-        // First entry in extras wins over later extras AND over baseline.
         assert_eq!(names[0], "worker");
         assert_eq!(names[1], "edge-light");
         assert_eq!(names[2], "development");
@@ -190,9 +419,6 @@ mod tests {
 
     #[test]
     fn test_duplicate_baseline_condition_from_user_is_deduped() {
-        // Users may list a baseline condition like `development` in their
-        // config to make priority explicit. That should not produce a
-        // duplicate entry in the final list.
         let names = build_condition_names(&[], &["development".to_string()]);
         let dev_count = names.iter().filter(|n| *n == "development").count();
         assert_eq!(dev_count, 1, "`development` should appear exactly once");
@@ -203,9 +429,105 @@ mod tests {
     }
 
     #[test]
+    fn test_specifier_names_platform_variant() {
+        assert!(specifier_names_platform_variant("./UserMenu.ios"));
+        assert!(specifier_names_platform_variant("./UserMenu.android.tsx"));
+        assert!(specifier_names_platform_variant("../deep/UserMenu.native"));
+        assert!(!specifier_names_platform_variant("./UserMenu"));
+        assert!(!specifier_names_platform_variant("./UserMenu.tsx"));
+        assert!(!specifier_names_platform_variant("./ios/UserMenu"));
+    }
+
+    #[test]
+    fn test_platform_family_key_marks_platform_variants() {
+        let key = platform_family_key(Path::new("src/components/UserMenu.ios.tsx"))
+            .expect("source file has a family key");
+        assert_eq!(key.parent, Path::new("src/components"));
+        assert_eq!(key.base, "UserMenu");
+        assert!(key.is_platform_variant);
+
+        let key = platform_family_key(Path::new("src/components/UserMenu.tsx"))
+            .expect("source file has a family key");
+        assert_eq!(key.parent, Path::new("src/components"));
+        assert_eq!(key.base, "UserMenu");
+        assert!(!key.is_platform_variant);
+    }
+
+    #[test]
+    fn test_platform_family_key_covers_every_platform_and_source_extension() {
+        for platform in RN_PLATFORM_PREFIXES {
+            for ext in RN_SOURCE_EXTS {
+                let path = format!("src/Button{platform}{ext}");
+                let key = platform_family_key(Path::new(&path)).expect("family key");
+                assert_eq!(key.base, "Button", "{path}");
+                assert!(key.is_platform_variant, "{path}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_platform_family_key_rejects_non_source_files() {
+        assert_eq!(platform_family_key(Path::new("src/UserMenu.css")), None);
+        assert_eq!(
+            platform_family_key(Path::new("src/UserMenu.ios.json")),
+            None
+        );
+        assert_eq!(platform_family_key(Path::new("src/UserMenu.ios")), None);
+        assert_eq!(
+            platform_family_key(Path::new("src/.ios.tsx")),
+            None,
+            "a bare platform segment has no base stem"
+        );
+    }
+
+    fn discovered(id: u32, path: &str) -> DiscoveredFile {
+        DiscoveredFile {
+            id: FileId(id),
+            path: std::path::PathBuf::from(path),
+            size_bytes: 0,
+        }
+    }
+
+    #[test]
+    fn test_platform_families_group_base_and_variants() {
+        let files = vec![
+            discovered(0, "src/UserMenu.tsx"),
+            discovered(1, "src/UserMenu.ios.tsx"),
+            discovered(2, "src/UserMenu.android.tsx"),
+            discovered(3, "src/Other.tsx"),
+            discovered(4, "src/nested/UserMenu.tsx"),
+        ];
+        let families = PlatformFamilies::build(&files);
+
+        assert_eq!(families.members.len(), 1);
+        assert_eq!(
+            families.siblings(FileId(0)),
+            Some([FileId(0), FileId(1), FileId(2)].as_slice())
+        );
+        assert_eq!(families.siblings(FileId(1)), families.siblings(FileId(0)));
+        assert_eq!(families.siblings(FileId(3)), None);
+        assert_eq!(
+            families.siblings(FileId(4)),
+            None,
+            "same stem in a different directory is not part of the family"
+        );
+    }
+
+    #[test]
+    fn test_platform_families_require_a_platform_variant() {
+        let files = vec![
+            discovered(0, "src/Button.ts"),
+            discovered(1, "src/Button.tsx"),
+        ];
+        let families = PlatformFamilies::build(&files);
+        assert!(
+            families.members.is_empty(),
+            "same-stem files without a platform variant are not a Metro family"
+        );
+    }
+
+    #[test]
     fn test_duplicate_user_conditions_are_deduped_preserving_first() {
-        // If a user accidentally repeats a condition, only the first
-        // occurrence survives.
         let names = build_condition_names(
             &[],
             &[

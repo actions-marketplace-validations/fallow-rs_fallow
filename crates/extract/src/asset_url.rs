@@ -2,12 +2,12 @@
 //!
 //! Used by parsers that emit side-effect imports from user-authored asset
 //! references: Angular `@Component({ templateUrl, styleUrl })`, HTML
-//! `<script src>` / `<link href>`, and Vue/Svelte `<script src>`.
+//! `<script src>` / `<link href>`, Vue `<script src>`, and SFC `<style src>`.
 //!
-//! Browsers, Vite, Parcel, Angular's compiler, and Vue/Svelte's SFC tooling
-//! all resolve these references relative to the document or component file
-//! whether or not they start with `./`. Fallow's downstream specifier
-//! classifier, however, treats any string not starting with `.`, `/`, or
+//! Browsers, Vite, Parcel, Angular's compiler, Vue external scripts, and
+//! SFC style loaders all resolve these references relative to the document or
+//! component file whether or not they start with `./`. Fallow's downstream
+//! specifier classifier, however, treats any string not starting with `.`, `/`, or
 //! containing `://` as a bare npm package specifier, so bare filenames like
 //! `'app.component.html'` or `'app.js'` are misclassified as unlisted
 //! dependencies. Prepending `./` at extraction time aligns the emitted
@@ -95,9 +95,6 @@ mod tests {
 
     #[test]
     fn data_uri_unchanged() {
-        // `data:` URIs don't contain `://` but must not be prepended with `./`.
-        // Defensive check lets the helper be called unconditionally from SFC
-        // parsers that don't pre-filter remote/data URLs.
         assert_eq!(
             normalize_asset_url("data:text/javascript;base64,YWJj"),
             "data:text/javascript;base64,YWJj"
@@ -106,8 +103,6 @@ mod tests {
 
     #[test]
     fn scoped_package_unchanged() {
-        // Scoped package path aliases (webpack/esbuild) should stay bare so
-        // the resolver can handle them via node_modules / alias resolution.
         assert_eq!(
             normalize_asset_url("@shared/header.html"),
             "@shared/header.html"
@@ -116,9 +111,6 @@ mod tests {
 
     #[test]
     fn empty_string_edge_case() {
-        // Empty asset URL is syntactically possible but semantically invalid.
-        // Document current behavior: the normalizer prepends `./`, producing
-        // `./` which the resolver will fail to match to a file.
         assert_eq!(normalize_asset_url(""), "./");
     }
 }

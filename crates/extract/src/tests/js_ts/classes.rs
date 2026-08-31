@@ -1,8 +1,21 @@
-use fallow_types::extract::{ExportName, MemberKind};
+use fallow_types::extract::{ExportName, FactoryCallMemberAccessFact, MemberKind, SemanticFact};
 
 use crate::tests::parse_ts as parse_source;
 
-// ── Declaration extraction edge cases ────────────────────────────
+fn factory_call_member_facts(
+    info: &fallow_types::extract::ModuleInfo,
+) -> Vec<&FactoryCallMemberAccessFact> {
+    info.semantic_facts
+        .iter()
+        .filter_map(|fact| {
+            if let SemanticFact::FactoryCallMemberAccess(access) = fact {
+                Some(access)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
 
 #[test]
 fn enum_with_string_values_extracts_members() {
@@ -44,7 +57,6 @@ fn enum_with_numeric_values_extracts_members() {
 
 #[test]
 fn enum_not_type_only() {
-    // Enums are runtime values, not type-only
     let info = parse_source("export enum Color { Red, Green, Blue }");
     assert_eq!(info.exports.len(), 1);
     assert!(!info.exports[0].is_type_only);
@@ -54,7 +66,6 @@ fn enum_not_type_only() {
 fn const_enum_not_type_only() {
     let info = parse_source("export const enum Direction { Up, Down }");
     assert_eq!(info.exports.len(), 1);
-    // const enums are still exported as values (unless isolated modules)
     assert!(!info.exports[0].is_type_only);
 }
 
@@ -81,7 +92,6 @@ fn abstract_class_with_concrete_members() {
         .iter()
         .map(|m| m.name.as_str())
         .collect();
-    // Abstract methods and concrete methods/properties are all tracked
     assert!(members.contains(&"doWork"));
     assert!(members.contains(&"getName"));
     assert!(members.contains(&"label"));
@@ -189,6 +199,59 @@ fn class_decorated_members_tracked() {
         !plain.has_decorator,
         "plain should have has_decorator = false"
     );
+    assert_eq!(
+        get_users.decorator_names,
+        vec!["Get".to_string()],
+        "getUsers decorator path should be captured as 'Get'"
+    );
+    assert_eq!(
+        create_user.decorator_names,
+        vec!["Post".to_string()],
+        "createUser decorator path should be captured as 'Post'"
+    );
+    assert!(
+        plain.decorator_names.is_empty(),
+        "plain has no decorators; decorator_names should be empty"
+    );
+}
+
+#[test]
+fn class_decorator_path_shapes() {
+    let info = parse_source(
+        r"export class Demo {
+            @Bare
+            bare() {}
+            @Call('arg')
+            call() {}
+            @ns.namespaced
+            namespaced() {}
+            @ns.namespaced_call('arg')
+            namespacedCall() {}
+            @a.b.c
+            multiLevel() {}
+        }",
+    );
+    let demo = &info.exports[0];
+    let by_name = |name: &str| {
+        demo.members
+            .iter()
+            .find(|m| m.name == name)
+            .unwrap_or_else(|| panic!("{name} should be in members"))
+    };
+    assert_eq!(by_name("bare").decorator_names, vec!["Bare".to_string()]);
+    assert_eq!(by_name("call").decorator_names, vec!["Call".to_string()]);
+    assert_eq!(
+        by_name("namespaced").decorator_names,
+        vec!["ns.namespaced".to_string()]
+    );
+    assert_eq!(
+        by_name("namespacedCall").decorator_names,
+        vec!["ns.namespaced_call".to_string()]
+    );
+    assert_eq!(
+        by_name("multiLevel").decorator_names,
+        vec!["a.b.c".to_string()]
+    );
 }
 
 #[test]
@@ -216,6 +279,12 @@ fn class_decorated_properties_tracked() {
         .find(|m| m.name == "undecorated")
         .expect("undecorated should be in members");
     assert!(!undecorated.has_decorator);
+    assert!(undecorated.decorator_names.is_empty());
+    assert_eq!(
+        name_prop.decorator_names,
+        vec!["Column".to_string()],
+        "Column-decorated property should capture the decorator name"
+    );
 }
 
 #[test]
@@ -360,12 +429,9 @@ fn ts_module_declaration_identifier() {
 #[test]
 fn ts_namespace_declaration() {
     let info = parse_source("export namespace Utils { export function helper() {} }");
-    // Only the namespace itself is a top-level export; inner exports become members
     assert_eq!(info.exports.len(), 1);
     assert_eq!(info.exports[0].name, ExportName::Named("Utils".to_string()));
-    // Runtime namespace (no `declare`) is NOT type-only
     assert!(!info.exports[0].is_type_only);
-    // Inner function extracted as namespace member
     assert_eq!(info.exports[0].members.len(), 1);
     assert_eq!(info.exports[0].members[0].name, "helper");
     assert_eq!(info.exports[0].members[0].kind, MemberKind::NamespaceMember);
@@ -416,10 +482,8 @@ fn ts_namespace_inner_exports_not_top_level() {
     let info = parse_source(
         "export namespace Ns { export function a() {} export class B {} export enum C {} }",
     );
-    // Only the namespace should be a top-level export
     assert_eq!(info.exports.len(), 1);
     assert_eq!(info.exports[0].name, ExportName::Named("Ns".to_string()));
-    // All inner declarations should be namespace members
     assert_eq!(info.exports[0].members.len(), 3);
 }
 
@@ -430,7 +494,6 @@ fn ts_nested_namespace() {
     );
     assert_eq!(info.exports.len(), 1);
     assert_eq!(info.exports[0].name, ExportName::Named("Outer".to_string()));
-    // Inner namespace and its contents are flattened into Outer's members
     assert_eq!(info.exports[0].members.len(), 2);
     let names: Vec<&str> = info.exports[0]
         .members
@@ -632,7 +695,6 @@ fn enum_empty() {
 
 #[test]
 fn enum_string_literal_member_name() {
-    // Enum members can use string literal keys
     let info = parse_source("export enum Weird { 'hello-world' = 1 }");
     assert_eq!(info.exports.len(), 1);
     assert_eq!(info.exports[0].members.len(), 1);
@@ -670,7 +732,6 @@ fn mixed_value_and_type_exports() {
 
 #[test]
 fn array_destructured_export_with_skip() {
-    // Skipping elements in array destructuring with holes
     let info = parse_source("export const [, second, , fourth] = arr;");
     assert_eq!(info.exports.len(), 2);
     assert_eq!(
@@ -716,7 +777,6 @@ fn export_local_name_matches_for_simple_declarations() {
 
 #[test]
 fn export_specifier_with_as_default() {
-    // `export { foo as default }` uses a named specifier with "default" as the exported name
     let info = parse_source("const foo = 1;\nexport { foo as default };");
     assert_eq!(info.exports.len(), 1);
     assert_eq!(
@@ -724,8 +784,6 @@ fn export_specifier_with_as_default() {
         ExportName::Named("default".to_string())
     );
 }
-
-// ── Class member extraction: static properties ──────────────
 
 #[test]
 fn class_static_property_tracked() {
@@ -755,8 +813,6 @@ fn class_static_property_tracked() {
         "Regular property should also be tracked"
     );
 }
-
-// ── Class member extraction: getter/setter kinds ────────────
 
 #[test]
 fn class_getter_setter_are_class_method_kind() {
@@ -791,8 +847,6 @@ fn class_getter_setter_are_class_method_kind() {
     assert_eq!(normal.kind, MemberKind::ClassMethod);
 }
 
-// ── Class member extraction: decorated property ─────────────
-
 #[test]
 fn class_decorated_property_with_column_decorator() {
     let info = parse_source(
@@ -824,8 +878,6 @@ fn class_decorated_property_with_column_decorator() {
     );
 }
 
-// ── Instance member tracking via new expression ─────────────
-
 #[test]
 fn instance_member_access_via_new_expression() {
     let info = parse_source(
@@ -850,8 +902,6 @@ fn instance_member_access_via_new_expression() {
     );
 }
 
-// ── Builtin constructor not tracked ─────────────────────────
-
 #[test]
 fn builtin_constructor_instance_not_tracked() {
     let info = parse_source(
@@ -869,8 +919,6 @@ fn builtin_constructor_instance_not_tracked() {
         "new URL() should not create instance binding for member tracking"
     );
 }
-
-// ── Class with mixed accessibility and decorators ───────────
 
 #[test]
 fn class_mixed_members_comprehensive() {
@@ -893,7 +941,6 @@ fn class_mixed_members_comprehensive() {
     let members = &info.exports[0].members;
     let names: Vec<&str> = members.iter().map(|m| m.name.as_str()).collect();
 
-    // Public and static members included
     assert!(
         names.contains(&"version"),
         "Static property should be included"
@@ -911,7 +958,6 @@ fn class_mixed_members_comprehensive() {
         "Decorated public method should be included"
     );
 
-    // Private, protected, and constructor excluded
     assert!(
         !names.contains(&"db"),
         "Private property should be excluded"
@@ -933,7 +979,6 @@ fn class_mixed_members_comprehensive() {
         "Protected method should be excluded"
     );
 
-    // Decorator tracking
     let health_check = members.iter().find(|m| m.name == "healthCheck").unwrap();
     assert!(
         health_check.has_decorator,
@@ -946,14 +991,8 @@ fn class_mixed_members_comprehensive() {
     );
 }
 
-// ── super.member access tracking ────────────────────────────
-
 #[test]
 fn super_method_access_attributed_to_parent_class() {
-    // `super.speak()` in a subclass is a use of the parent's `speak`.
-    // Must be recorded with `object` = the local `extends` identifier, so
-    // `local_to_imported` in unused-member analysis can map it to the
-    // parent's export name. See issue #130.
     let info = parse_source(
         r"import { Animal } from './animal';
         export class Dog extends Animal {
@@ -971,7 +1010,6 @@ fn super_method_access_attributed_to_parent_class() {
 
 #[test]
 fn super_property_access_attributed_to_parent_class() {
-    // Property access through `super` should also be credited to the parent.
     let info = parse_source(
         r"import { Base } from './base';
         export class Child extends Base {
@@ -989,9 +1027,6 @@ fn super_property_access_attributed_to_parent_class() {
 
 #[test]
 fn super_access_same_file_parent_uses_local_name() {
-    // Parent class defined in the same file: the `extends` identifier is
-    // a local name, not an import. `find_unused_members` falls back to
-    // the raw object name when no import mapping exists.
     let info = parse_source(
         r"class Animal { speak(): string { return 'base'; } }
         export class Dog extends Animal {
@@ -1009,11 +1044,6 @@ fn super_access_same_file_parent_uses_local_name() {
 
 #[test]
 fn super_access_in_object_literal_method_is_dropped() {
-    // `super.X` inside an object literal method is syntactically valid JS
-    // (refers to the prototype chain). We cannot attribute it to a class,
-    // so it must be silently dropped. This exercises the `None` branch of
-    // the `class_super_stack.last()` guard: the object method is visited
-    // without any class frame on the stack.
     let info = parse_source(
         r"export const obj = {
             greet() { return super.toString(); }
@@ -1028,9 +1058,6 @@ fn super_access_in_object_literal_method_is_dropped() {
 
 #[test]
 fn super_access_respects_nested_class_boundary() {
-    // When a class expression is nested inside an outer class's method,
-    // `super` inside the INNER class must resolve to the INNER's parent,
-    // not the outer's. Tests the push/pop stack discipline.
     let info = parse_source(
         r"import { Outer } from './outer';
         import { Inner } from './inner';
@@ -1056,5 +1083,230 @@ fn super_access_respects_nested_class_boundary() {
             .any(|a| a.object == "Outer" && a.member == "run"),
         "super.run() must not leak to Outer: {:?}",
         info.member_accesses
+    );
+}
+
+#[test]
+fn static_factory_method_returning_new_this_is_flagged() {
+    let info = parse_source(
+        r"export class MyClass {
+            static getInstance() { return new this(); }
+            getData() { return [1, 2, 3]; }
+        }",
+    );
+    let class_export = info
+        .exports
+        .iter()
+        .find(|e| matches!(&e.name, ExportName::Named(n) if n == "MyClass"))
+        .expect("MyClass export should be present");
+    let get_instance = class_export
+        .members
+        .iter()
+        .find(|m| m.name == "getInstance")
+        .expect("getInstance member should be present");
+    assert!(
+        get_instance.is_instance_returning_static,
+        "static getInstance() {{ return new this(); }} should be flagged as instance-returning"
+    );
+    let get_data = class_export
+        .members
+        .iter()
+        .find(|m| m.name == "getData")
+        .expect("getData member should be present");
+    assert!(
+        !get_data.is_instance_returning_static,
+        "instance method getData must not be flagged as instance-returning static"
+    );
+}
+
+#[test]
+fn static_factory_method_returning_new_same_class_name_is_flagged() {
+    let info = parse_source(
+        r"export class Service {
+            static create() { return new Service(); }
+        }",
+    );
+    let class_export = info
+        .exports
+        .iter()
+        .find(|e| matches!(&e.name, ExportName::Named(n) if n == "Service"))
+        .expect("Service export should be present");
+    let create = class_export
+        .members
+        .iter()
+        .find(|m| m.name == "create")
+        .expect("create member should be present");
+    assert!(
+        create.is_instance_returning_static,
+        "static create() {{ return new Service(); }} should be flagged as instance-returning"
+    );
+}
+
+#[test]
+fn static_factory_method_returning_other_class_not_flagged() {
+    let info = parse_source(
+        r"export class MyClass {
+            static getBuilder() { return new Builder(); }
+        }",
+    );
+    let class_export = info
+        .exports
+        .iter()
+        .find(|e| matches!(&e.name, ExportName::Named(n) if n == "MyClass"))
+        .expect("MyClass export should be present");
+    let get_builder = class_export
+        .members
+        .iter()
+        .find(|m| m.name == "getBuilder")
+        .expect("getBuilder member should be present");
+    assert!(
+        !get_builder.is_instance_returning_static,
+        "factory returning a different class must not be flagged"
+    );
+}
+
+#[test]
+fn instance_method_with_new_this_return_not_flagged() {
+    let info = parse_source(
+        r"export class MyClass {
+            clone() { return new this.constructor(); }
+        }",
+    );
+    let class_export = info
+        .exports
+        .iter()
+        .find(|e| matches!(&e.name, ExportName::Named(n) if n == "MyClass"))
+        .expect("MyClass export should be present");
+    let clone = class_export
+        .members
+        .iter()
+        .find(|m| m.name == "clone")
+        .expect("clone member should be present");
+    assert!(
+        !clone.is_instance_returning_static,
+        "instance method must not be flagged regardless of return shape"
+    );
+}
+
+#[test]
+fn static_factory_binding_emits_typed_member_fact() {
+    let info = parse_source(
+        r"import { MyClass } from './my-class';
+        const myInstance = MyClass.getInstance();
+        myInstance.getData();",
+    );
+    let fact = factory_call_member_facts(&info)
+        .into_iter()
+        .next()
+        .expect("typed factory call fact should be emitted");
+    assert_eq!(fact.callee_object, "MyClass");
+    assert_eq!(fact.callee_method, "getInstance");
+    assert_eq!(fact.member, "getData");
+}
+
+#[test]
+fn static_factory_binding_same_file_emits_direct_access() {
+    let info = parse_source(
+        r"export class MyClass {
+            static getInstance() { return new this(); }
+            getData() { return [1, 2, 3]; }
+        }
+        const myInstance = MyClass.getInstance();
+        myInstance.getData();",
+    );
+    assert!(
+        info.member_accesses
+            .iter()
+            .any(|a| a.object == "MyClass" && a.member == "getData"),
+        "same-file factory call should expand `myInstance.getData` to `MyClass.getData`, found: {:?}",
+        info.member_accesses
+    );
+    assert!(factory_call_member_facts(&info).is_empty());
+}
+
+#[test]
+fn static_factory_with_early_guard_return_is_flagged() {
+    let info = parse_source(
+        r"export class MyClass {
+            static getInstance(cond: boolean) {
+                if (cond) return null;
+                return new this();
+            }
+        }",
+    );
+    let class_export = info
+        .exports
+        .iter()
+        .find(|e| matches!(&e.name, ExportName::Named(n) if n == "MyClass"))
+        .expect("MyClass export should be present");
+    let get_instance = class_export
+        .members
+        .iter()
+        .find(|m| m.name == "getInstance")
+        .expect("getInstance member should be present");
+    assert!(
+        get_instance.is_instance_returning_static,
+        "factory with an early guard return must still be flagged as instance-returning"
+    );
+}
+
+#[test]
+fn static_method_returning_conditional_expression_is_not_flagged() {
+    let info = parse_source(
+        r"export class MyClass {
+            static maybe(cond: boolean) {
+                return cond ? new this() : null;
+            }
+        }",
+    );
+    let class_export = info
+        .exports
+        .iter()
+        .find(|e| matches!(&e.name, ExportName::Named(n) if n == "MyClass"))
+        .expect("MyClass export should be present");
+    let maybe = class_export
+        .members
+        .iter()
+        .find(|m| m.name == "maybe")
+        .expect("maybe member should be present");
+    assert!(
+        !maybe.is_instance_returning_static,
+        "ConditionalExpression in the return argument must not flag the method"
+    );
+}
+
+#[test]
+fn factory_call_candidate_with_unknown_object_is_dropped() {
+    let info = parse_source(
+        r"const n = Math.floor(1.5);
+        n.toString();",
+    );
+    assert!(factory_call_member_facts(&info).is_empty());
+}
+
+/// Regression test for issue #839: `declare` ambient class properties must not
+/// be extracted as class members. They emit no JS and cannot be value-referenced,
+/// so including them causes false unused-class-member findings.
+#[test]
+fn declare_ambient_property_excluded_from_class_members() {
+    let info = parse_source(
+        r"export class MyComponent<I> {
+            declare readonly __input?: I;
+            processInput() { return this.__input; }
+        }",
+    );
+    assert_eq!(info.exports.len(), 1);
+    let names: Vec<&str> = info.exports[0]
+        .members
+        .iter()
+        .map(|m| m.name.as_str())
+        .collect();
+    assert!(
+        !names.contains(&"__input"),
+        "`declare` ambient property must not appear in extracted members; got {names:?}",
+    );
+    assert!(
+        names.contains(&"processInput"),
+        "normal method must still be extracted; got {names:?}",
     );
 }

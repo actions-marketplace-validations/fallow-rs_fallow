@@ -1,79 +1,214 @@
 mod badge;
-mod codeclimate;
+pub mod ci;
+pub(crate) mod codeclimate;
 mod compact;
+pub mod dupes_grouping;
+pub mod github;
+pub mod github_annotations;
+pub mod github_summary;
 pub mod grouping;
 mod human;
 mod json;
 mod markdown;
-mod sarif;
+pub(crate) mod sarif;
+mod shared;
+pub(crate) mod sink;
+mod status;
+pub(crate) mod suggestions;
 #[cfg(test)]
-pub mod test_helpers;
+pub(crate) mod test_helpers;
 
 use std::path::Path;
 use std::process::ExitCode;
 use std::time::Duration;
 
+use fallow_api::DuplicationGrouping;
 use fallow_config::{OutputFormat, RulesConfig, Severity};
-use fallow_core::duplicates::DuplicationReport;
-use fallow_core::results::AnalysisResults;
-use fallow_core::trace::{CloneTrace, DependencyTrace, ExportTrace, FileTrace, PipelineTimings};
+use fallow_types::duplicates::DuplicationReport;
+use fallow_types::results::AnalysisResults;
+use fallow_types::semantic::SemanticSymbolImpact;
+use fallow_types::trace::{
+    CloneTrace, DependencyTrace, ExportTrace, FileTrace, ImpactClosureTrace, PipelineTimings,
+};
 
-pub use grouping::OwnershipResolver;
+use crate::report::sink::outln;
+
 #[allow(
     unused_imports,
     reason = "used by binary crate modules (combined.rs, audit.rs)"
 )]
-pub use json::strip_root_prefix;
+pub use fallow_output::strip_root_prefix;
+pub use grouping::OwnershipResolver;
+pub(crate) use human::dupes::MAX_CLONE_GROUPS;
+pub(crate) use human::health::{render_health_score, render_health_trend};
+pub(crate) use status::{
+    HumanStatus, line as human_status_line, semantic_status, type_aware_meta_status,
+};
+
+/// The three line-groups of a human `fallow review --walkthrough` render: the
+/// orientation header and final status (stderr), and the staged tour body
+/// (stdout). The entry point in `audit_brief.rs` owns the stream split; this
+/// keeps the pure line builder behind the private `human` module while exposing
+/// exactly what the entry point needs.
+pub(crate) struct WalkthroughHumanRender {
+    /// Review Focus orientation header lines (stderr).
+    pub(crate) header: Vec<String>,
+    /// The staged tour body lines (stdout).
+    pub(crate) body: Vec<String>,
+    /// The final green status line (stderr).
+    pub(crate) status: String,
+}
+
+/// The root-relative files (in `direction.order`) the local ledger marked viewed
+/// against the guide's current hash. Exposed so the markdown surface can collapse
+/// the same viewed files into Cleared that the human surface does, keeping the two
+/// formats consistent on the same on-disk `--mark-viewed` state.
+#[must_use]
+pub(crate) fn walkthrough_viewed_files(
+    guide: &fallow_output::StandardWalkthroughGuide,
+    viewed: &crate::walkthrough_state::ViewedState,
+) -> Vec<String> {
+    human::walkthrough::viewed_files_for(guide, viewed)
+}
+
+/// Build the human walkthrough tour from the in-memory guide. Pure: no IO, no
+/// mutation. `viewed` decorates each file row; `show_cleared` expands the
+/// Cleared panel.
+#[must_use]
+pub(crate) fn build_walkthrough_human(
+    guide: &fallow_output::StandardWalkthroughGuide,
+    viewed: &crate::walkthrough_state::ViewedState,
+    show_cleared: bool,
+) -> WalkthroughHumanRender {
+    let input = human::walkthrough::WalkthroughHumanInput {
+        guide,
+        viewed,
+        show_cleared,
+    };
+    WalkthroughHumanRender {
+        header: human::walkthrough::build_focus_header(guide, viewed),
+        body: human::walkthrough::build_walkthrough_human_lines(&input),
+        status: human::walkthrough::build_status_line(guide, viewed),
+    }
+}
 
 /// Shared context for all report dispatch functions.
 ///
 /// Bundles the common parameters that every format renderer needs,
 /// replacing per-parameter threading through the dispatch match arms.
-pub struct ReportContext<'a> {
-    pub root: &'a Path,
-    pub rules: &'a RulesConfig,
-    pub elapsed: Duration,
-    pub quiet: bool,
-    pub explain: bool,
+pub(crate) struct ReportContext<'a> {
+    pub(crate) root: &'a Path,
+    pub(crate) rules: &'a RulesConfig,
+    /// Workspace diagnostics captured by the analysis that owns this report.
+    pub(crate) workspace_diagnostics: &'a [fallow_config::WorkspaceDiagnostic],
+    pub(crate) elapsed: Duration,
+    pub(crate) quiet: bool,
+    pub(crate) explain: bool,
+    /// Provenance for the opt-in TypeScript semantic analysis pass.
+    pub(crate) type_aware: Option<&'a fallow_types::envelope::TypeAwareMeta>,
+    /// Optional label for semantic metadata when one command renders multiple
+    /// analysis scopes into the same stream.
+    pub(crate) type_aware_scope: Option<&'static str>,
     /// When set, group all output by this resolver.
-    pub group_by: Option<OwnershipResolver>,
+    pub(crate) group_by: Option<OwnershipResolver>,
     /// Limit displayed items per section (--top N).
-    pub top: Option<usize>,
+    pub(crate) top: Option<usize>,
     /// When set, print a concise summary instead of the full report.
-    pub summary: bool,
+    pub(crate) summary: bool,
+    /// Human-only: print the summary renderer's own title line. Combined mode
+    /// already prints section headers, so it disables this to avoid duplicate
+    /// "Dead Code" / "Dead Code Summary" headings.
+    pub(crate) summary_heading: bool,
+    /// Human-only: print a one-line hint pointing at `fallow explain`.
+    pub(crate) show_explain_tip: bool,
     /// When a baseline was loaded: (total entries in baseline, entries that matched).
-    pub baseline_matched: Option<(usize, usize)>,
+    pub(crate) baseline_matched: Option<(usize, usize)>,
+    /// Whether config-edit actions can be applied by `fallow fix`.
+    ///
+    /// This is caller-provided because an explicit `--config` path is fixable
+    /// even when default config discovery from the root would find nothing.
+    pub(crate) config_fixable: bool,
+    /// When set, the human health renderer skips the `● Health score:` and
+    /// trend table sections because they have already been rendered upstream
+    /// (combined-mode orientation header). Standalone `fallow health` keeps
+    /// the default `false` and renders both sections inline.
+    pub(crate) skip_score_and_trend: bool,
+    /// Human-only: whether `--css` was requested. When `true` but no stylesheet
+    /// was import-reachable, the CSS-health section renders an explanatory note
+    /// instead of being silently omitted. Defaults `false` for non-css callers.
+    pub(crate) css_requested: bool,
+    /// Presentation style for report JSON. Non-JSON renderers ignore it.
+    pub(crate) json_style: crate::json_style::JsonStyle,
 }
 
 /// Strip the project root prefix from a path for display, falling back to the full path.
 #[must_use]
-pub fn relative_path<'a>(path: &'a Path, root: &Path) -> &'a Path {
+pub(crate) fn relative_path<'a>(path: &'a Path, root: &Path) -> &'a Path {
     path.strip_prefix(root).unwrap_or(path)
+}
+
+/// Format a path for human-facing display: project-relative when the path is
+/// under `root`, falling back to the full path otherwise. Always
+/// forward-slash-normalized so Windows backslashes do not leak into
+/// terminal output.
+///
+/// Use this for any human-output site that today renders bare `file_name()`,
+/// since bare basenames are ambiguous in Nx / Angular / Rust-workspace layouts
+/// where many files share names like `index.ts`, `mod.rs`, or
+/// `*.component.ts`. See issue #547.
+#[must_use]
+pub(crate) fn format_display_path(path: &Path, root: &Path) -> String {
+    relative_path(path, root)
+        .display()
+        .to_string()
+        .replace('\\', "/")
 }
 
 /// Split a path string into (directory, filename) for display.
 /// Directory includes the trailing `/`. If no directory, returns `("", filename)`.
 #[must_use]
-pub fn split_dir_filename(path: &str) -> (&str, &str) {
+pub(crate) fn split_dir_filename(path: &str) -> (&str, &str) {
     path.rfind('/')
         .map_or(("", path), |pos| (&path[..=pos], &path[pos + 1..]))
 }
 
 /// Return `"s"` for plural or `""` for singular.
 #[must_use]
-pub const fn plural(n: usize) -> &'static str {
+pub(crate) const fn plural(n: usize) -> &'static str {
     if n == 1 { "" } else { "s" }
 }
 
-/// Serialize a JSON value to pretty-printed stdout, returning the appropriate exit code.
+/// Format a byte count in KiB / MiB / GiB for terminal output. Byte-exact
+/// sizes are available in JSON output paths; humans get a readable form.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "reported byte counts are well under the f64 precision loss range"
+)]
+#[must_use]
+pub(crate) fn format_bytes(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = KIB * 1024;
+    const GIB: u64 = MIB * 1024;
+    if bytes >= GIB {
+        format!("{:.1} GiB", bytes as f64 / GIB as f64)
+    } else if bytes >= MIB {
+        format!("{:.1} MiB", bytes as f64 / MIB as f64)
+    } else if bytes >= KIB {
+        format!("{:.0} KiB", bytes as f64 / KIB as f64)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+/// Serialize a spec-defined JSON value with its established pretty formatting.
 ///
 /// On success prints the JSON and returns `ExitCode::SUCCESS`.
 /// On serialization failure prints an error to stderr and returns exit code 2.
 #[must_use]
-pub fn emit_json(value: &serde_json::Value, kind: &str) -> ExitCode {
+pub(crate) fn emit_json(value: &serde_json::Value, kind: &str) -> ExitCode {
     match serde_json::to_string_pretty(value) {
         Ok(json) => {
-            println!("{json}");
+            outln!("{json}");
             ExitCode::SUCCESS
         }
         Err(e) => {
@@ -83,13 +218,61 @@ pub fn emit_json(value: &serde_json::Value, kind: &str) -> ExitCode {
     }
 }
 
+/// Serialize report JSON with the requested presentation style.
+#[must_use]
+pub(crate) fn emit_report_json(
+    value: &serde_json::Value,
+    kind: &str,
+    style: crate::json_style::JsonStyle,
+) -> ExitCode {
+    match style.serialize(value) {
+        Ok(json) => {
+            outln!("{json}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("Error: failed to serialize {kind} output: {e}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+pub(crate) struct CheckJsonRenderInput<'a> {
+    pub(crate) results: &'a AnalysisResults,
+    pub(crate) root: &'a Path,
+    pub(crate) elapsed: Duration,
+    pub(crate) type_aware: Option<&'a fallow_types::envelope::TypeAwareMeta>,
+    pub(crate) regression: Option<&'a crate::regression::RegressionOutcome>,
+    pub(crate) baseline_matched: Option<(usize, usize)>,
+    pub(crate) config_fixable: bool,
+    pub(crate) workspace_diagnostics: &'a [fallow_config::WorkspaceDiagnostic],
+    pub(crate) json_style: crate::json_style::JsonStyle,
+}
+
+pub(crate) fn render_check_json(
+    input: &CheckJsonRenderInput<'_>,
+) -> Result<String, serde_json::Error> {
+    json::render_json(&json::PrintJsonInput {
+        results: input.results,
+        root: input.root,
+        elapsed: input.elapsed,
+        explain: false,
+        type_aware: input.type_aware,
+        regression: input.regression,
+        baseline_matched: input.baseline_matched,
+        config_fixable: input.config_fixable,
+        workspace_diagnostics: input.workspace_diagnostics,
+        json_style: input.json_style,
+    })
+}
+
 /// Elide the common directory prefix between a base path and a target path.
 /// Only strips complete directory segments (never partial filenames).
 /// Returns the remaining suffix of `target`.
 ///
 /// Example: `elide_common_prefix("a/b/c/foo.ts", "a/b/d/bar.ts")` → `"d/bar.ts"`
 #[must_use]
-pub fn elide_common_prefix<'a>(base: &str, target: &'a str) -> &'a str {
+pub(crate) fn elide_common_prefix<'a>(base: &str, target: &'a str) -> &'a str {
     let mut last_sep = 0;
     for (i, (a, b)) in base.bytes().zip(target.bytes()).enumerate() {
         if a != b {
@@ -107,6 +290,7 @@ pub fn elide_common_prefix<'a>(base: &str, target: &'a str) -> &'a str {
 }
 
 /// Compute a SARIF-compatible relative URI from an absolute path and project root.
+#[cfg(test)]
 fn relative_uri(path: &Path, root: &Path) -> String {
     normalize_uri(&relative_path(path, root).display().to_string())
 }
@@ -116,11 +300,8 @@ fn relative_uri(path: &Path, root: &Path) -> String {
 /// Brackets (`[`, `]`) are not valid in URI path segments per RFC 3986 and cause
 /// SARIF validation warnings (e.g., Next.js dynamic routes like `[slug]`).
 #[must_use]
-pub fn normalize_uri(path_str: &str) -> String {
-    path_str
-        .replace('\\', "/")
-        .replace('[', "%5B")
-        .replace(']', "%5D")
+pub(crate) fn normalize_uri(path_str: &str) -> String {
+    fallow_output::normalize_uri(path_str)
 }
 
 /// Severity level for human-readable output.
@@ -132,11 +313,10 @@ pub enum Level {
 }
 
 #[must_use]
-pub const fn severity_to_level(s: Severity) -> Level {
+pub(crate) const fn severity_to_level(s: Severity) -> Level {
     match s {
         Severity::Error => Level::Error,
         Severity::Warn => Level::Warn,
-        // Off issues are filtered before reporting; fall back to Info.
         Severity::Off => Level::Info,
     }
 }
@@ -147,13 +327,12 @@ pub const fn severity_to_level(s: Severity) -> Level {
 /// When `regression` is `Some`, the JSON format includes a `regression` key in the output envelope.
 /// When `ctx.group_by` is `Some`, results are partitioned into labeled groups before rendering.
 #[must_use]
-pub fn print_results(
+pub(crate) fn print_results(
     results: &AnalysisResults,
     ctx: &ReportContext<'_>,
     output: OutputFormat,
     regression: Option<&crate::regression::RegressionOutcome>,
 ) -> ExitCode {
-    // Grouped output: partition results and render per-group
     if let Some(ref resolver) = ctx.group_by {
         let groups = grouping::group_analysis_results(results, ctx.root, resolver);
         return print_grouped_results(&groups, results, ctx, output, resolver);
@@ -162,42 +341,132 @@ pub fn print_results(
     match output {
         OutputFormat::Human => {
             if ctx.summary {
-                human::check::print_check_summary(results, ctx.rules, ctx.elapsed, ctx.quiet);
-            } else {
-                human::print_human(
+                human::check::print_check_summary(
                     results,
-                    ctx.root,
                     ctx.rules,
                     ctx.elapsed,
                     ctx.quiet,
-                    ctx.top,
+                    ctx.summary_heading,
                 );
+            } else {
+                human::print_human(&human::PrintHumanInput {
+                    results,
+                    root: ctx.root,
+                    rules: ctx.rules,
+                    elapsed: ctx.elapsed,
+                    quiet: ctx.quiet,
+                    top: ctx.top,
+                    show_explain_tip: ctx.show_explain_tip,
+                    explain: ctx.explain,
+                });
             }
             ExitCode::SUCCESS
         }
-        OutputFormat::Json => json::print_json(
+        OutputFormat::Json => json::print_json(&json::PrintJsonInput {
             results,
-            ctx.root,
-            ctx.elapsed,
-            ctx.explain,
+            root: ctx.root,
+            elapsed: ctx.elapsed,
+            explain: ctx.explain,
+            type_aware: ctx.type_aware,
             regression,
-            ctx.baseline_matched,
-        ),
+            baseline_matched: ctx.baseline_matched,
+            config_fixable: ctx.config_fixable,
+            workspace_diagnostics: ctx.workspace_diagnostics,
+            json_style: ctx.json_style,
+        }),
         OutputFormat::Compact => {
             compact::print_compact(results, ctx.root);
+            compact::print_type_aware_compact(ctx.type_aware, ctx.type_aware_scope);
             ExitCode::SUCCESS
         }
-        OutputFormat::Sarif => sarif::print_sarif(results, ctx.root, ctx.rules),
+        OutputFormat::Sarif => sarif::print_sarif(results, ctx.root, ctx.rules, ctx.type_aware),
         OutputFormat::Markdown => {
             markdown::print_markdown(results, ctx.root);
+            markdown::print_type_aware_markdown(ctx.type_aware, ctx.type_aware_scope);
             ExitCode::SUCCESS
         }
         OutputFormat::CodeClimate => codeclimate::print_codeclimate(results, ctx.root, ctx.rules),
-        OutputFormat::Badge => {
-            eprintln!("Error: badge format is only supported for the health command");
+        OutputFormat::GithubAnnotations => print_check_github_annotations(results, ctx),
+        OutputFormat::GithubSummary => {
+            print_check_github_format(results, ctx, GithubTarget::Summary)
+        }
+        ci_format => print_results_ci_comment(results, ctx, ci_format),
+    }
+}
+
+/// Which GitHub-native renderer a dispatch arm targets.
+#[derive(Clone, Copy)]
+enum GithubTarget {
+    Annotations,
+    Summary,
+}
+
+fn print_github_format(
+    kind: github_annotations::EnvelopeKind,
+    envelope: &serde_json::Value,
+    root: &Path,
+    target: GithubTarget,
+) -> ExitCode {
+    match target {
+        GithubTarget::Annotations => github_annotations::print_annotations(kind, envelope, root),
+        GithubTarget::Summary => github_summary::print_summary(kind, envelope, root),
+    }
+}
+
+/// Render dead-code results as GitHub workflow-command annotations by
+/// building the same JSON envelope `--format json` serializes and feeding it
+/// to the value-driven renderer (which keeps `fallow report --from` output
+/// byte-identical to the direct format run).
+fn print_check_github_annotations(results: &AnalysisResults, ctx: &ReportContext<'_>) -> ExitCode {
+    print_check_github_format(results, ctx, GithubTarget::Annotations)
+}
+
+fn print_check_github_format(
+    results: &AnalysisResults,
+    ctx: &ReportContext<'_>,
+    target: GithubTarget,
+) -> ExitCode {
+    match json::api_check_json_document_with_config_fixable_meta_and_extras(
+        results,
+        ctx.root,
+        ctx.elapsed,
+        ctx.config_fixable,
+        None,
+        fallow_api::CheckJsonExtraOutputs::default(),
+        ctx.workspace_diagnostics,
+    ) {
+        Ok(envelope) => print_github_format(
+            github_annotations::EnvelopeKind::DeadCode,
+            &envelope,
+            ctx.root,
+            target,
+        ),
+        Err(e) => {
+            eprintln!("Error: failed to serialize results: {e}");
             ExitCode::from(2)
         }
     }
+}
+
+/// Render the CI comment / review / badge fallback arms for dead-code results.
+fn print_results_ci_comment(
+    results: &AnalysisResults,
+    ctx: &ReportContext<'_>,
+    output: OutputFormat,
+) -> ExitCode {
+    // Analysis-root-relative on purpose: the review renderer applies the
+    // presentation prefix after its diff lookups, and rebasing here would
+    // prefix twice and key the filter in the wrong namespace.
+    let issues = codeclimate::api_codeclimate_issues(results, ctx.root, ctx.rules);
+    let value = fallow_output::codeclimate_issues_to_value(&issues);
+    let incomplete = ci::required_type_aware_incomplete(ctx.type_aware);
+    let conclusion = incomplete.then_some(fallow_output::PrDecisionConclusion::Failure);
+    let status_message = incomplete.then_some(ci::TYPE_AWARE_INCOMPLETE_MESSAGE);
+    print_ci_comment_format_with_status("dead-code", &value, output, conclusion, status_message)
+        .unwrap_or_else(|| {
+            eprintln!("Error: badge format is only supported for the health command");
+            ExitCode::from(2)
+        })
 }
 
 /// Render grouped results across all output formats.
@@ -211,64 +480,96 @@ fn print_grouped_results(
 ) -> ExitCode {
     match output {
         OutputFormat::Human => {
-            human::print_grouped_human(
+            human::print_grouped_human(&human::PrintGroupedHumanInput {
                 groups,
-                ctx.root,
-                ctx.rules,
-                ctx.elapsed,
-                ctx.quiet,
-                Some(resolver),
-            );
+                root: ctx.root,
+                rules: ctx.rules,
+                elapsed: ctx.elapsed,
+                quiet: ctx.quiet,
+                resolver: Some(resolver),
+                explain: ctx.explain,
+            });
             ExitCode::SUCCESS
         }
-        OutputFormat::Json => json::print_grouped_json(
+        OutputFormat::Json => json::print_grouped_json(&json::PrintGroupedJsonInput {
             groups,
             original,
-            ctx.root,
-            ctx.elapsed,
-            ctx.explain,
+            root: ctx.root,
+            elapsed: ctx.elapsed,
+            explain: ctx.explain,
+            type_aware: ctx.type_aware,
             resolver,
-        ),
+            config_fixable: ctx.config_fixable,
+            workspace_diagnostics: ctx.workspace_diagnostics,
+            json_style: ctx.json_style,
+        }),
         OutputFormat::Compact => {
             compact::print_grouped_compact(groups, ctx.root);
+            compact::print_type_aware_compact(ctx.type_aware, ctx.type_aware_scope);
             ExitCode::SUCCESS
         }
         OutputFormat::Markdown => {
             markdown::print_grouped_markdown(groups, ctx.root);
+            markdown::print_type_aware_markdown(ctx.type_aware, ctx.type_aware_scope);
             ExitCode::SUCCESS
         }
-        OutputFormat::Sarif => sarif::print_grouped_sarif(original, ctx.root, ctx.rules, resolver),
+        OutputFormat::Sarif => {
+            sarif::print_grouped_sarif(original, ctx.root, ctx.rules, resolver, ctx.type_aware)
+        }
         OutputFormat::CodeClimate => {
             codeclimate::print_grouped_codeclimate(original, ctx.root, ctx.rules, resolver)
         }
-        OutputFormat::Badge => {
-            eprintln!("Error: badge format is only supported for the health command");
-            ExitCode::from(2)
+        // The GitHub formats have no grouping concept; render ungrouped from
+        // the original results (same fallback the PR-comment formats use).
+        OutputFormat::GithubAnnotations => print_check_github_annotations(original, ctx),
+        OutputFormat::GithubSummary => {
+            print_check_github_format(original, ctx, GithubTarget::Summary)
         }
+        ci_format => print_results_ci_comment(original, ctx, ci_format),
     }
 }
 
-// ── Duplication report ────────────────────────────────────────────
-
 /// Print duplication analysis results in the configured format.
 #[must_use]
-pub fn print_duplication_report(
+pub(crate) fn print_duplication_report(
     report: &DuplicationReport,
     ctx: &ReportContext<'_>,
     output: OutputFormat,
 ) -> ExitCode {
+    if let Some(ref resolver) = ctx.group_by {
+        let grouping = dupes_grouping::build_duplication_grouping(report, ctx.root, resolver);
+        return print_grouped_duplication_report(report, &grouping, ctx, output, resolver);
+    }
+
     match output {
         OutputFormat::Human => {
             if ctx.summary {
-                human::dupes::print_duplication_summary(report, ctx.elapsed, ctx.quiet);
+                human::dupes::print_duplication_summary(
+                    report,
+                    ctx.elapsed,
+                    ctx.quiet,
+                    ctx.summary_heading,
+                );
             } else {
-                human::print_duplication_human(report, ctx.root, ctx.elapsed, ctx.quiet);
+                human::print_duplication_human(
+                    report,
+                    ctx.root,
+                    ctx.elapsed,
+                    ctx.quiet,
+                    ctx.show_explain_tip,
+                    ctx.explain,
+                );
             }
             ExitCode::SUCCESS
         }
-        OutputFormat::Json => {
-            json::print_duplication_json(report, ctx.root, ctx.elapsed, ctx.explain)
-        }
+        OutputFormat::Json => json::print_duplication_json(
+            report,
+            ctx.root,
+            ctx.elapsed,
+            ctx.explain,
+            ctx.workspace_diagnostics,
+            ctx.json_style,
+        ),
         OutputFormat::Compact => {
             compact::print_duplication_compact(report, ctx.root);
             ExitCode::SUCCESS
@@ -279,6 +580,112 @@ pub fn print_duplication_report(
             ExitCode::SUCCESS
         }
         OutputFormat::CodeClimate => codeclimate::print_duplication_codeclimate(report, ctx.root),
+        OutputFormat::GithubAnnotations => {
+            print_dupes_github_format(report, ctx, GithubTarget::Annotations)
+        }
+        OutputFormat::GithubSummary => {
+            print_dupes_github_format(report, ctx, GithubTarget::Summary)
+        }
+        ci_format => print_duplication_ci_comment(report, ctx.root, ci_format),
+    }
+}
+
+/// Render duplication results in a GitHub-native format from the same JSON
+/// envelope `--format json` serializes.
+fn print_dupes_github_format(
+    report: &DuplicationReport,
+    ctx: &ReportContext<'_>,
+    target: GithubTarget,
+) -> ExitCode {
+    match json::api_duplication_json_document(
+        report,
+        ctx.root,
+        ctx.elapsed,
+        ctx.explain,
+        ctx.workspace_diagnostics,
+    ) {
+        Ok(envelope) => print_github_format(
+            github_annotations::EnvelopeKind::Dupes,
+            &envelope,
+            ctx.root,
+            target,
+        ),
+        Err(e) => {
+            eprintln!("Error: failed to serialize duplication report: {e}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// Render the CI comment / review / badge fallback arms for duplication results.
+fn print_duplication_ci_comment(
+    report: &DuplicationReport,
+    root: &Path,
+    output: OutputFormat,
+) -> ExitCode {
+    let issues = codeclimate::api_duplication_codeclimate_issues(report, root);
+    let value = fallow_output::codeclimate_issues_to_value(&issues);
+    print_ci_comment_format("dupes", &value, output).unwrap_or_else(|| {
+        eprintln!("Error: badge format is only supported for the health command");
+        ExitCode::from(2)
+    })
+}
+
+/// Render grouped duplication results across all output formats.
+#[must_use]
+fn print_grouped_duplication_report(
+    report: &DuplicationReport,
+    grouping: &DuplicationGrouping,
+    ctx: &ReportContext<'_>,
+    output: OutputFormat,
+    resolver: &OwnershipResolver,
+) -> ExitCode {
+    match output {
+        OutputFormat::Human => {
+            human::print_grouped_duplication_human(
+                report,
+                grouping,
+                ctx.root,
+                ctx.elapsed,
+                ctx.quiet,
+            );
+            ExitCode::SUCCESS
+        }
+        OutputFormat::Json => json::print_grouped_duplication_json(
+            report,
+            grouping,
+            ctx.root,
+            ctx.elapsed,
+            ctx.explain,
+            ctx.workspace_diagnostics,
+            ctx.json_style,
+        ),
+        OutputFormat::Sarif => sarif::print_grouped_duplication_sarif(report, ctx.root, resolver),
+        OutputFormat::CodeClimate => {
+            codeclimate::print_grouped_duplication_codeclimate(report, ctx.root, resolver)
+        }
+        OutputFormat::PrCommentGithub
+        | OutputFormat::PrCommentGitlab
+        | OutputFormat::ReviewGithub
+        | OutputFormat::ReviewGitlab => print_duplication_ci_comment(report, ctx.root, output),
+        // The GitHub formats have no grouping concept; render ungrouped (same
+        // fallback the PR-comment formats use).
+        OutputFormat::GithubAnnotations => {
+            print_dupes_github_format(report, ctx, GithubTarget::Annotations)
+        }
+        OutputFormat::GithubSummary => {
+            print_dupes_github_format(report, ctx, GithubTarget::Summary)
+        }
+        OutputFormat::Compact => {
+            compact::print_duplication_compact(report, ctx.root);
+            warn_dupes_grouping_unsupported(grouping, "compact");
+            ExitCode::SUCCESS
+        }
+        OutputFormat::Markdown => {
+            markdown::print_duplication_markdown(report, ctx.root);
+            warn_dupes_grouping_unsupported(grouping, "markdown");
+            ExitCode::SUCCESS
+        }
         OutputFormat::Badge => {
             eprintln!("Error: badge format is only supported for the health command");
             ExitCode::from(2)
@@ -286,44 +693,263 @@ pub fn print_duplication_report(
     }
 }
 
-// ── Health / complexity report ─────────────────────────────────────
+/// Dispatch a PR-comment / review CI format from a precomputed CodeClimate value.
+///
+/// Returns `Some(exit_code)` for the four CI comment/review formats and `None`
+/// for every other output format, so callers keep their exhaustive match arms.
+fn print_ci_comment_format(
+    analysis: &str,
+    value: &serde_json::Value,
+    output: OutputFormat,
+) -> Option<ExitCode> {
+    print_ci_comment_format_with_status(analysis, value, output, None, None)
+}
+
+fn print_ci_comment_format_with_status(
+    analysis: &str,
+    value: &serde_json::Value,
+    output: OutputFormat,
+    conclusion: Option<fallow_output::PrDecisionConclusion>,
+    status_message: Option<&str>,
+) -> Option<ExitCode> {
+    let exit = match output {
+        OutputFormat::PrCommentGithub => conclusion.map_or_else(
+            || ci::pr_comment::print_pr_comment(analysis, ci::pr_comment::Provider::Github, value),
+            |conclusion| {
+                ci::pr_comment::print_pr_comment_with_status(
+                    analysis,
+                    ci::pr_comment::Provider::Github,
+                    value,
+                    conclusion,
+                    status_message,
+                )
+            },
+        ),
+        OutputFormat::PrCommentGitlab => conclusion.map_or_else(
+            || ci::pr_comment::print_pr_comment(analysis, ci::pr_comment::Provider::Gitlab, value),
+            |conclusion| {
+                ci::pr_comment::print_pr_comment_with_status(
+                    analysis,
+                    ci::pr_comment::Provider::Gitlab,
+                    value,
+                    conclusion,
+                    status_message,
+                )
+            },
+        ),
+        OutputFormat::ReviewGithub => conclusion.map_or_else(
+            || ci::review::print_review_envelope(analysis, ci::pr_comment::Provider::Github, value),
+            |conclusion| {
+                ci::review::print_review_envelope_with_conclusion(
+                    analysis,
+                    ci::pr_comment::Provider::Github,
+                    value,
+                    conclusion,
+                    status_message,
+                )
+            },
+        ),
+        OutputFormat::ReviewGitlab => conclusion.map_or_else(
+            || ci::review::print_review_envelope(analysis, ci::pr_comment::Provider::Gitlab, value),
+            |conclusion| {
+                ci::review::print_review_envelope_with_conclusion(
+                    analysis,
+                    ci::pr_comment::Provider::Gitlab,
+                    value,
+                    conclusion,
+                    status_message,
+                )
+            },
+        ),
+        _ => return None,
+    };
+    Some(exit)
+}
+
+fn warn_dupes_grouping_unsupported(grouping: &DuplicationGrouping, format: &str) {
+    eprintln!(
+        "note: --group-by {} is not supported for {format} duplication output, falling back to \
+         ungrouped output (use --format json for the full grouped envelope)",
+        grouping.mode
+    );
+}
 
 /// Print health (complexity) analysis results in the configured format.
+///
+/// `grouping` and `group_resolver` carry per-group output produced by
+/// `--group-by`:
+/// - **JSON** renders the grouped envelope (`{ grouped_by, vital_signs,
+///   health_score, groups: [...] }`).
+/// - **Human** prints a per-group summary block (score / files / hot / p90)
+///   after the project-level report.
+/// - **SARIF** and **CodeClimate** tag every per-finding result with the
+///   resolver-derived group key (`properties.group` for SARIF, top-level
+///   `group` for CodeClimate) so CI consumers like GitHub Code Scanning
+///   and GitLab Code Quality can partition findings per team / package
+///   without re-parsing the project structure.
+/// - **Compact**, **Markdown**, and **Badge** fall back to ungrouped output
+///   and emit a one-line stderr note pointing at `--format json` for the
+///   richer grouped envelope.
 #[must_use]
-pub fn print_health_report(
-    report: &crate::health_types::HealthReport,
+pub(crate) fn print_health_report(
+    report: &fallow_output::HealthReport,
+    grouping: Option<&fallow_output::HealthGrouping>,
+    group_resolver: Option<&grouping::OwnershipResolver>,
     ctx: &ReportContext<'_>,
     output: OutputFormat,
 ) -> ExitCode {
     match output {
         OutputFormat::Human => {
-            if ctx.summary {
-                human::health::print_health_summary(report, ctx.elapsed, ctx.quiet);
-            } else {
-                human::print_health_human(report, ctx.root, ctx.elapsed, ctx.quiet);
-            }
+            print_health_human_report(report, grouping, ctx);
             ExitCode::SUCCESS
         }
         OutputFormat::Compact => {
             compact::print_health_compact(report, ctx.root);
+            compact::print_type_aware_compact(ctx.type_aware, ctx.type_aware_scope);
+            warn_grouping_unsupported(grouping, "compact");
             ExitCode::SUCCESS
         }
         OutputFormat::Markdown => {
             markdown::print_health_markdown(report, ctx.root);
+            markdown::print_type_aware_markdown(ctx.type_aware, ctx.type_aware_scope);
+            warn_grouping_unsupported(grouping, "markdown");
             ExitCode::SUCCESS
         }
-        OutputFormat::Sarif => sarif::print_health_sarif(report, ctx.root),
-        OutputFormat::Json => json::print_health_json(report, ctx.root, ctx.elapsed, ctx.explain),
-        OutputFormat::CodeClimate => codeclimate::print_health_codeclimate(report, ctx.root),
-        OutputFormat::Badge => badge::print_health_badge(report),
+        OutputFormat::Sarif => match group_resolver {
+            Some(resolver) => {
+                sarif::print_grouped_health_sarif(report, ctx.root, resolver, ctx.type_aware)
+            }
+            None => sarif::print_health_sarif(report, ctx.root, ctx.type_aware),
+        },
+        OutputFormat::Json => match grouping {
+            Some(grouping) => json::print_grouped_health_json(
+                report,
+                grouping,
+                ctx.root,
+                ctx.elapsed,
+                ctx.explain,
+                ctx.type_aware,
+                ctx.workspace_diagnostics,
+                ctx.json_style,
+            ),
+            None => json::print_health_json(
+                report,
+                ctx.root,
+                ctx.elapsed,
+                ctx.explain,
+                ctx.type_aware,
+                ctx.workspace_diagnostics,
+                ctx.json_style,
+            ),
+        },
+        OutputFormat::CodeClimate => match group_resolver {
+            Some(resolver) => {
+                codeclimate::print_grouped_health_codeclimate(report, ctx.root, resolver)
+            }
+            None => codeclimate::print_health_codeclimate(report, ctx.root),
+        },
+        OutputFormat::PrCommentGithub
+        | OutputFormat::PrCommentGitlab
+        | OutputFormat::ReviewGithub
+        | OutputFormat::ReviewGitlab => print_health_ci_comment(report, ctx.root, output),
+        // The GitHub formats have no grouping concept; render ungrouped (same
+        // fallback the PR-comment formats use).
+        OutputFormat::GithubAnnotations => {
+            print_health_github_format(report, ctx, GithubTarget::Annotations)
+        }
+        OutputFormat::GithubSummary => {
+            print_health_github_format(report, ctx, GithubTarget::Summary)
+        }
+        OutputFormat::Badge => {
+            warn_grouping_unsupported(grouping, "badge");
+            badge::print_health_badge(report)
+        }
+    }
+}
+
+/// Render health results in a GitHub-native format from the same JSON
+/// envelope `--format json` serializes.
+fn print_health_github_format(
+    report: &fallow_output::HealthReport,
+    ctx: &ReportContext<'_>,
+    target: GithubTarget,
+) -> ExitCode {
+    match json::api_health_json_document(
+        report,
+        ctx.root,
+        ctx.elapsed,
+        ctx.explain,
+        ctx.type_aware,
+        ctx.workspace_diagnostics,
+    ) {
+        Ok(envelope) => print_github_format(
+            github_annotations::EnvelopeKind::Health,
+            &envelope,
+            ctx.root,
+            target,
+        ),
+        Err(e) => {
+            eprintln!("Error: failed to serialize health report: {e}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// Render the human-format health report, including the per-group summary block.
+fn print_health_human_report(
+    report: &fallow_output::HealthReport,
+    grouping: Option<&fallow_output::HealthGrouping>,
+    ctx: &ReportContext<'_>,
+) {
+    if ctx.summary {
+        human::health::print_health_summary(report, ctx.elapsed, ctx.quiet, ctx.summary_heading);
+        return;
+    }
+    human::print_health_human(&human::PrintHealthHumanInput {
+        report,
+        root: ctx.root,
+        elapsed: ctx.elapsed,
+        quiet: ctx.quiet,
+        show_explain_tip: ctx.show_explain_tip,
+        explain: ctx.explain,
+        skip_score_and_trend: ctx.skip_score_and_trend,
+        css_requested: ctx.css_requested,
+        type_aware: ctx.type_aware,
+    });
+    if let Some(grouping) = grouping {
+        human::print_health_grouping(grouping, ctx.root, ctx.quiet);
+    }
+}
+
+/// Render the CI comment / review fallback arms for health results.
+fn print_health_ci_comment(
+    report: &fallow_output::HealthReport,
+    root: &Path,
+    output: OutputFormat,
+) -> ExitCode {
+    let issues = codeclimate::api_health_codeclimate_issues(report, root);
+    let value = fallow_output::codeclimate_issues_to_value(&issues);
+    print_ci_comment_format("health", &value, output).unwrap_or_else(|| {
+        eprintln!("Error: badge format is only supported for the health command");
+        ExitCode::from(2)
+    })
+}
+
+fn warn_grouping_unsupported(grouping: Option<&fallow_output::HealthGrouping>, format: &str) {
+    if let Some(g) = grouping {
+        eprintln!(
+            "note: --group-by {} is not supported for {format} output, falling back to \
+             ungrouped output (use --format json for the full grouped envelope)",
+            g.mode
+        );
     }
 }
 
 /// Print cross-reference findings (duplicated code that is also dead code).
 ///
 /// Only emits output in human format to avoid corrupting structured JSON/SARIF output.
-pub fn print_cross_reference_findings(
-    cross_ref: &fallow_core::cross_reference::CrossReferenceResult,
+pub(crate) fn print_cross_reference_findings(
+    cross_ref: &fallow_engine::cross_reference::CrossReferenceResult,
     root: &Path,
     quiet: bool,
     output: OutputFormat,
@@ -331,45 +957,144 @@ pub fn print_cross_reference_findings(
     human::print_cross_reference_findings(cross_ref, root, quiet, output);
 }
 
-// ── Trace output ──────────────────────────────────────────────────
-
 /// Print export trace results.
-pub fn print_export_trace(trace: &ExportTrace, format: OutputFormat) {
+pub(crate) fn print_export_trace(
+    trace: &ExportTrace,
+    format: OutputFormat,
+    json_style: crate::json_style::JsonStyle,
+) {
     match format {
-        OutputFormat::Json => json::print_trace_json(trace),
+        OutputFormat::Json => json::print_trace_json(trace, json_style),
         _ => human::print_export_trace_human(trace),
     }
 }
 
-/// Print file trace results.
-pub fn print_file_trace(trace: &FileTrace, format: OutputFormat) {
+/// Print a syntactic export trace with its authoritative checker-backed
+/// semantic section and optional field definitions.
+pub(crate) fn print_semantic_export_trace(
+    trace: &ExportTrace,
+    format: OutputFormat,
+    explain: bool,
+    json_style: crate::json_style::JsonStyle,
+) {
     match format {
-        OutputFormat::Json => json::print_trace_json(trace),
+        OutputFormat::Json => json::print_semantic_trace_json(trace, explain, json_style),
+        _ => human::print_export_trace_human(trace),
+    }
+}
+
+/// Print class-member trace results (the `--trace FILE:MEMBER` fallback).
+pub(crate) fn print_class_member_trace(
+    trace: &fallow_engine::trace::ClassMemberTrace,
+    format: OutputFormat,
+    json_style: crate::json_style::JsonStyle,
+) {
+    match format {
+        OutputFormat::Json => json::print_trace_json(trace, json_style),
+        _ => human::print_class_member_trace_human(trace),
+    }
+}
+
+/// Print a class-member trace with authoritative checker-backed evidence and
+/// optional field definitions.
+pub(crate) fn print_semantic_class_member_trace(
+    trace: &fallow_engine::trace::ClassMemberTrace,
+    format: OutputFormat,
+    explain: bool,
+    json_style: crate::json_style::JsonStyle,
+) {
+    match format {
+        OutputFormat::Json => json::print_semantic_trace_json(trace, explain, json_style),
+        _ => human::print_class_member_trace_human(trace),
+    }
+}
+
+/// Print file trace results.
+pub(crate) fn print_file_trace(
+    trace: &FileTrace,
+    format: OutputFormat,
+    json_style: crate::json_style::JsonStyle,
+) {
+    match format {
+        OutputFormat::Json => json::print_trace_json(trace, json_style),
         _ => human::print_file_trace_human(trace),
     }
 }
 
 /// Print dependency trace results.
-pub fn print_dependency_trace(trace: &DependencyTrace, format: OutputFormat) {
+pub(crate) fn print_dependency_trace(
+    trace: &DependencyTrace,
+    format: OutputFormat,
+    json_style: crate::json_style::JsonStyle,
+) {
     match format {
-        OutputFormat::Json => json::print_trace_json(trace),
+        OutputFormat::Json => json::print_trace_json(trace, json_style),
         _ => human::print_dependency_trace_human(trace),
     }
 }
 
 /// Print clone trace results.
-pub fn print_clone_trace(trace: &CloneTrace, root: &Path, format: OutputFormat) {
+pub(crate) fn print_clone_trace(
+    trace: &CloneTrace,
+    root: &Path,
+    format: OutputFormat,
+    json_style: crate::json_style::JsonStyle,
+) {
     match format {
-        OutputFormat::Json => json::print_trace_json(trace),
+        OutputFormat::Json => json::print_trace_json(trace, json_style),
         _ => human::print_clone_trace_human(trace, root),
+    }
+}
+
+/// Print impact-closure trace results. JSON only emits the structured
+/// closure; human renders a short summary.
+pub(crate) fn print_impact_closure_trace(
+    trace: &ImpactClosureTrace,
+    format: OutputFormat,
+    json_style: crate::json_style::JsonStyle,
+) {
+    match format {
+        OutputFormat::Json => json::print_trace_json(trace, json_style),
+        _ => {
+            outln!("Impact closure for {}", trace.seed);
+            outln!(
+                "  affected beyond the diff: {} file{}",
+                trace.affected_not_shown.len(),
+                plural(trace.affected_not_shown.len())
+            );
+            for gap in &trace.coordination_gap {
+                outln!(
+                    "  coordination gap: {} consumes {}",
+                    gap.consumer_file,
+                    gap.consumed_symbols.join(", ")
+                );
+            }
+        }
+    }
+}
+
+/// Print exact-symbol impact and targeted-test recommendations.
+pub(crate) fn print_symbol_impact(
+    impact: &SemanticSymbolImpact,
+    format: OutputFormat,
+    explain: bool,
+    json_style: crate::json_style::JsonStyle,
+) {
+    match format {
+        OutputFormat::Json => json::print_semantic_impact_json(impact, explain, json_style),
+        _ => human::print_symbol_impact_human(impact),
     }
 }
 
 /// Print pipeline performance timings.
 /// In JSON mode, outputs to stderr to avoid polluting the JSON analysis output on stdout.
-pub fn print_performance(timings: &PipelineTimings, format: OutputFormat) {
+pub(crate) fn print_performance(
+    timings: &PipelineTimings,
+    format: OutputFormat,
+    json_style: crate::json_style::JsonStyle,
+) {
     match format {
-        OutputFormat::Json => match serde_json::to_string_pretty(timings) {
+        OutputFormat::Json => match json_style.serialize(timings) {
             Ok(json) => eprintln!("{json}"),
             Err(e) => eprintln!("Error: failed to serialize timings: {e}"),
         },
@@ -379,12 +1104,13 @@ pub fn print_performance(timings: &PipelineTimings, format: OutputFormat) {
 
 /// Print health pipeline performance timings.
 /// In JSON mode, outputs to stderr to avoid polluting the JSON analysis output on stdout.
-pub fn print_health_performance(
-    timings: &crate::health_types::HealthTimings,
+pub(crate) fn print_health_performance(
+    timings: &fallow_output::HealthTimings,
     format: OutputFormat,
+    json_style: crate::json_style::JsonStyle,
 ) {
     match format {
-        OutputFormat::Json => match serde_json::to_string_pretty(timings) {
+        OutputFormat::Json => match json_style.serialize(timings) {
             Ok(json) => eprintln!("{json}"),
             Err(e) => eprintln!("Error: failed to serialize timings: {e}"),
         },
@@ -392,94 +1118,93 @@ pub fn print_health_performance(
     }
 }
 
-// Re-exported for snapshot testing via the lib target.
-// Uses #[allow] because unused_imports is target-dependent (used in lib, unused in bin).
 #[allow(
     unused_imports,
     reason = "target-dependent: used in lib, unused in bin"
 )]
-pub use codeclimate::build_codeclimate;
+pub use fallow_api::build_compact_lines;
 #[allow(
     unused_imports,
     reason = "target-dependent: used in lib, unused in bin"
 )]
-pub use codeclimate::build_duplication_codeclimate;
+pub use fallow_api::build_duplication_markdown;
 #[allow(
     unused_imports,
     reason = "target-dependent: used in lib, unused in bin"
 )]
-pub use codeclimate::build_health_codeclimate;
+pub use fallow_api::build_health_markdown;
 #[allow(
     unused_imports,
     reason = "target-dependent: used in lib, unused in bin"
 )]
-pub use compact::build_compact_lines;
-pub use json::build_baseline_deltas_json;
+pub use fallow_api::build_markdown;
+#[allow(
+    clippy::redundant_pub_crate,
+    reason = "target-dependent: report is public in lib, private in bin, but this adapter remains crate-internal"
+)]
+pub(crate) use json::api_check_json_payload_with_config_fixable;
+#[allow(
+    clippy::redundant_pub_crate,
+    reason = "target-dependent: report is public in lib, private in bin, but these adapters remain crate-internal"
+)]
+pub(crate) use json::{build_baseline_deltas_output, check_json_extras};
 #[allow(
     unused_imports,
     reason = "target-dependent: used in lib, unused in bin"
-)]
-pub use json::build_duplication_json;
-#[allow(
-    unused_imports,
-    reason = "target-dependent: used in lib, unused in bin"
-)]
-pub use json::build_health_json;
-#[allow(
-    unused_imports,
-    reason = "target-dependent: used in lib, unused in bin"
-)]
-pub use json::build_json;
-#[allow(
-    unused_imports,
-    reason = "target-dependent: used in bin audit.rs, unused in lib"
 )]
 #[allow(
     clippy::redundant_pub_crate,
-    reason = "pub(crate) deliberately limits visibility — report is pub but these are internal"
+    reason = "target-dependent: report is public in lib, private in bin, but this adapter remains crate-internal"
 )]
-pub(crate) use json::inject_dupes_actions;
+pub(crate) use sarif::api_health_sarif_document;
 #[allow(
     unused_imports,
-    reason = "target-dependent: used in bin audit.rs, unused in lib"
+    reason = "target-dependent: used in lib, unused in bin"
 )]
 #[allow(
     clippy::redundant_pub_crate,
-    reason = "pub(crate) deliberately limits visibility — report is pub but these are internal"
+    reason = "target-dependent: report is public in lib, private in bin, but this adapter remains crate-internal"
 )]
-pub(crate) use json::inject_health_actions;
-#[allow(
-    unused_imports,
-    reason = "target-dependent: used in lib, unused in bin"
-)]
-pub use markdown::build_duplication_markdown;
-#[allow(
-    unused_imports,
-    reason = "target-dependent: used in lib, unused in bin"
-)]
-pub use markdown::build_health_markdown;
-#[allow(
-    unused_imports,
-    reason = "target-dependent: used in lib, unused in bin"
-)]
-pub use markdown::build_markdown;
-#[allow(
-    unused_imports,
-    reason = "target-dependent: used in lib, unused in bin"
-)]
-pub use sarif::build_health_sarif;
-#[allow(
-    unused_imports,
-    reason = "target-dependent: used in lib, unused in bin"
-)]
-pub use sarif::build_sarif;
+pub(crate) use sarif::api_sarif_document;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
-    // ── normalize_uri ────────────────────────────────────────────────
+    #[test]
+    fn format_bytes_pivots_at_power_of_1024() {
+        assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(1023), "1023 B");
+        assert_eq!(format_bytes(1024), "1 KiB");
+        assert_eq!(format_bytes(2048), "2 KiB");
+        assert_eq!(format_bytes(1_048_576), "1.0 MiB");
+        assert_eq!(format_bytes(10_485_760), "10.0 MiB");
+        assert_eq!(format_bytes(1_073_741_824), "1.0 GiB");
+    }
+
+    fn test_context<'a>(root: &'a Path, rules: &'a RulesConfig) -> ReportContext<'a> {
+        ReportContext {
+            root,
+            rules,
+            workspace_diagnostics: &[],
+            elapsed: Duration::default(),
+            quiet: true,
+            explain: false,
+            type_aware: None,
+            type_aware_scope: None,
+            group_by: None,
+            top: None,
+            summary: false,
+            summary_heading: false,
+            show_explain_tip: false,
+            baseline_matched: None,
+            config_fixable: false,
+            skip_score_and_trend: false,
+            css_requested: false,
+            json_style: crate::json_style::JsonStyle::Compact,
+        }
+    }
 
     #[test]
     fn normalize_uri_forward_slashes_unchanged() {
@@ -508,8 +1233,6 @@ mod tests {
     fn normalize_uri_empty_string() {
         assert_eq!(normalize_uri(""), "");
     }
-
-    // ── relative_path ────────────────────────────────────────────────
 
     #[test]
     fn relative_path_strips_root_prefix() {
@@ -542,7 +1265,81 @@ mod tests {
         );
     }
 
-    // ── relative_uri ─────────────────────────────────────────────────
+    #[test]
+    fn format_display_path_returns_workspace_relative() {
+        let root = Path::new("/project");
+        let path = Path::new("/project/apps/server/src/index.ts");
+        assert_eq!(format_display_path(path, root), "apps/server/src/index.ts");
+    }
+
+    #[test]
+    fn format_display_path_collides_in_nx_layout_renders_full_relative() {
+        let root = Path::new("/project");
+        let server = Path::new("/project/apps/server/src/index.ts");
+        let client = Path::new("/project/apps/client/src/index.ts");
+        assert_eq!(
+            format_display_path(server, root),
+            "apps/server/src/index.ts"
+        );
+        assert_eq!(
+            format_display_path(client, root),
+            "apps/client/src/index.ts"
+        );
+    }
+
+    #[test]
+    fn format_display_path_angular_component_renders_parent_directory() {
+        let root = Path::new("/project");
+        let path = Path::new(
+            "/project/apps/admin/src/app/payments/payment-list/payment-list.component.html",
+        );
+        assert_eq!(
+            format_display_path(path, root),
+            "apps/admin/src/app/payments/payment-list/payment-list.component.html"
+        );
+    }
+
+    #[test]
+    fn format_display_path_falls_back_to_full_path_when_root_does_not_prefix() {
+        let root = Path::new("/other");
+        let path = Path::new("/project/src/utils.ts");
+        let rendered = format_display_path(path, root);
+        assert!(rendered.contains("project"));
+        assert!(rendered.ends_with("utils.ts"));
+        assert!(!rendered.contains('\\'));
+    }
+
+    #[test]
+    fn format_display_path_normalizes_backslashes_to_forward_slashes() {
+        let root = Path::new("/project");
+        let path = Path::new("/project/src/sub\\file.ts");
+        let rendered = format_display_path(path, root);
+        assert!(
+            !rendered.contains('\\'),
+            "backslashes must be normalized: {rendered}"
+        );
+    }
+
+    #[test]
+    fn format_display_path_handles_brackets_verbatim() {
+        let root = Path::new("/project");
+        let path = Path::new("/project/app/[slug]/page.tsx");
+        assert_eq!(format_display_path(path, root), "app/[slug]/page.tsx");
+    }
+
+    #[test]
+    fn format_display_path_path_equals_root_returns_empty() {
+        let root = Path::new("/project");
+        let path = Path::new("/project");
+        assert_eq!(format_display_path(path, root), "");
+    }
+
+    #[test]
+    fn format_display_path_basename_only_when_path_is_at_root() {
+        let root = Path::new("/project");
+        let path = Path::new("/project/Cargo.toml");
+        assert_eq!(format_display_path(path, root), "Cargo.toml");
+    }
 
     #[test]
     fn relative_uri_produces_forward_slash_path() {
@@ -577,8 +1374,6 @@ mod tests {
         assert!(uri.contains("utils.ts"));
     }
 
-    // ── severity_to_level ────────────────────────────────────────────
-
     #[test]
     fn severity_error_maps_to_level_error() {
         assert!(matches!(severity_to_level(Severity::Error), Level::Error));
@@ -593,8 +1388,6 @@ mod tests {
     fn severity_off_maps_to_level_info() {
         assert!(matches!(severity_to_level(Severity::Off), Level::Info));
     }
-
-    // ── normalize_uri bracket encoding ──────────────────────────────
 
     #[test]
     fn normalize_uri_single_bracket_pair() {
@@ -636,8 +1429,6 @@ mod tests {
         assert_eq!(normalize_uri("a\\b\\c"), "a/b/c");
     }
 
-    // ── relative_path edge cases ────────────────────────────────────
-
     #[test]
     fn relative_path_identical_paths_returns_empty() {
         let root = Path::new("/project");
@@ -646,21 +1437,16 @@ mod tests {
 
     #[test]
     fn relative_path_partial_name_match_not_stripped() {
-        // "/project-two/src/a.ts" should NOT strip "/project" because
-        // "/project" is not a proper prefix of "/project-two".
         let root = Path::new("/project");
         let path = Path::new("/project-two/src/a.ts");
         assert_eq!(relative_path(path, root), path);
     }
-
-    // ── relative_uri edge cases ─────────────────────────────────────
 
     #[test]
     fn relative_uri_combines_stripping_and_encoding() {
         let root = PathBuf::from("/project");
         let path = root.join("src/app/[slug]/page.tsx");
         let uri = relative_uri(&path, &root);
-        // Should both strip the prefix AND encode brackets.
         assert_eq!(uri, "src/app/%5Bslug%5D/page.tsx");
         assert!(!uri.starts_with('/'));
     }
@@ -672,11 +1458,8 @@ mod tests {
         assert_eq!(relative_uri(&path, &root), "index.ts");
     }
 
-    // ── severity_to_level exhaustiveness ────────────────────────────
-
     #[test]
     fn severity_to_level_is_const_evaluable() {
-        // Verify the function can be used in const context.
         const LEVEL_FROM_ERROR: Level = severity_to_level(Severity::Error);
         const LEVEL_FROM_WARN: Level = severity_to_level(Severity::Warn);
         const LEVEL_FROM_OFF: Level = severity_to_level(Severity::Off);
@@ -685,18 +1468,36 @@ mod tests {
         assert!(matches!(LEVEL_FROM_OFF, Level::Info));
     }
 
-    // ── Level is Copy ───────────────────────────────────────────────
-
     #[test]
     fn level_is_copy() {
         let level = severity_to_level(Severity::Error);
         let copy = level;
-        // Both should still be usable (Copy semantics).
         assert!(matches!(level, Level::Error));
         assert!(matches!(copy, Level::Error));
     }
 
-    // ── elide_common_prefix ─────────────────────────────────────────
+    #[test]
+    fn print_results_rejects_badge_for_dead_code_reports() {
+        let root = Path::new("/project");
+        let rules = RulesConfig::default();
+        let ctx = test_context(root, &rules);
+
+        let code = print_results(&AnalysisResults::default(), &ctx, OutputFormat::Badge, None);
+
+        assert_eq!(code, ExitCode::from(2));
+    }
+
+    #[test]
+    fn print_duplication_report_rejects_badge_format() {
+        let root = Path::new("/project");
+        let rules = RulesConfig::default();
+        let ctx = test_context(root, &rules);
+
+        let code =
+            print_duplication_report(&DuplicationReport::default(), &ctx, OutputFormat::Badge);
+
+        assert_eq!(code, ExitCode::from(2));
+    }
 
     #[test]
     fn elide_common_prefix_shared_dir() {
@@ -724,7 +1525,6 @@ mod tests {
 
     #[test]
     fn elide_common_prefix_identical_files() {
-        // Same dir, different file
         assert_eq!(elide_common_prefix("a/b/x.ts", "a/b/y.ts"), "y.ts");
     }
 
@@ -743,8 +1543,6 @@ mod tests {
             "SearchSelectItem.tsx"
         );
     }
-
-    // ── split_dir_filename ───────────────────────────────────────
 
     #[test]
     fn split_dir_filename_with_dir() {
@@ -781,8 +1579,6 @@ mod tests {
         assert_eq!(file, "");
     }
 
-    // ── plural ──────────────────────────────────────────────────
-
     #[test]
     fn plural_zero_is_plural() {
         assert_eq!(plural(0), "s");
@@ -803,8 +1599,6 @@ mod tests {
         assert_eq!(plural(999), "s");
     }
 
-    // ── elide_common_prefix edge cases ──────────────────────────
-
     #[test]
     fn elide_common_prefix_empty_base() {
         assert_eq!(elide_common_prefix("", "src/foo.ts"), "src/foo.ts");
@@ -822,7 +1616,6 @@ mod tests {
 
     #[test]
     fn elide_common_prefix_same_file_different_extension() {
-        // "src/utils.ts" vs "src/utils.js" — common prefix is "src/"
         assert_eq!(
             elide_common_prefix("src/utils.ts", "src/utils.js"),
             "utils.js"
@@ -831,7 +1624,6 @@ mod tests {
 
     #[test]
     fn elide_common_prefix_partial_filename_match_not_stripped() {
-        // "src/App.tsx" vs "src/AppUtils.tsx" — both in src/, but file names differ
         assert_eq!(
             elide_common_prefix("src/App.tsx", "src/AppUtils.tsx"),
             "AppUtils.tsx"

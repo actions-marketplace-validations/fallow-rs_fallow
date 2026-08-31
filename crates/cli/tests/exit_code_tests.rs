@@ -1,11 +1,15 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "tests and benches use unwrap and expect to keep fixture setup concise"
+)]
+
 #[path = "common/mod.rs"]
 mod common;
 
-use common::{parse_json, run_fallow, run_fallow_combined, run_fallow_raw};
-
-// ---------------------------------------------------------------------------
-// --fail-on-issues across commands
-// ---------------------------------------------------------------------------
+use common::{
+    fallow_bin, parse_json, run_fallow, run_fallow_combined, run_fallow_in_root, run_fallow_raw,
+};
 
 #[test]
 fn fail_on_issues_check_exits_1_with_issues() {
@@ -20,24 +24,23 @@ fn fail_on_issues_check_exits_1_with_issues() {
     );
 }
 
+/// Named for the flag that actually drives the exit code. This case previously
+/// also passed `--fail-on-issues` and was named for it, but `dupes` never reads
+/// that flag (`dispatch_dupes` discards it and `DupesOptions` has no such
+/// field), so the assertion was carried entirely by `--threshold`. Wiring
+/// `--fail-on-issues` into `dupes` is a separate behaviour change; until then
+/// this test pins the threshold gate only, under a name that matches.
 #[test]
-fn fail_on_issues_dupes_exits_1_with_clones() {
+fn dupes_threshold_exits_1_with_clones() {
     let output = run_fallow(
         "dupes",
         "duplicate-code",
-        &[
-            "--threshold",
-            "0.1",
-            "--fail-on-issues",
-            "--format",
-            "json",
-            "--quiet",
-        ],
+        &["--threshold", "0.1", "--format", "json", "--quiet"],
     );
-    assert!(
-        output.code == 0 || output.code == 1,
-        "dupes with --fail-on-issues should not crash, got {}",
-        output.code
+    assert_eq!(
+        output.code, 1,
+        "dupes over its threshold must exit 1. stderr: {}",
+        output.stderr
     );
 }
 
@@ -52,6 +55,216 @@ fn combined_mode_runs_successfully() {
     let json: serde_json::Value = serde_json::from_str(&output.stdout)
         .unwrap_or_else(|e| panic!("combined output should be JSON: {e}"));
     assert!(json.is_object(), "combined output should be a JSON object");
+}
+
+#[test]
+fn combined_json_explain_includes_sectioned_meta() {
+    let output = run_fallow_combined(
+        "basic-project",
+        &["--format", "json", "--quiet", "--explain"],
+    );
+    assert!(
+        output.code == 0 || output.code == 1,
+        "combined mode should not crash, got exit code {}",
+        output.code
+    );
+    let json = parse_json(&output);
+    assert!(
+        json.pointer("/_meta/check/rules/unused-export/description")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|text| text.contains("Named exports")),
+        "combined _meta should include dead-code rule descriptions"
+    );
+    assert!(
+        json.pointer("/_meta/dupes/metrics/duplication_percentage/description")
+            .and_then(serde_json::Value::as_str)
+            .is_some(),
+        "combined _meta should include duplication metric descriptions"
+    );
+    assert!(
+        json.pointer("/_meta/health/metrics/cyclomatic/description")
+            .and_then(serde_json::Value::as_str)
+            .is_some(),
+        "combined _meta should include health metric descriptions"
+    );
+}
+
+#[test]
+fn human_explain_adds_inline_descriptions_for_analysis_commands() {
+    let check = run_fallow("check", "basic-project", &["--quiet", "--explain"]);
+    assert!(
+        check
+            .stdout
+            .contains("Description: Named exports that are never imported"),
+        "check --explain should describe dead-code sections, stdout:\n{}",
+        check.stdout
+    );
+
+    let dupes = run_fallow("dupes", "duplicate-code", &["--quiet", "--explain"]);
+    assert!(
+        dupes.stdout.contains("Description: A block of code"),
+        "dupes --explain should describe duplicate sections, stdout:\n{}",
+        dupes.stdout
+    );
+
+    let health = run_fallow("health", "complexity-project", &["--quiet", "--explain"]);
+    assert!(
+        health
+            .stdout
+            .contains("Description: Function exceeds both cyclomatic and cognitive"),
+        "health --explain should describe health sections, stdout:\n{}",
+        health.stdout
+    );
+}
+
+#[test]
+fn health_json_reports_framework_abstains() {
+    let output = run_fallow(
+        "health",
+        "sveltekit-load-data-global-abstain",
+        &["--format", "json", "--quiet", "--score"],
+    );
+    assert_eq!(output.code, 0, "health should pass: {}", output.stderr);
+    let json = parse_json(&output);
+    assert!(
+        json.pointer("/framework_health/detected_frameworks")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|frameworks| frameworks.iter().any(|framework| framework == "sveltekit")),
+        "SvelteKit should be detected: {}",
+        output.stdout
+    );
+    let detectors = json
+        .pointer("/framework_health/detectors")
+        .and_then(serde_json::Value::as_array)
+        .expect("framework detectors should be present");
+    let abstain = detectors
+        .iter()
+        .find(|detector| {
+            detector.get("id").and_then(serde_json::Value::as_str) == Some("unused-load-data-key")
+                && detector
+                    .get("framework")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("sveltekit")
+        })
+        .expect("unused-load-data-key detector should be reported");
+    assert_eq!(
+        abstain.get("status").and_then(serde_json::Value::as_str),
+        Some("abstained")
+    );
+    assert_eq!(
+        abstain.get("reason").and_then(serde_json::Value::as_str),
+        Some("unused_load_data_keys_global_abstain")
+    );
+}
+
+#[test]
+fn health_json_reports_disabled_framework_detectors() {
+    let output = run_fallow(
+        "health",
+        "unused-react-prop",
+        &["--format", "json", "--quiet", "--score"],
+    );
+    assert_eq!(output.code, 0, "health should pass: {}", output.stderr);
+    let json = parse_json(&output);
+    let detectors = json
+        .pointer("/framework_health/detectors")
+        .and_then(serde_json::Value::as_array)
+        .expect("framework detectors should be present");
+    for id in ["prop-drilling", "thin-wrapper", "duplicate-prop-shape"] {
+        let detector = detectors
+            .iter()
+            .find(|detector| {
+                detector.get("id").and_then(serde_json::Value::as_str) == Some(id)
+                    && detector
+                        .get("framework")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("react")
+            })
+            .unwrap_or_else(|| panic!("{id} should be reported"));
+        assert_eq!(
+            detector.get("status").and_then(serde_json::Value::as_str),
+            Some("disabled_by_config")
+        );
+        assert_eq!(
+            detector.get("reason").and_then(serde_json::Value::as_str),
+            Some("disabled_by_config")
+        );
+    }
+}
+
+#[test]
+fn health_json_reports_not_checked_framework_detectors() {
+    let output = run_fallow(
+        "health",
+        "nuxt-auto-import-components",
+        &["--format", "json", "--quiet", "--score"],
+    );
+    assert_eq!(output.code, 0, "health should pass: {}", output.stderr);
+    let json = parse_json(&output);
+    let detectors = json
+        .pointer("/framework_health/detectors")
+        .and_then(serde_json::Value::as_array)
+        .expect("framework detectors should be present");
+    assert!(
+        !detectors.iter().any(|detector| {
+            detector
+                .get("framework")
+                .and_then(serde_json::Value::as_str)
+                == Some("vue")
+        }),
+        "Nuxt-only projects should not synthesize a Vue detector row"
+    );
+    let detector = detectors
+        .iter()
+        .find(|detector| {
+            detector.get("id").and_then(serde_json::Value::as_str) == Some("unprovided-inject")
+                && detector
+                    .get("framework")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("nuxt")
+        })
+        .expect("Nuxt unprovided-inject detector should be reported");
+    assert_eq!(
+        detector.get("status").and_then(serde_json::Value::as_str),
+        Some("not_checked")
+    );
+    assert_eq!(
+        detector.get("reason").and_then(serde_json::Value::as_str),
+        Some("requires_vue_runtime_dependency")
+    );
+}
+
+#[test]
+fn combined_human_explain_renders_inline_descriptions() {
+    let combined = run_fallow_combined("basic-project", &["--quiet", "--explain"]);
+    assert!(
+        combined.code == 0 || combined.code == 1,
+        "combined --explain should not crash, got exit code {}",
+        combined.code
+    );
+    assert!(
+        combined
+            .stdout
+            .contains("Description: Named exports that are never imported"),
+        "combined --explain should render dead-code descriptions inline, stdout:\n{}",
+        combined.stdout
+    );
+}
+
+#[test]
+fn check_grouped_human_explain_renders_inline_descriptions() {
+    let output = run_fallow(
+        "check",
+        "basic-project",
+        &["--quiet", "--explain", "--group-by", "directory"],
+    );
+    assert!(
+        output
+            .stdout
+            .contains("Description: Named exports that are never imported"),
+        "check --group-by --explain should render dead-code descriptions inline, stdout:\n{}",
+        output.stdout
+    );
 }
 
 #[test]
@@ -154,10 +367,6 @@ fn combined_human_output_labels_metrics_line() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// --only / --skip in combined mode
-// ---------------------------------------------------------------------------
-
 #[test]
 fn combined_only_dead_code() {
     let output = run_fallow_combined(
@@ -202,14 +411,9 @@ fn combined_only_and_skip_are_mutually_exclusive() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Baseline round-trip
-// ---------------------------------------------------------------------------
-
 #[test]
 fn save_baseline_creates_file() {
     let dir = std::env::temp_dir().join(format!("fallow-baseline-test-{}", std::process::id()));
-    // Pre-clean to avoid false positives from previous runs
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::create_dir_all(&dir);
     let baseline_path = dir.join("fallow-baselines/dead-code.json");
@@ -284,9 +488,96 @@ fn baseline_filters_known_issues() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-// ---------------------------------------------------------------------------
-// --changed-since
-// ---------------------------------------------------------------------------
+#[test]
+fn save_baseline_distinguishes_same_unused_dep_across_workspaces() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    std::fs::write(
+        dir.path().join("package.json"),
+        r#"{
+  "name": "baseline-workspace-deps",
+  "private": true,
+  "workspaces": ["packages/*"]
+}
+"#,
+    )
+    .expect("write root package.json");
+    std::fs::write(
+        dir.path().join("tsconfig.json"),
+        r#"{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ES2022",
+    "moduleResolution": "bundler",
+    "strict": true
+  }
+}
+"#,
+    )
+    .expect("write tsconfig");
+
+    for package in ["app-a", "app-b"] {
+        let package_dir = dir.path().join("packages").join(package);
+        let src_dir = package_dir.join("src");
+        std::fs::create_dir_all(&src_dir).expect("create package src");
+        std::fs::write(
+            package_dir.join("package.json"),
+            format!(
+                r#"{{
+  "name": "{package}",
+  "version": "1.0.0",
+  "main": "src/index.ts",
+  "dependencies": {{ "lodash-es": "4.17.21" }}
+}}
+"#
+            ),
+        )
+        .expect("write workspace package.json");
+        std::fs::write(
+            src_dir.join("index.ts"),
+            format!("export const {package}_value = 1;\n").replace('-', "_"),
+        )
+        .expect("write source file");
+    }
+
+    let baseline_path = dir.path().join("baseline.json");
+    let output = run_fallow_in_root(
+        "dead-code",
+        dir.path(),
+        &[
+            "--save-baseline",
+            baseline_path
+                .to_str()
+                .expect("baseline path should be utf-8"),
+            "--format",
+            "json",
+            "--quiet",
+        ],
+    );
+    assert!(
+        output.code == 0 || output.code == 1,
+        "save-baseline should not crash, got {}: {}",
+        output.code,
+        output.stderr
+    );
+
+    let baseline: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&baseline_path).expect("read baseline"))
+            .expect("baseline should be valid JSON");
+    let deps: Vec<&str> = baseline["unused_dependencies"]
+        .as_array()
+        .expect("unused_dependencies should be an array")
+        .iter()
+        .map(|value| value.as_str().expect("dependency key should be a string"))
+        .collect();
+
+    assert_eq!(
+        deps,
+        vec![
+            "packages/app-a/package.json:lodash-es",
+            "packages/app-b/package.json:lodash-es"
+        ]
+    );
+}
 
 #[test]
 fn changed_since_accepts_head() {
@@ -308,10 +599,6 @@ fn changed_since_accepts_head() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Error paths
-// ---------------------------------------------------------------------------
-
 #[test]
 fn nonexistent_root_exits_2() {
     let output = run_fallow_raw(&[
@@ -321,6 +608,203 @@ fn nonexistent_root_exits_2() {
         "--quiet",
     ]);
     assert_eq!(output.code, 2, "nonexistent root should exit 2");
+}
+
+/// #2091 made workspace discovery fatal for analysis commands: a root
+/// `package.json` that cannot be parsed must exit 2 with the malformed-JSON
+/// message instead of analyzing a fictional workspace layout. The JSON error
+/// envelope on stdout is a published contract.
+#[test]
+fn malformed_root_package_json_exits_2_across_commands() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src")).expect("mk src");
+    std::fs::write(root.join("package.json"), "{ not json").expect("write package.json");
+    std::fs::write(root.join("src").join("index.ts"), "export const a = 1;\n")
+        .expect("write source");
+
+    for command in ["check", "dupes", "list"] {
+        let human = run_fallow_in_root(command, root, &["--quiet"]);
+        assert_eq!(
+            human.code, 2,
+            "{command} should exit 2 on malformed root package.json, stderr: {}",
+            human.stderr
+        );
+        assert!(
+            human.stderr.contains("is not valid JSON"),
+            "{command} stderr should explain the parse failure, got: {}",
+            human.stderr
+        );
+
+        let json = run_fallow_in_root(command, root, &["--format", "json", "--quiet"]);
+        assert_eq!(
+            json.code, 2,
+            "{command} --format json should exit 2, stderr: {}",
+            json.stderr
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&json.stdout).unwrap_or_else(|e| {
+            panic!(
+                "{command} stdout should be a JSON error envelope: {e}\nstdout: {}",
+                json.stdout
+            )
+        });
+        assert_eq!(parsed["error"], serde_json::Value::Bool(true));
+        assert_eq!(parsed["exit_code"], serde_json::Value::from(2));
+        assert!(
+            parsed["message"]
+                .as_str()
+                .is_some_and(|msg| msg.contains("is not valid JSON")),
+            "{command} envelope message should explain the parse failure, got: {}",
+            json.stdout
+        );
+    }
+}
+
+/// Sibling of [`malformed_root_package_json_exits_2_across_commands`] for the
+/// `MalformedRootDenoConfig` arm: a pure Deno root with an unparsable
+/// `deno.json` must also exit 2 instead of proceeding without workspaces.
+#[test]
+fn malformed_root_deno_config_exits_2_with_structured_envelope() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src")).expect("mk src");
+    std::fs::write(root.join("deno.json"), r#"{"name":"broken""#).expect("write deno.json");
+    std::fs::write(root.join("src").join("index.ts"), "export const a = 1;\n")
+        .expect("write source");
+
+    let human = run_fallow_in_root("check", root, &["--quiet"]);
+    assert_eq!(
+        human.code, 2,
+        "check should exit 2 on malformed root deno.json, stderr: {}",
+        human.stderr
+    );
+    assert!(
+        human.stderr.contains("is not valid JSONC"),
+        "stderr should explain the parse failure, got: {}",
+        human.stderr
+    );
+
+    let json = run_fallow_in_root("check", root, &["--format", "json", "--quiet"]);
+    assert_eq!(json.code, 2, "stderr: {}", json.stderr);
+    let parsed: serde_json::Value = serde_json::from_str(&json.stdout).unwrap_or_else(|e| {
+        panic!(
+            "stdout should be a JSON error envelope: {e}\nstdout: {}",
+            json.stdout
+        )
+    });
+    assert_eq!(parsed["error"], serde_json::Value::Bool(true));
+    assert_eq!(parsed["exit_code"], serde_json::Value::from(2));
+    assert!(
+        parsed["message"]
+            .as_str()
+            .is_some_and(|msg| msg.contains("is not valid JSONC")),
+        "envelope message should explain the parse failure, got: {}",
+        json.stdout
+    );
+}
+
+#[test]
+fn config_with_traversal_glob_exits_2() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let root = dir.path();
+    std::fs::write(root.join("package.json"), r#"{"name":"test"}"#).expect("write package.json");
+    std::fs::write(
+        root.join(".fallowrc.json"),
+        r#"{ "entry": ["../escape/**"] }"#,
+    )
+    .expect("write config");
+
+    let output = run_fallow_in_root("check", root, &["--quiet"]);
+    assert_eq!(
+        output.code, 2,
+        "traversal glob in config should exit 2, stderr: {}",
+        output.stderr
+    );
+    assert!(
+        output.stderr.contains("entry") && output.stderr.contains("../escape/**"),
+        "stderr should mention the offending field + pattern, got: {}",
+        output.stderr
+    );
+}
+
+#[test]
+fn config_with_invalid_glob_exits_2() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let root = dir.path();
+    std::fs::write(root.join("package.json"), r#"{"name":"test"}"#).expect("write package.json");
+    std::fs::write(
+        root.join(".fallowrc.json"),
+        r#"{ "ignorePatterns": ["[unclosed"] }"#,
+    )
+    .expect("write config");
+
+    let output = run_fallow_in_root("check", root, &["--quiet"]);
+    assert_eq!(
+        output.code, 2,
+        "invalid glob syntax in config should exit 2, stderr: {}",
+        output.stderr
+    );
+    assert!(
+        output.stderr.contains("ignorePatterns") && output.stderr.contains("[unclosed"),
+        "stderr should mention the offending field + pattern, got: {}",
+        output.stderr
+    );
+}
+
+#[test]
+fn external_plugin_file_traversal_glob_exits_2() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let root = dir.path();
+    std::fs::write(root.join("package.json"), r#"{"name":"test"}"#).expect("write package.json");
+    std::fs::create_dir_all(root.join(".fallow").join("plugins")).expect("mk .fallow/plugins/");
+    std::fs::write(
+        root.join(".fallow").join("plugins").join("leak.json"),
+        r#"{
+            "name": "leaky-plugin",
+            "detection": { "type": "fileExists", "pattern": "../secret-marker" }
+        }"#,
+    )
+    .expect("write plugin");
+
+    let output = run_fallow_in_root("check", root, &["--quiet"]);
+    assert_eq!(
+        output.code, 2,
+        "external plugin with traversal glob should exit 2, stderr: {}",
+        output.stderr
+    );
+    assert!(
+        output.stderr.contains("framework[].detection")
+            && output.stderr.contains("../secret-marker"),
+        "stderr should mention the offending field + pattern, got: {}",
+        output.stderr
+    );
+}
+
+#[test]
+fn fallow_plugin_root_file_traversal_glob_exits_2() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let root = dir.path();
+    std::fs::write(root.join("package.json"), r#"{"name":"test"}"#).expect("write package.json");
+    std::fs::write(
+        root.join("fallow-plugin-leak.json"),
+        r#"{
+            "name": "leaky-root-plugin",
+            "entryPoints": ["../entry/**"]
+        }"#,
+    )
+    .expect("write plugin");
+
+    let output = run_fallow_in_root("check", root, &["--quiet"]);
+    assert_eq!(
+        output.code, 2,
+        "fallow-plugin-* root file with traversal glob should exit 2, stderr: {}",
+        output.stderr
+    );
+    assert!(
+        output.stderr.contains("framework[].entryPoints") && output.stderr.contains("../entry/**"),
+        "stderr should mention the offending field + pattern, got: {}",
+        output.stderr
+    );
 }
 
 #[test]
@@ -340,5 +824,382 @@ fn no_package_json_returns_empty_results() {
         json["total_issues"].as_u64().unwrap_or(0),
         0,
         "should have 0 issues without package.json"
+    );
+}
+
+#[test]
+fn combined_json_outside_git_repo_emits_single_document() {
+    use std::process::Command;
+
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let root = dir.path();
+    std::fs::write(
+        root.join("package.json"),
+        r#"{"name":"no-git-combined","type":"module","main":"src/index.ts"}"#,
+    )
+    .expect("write package.json");
+    std::fs::write(
+        root.join("tsconfig.json"),
+        r#"{"compilerOptions":{"target":"ES2020","module":"ES2020","strict":true},"include":["src"]}"#,
+    )
+    .expect("write tsconfig.json");
+    std::fs::create_dir_all(root.join("src")).expect("create src");
+    std::fs::write(
+        root.join("src/index.ts"),
+        "export function add(a: number, b: number): number { return a + b; }\n",
+    )
+    .expect("write index.ts");
+
+    let mut cmd = Command::new(fallow_bin());
+    cmd.arg("--root")
+        .arg(root)
+        .arg("--format")
+        .arg("json")
+        .arg("--quiet")
+        .env("RUST_LOG", "")
+        .env("NO_COLOR", "1")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null");
+    let output = cmd.output().expect("failed to run fallow binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    serde_json::from_str::<serde_json::Value>(&stdout).unwrap_or_else(|e| {
+        panic!(
+            "combined mode outside a git repo must emit exactly one JSON document on stdout: {e}\nstdout was:\n{stdout}\nstderr was:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+    });
+
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("already parsed");
+    assert!(
+        json.get("schema_version").is_some(),
+        "stdout should be the combined report envelope, got: {json}"
+    );
+    assert!(
+        json.get("error").is_none(),
+        "combined report must not surface a top-level `error` key from a nested hotspot bail-out"
+    );
+}
+
+#[test]
+fn config_with_unknown_boundary_zone_reference_exits_2() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let root = dir.path();
+    std::fs::write(root.join("package.json"), r#"{"name":"test"}"#).expect("write package.json");
+    std::fs::write(
+        root.join(".fallowrc.json"),
+        r#"{
+            "boundaries": {
+                "zones": [{ "name": "ui", "patterns": ["src/ui/**"] }],
+                "rules": [
+                    {
+                        "from": "typo-from",
+                        "allow": ["typo-allow"],
+                        "allowTypeOnly": ["typo-type-only"]
+                    },
+                    {
+                        "from": "ui",
+                        "allow": ["another-typo"]
+                    }
+                ]
+            }
+        }"#,
+    )
+    .expect("write config");
+
+    let output = run_fallow_in_root("check", root, &["--quiet"]);
+    assert_eq!(
+        output.code, 2,
+        "unknown boundary zone reference should exit 2, stderr: {}",
+        output.stderr
+    );
+
+    let stderr = &output.stderr;
+    assert!(
+        stderr.contains("invalid boundary configuration"),
+        "stderr: {stderr}"
+    );
+    for name in ["typo-from", "typo-allow", "typo-type-only", "another-typo"] {
+        assert!(
+            stderr.contains(name),
+            "stderr should name every offending zone (`{name}`): {stderr}"
+        );
+    }
+}
+
+#[test]
+fn config_with_redundant_boundary_root_prefix_exits_2() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let root = dir.path();
+    std::fs::write(root.join("package.json"), r#"{"name":"test"}"#).expect("write package.json");
+    std::fs::write(
+        root.join(".fallowrc.json"),
+        r#"{
+            "boundaries": {
+                "zones": [{
+                    "name": "ui",
+                    "patterns": ["packages/app/src/**"],
+                    "root": "packages/app/"
+                }],
+                "rules": []
+            }
+        }"#,
+    )
+    .expect("write config");
+
+    let output = run_fallow_in_root("check", root, &["--quiet"]);
+    assert_eq!(
+        output.code, 2,
+        "redundant root prefix should exit 2, stderr: {}",
+        output.stderr
+    );
+    let stderr = &output.stderr;
+    assert!(
+        stderr.contains("FALLOW-BOUNDARY-ROOT-REDUNDANT-PREFIX"),
+        "stderr should preserve the legacy tag for CI grep recipes: {stderr}"
+    );
+    assert!(stderr.contains("packages/app/src/**"), "stderr: {stderr}");
+}
+
+#[test]
+fn config_with_invalid_rule_pack_exits_2() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let root = dir.path();
+    std::fs::write(root.join("package.json"), r#"{"name":"test"}"#).expect("write package.json");
+    std::fs::create_dir_all(root.join("packs")).expect("create packs dir");
+    std::fs::write(
+        root.join("packs/bad-kind.json"),
+        r#"{
+            "version": 1,
+            "name": "bad-kind",
+            "rules": [
+                { "id": "no-foo", "kind": "banned-callee", "callees": ["foo.*"] }
+            ]
+        }"#,
+    )
+    .expect("write pack");
+    std::fs::write(
+        root.join(".fallowrc.json"),
+        r#"{ "rulePacks": ["packs/bad-kind.json", "packs/nonexistent.json"] }"#,
+    )
+    .expect("write config");
+
+    let output = run_fallow_in_root("check", root, &["--quiet"]);
+    assert_eq!(
+        output.code, 2,
+        "an invalid or missing rule pack must fail the run instead of silently \
+         skipping policy, stderr: {}",
+        output.stderr
+    );
+
+    let stderr = &output.stderr;
+    assert!(stderr.contains("invalid rule pack"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("bad-kind.json"),
+        "stderr should name the unparsable pack: {stderr}"
+    );
+    assert!(
+        stderr.contains("nonexistent.json"),
+        "stderr should collect the missing pack too: {stderr}"
+    );
+}
+
+#[test]
+fn fallow_config_subcommand_reports_unknown_boundary_zone_as_json() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let root = dir.path();
+    std::fs::write(root.join("package.json"), r#"{"name":"test"}"#).expect("write package.json");
+    std::fs::write(
+        root.join(".fallowrc.json"),
+        r#"{
+            "boundaries": {
+                "zones": [{ "name": "ui", "patterns": ["src/ui/**"] }],
+                "rules": [{ "from": "ui", "allow": ["typo-zone"] }]
+            }
+        }"#,
+    )
+    .expect("write config");
+
+    let output = run_fallow_raw(&["--root", root.to_str().expect("utf-8 root"), "config"]);
+    assert_eq!(
+        output.code, 2,
+        "fallow config must reject invalid boundary config, stdout: {}",
+        output.stdout
+    );
+    assert!(output.stderr.is_empty());
+    let error: serde_json::Value =
+        serde_json::from_str(&output.stdout).expect("config errors should be structured JSON");
+    assert!(
+        error["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("typo-zone")),
+        "JSON error should name the typo'd zone, got: {}",
+        output.stdout
+    );
+}
+
+#[test]
+fn fallow_config_subcommand_json_format_emits_structured_error_envelope() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let root = dir.path();
+    std::fs::write(root.join("package.json"), r#"{"name":"test"}"#).expect("write package.json");
+    std::fs::write(
+        root.join(".fallowrc.json"),
+        r#"{
+            "boundaries": {
+                "zones": [{ "name": "ui", "patterns": ["src/ui/**"] }],
+                "rules": [{ "from": "ui", "allow": ["typo-zone"] }]
+            }
+        }"#,
+    )
+    .expect("write config");
+
+    let output = run_fallow_raw(&[
+        "--root",
+        root.to_str().expect("utf-8 root"),
+        "--format",
+        "json",
+        "config",
+    ]);
+    assert_eq!(output.code, 2, "should exit 2, stderr: {}", output.stderr);
+    let parsed: serde_json::Value = serde_json::from_str(&output.stdout).unwrap_or_else(|e| {
+        panic!(
+            "stdout should be JSON envelope: {e}\nstdout: {}",
+            output.stdout
+        )
+    });
+    assert_eq!(parsed["error"], serde_json::Value::Bool(true));
+    assert_eq!(parsed["exit_code"], serde_json::Value::from(2));
+    let msg = parsed["message"]
+        .as_str()
+        .expect("message should be a string");
+    assert!(msg.contains("invalid boundary configuration"), "msg: {msg}");
+    assert!(msg.contains("typo-zone"), "msg: {msg}");
+}
+
+#[test]
+fn fallow_list_boundaries_json_format_emits_structured_error_envelope() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let root = dir.path();
+    std::fs::write(root.join("package.json"), r#"{"name":"test"}"#).expect("write package.json");
+    std::fs::write(
+        root.join(".fallowrc.json"),
+        r#"{
+            "boundaries": {
+                "zones": [{ "name": "ui", "patterns": ["src/ui/**"] }],
+                "rules": [{ "from": "ui", "allow": ["typo-zone"] }]
+            }
+        }"#,
+    )
+    .expect("write config");
+
+    let output = run_fallow_raw(&[
+        "--root",
+        root.to_str().expect("utf-8 root"),
+        "--format",
+        "json",
+        "list",
+        "--boundaries",
+    ]);
+    assert_eq!(output.code, 2, "should exit 2, stderr: {}", output.stderr);
+    let parsed: serde_json::Value = serde_json::from_str(&output.stdout).unwrap_or_else(|e| {
+        panic!(
+            "stdout should be JSON envelope: {e}\nstdout: {}",
+            output.stdout
+        )
+    });
+    assert_eq!(parsed["error"], serde_json::Value::Bool(true));
+    assert_eq!(parsed["exit_code"], serde_json::Value::from(2));
+    let msg = parsed["message"]
+        .as_str()
+        .expect("message should be a string");
+    assert!(msg.contains("invalid boundary configuration"), "msg: {msg}");
+    assert!(msg.contains("typo-zone"), "msg: {msg}");
+}
+
+#[test]
+fn config_with_valid_boundaries_loads_cleanly() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let root = dir.path();
+    std::fs::write(root.join("package.json"), r#"{"name":"test"}"#).expect("write package.json");
+    std::fs::write(
+        root.join(".fallowrc.json"),
+        r#"{
+            "boundaries": {
+                "zones": [
+                    { "name": "ui", "patterns": ["src/ui/**"] },
+                    { "name": "db", "patterns": ["src/db/**"] }
+                ],
+                "rules": [
+                    { "from": "ui", "allow": ["db"] }
+                ]
+            }
+        }"#,
+    )
+    .expect("write config");
+
+    let output = run_fallow_in_root("check", root, &["--quiet"]);
+    assert_eq!(
+        output.code, 0,
+        "valid boundary config should load (exit 0 with no sources), stderr: {}",
+        output.stderr
+    );
+}
+
+#[test]
+fn regression_baseline_schema_mismatch_json_format_emits_structured_error_envelope() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let root = dir.path();
+    std::fs::write(root.join("package.json"), r#"{"name":"test"}"#).expect("write package.json");
+
+    let baseline_path = root.join("stale-baseline.json");
+    std::fs::write(
+        &baseline_path,
+        r#"{
+  "schema_version": 99,
+  "fallow_version": "9.9.9",
+  "timestamp": "2030-01-01T00:00:00Z",
+  "check": {"total_issues": 0, "unused_files": 0}
+}"#,
+    )
+    .expect("write baseline");
+
+    let output = run_fallow_in_root(
+        "check",
+        root,
+        &[
+            "--regression-baseline",
+            baseline_path.to_str().expect("utf-8 baseline path"),
+            "--fail-on-regression",
+            "--format",
+            "json",
+            "--quiet",
+        ],
+    );
+    assert_eq!(
+        output.code, 2,
+        "schema mismatch should exit 2, stderr: {}",
+        output.stderr
+    );
+
+    let parsed: serde_json::Value = serde_json::from_str(&output.stdout).unwrap_or_else(|e| {
+        panic!(
+            "stdout should be JSON envelope: {e}\nstdout: {}",
+            output.stdout
+        )
+    });
+    assert_eq!(parsed["error"], serde_json::Value::Bool(true));
+    assert_eq!(parsed["exit_code"], serde_json::Value::from(2));
+    let msg = parsed["message"]
+        .as_str()
+        .expect("message should be a string");
+    assert!(msg.contains("schema_version 99"), "msg: {msg}");
+    assert!(msg.contains("expects 2"), "msg: {msg}");
+    assert!(msg.contains("fallow 9.9.9"), "msg: {msg}");
+    assert!(
+        msg.contains("fallow dead-code --save-regression-baseline"),
+        "msg should include regenerate command, msg: {msg}"
     );
 }

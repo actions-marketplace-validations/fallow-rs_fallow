@@ -23,19 +23,15 @@ define_plugin! {
     resolve_config(config_path, source, _root) {
         let mut result = PluginResult::default();
 
-        // Extract import sources as referenced dependencies
         let imports = config_parser::extract_imports(source, config_path);
         for imp in &imports {
             let dep = crate::resolve::extract_package_name(imp);
             result.referenced_dependencies.push(dep);
         }
 
-        // content -> file globs that Tailwind scans for class usage
-        // e.g. content: ["./src/**/*.{js,ts,jsx,tsx}", "./index.html"]
         let content = config_parser::extract_config_string_array(source, config_path, &["content"]);
         result.always_used_files.extend(content);
 
-        // plugins as require() calls: plugins: [require("@tailwindcss/typography")]
         let require_deps =
             config_parser::extract_config_require_strings(source, config_path, "plugins");
         for dep in &require_deps {
@@ -44,7 +40,6 @@ define_plugin! {
                 .push(crate::resolve::extract_package_name(dep));
         }
 
-        // plugins as shallow strings (less common): plugins: ["@tailwindcss/typography"]
         let plugin_strings =
             config_parser::extract_config_shallow_strings(source, config_path, "plugins");
         for plugin in &plugin_strings {
@@ -53,7 +48,6 @@ define_plugin! {
                 .push(crate::resolve::extract_package_name(plugin));
         }
 
-        // presets -> referenced dependencies
         let presets = config_parser::extract_config_shallow_strings(source, config_path, "presets");
         for preset in &presets {
             result

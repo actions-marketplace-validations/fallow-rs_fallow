@@ -1,8 +1,6 @@
 use fallow_types::extract::ImportedName;
 
-use crate::tests::parse_ts as parse_source;
-
-// -- Whole-object use detection --
+use crate::tests::{parse_ts as parse_source, parse_tsx};
 
 #[test]
 fn detects_object_values_whole_use() {
@@ -52,8 +50,6 @@ fn computed_member_variable_marks_whole_use() {
     let info = parse_source("import { Status } from './types';\nconst k = 'foo';\nStatus[k];");
     assert!(info.whole_object_uses.contains(&"Status".to_string()));
 }
-
-// -- Namespace destructuring detection --
 
 #[test]
 fn namespace_destructuring_generates_member_accesses() {
@@ -131,11 +127,120 @@ fn namespace_destructuring_from_require() {
     );
 }
 
+/// Regression test for issue #2348: rendering `<SC.UsedStyle />` through a
+/// namespace import must record the same member access as `SC.UsedStyle`
+/// in plain expression position.
+#[test]
+fn jsx_namespace_member_tag_generates_member_access() {
+    let info = parse_tsx(
+        "import * as SC from './style';\nexport const RenderedStyle = () => <SC.UsedStyle />;",
+    );
+    assert_eq!(info.imports.len(), 1);
+    assert_eq!(info.imports[0].imported_name, ImportedName::Namespace);
+    let has_access = info
+        .member_accesses
+        .iter()
+        .any(|a| a.object == "SC" && a.member == "UsedStyle");
+    assert!(
+        has_access,
+        "<SC.UsedStyle /> should record SC.UsedStyle as a member access; got {:?}",
+        info.member_accesses
+    );
+}
+
+/// Issue #2348: a nested member tag `<A.B.C />` mirrors the plain-expression
+/// walk of `A.B.C`, recording both the innermost `A.B` access (namespace
+/// crediting) and the full-path `A.B.C` access.
+#[test]
+fn jsx_nested_namespace_member_tag_generates_member_accesses() {
+    let info = parse_tsx("import * as A from './widgets';\nexport const R = () => <A.B.C />;");
+    let has_inner = info
+        .member_accesses
+        .iter()
+        .any(|a| a.object == "A" && a.member == "B");
+    let has_outer = info
+        .member_accesses
+        .iter()
+        .any(|a| a.object == "A.B" && a.member == "C");
+    assert!(
+        has_inner,
+        "<A.B.C /> should record A.B for namespace crediting; got {:?}",
+        info.member_accesses
+    );
+    assert!(
+        has_outer,
+        "<A.B.C /> should record the full A.B.C path; got {:?}",
+        info.member_accesses
+    );
+}
+
+/// Issue #2348: a `this` receiver in JSX tag position (`<this.Foo />`) records
+/// the same `this.Foo` access as the plain-expression spelling, and the
+/// internal `this@<id>` class-scope qualifier (issue #1821) never leaks into
+/// the emitted spellings.
+#[test]
+fn jsx_this_member_tag_generates_member_access() {
+    let info = parse_tsx(
+        "class Panel {\n  Foo = () => null;\n  render() {\n    return <this.Foo />;\n  }\n}\nexport const panel = new Panel();",
+    );
+    let has_access = info
+        .member_accesses
+        .iter()
+        .any(|a| a.object == "this" && a.member == "Foo");
+    assert!(
+        has_access,
+        "<this.Foo /> should record this.Foo as a member access; got {:?}",
+        info.member_accesses
+    );
+    assert!(
+        info.member_accesses.iter().all(|a| !a.object.contains('@')),
+        "no emitted spelling may keep the internal this@<id> qualifier; got {:?}",
+        info.member_accesses
+    );
+}
+
+/// Issue #2348: a class-instance receiver in JSX tag position (`<w.Card />`)
+/// records the same member access as the plain-expression spelling, feeding
+/// the bound-member resolution that credits local class members.
+#[test]
+fn jsx_class_instance_member_tag_generates_member_access() {
+    let info = parse_tsx(
+        "class Widgets {\n  Card = () => null;\n}\nconst w = new Widgets();\nexport const R = () => <w.Card />;",
+    );
+    let has_access = info
+        .member_accesses
+        .iter()
+        .any(|a| a.object == "w" && a.member == "Card");
+    assert!(
+        has_access,
+        "<w.Card /> should record w.Card as a member access; got {:?}",
+        info.member_accesses
+    );
+}
+
+/// Issue #2348: the closing tag of a non-self-closing member-expression
+/// element must not double-record the access.
+#[test]
+fn jsx_namespace_member_tag_records_single_access_for_paired_tags() {
+    let info = parse_tsx(
+        "import * as SC from './style';\nexport const R = () => <SC.Layout>text</SC.Layout>;",
+    );
+    let count = info
+        .member_accesses
+        .iter()
+        .filter(|a| a.object == "SC" && a.member == "Layout")
+        .count();
+    assert_eq!(
+        count, 1,
+        "paired tags should record exactly one SC.Layout access; got {:?}",
+        info.member_accesses
+    );
+}
+
 #[test]
 fn non_namespace_destructuring_not_captured() {
     let info =
         parse_source("import { foo } from './utils';\nconst obj = { a: 1 };\nconst { a } = obj;");
-    // 'obj' is not a namespace import, so destructuring should not add member_accesses for it
     let has_obj_a = info
         .member_accesses
         .iter()
@@ -144,4 +249,364 @@ fn non_namespace_destructuring_not_captured() {
         !has_obj_a,
         "Should not capture destructuring of non-namespace variables"
     );
+}
+
+/// Regression test for issue #845: a method call on a value narrowed by
+/// `if (x instanceof ClassName)` must be credited as a use of
+/// `ClassName.method`, preventing a false `unused-class-member` finding.
+#[test]
+fn instanceof_narrowed_method_call_is_credited_as_class_member_use() {
+    let info = parse_source(
+        r"
+import { BaseException } from './exceptions';
+function handle(e) {
+    if (e instanceof BaseException) {
+        e.getMessage();
+    }
+}
+",
+    );
+    let has_access = info
+        .member_accesses
+        .iter()
+        .any(|a| a.object == "BaseException" && a.member == "getMessage");
+    assert!(
+        has_access,
+        "e.getMessage() inside `if (e instanceof BaseException)` must be \
+         credited as BaseException.getMessage; got member_accesses = {:?}",
+        info.member_accesses,
+    );
+}
+
+/// Regression test for issue #845: `&&`-chained instanceof guards must all
+/// contribute narrowings so each narrowed local's method calls are credited.
+#[test]
+fn instanceof_narrowing_through_logical_and_chain() {
+    let info = parse_source(
+        r"
+import { FooError } from './foo';
+import { BarError } from './bar';
+function handle(a, b) {
+    if (a instanceof FooError && b instanceof BarError) {
+        a.getFooMessage();
+        b.getBarMessage();
+    }
+}
+",
+    );
+    let has_foo = info
+        .member_accesses
+        .iter()
+        .any(|a| a.object == "FooError" && a.member == "getFooMessage");
+    let has_bar = info
+        .member_accesses
+        .iter()
+        .any(|a| a.object == "BarError" && a.member == "getBarMessage");
+    assert!(
+        has_foo,
+        "a.getFooMessage() inside `if (a instanceof FooError && ...)` must be \
+         credited as FooError.getFooMessage; got member_accesses = {:?}",
+        info.member_accesses,
+    );
+    assert!(
+        has_bar,
+        "b.getBarMessage() inside `if (... && b instanceof BarError)` must be \
+         credited as BarError.getBarMessage; got member_accesses = {:?}",
+        info.member_accesses,
+    );
+}
+
+#[test]
+fn template_literal_new_class_credits_to_string() {
+    let info =
+        parse_source("import { Money } from './money';\nconst label = `Total: ${new Money(5)}`;");
+    let has_access = info
+        .member_accesses
+        .iter()
+        .any(|a| a.object == "Money" && a.member == "toString");
+    assert!(
+        has_access,
+        "`${{new Money()}}` in a template literal must credit Money.toString; \
+         got member_accesses = {:?}",
+        info.member_accesses,
+    );
+}
+
+#[test]
+fn string_call_new_class_credits_to_string() {
+    let info = parse_source("import { Money } from './money';\nconst s = String(new Money(1));");
+    assert!(
+        info.member_accesses
+            .iter()
+            .any(|a| a.object == "Money" && a.member == "toString"),
+        "String(new Money()) must credit Money.toString; got {:?}",
+        info.member_accesses,
+    );
+}
+
+#[test]
+fn string_concat_new_class_credits_to_string() {
+    let info = parse_source("import { Money } from './money';\nconst s = '' + new Money(1);");
+    assert!(
+        info.member_accesses
+            .iter()
+            .any(|a| a.object == "Money" && a.member == "toString"),
+        "'' + new Money() must credit Money.toString; got {:?}",
+        info.member_accesses,
+    );
+}
+
+#[test]
+fn string_concat_prefix_new_class_credits_to_string() {
+    let info =
+        parse_source("import { Money } from './money';\nconst s = new Money(1) + ' suffix';");
+    assert!(
+        info.member_accesses
+            .iter()
+            .any(|a| a.object == "Money" && a.member == "toString"),
+        "new Money() + ' suffix' must credit Money.toString; got {:?}",
+        info.member_accesses,
+    );
+}
+
+#[test]
+fn numeric_plus_new_class_does_not_credit_to_string() {
+    // Sibling operand is a numeric literal, not a string: no coercion proof.
+    let info = parse_source("import { Num } from './num';\nconst n = new Num() + 5;");
+    assert!(
+        !info
+            .member_accesses
+            .iter()
+            .any(|a| a.object == "Num" && a.member == "toString"),
+        "new Num() + 5 must NOT credit Num.toString (numeric context); got {:?}",
+        info.member_accesses,
+    );
+}
+
+#[test]
+fn bare_new_class_not_in_coercion_does_not_credit_to_string() {
+    // A constructed instance NOT in a coercion position must not be credited.
+    let info = parse_source("import { Money } from './money';\nconst m = new Money(1);");
+    assert!(
+        !info
+            .member_accesses
+            .iter()
+            .any(|a| a.object == "Money" && a.member == "toString"),
+        "a bare `new Money()` must NOT credit Money.toString; got {:?}",
+        info.member_accesses,
+    );
+}
+
+#[test]
+fn tagged_template_new_class_does_not_credit_to_string() {
+    // A tagged template's tag function receives the raw values and does NOT
+    // coerce interpolations via toString (Lit `html`, styled-components, gql),
+    // so a direct `new Money()` interpolation must NOT credit Money.toString.
+    // Regression for #1638 (tagged-template over-credit).
+    let info = parse_source(
+        "import { Money } from './money';\nconst t = html`<span>${new Money(1)}</span>`;",
+    );
+    assert!(
+        !info
+            .member_accesses
+            .iter()
+            .any(|a| a.object == "Money" && a.member == "toString"),
+        "a tagged-template interpolation must NOT credit Money.toString; got {:?}",
+        info.member_accesses,
+    );
+}
+
+#[test]
+fn nested_plain_template_in_tagged_credits_to_string() {
+    // A plain template literal nested inside a tagged-template interpolation
+    // still coerces, so the inner `${new Money()}` credits Money.toString.
+    let info = parse_source(
+        "import { Money } from './money';\nconst t = html`<span>${`x ${new Money(1)}`}</span>`;",
+    );
+    assert!(
+        info.member_accesses
+            .iter()
+            .any(|a| a.object == "Money" && a.member == "toString"),
+        "a plain template nested in a tagged interpolation must credit Money.toString; got {:?}",
+        info.member_accesses,
+    );
+}
+
+// Issue #1793: array-typed formal parameter iteration binding. The TOP-LEVEL
+// function shape is load-bearing: recording the element type from the function
+// declaration scope (not `visit_formal_parameter`) is required because the
+// function-body scoped frame is not yet pushed at param-visit time, so a
+// top-level function's params would otherwise be silently dropped.
+
+#[test]
+fn top_level_fn_array_param_for_of_credits_element_class_member() {
+    let info = parse_source(
+        "class Item { used() {} }\n\
+         function run(items: Item[]) {\n\
+           for (const item of items) {\n\
+             item.used();\n\
+           }\n\
+         }",
+    );
+    assert!(
+        info.member_accesses
+            .iter()
+            .any(|a| a.object == "Item" && a.member == "used"),
+        "a for-of over an array-typed top-level fn param must credit Item.used; got {:?}",
+        info.member_accesses,
+    );
+}
+
+#[test]
+fn top_level_fn_array_param_map_callback_credits_element_class_member() {
+    let info = parse_source(
+        "class Item { used() {} }\n\
+         function run(items: Item[]) {\n\
+           items.forEach((item) => item.used());\n\
+         }",
+    );
+    assert!(
+        info.member_accesses
+            .iter()
+            .any(|a| a.object == "Item" && a.member == "used"),
+        "a .forEach callback over an array-typed top-level fn param must credit Item.used; got {:?}",
+        info.member_accesses,
+    );
+}
+
+#[test]
+fn top_level_fn_builtin_array_param_records_no_class_binding() {
+    // `number[]` has a builtin element, so the loop variable must NOT bind to
+    // any class; `Item.used` must not appear.
+    let info = parse_source(
+        "class Item { used() {} }\n\
+         function run(items: number[]) {\n\
+           for (const item of items) {\n\
+             item.used();\n\
+           }\n\
+         }",
+    );
+    assert!(
+        !info
+            .member_accesses
+            .iter()
+            .any(|a| a.object == "Item" && a.member == "used"),
+        "a number[] element must not bind the loop variable to a class; got {:?}",
+        info.member_accesses,
+    );
+}
+
+// Issue #1793: `Promise.all(arr.map(cb))` element inference.
+
+#[test]
+fn promise_all_map_credits_element_from_return_type_declared_after_consumer() {
+    // `makeThing` is declared AFTER `consume`, proving the pre-pass makes the
+    // inference declaration-order independent.
+    let info = parse_source(
+        "class Thing { greet() {} }\n\
+         async function consume() {\n\
+           const xs = await Promise.all(['a', 'b'].map(async (n) => makeThing(n)));\n\
+           xs.forEach((x) => x.greet());\n\
+         }\n\
+         async function makeThing(n: string): Promise<Thing> {\n\
+           return new Thing();\n\
+         }",
+    );
+    assert!(
+        info.member_accesses
+            .iter()
+            .any(|a| a.object == "Thing" && a.member == "greet"),
+        "Promise.all(arr.map(async n => makeThing(n))) must type xs as Thing[] via makeThing's Promise<Thing> return; got {:?}",
+        info.member_accesses,
+    );
+}
+
+#[test]
+fn promise_all_settled_map_records_no_element_binding() {
+    let info = parse_source(
+        "class Thing { greet() {} }\n\
+         async function consume() {\n\
+           const xs = await Promise.allSettled(['a'].map(async (n) => makeThing(n)));\n\
+           xs.forEach((x) => x.greet());\n\
+         }\n\
+         async function makeThing(n: string): Promise<Thing> {\n\
+           return new Thing();\n\
+         }",
+    );
+    assert!(
+        !info
+            .member_accesses
+            .iter()
+            .any(|a| a.object == "Thing" && a.member == "greet"),
+        "Promise.allSettled must not type xs (only `all` yields the resolved element array); got {:?}",
+        info.member_accesses,
+    );
+}
+
+#[test]
+fn promise_all_map_imported_callee_records_no_element_binding() {
+    // An imported callee has no local return type in the pre-pass map.
+    let info = parse_source(
+        "import { makeThing } from './factory';\n\
+         class Thing { greet() {} }\n\
+         async function consume() {\n\
+           const xs = await Promise.all(['a'].map(async (n) => makeThing(n)));\n\
+           xs.forEach((x) => x.greet());\n\
+         }",
+    );
+    assert!(
+        !info
+            .member_accesses
+            .iter()
+            .any(|a| a.object == "Thing" && a.member == "greet"),
+        "an imported map-callback callee must not credit an element class; got {:?}",
+        info.member_accesses,
+    );
+}
+
+#[test]
+fn promise_all_map_multi_statement_callback_records_no_element_binding() {
+    let info = parse_source(
+        "class Thing { greet() {} }\n\
+         async function consume() {\n\
+           const xs = await Promise.all(['a'].map(async (n) => {\n\
+             if (n) {\n\
+               return makeThing(n);\n\
+             }\n\
+             return makeThing(n);\n\
+           }));\n\
+           xs.forEach((x) => x.greet());\n\
+         }\n\
+         async function makeThing(n: string): Promise<Thing> {\n\
+           return new Thing();\n\
+         }",
+    );
+    assert!(
+        !info
+            .member_accesses
+            .iter()
+            .any(|a| a.object == "Thing" && a.member == "greet"),
+        "a multi-statement conditional-return callback must not credit an element class; got {:?}",
+        info.member_accesses,
+    );
+}
+
+#[test]
+fn cyclic_object_binding_candidates_terminate() {
+    // A cycle of object literals referencing each other (with a class
+    // instance seeding real binding targets) used to make the
+    // object-binding fixpoint deepen and multiply every copied path per
+    // iteration: exponential time and memory on minified bundles. The
+    // resolver's per-module caps bound it; this test regresses on hang.
+    use std::fmt::Write as _;
+    let mut source = String::from("class C { m() {} }\nconst c = new C();\n");
+    let nodes = 40;
+    for i in 0..nodes {
+        let prev = (i + nodes - 1) % nodes;
+        let _ = writeln!(source, "const n{i} = {{ a: n{prev}, b: n{prev}, s: c }};");
+    }
+    source.push_str("n1.s.m();\n");
+    let info = parse_source(&source);
+    // The direct one-hop path still resolves through the cycle guard.
+    assert!(info.member_accesses.iter().any(|m| m.member == "m"));
 }

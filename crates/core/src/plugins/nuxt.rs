@@ -7,20 +7,51 @@
 //!
 //! Also detects Nuxt **module** authoring projects (using `@nuxt/kit`) and marks
 //! `src/runtime/` components, composables, plugins, and utils as entry points.
+//!
+//! When `@nuxt/content` is registered in the nuxt.config `modules:` array, the
+//! adjacent `content.config.{ts,js,mts,mjs,cts,cjs}` (which `@nuxt/content` reads
+//! at build time and nothing imports) is credited as a default-export entry.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+use fallow_config::{AutoImportKind, AutoImportRule};
+use fallow_types::discover::FileId;
+use fallow_types::extract::ExportName;
 
 use super::config_parser;
 use super::{Plugin, PluginResult};
 
 const ENABLERS: &[&str] = &["nuxt"];
 
+/// Directories Nuxt auto-imports components from, relative to the project root.
+/// Nuxt 4 uses `app/components`; Nuxt 3 uses top-level `components`. Both are
+/// scanned when present. Custom `components: [...]` dirs in `nuxt.config` are out
+/// of scope (the entry-pattern fallback keeps those files alive). See issue #704.
+const COMPONENT_DIRS: &[&str] = &["components", "app/components"];
+
+/// Directories Nuxt auto-imports composables and utilities from by default.
+///
+/// Composables and utils are top-level scans; shared utils/types are recursive.
+const SCRIPT_AUTO_IMPORT_DIRS: &[&str] = &["composables", "app/composables", "utils", "app/utils"];
+const SCRIPT_AUTO_IMPORT_RECURSIVE_DIRS: &[&str] = &["shared/utils", "shared/types"];
+
+/// File extensions Nuxt treats as components, matching the component entry glob.
+const COMPONENT_EXTS: &[&str] = &["vue", "ts", "tsx", "js", "jsx"];
+
+/// Filename suffixes Nuxt strips before deriving the component name
+/// (`Comments.client.vue` and `Comments.server.vue` both become `<Comments>`;
+/// `Foo.global.vue` becomes `<Foo>`).
+const COMPONENT_NAME_SUFFIXES: &[&str] = &["client", "server", "global"];
+
 /// Secondary enabler for Nuxt module authoring projects.
 /// `@nuxt/kit` is the standard API for building Nuxt modules.
 const MODULE_AUTHORING_ENABLER: &str = "@nuxt/kit";
 
+/// First-party module whose root `content.config.*` file is read at build time.
+/// When registered in `modules:`, its config file is credited as an entry point.
+const CONTENT_MODULE: &str = "@nuxt/content";
+
 const ENTRY_PATTERNS: &[&str] = &[
-    // Standard Nuxt directories
     "pages/**/*.{vue,ts,tsx,js,jsx}",
     "layouts/**/*.{vue,ts,tsx,js,jsx}",
     "middleware/**/*.{ts,js}",
@@ -29,19 +60,14 @@ const ENTRY_PATTERNS: &[&str] = &[
     "server/middleware/**/*.{ts,js}",
     "server/plugins/**/*.{ts,js}",
     "server/utils/**/*.{ts,js}",
-    // Nuxt only auto-registers top-level plugins plus nested index files.
     "plugins/*.{ts,tsx,js,jsx,mts,cts,mjs,cjs}",
     "plugins/**/index.{ts,tsx,js,jsx,mts,cts,mjs,cjs}",
-    // Nuxt only scans the top level of composables/utils by default.
     "composables/*.{ts,tsx,js,jsx,mts,cts,mjs,cjs}",
     "utils/*.{ts,tsx,js,jsx,mts,cts,mjs,cjs}",
-    // Nuxt auto-imports top-level shared utils/types from the root shared/ dir.
-    "shared/utils/*.{ts,tsx,js,jsx,mts,cts,mjs,cjs}",
-    "shared/types/*.{ts,tsx,js,jsx,mts,cts,mjs,cjs}",
+    "shared/utils/**/*.{ts,tsx,js,jsx,mts,cts,mjs,cjs}",
+    "shared/types/**/*.{ts,tsx,js,jsx,mts,cts,mjs,cjs}",
     "components/**/*.{vue,ts,tsx,js,jsx}",
-    // Nuxt auto-scans modules/ for custom modules
     "modules/**/*.{ts,js}",
-    // Nuxt 3 app/ directory structure
     "app/pages/**/*.{vue,ts,tsx,js,jsx}",
     "app/layouts/**/*.{vue,ts,tsx,js,jsx}",
     "app/middleware/**/*.{ts,js}",
@@ -64,22 +90,16 @@ const SRC_DIR_ENTRY_PATTERNS: &[&str] = &[
     "components/**/*.{vue,ts,tsx,js,jsx}",
 ];
 
-const CONFIG_PATTERNS: &[&str] = &[
-    "nuxt.config.{ts,js}",
-    // Nuxt module entry point: triggers runtime directory discovery
-    "src/module.{ts,js}",
-];
+const CONFIG_PATTERNS: &[&str] = &["nuxt.config.{ts,js}", "src/module.{ts,js}"];
 
 const ALWAYS_USED: &[&str] = &[
     "nuxt.config.{ts,js}",
     "app.vue",
     "app.config.{ts,js}",
     "error.vue",
-    // Nuxt 3 app/ directory structure
     "app/app.vue",
     "app/app.config.{ts,js}",
     "app/error.vue",
-    // Nuxt module entry point
     "src/module.{ts,js}",
 ];
 
@@ -87,15 +107,16 @@ const SRC_DIR_ALWAYS_USED: &[&str] = &["app.vue", "app.config.{ts,js}", "error.v
 const COMPONENT_ENTRY_GLOB: &str = "vue,ts,tsx,js,jsx";
 const SCRIPT_ENTRY_GLOB: &str = "ts,js,mts,cts,mjs,cjs";
 const SCRIPT_ENTRY_EXTENSIONS: &[&str] = &["ts", "js", "mts", "cts", "mjs", "cjs"];
+const AUTO_IMPORT_SCRIPT_EXTENSIONS: &[&str] =
+    &["ts", "tsx", "js", "jsx", "mts", "cts", "mjs", "cjs"];
 
-/// Implicit dependencies that Nuxt provides — these should not be flagged as unlisted.
+/// Implicit dependencies that Nuxt provides. These should not be flagged as unlisted.
 const TOOLING_DEPENDENCIES: &[&str] = &[
     "nuxt",
     "@nuxt/devtools",
     "@nuxt/test-utils",
     "@nuxt/schema",
     "@nuxt/kit",
-    // Implicit Nuxt runtime dependencies (re-exported by Nuxt at build time)
     "vue",
     "vue-router",
     "ofetch",
@@ -201,32 +222,45 @@ impl Plugin for NuxtPlugin {
     }
 
     fn path_aliases(&self, root: &Path) -> Vec<(&'static str, String)> {
-        // Nuxt's srcDir defaults to `app/` when the directory exists, otherwise root.
         let src_dir = if root.join("app").is_dir() {
             "app".to_string()
         } else {
             String::new()
         };
         let mut aliases = vec![
-            // ~/  → srcDir (app/ or root)
             ("~/", src_dir.clone()),
-            // @/  → srcDir (Nuxt alias synonym for ~/)
             ("@/", src_dir),
-            // ~~/ → rootDir (project root)
             ("~~/", String::new()),
-            // @@/ → rootDir (Nuxt alias synonym for ~~/)
             ("@@/", String::new()),
-            // #shared/ → shared/ directory
             ("#shared/", "shared".to_string()),
-            // #server/ → server/ directory
             ("#server/", "server".to_string()),
         ];
-        // Also map the bare `~` and `~~` (without trailing slash) for edge cases
-        // like `import '~/composables/foo'` — already covered by `~/` prefix.
-        // Map #shared (without slash) for bare imports like `import '#shared'`
         aliases.push(("#shared", "shared".to_string()));
         aliases.push(("#server", "server".to_string()));
         aliases
+    }
+
+    fn auto_imports(&self, root: &Path) -> Vec<AutoImportRule> {
+        let mut rules = Vec::new();
+        for dir in COMPONENT_DIRS {
+            let base = root.join(dir);
+            if base.is_dir() {
+                collect_component_auto_imports(&base, &base, &mut rules);
+            }
+        }
+        for dir in SCRIPT_AUTO_IMPORT_DIRS {
+            let base = root.join(dir);
+            if base.is_dir() {
+                collect_script_auto_imports(&base, false, &mut rules);
+            }
+        }
+        for dir in SCRIPT_AUTO_IMPORT_RECURSIVE_DIRS {
+            let base = root.join(dir);
+            if base.is_dir() {
+                collect_script_auto_imports(&base, true, &mut rules);
+            }
+        }
+        rules
     }
 
     fn used_exports(&self) -> Vec<(&'static str, &'static [&'static str])> {
@@ -246,151 +280,218 @@ impl Plugin for NuxtPlugin {
     fn resolve_config(&self, config_path: &Path, source: &str, root: &Path) -> PluginResult {
         let mut result = PluginResult::default();
 
-        // Nuxt module authoring: src/module.{ts,js} → add src/runtime/ patterns.
-        // Nuxt modules place their runtime code (components, composables, plugins,
-        // utils) in src/runtime/ and register them programmatically via @nuxt/kit
-        // APIs (addComponentsDir, addImportsDir, addPlugin).
         if config_path.file_stem().is_some_and(|stem| stem == "module") {
-            add_module_runtime_patterns(&mut result, root);
-
-            // Extract import sources as referenced dependencies
-            let imports = config_parser::extract_imports(source, config_path);
-            for imp in &imports {
-                let dep = crate::resolve::extract_package_name(imp);
-                result.referenced_dependencies.push(dep);
-            }
-
+            resolve_nuxt_module_file(&mut result, source, config_path, root);
             return result;
         }
 
-        // Nuxt aliases resolve against srcDir, which defaults to `app/` when it exists
-        // and can be overridden explicitly via config.
-        let default_src_dir = default_nuxt_src_dir(root);
-        let configured_src_dir = extract_nuxt_src_dir(source, config_path, root);
-        let src_dir = configured_src_dir
-            .clone()
-            .unwrap_or_else(|| default_src_dir.clone());
-
-        if let Some(configured_src_dir) = configured_src_dir.as_deref()
-            && configured_src_dir != default_src_dir.as_str()
-        {
-            add_src_dir_support(&mut result, configured_src_dir);
-        }
-
-        // Extract import sources as referenced dependencies
-        let imports = config_parser::extract_imports(source, config_path);
-        for imp in &imports {
-            let dep = crate::resolve::extract_package_name(imp);
-            result.referenced_dependencies.push(dep);
-        }
-
-        // modules: [...] → referenced dependencies (Nuxt modules are npm packages)
-        let modules = config_parser::extract_config_string_array(source, config_path, &["modules"]);
-        for module in &modules {
-            let dep = crate::resolve::extract_package_name(module);
-            result.referenced_dependencies.push(dep);
-        }
-
-        // css: [...] → always-used files or referenced dependencies
-        // Local paths (`~/`, `~~/`, `@/`, `@@/`, `./`, `/`) route through
-        // `normalize_nuxt_path` for the same workspace-root-relative resolution
-        // used by plugins/components/alias. Bare specifiers are npm package CSS.
-        let css = config_parser::extract_config_string_array(source, config_path, &["css"]);
-        for entry in &css {
-            if is_local_css_path(entry) {
-                if let Some(normalized) = normalize_nuxt_path(entry, config_path, root, &src_dir) {
-                    result.always_used_files.push(normalized);
-                }
-            } else {
-                // npm package CSS (e.g., `@unocss/reset/tailwind.css`, `floating-vue/dist/style.css`)
-                let dep = crate::resolve::extract_package_name(entry);
-                result.referenced_dependencies.push(dep);
-            }
-        }
-
-        // postcss.plugins → referenced dependencies (object keys)
-        let postcss_plugins =
-            config_parser::extract_config_object_keys(source, config_path, &["postcss", "plugins"]);
-        for plugin in &postcss_plugins {
-            result
-                .referenced_dependencies
-                .push(crate::resolve::extract_package_name(plugin));
-        }
-
-        // plugins: [...] → entry patterns with default-export coverage
-        let mut plugins =
-            config_parser::extract_config_string_array(source, config_path, &["plugins"]);
-        plugins.extend(config_parser::extract_config_array_object_strings(
-            source,
-            config_path,
-            &["plugins"],
-            "src",
-        ));
-        for plugin in plugins {
-            if let Some(normalized) = normalize_nuxt_path(&plugin, config_path, root, &src_dir) {
-                let pattern = script_entry_pattern(&normalized);
-                add_default_used_export(&mut result, &pattern);
-                result.push_entry_pattern(pattern);
-            }
-        }
-
-        // alias: { "@shared": "./shared" } → resolver path aliases
-        for (find, replacement) in
-            config_parser::extract_config_aliases(source, config_path, &["alias"])
-        {
-            if let Some(normalized) = normalize_nuxt_path(&replacement, config_path, root, &src_dir)
-            {
-                result.path_aliases.push((find, normalized));
-            }
-        }
-
-        // imports.dirs: ["~/custom/composables"] → auto-import roots
-        for dir in
-            config_parser::extract_config_string_array(source, config_path, &["imports", "dirs"])
-        {
-            if let Some(pattern) = normalize_imports_dir_pattern(&dir, config_path, root, &src_dir)
-            {
-                result.push_entry_pattern(pattern);
-            }
-        }
-
-        // components config supports string arrays, object arrays, and object.dirs arrays.
-        let mut component_dirs =
-            config_parser::extract_config_string_array(source, config_path, &["components"]);
-        component_dirs.extend(config_parser::extract_config_array_object_strings(
-            source,
-            config_path,
-            &["components"],
-            "path",
-        ));
-        component_dirs.extend(config_parser::extract_config_array_object_strings(
-            source,
-            config_path,
-            &["components", "dirs"],
-            "path",
-        ));
-        component_dirs.extend(config_parser::extract_config_string_array(
-            source,
-            config_path,
-            &["components", "dirs"],
-        ));
-        for dir in component_dirs {
-            if let Some(normalized) = normalize_nuxt_path(&dir, config_path, root, &src_dir) {
-                let pattern = component_dir_pattern(&normalized);
-                add_default_used_export(&mut result, &pattern);
-                result.push_entry_pattern(pattern);
-            }
-        }
-
-        // extends: [...] → referenced dependencies
-        let extends = config_parser::extract_config_string_array(source, config_path, &["extends"]);
-        for ext in &extends {
-            result
-                .referenced_dependencies
-                .push(crate::resolve::extract_package_name(ext));
-        }
-
+        resolve_nuxt_main_config(&mut result, source, config_path, root);
         result
+    }
+}
+
+/// Handle a Nuxt `module.{ts,js}` config file: seed runtime patterns and credit
+/// the packages it imports.
+fn resolve_nuxt_module_file(
+    result: &mut PluginResult,
+    source: &str,
+    config_path: &Path,
+    root: &Path,
+) {
+    add_module_runtime_patterns(result, root);
+
+    let imports = config_parser::extract_imports(source, config_path);
+    for imp in &imports {
+        let dep = crate::resolve::extract_package_name(imp);
+        result.referenced_dependencies.push(dep);
+    }
+}
+
+/// Handle a Nuxt `nuxt.config.*` file: resolve the src dir, then credit modules,
+/// css, plugins, aliases, import dirs, component dirs, and extends.
+fn resolve_nuxt_main_config(
+    result: &mut PluginResult,
+    source: &str,
+    config_path: &Path,
+    root: &Path,
+) {
+    let default_src_dir = default_nuxt_src_dir(root);
+    let configured_src_dir = extract_nuxt_src_dir(source, config_path, root);
+    let src_dir = configured_src_dir
+        .clone()
+        .unwrap_or_else(|| default_src_dir.clone());
+
+    if let Some(configured_src_dir) = configured_src_dir.as_deref()
+        && configured_src_dir != default_src_dir.as_path()
+    {
+        add_src_dir_support(result, configured_src_dir);
+    }
+
+    let imports = config_parser::extract_imports(source, config_path);
+    add_referenced_packages(result, &imports);
+
+    let modules = config_parser::extract_config_string_array(source, config_path, &["modules"]);
+    let content_module_registered = add_nuxt_module_dependencies(result, &modules);
+
+    if content_module_registered
+        && let Some(pattern) = content_config_entry_pattern(config_path, root)
+    {
+        add_default_used_export(result, &pattern);
+        result.push_entry_pattern(pattern);
+    }
+
+    let css = config_parser::extract_config_string_array(source, config_path, &["css"]);
+    add_nuxt_css_entries(result, &css, config_path, root, &src_dir);
+
+    let postcss_plugins =
+        config_parser::extract_config_object_keys(source, config_path, &["postcss", "plugins"]);
+    add_referenced_packages(result, &postcss_plugins);
+
+    let mut plugins = config_parser::extract_config_string_array(source, config_path, &["plugins"]);
+    plugins.extend(config_parser::extract_config_array_object_strings(
+        source,
+        config_path,
+        &["plugins"],
+        "src",
+    ));
+    add_nuxt_plugin_entries(result, plugins, config_path, root, &src_dir);
+
+    add_nuxt_aliases(result, source, config_path, root, &src_dir);
+    add_nuxt_import_dirs(result, source, config_path, root, &src_dir);
+
+    let component_dirs = collect_nuxt_component_dirs(source, config_path);
+    add_nuxt_component_dirs(result, component_dirs, config_path, root, &src_dir);
+
+    let extends = config_parser::extract_config_string_array(source, config_path, &["extends"]);
+    add_referenced_packages(result, &extends);
+}
+
+/// Collect Nuxt component directory entries from `components`, its object `path`
+/// form, and the nested `components.dirs` array/object forms.
+fn collect_nuxt_component_dirs(source: &str, config_path: &Path) -> Vec<String> {
+    let mut component_dirs =
+        config_parser::extract_config_string_array(source, config_path, &["components"]);
+    component_dirs.extend(config_parser::extract_config_array_object_strings(
+        source,
+        config_path,
+        &["components"],
+        "path",
+    ));
+    component_dirs.extend(config_parser::extract_config_array_object_strings(
+        source,
+        config_path,
+        &["components", "dirs"],
+        "path",
+    ));
+    component_dirs.extend(config_parser::extract_config_string_array(
+        source,
+        config_path,
+        &["components", "dirs"],
+    ));
+    component_dirs
+}
+
+fn add_referenced_packages(result: &mut PluginResult, entries: &[String]) {
+    for entry in entries {
+        result
+            .referenced_dependencies
+            .push(crate::resolve::extract_package_name(entry));
+    }
+}
+
+fn add_nuxt_module_dependencies(result: &mut PluginResult, modules: &[String]) -> bool {
+    let mut content_module_registered = false;
+    for module in modules {
+        let dep = crate::resolve::extract_package_name(module);
+        if dep == CONTENT_MODULE {
+            content_module_registered = true;
+        }
+        result.referenced_dependencies.push(dep);
+    }
+    content_module_registered
+}
+
+fn add_nuxt_css_entries(
+    result: &mut PluginResult,
+    css: &[String],
+    config_path: &Path,
+    root: &Path,
+    src_dir: &Path,
+) {
+    for entry in css {
+        if is_local_css_path(entry) {
+            if let Some(normalized) = normalize_nuxt_path(entry, config_path, root, src_dir) {
+                result.always_used_files.push(normalized);
+            }
+        } else {
+            result
+                .referenced_dependencies
+                .push(crate::resolve::extract_package_name(entry));
+        }
+    }
+}
+
+fn add_nuxt_plugin_entries(
+    result: &mut PluginResult,
+    plugins: Vec<String>,
+    config_path: &Path,
+    root: &Path,
+    src_dir: &Path,
+) {
+    for plugin in plugins {
+        if let Some(normalized) = normalize_nuxt_path(&plugin, config_path, root, src_dir) {
+            let pattern = script_entry_pattern(&normalized);
+            add_default_used_export(result, &pattern);
+            result.push_entry_pattern(pattern);
+        }
+    }
+}
+
+fn add_nuxt_aliases(
+    result: &mut PluginResult,
+    source: &str,
+    config_path: &Path,
+    root: &Path,
+    src_dir: &Path,
+) {
+    for (find, replacement) in
+        config_parser::extract_config_path_aliases(source, config_path, &["alias"])
+    {
+        let replacement = config_parser::path_to_config_string(&replacement);
+        if let Some(normalized) = normalize_nuxt_path(&replacement, config_path, root, src_dir) {
+            result.path_aliases.push((find, normalized));
+        }
+    }
+}
+
+fn add_nuxt_import_dirs(
+    result: &mut PluginResult,
+    source: &str,
+    config_path: &Path,
+    root: &Path,
+    src_dir: &Path,
+) {
+    for dir in config_parser::extract_config_string_array(source, config_path, &["imports", "dirs"])
+    {
+        if let Some(pattern) = normalize_imports_dir_pattern(&dir, config_path, root, src_dir) {
+            result.push_entry_pattern(pattern);
+        }
+    }
+}
+
+fn add_nuxt_component_dirs(
+    result: &mut PluginResult,
+    component_dirs: Vec<String>,
+    config_path: &Path,
+    root: &Path,
+    src_dir: &Path,
+) {
+    for dir in component_dirs {
+        if let Some(normalized) = normalize_nuxt_path(&dir, config_path, root, src_dir) {
+            let pattern = component_dir_pattern(&normalized);
+            add_default_used_export(result, &pattern);
+            result.push_entry_pattern(pattern);
+        }
     }
 }
 
@@ -410,40 +511,32 @@ fn add_module_runtime_patterns(result: &mut PluginResult, root: &Path) {
         return;
     };
 
-    // Components (Vue SFCs and TS/JS)
     let components = format!("{runtime_dir}/components/**/*.{{{COMPONENT_ENTRY_GLOB}}}");
     add_default_used_export(result, &components);
     result.push_entry_pattern(components);
 
-    // Composables (top-level only, matching Nuxt convention)
     let composables = format!("{runtime_dir}/composables/*.{{{SCRIPT_ENTRY_GLOB}}}");
     result.push_entry_pattern(composables);
 
-    // Utils (top-level only)
     let utils = format!("{runtime_dir}/utils/*.{{{SCRIPT_ENTRY_GLOB}}}");
     result.push_entry_pattern(utils);
 
-    // Plugins
     let plugins = format!("{runtime_dir}/plugins/*.{{{SCRIPT_ENTRY_GLOB}}}");
     add_default_used_export(result, &plugins);
     result.push_entry_pattern(plugins);
 
-    // Locale files (common in i18n-aware modules like Nuxt UI)
     let locale_dir = root.join(runtime_dir).join("locale");
     if locale_dir.is_dir() {
         let locale = format!("{runtime_dir}/locale/*.{{{SCRIPT_ENTRY_GLOB}}}");
         result.push_entry_pattern(locale);
     }
 
-    // Types directory (re-exported types)
     let types_dir = root.join(runtime_dir).join("types");
     if types_dir.is_dir() {
         let types = format!("{runtime_dir}/types/*.{{{SCRIPT_ENTRY_GLOB}}}");
         result.push_entry_pattern(types);
     }
 
-    // Vue-specific runtime directory: mirrors the main runtime structure with
-    // its own components, composables, plugins, and stubs subdirectories.
     let vue_dir = root.join(runtime_dir).join("vue");
     if vue_dir.is_dir() {
         let vue_components = format!("{runtime_dir}/vue/**/*.{{{COMPONENT_ENTRY_GLOB}}}");
@@ -452,11 +545,11 @@ fn add_module_runtime_patterns(result: &mut PluginResult, root: &Path) {
     }
 }
 
-fn default_nuxt_src_dir(root: &Path) -> String {
+fn default_nuxt_src_dir(root: &Path) -> PathBuf {
     if root.join("app").is_dir() {
-        "app".to_string()
+        PathBuf::from("app")
     } else {
-        String::new()
+        PathBuf::new()
     }
 }
 
@@ -469,28 +562,32 @@ fn is_local_css_path(entry: &str) -> bool {
         || entry.starts_with('/')
 }
 
-fn extract_nuxt_src_dir(source: &str, config_path: &Path, root: &Path) -> Option<String> {
-    let raw = config_parser::extract_config_string(source, config_path, &["srcDir"])?;
+fn extract_nuxt_src_dir(source: &str, config_path: &Path, root: &Path) -> Option<PathBuf> {
+    let raw = config_parser::extract_config_path(source, config_path, &["srcDir"])?;
     normalize_nuxt_src_dir(&raw, config_path, root)
 }
 
-fn normalize_nuxt_src_dir(raw: &str, config_path: &Path, root: &Path) -> Option<String> {
-    let trimmed = raw.trim().trim_end_matches('/');
+fn normalize_nuxt_src_dir(raw: &Path, config_path: &Path, root: &Path) -> Option<PathBuf> {
+    let raw_string = config_parser::path_to_config_string(raw);
+    let trimmed = raw_string.trim().trim_end_matches('/');
     if trimmed.is_empty() || trimmed == "." {
-        return Some(String::new());
+        return Some(PathBuf::new());
     }
-    config_parser::normalize_config_path(trimmed, config_path, root)
+    config_parser::normalize_config_path_buf(
+        config_parser::path_from_config_string(trimmed),
+        config_path,
+        root,
+    )
 }
 
-fn add_src_dir_support(result: &mut PluginResult, src_dir: &str) {
+fn add_src_dir_support(result: &mut PluginResult, src_dir: &Path) {
+    let src_dir_string = config_parser::path_to_config_string(src_dir);
     result
         .path_aliases
-        .push(("~/".to_string(), src_dir.to_string()));
-    result
-        .path_aliases
-        .push(("@/".to_string(), src_dir.to_string()));
+        .push(("~/".to_string(), src_dir_string.clone()));
+    result.path_aliases.push(("@/".to_string(), src_dir_string));
 
-    if src_dir.is_empty() {
+    if src_dir.as_os_str().is_empty() {
         return;
     }
 
@@ -512,13 +609,13 @@ fn add_default_used_export(result: &mut PluginResult, pattern: impl Into<String>
     result.push_used_export_rule(pattern, ["default"]);
 }
 
-fn add_prefixed_default_used_exports(result: &mut PluginResult, prefix: &str, patterns: &[&str]) {
+fn add_prefixed_default_used_exports(result: &mut PluginResult, prefix: &Path, patterns: &[&str]) {
     for pattern in patterns {
         add_default_used_export(result, prefix_with_src_dir(prefix, pattern));
     }
 }
 
-fn extend_prefixed_patterns(target: &mut Vec<String>, prefix: &str, patterns: &[&str]) {
+fn extend_prefixed_patterns(target: &mut Vec<String>, prefix: &Path, patterns: &[&str]) {
     target.extend(
         patterns
             .iter()
@@ -528,6 +625,15 @@ fn extend_prefixed_patterns(target: &mut Vec<String>, prefix: &str, patterns: &[
 
 fn component_dir_pattern(dir: &str) -> String {
     format!("{dir}/**/*.{{{COMPONENT_ENTRY_GLOB}}}")
+}
+
+/// Build the `content.config.{ts,js,mts,cts,mjs,cjs}` entry pattern for the
+/// directory holding the nuxt.config (`config_path`'s parent), workspace-root
+/// relative. Returns `None` when the path falls outside `root` (e.g. a relative
+/// `config_path` in a unit test); production passes an absolute config path.
+fn content_config_entry_pattern(config_path: &Path, root: &Path) -> Option<String> {
+    let base = config_parser::normalize_config_path("content.config", config_path, root)?;
+    Some(format!("{base}.{{{SCRIPT_ENTRY_GLOB}}}"))
 }
 
 fn script_entry_pattern(path: &str) -> String {
@@ -549,14 +655,16 @@ fn normalize_nuxt_path(
     raw: &str,
     config_path: &Path,
     root: &Path,
-    src_dir: &str,
+    src_dir: &Path,
 ) -> Option<String> {
     if let Some(stripped) = raw.strip_prefix("~/").or_else(|| raw.strip_prefix("@/")) {
         return Some(prefix_with_src_dir(src_dir, stripped));
     }
 
     if let Some(stripped) = raw.strip_prefix("~~/").or_else(|| raw.strip_prefix("@@/")) {
-        return Some(stripped.to_string());
+        return Some(config_parser::path_to_config_string(
+            &config_parser::path_from_config_string(stripped),
+        ));
     }
 
     config_parser::normalize_config_path(raw, config_path, root)
@@ -566,7 +674,7 @@ fn normalize_imports_dir_pattern(
     raw: &str,
     config_path: &Path,
     root: &Path,
-    src_dir: &str,
+    src_dir: &Path,
 ) -> Option<String> {
     let normalized = normalize_nuxt_path(raw, config_path, root, src_dir)?;
     Some(imports_dir_pattern(&normalized))
@@ -600,13 +708,375 @@ fn path_looks_like_file_pattern(pattern: &str) -> bool {
         .is_some_and(|segment| segment.contains('.'))
 }
 
-fn prefix_with_src_dir(src_dir: &str, path: &str) -> String {
-    if src_dir.is_empty() {
-        path.to_string()
+fn prefix_with_src_dir(src_dir: &Path, path: &str) -> String {
+    let path = config_parser::path_from_config_string(path);
+    if src_dir.as_os_str().is_empty() {
+        config_parser::path_to_config_string(&path)
     } else {
-        format!("{src_dir}/{path}")
+        let normalized = config_parser::lexical_normalize(&src_dir.join(path));
+        config_parser::path_to_config_string(&normalized)
     }
 }
+
+/// Recursively walk a components directory, emitting an [`AutoImportRule`] (plus
+/// its implicit `Lazy`-prefixed variant) for every component file found.
+///
+/// `base` is the components root (used to compute the relative path that drives
+/// the name); `dir` is the directory currently being scanned.
+fn collect_component_auto_imports(base: &Path, dir: &Path, rules: &mut Vec<AutoImportRule>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
+            collect_component_auto_imports(base, &path, rules);
+            continue;
+        }
+        if !has_component_extension(&path) {
+            continue;
+        }
+        let Ok(rel) = path.strip_prefix(base) else {
+            continue;
+        };
+        let Some(name) = derive_component_name(rel) else {
+            continue;
+        };
+        push_component_rule(rules, name, path);
+    }
+}
+
+/// Push the canonical rule and its `Lazy`-prefixed dynamic-import variant.
+fn push_component_rule(rules: &mut Vec<AutoImportRule>, name: String, source: PathBuf) {
+    let lazy = format!("Lazy{name}");
+    rules.push(AutoImportRule {
+        name,
+        source: source.clone(),
+        kind: AutoImportKind::DefaultComponent,
+    });
+    rules.push(AutoImportRule {
+        name: lazy,
+        source,
+        kind: AutoImportKind::DefaultComponent,
+    });
+}
+
+/// Scan one Nuxt composable/util directory and emit rules for the exports Nuxt
+/// can inject into scripts. Shared dirs recurse; composable/util dirs do not.
+fn collect_script_auto_imports(dir: &Path, recursive: bool, rules: &mut Vec<AutoImportRule>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
+            if recursive {
+                collect_script_auto_imports(&path, true, rules);
+            }
+            continue;
+        }
+        if !has_auto_import_script_extension(&path) {
+            continue;
+        }
+        let Ok(source) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let module = fallow_extract::parse_source_to_module(FileId(0), &path, &source, 0, false);
+        let default_name = derive_script_default_name(&path);
+        for export in module.exports.iter() {
+            match &export.name {
+                ExportName::Named(name) if !export.is_type_only => {
+                    push_auto_import_rule(rules, name.clone(), path.clone(), AutoImportKind::Named);
+                }
+                ExportName::Default if !export.is_type_only => {
+                    if let Some(name) = &default_name {
+                        push_auto_import_rule(
+                            rules,
+                            name.clone(),
+                            path.clone(),
+                            AutoImportKind::Default,
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+fn push_auto_import_rule(
+    rules: &mut Vec<AutoImportRule>,
+    name: String,
+    source: PathBuf,
+    kind: AutoImportKind,
+) {
+    if rules
+        .iter()
+        .any(|rule| rule.name == name && rule.source == source && rule.kind == kind)
+    {
+        return;
+    }
+    rules.push(AutoImportRule { name, source, kind });
+}
+
+fn derive_script_default_name(path: &Path) -> Option<String> {
+    let stem = path.file_stem()?.to_str()?;
+    let words = split_words(stem);
+    if words.is_empty() {
+        return None;
+    }
+    let mut name = words[0].clone();
+    for word in &words[1..] {
+        let mut chars = word.chars();
+        if let Some(first) = chars.next() {
+            name.extend(first.to_uppercase());
+            name.push_str(chars.as_str());
+        }
+    }
+    Some(name)
+}
+
+/// Whether the path has a component file extension (case-insensitive).
+fn has_component_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| COMPONENT_EXTS.iter().any(|c| ext.eq_ignore_ascii_case(c)))
+}
+
+fn has_auto_import_script_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| {
+            AUTO_IMPORT_SCRIPT_EXTENSIONS
+                .iter()
+                .any(|candidate| ext.eq_ignore_ascii_case(candidate))
+        })
+}
+
+/// Derive the Nuxt component name from a path relative to the components root.
+///
+/// Mirrors Nuxt's directory-prefixed PascalCase convention with the
+/// prefix-overlap dedup: `base/foo/Button.vue` becomes `BaseFooButton`,
+/// `foo/Foo.vue` becomes `Foo` (not `FooFoo`), and `base/BaseButton.vue` becomes
+/// `BaseButton` (not `BaseBaseButton`). `.client` / `.server` / `.global`
+/// suffixes are stripped before deriving so paired files map to one name.
+fn derive_component_name(rel: &Path) -> Option<String> {
+    let stem = rel.file_stem().and_then(|s| s.to_str())?;
+    let stem = strip_component_suffix(stem);
+    if stem.is_empty() {
+        return None;
+    }
+    let dir_segments: Vec<&str> = rel
+        .parent()
+        .map(|parent| {
+            parent
+                .components()
+                .filter_map(|c| c.as_os_str().to_str())
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(resolve_component_name(&dir_segments, stem))
+}
+
+/// Strip a single trailing `.client` / `.server` / `.global` segment.
+fn strip_component_suffix(stem: &str) -> &str {
+    if let Some((head, tail)) = stem.rsplit_once('.')
+        && COMPONENT_NAME_SUFFIXES
+            .iter()
+            .any(|s| tail.eq_ignore_ascii_case(s))
+    {
+        return head;
+    }
+    stem
+}
+
+/// Combine PascalCase directory segments with the filename, removing the overlap
+/// where the filename already restates the trailing directory segments. This is
+/// a port of Nuxt's `resolveComponentName` dedup.
+fn resolve_component_name(dir_segments: &[&str], file_stem: &str) -> String {
+    let prefix_parts: Vec<String> = dir_segments
+        .iter()
+        .map(|seg| pascal_segment(seg))
+        .filter(|p| !p.is_empty())
+        .collect();
+    let file_words = split_words(file_stem);
+    let file_lower = file_words.join("/").to_lowercase();
+
+    let mut kept = prefix_parts.len();
+    let mut matched_suffix: Vec<String> = Vec::new();
+    let mut index = prefix_parts.len();
+    while index > 0 {
+        index -= 1;
+        let mut words: Vec<String> = split_words(&prefix_parts[index])
+            .into_iter()
+            .map(|w| w.to_lowercase())
+            .collect();
+        words.extend(matched_suffix.iter().cloned());
+        matched_suffix = words;
+        let matched_content = matched_suffix.join("/");
+        if file_lower == matched_content || file_lower.starts_with(&format!("{matched_content}/")) {
+            kept = index;
+        }
+    }
+
+    let mut name = String::new();
+    for part in &prefix_parts[..kept] {
+        name.push_str(part);
+    }
+    name.push_str(&pascal_segment(file_stem));
+    name
+}
+
+/// Split a string into lowercase word parts on separators (`-`, `_`, ` `, `.`)
+/// and lower-to-upper case transitions. `BaseButton` -> `["base", "button"]`,
+/// `my-widget` -> `["my", "widget"]`, `Card001` -> `["card001"]`.
+fn split_words(input: &str) -> Vec<String> {
+    let mut words: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut prev_lower = false;
+    for ch in input.chars() {
+        if ch == '-' || ch == '_' || ch == ' ' || ch == '.' {
+            if !current.is_empty() {
+                words.push(std::mem::take(&mut current));
+            }
+            prev_lower = false;
+            continue;
+        }
+        if ch.is_ascii_uppercase() && prev_lower && !current.is_empty() {
+            words.push(std::mem::take(&mut current));
+        }
+        current.push(ch.to_ascii_lowercase());
+        prev_lower = ch.is_ascii_lowercase() || ch.is_ascii_digit();
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+    words
+}
+
+/// PascalCase a path segment by capitalizing the first letter of each
+/// separator-delimited part while PRESERVING the existing internal casing, so
+/// acronyms survive: `UICard` -> `UICard`, `card001` -> `Card001`, `my-widget`
+/// -> `MyWidget`, `base` -> `Base`. Routing through the lowercasing `split_words`
+/// instead would collapse `UICard` to `Uicard` and break the table-key match
+/// against the `<UICard />` tag the scanner captures verbatim. See issue #704.
+fn pascal_segment(seg: &str) -> String {
+    let mut out = String::new();
+    for part in seg.split(['-', '_', ' ', '.']) {
+        let mut chars = part.chars();
+        if let Some(first) = chars.next() {
+            out.extend(first.to_uppercase());
+            out.push_str(chars.as_str());
+        }
+    }
+    out
+}
+
+/// Whether an aggregated entry-pattern glob is one of the Nuxt CONSUMER component
+/// directories (`components/**`, `app/components/**`, including workspace-prefixed
+/// forms). These are the patterns `auto_imports` resolves, so the `autoImports`
+/// flag drops them. Module-authoring `src/runtime/components` patterns are
+/// intentionally NOT matched: `auto_imports` does not scan them, so they keep
+/// their entry-pattern protection. See issue #704.
+pub fn is_component_entry_pattern(pattern: &str) -> bool {
+    const SUFFIX: &str = "components/**/*.{vue,ts,tsx,js,jsx}";
+    let Some(prefix) = pattern.strip_suffix(SUFFIX) else {
+        return false;
+    };
+    let valid_prefix = prefix.is_empty() || prefix.ends_with('/');
+    valid_prefix && !prefix.contains("runtime/")
+}
+
+/// Whether an aggregated entry-pattern glob is one of the Nuxt script
+/// convention directories that `auto_imports` now resolves.
+pub fn is_script_auto_import_entry_pattern(pattern: &str) -> bool {
+    const SUFFIXES: &[&str] = &[
+        "composables/*.{ts,tsx,js,jsx,mts,cts,mjs,cjs}",
+        "utils/*.{ts,tsx,js,jsx,mts,cts,mjs,cjs}",
+        "shared/utils/**/*.{ts,tsx,js,jsx,mts,cts,mjs,cjs}",
+        "shared/types/**/*.{ts,tsx,js,jsx,mts,cts,mjs,cjs}",
+        "app/composables/*.{ts,tsx,js,jsx,mts,cts,mjs,cjs}",
+        "app/utils/*.{ts,tsx,js,jsx,mts,cts,mjs,cjs}",
+    ];
+    SUFFIXES.iter().any(|suffix| {
+        pattern.strip_suffix(suffix).is_some_and(|prefix| {
+            let valid_prefix = prefix.is_empty() || prefix.ends_with('/');
+            valid_prefix && !prefix.contains("runtime/")
+        })
+    })
+}
+
+/// Conservative guard for the `autoImports` flag: whether the root `nuxt.config`
+/// declares a `components:` key. When it does, custom `prefix` / `pathPrefix` /
+/// `dirs` settings (which `auto_imports` does not model) may be in play, so the
+/// component entry patterns are kept rather than dropped, avoiding false
+/// `unused-file` reports. Conservative on purpose: any `components:` property key
+/// keeps the patterns. See issue #704.
+pub fn config_declares_components(root: &Path) -> bool {
+    for name in ["nuxt.config.ts", "nuxt.config.js"] {
+        let path = root.join(name);
+        let Ok(source) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        if source_has_components_key(&source) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Conservative guard for script auto-import fallbacks: whether the root
+/// `nuxt.config` declares an `imports:` key. When it does, custom `dirs` or
+/// `scan` settings may be in play, so composable/util entry patterns are kept.
+pub fn config_declares_imports(root: &Path) -> bool {
+    for name in ["nuxt.config.ts", "nuxt.config.js"] {
+        let path = root.join(name);
+        let Ok(source) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        if source_has_imports_key(&source) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether the source declares a `components` property key in any position.
+///
+/// Tolerant on purpose: matches `components:`, `"components":`, `'components':`,
+/// and inline shapes like `defineNuxtConfig({ components: [...] })` regardless of
+/// line position or quoting. It can also match `components:` inside a comment or
+/// string literal, but that only keeps the entry patterns (the safe direction:
+/// no false `unused-file` reports), so over-matching is acceptable. See issue #704.
+fn source_has_components_key(source: &str) -> bool {
+    COMPONENTS_KEY_RE.is_match(source)
+}
+
+fn source_has_imports_key(source: &str) -> bool {
+    IMPORTS_KEY_RE.is_match(source)
+}
+
+#[expect(
+    clippy::expect_used,
+    reason = "static Nuxt regex pattern is hard-coded and covered by plugin tests"
+)]
+static COMPONENTS_KEY_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r#"["']?\bcomponents\b["']?\s*:"#).expect("valid regex")
+});
+
+#[expect(
+    clippy::expect_used,
+    reason = "static Nuxt regex pattern is hard-coded and covered by plugin tests"
+)]
+static IMPORTS_KEY_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r#"["']?\bimports\b["']?\s*:"#).expect("valid regex")
+});
 
 #[cfg(test)]
 mod tests {
@@ -736,8 +1206,6 @@ mod tests {
         }
     }
 
-    // ── resolve_config tests ─────────────────────────────────────
-
     #[test]
     fn resolve_config_modules_as_deps() {
         let source = r#"
@@ -761,8 +1229,80 @@ mod tests {
     }
 
     #[test]
+    fn resolve_config_credits_content_config_when_module_registered() {
+        let source = r#"
+            export default defineNuxtConfig({
+                modules: ["@nuxt/content"]
+            });
+        "#;
+        let plugin = NuxtPlugin;
+        let result = plugin.resolve_config(
+            Path::new("/project/nuxt.config.ts"),
+            source,
+            Path::new("/project"),
+        );
+
+        let pattern = "content.config.{ts,js,mts,cts,mjs,cjs}";
+        assert!(
+            has_entry_pattern(&result, pattern),
+            "@nuxt/content should credit content.config as an entry: {:?}",
+            result.entry_patterns
+        );
+        assert!(
+            has_used_export_rule(&result, pattern, &["default"]),
+            "content.config should keep its default export alive"
+        );
+    }
+
+    #[test]
+    fn resolve_config_no_content_config_credit_without_module() {
+        let source = r#"
+            export default defineNuxtConfig({
+                modules: ["@nuxtjs/tailwindcss"]
+            });
+        "#;
+        let plugin = NuxtPlugin;
+        let result = plugin.resolve_config(
+            Path::new("/project/nuxt.config.ts"),
+            source,
+            Path::new("/project"),
+        );
+
+        assert!(
+            !has_entry_pattern(&result, "content.config.{ts,js,mts,cts,mjs,cjs}"),
+            "content.config must not be credited without @nuxt/content in modules: {:?}",
+            result.entry_patterns
+        );
+    }
+
+    #[test]
+    fn resolve_config_content_config_resolves_relative_to_nested_config_dir() {
+        let source = r#"
+            export default defineNuxtConfig({
+                modules: ["@nuxt/content"]
+            });
+        "#;
+        let plugin = NuxtPlugin;
+        let result = plugin.resolve_config(
+            Path::new("/repo/docs/nuxt.config.ts"),
+            source,
+            Path::new("/repo"),
+        );
+
+        let pattern = "docs/content.config.{ts,js,mts,cts,mjs,cjs}";
+        assert!(
+            has_entry_pattern(&result, pattern),
+            "nested nuxt.config should credit docs/content.config: {:?}",
+            result.entry_patterns
+        );
+        assert!(
+            has_used_export_rule(&result, pattern, &["default"]),
+            "nested content.config should keep its default export alive"
+        );
+    }
+
+    #[test]
     fn resolve_config_css_tilde_resolves_to_root() {
-        // Without an `app/` dir, `~/` resolves to project root
         let source = r#"
             export default defineNuxtConfig({
                 css: ["~/assets/main.css"]
@@ -914,8 +1454,6 @@ mod tests {
 
     #[test]
     fn resolve_config_css_relative_with_nested_config() {
-        // `./assets/global.css` in docs/nuxt.config.ts is config-relative, so it
-        // resolves to docs/assets/global.css at the workspace root.
         let tmp = tempfile::tempdir().expect("create tempdir");
         let root = tmp.path();
         std::fs::create_dir_all(root.join("docs")).expect("create docs");
@@ -942,8 +1480,6 @@ mod tests {
 
     #[test]
     fn resolve_config_css_tilde_with_srcdir_app() {
-        // Root-level config with explicit srcDir: 'app' plus `css: ['~/assets/main.css']`.
-        // Previously untested combination — covers the tests/904–1128 gap.
         let tmp = tempfile::tempdir().expect("create tempdir");
         let root = tmp.path();
         std::fs::create_dir_all(root.join("app")).expect("create app");
@@ -1193,6 +1729,79 @@ mod tests {
     }
 
     #[test]
+    fn resolve_config_src_dir_leading_slash_is_project_relative() {
+        let source = r#"
+            export default defineNuxtConfig({
+                srcDir: "/src",
+                imports: {
+                    dirs: ["~/custom/composables"]
+                }
+            });
+        "#;
+        let plugin = NuxtPlugin;
+        let result = plugin.resolve_config(
+            Path::new("/project/nuxt.config.ts"),
+            source,
+            Path::new("/project"),
+        );
+
+        assert!(
+            result
+                .path_aliases
+                .contains(&("~/".to_string(), "src".to_string())),
+            "leading-slash srcDir should remap ~/ under the project root"
+        );
+        assert!(has_entry_pattern(
+            &result,
+            "src/custom/composables/*.{ts,tsx,js,jsx,mts,cts,mjs,cjs}"
+        ));
+    }
+
+    #[test]
+    fn resolve_config_src_dir_normalizes_backslash_config_values() {
+        let source = r#"
+            export default defineNuxtConfig({
+                srcDir: path.resolve(__dirname, "src\\\\app/"),
+                imports: {
+                    dirs: ["~/custom\\\\composables"]
+                },
+                components: [
+                    { path: "@/feature\\\\components" }
+                ]
+            });
+        "#;
+        let plugin = NuxtPlugin;
+        let result = plugin.resolve_config(
+            Path::new("/project/nuxt.config.ts"),
+            source,
+            Path::new("/project"),
+        );
+
+        assert!(
+            result
+                .path_aliases
+                .contains(&("~/".to_string(), "src/app".to_string())),
+            "srcDir should be normalized in aliases"
+        );
+        assert!(has_entry_pattern(
+            &result,
+            "src/app/custom/composables/*.{ts,tsx,js,jsx,mts,cts,mjs,cjs}"
+        ));
+        assert!(has_entry_pattern(
+            &result,
+            "src/app/feature/components/**/*.{vue,ts,tsx,js,jsx}"
+        ));
+        assert!(
+            result
+                .entry_patterns
+                .iter()
+                .all(|entry| !entry.contains('\\')),
+            "entry patterns should use forward slashes: {:?}",
+            result.entry_patterns
+        );
+    }
+
+    #[test]
     fn imports_dirs_glob_can_scan_nested_files() {
         assert_eq!(
             imports_dir_pattern("app/composables"),
@@ -1216,8 +1825,6 @@ mod tests {
         assert!(patterns.contains(&"plugins/**/index.{ts,tsx,js,jsx,mts,cts,mjs,cjs}"));
         assert!(!patterns.contains(&"plugins/**/*.{ts,js}"));
     }
-
-    // ── Nuxt module authoring tests ──────────────────────────────
 
     #[test]
     fn module_authoring_resolve_config_adds_runtime_patterns() {
@@ -1302,7 +1909,6 @@ mod tests {
     #[test]
     fn module_authoring_no_runtime_dir_is_noop() {
         let temp = tempfile::tempdir().unwrap();
-        // No src/runtime/ directory
         let source = "";
         let plugin = NuxtPlugin;
         let result = plugin.resolve_config(&temp.path().join("src/module.ts"), source, temp.path());
@@ -1347,11 +1953,275 @@ mod tests {
         let result =
             plugin.resolve_config(&temp.path().join("nuxt.config.ts"), source, temp.path());
 
-        // nuxt.config.ts should NOT add runtime patterns
         assert!(
             !result.entry_patterns.iter().any(|p| p.contains("runtime")),
             "nuxt.config.ts should not add runtime patterns: {:?}",
             result.entry_patterns
         );
+    }
+
+    fn name_of(rel: &str) -> String {
+        derive_component_name(Path::new(rel)).expect("component name")
+    }
+
+    #[test]
+    fn component_name_flat() {
+        assert_eq!(name_of("Card001.vue"), "Card001");
+    }
+
+    #[test]
+    fn component_name_directory_prefix_concat() {
+        assert_eq!(name_of("base/foo/Button.vue"), "BaseFooButton");
+    }
+
+    #[test]
+    fn component_name_dedups_repeated_segment() {
+        assert_eq!(name_of("foo/Foo.vue"), "Foo");
+    }
+
+    #[test]
+    fn component_name_dedups_filename_prefix_overlap() {
+        assert_eq!(name_of("base/BaseButton.vue"), "BaseButton");
+    }
+
+    #[test]
+    fn component_name_kebab_directory_segments() {
+        assert_eq!(name_of("my-widget/Header.vue"), "MyWidgetHeader");
+    }
+
+    #[test]
+    fn component_name_preserves_consecutive_uppercase_acronyms() {
+        assert_eq!(name_of("UICard.vue"), "UICard");
+        assert_eq!(name_of("APIClient.vue"), "APIClient");
+        assert_eq!(name_of("base/HTTPForm.vue"), "BaseHTTPForm");
+    }
+
+    #[test]
+    fn component_name_strips_client_server_global_suffixes() {
+        assert_eq!(name_of("Comments.client.vue"), "Comments");
+        assert_eq!(name_of("Comments.server.vue"), "Comments");
+        assert_eq!(name_of("Banner.global.vue"), "Banner");
+    }
+
+    #[test]
+    fn auto_imports_emits_canonical_and_lazy_variants() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("components/base")).unwrap();
+        std::fs::write(root.join("components/Card001.vue"), "<template></template>").unwrap();
+        std::fs::write(
+            root.join("components/base/Button.vue"),
+            "<template></template>",
+        )
+        .unwrap();
+
+        let rules = NuxtPlugin.auto_imports(root);
+        let names: std::collections::BTreeSet<&str> =
+            rules.iter().map(|r| r.name.as_str()).collect();
+
+        assert!(names.contains("Card001"));
+        assert!(names.contains("LazyCard001"));
+        assert!(names.contains("BaseButton"));
+        assert!(names.contains("LazyBaseButton"));
+        assert!(
+            rules
+                .iter()
+                .all(|r| matches!(r.kind, AutoImportKind::DefaultComponent)),
+            "component rules are DefaultComponent kind"
+        );
+        let card = rules.iter().find(|r| r.name == "Card001").unwrap();
+        assert_eq!(card.source, root.join("components/Card001.vue"));
+    }
+
+    #[test]
+    fn auto_imports_paired_client_server_share_a_name_with_distinct_sources() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("app/components")).unwrap();
+        std::fs::write(
+            root.join("app/components/Comments.client.vue"),
+            "<template></template>",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("app/components/Comments.server.vue"),
+            "<template></template>",
+        )
+        .unwrap();
+
+        let rules = NuxtPlugin.auto_imports(root);
+        let comments_sources: std::collections::BTreeSet<_> = rules
+            .iter()
+            .filter(|r| r.name == "Comments")
+            .map(|r| r.source.clone())
+            .collect();
+        assert_eq!(comments_sources.len(), 2);
+    }
+
+    #[test]
+    fn auto_imports_emits_script_named_and_default_exports() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("composables")).unwrap();
+        std::fs::create_dir_all(root.join("utils")).unwrap();
+        std::fs::write(
+            root.join("composables/useCounter.ts"),
+            "export function useCounter() { return 1; }\nexport type CounterType = number;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("utils/format-price.ts"),
+            "export default function format(value: number) { return String(value); }\n",
+        )
+        .unwrap();
+
+        let rules = NuxtPlugin.auto_imports(root);
+        let use_counter = rules
+            .iter()
+            .find(|rule| rule.name == "useCounter")
+            .expect("named export rule");
+        assert_eq!(use_counter.source, root.join("composables/useCounter.ts"));
+        assert!(matches!(use_counter.kind, AutoImportKind::Named));
+        assert!(
+            rules.iter().all(|rule| rule.name != "CounterType"),
+            "type-only exports are not value auto-import rules"
+        );
+        let format_price = rules
+            .iter()
+            .find(|rule| rule.name == "formatPrice")
+            .expect("default export rule");
+        assert_eq!(format_price.source, root.join("utils/format-price.ts"));
+        assert!(matches!(format_price.kind, AutoImportKind::Default));
+    }
+
+    #[test]
+    fn auto_imports_scans_shared_recursively() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("shared/utils/nested")).unwrap();
+        std::fs::write(
+            root.join("shared/utils/useShared.ts"),
+            "export const useShared = () => null;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("shared/utils/nested/useDeep.ts"),
+            "export const useDeep = () => null;\n",
+        )
+        .unwrap();
+
+        let rules = NuxtPlugin.auto_imports(root);
+        assert!(rules.iter().any(|rule| rule.name == "useShared"));
+        assert!(
+            rules.iter().any(|rule| rule.name == "useDeep"),
+            "nested shared utils are scanned by default"
+        );
+    }
+
+    #[test]
+    fn auto_imports_empty_without_convention_dirs() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        assert!(NuxtPlugin.auto_imports(tmp.path()).is_empty());
+    }
+
+    #[test]
+    fn component_entry_pattern_matches_consumer_dirs_only() {
+        assert!(is_component_entry_pattern(
+            "components/**/*.{vue,ts,tsx,js,jsx}"
+        ));
+        assert!(is_component_entry_pattern(
+            "app/components/**/*.{vue,ts,tsx,js,jsx}"
+        ));
+        assert!(is_component_entry_pattern(
+            "packages/web/components/**/*.{vue,ts,tsx,js,jsx}"
+        ));
+        assert!(!is_component_entry_pattern(
+            "src/runtime/components/**/*.{vue,ts,tsx,js,jsx}"
+        ));
+        assert!(!is_component_entry_pattern(
+            "pages/**/*.{vue,ts,tsx,js,jsx}"
+        ));
+    }
+
+    #[test]
+    fn script_auto_import_entry_pattern_matches_modeled_dirs_only() {
+        assert!(is_script_auto_import_entry_pattern(
+            "composables/*.{ts,tsx,js,jsx,mts,cts,mjs,cjs}"
+        ));
+        assert!(is_script_auto_import_entry_pattern(
+            "app/utils/*.{ts,tsx,js,jsx,mts,cts,mjs,cjs}"
+        ));
+        assert!(is_script_auto_import_entry_pattern(
+            "packages/web/shared/types/**/*.{ts,tsx,js,jsx,mts,cts,mjs,cjs}"
+        ));
+        assert!(!is_script_auto_import_entry_pattern(
+            "server/utils/**/*.{ts,js}"
+        ));
+        assert!(!is_script_auto_import_entry_pattern(
+            "src/runtime/utils/*.{ts,js,mts,cts,mjs,cjs}"
+        ));
+    }
+
+    #[test]
+    fn config_declares_components_detects_key() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::write(
+            root.join("nuxt.config.ts"),
+            "export default defineNuxtConfig({\n  components: [{ path: '~/ui', prefix: 'U' }],\n})\n",
+        )
+        .unwrap();
+        assert!(config_declares_components(root));
+    }
+
+    #[test]
+    fn config_declares_components_detects_inline_and_quoted_keys() {
+        assert!(source_has_components_key(
+            "export default defineNuxtConfig({ components: [{ path: '~/ui' }] })"
+        ));
+        assert!(source_has_components_key(
+            r#"export default { "components": [{ path: "~/ui" }] }"#
+        ));
+        assert!(source_has_components_key("  components : [\n  ]"));
+        assert!(!source_has_components_key(
+            "export default defineNuxtConfig({ modules: ['@nuxt/image'] })"
+        ));
+    }
+
+    #[test]
+    fn config_declares_components_false_without_key() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::write(
+            root.join("nuxt.config.ts"),
+            "export default defineNuxtConfig({\n  modules: ['@nuxt/image'],\n})\n",
+        )
+        .unwrap();
+        assert!(!config_declares_components(root));
+    }
+
+    #[test]
+    fn config_declares_imports_detects_key() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::write(
+            root.join("nuxt.config.ts"),
+            "export default defineNuxtConfig({ imports: { dirs: ['custom'] } })\n",
+        )
+        .unwrap();
+        assert!(config_declares_imports(root));
+    }
+
+    #[test]
+    fn config_declares_imports_detects_inline_and_quoted_keys() {
+        assert!(source_has_imports_key(
+            "export default defineNuxtConfig({ imports: { dirs: ['custom'] } })"
+        ));
+        assert!(source_has_imports_key(
+            r#"export default { "imports": { scan: false } }"#
+        ));
+        assert!(!source_has_imports_key(
+            "export default defineNuxtConfig({ components: true })"
+        ));
     }
 }

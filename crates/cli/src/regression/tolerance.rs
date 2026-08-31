@@ -50,7 +50,6 @@ impl Tolerance {
         match *self {
             Self::Percentage(pct) => {
                 if baseline_total == 0 {
-                    // Any increase from zero is a regression when pct tolerance is used
                     return delta > 0;
                 }
                 let allowed = (baseline_total as f64 * pct / 100.0).floor() as usize;
@@ -64,8 +63,6 @@ impl Tolerance {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ── Tolerance parsing ───────────────────────────────────────────
 
     #[test]
     fn parse_percentage_tolerance() {
@@ -106,8 +103,6 @@ mod tests {
         assert!(Tolerance::parse("abc").is_err());
     }
 
-    // ── Tolerance::exceeded ────────────────────────────────────────
-
     #[test]
     fn zero_tolerance_detects_any_increase() {
         let t = Tolerance::Absolute(0);
@@ -119,24 +114,24 @@ mod tests {
     #[test]
     fn absolute_tolerance_allows_within_range() {
         let t = Tolerance::Absolute(3);
-        assert!(!t.exceeded(10, 12)); // delta=2, allowed=3
-        assert!(!t.exceeded(10, 13)); // delta=3, allowed=3
-        assert!(t.exceeded(10, 14)); // delta=4, allowed=3
+        assert!(!t.exceeded(10, 12));
+        assert!(!t.exceeded(10, 13));
+        assert!(t.exceeded(10, 14));
     }
 
     #[test]
     fn percentage_tolerance_allows_within_range() {
         let t = Tolerance::Percentage(10.0);
-        assert!(!t.exceeded(100, 109)); // delta=9, allowed=floor(10)=10
-        assert!(!t.exceeded(100, 110)); // delta=10, allowed=10
-        assert!(t.exceeded(100, 111)); // delta=11, allowed=10
+        assert!(!t.exceeded(100, 109));
+        assert!(!t.exceeded(100, 110));
+        assert!(t.exceeded(100, 111));
     }
 
     #[test]
     fn percentage_tolerance_from_zero_baseline() {
         let t = Tolerance::Percentage(10.0);
-        assert!(t.exceeded(0, 1)); // any increase from zero
-        assert!(!t.exceeded(0, 0)); // no increase
+        assert!(t.exceeded(0, 1));
+        assert!(!t.exceeded(0, 0));
     }
 
     #[test]
@@ -146,8 +141,6 @@ mod tests {
         let t = Tolerance::Percentage(0.0);
         assert!(!t.exceeded(10, 5));
     }
-
-    // ── Additional tolerance parsing ────────────────────────────────
 
     #[test]
     fn parse_whitespace_padded_tolerance() {
@@ -181,7 +174,6 @@ mod tests {
 
     #[test]
     fn parse_negative_absolute_is_err() {
-        // usize can't be negative, so parsing "-1" as usize fails
         assert!(Tolerance::parse("-1").is_err());
     }
 
@@ -190,8 +182,6 @@ mod tests {
         let t = Tolerance::parse("  3.5%  ").unwrap();
         assert!(matches!(t, Tolerance::Percentage(p) if (p - 3.5).abs() < f64::EPSILON));
     }
-
-    // ── Additional Tolerance::exceeded ──────────────────────────────
 
     #[test]
     fn zero_pct_tolerance_detects_any_increase() {
@@ -203,25 +193,23 @@ mod tests {
 
     #[test]
     fn percentage_tolerance_with_small_baseline() {
-        // baseline=3, 10% of 3 = 0.3, floor = 0 => delta > 0 triggers
         let t = Tolerance::Percentage(10.0);
-        assert!(t.exceeded(3, 4)); // delta=1 > allowed=0
-        assert!(!t.exceeded(3, 3)); // no increase
+        assert!(t.exceeded(3, 4));
+        assert!(!t.exceeded(3, 3));
     }
 
     #[test]
     fn percentage_tolerance_large_percentage() {
         let t = Tolerance::Percentage(100.0);
-        // baseline=10, 100% of 10 = 10, floor=10 => delta > 10 triggers
-        assert!(!t.exceeded(10, 20)); // delta=10, allowed=10
-        assert!(t.exceeded(10, 21)); // delta=11, allowed=10
+        assert!(!t.exceeded(10, 20));
+        assert!(t.exceeded(10, 21));
     }
 
     #[test]
     fn absolute_tolerance_at_exact_boundary() {
         let t = Tolerance::Absolute(5);
-        assert!(!t.exceeded(10, 15)); // delta=5, allowed=5
-        assert!(t.exceeded(10, 16)); // delta=6, allowed=5
+        assert!(!t.exceeded(10, 15));
+        assert!(t.exceeded(10, 16));
     }
 
     #[test]

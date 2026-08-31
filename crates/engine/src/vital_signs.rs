@@ -1,0 +1,1834 @@
+//! Vital signs computation and snapshot persistence.
+//!
+//! Vital signs are a fixed set of project-wide metrics computed from available
+//! health data. They are always shown as a summary in the health report and can
+//! be persisted to `.fallow/snapshots/` for Phase 2b trend tracking.
+
+use std::path::{Path, PathBuf};
+
+use crate::git_env::clear_ambient_git_env;
+
+/// Number of seconds in one day.
+const SECS_PER_DAY: u64 = 86_400;
+
+use fallow_output::{
+    DEFAULT_CYCLOMATIC_CRITICAL, FileHealthScore, HEALTH_SCORE_FORMULA_VERSION,
+    HOTSPOT_SCORE_THRESHOLD, HealthScore, HealthScorePenalties, HealthTrend, HotspotEntry,
+    RiskProfile, SNAPSHOT_SCHEMA_VERSION, TrendCount, TrendDirection, TrendMetric, TrendPoint,
+    VitalSigns, VitalSignsCounts, VitalSignsSnapshot, letter_grade,
+};
+
+/// Data sources for computing vital signs.
+///
+/// Fields are `Option` because not all pipelines run in every health invocation.
+pub(crate) struct VitalSignsInput<'a> {
+    /// All parsed modules (always available).
+    pub(crate) modules: &'a [crate::source::ModuleInfo],
+    /// Optional file-id allowlist used to restrict per-module aggregates
+    /// (cyclomatic distribution, total LOC, unit profiles) to a subset.
+    /// Used by `--workspace` and `--group-by` to scope project-wide metrics
+    /// to a single workspace package without re-parsing.
+    /// `None` includes every module in `modules`.
+    pub(crate) module_filter: Option<&'a rustc_hash::FxHashSet<crate::discover::FileId>>,
+    /// File health scores (available when file_scores/hotspots/targets are computed).
+    pub(crate) file_scores: Option<&'a [FileHealthScore]>,
+    /// Hotspot entries (available when hotspots are computed).
+    pub(crate) hotspots: Option<&'a [HotspotEntry]>,
+    /// Total discovered files (already scoped to the workspace when `--workspace` is set).
+    pub(crate) total_files: usize,
+    /// Analysis results (available when file_scores pipeline ran). When a
+    /// `module_filter` is also set, callers should pass workspace-scoped
+    /// counts here so `dead_*_pct` denominators line up with the rest of the
+    /// metrics.
+    pub(crate) analysis_counts: Option<AnalysisCounts>,
+}
+
+impl<'a> VitalSignsInput<'a> {
+    /// Iterate the modules selected by `module_filter`.
+    fn selected_modules(&self) -> impl Iterator<Item = &'a crate::source::ModuleInfo> + '_ {
+        let filter = self.module_filter;
+        self.modules
+            .iter()
+            .filter(move |m| filter.is_none_or(|set| set.contains(&m.file_id)))
+    }
+}
+
+/// Aggregate counts from the analysis pipeline.
+#[derive(Clone, Copy)]
+pub struct AnalysisCounts {
+    pub(crate) total_exports: usize,
+    pub(crate) dead_files: usize,
+    pub(crate) dead_exports: usize,
+    pub(crate) unused_deps: usize,
+    pub(crate) circular_deps: usize,
+    pub(crate) total_deps: usize,
+}
+
+fn collect_sorted_cyclomatic(input: &VitalSignsInput<'_>) -> Vec<u16> {
+    let mut values: Vec<u16> = input
+        .selected_modules()
+        .flat_map(|m| m.complexity.iter().map(|c| c.cyclomatic))
+        .collect();
+    values.sort_unstable();
+    values
+}
+
+fn average_cyclomatic(all_cyclomatic: &[u16]) -> f64 {
+    if all_cyclomatic.is_empty() {
+        return 0.0;
+    }
+
+    let sum: u64 = all_cyclomatic.iter().map(|&c| u64::from(c)).sum();
+    (sum as f64 / all_cyclomatic.len() as f64 * 10.0).round() / 10.0
+}
+
+fn critical_complexity_pct(all_cyclomatic: &[u16]) -> Option<f64> {
+    if all_cyclomatic.is_empty() {
+        return None;
+    }
+
+    let critical_count = all_cyclomatic
+        .iter()
+        .filter(|&&c| c >= DEFAULT_CYCLOMATIC_CRITICAL)
+        .count();
+    Some((critical_count as f64 / all_cyclomatic.len() as f64 * 1000.0).round() / 10.0)
+}
+
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "percentile index is bounded by the cyclomatic collection length"
+)]
+fn p90_cyclomatic(all_cyclomatic: &[u16]) -> u32 {
+    if all_cyclomatic.is_empty() {
+        return 0;
+    }
+
+    let idx = (all_cyclomatic.len() as f64 * 0.9).ceil() as usize;
+    let idx = idx.min(all_cyclomatic.len()) - 1;
+    u32::from(all_cyclomatic[idx])
+}
+
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "analysis counts are bounded by project size and emitted as compact u32 metrics"
+)]
+fn analysis_count_vitals(
+    counts: Option<&AnalysisCounts>,
+    total_files: usize,
+) -> (Option<f64>, Option<f64>, Option<u32>, Option<u32>) {
+    let Some(counts) = counts else {
+        return (None, None, None, None);
+    };
+
+    let dead_file_pct = if total_files > 0 {
+        Some((counts.dead_files as f64 / total_files as f64 * 1000.0).round() / 10.0)
+    } else {
+        Some(0.0)
+    };
+    let dead_export_pct = if counts.total_exports > 0 {
+        Some((counts.dead_exports as f64 / counts.total_exports as f64 * 1000.0).round() / 10.0)
+    } else {
+        Some(0.0)
+    };
+
+    (
+        dead_file_pct,
+        dead_export_pct,
+        Some(counts.unused_deps as u32),
+        Some(counts.circular_deps as u32),
+    )
+}
+
+struct SelectedModuleMetrics {
+    total_loc: u64,
+    line_counts: Vec<u32>,
+    param_counts: Vec<u8>,
+}
+
+fn selected_module_metrics(input: &VitalSignsInput<'_>) -> SelectedModuleMetrics {
+    let mut total_loc = 0;
+    let mut line_counts = Vec::new();
+    let mut param_counts = Vec::new();
+
+    for module in input.selected_modules() {
+        total_loc += module.line_offsets.len() as u64;
+        line_counts.extend(module.complexity.iter().map(|c| c.line_count));
+        param_counts.extend(module.complexity.iter().map(|c| c.param_count));
+    }
+
+    SelectedModuleMetrics {
+        total_loc,
+        line_counts,
+        param_counts,
+    }
+}
+
+fn vital_sign_counts(input: &VitalSignsInput<'_>, total_loc: u64) -> Option<VitalSignsCounts> {
+    input.analysis_counts.as_ref().map(|ac| VitalSignsCounts {
+        total_files: input.total_files,
+        total_exports: ac.total_exports,
+        dead_files: ac.dead_files,
+        dead_exports: ac.dead_exports,
+        duplicated_lines: None,
+        total_lines: Some(total_loc as usize),
+        files_scored: input.file_scores.map(<[_]>::len),
+        total_deps: ac.total_deps,
+    })
+}
+
+/// Compute vital signs from available health data.
+pub(crate) fn compute_vital_signs(input: &VitalSignsInput<'_>) -> VitalSigns {
+    let all_cyclomatic = collect_sorted_cyclomatic(input);
+    let avg_cyclomatic = average_cyclomatic(&all_cyclomatic);
+    let critical_complexity_pct = critical_complexity_pct(&all_cyclomatic);
+    let p90_cyclomatic = p90_cyclomatic(&all_cyclomatic);
+
+    let (dead_file_pct, dead_export_pct, unused_dep_count, circular_dep_count) =
+        analysis_count_vitals(input.analysis_counts.as_ref(), input.total_files);
+    let unused_deps_per_k_files =
+        unused_dep_count.map(|count| per_k_files(count, input.total_files));
+    let circular_deps_per_k_files =
+        circular_dep_count.map(|count| per_k_files(count, input.total_files));
+
+    let (maintainability_avg, maintainability_low_pct) = maintainability_vitals(input.file_scores);
+
+    let (hotspot_count, hotspot_top_pct_count) = hotspot_vitals(input.hotspots, input.total_files);
+
+    let module_metrics = selected_module_metrics(input);
+    let counts = vital_sign_counts(input, module_metrics.total_loc);
+    let functions_over_60_loc_per_k = functions_over_60_loc_per_k(&module_metrics.line_counts);
+    let unit_size_profile = unit_size_profile(&module_metrics.line_counts);
+
+    let unit_interfacing_profile =
+        unit_interfacing_profile(&module_metrics.param_counts, &all_cyclomatic);
+
+    let (p95_fan_in, coupling_high_pct) = if let Some(scores) = input.file_scores {
+        compute_coupling_concentration(scores)
+    } else {
+        (None, None)
+    };
+
+    VitalSigns {
+        dead_file_pct,
+        dead_export_pct,
+        avg_cyclomatic,
+        critical_complexity_pct,
+        p90_cyclomatic,
+        duplication_pct: None, // Lazy: only set if duplication pipeline was run
+        hotspot_count,
+        hotspot_top_pct_count,
+        maintainability_avg,
+        maintainability_low_pct,
+        unused_dep_count,
+        unused_deps_per_k_files,
+        circular_dep_count,
+        circular_deps_per_k_files,
+        counts,
+        unit_size_profile,
+        functions_over_60_loc_per_k,
+        unit_interfacing_profile,
+        p95_fan_in,
+        coupling_high_pct,
+        // Set post-construction from the whole-project analysis results (only
+        // when the opt-in prop-drilling rule is enabled); see health/mod.rs.
+        prop_drilling_chain_count: None,
+        prop_drilling_max_depth: None,
+        // Set post-construction from the whole-project render fan-in metric
+        // (whenever React is declared, the core metric carries the aggregates);
+        // see health/mod.rs.
+        p95_render_fan_in: None,
+        render_fan_in_high_pct: None,
+        max_render_fan_in: None,
+        top_render_fan_in: Vec::new(),
+        total_loc: module_metrics.total_loc,
+    }
+}
+
+fn per_k_files(count: u32, total_files: usize) -> f64 {
+    if total_files == 0 {
+        0.0
+    } else {
+        (f64::from(count) / total_files as f64 * 10_000.0).round() / 10.0
+    }
+}
+
+fn maintainability_vitals(scores: Option<&[FileHealthScore]>) -> (Option<f64>, Option<f64>) {
+    let Some(scores) = scores.filter(|scores| !scores.is_empty()) else {
+        return (None, None);
+    };
+    let sum: f64 = scores.iter().map(|s| s.maintainability_index).sum();
+    let low_count = scores
+        .iter()
+        .filter(|s| s.maintainability_index < 70.0)
+        .count();
+    (
+        Some((sum / scores.len() as f64 * 10.0).round() / 10.0),
+        Some((low_count as f64 / scores.len() as f64 * 1000.0).round() / 10.0),
+    )
+}
+
+fn hotspot_vitals(
+    hotspots: Option<&[HotspotEntry]>,
+    total_files: usize,
+) -> (Option<u32>, Option<u32>) {
+    let hotspot_count = hotspots.map(|entries| {
+        entries
+            .iter()
+            .filter(|e| e.score >= HOTSPOT_SCORE_THRESHOLD)
+            .count() as u32
+    });
+    let hotspot_top_pct_count = hotspots.map(|entries| {
+        if total_files == 0 || entries.is_empty() {
+            return 0;
+        }
+        let top_count = (total_files as f64 * 0.01).ceil() as usize;
+        entries
+            .iter()
+            .take(top_count.max(1))
+            .filter(|entry| entry.score > 0.0)
+            .count() as u32
+    });
+    (hotspot_count, hotspot_top_pct_count)
+}
+
+fn functions_over_60_loc_per_k(line_counts: &[u32]) -> Option<f64> {
+    if line_counts.is_empty() {
+        return None;
+    }
+    let over_60 = line_counts
+        .iter()
+        .filter(|&&line_count| line_count > 60)
+        .count();
+    Some((over_60 as f64 / line_counts.len() as f64 * 10_000.0).round() / 10.0)
+}
+
+fn unit_size_profile(line_counts: &[u32]) -> Option<RiskProfile> {
+    (!line_counts.is_empty()).then(|| compute_size_risk_profile(line_counts))
+}
+
+fn unit_interfacing_profile(param_counts: &[u8], all_cyclomatic: &[u16]) -> Option<RiskProfile> {
+    if all_cyclomatic.is_empty() {
+        return None;
+    }
+    Some(compute_interfacing_risk_profile(param_counts))
+}
+
+/// Compute unit size risk profile from function line counts.
+///
+/// Bins: low risk (1-15 LOC), medium risk (16-30), high risk (31-60), very high risk (>60).
+fn compute_size_risk_profile(line_counts: &[u32]) -> RiskProfile {
+    if line_counts.is_empty() {
+        return RiskProfile {
+            low_risk: 0.0,
+            medium_risk: 0.0,
+            high_risk: 0.0,
+            very_high_risk: 0.0,
+        };
+    }
+    let total = line_counts.len() as f64;
+    let low = line_counts.iter().filter(|&&lc| lc <= 15).count() as f64;
+    let medium = line_counts
+        .iter()
+        .filter(|&&lc| (16..=30).contains(&lc))
+        .count() as f64;
+    let high = line_counts
+        .iter()
+        .filter(|&&lc| (31..=60).contains(&lc))
+        .count() as f64;
+    let very_high = line_counts.iter().filter(|&&lc| lc > 60).count() as f64;
+    RiskProfile {
+        low_risk: (low / total * 1000.0).round() / 10.0,
+        medium_risk: (medium / total * 1000.0).round() / 10.0,
+        high_risk: (high / total * 1000.0).round() / 10.0,
+        very_high_risk: (very_high / total * 1000.0).round() / 10.0,
+    }
+}
+
+/// Compute unit interfacing risk profile from function parameter counts.
+///
+/// Bins: low risk (0-2 params), medium risk (3-4), high risk (5-6), very high risk (>=7).
+fn compute_interfacing_risk_profile(param_counts: &[u8]) -> RiskProfile {
+    if param_counts.is_empty() {
+        return RiskProfile {
+            low_risk: 0.0,
+            medium_risk: 0.0,
+            high_risk: 0.0,
+            very_high_risk: 0.0,
+        };
+    }
+    let total = param_counts.len() as f64;
+    let low = param_counts.iter().filter(|&&pc| pc <= 2).count() as f64;
+    let medium = param_counts
+        .iter()
+        .filter(|&&pc| (3..=4).contains(&pc))
+        .count() as f64;
+    let high = param_counts
+        .iter()
+        .filter(|&&pc| (5..=6).contains(&pc))
+        .count() as f64;
+    let very_high = param_counts.iter().filter(|&&pc| pc >= 7).count() as f64;
+    RiskProfile {
+        low_risk: (low / total * 1000.0).round() / 10.0,
+        medium_risk: (medium / total * 1000.0).round() / 10.0,
+        high_risk: (high / total * 1000.0).round() / 10.0,
+        very_high_risk: (very_high / total * 1000.0).round() / 10.0,
+    }
+}
+
+/// Compute coupling concentration from file health scores.
+///
+/// Returns (p95_fan_in, coupling_high_pct) where coupling_high_pct is the
+/// percentage of files with fan-in above the effective threshold (max(p95_fan_in, 10)).
+///
+/// The component-graph analogue (render fan-in concentration:
+/// `p95_render_fan_in` / `render_fan_in_high_pct` / `max_render_fan_in`) is
+/// computed in core (`crate::render_fan_in`), which has the
+/// resolved-module graph the CLI lacks. It mirrors this helper verbatim (p95 +
+/// `high_pct` over the per-component distinct-parents distribution, reusing the
+/// same `max(p95, 10)` floor) and is assigned onto `VitalSigns` in
+/// `health/mod.rs::prepare_health_vital_data`.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "fan-in values are bounded by project size"
+)]
+fn compute_coupling_concentration(scores: &[FileHealthScore]) -> (Option<u32>, Option<f64>) {
+    if scores.is_empty() {
+        return (None, None);
+    }
+    let mut fan_ins: Vec<usize> = scores.iter().map(|s| s.fan_in).collect();
+    fan_ins.sort_unstable();
+    let idx = (fan_ins.len() as f64 * 0.95).ceil() as usize;
+    let idx = idx.min(fan_ins.len()) - 1;
+    let p95 = fan_ins[idx] as u32;
+
+    let threshold = (p95 as usize).max(10);
+    let high_count = fan_ins.iter().filter(|&&fi| fi > threshold).count();
+    let high_pct = (high_count as f64 / fan_ins.len() as f64 * 1000.0).round() / 10.0;
+
+    (Some(p95), Some(high_pct))
+}
+
+/// Compute a project-level health score from vital signs.
+///
+/// The score starts at 100 and subtracts penalties for each metric.
+/// Missing metrics (from pipelines that didn't run) don't penalize.
+/// `total_files` is used to normalize the hotspot count penalty.
+pub(crate) fn compute_health_score(vs: &VitalSigns, total_files: usize) -> HealthScore {
+    let penalties = compute_health_score_penalties(vs, total_files);
+    let score = apply_health_score_penalties(&penalties);
+    let grade = letter_grade(score);
+
+    HealthScore {
+        formula_version: HEALTH_SCORE_FORMULA_VERSION,
+        score,
+        grade,
+        penalties,
+    }
+}
+
+fn compute_health_score_penalties(vs: &VitalSigns, total_files: usize) -> HealthScorePenalties {
+    HealthScorePenalties {
+        dead_files: vs.dead_file_pct.map(|pct| round1((pct * 0.2).min(15.0))),
+        dead_exports: vs.dead_export_pct.map(|pct| round1((pct * 0.2).min(15.0))),
+        complexity: complexity_penalty(vs),
+        p90_complexity: p90_complexity_penalty(vs),
+        maintainability: maintainability_penalty(vs),
+        hotspots: hotspot_penalty(vs, total_files),
+        unused_deps: dependency_count_penalty(
+            vs.unused_deps_per_k_files,
+            vs.unused_dep_count,
+            25.0,
+            10.0,
+        ),
+        circular_deps: dependency_count_penalty(
+            vs.circular_deps_per_k_files,
+            vs.circular_dep_count,
+            25.0,
+            10.0,
+        ),
+        unit_size: unit_size_penalty(vs),
+        coupling: coupling_penalty(vs),
+        duplication: vs
+            .duplication_pct
+            .map(|dp| round1((dp - 5.0).clamp(0.0, 10.0))),
+        prop_drilling: prop_drilling_penalty(vs),
+    }
+}
+
+fn apply_health_score_penalties(penalties: &HealthScorePenalties) -> f64 {
+    let mut score = 100.0_f64;
+
+    subtract_optional_penalty(&mut score, penalties.dead_files);
+    subtract_optional_penalty(&mut score, penalties.dead_exports);
+    score -= penalties.complexity;
+    score -= penalties.p90_complexity;
+    subtract_optional_penalty(&mut score, penalties.maintainability);
+    subtract_optional_penalty(&mut score, penalties.hotspots);
+    subtract_optional_penalty(&mut score, penalties.unused_deps);
+    subtract_optional_penalty(&mut score, penalties.circular_deps);
+    subtract_optional_penalty(&mut score, penalties.unit_size);
+    subtract_optional_penalty(&mut score, penalties.coupling);
+    subtract_optional_penalty(&mut score, penalties.duplication);
+    subtract_optional_penalty(&mut score, penalties.prop_drilling);
+
+    round1(score).clamp(0.0, 100.0)
+}
+
+/// Small capped penalty for prop-drilling chains, sized like the coupling
+/// penalty (~5pt cap). Each located chain costs 1pt up to the cap; a deeper
+/// chain does not cost more (depth is descriptive, not a tunable threshold).
+/// `None` (no penalty) unless the opt-in `prop-drilling` rule populated the
+/// count, so the score is unchanged by default.
+fn prop_drilling_penalty(vs: &VitalSigns) -> Option<f64> {
+    vs.prop_drilling_chain_count
+        .map(|count| round1((f64::from(count) * 1.0).min(5.0)))
+}
+
+fn round1(value: f64) -> f64 {
+    (value * 10.0).round() / 10.0
+}
+
+fn subtract_optional_penalty(score: &mut f64, penalty: Option<f64>) {
+    if let Some(penalty) = penalty {
+        *score -= penalty;
+    }
+}
+
+fn complexity_penalty(vs: &VitalSigns) -> f64 {
+    if let Some(critical_pct) = vs.critical_complexity_pct {
+        round1((critical_pct * 4.0).min(20.0))
+    } else {
+        round1(((vs.avg_cyclomatic - 1.5).max(0.0) * 5.0).min(20.0))
+    }
+}
+
+fn p90_complexity_penalty(vs: &VitalSigns) -> f64 {
+    if vs.critical_complexity_pct.is_some() {
+        0.0
+    } else {
+        round1((f64::from(vs.p90_cyclomatic) - 10.0).clamp(0.0, 10.0))
+    }
+}
+
+fn maintainability_penalty(vs: &VitalSigns) -> Option<f64> {
+    if let Some(low_pct) = vs.maintainability_low_pct {
+        Some(round1((low_pct * 1.5).min(15.0)))
+    } else {
+        vs.maintainability_avg
+            .map(|mi| round1(((70.0 - mi).max(0.0) * 0.5).min(15.0)))
+    }
+}
+
+fn hotspot_penalty(vs: &VitalSigns, total_files: usize) -> Option<f64> {
+    if let Some(top_pct_count) = vs.hotspot_top_pct_count {
+        return Some(if total_files > 0 {
+            let top_pct_bucket = (total_files as f64 * 0.01).ceil().max(1.0);
+            round1((f64::from(top_pct_count) / top_pct_bucket * 10.0).min(10.0))
+        } else {
+            0.0
+        });
+    }
+
+    vs.hotspot_count.map(|hc| {
+        if total_files > 0 {
+            round1((f64::from(hc) / total_files as f64 * 200.0).min(10.0))
+        } else {
+            0.0
+        }
+    })
+}
+
+fn dependency_count_penalty(
+    per_k: Option<f64>,
+    count: Option<u32>,
+    per_k_cap: f64,
+    count_cap: f64,
+) -> Option<f64> {
+    if let Some(per_k) = per_k {
+        Some(round1((per_k * 0.5).min(per_k_cap)))
+    } else {
+        count.map(|count| round1(f64::from(count).min(count_cap)))
+    }
+}
+
+fn unit_size_penalty(vs: &VitalSigns) -> Option<f64> {
+    if let Some(per_k) = vs.functions_over_60_loc_per_k {
+        Some(round1((per_k * 0.5).min(10.0)))
+    } else {
+        vs.unit_size_profile
+            .as_ref()
+            .map(|profile| round1(((profile.very_high_risk - 5.0).max(0.0) * 0.5).min(10.0)))
+    }
+}
+
+fn coupling_penalty(vs: &VitalSigns) -> Option<f64> {
+    if let Some(high_pct) = vs.coupling_high_pct {
+        Some(round1((high_pct * 0.5).min(5.0)))
+    } else {
+        vs.p95_fan_in
+            .map(|p95| round1(((f64::from(p95) - 30.0).max(0.0) * 0.25).min(5.0)))
+    }
+}
+
+/// Build the raw counts for a snapshot.
+pub(crate) fn build_counts(input: &VitalSignsInput<'_>) -> VitalSignsCounts {
+    let (total_exports, dead_files, dead_exports, total_deps) = input
+        .analysis_counts
+        .as_ref()
+        .map_or((0, 0, 0, 0), |counts| {
+            (
+                counts.total_exports,
+                counts.dead_files,
+                counts.dead_exports,
+                counts.total_deps,
+            )
+        });
+
+    let total_lines: usize = input.selected_modules().map(|m| m.line_offsets.len()).sum();
+
+    VitalSignsCounts {
+        total_files: input.total_files,
+        total_exports,
+        dead_files,
+        dead_exports,
+        duplicated_lines: None,
+        total_lines: Some(total_lines),
+        files_scored: input.file_scores.map(<[_]>::len),
+        total_deps,
+    }
+}
+
+/// Get the current git SHA (short form).
+#[expect(
+    clippy::disallowed_methods,
+    reason = "trusted git spawn with ambient repo-state env stripped, matching the core git spawn policy"
+)]
+fn git_sha(root: &Path) -> Option<String> {
+    let mut command = std::process::Command::new("git");
+    command
+        .args(["rev-parse", "--short", "HEAD"])
+        .current_dir(root);
+    clear_ambient_git_env(&mut command);
+    command
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+}
+
+/// Get the current git branch name.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "trusted git spawn with ambient repo-state env stripped, matching the core git spawn policy"
+)]
+fn git_branch(root: &Path) -> Option<String> {
+    let mut command = std::process::Command::new("git");
+    command
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .current_dir(root);
+    clear_ambient_git_env(&mut command);
+    command
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| {
+            let name = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if name == "HEAD" { None } else { Some(name) }
+        })
+}
+
+/// Build a snapshot from vital signs and input data.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "snapshot construction keeps every persisted compatibility input explicit"
+)]
+pub(crate) fn build_snapshot(
+    vital_signs: VitalSigns,
+    counts: VitalSignsCounts,
+    root: &Path,
+    shallow_clone: bool,
+    health_score: Option<&HealthScore>,
+    coverage_model: Option<fallow_output::CoverageModel>,
+    analysis_identity: fallow_types::semantic::SemanticAnalysisIdentity,
+) -> VitalSignsSnapshot {
+    let now = chrono_timestamp();
+
+    VitalSignsSnapshot {
+        snapshot_schema_version: SNAPSHOT_SCHEMA_VERSION,
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        timestamp: now,
+        git_sha: git_sha(root),
+        git_branch: git_branch(root),
+        shallow_clone,
+        vital_signs,
+        counts,
+        score: health_score.map(|s| s.score),
+        grade: health_score.map(|s| s.grade.to_string()),
+        coverage_model,
+        analysis_identity,
+    }
+}
+
+/// ISO 8601 UTC timestamp without external chrono dependency.
+pub fn chrono_timestamp() -> String {
+    use std::time::SystemTime;
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = now.as_secs();
+
+    let days = secs / SECS_PER_DAY;
+    let time_secs = secs % SECS_PER_DAY;
+    let hours = time_secs / 3600;
+    let minutes = (time_secs % 3600) / 60;
+    let seconds = time_secs % 60;
+
+    let (year, month, day) = days_to_ymd(days);
+
+    format!("{year:04}-{month:02}-{day:02}T{hours:02}:{minutes:02}:{seconds:02}Z")
+}
+
+/// Convert days since Unix epoch to (year, month, day).
+const fn days_to_ymd(days: u64) -> (u64, u64, u64) {
+    let z = days + 719_468;
+    let era = z / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
+}
+
+/// Save a snapshot to disk.
+///
+/// If `path` is `None`, writes to `.fallow/snapshots/{timestamp}.json`.
+/// Creates parent directories as needed.
+pub(crate) fn save_snapshot(
+    snapshot: &VitalSignsSnapshot,
+    root: &Path,
+    explicit_path: Option<&Path>,
+) -> Result<PathBuf, String> {
+    let path = explicit_path.map_or_else(
+        || {
+            let dir = root.join(".fallow").join("snapshots");
+            let filename = snapshot.timestamp.replace(':', "-");
+            dir.join(format!("{filename}.json"))
+        },
+        Path::to_path_buf,
+    );
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create snapshot directory: {e}"))?;
+    }
+
+    let json =
+        serde_json::to_string_pretty(snapshot).map_err(|e| format!("failed to serialize: {e}"))?;
+    std::fs::write(&path, json).map_err(|e| format!("failed to write snapshot: {e}"))?;
+
+    Ok(path)
+}
+
+/// Load all snapshots from the default snapshot directory, sorted by timestamp ascending.
+///
+/// Corrupt or unreadable files are skipped with a warning to stderr.
+/// Returns an empty vec if the directory does not exist.
+#[expect(
+    clippy::print_stderr,
+    reason = "corrupt-snapshot warnings to stderr, preserved verbatim from the CLI health path"
+)]
+pub(crate) fn load_snapshots(root: &Path) -> Vec<VitalSignsSnapshot> {
+    let dir = root.join(".fallow").join("snapshots");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+
+    let mut snapshots = Vec::new();
+    for entry in entries {
+        let Ok(entry) = entry else { continue };
+        let path = entry.path();
+        if path.extension().is_some_and(|ext| ext == "json") {
+            match std::fs::read_to_string(&path) {
+                Ok(content) => match serde_json::from_str::<VitalSignsSnapshot>(&content) {
+                    Ok(snap) => snapshots.push(snap),
+                    Err(e) => {
+                        eprintln!("warning: skipping corrupt snapshot {}: {e}", path.display());
+                    }
+                },
+                Err(e) => {
+                    eprintln!("warning: could not read snapshot {}: {e}", path.display());
+                }
+            }
+        }
+    }
+
+    snapshots.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+    snapshots
+}
+
+/// Tolerance for treating a metric delta as "stable" rather than improving/declining.
+const TREND_TOLERANCE: f64 = 0.5;
+
+fn trend_point_from_snapshot(prev: &VitalSignsSnapshot) -> TrendPoint {
+    TrendPoint {
+        timestamp: prev.timestamp.clone(),
+        git_sha: prev.git_sha.clone(),
+        score: prev.score,
+        grade: prev.grade.clone(),
+        coverage_model: prev.coverage_model.clone(),
+        snapshot_schema_version: Some(prev.snapshot_schema_version),
+    }
+}
+
+fn overall_trend_direction(metrics: &[TrendMetric]) -> TrendDirection {
+    let (improving, declining) = metrics.iter().fold((0usize, 0usize), |(imp, dec), metric| {
+        match metric.direction {
+            TrendDirection::Improving => (imp + 1, dec),
+            TrendDirection::Declining => (imp, dec + 1),
+            TrendDirection::Stable => (imp, dec),
+        }
+    });
+
+    match improving.cmp(&declining) {
+        std::cmp::Ordering::Greater => TrendDirection::Improving,
+        std::cmp::Ordering::Less => TrendDirection::Declining,
+        std::cmp::Ordering::Equal => TrendDirection::Stable,
+    }
+}
+
+/// Compute a trend comparison between the current run and the most recent snapshot.
+///
+/// Uses the stored `score` field from the snapshot (never re-derives it).
+/// Returns `None` if no snapshots are available.
+pub(crate) fn compute_trend(
+    current_vs: &VitalSigns,
+    current_counts: &VitalSignsCounts,
+    current_score: Option<f64>,
+    snapshots: &[VitalSignsSnapshot],
+) -> Option<HealthTrend> {
+    let prev = snapshots.last()?;
+
+    let compared_to = trend_point_from_snapshot(prev);
+
+    let metrics = TrendBuilder::new(prev, current_vs, current_counts, current_score).build();
+
+    let overall_direction = overall_trend_direction(&metrics);
+
+    Some(HealthTrend {
+        compared_to,
+        metrics,
+        snapshots_loaded: snapshots.len(),
+        overall_direction,
+    })
+}
+
+struct TrendBuilder<'a> {
+    prev: &'a VitalSignsSnapshot,
+    current_vs: &'a VitalSigns,
+    current_counts: &'a VitalSignsCounts,
+    current_score: Option<f64>,
+    metrics: Vec<TrendMetric>,
+}
+
+impl TrendBuilder<'_> {
+    fn new<'a>(
+        prev: &'a VitalSignsSnapshot,
+        current_vs: &'a VitalSigns,
+        current_counts: &'a VitalSignsCounts,
+        current_score: Option<f64>,
+    ) -> TrendBuilder<'a> {
+        TrendBuilder {
+            prev,
+            current_vs,
+            current_counts,
+            current_score,
+            metrics: Vec::new(),
+        }
+    }
+
+    fn build(mut self) -> Vec<TrendMetric> {
+        self.add_score_metric();
+        self.add_dead_code_metrics();
+        self.add_complexity_metrics();
+        self.add_dependency_metrics();
+        self.add_structure_metrics();
+        self.metrics
+    }
+
+    fn push(&mut self, input: TrendMetricInput) {
+        self.metrics.push(make_metric(input));
+    }
+
+    fn add_score_metric(&mut self) {
+        if let (Some(prev_score), Some(cur_score)) = (self.prev.score, self.current_score) {
+            self.push(TrendMetricInput {
+                name: "score",
+                label: "Health Score",
+                previous: prev_score,
+                current: cur_score,
+                unit: "",
+                higher_is_better: true,
+                previous_count: None,
+                current_count: None,
+            });
+        }
+    }
+
+    fn add_dead_code_metrics(&mut self) {
+        if let (Some(prev_val), Some(cur_val)) = (
+            self.prev.vital_signs.dead_file_pct,
+            self.current_vs.dead_file_pct,
+        ) {
+            self.push(TrendMetricInput {
+                name: "dead_file_pct",
+                label: "Dead Files",
+                previous: prev_val,
+                current: cur_val,
+                unit: "%",
+                higher_is_better: false,
+                previous_count: Some(TrendCount {
+                    value: self.prev.counts.dead_files,
+                    total: self.prev.counts.total_files,
+                }),
+                current_count: Some(TrendCount {
+                    value: self.current_counts.dead_files,
+                    total: self.current_counts.total_files,
+                }),
+            });
+        }
+
+        if let (Some(prev_val), Some(cur_val)) = (
+            self.prev.vital_signs.dead_export_pct,
+            self.current_vs.dead_export_pct,
+        ) {
+            self.push(TrendMetricInput {
+                name: "dead_export_pct",
+                label: "Dead Exports",
+                previous: prev_val,
+                current: cur_val,
+                unit: "%",
+                higher_is_better: false,
+                previous_count: Some(TrendCount {
+                    value: self.prev.counts.dead_exports,
+                    total: self.prev.counts.total_exports,
+                }),
+                current_count: Some(TrendCount {
+                    value: self.current_counts.dead_exports,
+                    total: self.current_counts.total_exports,
+                }),
+            });
+        }
+    }
+
+    fn add_complexity_metrics(&mut self) {
+        self.push(TrendMetricInput {
+            name: "avg_cyclomatic",
+            label: "Avg Cyclomatic",
+            previous: self.prev.vital_signs.avg_cyclomatic,
+            current: self.current_vs.avg_cyclomatic,
+            unit: "",
+            higher_is_better: false,
+            previous_count: None,
+            current_count: None,
+        });
+
+        if let (Some(prev_val), Some(cur_val)) = (
+            self.prev.vital_signs.maintainability_avg,
+            self.current_vs.maintainability_avg,
+        ) {
+            self.push(TrendMetricInput {
+                name: "maintainability_avg",
+                label: "Maintainability",
+                previous: prev_val,
+                current: cur_val,
+                unit: "",
+                higher_is_better: true,
+                previous_count: None,
+                current_count: None,
+            });
+        }
+
+        if let (Some(prev_profile), Some(cur_profile)) = (
+            &self.prev.vital_signs.unit_size_profile,
+            &self.current_vs.unit_size_profile,
+        ) {
+            self.push(TrendMetricInput {
+                name: "unit_size_very_high_pct",
+                label: "Oversized Fns",
+                previous: prev_profile.very_high_risk,
+                current: cur_profile.very_high_risk,
+                unit: "%",
+                higher_is_better: false,
+                previous_count: None,
+                current_count: None,
+            });
+        }
+
+        self.add_duplication_metric();
+    }
+
+    fn add_duplication_metric(&mut self) {
+        if let (Some(prev_val), Some(cur_val)) = (
+            self.prev.vital_signs.duplication_pct,
+            self.current_vs.duplication_pct,
+        ) {
+            self.push(TrendMetricInput {
+                name: "duplication_pct",
+                label: "Duplication",
+                previous: prev_val,
+                current: cur_val,
+                unit: "%",
+                higher_is_better: false,
+                previous_count: self
+                    .prev
+                    .counts
+                    .duplicated_lines
+                    .zip(self.prev.counts.total_lines)
+                    .map(|(d, t)| TrendCount { value: d, total: t }),
+                current_count: self
+                    .current_counts
+                    .duplicated_lines
+                    .zip(self.current_counts.total_lines)
+                    .map(|(d, t)| TrendCount { value: d, total: t }),
+            });
+        }
+    }
+
+    fn add_dependency_metrics(&mut self) {
+        if let (Some(prev_val), Some(cur_val)) = (
+            self.prev.vital_signs.unused_dep_count,
+            self.current_vs.unused_dep_count,
+        ) {
+            self.push(TrendMetricInput {
+                name: "unused_dep_count",
+                label: "Unused Deps",
+                previous: f64::from(prev_val),
+                current: f64::from(cur_val),
+                unit: "",
+                higher_is_better: false,
+                previous_count: None,
+                current_count: None,
+            });
+        }
+    }
+
+    fn add_structure_metrics(&mut self) {
+        if let (Some(prev_val), Some(cur_val)) = (
+            self.prev.vital_signs.circular_dep_count,
+            self.current_vs.circular_dep_count,
+        ) {
+            self.push(TrendMetricInput {
+                name: "circular_dep_count",
+                label: "Circular Deps",
+                previous: f64::from(prev_val),
+                current: f64::from(cur_val),
+                unit: "",
+                higher_is_better: false,
+                previous_count: None,
+                current_count: None,
+            });
+        }
+
+        if let (Some(prev_val), Some(cur_val)) = (
+            self.prev.vital_signs.hotspot_count,
+            self.current_vs.hotspot_count,
+        ) {
+            self.push(TrendMetricInput {
+                name: "hotspot_count",
+                label: "Hotspots",
+                previous: f64::from(prev_val),
+                current: f64::from(cur_val),
+                unit: "",
+                higher_is_better: false,
+                previous_count: None,
+                current_count: None,
+            });
+        }
+
+        if let (Some(prev_val), Some(cur_val)) =
+            (self.prev.vital_signs.p95_fan_in, self.current_vs.p95_fan_in)
+        {
+            self.push(TrendMetricInput {
+                name: "p95_fan_in",
+                label: "P95 Fan-in",
+                previous: f64::from(prev_val),
+                current: f64::from(cur_val),
+                unit: "",
+                higher_is_better: false,
+                previous_count: None,
+                current_count: None,
+            });
+        }
+    }
+}
+
+/// Build a single trend metric.
+struct TrendMetricInput {
+    name: &'static str,
+    label: &'static str,
+    previous: f64,
+    current: f64,
+    unit: &'static str,
+    higher_is_better: bool,
+    previous_count: Option<TrendCount>,
+    current_count: Option<TrendCount>,
+}
+
+fn make_metric(input: TrendMetricInput) -> TrendMetric {
+    let TrendMetricInput {
+        name,
+        label,
+        previous,
+        current,
+        unit,
+        higher_is_better,
+        previous_count,
+        current_count,
+    } = input;
+    let delta = (current - previous).round_to(1);
+    let direction = if delta.abs() < TREND_TOLERANCE {
+        TrendDirection::Stable
+    } else if (higher_is_better && delta > 0.0) || (!higher_is_better && delta < 0.0) {
+        TrendDirection::Improving
+    } else {
+        TrendDirection::Declining
+    };
+
+    TrendMetric {
+        name,
+        label,
+        previous,
+        current,
+        delta,
+        direction,
+        unit,
+        previous_count,
+        current_count,
+    }
+}
+
+/// Extension trait for rounding floats to N decimal places.
+trait RoundTo {
+    fn round_to(self, decimals: u32) -> Self;
+}
+
+impl RoundTo for f64 {
+    fn round_to(self, decimals: u32) -> Self {
+        let factor = 10_f64.powi(decimals as i32);
+        (self * factor).round() / factor
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_module(id: u32, cyclomatic: u16) -> crate::source::ModuleInfo {
+        crate::source::ModuleInfo {
+            complexity: vec![fallow_types::extract::FunctionComplexity {
+                name: format!("fn_{id}"),
+                is_private_member: false,
+                line: id + 1,
+                col: 0,
+                cyclomatic,
+                cognitive: 0,
+                line_count: 10,
+                param_count: 0,
+                react_hook_count: 0,
+                react_jsx_max_depth: 0,
+                react_prop_count: 0,
+                source_hash: None,
+                contributions: Vec::new(),
+            }],
+            ..crate::source::ModuleInfo::empty(crate::discover::FileId(id))
+        }
+    }
+
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "test values are trivially small"
+    )]
+    fn make_modules() -> Vec<crate::source::ModuleInfo> {
+        (0..10)
+            .map(|i| make_module(i, (i as u16 + 1) * 2))
+            .collect()
+    }
+
+    fn assert_close(actual: f64, expected: f64) {
+        assert!(
+            (actual - expected).abs() < f64::EPSILON,
+            "expected {expected}, got {actual}"
+        );
+    }
+
+    fn assert_some_close(actual: Option<f64>, expected: f64) {
+        assert_close(actual.expect("expected metric to be present"), expected);
+    }
+
+    #[test]
+    fn compute_cyclomatic_stats() {
+        let modules = make_modules();
+        let input = VitalSignsInput {
+            modules: &modules,
+            module_filter: None,
+            file_scores: None,
+            hotspots: None,
+            total_files: 10,
+            analysis_counts: None,
+        };
+        let vs = compute_vital_signs(&input);
+        assert!((vs.avg_cyclomatic - 11.0).abs() < f64::EPSILON);
+        assert_eq!(vs.p90_cyclomatic, 18);
+    }
+
+    #[test]
+    fn compute_with_analysis_counts() {
+        let modules = make_modules();
+        let input = VitalSignsInput {
+            modules: &modules,
+            module_filter: None,
+            file_scores: None,
+            hotspots: None,
+            total_files: 100,
+            analysis_counts: Some(AnalysisCounts {
+                total_exports: 500,
+                dead_files: 5,
+                dead_exports: 50,
+                unused_deps: 3,
+                circular_deps: 2,
+                total_deps: 40,
+            }),
+        };
+        let vs = compute_vital_signs(&input);
+        assert_eq!(vs.dead_file_pct, Some(5.0)); // 5/100 * 100
+        assert_eq!(vs.dead_export_pct, Some(10.0)); // 50/500 * 100
+        assert_eq!(vs.unused_dep_count, Some(3));
+        assert_eq!(vs.circular_dep_count, Some(2));
+    }
+
+    #[test]
+    fn compute_hotspot_count_with_threshold() {
+        let hotspots = vec![
+            HotspotEntry {
+                path: PathBuf::from("a.ts"),
+                score: 80.0,
+                commits: 10,
+                weighted_commits: 8.0,
+                lines_added: 100,
+                lines_deleted: 50,
+                complexity_density: 0.5,
+                fan_in: 5,
+                trend: crate::churn::ChurnTrend::Stable,
+                ownership: None,
+                is_test_path: false,
+            },
+            HotspotEntry {
+                path: PathBuf::from("b.ts"),
+                score: 30.0, // Below threshold
+                commits: 5,
+                weighted_commits: 3.0,
+                lines_added: 40,
+                lines_deleted: 20,
+                complexity_density: 0.2,
+                fan_in: 2,
+                trend: crate::churn::ChurnTrend::Cooling,
+                ownership: None,
+                is_test_path: false,
+            },
+            HotspotEntry {
+                path: PathBuf::from("c.ts"),
+                score: 50.0, // At threshold
+                commits: 8,
+                weighted_commits: 6.0,
+                lines_added: 80,
+                lines_deleted: 30,
+                complexity_density: 0.4,
+                fan_in: 3,
+                trend: crate::churn::ChurnTrend::Accelerating,
+                ownership: None,
+                is_test_path: false,
+            },
+        ];
+        let modules = Vec::new();
+        let input = VitalSignsInput {
+            modules: &modules,
+            module_filter: None,
+            file_scores: None,
+            hotspots: Some(&hotspots),
+            total_files: 10,
+            analysis_counts: None,
+        };
+        let vs = compute_vital_signs(&input);
+        assert_eq!(vs.hotspot_count, Some(2)); // 80.0 and 50.0 meet threshold
+        assert_eq!(vs.hotspot_top_pct_count, Some(1)); // top 1% bucket rounds up to one file
+    }
+
+    #[test]
+    fn compute_without_hotspots_gives_none() {
+        let modules = Vec::new();
+        let input = VitalSignsInput {
+            modules: &modules,
+            module_filter: None,
+            file_scores: None,
+            hotspots: None,
+            total_files: 0,
+            analysis_counts: None,
+        };
+        let vs = compute_vital_signs(&input);
+        assert!(vs.hotspot_count.is_none());
+    }
+
+    #[test]
+    fn snapshot_save_and_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let vs = VitalSigns {
+            dead_file_pct: Some(3.2),
+            dead_export_pct: Some(8.1),
+            avg_cyclomatic: 4.7,
+            p90_cyclomatic: 12,
+            hotspot_count: Some(5),
+            maintainability_avg: Some(72.4),
+            unused_dep_count: Some(4),
+            circular_dep_count: Some(2),
+            ..Default::default()
+        };
+        let counts = VitalSignsCounts {
+            total_files: 1200,
+            total_exports: 5400,
+            dead_files: 38,
+            dead_exports: 437,
+            files_scored: Some(1150),
+            total_deps: 42,
+            ..Default::default()
+        };
+        let health_score = compute_health_score(&vs, 1200);
+        let snapshot = build_snapshot(
+            vs,
+            counts,
+            root,
+            false,
+            Some(&health_score),
+            None,
+            fallow_types::semantic::SemanticAnalysisIdentity::default(),
+        );
+        let saved_path = save_snapshot(&snapshot, root, None).unwrap();
+
+        assert!(saved_path.exists());
+        assert!(saved_path.starts_with(root.join(".fallow/snapshots")));
+
+        let content = std::fs::read_to_string(&saved_path).unwrap();
+        let loaded: VitalSignsSnapshot = serde_json::from_str(&content).unwrap();
+        assert_eq!(loaded.snapshot_schema_version, SNAPSHOT_SCHEMA_VERSION);
+        assert!((loaded.vital_signs.avg_cyclomatic - 4.7).abs() < f64::EPSILON);
+        assert_eq!(loaded.counts.total_files, 1200);
+        assert!(loaded.score.is_some());
+        assert!(loaded.grade.is_some());
+    }
+
+    #[test]
+    fn snapshot_save_explicit_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let explicit = root.join("my-snapshot.json");
+        let vs = VitalSigns {
+            avg_cyclomatic: 1.0,
+            p90_cyclomatic: 2,
+            ..Default::default()
+        };
+        let counts = VitalSignsCounts::default();
+        let snapshot = build_snapshot(
+            vs,
+            counts,
+            root,
+            false,
+            None,
+            None,
+            fallow_types::semantic::SemanticAnalysisIdentity::default(),
+        );
+        let saved = save_snapshot(&snapshot, root, Some(&explicit)).unwrap();
+        assert_eq!(saved, explicit);
+        assert!(explicit.exists());
+    }
+
+    #[test]
+    fn snapshot_save_creates_nested_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let nested = root.join("a/b/c/snapshot.json");
+        let vs = VitalSigns {
+            avg_cyclomatic: 1.0,
+            p90_cyclomatic: 2,
+            ..Default::default()
+        };
+        let counts = VitalSignsCounts::default();
+        let snapshot = build_snapshot(
+            vs,
+            counts,
+            root,
+            false,
+            None,
+            None,
+            fallow_types::semantic::SemanticAnalysisIdentity::default(),
+        );
+        let saved = save_snapshot(&snapshot, root, Some(&nested)).unwrap();
+        assert_eq!(saved, nested);
+        assert!(nested.exists());
+    }
+
+    #[test]
+    fn days_to_ymd_epoch() {
+        assert_eq!(days_to_ymd(0), (1970, 1, 1));
+    }
+
+    #[test]
+    fn days_to_ymd_known_date() {
+        assert_eq!(days_to_ymd(20_537), (2026, 3, 25));
+    }
+
+    #[test]
+    fn health_score_perfect() {
+        let vs = VitalSigns {
+            dead_file_pct: Some(0.0),
+            dead_export_pct: Some(0.0),
+            avg_cyclomatic: 1.0,
+            p90_cyclomatic: 2,
+            hotspot_count: Some(0),
+            maintainability_avg: Some(90.0),
+            unused_dep_count: Some(0),
+            circular_dep_count: Some(0),
+            ..Default::default()
+        };
+        let score = compute_health_score(&vs, 100);
+        assert!((score.score - 100.0).abs() < f64::EPSILON);
+        assert_eq!(score.grade, "A");
+    }
+
+    #[test]
+    fn health_score_no_optional_metrics() {
+        let vs = VitalSigns {
+            avg_cyclomatic: 1.0,
+            p90_cyclomatic: 2,
+            ..Default::default()
+        };
+        let score = compute_health_score(&vs, 0);
+        assert!((score.score - 100.0).abs() < f64::EPSILON);
+        assert_eq!(score.grade, "A");
+        assert!(score.penalties.dead_files.is_none());
+        assert!(score.penalties.unused_deps.is_none());
+        assert!(score.penalties.duplication.is_none());
+    }
+
+    #[test]
+    fn health_score_dead_code_penalty() {
+        let vs = VitalSigns {
+            dead_file_pct: Some(50.0),
+            dead_export_pct: Some(30.0),
+            avg_cyclomatic: 1.0,
+            p90_cyclomatic: 2,
+            ..Default::default()
+        };
+        let score = compute_health_score(&vs, 100);
+        assert!((score.score - 84.0).abs() < 0.1);
+        assert_eq!(score.grade, "B");
+    }
+
+    #[test]
+    fn health_score_complexity_penalty() {
+        let vs = VitalSigns {
+            avg_cyclomatic: 5.5,
+            p90_cyclomatic: 15,
+            ..Default::default()
+        };
+        let score = compute_health_score(&vs, 100);
+        assert!((score.score - 75.0).abs() < 0.1);
+        assert_eq!(score.grade, "B");
+    }
+
+    #[test]
+    fn health_score_prop_drilling_penalty_opt_in() {
+        let base = || VitalSigns {
+            avg_cyclomatic: 1.0,
+            p90_cyclomatic: 2,
+            ..Default::default()
+        };
+        let base_score = compute_health_score(&base(), 100).score;
+
+        // Each located chain costs 1pt (depth is descriptive, not a multiplier).
+        let three = VitalSigns {
+            prop_drilling_chain_count: Some(3),
+            prop_drilling_max_depth: Some(5),
+            ..base()
+        };
+        assert!((base_score - compute_health_score(&three, 100).score - 3.0).abs() < 0.1);
+
+        // Capped at 5pt regardless of chain count.
+        let many = VitalSigns {
+            prop_drilling_chain_count: Some(20),
+            ..base()
+        };
+        assert!((base_score - compute_health_score(&many, 100).score - 5.0).abs() < 0.1);
+
+        // Dormant by default: the opt-in rule is off, so the count is `None` and
+        // the score is unchanged.
+        let off = VitalSigns {
+            prop_drilling_chain_count: None,
+            ..base()
+        };
+        assert!((base_score - compute_health_score(&off, 100).score).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn health_score_clamped_at_zero() {
+        let vs = VitalSigns {
+            dead_file_pct: Some(100.0),
+            dead_export_pct: Some(100.0),
+            avg_cyclomatic: 10.0,
+            p90_cyclomatic: 30,
+            hotspot_count: Some(50),
+            maintainability_avg: Some(20.0),
+            unused_dep_count: Some(100),
+            circular_dep_count: Some(50),
+            ..Default::default()
+        };
+        let score = compute_health_score(&vs, 100);
+        assert!((score.score).abs() < f64::EPSILON);
+        assert_eq!(score.grade, "F");
+    }
+
+    #[test]
+    fn health_score_hotspot_normalized_by_files() {
+        let vs = VitalSigns {
+            avg_cyclomatic: 1.0,
+            p90_cyclomatic: 2,
+            hotspot_count: Some(5),
+            ..Default::default()
+        };
+        let score_100 = compute_health_score(&vs, 100);
+        let score_1000 = compute_health_score(&vs, 1000);
+        assert!(score_1000.score > score_100.score);
+    }
+
+    #[test]
+    fn health_score_hotspot_top_pct_can_use_full_budget() {
+        let vs = VitalSigns {
+            avg_cyclomatic: 1.0,
+            p90_cyclomatic: 2,
+            hotspot_count: Some(0),
+            hotspot_top_pct_count: Some(250),
+            ..Default::default()
+        };
+
+        let score = compute_health_score(&vs, 25_000);
+
+        assert_some_close(score.penalties.hotspots, 10.0);
+        assert_close(score.score, 90.0);
+    }
+
+    #[test]
+    fn health_score_duplication_penalty() {
+        let vs = VitalSigns {
+            dead_file_pct: None,
+            dead_export_pct: None,
+            avg_cyclomatic: 1.0,
+            critical_complexity_pct: None,
+            p90_cyclomatic: 2,
+            duplication_pct: Some(10.0), // 10% - 5% = 5 points
+            hotspot_count: None,
+            hotspot_top_pct_count: None,
+            maintainability_avg: None,
+            maintainability_low_pct: None,
+            unused_dep_count: None,
+            unused_deps_per_k_files: None,
+            circular_dep_count: None,
+            circular_deps_per_k_files: None,
+            counts: None,
+            unit_size_profile: None,
+            functions_over_60_loc_per_k: None,
+            unit_interfacing_profile: None,
+            p95_fan_in: None,
+            coupling_high_pct: None,
+            prop_drilling_chain_count: None,
+            prop_drilling_max_depth: None,
+            p95_render_fan_in: None,
+            render_fan_in_high_pct: None,
+            max_render_fan_in: None,
+            top_render_fan_in: Vec::new(),
+            total_loc: 0,
+        };
+        let score = compute_health_score(&vs, 100);
+        assert_eq!(score.penalties.duplication, Some(5.0));
+
+        let vs_low = VitalSigns {
+            duplication_pct: Some(4.0),
+            ..vs.clone()
+        };
+        let score_low = compute_health_score(&vs_low, 100);
+        assert_eq!(score_low.penalties.duplication, Some(0.0));
+
+        let vs_high = VitalSigns {
+            duplication_pct: Some(20.0),
+            ..vs
+        };
+        let score_high = compute_health_score(&vs_high, 100);
+        assert_eq!(score_high.penalties.duplication, Some(10.0));
+    }
+
+    #[test]
+    fn health_score_uses_scale_invariant_monorepo_signals() {
+        let vs = VitalSigns {
+            dead_file_pct: Some(4.0),
+            dead_export_pct: Some(9.0),
+            avg_cyclomatic: 2.3,
+            critical_complexity_pct: Some(2.3),
+            p90_cyclomatic: 4,
+            duplication_pct: Some(6.0),
+            hotspot_count: Some(0),
+            hotspot_top_pct_count: Some(250),
+            maintainability_avg: Some(91.0),
+            maintainability_low_pct: Some(8.0),
+            unused_dep_count: Some(180),
+            unused_deps_per_k_files: Some(7.2),
+            circular_dep_count: Some(450),
+            circular_deps_per_k_files: Some(18.0),
+            unit_size_profile: Some(RiskProfile {
+                low_risk: 80.0,
+                medium_risk: 12.7,
+                high_risk: 5.0,
+                very_high_risk: 2.3,
+            }),
+            functions_over_60_loc_per_k: Some(23.0),
+            p95_fan_in: Some(7),
+            coupling_high_pct: Some(4.0),
+            ..Default::default()
+        };
+        let score = compute_health_score(&vs, 25_000);
+        let penalties = &score.penalties;
+
+        assert_some_close(penalties.dead_files, 0.8);
+        assert_some_close(penalties.dead_exports, 1.8);
+        assert_close(penalties.complexity, 9.2);
+        assert!((penalties.p90_complexity).abs() < f64::EPSILON);
+        assert_some_close(penalties.maintainability, 12.0);
+        assert_some_close(penalties.hotspots, 10.0);
+        assert_some_close(penalties.unused_deps, 3.6);
+        assert_some_close(penalties.circular_deps, 9.0);
+        assert_some_close(penalties.unit_size, 10.0);
+        assert_some_close(penalties.coupling, 2.0);
+        assert_some_close(penalties.duplication, 1.0);
+        assert_close(score.score, 40.6);
+        assert_eq!(score.grade, "D");
+    }
+
+    #[test]
+    fn load_snapshots_empty_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let snaps = load_snapshots(dir.path());
+        assert!(snaps.is_empty());
+    }
+
+    #[test]
+    fn load_snapshots_returns_sorted() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let snap_dir = root.join(".fallow/snapshots");
+        std::fs::create_dir_all(&snap_dir).unwrap();
+
+        let older = make_test_snapshot("2026-01-01T00:00:00Z", Some(72.0));
+        let newer = make_test_snapshot("2026-03-01T00:00:00Z", Some(78.0));
+
+        std::fs::write(
+            snap_dir.join("2026-03-01T00-00-00Z.json"),
+            serde_json::to_string(&newer).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            snap_dir.join("2026-01-01T00-00-00Z.json"),
+            serde_json::to_string(&older).unwrap(),
+        )
+        .unwrap();
+
+        let loaded = load_snapshots(root);
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].timestamp, "2026-01-01T00:00:00Z");
+        assert_eq!(loaded[1].timestamp, "2026-03-01T00:00:00Z");
+    }
+
+    #[test]
+    fn load_snapshots_skips_corrupt_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let snap_dir = root.join(".fallow/snapshots");
+        std::fs::create_dir_all(&snap_dir).unwrap();
+
+        std::fs::write(snap_dir.join("corrupt.json"), "not valid json").unwrap();
+        let good = make_test_snapshot("2026-02-01T00:00:00Z", Some(80.0));
+        std::fs::write(
+            snap_dir.join("good.json"),
+            serde_json::to_string(&good).unwrap(),
+        )
+        .unwrap();
+
+        let loaded = load_snapshots(root);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].timestamp, "2026-02-01T00:00:00Z");
+    }
+
+    #[test]
+    fn load_snapshots_ignores_non_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let snap_dir = root.join(".fallow/snapshots");
+        std::fs::create_dir_all(&snap_dir).unwrap();
+
+        std::fs::write(snap_dir.join("readme.txt"), "not a snapshot").unwrap();
+
+        let loaded = load_snapshots(root);
+        assert!(loaded.is_empty());
+    }
+
+    #[test]
+    fn compute_trend_no_snapshots() {
+        let vs = make_test_vital_signs();
+        let counts = make_test_counts();
+        assert!(compute_trend(&vs, &counts, Some(78.0), &[]).is_none());
+    }
+
+    #[test]
+    fn compute_trend_improving() {
+        let prev = make_test_snapshot("2026-01-01T00:00:00Z", Some(72.0));
+        let vs = VitalSigns {
+            dead_file_pct: Some(2.8),
+            dead_export_pct: Some(7.5),
+            avg_cyclomatic: 4.1,
+            p90_cyclomatic: 12,
+            hotspot_count: Some(3),
+            maintainability_avg: Some(75.0),
+            unused_dep_count: Some(3),
+            circular_dep_count: Some(1),
+            ..Default::default()
+        };
+        let counts = VitalSignsCounts {
+            total_files: 100,
+            total_exports: 500,
+            dead_files: 3,
+            dead_exports: 38,
+            files_scored: Some(95),
+            total_deps: 40,
+            ..Default::default()
+        };
+
+        let trend = compute_trend(&vs, &counts, Some(78.0), &[prev]).unwrap();
+        assert_eq!(trend.compared_to.timestamp, "2026-01-01T00:00:00Z");
+        assert_eq!(trend.snapshots_loaded, 1);
+        assert_eq!(trend.overall_direction, TrendDirection::Improving);
+
+        let score_metric = trend.metrics.iter().find(|m| m.name == "score").unwrap();
+        assert_eq!(score_metric.direction, TrendDirection::Improving);
+        assert!((score_metric.delta - 6.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn compute_trend_stable_within_tolerance() {
+        let prev = make_test_snapshot("2026-01-01T00:00:00Z", Some(78.0));
+        let vs = make_test_vital_signs();
+        let counts = make_test_counts();
+
+        let trend = compute_trend(&vs, &counts, Some(78.3), &[prev]).unwrap();
+        let score_metric = trend.metrics.iter().find(|m| m.name == "score").unwrap();
+        assert_eq!(score_metric.direction, TrendDirection::Stable);
+    }
+
+    #[test]
+    fn compute_trend_uses_most_recent_snapshot() {
+        let older = make_test_snapshot("2026-01-01T00:00:00Z", Some(60.0));
+        let newer = make_test_snapshot("2026-03-01T00:00:00Z", Some(72.0));
+        let vs = make_test_vital_signs();
+        let counts = make_test_counts();
+
+        let trend = compute_trend(&vs, &counts, Some(78.0), &[older, newer]).unwrap();
+        assert_eq!(trend.compared_to.score, Some(72.0));
+        assert_eq!(trend.snapshots_loaded, 2);
+    }
+
+    #[test]
+    fn compute_trend_includes_raw_counts() {
+        let prev = make_test_snapshot("2026-01-01T00:00:00Z", Some(72.0));
+        let vs = make_test_vital_signs();
+        let counts = make_test_counts();
+
+        let trend = compute_trend(&vs, &counts, Some(78.0), &[prev]).unwrap();
+        let dead_files = trend
+            .metrics
+            .iter()
+            .find(|m| m.name == "dead_file_pct")
+            .unwrap();
+        assert!(dead_files.previous_count.is_some());
+        assert!(dead_files.current_count.is_some());
+    }
+
+    fn make_test_vital_signs() -> VitalSigns {
+        VitalSigns {
+            dead_file_pct: Some(3.2),
+            dead_export_pct: Some(8.1),
+            avg_cyclomatic: 4.2,
+            p90_cyclomatic: 12,
+            hotspot_count: Some(5),
+            maintainability_avg: Some(72.4),
+            unused_dep_count: Some(4),
+            circular_dep_count: Some(2),
+            ..Default::default()
+        }
+    }
+
+    fn make_test_counts() -> VitalSignsCounts {
+        VitalSignsCounts {
+            total_files: 100,
+            total_exports: 500,
+            dead_files: 3,
+            dead_exports: 40,
+            files_scored: Some(95),
+            total_deps: 42,
+            ..Default::default()
+        }
+    }
+
+    fn make_test_snapshot(timestamp: &str, score: Option<f64>) -> VitalSignsSnapshot {
+        VitalSignsSnapshot {
+            snapshot_schema_version: SNAPSHOT_SCHEMA_VERSION,
+            version: "2.5.5".into(),
+            timestamp: timestamp.into(),
+            git_sha: Some("abc1234".into()),
+            git_branch: Some("main".into()),
+            shallow_clone: false,
+            vital_signs: VitalSigns {
+                dead_file_pct: Some(3.2),
+                dead_export_pct: Some(8.1),
+                avg_cyclomatic: 4.7,
+                p90_cyclomatic: 12,
+                hotspot_count: Some(5),
+                maintainability_avg: Some(72.4),
+                unused_dep_count: Some(4),
+                circular_dep_count: Some(2),
+                ..Default::default()
+            },
+            counts: VitalSignsCounts {
+                total_files: 100,
+                total_exports: 500,
+                dead_files: 3,
+                dead_exports: 40,
+                files_scored: Some(95),
+                total_deps: 42,
+                ..Default::default()
+            },
+            score,
+            grade: score.map(|s| letter_grade(s).to_string()),
+            coverage_model: None,
+            analysis_identity: fallow_types::semantic::SemanticAnalysisIdentity::default(),
+        }
+    }
+}

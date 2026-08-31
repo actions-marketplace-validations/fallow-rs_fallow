@@ -1,3 +1,9 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "tests and benches use unwrap and expect to keep fixture setup concise"
+)]
+
 #[path = "common/mod.rs"]
 mod common;
 
@@ -61,8 +67,6 @@ fn run_git(dir: &Path, args: &[&str]) {
     let status = Command::new("git")
         .args(args)
         .current_dir(dir)
-        // Parent git context can override via GIT_DIR / GIT_WORK_TREE; clear both
-        // so the pre-push hook's env doesn't leak commits into the real repo.
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -93,10 +97,6 @@ fn touch_and_commit(dir: &Path, rel_path: &str, contents: &str, message: &str) {
         &["-c", "commit.gpgsign=false", "commit", "-m", message],
     );
 }
-
-// ────────────────────────────────────────────────────────────────
-// Happy path: scopes to workspaces containing changed files.
-// ────────────────────────────────────────────────────────────────
 
 #[test]
 fn changed_workspaces_scopes_to_workspaces_with_changes() {
@@ -214,10 +214,6 @@ fn changed_workspaces_scopes_to_workspace_with_untracked_file() {
     );
 }
 
-// ────────────────────────────────────────────────────────────────
-// CLI-layer conflict detection.
-// ────────────────────────────────────────────────────────────────
-
 #[test]
 fn workspace_and_changed_workspaces_are_mutually_exclusive() {
     let tmp = create_monorepo_fixture();
@@ -245,10 +241,6 @@ fn workspace_and_changed_workspaces_are_mutually_exclusive() {
     );
 }
 
-// ────────────────────────────────────────────────────────────────
-// Git-failure is a hard error (not silent full-scope fallback).
-// ────────────────────────────────────────────────────────────────
-
 #[test]
 fn changed_workspaces_bad_ref_is_hard_error() {
     let tmp = create_monorepo_fixture();
@@ -270,7 +262,6 @@ fn changed_workspaces_bad_ref_is_hard_error() {
         "unknown ref should cause a non-zero exit so CI notices instead of \
          silently widening analysis back to the full monorepo"
     );
-    // Either JSON error on stdout or plaintext error on stderr.
     let combined = format!("{}\n{}", output.stdout, output.stderr);
     assert!(
         combined.contains("--changed-workspaces"),
@@ -278,13 +269,8 @@ fn changed_workspaces_bad_ref_is_hard_error() {
     );
 }
 
-// ────────────────────────────────────────────────────────────────
-// No workspaces in repo -> targeted error.
-// ────────────────────────────────────────────────────────────────
-
 #[test]
 fn changed_workspaces_without_monorepo_errors() {
-    // Single-package project, no `workspaces` field.
     let tmp = TempDir::new().unwrap();
     let dir = tmp.path();
     fs::create_dir_all(dir.join("src")).unwrap();
@@ -312,10 +298,6 @@ fn changed_workspaces_without_monorepo_errors() {
         "expected 'no workspaces found' error, got:\n{combined}"
     );
 }
-
-// ────────────────────────────────────────────────────────────────
-// Root-only changes map to zero workspaces (silent no-op success).
-// ────────────────────────────────────────────────────────────────
 
 #[test]
 fn changed_workspaces_root_only_diff_scopes_to_empty() {

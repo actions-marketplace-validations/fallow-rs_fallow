@@ -1,48 +1,184 @@
+//! fallow-core is the internal implementation crate behind the `fallow`
+//! analyzer. External embedders should consume the curated programmatic
+//! surface at `fallow_api` (e.g. `run_dead_code`,
+//! `run_boundary_violations`, `run_duplication`, `run_health`). The typed
+//! `run_*` functions are the primary embedder contract; serialize typed output
+//! with the matching `serialize_*_programmatic_json` helper only at a protocol
+//! boundary. See `docs/fallow-core-migration.md`
+//! for the function-by-function migration map. Items in this crate may change
+//! in any release, including patch releases. Publishing remains transitional
+//! while `fallow-engine` still depends on core internals.
+
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        reason = "tests use unwrap and expect to keep fixture setup concise"
+    )
+)]
+
 pub mod analyze;
 pub mod cache;
-pub mod churn;
-pub mod cross_reference;
 pub mod discover;
-pub mod duplicates;
 pub(crate) mod errors;
 mod external_style_usage;
 pub mod extract;
+pub mod git_env;
+mod package_assets;
 pub mod plugins;
 pub(crate) mod progress;
 pub mod results;
 pub(crate) mod scripts;
+/// Public hook for the fuzz harness (fuzz/fuzz_targets/fuzz_scripts.rs) only;
+/// not a supported API. The module itself stays crate-private.
+#[doc(hidden)]
+pub use scripts::parse_script;
 pub mod suppress;
-pub mod trace;
 
-// Re-export from fallow-graph for backwards compatibility
+pub use fallow_graph::cache as graph_cache;
 pub use fallow_graph::graph;
 pub use fallow_graph::project;
 pub use fallow_graph::resolve;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use errors::FallowError;
 use fallow_config::{
-    EntryPointRole, PackageJson, ResolvedConfig, discover_workspaces, find_undeclared_workspaces,
+    EntryPointRole, PackageJson, ResolvedConfig, discover_workspaces_with_diagnostics,
+    find_undeclared_workspaces_with_ignores,
 };
+use fallow_types::trace::PipelineTimings;
 use rayon::prelude::*;
 use results::AnalysisResults;
-use trace::PipelineTimings;
+use rustc_hash::FxHashSet;
 
 const UNDECLARED_WORKSPACE_WARNING_PREVIEW: usize = 5;
-type LoadedWorkspacePackage<'a> = (&'a fallow_config::WorkspaceInfo, PackageJson);
+type LoadedWorkspacePackage = (fallow_config::WorkspaceInfo, PackageJson);
+
+fn record_graph_package_usage(
+    graph: &mut graph::ModuleGraph,
+    package_name: &str,
+    file_id: discover::FileId,
+    is_type_only: bool,
+) {
+    graph
+        .package_usage
+        .entry(package_name.to_owned())
+        .or_default()
+        .push(file_id);
+    if is_type_only {
+        graph
+            .type_only_package_usage
+            .entry(package_name.to_owned())
+            .or_default()
+            .push(file_id);
+    }
+}
+
+fn workspace_package_name<'a>(
+    source: &str,
+    workspace_names: &FxHashSet<&'a str>,
+) -> Option<&'a str> {
+    if !resolve::is_bare_specifier(source) {
+        return None;
+    }
+    let package_name = resolve::extract_package_name(source);
+    workspace_names.get(package_name.as_str()).copied()
+}
+
+fn credit_workspace_package_usage(
+    graph: &mut graph::ModuleGraph,
+    resolved: &[resolve::ResolvedModule],
+    workspaces: &[fallow_config::WorkspaceInfo],
+) {
+    if workspaces.is_empty() {
+        return;
+    }
+
+    let workspace_names: FxHashSet<&str> = workspaces.iter().map(|ws| ws.name.as_str()).collect();
+    for module in resolved {
+        for import in module.all_resolved_imports() {
+            if matches!(
+                import.target,
+                resolve::ResolveResult::InternalModule(_)
+                    | resolve::ResolveResult::CommonJsInternalModule(_)
+            ) && let Some(package_name) =
+                workspace_package_name(&import.info.source, &workspace_names)
+            {
+                record_graph_package_usage(
+                    graph,
+                    package_name,
+                    module.file_id,
+                    import.info.is_type_only,
+                );
+            }
+        }
+
+        for re_export in &module.re_exports {
+            if matches!(re_export.target, resolve::ResolveResult::InternalModule(_))
+                && let Some(package_name) =
+                    workspace_package_name(&re_export.info.source, &workspace_names)
+            {
+                record_graph_package_usage(
+                    graph,
+                    package_name,
+                    module.file_id,
+                    re_export.info.is_type_only,
+                );
+            }
+        }
+    }
+}
+
+fn credit_package_path_references(graph: &mut graph::ModuleGraph, modules: &[extract::ModuleInfo]) {
+    for module in modules {
+        for package_name in &module.package_path_references {
+            record_graph_package_usage(graph, package_name, module.file_id, false);
+        }
+    }
+}
 
 /// Result of the full analysis pipeline, including optional performance timings.
+#[doc(hidden)]
 pub struct AnalysisOutput {
     pub results: AnalysisResults,
     pub timings: Option<PipelineTimings>,
     pub graph: Option<graph::ModuleGraph>,
     /// Parsed modules from the pipeline, available when `retain_modules` is true.
-    /// Used by the combined command to share a single parse across dead-code and health.
+    /// Used by combined and LSP flows to share downstream module data.
+    /// Graph-only extraction payloads are released after graph construction.
     pub modules: Option<Vec<extract::ModuleInfo>>,
     /// Discovered files from the pipeline, available when `retain_modules` is true.
     pub files: Option<Vec<discover::DiscoveredFile>>,
+    /// Package names invoked from package.json scripts and CI configs, mirroring
+    /// what the unused-deps detector consults. Populated for every pipeline run;
+    /// trace tooling reads it so `trace_dependency` agrees with `unused-deps` on
+    /// "used vs unused" instead of returning false-negatives for script-only deps.
+    pub script_used_packages: rustc_hash::FxHashSet<String>,
+    /// xxh3 content hash of every parsed source file, keyed by absolute path.
+    /// Used by `fallow fix` to detect on-disk drift between the in-process
+    /// analysis read and the per-file write; if the file's current hash
+    /// differs from the captured value, the fix for that file is skipped
+    /// with a clear diagnostic and exit 2. The hash is the same value
+    /// extract/cache uses for cache invalidation, so a cached parse contributes
+    /// the same hash as a fresh parse. Roughly 8 bytes per file (negligible
+    /// memory cost even on 100k-file projects).
+    pub file_hashes: rustc_hash::FxHashMap<std::path::PathBuf, u64>,
+}
+
+/// Parse/cache phase metrics supplied by callers that own parsing before
+/// handing modules back to the core detector backend.
+#[derive(Debug, Clone, Copy)]
+#[doc(hidden)]
+pub struct AnalysisParseMetrics {
+    parse_ms: f64,
+    cache_ms: f64,
+    cache_hits: usize,
+    cache_misses: usize,
+    parse_cpu_ms: f64,
 }
 
 /// Update cache: write freshly parsed modules and refresh stale mtime/size entries.
@@ -50,35 +186,53 @@ fn update_cache(
     store: &mut cache::CacheStore,
     modules: &[extract::ModuleInfo],
     files: &[discover::DiscoveredFile],
-) {
+) -> bool {
+    let mut dirty = false;
     for module in modules {
         if let Some(file) = files.get(module.file_id.0 as usize) {
-            let (mt, sz) = file_mtime_and_size(&file.path);
-            // If content hash matches, just refresh mtime/size if stale (e.g. `touch`ed file)
+            let fingerprint = file_fingerprint(&file.path);
             if let Some(cached) = store.get_by_path_only(&file.path)
                 && cached.content_hash == module.content_hash
             {
-                if cached.mtime_secs != mt || cached.file_size != sz {
-                    store.insert(&file.path, cache::module_to_cached(module, mt, sz));
+                if cached.source_fingerprint() != fingerprint {
+                    let preserved_last_access = cached.last_access_secs;
+                    let mut refreshed = cache::module_to_cached(module, fingerprint);
+                    refreshed.last_access_secs = preserved_last_access;
+                    store.insert(&file.path, refreshed);
+                    dirty = true;
                 }
                 continue;
             }
-            store.insert(&file.path, cache::module_to_cached(module, mt, sz));
+            store.insert(&file.path, cache::module_to_cached(module, fingerprint));
+            dirty = true;
         }
     }
-    store.retain_paths(files);
+    let removed_stale_paths = store.retain_paths(files);
+    dirty || removed_stale_paths
 }
 
-/// Extract mtime (seconds since epoch) and file size from a path.
-fn file_mtime_and_size(path: &std::path::Path) -> (u64, u64) {
-    std::fs::metadata(path).map_or((0, 0), |m| {
-        let mt = m
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
-            .map_or(0, |d| d.as_secs());
-        (mt, m.len())
-    })
+/// Resolve `config.cache_max_size_mb` into bytes, falling back to the
+/// extract crate's `DEFAULT_CACHE_MAX_SIZE`. Lives at this layer (not on
+/// `ResolvedConfig`) because `fallow-config` does not depend on
+/// `fallow-extract`; the bytes conversion is owned by the cache callsite.
+/// Public so CLI subcommands that load the cache directly (`flags`,
+/// `health`, `coverage analyze`) can call it without re-deriving the
+/// same fallback policy.
+#[must_use]
+fn resolve_cache_max_size_bytes(config: &ResolvedConfig) -> usize {
+    config
+        .cache_max_size_mb
+        .map_or(cache::DEFAULT_CACHE_MAX_SIZE, |mb| {
+            (mb as usize).saturating_mul(1024 * 1024)
+        })
+}
+
+/// Extract source fingerprint metadata from a path.
+fn file_fingerprint(path: &std::path::Path) -> fallow_types::source_fingerprint::SourceFingerprint {
+    std::fs::metadata(path).map_or(
+        fallow_types::source_fingerprint::SourceFingerprint::new(0, 0),
+        |metadata| fallow_types::source_fingerprint::SourceFingerprint::from_metadata(&metadata),
+    )
 }
 
 fn format_undeclared_workspace_warning(
@@ -138,14 +292,33 @@ fn format_undeclared_workspace_warning(
 fn warn_undeclared_workspaces(
     root: &Path,
     workspaces_vec: &[fallow_config::WorkspaceInfo],
+    ignore_patterns: &globset::GlobSet,
     quiet: bool,
 ) {
-    if quiet {
+    let undeclared = find_undeclared_workspaces_with_ignores(root, workspaces_vec, ignore_patterns);
+    if undeclared.is_empty() {
         return;
     }
 
-    let undeclared = find_undeclared_workspaces(root, workspaces_vec);
-    if let Some(message) = format_undeclared_workspace_warning(root, &undeclared) {
+    let existing = fallow_config::workspace_diagnostics_for(root);
+    let already_flagged: rustc_hash::FxHashSet<PathBuf> = existing
+        .iter()
+        .map(|d| dunce::canonicalize(&d.path).unwrap_or_else(|_| d.path.clone()))
+        .collect();
+    let undeclared: Vec<_> = undeclared
+        .into_iter()
+        .filter(|diag| {
+            let canonical = dunce::canonicalize(&diag.path).unwrap_or_else(|_| diag.path.clone());
+            !already_flagged.contains(&canonical)
+        })
+        .collect();
+    if undeclared.is_empty() {
+        return;
+    }
+
+    fallow_config::append_workspace_diagnostics(root, undeclared.clone());
+
+    if !quiet && let Some(message) = format_undeclared_workspace_warning(root, &undeclared) {
         tracing::warn!("{message}");
     }
 }
@@ -155,6 +328,11 @@ fn warn_undeclared_workspaces(
 /// # Errors
 ///
 /// Returns an error if file discovery, parsing, or analysis fails.
+#[doc(hidden)]
+#[deprecated(
+    since = "2.76.0",
+    note = "fallow_core is internal; use fallow_api::run_dead_code for typed output; serialize with fallow_api::serialize_dead_code_programmatic_json for JSON output. See docs/fallow-core-migration.md."
+)]
 pub fn analyze(config: &ResolvedConfig) -> Result<AnalysisResults, FallowError> {
     let output = analyze_full(config, false, false, false, false)?;
     Ok(output.results)
@@ -165,6 +343,11 @@ pub fn analyze(config: &ResolvedConfig) -> Result<AnalysisResults, FallowError> 
 /// # Errors
 ///
 /// Returns an error if file discovery, parsing, or analysis fails.
+#[doc(hidden)]
+#[deprecated(
+    since = "2.76.0",
+    note = "fallow_core is internal; use fallow_api::run_dead_code for public typed output. NOTE: export-usage collection is not exposed in the programmatic surface today. See docs/fallow-core-migration.md."
+)]
 pub fn analyze_with_usages(config: &ResolvedConfig) -> Result<AnalysisResults, FallowError> {
     let output = analyze_full(config, false, true, false, false)?;
     Ok(output.results)
@@ -175,6 +358,11 @@ pub fn analyze_with_usages(config: &ResolvedConfig) -> Result<AnalysisResults, F
 /// # Errors
 ///
 /// Returns an error if file discovery, parsing, or analysis fails.
+#[doc(hidden)]
+#[deprecated(
+    since = "2.76.0",
+    note = "fallow_core is internal; use fallow_api::run_dead_code for public typed output. NOTE: trace timings are not exposed in the programmatic surface today; use `fallow dead-code --performance` for CLI-side timings. See docs/fallow-core-migration.md."
+)]
 pub fn analyze_with_trace(config: &ResolvedConfig) -> Result<AnalysisOutput, FallowError> {
     analyze_full(config, true, false, false, false)
 }
@@ -188,6 +376,11 @@ pub fn analyze_with_trace(config: &ResolvedConfig) -> Result<AnalysisOutput, Fal
 /// # Errors
 ///
 /// Returns an error if file discovery, parsing, or analysis fails.
+#[doc(hidden)]
+#[deprecated(
+    since = "2.76.0",
+    note = "fallow_core is internal; use fallow_api::run_dead_code for public typed output. NOTE: combined-mode module retention is not exposed in the programmatic surface today. See docs/fallow-core-migration.md."
+)]
 pub fn analyze_retaining_modules(
     config: &ResolvedConfig,
     need_complexity: bool,
@@ -196,27 +389,7 @@ pub fn analyze_retaining_modules(
     analyze_full(config, retain_graph, false, need_complexity, true)
 }
 
-/// Run the analysis pipeline using pre-parsed modules, skipping the parsing stage.
-///
-/// This avoids re-parsing files when the caller already has a `ParseResult` (e.g., from
-/// `fallow_core::extract::parse_all_files`). Discovery, plugins, scripts, entry points,
-/// import resolution, graph construction, and dead code detection still run normally.
-/// The graph is always retained (needed for file scores).
-///
-/// # Errors
-///
-/// Returns an error if discovery, graph construction, or analysis fails.
-#[allow(
-    clippy::too_many_lines,
-    reason = "pipeline orchestration stays easier to audit in one place"
-)]
-pub fn analyze_with_parse_result(
-    config: &ResolvedConfig,
-    modules: &[extract::ModuleInfo],
-) -> Result<AnalysisOutput, FallowError> {
-    let _span = tracing::info_span!("fallow_analyze_with_parse_result").entered();
-    let pipeline_start = Instant::now();
-
+fn new_analysis_progress(config: &ResolvedConfig) -> progress::AnalysisProgress {
     let show_progress = !config.quiet
         && std::io::IsTerminal::is_terminal(&std::io::stderr())
         && matches!(
@@ -225,199 +398,838 @@ pub fn analyze_with_parse_result(
                 | fallow_config::OutputFormat::Compact
                 | fallow_config::OutputFormat::Markdown
         );
-    let progress = progress::AnalysisProgress::new(show_progress);
+    progress::AnalysisProgress::new(show_progress)
+}
 
-    if !config.root.join("node_modules").is_dir() {
-        tracing::warn!(
-            "node_modules directory not found. Run `npm install` / `pnpm install` first for accurate results."
-        );
+fn warn_missing_node_modules(config: &ResolvedConfig) {
+    if config.root.join("node_modules").is_dir() {
+        return;
+    }
+    if fallow_config::is_deno_without_node_modules(&config.root) {
+        return;
     }
 
-    // Discover workspaces
+    tracing::warn!(
+        "node_modules directory not found. Run `npm install` / `pnpm install` first for accurate results."
+    );
+}
+
+fn discover_analysis_workspaces(
+    config: &ResolvedConfig,
+) -> Result<(Vec<fallow_config::WorkspaceInfo>, f64), FallowError> {
     let t = Instant::now();
-    let workspaces_vec = discover_workspaces(&config.root);
+    let (workspaces, diagnostics) =
+        discover_workspaces_with_diagnostics(&config.root, &config.ignore_patterns)
+            .map_err(|error| FallowError::config(error.to_string()))?;
+    fallow_config::stash_workspace_diagnostics(&config.root, diagnostics);
     let workspaces_ms = t.elapsed().as_secs_f64() * 1000.0;
-    if !workspaces_vec.is_empty() {
-        tracing::info!(count = workspaces_vec.len(), "workspaces discovered");
+    if !workspaces.is_empty() {
+        tracing::info!(count = workspaces.len(), "workspaces discovered");
     }
 
-    // Warn about directories with package.json not declared as workspaces
-    warn_undeclared_workspaces(&config.root, &workspaces_vec, config.quiet);
+    warn_undeclared_workspaces(
+        &config.root,
+        &workspaces,
+        &config.ignore_patterns,
+        config.quiet,
+    );
 
-    // Stage 1: Discover files (cheap — needed for file registry and resolution)
+    Ok((workspaces, workspaces_ms))
+}
+
+/// Owned products of the shared pipeline prelude: progress reporter, project
+/// state (owns discovered files and workspaces), root package.json, and the
+/// discovery/workspace timings.
+struct AnalysisSetup {
+    progress: progress::AnalysisProgress,
+    project: project::ProjectState,
+    root_pkg: Option<PackageJson>,
+    /// Non-source config-candidate files captured by the same discovery walk,
+    /// used to resolve plugin config patterns in-memory (empty in production
+    /// mode, where the filesystem path is kept). Carried alongside `project`
+    /// rather than inside it to avoid churning `ProjectState`'s many callers.
+    config_candidates: Vec<std::path::PathBuf>,
+    discover_ms: f64,
+    workspaces_ms: f64,
+}
+
+/// Reusable discovery prelude for a resolved project.
+///
+/// This carries the file registry plus the workspace and config-candidate state
+/// that plugin detection needs, so engine sessions can run several analyses
+/// over one stable discovery boundary without re-walking the project.
+#[derive(Debug, Clone)]
+#[doc(hidden)]
+pub struct AnalysisDiscovery {
+    files: Vec<discover::DiscoveredFile>,
+    workspaces: Vec<fallow_config::WorkspaceInfo>,
+    root_pkg: Option<PackageJson>,
+    config_candidates: Vec<std::path::PathBuf>,
+    discover_ms: f64,
+    workspaces_ms: f64,
+}
+
+impl AnalysisDiscovery {
+    /// Build a discovery prelude from an engine-owned discovery run.
+    #[must_use]
+    pub fn from_parts(
+        files: Vec<discover::DiscoveredFile>,
+        workspaces: Vec<fallow_config::WorkspaceInfo>,
+        root_pkg: Option<PackageJson>,
+        config_candidates: Vec<std::path::PathBuf>,
+        discover_ms: f64,
+        workspaces_ms: f64,
+    ) -> Self {
+        Self {
+            files,
+            workspaces,
+            root_pkg,
+            config_candidates,
+            discover_ms,
+            workspaces_ms,
+        }
+    }
+
+    /// Discovered source files, indexed by stable `FileId` for this session.
+    #[must_use]
+    fn files(&self) -> &[discover::DiscoveredFile] {
+        &self.files
+    }
+
+    /// Discovered workspace packages for this session.
+    #[must_use]
+    pub fn workspaces(&self) -> &[fallow_config::WorkspaceInfo] {
+        &self.workspaces
+    }
+
+    /// Consume this discovery prelude and return its source file registry.
+    #[must_use]
+    pub fn into_files(self) -> Vec<discover::DiscoveredFile> {
+        self.files
+    }
+}
+
+/// Owned state shared across one legacy core analysis run.
+///
+/// Engine-owned sessions use `fallow-engine`; this remains only for deprecated
+/// core entrypoints while core is being narrowed to detector/backend helpers.
+pub(crate) struct AnalysisSession<'a> {
+    config: &'a ResolvedConfig,
+    pipeline_start: Instant,
+    progress: progress::AnalysisProgress,
+    project: project::ProjectState,
+    root_pkg: Option<PackageJson>,
+    config_candidates: Vec<std::path::PathBuf>,
+    discover_ms: f64,
+    workspaces_ms: f64,
+}
+
+impl<'a> AnalysisSession<'a> {
+    fn new(config: &'a ResolvedConfig) -> Result<Self, FallowError> {
+        let pipeline_start = Instant::now();
+        let AnalysisSetup {
+            progress,
+            project,
+            root_pkg,
+            config_candidates,
+            discover_ms,
+            workspaces_ms,
+        } = run_analysis_setup(config)?;
+
+        Ok(Self {
+            config,
+            pipeline_start,
+            progress,
+            project,
+            root_pkg,
+            config_candidates,
+            discover_ms,
+            workspaces_ms,
+        })
+    }
+
+    fn files(&self) -> &[discover::DiscoveredFile] {
+        self.project.files()
+    }
+
+    fn workspaces(&self) -> &[fallow_config::WorkspaceInfo] {
+        self.project.workspaces()
+    }
+
+    fn load_workspace_packages(&self) -> Vec<LoadedWorkspacePackage> {
+        load_workspace_packages(self.workspaces())
+    }
+
+    fn run_plugins_and_scripts(
+        &self,
+        workspace_pkgs: &[LoadedWorkspacePackage],
+    ) -> Result<(plugins::AggregatedPluginResult, f64, f64), FallowError> {
+        run_plugins_and_scripts(&PluginScriptInput {
+            config: self.config,
+            progress: &self.progress,
+            files: self.files(),
+            workspaces: self.workspaces(),
+            root_pkg: self.root_pkg.as_ref(),
+            workspace_pkgs,
+            config_candidates: &self.config_candidates,
+        })
+    }
+
+    fn prelude_timings(&self, plugins_ms: f64, scripts_ms: f64) -> PreludeTimings {
+        PreludeTimings {
+            discover_ms: self.discover_ms,
+            workspaces_ms: self.workspaces_ms,
+            plugins_ms,
+            scripts_ms,
+        }
+    }
+
+    fn parse_modules(&self, need_complexity: bool) -> AnalysisParseOutput {
+        let t = Instant::now();
+        self.progress
+            .set_stage(&format!("parsing {} files...", self.files().len()));
+        parse_analysis_modules(self.config, self.files(), need_complexity, t)
+    }
+
+    fn run_owned_core(
+        &self,
+        workspace_pkgs: &[LoadedWorkspacePackage],
+        plugin_result: &plugins::AggregatedPluginResult,
+        mut modules: Vec<extract::ModuleInfo>,
+        collect_usages: bool,
+    ) -> OwnedAnalysisCore {
+        let shared = AnalysisCoreSharedInput {
+            config: self.config,
+            progress: &self.progress,
+            files: self.files(),
+            workspaces: self.workspaces(),
+            root_pkg: self.root_pkg.as_ref(),
+            workspace_pkgs,
+            plugin_result,
+        };
+
+        let entry_points = discover_analysis_entry_points(&shared);
+        let (resolved, graph) =
+            if let Some(hit) = try_load_analysis_graph_cache(&shared, &entry_points, &modules) {
+                (
+                    TimedResolvedModules {
+                        project: hit.project,
+                        elapsed_ms: 0.0,
+                    },
+                    TimedGraph {
+                        graph: hit.graph,
+                        elapsed_ms: hit.elapsed_ms,
+                    },
+                )
+            } else {
+                let resolved = resolve_analysis_imports_timed(&shared, &modules);
+                let graph =
+                    build_analysis_graph_timed(&shared, &resolved.project, &entry_points, &modules);
+                (resolved, graph)
+            };
+        release_resolution_payloads(&mut modules);
+        let analysis = analyze_dead_code_timed(
+            &shared,
+            &graph.graph,
+            &resolved.project.modules,
+            &modules,
+            collect_usages,
+            entry_points.summary,
+        );
+
+        OwnedAnalysisCore {
+            result: analysis.result,
+            graph: graph.graph,
+            modules,
+            entry_point_count: entry_points.count,
+            entry_points_ms: entry_points.elapsed_ms,
+            resolve_ms: resolved.elapsed_ms,
+            graph_ms: graph.elapsed_ms,
+            analyze_ms: analysis.elapsed_ms,
+        }
+    }
+
+    fn run_full(
+        self,
+        retain: bool,
+        collect_usages: bool,
+        need_complexity: bool,
+        retain_modules: bool,
+    ) -> Result<AnalysisOutput, FallowError> {
+        let workspace_pkgs = self.load_workspace_packages();
+        let (plugin_result, plugins_ms, scripts_ms) =
+            self.run_plugins_and_scripts(&workspace_pkgs)?;
+
+        let AnalysisParseOutput { modules, metrics } = self.parse_modules(need_complexity);
+        let core = self.run_owned_core(&workspace_pkgs, &plugin_result, modules, collect_usages);
+        self.progress.finish();
+
+        let profile = full_analysis_pipeline_profile(
+            &self.prelude_timings(plugins_ms, scripts_ms),
+            self.pipeline_start,
+            self.files(),
+            self.workspaces(),
+            &core,
+            &metrics,
+        );
+        trace_pipeline_profile(&profile);
+
+        Ok(assemble_full_output(
+            core,
+            plugin_result,
+            &profile,
+            self.files(),
+            retain,
+            retain_modules,
+        ))
+    }
+}
+
+/// Run the shared prelude: progress setup, node_modules check, workspace and
+/// root-package discovery, hidden-dir scoping, and file discovery.
+fn run_analysis_setup(config: &ResolvedConfig) -> Result<AnalysisSetup, FallowError> {
+    let progress = new_analysis_progress(config);
+    warn_missing_node_modules(config);
+
+    let (workspaces_vec, workspaces_ms) = discover_analysis_workspaces(config)?;
+    let root_pkg = load_root_package_json(config);
+    let discovery_hidden_dir_scopes =
+        discover::collect_hidden_dir_scopes(config, root_pkg.as_ref(), &workspaces_vec);
+
     let t = Instant::now();
-    let pb = progress.stage_spinner("Discovering files...");
-    let discovered_files = discover::discover_files(config);
+    progress.set_stage("discovering files...");
+    let (discovered_files, config_candidates) =
+        discover::discover_files_and_config_candidates(config, &discovery_hidden_dir_scopes);
     let discover_ms = t.elapsed().as_secs_f64() * 1000.0;
-    pb.finish_and_clear();
 
     let project = project::ProjectState::new(discovered_files, workspaces_vec);
-    let files = project.files();
-    let workspaces = project.workspaces();
-    let root_pkg = load_root_package_json(config);
-    let workspace_pkgs = load_workspace_packages(workspaces);
 
-    // Stage 1.5: Run plugin system
+    Ok(AnalysisSetup {
+        progress,
+        project,
+        root_pkg,
+        config_candidates,
+        discover_ms,
+        workspaces_ms,
+    })
+}
+
+/// Borrowed inputs for plugin detection and script analysis.
+struct PluginScriptInput<'a> {
+    config: &'a ResolvedConfig,
+    progress: &'a progress::AnalysisProgress,
+    files: &'a [discover::DiscoveredFile],
+    workspaces: &'a [fallow_config::WorkspaceInfo],
+    root_pkg: Option<&'a PackageJson>,
+    workspace_pkgs: &'a [LoadedWorkspacePackage],
+    config_candidates: &'a [std::path::PathBuf],
+}
+
+/// Run plugin detection and package.json/CI script analysis, returning the
+/// aggregated plugin result plus the two phase timings.
+fn run_plugins_and_scripts(
+    input: &PluginScriptInput<'_>,
+) -> Result<(plugins::AggregatedPluginResult, f64, f64), FallowError> {
     let t = Instant::now();
-    let pb = progress.stage_spinner("Detecting plugins...");
+    input.progress.set_stage("detecting plugins...");
     let mut plugin_result = run_plugins(
-        config,
-        files,
-        workspaces,
-        root_pkg.as_ref(),
-        &workspace_pkgs,
-    );
+        input.config,
+        input.files,
+        input.workspaces,
+        input.root_pkg,
+        input.workspace_pkgs,
+        input.config_candidates,
+    )?;
     let plugins_ms = t.elapsed().as_secs_f64() * 1000.0;
-    pb.finish_and_clear();
 
-    // Stage 1.6: Analyze package.json scripts
     let t = Instant::now();
     analyze_all_scripts(
-        config,
-        workspaces,
-        root_pkg.as_ref(),
-        &workspace_pkgs,
+        input.config,
+        input.workspaces,
+        input.root_pkg,
+        input.workspace_pkgs,
         &mut plugin_result,
     );
     let scripts_ms = t.elapsed().as_secs_f64() * 1000.0;
 
-    // Stage 2: SKIPPED — using pre-parsed modules from caller
+    Ok((plugin_result, plugins_ms, scripts_ms))
+}
 
-    // Stage 3: Discover entry points
-    let t = Instant::now();
-    let entry_points = discover_all_entry_points(
+/// Timings captured by the dead-code backend prelude.
+#[derive(Debug, Clone, Copy)]
+#[doc(hidden)]
+pub struct DeadCodePreludeTimings {
+    pub discover_ms: f64,
+    pub workspaces_ms: f64,
+    pub plugins_ms: f64,
+    pub scripts_ms: f64,
+}
+
+/// Opaque backend prelude for engine-owned dead-code orchestration.
+///
+/// The engine owns the phase ordering. Core keeps the detector/backend state
+/// needed by those phases private.
+#[doc(hidden)]
+pub struct DeadCodeBackendPrelude<'a> {
+    config: &'a ResolvedConfig,
+    pipeline_start: Instant,
+    progress: progress::AnalysisProgress,
+    discovery: AnalysisDiscovery,
+    workspace_pkgs: Vec<LoadedWorkspacePackage>,
+    plugin_result: plugins::AggregatedPluginResult,
+    plugins_ms: f64,
+    scripts_ms: f64,
+}
+
+impl DeadCodeBackendPrelude<'_> {
+    #[must_use]
+    pub fn timings(&self) -> DeadCodePreludeTimings {
+        DeadCodePreludeTimings {
+            discover_ms: self.discovery.discover_ms,
+            workspaces_ms: self.discovery.workspaces_ms,
+            plugins_ms: self.plugins_ms,
+            scripts_ms: self.scripts_ms,
+        }
+    }
+
+    #[must_use]
+    pub fn elapsed_ms(&self) -> f64 {
+        self.pipeline_start.elapsed().as_secs_f64() * 1000.0
+    }
+
+    #[must_use]
+    pub fn script_used_packages(&self) -> FxHashSet<String> {
+        self.plugin_result.script_used_packages.clone()
+    }
+
+    pub fn finish(&self) {
+        self.progress.finish();
+    }
+}
+
+/// Entry-point discovery result for an engine-owned dead-code pipeline.
+#[doc(hidden)]
+pub struct DeadCodeEntryPoints {
+    inner: TimedEntryPoints,
+}
+
+impl DeadCodeEntryPoints {
+    #[must_use]
+    pub fn count(&self) -> usize {
+        self.inner.count
+    }
+
+    #[must_use]
+    pub fn elapsed_ms(&self) -> f64 {
+        self.inner.elapsed_ms
+    }
+}
+
+/// Import-resolution result for an engine-owned dead-code pipeline.
+#[doc(hidden)]
+pub struct DeadCodeResolvedModules {
+    pub project: resolve::ResolvedProject,
+    pub elapsed_ms: f64,
+}
+
+/// Graph build or graph-cache result for an engine-owned dead-code pipeline.
+#[doc(hidden)]
+pub struct DeadCodeGraphRun {
+    pub graph: graph::ModuleGraph,
+    pub elapsed_ms: f64,
+}
+
+/// Detector result for an engine-owned dead-code pipeline.
+#[doc(hidden)]
+pub struct DeadCodeDetectorRun {
+    pub results: AnalysisResults,
+    pub elapsed_ms: f64,
+}
+
+/// Prepare plugin and script context for engine-owned dead-code orchestration.
+///
+/// # Errors
+///
+/// Returns an error if plugin detection fails.
+pub fn prepare_dead_code_backend_prelude(
+    config: &ResolvedConfig,
+    discovery: AnalysisDiscovery,
+) -> Result<DeadCodeBackendPrelude<'_>, FallowError> {
+    let progress = new_analysis_progress(config);
+    let pipeline_start = Instant::now();
+    let workspace_pkgs = load_workspace_packages(&discovery.workspaces);
+    let (plugin_result, plugins_ms, scripts_ms) = run_plugins_and_scripts(&PluginScriptInput {
         config,
-        files,
-        workspaces,
-        root_pkg.as_ref(),
-        &workspace_pkgs,
-        &plugin_result,
-    );
-    let entry_points_ms = t.elapsed().as_secs_f64() * 1000.0;
+        progress: &progress,
+        files: discovery.files(),
+        workspaces: &discovery.workspaces,
+        root_pkg: discovery.root_pkg.as_ref(),
+        workspace_pkgs: &workspace_pkgs,
+        config_candidates: &discovery.config_candidates,
+    })?;
 
-    // Compute entry-point summary before the graph consumes the entry_points vec
-    let ep_summary = summarize_entry_points(&entry_points.all);
-
-    // Stage 4: Resolve imports to file IDs
-    let t = Instant::now();
-    let pb = progress.stage_spinner("Resolving imports...");
-    let mut resolved = resolve::resolve_all_imports(
-        modules,
-        files,
-        workspaces,
-        &plugin_result.active_plugins,
-        &plugin_result.path_aliases,
-        &plugin_result.scss_include_paths,
-        &config.root,
-        &config.resolve.conditions,
-    );
-    external_style_usage::augment_external_style_package_usage(
-        &mut resolved,
+    Ok(DeadCodeBackendPrelude {
         config,
-        workspaces,
-        &plugin_result,
-    );
-    let resolve_ms = t.elapsed().as_secs_f64() * 1000.0;
-    pb.finish_and_clear();
-
-    // Stage 5: Build module graph
-    let t = Instant::now();
-    let pb = progress.stage_spinner("Building module graph...");
-    let graph = graph::ModuleGraph::build_with_reachability_roots(
-        &resolved,
-        &entry_points.all,
-        &entry_points.runtime,
-        &entry_points.test,
-        files,
-    );
-    let graph_ms = t.elapsed().as_secs_f64() * 1000.0;
-    pb.finish_and_clear();
-
-    // Stage 6: Analyze for dead code
-    let t = Instant::now();
-    let pb = progress.stage_spinner("Analyzing...");
-    let mut result = analyze::find_dead_code_full(
-        &graph,
-        config,
-        &resolved,
-        Some(&plugin_result),
-        workspaces,
-        modules,
-        false,
-    );
-    let analyze_ms = t.elapsed().as_secs_f64() * 1000.0;
-    pb.finish_and_clear();
-    progress.finish();
-
-    result.entry_point_summary = Some(ep_summary);
-
-    let total_ms = pipeline_start.elapsed().as_secs_f64() * 1000.0;
-
-    tracing::debug!(
-        "\n┌─ Pipeline Profile (reuse) ─────────────────────\n\
-         │  discover files:   {:>8.1}ms  ({} files)\n\
-         │  workspaces:       {:>8.1}ms\n\
-         │  plugins:          {:>8.1}ms\n\
-         │  script analysis:  {:>8.1}ms\n\
-         │  parse/extract:    SKIPPED (reused {} modules)\n\
-         │  entry points:     {:>8.1}ms  ({} entries)\n\
-         │  resolve imports:  {:>8.1}ms\n\
-         │  build graph:      {:>8.1}ms\n\
-         │  analyze:          {:>8.1}ms\n\
-         │  ────────────────────────────────────────────\n\
-         │  TOTAL:            {:>8.1}ms\n\
-         └─────────────────────────────────────────────────",
-        discover_ms,
-        files.len(),
-        workspaces_ms,
+        pipeline_start,
+        progress,
+        discovery,
+        workspace_pkgs,
+        plugin_result,
         plugins_ms,
         scripts_ms,
-        modules.len(),
-        entry_points_ms,
-        entry_points.all.len(),
-        resolve_ms,
-        graph_ms,
-        analyze_ms,
-        total_ms,
-    );
-
-    let timings = Some(PipelineTimings {
-        discover_files_ms: discover_ms,
-        file_count: files.len(),
-        workspaces_ms,
-        workspace_count: workspaces.len(),
-        plugins_ms,
-        script_analysis_ms: scripts_ms,
-        parse_extract_ms: 0.0, // Skipped — modules were reused
-        module_count: modules.len(),
-        cache_hits: 0,
-        cache_misses: 0,
-        cache_update_ms: 0.0,
-        entry_points_ms,
-        entry_point_count: entry_points.all.len(),
-        resolve_imports_ms: resolve_ms,
-        build_graph_ms: graph_ms,
-        analyze_ms,
-        total_ms,
-    });
-
-    Ok(AnalysisOutput {
-        results: result,
-        timings,
-        graph: Some(graph),
-        modules: None,
-        files: None,
     })
 }
 
+/// Discover entry points for an engine-owned dead-code pipeline.
+#[must_use]
+pub fn discover_dead_code_entry_points(
+    prelude: &DeadCodeBackendPrelude<'_>,
+) -> DeadCodeEntryPoints {
+    let shared = prelude.shared_input();
+    DeadCodeEntryPoints {
+        inner: discover_analysis_entry_points(&shared),
+    }
+}
+
+/// Try loading the graph cache for an engine-owned dead-code pipeline.
+#[must_use]
+pub fn try_load_dead_code_graph_cache(
+    prelude: &DeadCodeBackendPrelude<'_>,
+    entry_points: &DeadCodeEntryPoints,
+    modules: &[extract::ModuleInfo],
+) -> Option<(DeadCodeResolvedModules, DeadCodeGraphRun)> {
+    let shared = prelude.shared_input();
+    try_load_analysis_graph_cache(&shared, &entry_points.inner, modules).map(|hit| {
+        (
+            DeadCodeResolvedModules {
+                project: hit.project,
+                elapsed_ms: 0.0,
+            },
+            DeadCodeGraphRun {
+                graph: hit.graph,
+                elapsed_ms: hit.elapsed_ms,
+            },
+        )
+    })
+}
+
+/// Resolve imports for an engine-owned dead-code pipeline.
+#[must_use]
+pub fn resolve_dead_code_imports(
+    prelude: &DeadCodeBackendPrelude<'_>,
+    modules: &[extract::ModuleInfo],
+) -> DeadCodeResolvedModules {
+    let shared = prelude.shared_input();
+    let resolved = resolve_analysis_imports_timed(&shared, modules);
+    DeadCodeResolvedModules {
+        project: resolved.project,
+        elapsed_ms: resolved.elapsed_ms,
+    }
+}
+
+/// Build the module graph for an engine-owned dead-code pipeline.
+#[must_use]
+pub fn build_dead_code_graph(
+    prelude: &DeadCodeBackendPrelude<'_>,
+    project: &resolve::ResolvedProject,
+    entry_points: &DeadCodeEntryPoints,
+    modules: &[extract::ModuleInfo],
+) -> DeadCodeGraphRun {
+    let shared = prelude.shared_input();
+    let graph = build_analysis_graph_timed(&shared, project, &entry_points.inner, modules);
+    DeadCodeGraphRun {
+        graph: graph.graph,
+        elapsed_ms: graph.elapsed_ms,
+    }
+}
+
+/// Run the dead-code detectors for an engine-owned pipeline.
+#[must_use]
+pub fn run_dead_code_detectors(
+    prelude: &DeadCodeBackendPrelude<'_>,
+    graph: &graph::ModuleGraph,
+    resolved: &[resolve::ResolvedModule],
+    modules: &[extract::ModuleInfo],
+    collect_usages: bool,
+    entry_points: &DeadCodeEntryPoints,
+) -> DeadCodeDetectorRun {
+    let shared = prelude.shared_input();
+    let analysis = analyze_dead_code_timed(
+        &shared,
+        graph,
+        resolved,
+        modules,
+        collect_usages,
+        entry_points.inner.summary.clone(),
+    );
+    DeadCodeDetectorRun {
+        results: analysis.result,
+        elapsed_ms: analysis.elapsed_ms,
+    }
+}
+
+impl<'a> DeadCodeBackendPrelude<'a> {
+    fn shared_input(&'a self) -> AnalysisCoreSharedInput<'a> {
+        AnalysisCoreSharedInput {
+            config: self.config,
+            progress: &self.progress,
+            files: self.discovery.files(),
+            workspaces: &self.discovery.workspaces,
+            root_pkg: self.discovery.root_pkg.as_ref(),
+            workspace_pkgs: &self.workspace_pkgs,
+            plugin_result: &self.plugin_result,
+        }
+    }
+}
+
+/// Prelude/aggregate metrics shared between the parse and reuse pipeline paths
+/// when assembling the `PipelineProfile`.
+struct PreludeMetrics {
+    discover_ms: f64,
+    workspaces_ms: f64,
+    plugins_ms: f64,
+    scripts_ms: f64,
+    total_ms: f64,
+    file_count: usize,
+    workspace_count: usize,
+    module_count: usize,
+}
+
+/// The four prelude phase timings (discovery through script analysis).
 #[expect(
-    clippy::unnecessary_wraps,
-    reason = "Result kept for future error handling"
+    clippy::struct_field_names,
+    reason = "timings are all milliseconds; the _ms suffix is the unit"
 )]
-#[expect(
-    clippy::too_many_lines,
-    reason = "main pipeline function; split candidate for sig-audit-loop"
-)]
+struct PreludeTimings {
+    discover_ms: f64,
+    workspaces_ms: f64,
+    plugins_ms: f64,
+    scripts_ms: f64,
+}
+
+/// Build `PreludeMetrics` from the prelude timings, pipeline start instant, and
+/// the discovered file/workspace/module counts.
+fn prelude_metrics(
+    timings: &PreludeTimings,
+    pipeline_start: Instant,
+    files: &[discover::DiscoveredFile],
+    workspaces: &[fallow_config::WorkspaceInfo],
+    module_count: usize,
+) -> PreludeMetrics {
+    PreludeMetrics {
+        discover_ms: timings.discover_ms,
+        workspaces_ms: timings.workspaces_ms,
+        plugins_ms: timings.plugins_ms,
+        scripts_ms: timings.scripts_ms,
+        total_ms: pipeline_start.elapsed().as_secs_f64() * 1000.0,
+        file_count: files.len(),
+        workspace_count: workspaces.len(),
+        module_count,
+    }
+}
+
+struct AnalysisCoreSharedInput<'a> {
+    config: &'a ResolvedConfig,
+    progress: &'a progress::AnalysisProgress,
+    files: &'a [discover::DiscoveredFile],
+    workspaces: &'a [fallow_config::WorkspaceInfo],
+    root_pkg: Option<&'a PackageJson>,
+    workspace_pkgs: &'a [LoadedWorkspacePackage],
+    plugin_result: &'a plugins::AggregatedPluginResult,
+}
+
+struct TimedEntryPoints {
+    entry_points: discover::CategorizedEntryPoints,
+    summary: results::EntryPointSummary,
+    count: usize,
+    elapsed_ms: f64,
+}
+
+struct TimedResolvedModules {
+    project: resolve::ResolvedProject,
+    elapsed_ms: f64,
+}
+
+struct TimedGraph {
+    graph: graph::ModuleGraph,
+    elapsed_ms: f64,
+}
+
+struct GraphCacheHit {
+    graph: graph::ModuleGraph,
+    project: resolve::ResolvedProject,
+    elapsed_ms: f64,
+}
+
+#[derive(Clone, Copy)]
+struct DiscoverAllEntryPointsInput<'a> {
+    config: &'a ResolvedConfig,
+    files: &'a [discover::DiscoveredFile],
+    workspaces: &'a [fallow_config::WorkspaceInfo],
+    root_pkg: Option<&'a PackageJson>,
+    workspace_pkgs: &'a [LoadedWorkspacePackage],
+    plugin_result: &'a plugins::AggregatedPluginResult,
+}
+
+struct TimedAnalysis {
+    result: AnalysisResults,
+    elapsed_ms: f64,
+}
+
+fn discover_analysis_entry_points(input: &AnalysisCoreSharedInput<'_>) -> TimedEntryPoints {
+    let t = Instant::now();
+    let entry_points = discover_all_entry_points(DiscoverAllEntryPointsInput {
+        config: input.config,
+        files: input.files,
+        workspaces: input.workspaces,
+        root_pkg: input.root_pkg,
+        workspace_pkgs: input.workspace_pkgs,
+        plugin_result: input.plugin_result,
+    });
+    let elapsed_ms = t.elapsed().as_secs_f64() * 1000.0;
+    let summary = summarize_entry_points(&entry_points.all);
+    let count = entry_points.all.len();
+
+    TimedEntryPoints {
+        entry_points,
+        summary,
+        count,
+        elapsed_ms,
+    }
+}
+
+fn try_load_analysis_graph_cache(
+    input: &AnalysisCoreSharedInput<'_>,
+    entry_points: &TimedEntryPoints,
+    modules: &[extract::ModuleInfo],
+) -> Option<GraphCacheHit> {
+    if input.config.no_cache {
+        return None;
+    }
+
+    let t = Instant::now();
+    input.progress.set_stage("loading module graph cache...");
+    let current = build_graph_cache_manifest(
+        input.config,
+        input.plugin_result,
+        &entry_points.entry_points,
+        input.files,
+    );
+    let store = graph_cache::GraphCacheStore::load(&input.config.cache_dir)?;
+    if store.manifest.matches_inputs(&current) {
+        let project = graph_cache::restore_resolved_project(
+            &input.config.root,
+            modules,
+            input.files,
+            &store.resolved_project,
+        )?;
+        tracing::debug!("Graph cache hit: skipping import resolution and graph build");
+
+        return Some(GraphCacheHit {
+            graph: store.graph,
+            project,
+            elapsed_ms: t.elapsed().as_secs_f64() * 1000.0,
+        });
+    }
+
+    if !store.manifest.matches_resolution_inputs(&current) {
+        return None;
+    }
+
+    let project = graph_cache::restore_resolved_project(
+        &input.config.root,
+        modules,
+        input.files,
+        &store.resolved_project,
+    )?;
+    tracing::debug!("Graph resolver cache hit: skipping import resolution and rebuilding graph");
+    let graph = build_analysis_graph_timed(input, &project, entry_points, modules);
+
+    Some(GraphCacheHit {
+        graph: graph.graph,
+        project,
+        elapsed_ms: t.elapsed().as_secs_f64() * 1000.0,
+    })
+}
+
+fn resolve_analysis_imports_timed(
+    input: &AnalysisCoreSharedInput<'_>,
+    modules: &[extract::ModuleInfo],
+) -> TimedResolvedModules {
+    let t = Instant::now();
+    input.progress.set_stage("resolving imports...");
+    let project = resolve_analysis_imports(
+        modules,
+        input.files,
+        input.workspaces,
+        input.plugin_result,
+        input.config,
+    );
+    TimedResolvedModules {
+        project,
+        elapsed_ms: t.elapsed().as_secs_f64() * 1000.0,
+    }
+}
+
+fn build_analysis_graph_timed(
+    input: &AnalysisCoreSharedInput<'_>,
+    project: &resolve::ResolvedProject,
+    entry_points: &TimedEntryPoints,
+    modules: &[extract::ModuleInfo],
+) -> TimedGraph {
+    let t = Instant::now();
+    input.progress.set_stage("building module graph...");
+    let graph = build_analysis_graph(&BuildAnalysisGraphInput {
+        config: input.config,
+        plugin_result: input.plugin_result,
+        project,
+        entry_points: &entry_points.entry_points,
+        files: input.files,
+        modules,
+        workspaces: input.workspaces,
+    });
+    TimedGraph {
+        graph,
+        elapsed_ms: t.elapsed().as_secs_f64() * 1000.0,
+    }
+}
+
+fn release_resolution_payloads(modules: &mut [extract::ModuleInfo]) {
+    for module in modules {
+        module.release_resolution_payload();
+    }
+}
+
+fn analyze_dead_code_timed(
+    input: &AnalysisCoreSharedInput<'_>,
+    graph: &graph::ModuleGraph,
+    resolved: &[resolve::ResolvedModule],
+    modules: &[extract::ModuleInfo],
+    collect_usages: bool,
+    entry_point_summary: results::EntryPointSummary,
+) -> TimedAnalysis {
+    let t = Instant::now();
+    input.progress.set_stage("analyzing...");
+    #[expect(
+        deprecated,
+        reason = "Core-internal policy keeps workspace path-dependency calls while warning external fallow-core consumers"
+    )]
+    let mut result = analyze::find_dead_code_full(
+        graph,
+        input.config,
+        resolved,
+        Some(input.plugin_result),
+        input.workspaces,
+        modules,
+        collect_usages,
+    );
+    result.entry_point_summary = Some(entry_point_summary);
+    TimedAnalysis {
+        result,
+        elapsed_ms: t.elapsed().as_secs_f64() * 1000.0,
+    }
+}
+
 fn analyze_full(
     config: &ResolvedConfig,
     retain: bool,
@@ -426,175 +1238,508 @@ fn analyze_full(
     retain_modules: bool,
 ) -> Result<AnalysisOutput, FallowError> {
     let _span = tracing::info_span!("fallow_analyze").entered();
-    let pipeline_start = Instant::now();
+    AnalysisSession::new(config)?.run_full(retain, collect_usages, need_complexity, retain_modules)
+}
 
-    // Progress bars: enabled when not quiet, stderr is a terminal, and output is human-readable.
-    // Structured formats (JSON, SARIF) suppress spinners even on TTY — users piping structured
-    // output don't expect progress noise on stderr.
-    let show_progress = !config.quiet
-        && std::io::IsTerminal::is_terminal(&std::io::stderr())
-        && matches!(
-            config.output,
-            fallow_config::OutputFormat::Human
-                | fallow_config::OutputFormat::Compact
-                | fallow_config::OutputFormat::Markdown
-        );
-    let progress = progress::AnalysisProgress::new(show_progress);
-
-    // Warn if node_modules is missing — resolution will be severely degraded
-    if !config.root.join("node_modules").is_dir() {
-        tracing::warn!(
-            "node_modules directory not found. Run `npm install` / `pnpm install` first for accurate results."
-        );
-    }
-
-    // Discover workspaces if in a monorepo
-    let t = Instant::now();
-    let workspaces_vec = discover_workspaces(&config.root);
-    let workspaces_ms = t.elapsed().as_secs_f64() * 1000.0;
-    if !workspaces_vec.is_empty() {
-        tracing::info!(count = workspaces_vec.len(), "workspaces discovered");
-    }
-
-    // Warn about directories with package.json not declared as workspaces
-    warn_undeclared_workspaces(&config.root, &workspaces_vec, config.quiet);
-
-    // Stage 1: Discover all source files
-    let t = Instant::now();
-    let pb = progress.stage_spinner("Discovering files...");
-    let discovered_files = discover::discover_files(config);
-    let discover_ms = t.elapsed().as_secs_f64() * 1000.0;
-    pb.finish_and_clear();
-
-    // Build ProjectState: owns the file registry with stable FileIds and workspace metadata.
-    // This is the foundation for cross-workspace resolution and future incremental analysis.
-    let project = project::ProjectState::new(discovered_files, workspaces_vec);
-    let files = project.files();
-    let workspaces = project.workspaces();
-    let root_pkg = load_root_package_json(config);
-    let workspace_pkgs = load_workspace_packages(workspaces);
-
-    // Stage 1.5: Run plugin system — parse config files, discover dynamic entries
-    let t = Instant::now();
-    let pb = progress.stage_spinner("Detecting plugins...");
-    let mut plugin_result = run_plugins(
-        config,
+fn full_analysis_pipeline_profile(
+    timings: &PreludeTimings,
+    pipeline_start: Instant,
+    files: &[discover::DiscoveredFile],
+    workspaces: &[fallow_config::WorkspaceInfo],
+    core: &OwnedAnalysisCore,
+    metrics: &ParseMetrics,
+) -> PipelineProfile {
+    let prelude = prelude_metrics(
+        timings,
+        pipeline_start,
         files,
         workspaces,
-        root_pkg.as_ref(),
-        &workspace_pkgs,
+        core.modules.len(),
     );
-    let plugins_ms = t.elapsed().as_secs_f64() * 1000.0;
-    pb.finish_and_clear();
+    full_pipeline_profile(&prelude, core, metrics)
+}
 
-    // Stage 1.6: Analyze package.json scripts for binary usage and config file refs
-    let t = Instant::now();
-    analyze_all_scripts(
-        config,
-        workspaces,
-        root_pkg.as_ref(),
-        &workspace_pkgs,
-        &mut plugin_result,
-    );
-    let scripts_ms = t.elapsed().as_secs_f64() * 1000.0;
+/// Assemble the `AnalysisOutput` for the full pipeline, honoring the graph/module
+/// retention flags and computing per-file content hashes.
+fn assemble_full_output(
+    core: OwnedAnalysisCore,
+    plugin_result: plugins::AggregatedPluginResult,
+    profile: &PipelineProfile,
+    files: &[discover::DiscoveredFile],
+    retain: bool,
+    retain_modules: bool,
+) -> AnalysisOutput {
+    let file_hashes = collect_file_hashes(&core.modules, files);
+    AnalysisOutput {
+        results: core.result,
+        timings: retained_pipeline_timings(retain, profile),
+        graph: if retain { Some(core.graph) } else { None },
+        modules: if retain_modules {
+            Some(core.modules)
+        } else {
+            None
+        },
+        files: if retain_modules {
+            Some(files.to_vec())
+        } else {
+            None
+        },
+        script_used_packages: plugin_result.script_used_packages,
+        file_hashes,
+    }
+}
 
-    // Stage 2: Parse all files in parallel and extract imports/exports
-    let t = Instant::now();
-    let pb = progress.stage_spinner(&format!("Parsing {} files...", files.len()));
+/// Result of the freshly-parsed analysis core; returns the owned `modules` (so the
+/// caller can retain them) plus the per-phase timings.
+struct OwnedAnalysisCore {
+    result: AnalysisResults,
+    graph: graph::ModuleGraph,
+    modules: Vec<extract::ModuleInfo>,
+    entry_point_count: usize,
+    entry_points_ms: f64,
+    resolve_ms: f64,
+    graph_ms: f64,
+    analyze_ms: f64,
+}
+
+/// Assemble the `PipelineProfile` for the full (freshly parsed) pipeline path.
+fn full_pipeline_profile(
+    prelude: &PreludeMetrics,
+    core: &OwnedAnalysisCore,
+    parse: &ParseMetrics,
+) -> PipelineProfile {
+    PipelineProfile {
+        discover_ms: prelude.discover_ms,
+        workspaces_ms: prelude.workspaces_ms,
+        plugins_ms: prelude.plugins_ms,
+        scripts_ms: prelude.scripts_ms,
+        parse_ms: parse.parse_ms,
+        cache_ms: parse.cache_ms,
+        entry_points_ms: core.entry_points_ms,
+        resolve_ms: core.resolve_ms,
+        graph_ms: core.graph_ms,
+        analyze_ms: core.analyze_ms,
+        total_ms: prelude.total_ms,
+        file_count: prelude.file_count,
+        workspace_count: prelude.workspace_count,
+        module_count: prelude.module_count,
+        entry_point_count: core.entry_point_count,
+        cache_hits: parse.cache_hits,
+        cache_misses: parse.cache_misses,
+        parse_cpu_ms: parse.parse_cpu_ms,
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PipelineProfile {
+    discover_ms: f64,
+    workspaces_ms: f64,
+    plugins_ms: f64,
+    scripts_ms: f64,
+    parse_ms: f64,
+    cache_ms: f64,
+    entry_points_ms: f64,
+    resolve_ms: f64,
+    graph_ms: f64,
+    analyze_ms: f64,
+    total_ms: f64,
+    file_count: usize,
+    workspace_count: usize,
+    module_count: usize,
+    entry_point_count: usize,
+    cache_hits: usize,
+    cache_misses: usize,
+    parse_cpu_ms: f64,
+}
+
+struct AnalysisParseOutput {
+    modules: Vec<extract::ModuleInfo>,
+    metrics: ParseMetrics,
+}
+
+/// Parse/cache phase metrics carried into the full-pipeline `PipelineProfile`.
+struct ParseMetrics {
+    parse_ms: f64,
+    cache_ms: f64,
+    cache_hits: usize,
+    cache_misses: usize,
+    parse_cpu_ms: f64,
+}
+
+impl From<AnalysisParseMetrics> for ParseMetrics {
+    fn from(metrics: AnalysisParseMetrics) -> Self {
+        Self {
+            parse_ms: metrics.parse_ms,
+            cache_ms: metrics.cache_ms,
+            cache_hits: metrics.cache_hits,
+            cache_misses: metrics.cache_misses,
+            parse_cpu_ms: metrics.parse_cpu_ms,
+        }
+    }
+}
+
+fn parse_analysis_modules(
+    config: &ResolvedConfig,
+    files: &[discover::DiscoveredFile],
+    need_complexity: bool,
+    start: Instant,
+) -> AnalysisParseOutput {
+    let cache_max_size_bytes = resolve_cache_max_size_bytes(config);
     let mut cache_store = if config.no_cache {
         None
     } else {
-        cache::CacheStore::load(&config.cache_dir)
+        cache::CacheStore::load(
+            &config.cache_dir,
+            config.cache_config_hash,
+            cache_max_size_bytes,
+        )
     };
 
     let parse_result = extract::parse_all_files(files, cache_store.as_ref(), need_complexity);
+    let _ = fallow_config::record_source_read_failures(&config.root, &parse_result.read_failures);
     let modules = parse_result.modules;
-    let cache_hits = parse_result.cache_hits;
-    let cache_misses = parse_result.cache_misses;
-    let parse_ms = t.elapsed().as_secs_f64() * 1000.0;
-    pb.finish_and_clear();
+    let parse_ms = start.elapsed().as_secs_f64() * 1000.0;
+    let cache_ms = update_parse_cache_if_enabled(
+        config,
+        &mut cache_store,
+        &modules,
+        files,
+        cache_max_size_bytes,
+    );
 
-    // Update cache with freshly parsed modules and refresh stale mtime/size entries.
+    AnalysisParseOutput {
+        modules,
+        metrics: ParseMetrics {
+            parse_ms,
+            cache_ms,
+            cache_hits: parse_result.cache_hits,
+            cache_misses: parse_result.cache_misses,
+            parse_cpu_ms: parse_result.parse_cpu_ms,
+        },
+    }
+}
+
+fn retained_pipeline_timings(retain: bool, profile: &PipelineProfile) -> Option<PipelineTimings> {
+    retain.then_some(PipelineTimings {
+        discover_files_ms: profile.discover_ms,
+        file_count: profile.file_count,
+        workspaces_ms: profile.workspaces_ms,
+        workspace_count: profile.workspace_count,
+        plugins_ms: profile.plugins_ms,
+        script_analysis_ms: profile.scripts_ms,
+        parse_extract_ms: profile.parse_ms,
+        parse_cpu_ms: profile.parse_cpu_ms,
+        module_count: profile.module_count,
+        cache_hits: profile.cache_hits,
+        cache_misses: profile.cache_misses,
+        cache_update_ms: profile.cache_ms,
+        entry_points_ms: profile.entry_points_ms,
+        entry_point_count: profile.entry_point_count,
+        resolve_imports_ms: profile.resolve_ms,
+        build_graph_ms: profile.graph_ms,
+        analyze_ms: profile.analyze_ms,
+        duplication_ms: None,
+        total_ms: profile.total_ms,
+    })
+}
+
+fn update_parse_cache_if_enabled(
+    config: &ResolvedConfig,
+    cache_store: &mut Option<cache::CacheStore>,
+    modules: &[extract::ModuleInfo],
+    files: &[discover::DiscoveredFile],
+    cache_max_size_bytes: usize,
+) -> f64 {
     let t = Instant::now();
     if !config.no_cache {
         let store = cache_store.get_or_insert_with(cache::CacheStore::new);
-        update_cache(store, &modules, files);
-        if let Err(e) = store.save(&config.cache_dir) {
-            tracing::warn!("Failed to save cache: {e}");
+        if update_cache(store, modules, files)
+            && let Err(error) = store.save(
+                &config.cache_dir,
+                config.cache_config_hash,
+                cache_max_size_bytes,
+            )
+        {
+            tracing::warn!("Failed to save cache: {error}");
         }
     }
-    let cache_ms = t.elapsed().as_secs_f64() * 1000.0;
+    t.elapsed().as_secs_f64() * 1000.0
+}
 
-    // Stage 3: Discover entry points (static patterns + plugin-discovered patterns)
-    let t = Instant::now();
-    let entry_points = discover_all_entry_points(
-        config,
+fn resolve_analysis_imports(
+    modules: &[extract::ModuleInfo],
+    files: &[discover::DiscoveredFile],
+    workspaces: &[fallow_config::WorkspaceInfo],
+    plugin_result: &plugins::AggregatedPluginResult,
+    config: &ResolvedConfig,
+) -> resolve::ResolvedProject {
+    let mut project = resolve::resolve_all_imports(&resolve::ResolveAllImportsInput {
+        modules,
         files,
         workspaces,
-        root_pkg.as_ref(),
-        &workspace_pkgs,
-        &plugin_result,
-    );
-    let entry_points_ms = t.elapsed().as_secs_f64() * 1000.0;
-
-    // Stage 4: Resolve imports to file IDs
-    let t = Instant::now();
-    let pb = progress.stage_spinner("Resolving imports...");
-    let mut resolved = resolve::resolve_all_imports(
-        &modules,
-        files,
-        workspaces,
-        &plugin_result.active_plugins,
-        &plugin_result.path_aliases,
-        &plugin_result.scss_include_paths,
-        &config.root,
-        &config.resolve.conditions,
-    );
+        active_plugins: &plugin_result.active_plugins,
+        path_aliases: &plugin_result.path_aliases,
+        auto_imports: &plugin_result.auto_imports,
+        scss_include_paths: &plugin_result.scss_include_paths,
+        static_dir_mappings: &plugin_result.static_dir_mappings,
+        root: &config.root,
+        extra_conditions: &config.resolve.conditions,
+    });
     external_style_usage::augment_external_style_package_usage(
-        &mut resolved,
+        &mut project.modules,
         config,
         workspaces,
-        &plugin_result,
+        plugin_result,
     );
-    let resolve_ms = t.elapsed().as_secs_f64() * 1000.0;
-    pb.finish_and_clear();
+    project
+}
 
-    // Stage 5: Build module graph
-    let t = Instant::now();
-    let pb = progress.stage_spinner("Building module graph...");
-    let graph = graph::ModuleGraph::build_with_reachability_roots(
-        &resolved,
-        &entry_points.all,
-        &entry_points.runtime,
-        &entry_points.test,
-        files,
+struct BuildAnalysisGraphInput<'a> {
+    config: &'a ResolvedConfig,
+    plugin_result: &'a plugins::AggregatedPluginResult,
+    project: &'a resolve::ResolvedProject,
+    entry_points: &'a discover::CategorizedEntryPoints,
+    files: &'a [discover::DiscoveredFile],
+    modules: &'a [extract::ModuleInfo],
+    workspaces: &'a [fallow_config::WorkspaceInfo],
+}
+
+/// Build the analysis graph and persist it for the next identical run.
+///
+/// The warm hit path happens before import resolution in
+/// `try_load_analysis_graph_cache`. This miss path always builds fresh, runs
+/// both credit steps, and persists the graph plus resolver outputs for next
+/// time. The cache is gated on `config.no_cache` and is a strict performance
+/// optimization: a cache hit produces identical analysis results.
+fn build_analysis_graph(input: &BuildAnalysisGraphInput<'_>) -> graph::ModuleGraph {
+    let caching_enabled = !input.config.no_cache;
+    let current_manifest = caching_enabled.then(|| {
+        build_graph_cache_manifest(
+            input.config,
+            input.plugin_result,
+            input.entry_points,
+            input.files,
+        )
+    });
+
+    let mut graph = graph::ModuleGraph::build_with_reachability_roots_and_replacements(
+        &input.project.modules,
+        &input.project.replaced_module_targets,
+        &input.entry_points.all,
+        &input.entry_points.runtime,
+        &input.entry_points.test,
+        input.files,
     );
-    let graph_ms = t.elapsed().as_secs_f64() * 1000.0;
-    pb.finish_and_clear();
+    credit_package_path_references(&mut graph, input.modules);
+    credit_workspace_package_usage(&mut graph, &input.project.modules, input.workspaces);
 
-    // Compute entry-point summary before the graph consumes the entry_points vec
-    let ep_summary = summarize_entry_points(&entry_points.all);
+    if let Some(manifest) = current_manifest {
+        let Some(resolved_project) =
+            graph_cache::cache_resolved_project(&input.config.root, input.files, input.project)
+        else {
+            return graph;
+        };
+        let store = graph_cache::GraphCacheStore {
+            version: graph_cache::GRAPH_CACHE_VERSION,
+            manifest,
+            graph,
+            resolved_project,
+        };
+        store.save(&input.config.cache_dir);
+        // `save` borrows the store, so the freshly built graph is moved back out
+        // and returned in-memory. The warm path loads-and-reconstructs an
+        // identical graph from this same persisted blob (proven by the
+        // cold-vs-warm correctness gate).
+        return store.graph;
+    }
 
-    // Stage 6: Analyze for dead code (with plugin context and workspace info)
-    let t = Instant::now();
-    let pb = progress.stage_spinner("Analyzing...");
-    let mut result = analyze::find_dead_code_full(
-        &graph,
-        config,
-        &resolved,
-        Some(&plugin_result),
-        workspaces,
-        &modules,
-        collect_usages,
+    graph
+}
+
+/// Build the current `GraphCacheManifest` from the run's discovered files and
+/// graph-affecting option hashes.
+fn build_graph_cache_manifest(
+    config: &ResolvedConfig,
+    plugin_result: &plugins::AggregatedPluginResult,
+    entry_points: &discover::CategorizedEntryPoints,
+    files: &[discover::DiscoveredFile],
+) -> graph_cache::GraphCacheManifest {
+    let mode = graph_cache::GraphCacheMode::new(
+        resolver_options_hash(config),
+        entry_points_hash(entry_points),
+        plugin_config_hash(plugin_result),
     );
-    let analyze_ms = t.elapsed().as_secs_f64() * 1000.0;
-    pb.finish_and_clear();
-    progress.finish();
+    graph_cache::GraphCacheManifest::from_discovered_files(&config.root, files, mode, |path| {
+        std::fs::metadata(path).map_or(
+            fallow_types::source_fingerprint::SourceFingerprint::new(0, 0),
+            |metadata| {
+                fallow_types::source_fingerprint::SourceFingerprint::from_metadata(&metadata)
+            },
+        )
+    })
+}
 
-    result.entry_point_summary = Some(ep_summary);
+/// Hash the resolver-affecting options: the project root, extraction config
+/// hash (which already folds tsconfig / resolver-relevant config), and the
+/// user-supplied resolve `conditions`.
+///
+/// `production` and `ignore_patterns` intentionally stay out of this hash:
+/// they shape discovery, so changed file sets already miss through stable file
+/// keys and source fingerprints in the manifest.
+fn resolver_options_hash(config: &ResolvedConfig) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = rustc_hash::FxHasher::default();
+    config.root.hash(&mut hasher);
+    config.cache_config_hash.hash(&mut hasher);
+    config.resolve.conditions.hash(&mut hasher);
+    hasher.finish()
+}
 
-    let total_ms = pipeline_start.elapsed().as_secs_f64() * 1000.0;
+/// Hash the entry-point set (sorted paths per role) so any change in reachability
+/// roots misses the cache.
+fn entry_points_hash(entry_points: &discover::CategorizedEntryPoints) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = rustc_hash::FxHasher::default();
+    for role in [&entry_points.all, &entry_points.runtime, &entry_points.test] {
+        let mut paths: Vec<&std::path::Path> = role.iter().map(|ep| ep.path.as_path()).collect();
+        paths.sort_unstable();
+        paths.len().hash(&mut hasher);
+        for path in paths {
+            path.hash(&mut hasher);
+        }
+    }
+    hasher.finish()
+}
 
+/// Hash the plugin-derived graph-affecting configuration.
+fn plugin_config_hash(plugin_result: &plugins::AggregatedPluginResult) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = rustc_hash::FxHasher::default();
+
+    hash_active_plugins(plugin_result, &mut hasher);
+    hash_path_aliases(plugin_result, &mut hasher);
+
+    let mut auto_imports: Vec<(&str, &std::path::Path, fallow_config::AutoImportKind)> =
+        plugin_result
+            .auto_imports
+            .iter()
+            .map(|rule| (rule.name.as_str(), rule.source.as_path(), rule.kind))
+            .collect();
+    auto_imports.sort_unstable_by(|a, b| {
+        a.0.cmp(b.0)
+            .then_with(|| a.1.cmp(b.1))
+            .then_with(|| auto_import_kind_rank(a.2).cmp(&auto_import_kind_rank(b.2)))
+    });
+    auto_imports.len().hash(&mut hasher);
+    for (name, source, kind) in auto_imports {
+        name.hash(&mut hasher);
+        source.hash(&mut hasher);
+        auto_import_kind_rank(kind).hash(&mut hasher);
+    }
+
+    let mut scss_include_paths: Vec<&std::path::Path> = plugin_result
+        .scss_include_paths
+        .iter()
+        .map(std::path::PathBuf::as_path)
+        .collect();
+    scss_include_paths.sort_unstable();
+    scss_include_paths.len().hash(&mut hasher);
+    for path in scss_include_paths {
+        path.hash(&mut hasher);
+    }
+
+    let mut static_dir_mappings: Vec<(&std::path::Path, &str)> = plugin_result
+        .static_dir_mappings
+        .iter()
+        .map(|(from_dir, mount)| (from_dir.as_path(), mount.as_str()))
+        .collect();
+    static_dir_mappings.sort_unstable();
+    static_dir_mappings.len().hash(&mut hasher);
+    for (from_dir, mount) in static_dir_mappings {
+        from_dir.hash(&mut hasher);
+        mount.hash(&mut hasher);
+    }
+
+    hasher.finish()
+}
+
+fn hash_active_plugins(
+    plugin_result: &plugins::AggregatedPluginResult,
+    hasher: &mut rustc_hash::FxHasher,
+) {
+    use std::hash::Hash;
+    let mut active: Vec<&str> = plugin_result
+        .active_plugins
+        .iter()
+        .map(String::as_str)
+        .collect();
+    active.sort_unstable();
+    active.len().hash(hasher);
+    for name in active {
+        name.hash(hasher);
+    }
+}
+
+fn hash_path_aliases(
+    plugin_result: &plugins::AggregatedPluginResult,
+    hasher: &mut rustc_hash::FxHasher,
+) {
+    use std::hash::Hash;
+    let mut aliases: Vec<(&str, &str)> = plugin_result
+        .path_aliases
+        .iter()
+        .map(|(prefix, replacement)| (prefix.as_str(), replacement.as_str()))
+        .collect();
+    aliases.sort_unstable();
+    aliases.len().hash(hasher);
+    for (prefix, replacement) in aliases {
+        prefix.hash(hasher);
+        replacement.hash(hasher);
+    }
+}
+
+fn auto_import_kind_rank(kind: fallow_config::AutoImportKind) -> u8 {
+    match kind {
+        fallow_config::AutoImportKind::Named => 0,
+        fallow_config::AutoImportKind::Default => 1,
+        fallow_config::AutoImportKind::DefaultComponent => 2,
+    }
+}
+
+fn collect_file_hashes(
+    modules: &[extract::ModuleInfo],
+    files: &[discover::DiscoveredFile],
+) -> rustc_hash::FxHashMap<std::path::PathBuf, u64> {
+    modules
+        .iter()
+        .filter_map(|module| {
+            files
+                .get(module.file_id.0 as usize)
+                .map(|file| (file.path.clone(), module.content_hash))
+        })
+        .collect()
+}
+
+fn trace_pipeline_profile(profile: &PipelineProfile) {
+    let PipelineProfile {
+        discover_ms,
+        workspaces_ms,
+        plugins_ms,
+        scripts_ms,
+        parse_ms,
+        cache_ms,
+        entry_points_ms,
+        resolve_ms,
+        graph_ms,
+        analyze_ms,
+        total_ms,
+        file_count,
+        module_count,
+        entry_point_count,
+        cache_hits,
+        cache_misses,
+        ..
+    } = *profile;
     let cache_summary = if cache_hits > 0 {
         format!(" ({cache_hits} cached, {cache_misses} parsed)")
     } else {
@@ -617,57 +1762,21 @@ fn analyze_full(
          │  TOTAL:            {:>8.1}ms\n\
          └─────────────────────────────────────────────────",
         discover_ms,
-        files.len(),
+        file_count,
         workspaces_ms,
         plugins_ms,
         scripts_ms,
         parse_ms,
-        modules.len(),
+        module_count,
         cache_summary,
         cache_ms,
         entry_points_ms,
-        entry_points.all.len(),
+        entry_point_count,
         resolve_ms,
         graph_ms,
         analyze_ms,
         total_ms,
     );
-
-    let timings = if retain {
-        Some(PipelineTimings {
-            discover_files_ms: discover_ms,
-            file_count: files.len(),
-            workspaces_ms,
-            workspace_count: workspaces.len(),
-            plugins_ms,
-            script_analysis_ms: scripts_ms,
-            parse_extract_ms: parse_ms,
-            module_count: modules.len(),
-            cache_hits,
-            cache_misses,
-            cache_update_ms: cache_ms,
-            entry_points_ms,
-            entry_point_count: entry_points.all.len(),
-            resolve_imports_ms: resolve_ms,
-            build_graph_ms: graph_ms,
-            analyze_ms,
-            total_ms,
-        })
-    } else {
-        None
-    };
-
-    Ok(AnalysisOutput {
-        results: result,
-        timings,
-        graph: if retain { Some(graph) } else { None },
-        modules: if retain_modules { Some(modules) } else { None },
-        files: if retain_modules {
-            Some(files.to_vec())
-        } else {
-            None
-        },
-    })
 }
 
 /// Analyze package.json scripts from root and all workspace packages.
@@ -675,18 +1784,16 @@ fn analyze_full(
 /// Populates the plugin result with script-used packages and config file
 /// entry patterns. Also scans CI config files for binary invocations.
 fn load_root_package_json(config: &ResolvedConfig) -> Option<PackageJson> {
-    PackageJson::load(&config.root.join("package.json")).ok()
+    fallow_config::load_dir_package_json(&config.root)
 }
 
 fn load_workspace_packages(
     workspaces: &[fallow_config::WorkspaceInfo],
-) -> Vec<LoadedWorkspacePackage<'_>> {
+) -> Vec<LoadedWorkspacePackage> {
     workspaces
         .iter()
         .filter_map(|ws| {
-            PackageJson::load(&ws.root.join("package.json"))
-                .ok()
-                .map(|pkg| (ws, pkg))
+            fallow_config::load_dir_package_json(&ws.root).map(|pkg| (ws.clone(), pkg))
         })
         .collect()
 }
@@ -695,12 +1802,37 @@ fn analyze_all_scripts(
     config: &ResolvedConfig,
     workspaces: &[fallow_config::WorkspaceInfo],
     root_pkg: Option<&PackageJson>,
-    workspace_pkgs: &[LoadedWorkspacePackage<'_>],
+    workspace_pkgs: &[LoadedWorkspacePackage],
     plugin_result: &mut plugins::AggregatedPluginResult,
 ) {
-    // Collect all dependency names to build the bin-name → package-name reverse map.
-    // This resolves binaries like "attw" to "@arethetypeswrong/cli" even without
-    // node_modules/.bin symlinks.
+    let all_dep_names = collect_all_dependency_names(root_pkg, workspace_pkgs);
+    let all_dep_set: FxHashSet<String> = all_dep_names.iter().cloned().collect();
+    let all_scripts = collect_all_scripts(root_pkg, workspace_pkgs);
+
+    let nm_roots = collect_node_modules_roots(config, workspaces);
+    let bin_map = scripts::build_bin_to_package_map(&nm_roots, &all_dep_names);
+
+    analyze_root_scripts(config, root_pkg, &bin_map, &all_dep_set, plugin_result);
+    analyze_workspace_scripts(
+        config,
+        workspace_pkgs,
+        &bin_map,
+        &all_dep_set,
+        plugin_result,
+    );
+    analyze_ci_scripts(config, &bin_map, &all_dep_set, &all_scripts, plugin_result);
+
+    plugin_result
+        .entry_point_roles
+        .entry("scripts".to_string())
+        .or_insert(EntryPointRole::Support);
+}
+
+/// Gather sorted, deduped dependency names across the root and workspace packages.
+fn collect_all_dependency_names(
+    root_pkg: Option<&PackageJson>,
+    workspace_pkgs: &[LoadedWorkspacePackage],
+) -> Vec<String> {
     let mut all_dep_names: Vec<String> = Vec::new();
     if let Some(pkg) = root_pkg {
         all_dep_names.extend(pkg.all_dependency_names());
@@ -710,9 +1842,33 @@ fn analyze_all_scripts(
     }
     all_dep_names.sort_unstable();
     all_dep_names.dedup();
+    all_dep_names
+}
 
-    // Probe node_modules/ at project root and each workspace root so non-hoisted
-    // deps (pnpm strict, Yarn workspaces) are also discovered.
+/// Gather the scripts declared by the root and workspace packages.
+fn collect_all_scripts(
+    root_pkg: Option<&PackageJson>,
+    workspace_pkgs: &[LoadedWorkspacePackage],
+) -> scripts::ScriptCatalog {
+    let mut catalog = scripts::ScriptCatalog::default();
+    if let Some(pkg) = root_pkg
+        && let Some(ref pkg_scripts) = pkg.scripts
+    {
+        catalog.merge_scripts(pkg_scripts);
+    }
+    for (_, ws_pkg) in workspace_pkgs {
+        if let Some(ref ws_scripts) = ws_pkg.scripts {
+            catalog.merge_workspace_scripts(ws_scripts);
+        }
+    }
+    catalog
+}
+
+/// Collect every directory (root and workspaces) that has a local `node_modules`.
+fn collect_node_modules_roots<'a>(
+    config: &'a ResolvedConfig,
+    workspaces: &'a [fallow_config::WorkspaceInfo],
+) -> Vec<&'a std::path::Path> {
     let mut nm_roots: Vec<&std::path::Path> = Vec::new();
     if config.root.join("node_modules").is_dir() {
         nm_roots.push(&config.root);
@@ -722,113 +1878,217 @@ fn analyze_all_scripts(
             nm_roots.push(&ws.root);
         }
     }
-    let bin_map = scripts::build_bin_to_package_map(&nm_roots, &all_dep_names);
+    nm_roots
+}
 
-    if let Some(pkg) = root_pkg
-        && let Some(ref pkg_scripts) = pkg.scripts
-    {
-        let scripts_to_analyze = if config.production {
-            scripts::filter_production_scripts(pkg_scripts)
-        } else {
-            pkg_scripts.clone()
-        };
-        let script_analysis = scripts::analyze_scripts(&scripts_to_analyze, &config.root, &bin_map);
-        plugin_result.script_used_packages = script_analysis.used_packages;
+/// Analyze the root package.json scripts and fold the results into the plugin result.
+fn analyze_root_scripts(
+    config: &ResolvedConfig,
+    root_pkg: Option<&PackageJson>,
+    bin_map: &rustc_hash::FxHashMap<String, String>,
+    all_dep_set: &FxHashSet<String>,
+    plugin_result: &mut plugins::AggregatedPluginResult,
+) {
+    let Some(pkg) = root_pkg else {
+        return;
+    };
+    let Some(ref pkg_scripts) = pkg.scripts else {
+        return;
+    };
+    let scripts_to_analyze = if config.production {
+        scripts::filter_production_scripts(pkg_scripts)
+    } else {
+        pkg_scripts.clone()
+    };
+    let catalog =
+        scripts::ScriptCatalog::from_scripts_with_bodies(pkg_scripts, &scripts_to_analyze);
+    let script_analysis = scripts::analyze_scripts_with_dependency_context(
+        &scripts_to_analyze,
+        &config.root,
+        bin_map,
+        all_dep_set,
+        &catalog,
+    );
+    plugin_result.script_used_packages = script_analysis.used_packages;
 
-        for config_file in &script_analysis.config_files {
+    for config_file in &script_analysis.config_files {
+        plugin_result
+            .discovered_always_used
+            .push((config_file.clone(), "scripts".to_string()));
+    }
+    for entry in &script_analysis.entry_files {
+        if let Some(pat) = scripts::normalize_script_entry_pattern("", entry) {
             plugin_result
-                .discovered_always_used
-                .push((config_file.clone(), "scripts".to_string()));
+                .entry_patterns
+                .push((plugins::PathRule::new(pat), "scripts".to_string()));
         }
     }
-    for (ws, ws_pkg) in workspace_pkgs {
-        if let Some(ref ws_scripts) = ws_pkg.scripts {
-            let scripts_to_analyze = if config.production {
-                scripts::filter_production_scripts(ws_scripts)
-            } else {
-                ws_scripts.clone()
-            };
-            let ws_analysis = scripts::analyze_scripts(&scripts_to_analyze, &ws.root, &bin_map);
-            plugin_result
-                .script_used_packages
-                .extend(ws_analysis.used_packages);
+}
 
-            let ws_prefix = ws
-                .root
-                .strip_prefix(&config.root)
-                .unwrap_or(&ws.root)
-                .to_string_lossy();
-            for config_file in &ws_analysis.config_files {
-                plugin_result
-                    .discovered_always_used
-                    .push((format!("{ws_prefix}/{config_file}"), "scripts".to_string()));
-            }
+/// Analyze each workspace package's scripts in parallel and merge the results.
+type WsScriptOut = (
+    Vec<String>,
+    Vec<(String, String)>,
+    Vec<(plugins::PathRule, String)>,
+);
+
+fn analyze_workspace_scripts(
+    config: &ResolvedConfig,
+    workspace_pkgs: &[LoadedWorkspacePackage],
+    bin_map: &rustc_hash::FxHashMap<String, String>,
+    all_dep_set: &FxHashSet<String>,
+    plugin_result: &mut plugins::AggregatedPluginResult,
+) {
+    let ws_results: Vec<WsScriptOut> = workspace_pkgs
+        .par_iter()
+        .map(|(ws, ws_pkg)| analyze_one_workspace_scripts(config, ws, ws_pkg, bin_map, all_dep_set))
+        .collect();
+    for (used_packages, discovered_always_used, entry_patterns) in ws_results {
+        plugin_result.script_used_packages.extend(used_packages);
+        plugin_result
+            .discovered_always_used
+            .extend(discovered_always_used);
+        plugin_result.entry_patterns.extend(entry_patterns);
+    }
+}
+
+/// Analyze a single workspace package's scripts, returning its used packages,
+/// always-used config files, and entry patterns (all workspace-prefixed).
+fn analyze_one_workspace_scripts(
+    config: &ResolvedConfig,
+    ws: &fallow_config::WorkspaceInfo,
+    ws_pkg: &PackageJson,
+    bin_map: &rustc_hash::FxHashMap<String, String>,
+    all_dep_set: &FxHashSet<String>,
+) -> WsScriptOut {
+    let mut used_packages = Vec::new();
+    let mut discovered_always_used: Vec<(String, String)> = Vec::new();
+    let mut entry_patterns: Vec<(plugins::PathRule, String)> = Vec::new();
+    let Some(ref ws_scripts) = ws_pkg.scripts else {
+        return (used_packages, discovered_always_used, entry_patterns);
+    };
+    let scripts_to_analyze = if config.production {
+        scripts::filter_production_scripts(ws_scripts)
+    } else {
+        ws_scripts.clone()
+    };
+    let catalog = scripts::ScriptCatalog::from_scripts_with_bodies(ws_scripts, &scripts_to_analyze);
+    let ws_analysis = scripts::analyze_scripts_with_dependency_context(
+        &scripts_to_analyze,
+        &ws.root,
+        bin_map,
+        all_dep_set,
+        &catalog,
+    );
+    used_packages.extend(ws_analysis.used_packages);
+
+    let ws_prefix = ws
+        .root
+        .strip_prefix(&config.root)
+        .unwrap_or(&ws.root)
+        .to_string_lossy();
+    for config_file in &ws_analysis.config_files {
+        discovered_always_used.push((format!("{ws_prefix}/{config_file}"), "scripts".to_string()));
+    }
+    for entry in &ws_analysis.entry_files {
+        if let Some(pat) = scripts::normalize_script_entry_pattern(&ws_prefix, entry) {
+            entry_patterns.push((plugins::PathRule::new(pat), "scripts".to_string()));
         }
     }
+    (used_packages, discovered_always_used, entry_patterns)
+}
 
-    // Scan CI config files for binary invocations
-    let ci_packages = scripts::ci::analyze_ci_files(&config.root, &bin_map);
-    plugin_result.script_used_packages.extend(ci_packages);
+/// Analyze CI config files for binary invocations and merge the results.
+fn analyze_ci_scripts(
+    config: &ResolvedConfig,
+    bin_map: &rustc_hash::FxHashMap<String, String>,
+    all_dep_set: &FxHashSet<String>,
+    all_scripts: &scripts::ScriptCatalog,
+    plugin_result: &mut plugins::AggregatedPluginResult,
+) {
+    let ci_analysis =
+        scripts::ci::analyze_ci_files(&config.root, bin_map, all_dep_set, all_scripts);
     plugin_result
-        .entry_point_roles
-        .entry("scripts".to_string())
-        .or_insert(EntryPointRole::Support);
+        .script_used_packages
+        .extend(ci_analysis.used_packages);
+    for entry in &ci_analysis.entry_files {
+        if let Some(pat) = scripts::normalize_script_entry_pattern("", entry) {
+            plugin_result
+                .entry_patterns
+                .push((plugins::PathRule::new(pat), "scripts".to_string()));
+        }
+    }
 }
 
 /// Discover all entry points from static patterns, workspaces, plugins, and infrastructure.
 fn discover_all_entry_points(
-    config: &ResolvedConfig,
-    files: &[discover::DiscoveredFile],
-    workspaces: &[fallow_config::WorkspaceInfo],
-    root_pkg: Option<&PackageJson>,
-    workspace_pkgs: &[LoadedWorkspacePackage<'_>],
-    plugin_result: &plugins::AggregatedPluginResult,
+    input: DiscoverAllEntryPointsInput<'_>,
 ) -> discover::CategorizedEntryPoints {
     let mut entry_points = discover::CategorizedEntryPoints::default();
     let root_discovery = discover::discover_entry_points_with_warnings_from_pkg(
-        config,
-        files,
-        root_pkg,
-        workspaces.is_empty(),
+        input.config,
+        input.files,
+        input.root_pkg,
+        input.workspaces.is_empty(),
     );
 
-    let workspace_pkg_by_root: rustc_hash::FxHashMap<std::path::PathBuf, &PackageJson> =
-        workspace_pkgs
-            .iter()
-            .map(|(ws, pkg)| (ws.root.clone(), pkg))
-            .collect();
+    let workspace_pkg_by_root: rustc_hash::FxHashMap<std::path::PathBuf, &PackageJson> = input
+        .workspace_pkgs
+        .iter()
+        .map(|(ws, pkg)| (ws.root.clone(), pkg))
+        .collect();
+    let workspace_script_seeds = discover::workspace_runtime_script_seeds(
+        &input.config.root,
+        input.root_pkg,
+        input.workspace_pkgs,
+    );
 
-    let workspace_discovery: Vec<discover::EntryPointDiscovery> = workspaces
+    let workspace_discovery: Vec<discover::EntryPointDiscovery> = input
+        .workspaces
         .par_iter()
         .map(|ws| {
             let pkg = workspace_pkg_by_root.get(&ws.root).copied();
-            discover::discover_workspace_entry_points_with_warnings_from_pkg(&ws.root, files, pkg)
+            let seeds = workspace_script_seeds
+                .get(&ws.name)
+                .cloned()
+                .unwrap_or_default();
+            discover::discover_workspace_entry_points_with_runtime_scripts(
+                &ws.root,
+                input.files,
+                pkg,
+                &seeds,
+            )
         })
         .collect();
     let mut skipped_entries = rustc_hash::FxHashMap::default();
     entry_points.extend_runtime(root_discovery.entries);
+    entry_points.extend_support(root_discovery.support_entries);
     for (path, count) in root_discovery.skipped_entries {
         *skipped_entries.entry(path).or_insert(0) += count;
     }
     let mut ws_entries = Vec::new();
+    let mut ws_support_entries = Vec::new();
     for workspace in workspace_discovery {
         ws_entries.extend(workspace.entries);
+        ws_support_entries.extend(workspace.support_entries);
         for (path, count) in workspace.skipped_entries {
             *skipped_entries.entry(path).or_insert(0) += count;
         }
     }
     discover::warn_skipped_entry_summary(&skipped_entries);
     entry_points.extend_runtime(ws_entries);
+    entry_points.extend_support(ws_support_entries);
 
-    let plugin_entries = discover::discover_plugin_entry_point_sets(plugin_result, config, files);
+    let plugin_entries =
+        discover::discover_plugin_entry_point_sets(input.plugin_result, input.config, input.files);
     entry_points.extend(plugin_entries);
 
-    let infra_entries = discover::discover_infrastructure_entry_points(&config.root);
+    let infra_entries = discover::discover_infrastructure_entry_points(&input.config.root);
     entry_points.extend_runtime(infra_entries);
 
-    // Add dynamically loaded files from config as entry points
-    if !config.dynamically_loaded.is_empty() {
-        let dynamic_entries = discover::discover_dynamically_loaded_entry_points(config, files);
+    if !input.config.dynamically_loaded.is_empty() {
+        let dynamic_entries =
+            discover::discover_dynamically_loaded_entry_points(input.config, input.files);
         entry_points.extend_runtime(dynamic_entries);
     }
 
@@ -862,67 +2122,170 @@ fn summarize_entry_points(entry_points: &[discover::EntryPoint]) -> results::Ent
     }
 }
 
+fn append_package_file_asset_patterns(
+    result: &mut plugins::AggregatedPluginResult,
+    prefix: &str,
+    pkg: &PackageJson,
+) {
+    let prefix = prefix.trim_matches('/');
+    for pattern in package_assets::scaffold_template_asset_patterns(pkg) {
+        let pattern = if prefix.is_empty() {
+            pattern
+        } else {
+            format!("{prefix}/{pattern}")
+        };
+        result
+            .discovered_always_used
+            .push((pattern, package_assets::PACKAGE_FILES_SOURCE.to_string()));
+    }
+}
+
+fn append_workspace_package_file_asset_patterns(
+    result: &mut plugins::AggregatedPluginResult,
+    config: &ResolvedConfig,
+    workspace_pkgs: &[LoadedWorkspacePackage],
+) {
+    for (ws, ws_pkg) in workspace_pkgs {
+        let ws_prefix = ws
+            .root
+            .strip_prefix(&config.root)
+            .unwrap_or(&ws.root)
+            .to_string_lossy()
+            .replace('\\', "/");
+        append_package_file_asset_patterns(result, &ws_prefix, ws_pkg);
+    }
+}
+
 /// Run plugins for root project and all workspace packages.
 fn run_plugins(
     config: &ResolvedConfig,
     files: &[discover::DiscoveredFile],
     workspaces: &[fallow_config::WorkspaceInfo],
     root_pkg: Option<&PackageJson>,
-    workspace_pkgs: &[LoadedWorkspacePackage<'_>],
-) -> plugins::AggregatedPluginResult {
+    workspace_pkgs: &[LoadedWorkspacePackage],
+    config_candidates: &[std::path::PathBuf],
+) -> Result<plugins::AggregatedPluginResult, FallowError> {
     let registry = plugins::PluginRegistry::new(config.external_plugins.clone());
     let file_paths: Vec<std::path::PathBuf> = files.iter().map(|f| f.path.clone()).collect();
-    let root_config_search_roots = collect_config_search_roots(&config.root, &file_paths);
+
+    // The non-production config-discovery fast path: resolve plugin config
+    // patterns against the files the discovery walk already collected (source
+    // files unioned with non-source config candidates) instead of re-walking the
+    // filesystem. Production keeps the filesystem path (no candidates captured).
+    let candidate_index = (!config.production).then(|| {
+        plugins::registry::ConfigCandidateIndex::build(
+            file_paths
+                .iter()
+                .map(std::path::PathBuf::as_path)
+                .chain(config_candidates.iter().map(std::path::PathBuf::as_path)),
+        )
+    });
+
+    let mut result = run_root_plugins(
+        &registry,
+        config,
+        root_pkg,
+        &file_paths,
+        candidate_index.as_ref(),
+    )?;
+
+    if workspaces.is_empty() {
+        gate_auto_import_entry_patterns(&mut result, config, workspaces);
+        return Ok(result);
+    }
+
+    append_workspace_package_file_asset_patterns(&mut result, config, workspace_pkgs);
+
+    let ws_results = run_workspace_plugins(
+        &registry,
+        config,
+        workspace_pkgs,
+        &file_paths,
+        &result.active_plugins,
+        candidate_index.as_ref(),
+    );
+    merge_workspace_plugin_results(&mut result, ws_results)?;
+
+    gate_auto_import_entry_patterns(&mut result, config, workspaces);
+
+    Ok(result)
+}
+
+type WorkspacePluginResult = Result<
+    (plugins::AggregatedPluginResult, String),
+    Vec<plugins::registry::PluginRegexValidationError>,
+>;
+
+/// Run plugins for the root project and apply its package-file asset patterns.
+fn run_root_plugins(
+    registry: &plugins::PluginRegistry,
+    config: &ResolvedConfig,
+    root_pkg: Option<&PackageJson>,
+    file_paths: &[std::path::PathBuf],
+    candidate_index: Option<&plugins::registry::ConfigCandidateIndex>,
+) -> Result<plugins::AggregatedPluginResult, FallowError> {
+    let root_config_search_roots = collect_config_search_roots(&config.root, file_paths);
     let root_config_search_root_refs: Vec<&Path> = root_config_search_roots
         .iter()
         .map(std::path::PathBuf::as_path)
         .collect();
 
-    // Run plugins for root project (full run with external plugins, inline config, etc.)
-    let mut result = root_pkg.map_or_else(plugins::AggregatedPluginResult::default, |pkg| {
-        registry.run_with_search_roots(
-            pkg,
-            &config.root,
-            &file_paths,
-            &root_config_search_root_refs,
-        )
-    });
-
-    if workspaces.is_empty() {
-        return result;
-    }
-
-    let root_active_plugins: rustc_hash::FxHashSet<&str> =
-        result.active_plugins.iter().map(String::as_str).collect();
-
-    // Pre-compile config matchers and relative files once for all workspace runs.
-    // This avoids re-compiling glob patterns and re-computing relative paths per workspace
-    // (previously O(workspaces × plugins × files) glob compilations).
-    let precompiled_matchers = registry.precompile_config_matchers();
-    let relative_files: Vec<(&std::path::PathBuf, String)> = file_paths
-        .iter()
-        .map(|f| {
-            let rel = f
-                .strip_prefix(&config.root)
-                .unwrap_or(f)
-                .to_string_lossy()
-                .into_owned();
-            (f, rel)
-        })
-        .collect();
-
-    // Run plugins for each workspace package in parallel, then merge results.
-    let ws_results: Vec<_> = workspace_pkgs
-        .par_iter()
-        .filter_map(|(ws, ws_pkg)| {
-            let ws_result = registry.run_workspace_fast(
-                ws_pkg,
-                &ws.root,
+    let mut result = if let Some(pkg) = root_pkg {
+        registry
+            .try_run_with_search_roots(
+                pkg,
                 &config.root,
-                &precompiled_matchers,
-                &relative_files,
-                &root_active_plugins,
-            );
+                file_paths,
+                &root_config_search_root_refs,
+                config.production,
+                candidate_index,
+            )
+            .map_err(|errors| {
+                FallowError::config(plugins::registry::format_plugin_regex_errors(&errors))
+            })?
+    } else {
+        plugins::AggregatedPluginResult::default()
+    };
+    if let Some(pkg) = root_pkg {
+        append_package_file_asset_patterns(&mut result, "", pkg);
+    }
+    Ok(result)
+}
+
+/// Run plugins for every workspace package in parallel, returning per-workspace
+/// results (or regex errors) for the caller to merge.
+fn run_workspace_plugins(
+    registry: &plugins::PluginRegistry,
+    config: &ResolvedConfig,
+    workspace_pkgs: &[LoadedWorkspacePackage],
+    file_paths: &[std::path::PathBuf],
+    root_active_plugins: &[String],
+    candidate_index: Option<&plugins::registry::ConfigCandidateIndex>,
+) -> Vec<WorkspacePluginResult> {
+    let root_active_plugins: rustc_hash::FxHashSet<&str> =
+        root_active_plugins.iter().map(String::as_str).collect();
+
+    let precompiled_matchers = registry.precompile_config_matchers();
+    let workspace_relative_files = bucket_files_by_workspace(workspace_pkgs, file_paths);
+
+    workspace_pkgs
+        .par_iter()
+        .zip(workspace_relative_files.par_iter())
+        .filter_map(|((ws, ws_pkg), relative_files)| {
+            let ws_result =
+                match registry.try_run_workspace_fast(&plugins::registry::WorkspacePluginRunInput {
+                    pkg: ws_pkg,
+                    root: &ws.root,
+                    project_root: &config.root,
+                    precompiled_config_matchers: &precompiled_matchers,
+                    relative_files,
+                    skip_config_plugins: &root_active_plugins,
+                    production_mode: config.production,
+                    candidate_index,
+                }) {
+                    Ok(result) => result,
+                    Err(errors) => return Some(Err(errors)),
+                };
             if ws_result.active_plugins.is_empty() {
                 return None;
             }
@@ -932,98 +2295,136 @@ fn run_plugins(
                 .unwrap_or(&ws.root)
                 .to_string_lossy()
                 .into_owned();
-            Some((ws_result, ws_prefix))
+            Some(Ok((ws_result, ws_prefix)))
+        })
+        .collect::<Vec<_>>()
+}
+
+/// Merge per-workspace plugin results into the root result, surfacing any
+/// accumulated regex errors as a single config error.
+fn merge_workspace_plugin_results(
+    result: &mut plugins::AggregatedPluginResult,
+    ws_results: Vec<WorkspacePluginResult>,
+) -> Result<(), FallowError> {
+    let mut regex_errors = Vec::new();
+    for ws_result in ws_results {
+        match ws_result {
+            Ok((mut ws_result, ws_prefix)) => {
+                ws_result.apply_workspace_prefix(&ws_prefix);
+                ws_result.config_patterns.clear();
+                ws_result.script_used_packages.clear();
+                result.merge_into(ws_result);
+            }
+            Err(mut errors) => regex_errors.append(&mut errors),
+        }
+    }
+    if !regex_errors.is_empty() {
+        return Err(FallowError::config(
+            plugins::registry::format_plugin_regex_errors(&regex_errors),
+        ));
+    }
+    Ok(())
+}
+
+/// When `autoImports` is enabled, drop the modeled Nuxt convention entry
+/// patterns so genuinely-unreferenced convention files are reported as
+/// `unused-file`. Component and script fallbacks have separate conservative
+/// config guards because custom `components:` and `imports:` settings affect
+/// different convention surfaces.
+fn gate_auto_import_entry_patterns(
+    result: &mut plugins::AggregatedPluginResult,
+    config: &ResolvedConfig,
+    workspaces: &[fallow_config::WorkspaceInfo],
+) {
+    if !config.auto_imports {
+        return;
+    }
+    if !result.active_plugins.iter().any(|name| name == "nuxt") {
+        return;
+    }
+    let components_custom = plugins::nuxt::config_declares_components(&config.root)
+        || workspaces
+            .iter()
+            .any(|ws| plugins::nuxt::config_declares_components(&ws.root));
+    let imports_custom = plugins::nuxt::config_declares_imports(&config.root)
+        || workspaces
+            .iter()
+            .any(|ws| plugins::nuxt::config_declares_imports(&ws.root));
+    result.entry_patterns.retain(|(rule, plugin)| {
+        if plugin != "nuxt" {
+            return true;
+        }
+        if !components_custom && plugins::nuxt::is_component_entry_pattern(&rule.pattern) {
+            return false;
+        }
+        if !imports_custom && plugins::nuxt::is_script_auto_import_entry_pattern(&rule.pattern) {
+            return false;
+        }
+        true
+    });
+}
+
+fn bucket_files_by_workspace(
+    workspace_pkgs: &[LoadedWorkspacePackage],
+    file_paths: &[std::path::PathBuf],
+) -> Vec<Vec<(std::path::PathBuf, String)>> {
+    let workspace_roots: Vec<_> = workspace_pkgs
+        .iter()
+        .map(|(workspace, _)| workspace.root.as_path())
+        .collect();
+    bucket_files_by_workspace_roots(&workspace_roots, file_paths)
+}
+
+fn bucket_files_by_workspace_roots(
+    workspace_roots: &[&Path],
+    file_paths: &[std::path::PathBuf],
+) -> Vec<Vec<(std::path::PathBuf, String)>> {
+    use rayon::prelude::*;
+
+    // A file may match nested or duplicate workspace roots. Keep the original
+    // first-declaration-wins contract by storing the first index for each root
+    // and selecting the lowest index among the file's matching ancestors.
+    let mut workspace_by_root: rustc_hash::FxHashMap<&Path, usize> =
+        rustc_hash::FxHashMap::default();
+    for (idx, root) in workspace_roots.iter().enumerate() {
+        workspace_by_root.entry(root).or_insert(idx);
+    }
+
+    let assignments: Vec<Option<(usize, std::path::PathBuf, String)>> = file_paths
+        .par_iter()
+        .map(|file_path| {
+            let idx = file_path
+                .ancestors()
+                .filter_map(|ancestor| workspace_by_root.get(ancestor).copied())
+                .min()?;
+            let relative = file_path.strip_prefix(workspace_roots[idx]).ok()?;
+            Some((
+                idx,
+                file_path.clone(),
+                relative.to_string_lossy().into_owned(),
+            ))
         })
         .collect();
 
-    // Merge workspace results sequentially (deterministic order via par_iter index stability)
-    // Track seen names for O(1) dedup instead of O(n) Vec::contains
-    let mut seen_plugins: rustc_hash::FxHashSet<String> =
-        result.active_plugins.iter().cloned().collect();
-    let mut seen_prefixes: rustc_hash::FxHashSet<String> =
-        result.virtual_module_prefixes.iter().cloned().collect();
-    let mut seen_generated: rustc_hash::FxHashSet<String> =
-        result.generated_import_patterns.iter().cloned().collect();
-    for (ws_result, ws_prefix) in ws_results {
-        // Prefix helper: workspace-relative patterns need the workspace prefix
-        // to be matchable from the monorepo root. But patterns that are already
-        // project-root-relative (e.g., from angular.json which uses absolute paths
-        // like "apps/client/src/styles.css") should not be double-prefixed.
-        let prefix_if_needed = |pat: &str| -> String {
-            if pat.starts_with(ws_prefix.as_str()) || pat.starts_with('/') {
-                pat.to_string()
-            } else {
-                format!("{ws_prefix}/{pat}")
-            }
-        };
-
-        for (rule, pname) in &ws_result.entry_patterns {
-            result
-                .entry_patterns
-                .push((rule.prefixed(&ws_prefix), pname.clone()));
-        }
-        for (plugin_name, role) in ws_result.entry_point_roles {
-            result.entry_point_roles.entry(plugin_name).or_insert(role);
-        }
-        for (pat, pname) in &ws_result.always_used {
-            result
-                .always_used
-                .push((prefix_if_needed(pat), pname.clone()));
-        }
-        for (pat, pname) in &ws_result.discovered_always_used {
-            result
-                .discovered_always_used
-                .push((prefix_if_needed(pat), pname.clone()));
-        }
-        for (pat, pname) in &ws_result.fixture_patterns {
-            result
-                .fixture_patterns
-                .push((prefix_if_needed(pat), pname.clone()));
-        }
-        for rule in &ws_result.used_exports {
-            result.used_exports.push(rule.prefixed(&ws_prefix));
-        }
-        // Merge active plugin names (deduplicated via HashSet)
-        for plugin_name in ws_result.active_plugins {
-            if !seen_plugins.contains(&plugin_name) {
-                seen_plugins.insert(plugin_name.clone());
-                result.active_plugins.push(plugin_name);
-            }
-        }
-        // These don't need prefixing (absolute paths / package names)
-        result
-            .referenced_dependencies
-            .extend(ws_result.referenced_dependencies);
-        result.setup_files.extend(ws_result.setup_files);
-        result
-            .tooling_dependencies
-            .extend(ws_result.tooling_dependencies);
-        // Virtual module prefixes (e.g., Docusaurus @theme/, @site/) are
-        // package-name prefixes, not file paths — no workspace prefix needed.
-        for prefix in ws_result.virtual_module_prefixes {
-            if !seen_prefixes.contains(&prefix) {
-                seen_prefixes.insert(prefix.clone());
-                result.virtual_module_prefixes.push(prefix);
-            }
-        }
-        // Generated import patterns (e.g., SvelteKit /$types) are suffix
-        // matches on specifiers, not file paths — no workspace prefix needed.
-        for pattern in ws_result.generated_import_patterns {
-            if !seen_generated.contains(&pattern) {
-                seen_generated.insert(pattern.clone());
-                result.generated_import_patterns.push(pattern);
-            }
-        }
-        // Path aliases from workspace plugins (e.g., SvelteKit $lib/ → src/lib).
-        // Prefix the replacement directory so it resolves from the monorepo root.
-        for (prefix, replacement) in ws_result.path_aliases {
-            result
-                .path_aliases
-                .push((prefix, format!("{ws_prefix}/{replacement}")));
-        }
+    let mut buckets = vec![Vec::new(); workspace_roots.len()];
+    for (idx, file_path, relative) in assignments.into_iter().flatten() {
+        buckets[idx].push((file_path, relative));
     }
 
-    result
+    buckets
+}
+
+/// Benchmark hook for workspace file assignment. This is not a supported API.
+#[doc(hidden)]
+pub fn benchmark_bucket_files_by_workspace(
+    workspace_roots: &[std::path::PathBuf],
+    file_paths: &[std::path::PathBuf],
+) -> Vec<Vec<(std::path::PathBuf, String)>> {
+    let workspace_roots: Vec<_> = workspace_roots
+        .iter()
+        .map(std::path::PathBuf::as_path)
+        .collect();
+    bucket_files_by_workspace_roots(&workspace_roots, file_paths)
 }
 
 fn collect_config_search_roots(
@@ -1052,37 +2453,136 @@ fn collect_config_search_roots(
     roots_vec
 }
 
-/// Run analysis on a project directory (with export usages for LSP Code Lens).
+/// Resolve the analysis config for a project, mirroring the CLI's `--config`
+/// behavior when `config_path` is provided.
 ///
 /// # Errors
 ///
-/// Returns an error if config loading, file discovery, parsing, or analysis fails.
-pub fn analyze_project(root: &Path) -> Result<AnalysisResults, FallowError> {
-    let config = default_config(root);
-    analyze_with_usages(&config)
+/// Returns an error when an explicit config cannot be loaded or automatic
+/// config discovery finds an invalid config.
+fn config_for_project(
+    root: &Path,
+    config_path: Option<&Path>,
+) -> Result<(ResolvedConfig, Option<std::path::PathBuf>), FallowError> {
+    let user_config = if let Some(path) = config_path {
+        Some((
+            fallow_config::FallowConfig::load(path)
+                .map_err(|e| FallowError::config(format!("{e:#}")))?,
+            path.to_path_buf(),
+        ))
+    } else {
+        fallow_config::FallowConfig::find_and_load(root).map_err(FallowError::config)?
+    };
+
+    let config = match user_config {
+        Some((config, path)) => resolve_user_config(config, path, root)?,
+        None => (
+            fallow_config::FallowConfig::default().resolve(
+                root.to_path_buf(),
+                fallow_config::OutputFormat::Human,
+                num_cpus(),
+                false,
+                true,
+                None,
+            ),
+            None,
+        ),
+    };
+
+    Ok(config)
 }
 
-/// Create a default config for a project root.
-pub(crate) fn default_config(root: &Path) -> ResolvedConfig {
-    let user_config = fallow_config::FallowConfig::find_and_load(root)
-        .ok()
-        .flatten();
-    match user_config {
-        Some((config, _path)) => config.resolve(
+/// Flatten the dead-code production flag, validate boundaries and rule packs,
+/// then resolve a user-supplied config for LSP/programmatic callers.
+fn resolve_user_config(
+    mut config: fallow_config::FallowConfig,
+    path: std::path::PathBuf,
+    root: &Path,
+) -> Result<(ResolvedConfig, Option<std::path::PathBuf>), FallowError> {
+    let dead_code_production = config
+        .production
+        .for_analysis(fallow_config::ProductionAnalysis::DeadCode);
+    config.production = dead_code_production.into();
+    config
+        .validate_resolved_boundaries(root)
+        .map_err(|errors| {
+            let joined = errors
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n  - ");
+            FallowError::config(format!("invalid boundary configuration:\n  - {joined}"))
+        })?;
+    let packs = fallow_config::load_rule_packs(root, &config.rule_packs).map_err(|errors| {
+        let joined = errors
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n  - ");
+        FallowError::config(format!("invalid rule pack:\n  - {joined}"))
+    })?;
+    let boundaries =
+        fallow_config::resolve_boundaries_for_rule_pack_validation(config.boundaries.clone(), root);
+    let zone_errors = fallow_config::validate_rule_pack_zone_references(
+        root,
+        &config.rule_packs,
+        &packs,
+        &boundaries,
+    );
+    if !zone_errors.is_empty() {
+        let joined = zone_errors
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n  - ");
+        return Err(FallowError::config(format!(
+            "invalid rule pack:\n  - {joined}"
+        )));
+    }
+    Ok((
+        config.resolve(
             root.to_path_buf(),
             fallow_config::OutputFormat::Human,
             num_cpus(),
             false,
             true, // quiet: LSP/programmatic callers don't need progress bars
+            None, // LSP/programmatic embedders use the default cache cap
         ),
-        None => fallow_config::FallowConfig::default().resolve(
-            root.to_path_buf(),
-            fallow_config::OutputFormat::Human,
-            num_cpus(),
-            false,
-            true,
-        ),
-    }
+        Some(path),
+    ))
+}
+
+/// Create a default config for a project root.
+///
+/// `analyze_project` is the dead-code entry point used by the LSP and other
+/// programmatic embedders. When the loaded config uses the per-analysis
+/// production form (`production: { deadCode: true, ... }`), the production
+/// flag must be flattened to the dead-code analysis here. Otherwise
+/// `ResolvedConfig::resolve` calls `.global()` which returns false for the
+/// per-analysis variant and the production-mode rule overrides
+/// (`unused_dev_dependencies: off`, etc.) plus `resolved.production = true`
+/// are silently dropped.
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "config resolution fallback is exercised by session tests"
+    )
+)]
+pub(crate) fn default_config(root: &Path) -> ResolvedConfig {
+    config_for_project(root, None).map_or_else(
+        |_| {
+            fallow_config::FallowConfig::default().resolve(
+                root.to_path_buf(),
+                fallow_config::OutputFormat::Human,
+                num_cpus(),
+                false,
+                true,
+                None,
+            )
+        },
+        |(config, _)| config,
+    )
 }
 
 fn num_cpus() -> usize {
@@ -1091,16 +2591,254 @@ fn num_cpus() -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{collect_config_search_roots, format_undeclared_workspace_warning};
+    use super::{
+        AnalysisSession, bucket_files_by_workspace, bucket_files_by_workspace_roots,
+        collect_config_search_roots, credit_workspace_package_usage, default_config,
+        format_undeclared_workspace_warning, parse_analysis_modules, plugin_config_hash,
+        resolver_options_hash, warn_undeclared_workspaces,
+    };
     use std::path::{Path, PathBuf};
+    use std::time::Instant;
 
-    use fallow_config::WorkspaceDiagnostic;
+    use fallow_config::{
+        AutoImportKind, AutoImportRule, WorkspaceDiagnostic, WorkspaceDiagnosticKind,
+    };
+    use fallow_types::discover::{DiscoveredFile, FileId};
+    use fallow_types::extract::{ImportInfo, ImportedName};
+
+    fn plugin_result() -> crate::plugins::AggregatedPluginResult {
+        let mut result = crate::plugins::AggregatedPluginResult::default();
+        result.active_plugins.push("nuxt".to_string());
+        result
+            .path_aliases
+            .push(("@/".to_string(), "src/".to_string()));
+        result
+    }
+
+    #[test]
+    fn commonjs_internal_import_credits_workspace_package_usage() {
+        let workspace = fallow_config::WorkspaceInfo {
+            root: PathBuf::from("/repo/packages/shared"),
+            name: "@repo/shared".to_string(),
+            is_internal_dependency: true,
+        };
+        let resolved = vec![crate::resolve::ResolvedModule {
+            file_id: FileId(0),
+            resolved_imports: vec![crate::resolve::ResolvedImport {
+                info: ImportInfo {
+                    source: "@repo/shared".to_string(),
+                    imported_name: ImportedName::Namespace,
+                    local_name: "shared".to_string(),
+                    is_type_only: false,
+                    is_type_only_star: false,
+                    from_style: false,
+                    span: oxc_span::Span::new(0, 20),
+                    source_span: oxc_span::Span::new(8, 20),
+                },
+                target: crate::resolve::ResolveResult::CommonJsInternalModule(FileId(1)),
+            }],
+            ..crate::resolve::ResolvedModule::default()
+        }];
+        let mut graph = crate::graph::ModuleGraph::build(&[], &[], &[]);
+
+        credit_workspace_package_usage(&mut graph, &resolved, &[workspace]);
+
+        assert_eq!(
+            graph.package_usage.get("@repo/shared"),
+            Some(&vec![FileId(0)])
+        );
+    }
+
+    #[test]
+    fn graph_cache_resolver_hash_includes_project_root() {
+        let dir_a = tempfile::tempdir().expect("create temp dir a");
+        let dir_b = tempfile::tempdir().expect("create temp dir b");
+        let config_a = session_config(dir_a.path());
+        let config_b = session_config(dir_b.path());
+
+        assert_ne!(
+            resolver_options_hash(&config_a),
+            resolver_options_hash(&config_b),
+            "shared cache dirs must not reuse graphs across project roots"
+        );
+    }
+
+    #[test]
+    fn graph_cache_resolver_hash_includes_resolve_conditions() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let config_a = session_config(dir.path());
+        let mut config_b = session_config(dir.path());
+        config_b.resolve.conditions.push("react-server".to_string());
+
+        assert_ne!(
+            resolver_options_hash(&config_a),
+            resolver_options_hash(&config_b),
+            "resolve condition changes must invalidate the graph cache"
+        );
+    }
+
+    #[test]
+    fn graph_cache_plugin_hash_includes_auto_imports() {
+        let mut without_auto_import = plugin_result();
+        let mut with_auto_import = plugin_result();
+        with_auto_import.auto_imports.push(AutoImportRule {
+            name: "useCounter".to_string(),
+            source: PathBuf::from("/project/composables/useCounter.ts"),
+            kind: AutoImportKind::Named,
+        });
+
+        assert_ne!(
+            plugin_config_hash(&without_auto_import),
+            plugin_config_hash(&with_auto_import),
+            "auto-import edge changes must invalidate the graph cache"
+        );
+
+        without_auto_import.auto_imports.push(AutoImportRule {
+            name: "useCounter".to_string(),
+            source: PathBuf::from("/project/composables/useCounter.ts"),
+            kind: AutoImportKind::Default,
+        });
+        assert_ne!(
+            plugin_config_hash(&without_auto_import),
+            plugin_config_hash(&with_auto_import),
+            "auto-import kind changes must invalidate the graph cache"
+        );
+    }
+
+    #[test]
+    fn graph_cache_plugin_hash_includes_style_and_static_mappings() {
+        let base = plugin_result();
+        let mut with_scss = base.clone();
+        with_scss
+            .scss_include_paths
+            .push(PathBuf::from("/project/styles"));
+        assert_ne!(
+            plugin_config_hash(&base),
+            plugin_config_hash(&with_scss),
+            "SCSS include path changes must invalidate the graph cache"
+        );
+
+        let mut with_static_dir = base.clone();
+        with_static_dir
+            .static_dir_mappings
+            .push((PathBuf::from("/project/public"), "/".to_string()));
+        assert_ne!(
+            plugin_config_hash(&base),
+            plugin_config_hash(&with_static_dir),
+            "static directory mapping changes must invalidate the graph cache"
+        );
+    }
 
     fn diag(root: &Path, relative: &str) -> WorkspaceDiagnostic {
-        WorkspaceDiagnostic {
-            path: root.join(relative),
-            message: String::new(),
+        WorkspaceDiagnostic::new(
+            root,
+            root.join(relative),
+            WorkspaceDiagnosticKind::UndeclaredWorkspace,
+        )
+    }
+
+    fn session_config(root: &Path) -> fallow_config::ResolvedConfig {
+        let mut config = default_config(root);
+        config.no_cache = true;
+        config.quiet = true;
+        config
+    }
+
+    fn write_session_fixture(root: &Path) {
+        let src = root.join("src");
+        std::fs::create_dir_all(&src).expect("create src");
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"name":"session-fixture","type":"module"}"#,
+        )
+        .expect("write package json");
+        std::fs::write(
+            src.join("index.ts"),
+            "import { used } from './used';\nconsole.log(used);\n",
+        )
+        .expect("write index");
+        std::fs::write(src.join("used.ts"), "export const used = 1;\n").expect("write used");
+    }
+
+    #[test]
+    fn analysis_session_discovers_project_files() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        write_session_fixture(dir.path());
+        let config = session_config(dir.path());
+
+        let session = AnalysisSession::new(&config).expect("session setup should succeed");
+
+        assert!(
+            session
+                .files()
+                .iter()
+                .any(|file| file.path.ends_with("src/index.ts")),
+            "session should own discovered project files"
+        );
+        assert_eq!(session.workspaces().len(), 0);
+    }
+
+    #[test]
+    fn direct_core_parse_surfaces_source_read_failure_diagnostic() {
+        let project = tempfile::tempdir().expect("create project");
+        let root = project.path();
+        let paths = ["a.ts", "b.ts", "c.ts"].map(|name| root.join(name));
+        for (index, path) in paths.iter().enumerate() {
+            std::fs::write(path, format!("export const value{index} = {index};\n"))
+                .expect("write source");
         }
+        let files: Vec<DiscoveredFile> = paths
+            .iter()
+            .enumerate()
+            .map(|(index, path)| DiscoveredFile {
+                id: FileId(u32::try_from(index).expect("test index fits u32")),
+                path: path.clone(),
+                size_bytes: std::fs::metadata(path).expect("source metadata").len(),
+            })
+            .collect();
+        std::fs::remove_file(&paths[1]).expect("remove source after discovery");
+        let config = session_config(root);
+
+        let parsed = parse_analysis_modules(&config, &files, false, Instant::now());
+
+        assert_eq!(
+            parsed
+                .modules
+                .iter()
+                .map(|module| module.file_id)
+                .collect::<Vec<_>>(),
+            vec![FileId(0), FileId(2)]
+        );
+        let diagnostics = fallow_config::workspace_diagnostics_for(root);
+        let diagnostic = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.kind.id() == "source-read-failure")
+            .expect("source read failure diagnostic");
+        assert_eq!(diagnostic.path, paths[1]);
+        assert!(matches!(
+            diagnostic.kind,
+            WorkspaceDiagnosticKind::SourceReadFailure { .. }
+        ));
+    }
+
+    #[test]
+    fn analysis_session_parses_owned_modules() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        write_session_fixture(dir.path());
+        let config = session_config(dir.path());
+
+        let session = AnalysisSession::new(&config).expect("session setup should succeed");
+        let parsed = session.parse_modules(false);
+
+        assert!(
+            parsed
+                .modules
+                .iter()
+                .any(|module| session.files()[module.file_id.0 as usize]
+                    .path
+                    .ends_with("src/index.ts")),
+            "session parsing should return modules keyed to session files"
+        );
     }
 
     #[test]
@@ -1161,6 +2899,159 @@ mod tests {
                 root.join("packages/shared"),
                 root.join("packages/shared/lib"),
             ]
+        );
+    }
+
+    #[test]
+    fn bucket_files_by_workspace_uses_workspace_relative_paths() {
+        let root = PathBuf::from("/repo");
+        let ui = fallow_config::WorkspaceInfo {
+            root: root.join("apps/ui"),
+            name: "ui".to_string(),
+            is_internal_dependency: false,
+        };
+        let api = fallow_config::WorkspaceInfo {
+            root: root.join("apps/api"),
+            name: "api".to_string(),
+            is_internal_dependency: false,
+        };
+        let workspace_pkgs = vec![
+            (
+                ui,
+                fallow_config::PackageJson {
+                    name: Some("ui".to_string()),
+                    ..Default::default()
+                },
+            ),
+            (
+                api,
+                fallow_config::PackageJson {
+                    name: Some("api".to_string()),
+                    ..Default::default()
+                },
+            ),
+        ];
+        let files = vec![
+            root.join("apps/ui/vite.config.ts"),
+            root.join("apps/ui/src/main.ts"),
+            root.join("apps/api/src/server.ts"),
+            root.join("tools/build.ts"),
+        ];
+
+        let buckets = bucket_files_by_workspace(&workspace_pkgs, &files);
+
+        assert_eq!(
+            buckets[0],
+            vec![
+                (
+                    root.join("apps/ui/vite.config.ts"),
+                    "vite.config.ts".to_string()
+                ),
+                (root.join("apps/ui/src/main.ts"), "src/main.ts".to_string()),
+            ]
+        );
+        assert_eq!(
+            buckets[1],
+            vec![(
+                root.join("apps/api/src/server.ts"),
+                "src/server.ts".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn workspace_bucketing_preserves_first_declared_match_and_file_order() {
+        let root = PathBuf::from("/repo");
+        let parent = root.join("apps");
+        let child = parent.join("web");
+        let nested_first = child.join("src/first.ts");
+        let nested_second = child.join("src/second.ts");
+        let unmatched = root.join("tools/build.ts");
+        let files = vec![nested_first.clone(), unmatched, nested_second.clone()];
+
+        // The relative path preserves the input path's original separators, which
+        // are mixed on Windows when the fixture is built via multiple `join` calls
+        // (`web\src/first.ts`). Normalize separators before comparing so the
+        // assertion checks bucketing + ordering, not host path formatting.
+        let normalize = |bucket: &[(PathBuf, String)]| -> Vec<(PathBuf, String)> {
+            bucket
+                .iter()
+                .map(|(path, rel)| (path.clone(), rel.replace('\\', "/")))
+                .collect()
+        };
+
+        let parent_first = bucket_files_by_workspace_roots(&[&parent, &child, &child], &files);
+        assert_eq!(
+            normalize(&parent_first[0]),
+            vec![
+                (nested_first.clone(), "web/src/first.ts".to_string()),
+                (nested_second.clone(), "web/src/second.ts".to_string()),
+            ]
+        );
+        assert!(parent_first[1].is_empty());
+        assert!(parent_first[2].is_empty());
+
+        let child_first = bucket_files_by_workspace_roots(&[&child, &parent], &files);
+        assert_eq!(
+            normalize(&child_first[0]),
+            vec![
+                (nested_first, "src/first.ts".to_string()),
+                (nested_second, "src/second.ts".to_string()),
+            ]
+        );
+        assert!(child_first[1].is_empty());
+    }
+
+    #[test]
+    fn warn_undeclared_workspaces_suppresses_paths_already_flagged_as_malformed() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let pkg_good = dir.path().join("packages").join("good");
+        let pkg_bad = dir.path().join("packages").join("bad");
+        std::fs::create_dir_all(&pkg_good).unwrap();
+        std::fs::create_dir_all(&pkg_bad).unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"workspaces": ["packages/*"]}"#,
+        )
+        .unwrap();
+        std::fs::write(pkg_good.join("package.json"), r#"{"name": "good"}"#).unwrap();
+        std::fs::write(pkg_bad.join("package.json"), r"{,").unwrap();
+
+        let (workspaces, diagnostics) = fallow_config::discover_workspaces_with_diagnostics(
+            dir.path(),
+            &globset::GlobSet::empty(),
+        )
+        .expect("root package.json is valid");
+        assert_eq!(workspaces.len(), 1, "only the valid workspace discovers");
+        fallow_config::stash_workspace_diagnostics(dir.path(), diagnostics);
+
+        warn_undeclared_workspaces(dir.path(), &workspaces, &globset::GlobSet::empty(), false);
+
+        let diagnostics = fallow_config::workspace_diagnostics_for(dir.path());
+        let mut malformed = 0;
+        let mut undeclared_for_bad = 0;
+        for diag in &diagnostics {
+            if matches!(
+                diag.kind,
+                WorkspaceDiagnosticKind::MalformedPackageJson { .. }
+            ) && diag.path.ends_with("bad")
+            {
+                malformed += 1;
+            }
+            if matches!(diag.kind, WorkspaceDiagnosticKind::UndeclaredWorkspace)
+                && diag.path.ends_with("bad")
+            {
+                undeclared_for_bad += 1;
+            }
+        }
+        assert_eq!(
+            malformed, 1,
+            "expected one MalformedPackageJson for packages/bad: {diagnostics:?}"
+        );
+        assert_eq!(
+            undeclared_for_bad, 0,
+            "warn_undeclared_workspaces must NOT re-flag a path that already \
+             carries MalformedPackageJson; got duplicates: {diagnostics:?}"
         );
     }
 }

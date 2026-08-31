@@ -24,7 +24,7 @@ update_optional_deps() {
     pkg.version = '$VERSION';
     if (pkg.optionalDependencies) {
       for (const key of Object.keys(pkg.optionalDependencies)) {
-        if (key.startsWith('@fallow-cli/')) {
+        if (key.startsWith('@fallow-cli/') || key === 'fallow-type-aware' || key === 'fallow-similar-code') {
           pkg.optionalDependencies[key] = '$VERSION';
         }
       }
@@ -33,7 +33,7 @@ update_optional_deps() {
   "
 }
 
-update_napi_lockfile() {
+update_package_lockfile() {
   node -e "
     const fs = require('fs');
     const lockPath = '$1';
@@ -43,7 +43,7 @@ update_napi_lockfile() {
       lock.packages[''].version = '$VERSION';
       if (lock.packages[''].optionalDependencies) {
         for (const key of Object.keys(lock.packages[''].optionalDependencies)) {
-          if (key.startsWith('@fallow-cli/fallow-node')) {
+          if (key.startsWith('@fallow-cli/fallow-node') || key === 'fallow-type-aware' || key === 'fallow-similar-code') {
             lock.packages[''].optionalDependencies[key] = '$VERSION';
           }
         }
@@ -77,16 +77,52 @@ update_napi_index_version() {
   "
 }
 
+update_similar_code_cargo_version() {
+  node -e "
+    const fs = require('fs');
+    const manifestPath = '$ROOT/tools/similar-code-sidecar/Cargo.toml';
+    let manifest = fs.readFileSync(manifestPath, 'utf8');
+    manifest = manifest.replace(
+      /(name = \"fallow-similar-code-sidecar\"\nversion = \")[^\"]+/,
+      '\$1$VERSION',
+    );
+    fs.writeFileSync(manifestPath, manifest);
+    const lockPath = '$ROOT/tools/similar-code-sidecar/Cargo.lock';
+    if (fs.existsSync(lockPath)) {
+      let lock = fs.readFileSync(lockPath, 'utf8');
+      lock = lock.replace(
+        /(name = \"fallow-similar-code-sidecar\"\nversion = \")[^\"]+/,
+        '\$1$VERSION',
+      );
+      fs.writeFileSync(lockPath, lock);
+    }
+  "
+}
+
 # Update main fallow package (version + optionalDependencies)
 update_optional_deps "$ROOT/npm/fallow/package.json"
 echo "  Updated fallow/package.json → $VERSION"
+
+update_optional_deps "$ROOT/npm/fallow-similar-code/package.json"
+echo "  Updated fallow-similar-code/package.json → $VERSION"
+
+update_similar_code_cargo_version
+echo "  Updated similar-code sidecar Cargo version → $VERSION"
 
 # Update Node bindings package (version + optionalDependencies)
 update_optional_deps "$ROOT/crates/napi/package.json"
 echo "  Updated crates/napi/package.json → $VERSION"
 
+update_version "$ROOT/tools/type-aware-sidecar/package.json"
+echo "  Updated tools/type-aware-sidecar/package.json → $VERSION"
+
+if [ -f "$ROOT/tools/type-aware-sidecar/package-lock.json" ]; then
+  update_package_lockfile "$ROOT/tools/type-aware-sidecar/package-lock.json"
+  echo "  Updated tools/type-aware-sidecar/package-lock.json → $VERSION"
+fi
+
 if [ -f "$ROOT/crates/napi/package-lock.json" ]; then
-  update_napi_lockfile "$ROOT/crates/napi/package-lock.json"
+  update_package_lockfile "$ROOT/crates/napi/package-lock.json"
   echo "  Updated crates/napi/package-lock.json → $VERSION"
 fi
 
@@ -98,7 +134,7 @@ fi
 # Update platform-specific npm packages
 for pkg in "$ROOT"/npm/*/package.json; do
   case "$pkg" in
-    */fallow/package.json) continue ;; # Already handled above
+    */fallow/package.json|*/fallow-similar-code/package.json) continue ;; # Already handled above
   esac
   [ -f "$pkg" ] || continue
   update_version "$pkg"

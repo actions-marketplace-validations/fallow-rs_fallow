@@ -51,9 +51,9 @@ pub fn sign_sidecar_binary(binary_path: &Path) {
 }
 
 /// Mint a license JWT valid for 30 days that grants the
-/// `production_coverage` feature. Signed with the test license key.
+/// `runtime_coverage` feature. Signed with the test license key.
 #[must_use]
-pub fn mint_production_coverage_jwt() -> String {
+pub fn mint_runtime_coverage_jwt() -> String {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system clock before UNIX epoch")
@@ -67,22 +67,21 @@ pub fn mint_production_coverage_jwt() -> String {
         "tid": "test-tenant",
         "seats": 1,
         "tier": "team",
-        "features": ["production_coverage"],
+        "features": ["runtime_coverage"],
         "iat": now,
         "exp": exp,
-        "jti": "test-jwt-production-coverage",
+        "jti": "test-jwt-runtime-coverage",
     });
     encode_jwt(&header, &payload)
 }
 
 /// Mint an already-expired JWT to exercise the hard-fail path.
 #[must_use]
-pub fn mint_expired_production_coverage_jwt() -> String {
+pub fn mint_expired_runtime_coverage_jwt() -> String {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system clock before UNIX epoch")
         .as_secs() as i64;
-    // Past the 90-day default hard-fail cap.
     let iat = now - 180 * 24 * 60 * 60;
     let exp = now - 120 * 24 * 60 * 60;
 
@@ -93,7 +92,7 @@ pub fn mint_expired_production_coverage_jwt() -> String {
         "tid": "test-tenant",
         "seats": 1,
         "tier": "team",
-        "features": ["production_coverage"],
+        "features": ["runtime_coverage"],
         "iat": iat,
         "exp": exp,
         "jti": "test-jwt-expired",

@@ -14,11 +14,11 @@ ERRORS=()
 # --- Helpers ---
 
 pass() { PASSED=$((PASSED + 1)); echo "  ✓ $1"; }
-fail() { FAILED=$((FAILED + 1)); ERRORS+=("$1: $2"); echo "  ✗ $1 — $2"; }
+fail() { FAILED=$((FAILED + 1)); ERRORS+=("$1: $2"); echo "  ✗ $1 - $2"; }
 
 assert_contains() {
   local output="$1" expected="$2" name="$3"
-  if echo "$output" | /usr/bin/grep -q "$expected" 2>/dev/null; then
+  if [[ "$output" == *"$expected"* ]]; then
     pass "$name"
   else
     fail "$name" "expected to contain: $expected"
@@ -27,7 +27,7 @@ assert_contains() {
 
 assert_not_contains() {
   local output="$1" unexpected="$2" name="$3"
-  if echo "$output" | /usr/bin/grep -q "$unexpected" 2>/dev/null; then
+  if [[ "$output" == *"$unexpected"* ]]; then
     fail "$name" "should NOT contain: $unexpected"
   else
     pass "$name"
@@ -74,6 +74,1110 @@ assert_json_value() {
   fi
 }
 
+assert_safe_workflow_output() {
+  local output="$1" expected_lines="$2" name="$3"
+  local actual_lines
+  actual_lines=$(printf '%s\n' "$output" | awk 'END { print NR }')
+  if [[ "$output" == *$'\r'* ]]; then
+    fail "$name" "contains a raw carriage return"
+  elif [ "$actual_lines" != "$expected_lines" ]; then
+    fail "$name" "expected $expected_lines command lines, got $actual_lines"
+  elif printf '%s\n' "$output" | grep -qv '^::'; then
+    fail "$name" "contains a non-command continuation line"
+  else
+    pass "$name"
+  fi
+}
+
+# --- Repository config hygiene ---
+
+echo ""
+echo "=== Repository config hygiene ==="
+
+CONFIG_HYGIENE_JS=$(mktemp)
+cat > "$CONFIG_HYGIENE_JS" <<'NODE'
+const { readdirSync, readFileSync, statSync } = require("node:fs");
+const { join } = require("node:path");
+
+const ignored = new Set([".git", "target", "node_modules"]);
+const configNames = new Set([".fallowrc.json", ".fallowrc.jsonc"]);
+const issues = [];
+
+const stripJsonc = (input) => {
+  let output = "";
+  let inString = false;
+  let escaped = false;
+  for (let i = 0; i < input.length; i += 1) {
+    const char = input[i];
+    const next = input[i + 1];
+    if (inString) {
+      output += char;
+      if (escaped) {
+        escaped = false;
+      } else if (char === "\\") {
+        escaped = true;
+      } else if (char === "\"") {
+        inString = false;
+      }
+      continue;
+    }
+    if (char === "\"") {
+      inString = true;
+      output += char;
+      continue;
+    }
+    if (char === "/" && next === "/") {
+      while (i < input.length && input[i] !== "\n") i += 1;
+      output += "\n";
+      continue;
+    }
+    if (char === "/" && next === "*") {
+      i += 2;
+      while (i < input.length && !(input[i] === "*" && input[i + 1] === "/")) i += 1;
+      i += 1;
+      output += " ";
+      continue;
+    }
+    output += char;
+  }
+  return output;
+};
+
+const findDuplicateKeys = (source, path) => {
+  const stripped = stripJsonc(source);
+  const duplicatePattern = /"([^"\\]*(?:\\.[^"\\]*)*)"\s*:/g;
+  const stack = [];
+  const objectKeys = [new Set()];
+  let match;
+  let i = 0;
+  let inString = false;
+  let escaped = false;
+  while (i < stripped.length) {
+    const char = stripped[i];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === "\\") {
+        escaped = true;
+      } else if (char === "\"") {
+        inString = false;
+      }
+      i += 1;
+      continue;
+    }
+    if (char === "\"") {
+      duplicatePattern.lastIndex = i;
+      match = duplicatePattern.exec(stripped);
+      if (match && match.index === i) {
+        const key = JSON.parse(`"${match[1]}"`);
+        const current = objectKeys[objectKeys.length - 1];
+        if (current.has(key)) {
+          issues.push(`${path}: duplicate key ${[...stack, key].join(".")}`);
+        }
+        current.add(key);
+        i = duplicatePattern.lastIndex;
+        continue;
+      }
+      inString = true;
+    } else if (char === "{") {
+      objectKeys.push(new Set());
+      stack.push("<object>");
+    } else if (char === "}") {
+      objectKeys.pop();
+      stack.pop();
+    }
+    i += 1;
+  }
+};
+
+const walk = (dir) => {
+  for (const entry of readdirSync(dir)) {
+    if (ignored.has(entry)) continue;
+    const path = join(dir, entry);
+    const stat = statSync(path);
+    if (stat.isDirectory()) {
+      walk(path);
+    } else if (configNames.has(entry)) {
+      findDuplicateKeys(readFileSync(path, "utf8"), path);
+    }
+  }
+};
+
+walk(".");
+for (const issue of issues) console.log(issue);
+process.exit(issues.length === 0 ? 0 : 1);
+NODE
+DUPLICATE_CONFIG_KEYS=$(cd "$DIR/../.." && node "$CONFIG_HYGIENE_JS")
+rm -f "$CONFIG_HYGIENE_JS"
+if [ -z "$DUPLICATE_CONFIG_KEYS" ]; then
+  pass "repo fallow configs have no duplicate JSON keys"
+else
+  fail "repo fallow configs have no duplicate JSON keys" "$DUPLICATE_CONFIG_KEYS"
+fi
+
+# --- Install script tests ---
+
+echo ""
+echo "=== Install script ==="
+
+if node --test "$DIR/install-verification-timeout.test.mjs"; then
+  pass "install: binary verification is supervised"
+else
+  fail "install: binary verification is supervised" "regression test failed"
+fi
+
+INSTALL_TMP=$(mktemp -d)
+trap 'rm -rf "$INSTALL_TMP"' EXIT
+mkdir -p "$INSTALL_TMP/pinned" "$INSTALL_TMP/range" "$INSTALL_TMP/unsafe" "$INSTALL_TMP/empty"
+
+cat > "$INSTALL_TMP/pinned/package.json" <<'JSON'
+{"devDependencies":{"fallow":"2.7.3"}}
+JSON
+cat > "$INSTALL_TMP/range/package.json" <<'JSON'
+{"dependencies":{"fallow":"^2.52.0"}}
+JSON
+cat > "$INSTALL_TMP/unsafe/package.json" <<'JSON'
+{"devDependencies":{"fallow":"workspace:*"}}
+JSON
+
+OUT=$(INPUT_ROOT="$INSTALL_TMP/pinned" FALLOW_VERSION="" FALLOW_INSTALL_DRY_RUN=true bash "$DIR/../scripts/install.sh" 2>&1)
+assert_contains "$OUT" "Using fallow version from" "install: reads package.json pin"
+assert_contains "$OUT" "DRY RUN: npm install -g --ignore-scripts fallow@2.7.3" "install: installs project pin"
+
+OUT=$(INPUT_ROOT="$INSTALL_TMP/range" FALLOW_VERSION="" FALLOW_INSTALL_DRY_RUN=true bash "$DIR/../scripts/install.sh" 2>&1)
+assert_contains "$OUT" "DRY RUN: npm install -g --ignore-scripts fallow@^2.52.0" "install: supports package.json semver range"
+
+OUT=$(INPUT_ROOT="$INSTALL_TMP/empty" FALLOW_VERSION="2.52.0 - 2.53.0" FALLOW_INSTALL_DRY_RUN=true bash "$DIR/../scripts/install.sh" 2>&1)
+assert_contains "$OUT" "DRY RUN: npm install -g --ignore-scripts fallow@2.52.0 - 2.53.0" "install: supports npm hyphen ranges"
+
+OUT=$(INPUT_ROOT="$INSTALL_TMP/pinned" FALLOW_VERSION="latest" FALLOW_INSTALL_DRY_RUN=true bash "$DIR/../scripts/install.sh" 2>&1)
+assert_contains "$OUT" "Using fallow version from action input: latest" "install: explicit version wins"
+assert_contains "$OUT" "DRY RUN: npm install -g --ignore-scripts fallow" "install: explicit latest installs latest"
+
+OUT=$(INPUT_ROOT="$INSTALL_TMP/unsafe" FALLOW_VERSION="" FALLOW_INSTALL_DRY_RUN=true bash "$DIR/../scripts/install.sh" 2>&1)
+assert_contains "$OUT" "Ignoring unsupported fallow package.json spec" "install: warns on unsupported package spec"
+assert_contains "$OUT" "DRY RUN: npm install -g --ignore-scripts fallow" "install: unsupported package spec falls back to latest"
+
+OUT=$(INPUT_ROOT="$INSTALL_TMP/empty" FALLOW_VERSION="" FALLOW_INSTALL_DRY_RUN=true bash "$DIR/../scripts/install.sh" 2>&1)
+assert_contains "$OUT" "DRY RUN: npm install -g --ignore-scripts fallow" "install: no package spec falls back to latest"
+
+OUT=$(INPUT_ROOT="$INSTALL_TMP/empty" FALLOW_VERSION="file:../fallow" FALLOW_INSTALL_DRY_RUN=true bash "$DIR/../scripts/install.sh" 2>&1)
+cmd_status=$?
+if [ "$cmd_status" -ne 0 ]; then
+  pass "install: invalid explicit spec fails"
+else
+  fail "install: invalid explicit spec fails" "expected non-zero exit"
+fi
+assert_contains "$OUT" "Invalid version specifier" "install: invalid explicit spec explains failure"
+
+OUT=$(INPUT_ROOT="$INSTALL_TMP/empty" FALLOW_VERSION="2.0.0 -g malicious" FALLOW_INSTALL_DRY_RUN=true bash "$DIR/../scripts/install.sh" 2>&1)
+cmd_status=$?
+if [ "$cmd_status" -ne 0 ]; then
+  pass "install: rejects dash-prefixed extra args in spec"
+else
+  fail "install: rejects dash-prefixed extra args in spec" "expected non-zero exit"
+fi
+
+# --- Type-aware sidecar provisioning ---
+
+echo ""
+echo "=== Install script: type-aware sidecar ==="
+
+mkdir -p "$INSTALL_TMP/ta-jsonc" "$INSTALL_TMP/ta-toml" "$INSTALL_TMP/ta-off" \
+  "$INSTALL_TMP/ta-audit" "$INSTALL_TMP/ta-pinned" "$INSTALL_TMP/ta-explicit"
+
+cat > "$INSTALL_TMP/ta-jsonc/.fallowrc.jsonc" <<'JSONC'
+{
+  // semantic evidence for dead-code candidates
+  "typeAware": { "enabled": true, "require": "best-effort" },
+}
+JSONC
+cat > "$INSTALL_TMP/ta-toml/fallow.toml" <<'TOML'
+[typeAware]
+enabled = true
+TOML
+cat > "$INSTALL_TMP/ta-off/.fallowrc.json" <<'JSON'
+{"typeAware":{"enabled":false}}
+JSON
+cat > "$INSTALL_TMP/ta-audit/.fallowrc.json" <<'JSON'
+{"audit":{"typeAware":true}}
+JSON
+cat > "$INSTALL_TMP/ta-pinned/package.json" <<'JSON'
+{"devDependencies":{"fallow":"2.7.3"}}
+JSON
+cat > "$INSTALL_TMP/ta-pinned/.fallowrc.json" <<'JSON'
+{"typeAware":{"enabled":true}}
+JSON
+cat > "$INSTALL_TMP/ta-explicit/custom-config.jsonc" <<'JSONC'
+{"typeAware":{"enabled":true}}
+JSONC
+
+OUT=$(INPUT_ROOT="$INSTALL_TMP/ta-jsonc" FALLOW_VERSION="" FALLOW_INSTALL_DRY_RUN=true bash "$DIR/../scripts/install.sh" 2>&1)
+assert_contains "$OUT" "Type-aware sidecar enabled via the project fallow config" "sidecar: auto detects jsonc typeAware.enabled"
+assert_contains "$OUT" "DRY RUN: npm install --prefix <tool-dir> --ignore-scripts fallow-type-aware@<resolved CLI version>" "sidecar: auto installs sidecar for unpinned CLI"
+
+OUT=$(INPUT_ROOT="$INSTALL_TMP/ta-toml" FALLOW_VERSION="" FALLOW_INSTALL_DRY_RUN=true bash "$DIR/../scripts/install.sh" 2>&1)
+assert_contains "$OUT" "fallow-type-aware@" "sidecar: auto detects fallow.toml typeAware section"
+
+OUT=$(INPUT_ROOT="$INSTALL_TMP/ta-audit" FALLOW_VERSION="" FALLOW_INSTALL_DRY_RUN=true bash "$DIR/../scripts/install.sh" 2>&1)
+assert_contains "$OUT" "fallow-type-aware@" "sidecar: auto detects audit.typeAware override"
+
+OUT=$(INPUT_ROOT="$INSTALL_TMP/ta-explicit" INPUT_CONFIG="$INSTALL_TMP/ta-explicit/custom-config.jsonc" FALLOW_VERSION="" FALLOW_INSTALL_DRY_RUN=true bash "$DIR/../scripts/install.sh" 2>&1)
+assert_contains "$OUT" "fallow-type-aware@" "sidecar: auto respects explicit config path"
+
+OUT=$(INPUT_ROOT="$INSTALL_TMP/empty" INPUT_TYPE_AWARE=true FALLOW_VERSION="" FALLOW_INSTALL_DRY_RUN=true bash "$DIR/../scripts/install.sh" 2>&1)
+assert_contains "$OUT" "Type-aware sidecar enabled via the action 'type-aware' input" "sidecar: input true forces provisioning"
+assert_contains "$OUT" "fallow-type-aware@" "sidecar: input true installs sidecar"
+
+OUT=$(INPUT_ROOT="$INSTALL_TMP/ta-off" FALLOW_VERSION="" FALLOW_INSTALL_DRY_RUN=true bash "$DIR/../scripts/install.sh" 2>&1)
+assert_not_contains "$OUT" "fallow-type-aware@" "sidecar: config enabled=false skips provisioning"
+
+OUT=$(INPUT_ROOT="$INSTALL_TMP/ta-jsonc" INPUT_TYPE_AWARE=false FALLOW_VERSION="" FALLOW_INSTALL_DRY_RUN=true bash "$DIR/../scripts/install.sh" 2>&1)
+assert_not_contains "$OUT" "fallow-type-aware@" "sidecar: input false wins over enabled config"
+
+OUT=$(INPUT_ROOT="$INSTALL_TMP/empty" FALLOW_VERSION="" FALLOW_INSTALL_DRY_RUN=true bash "$DIR/../scripts/install.sh" 2>&1)
+assert_not_contains "$OUT" "fallow-type-aware@" "sidecar: auto without config skips provisioning"
+
+OUT=$(INPUT_ROOT="$INSTALL_TMP/ta-pinned" FALLOW_VERSION="" FALLOW_INSTALL_DRY_RUN=true bash "$DIR/../scripts/install.sh" 2>&1)
+assert_contains "$OUT" "DRY RUN: npm install -g --ignore-scripts fallow@2.7.3" "sidecar: pinned CLI still installs pin"
+assert_contains "$OUT" "DRY RUN: npm install --prefix <tool-dir> --ignore-scripts fallow-type-aware@2.7.3" "sidecar: exact pin propagates to sidecar version"
+
+OUT=$(INPUT_ROOT="$INSTALL_TMP/ta-pinned" FALLOW_VERSION="3.11.0" FALLOW_INSTALL_DRY_RUN=true bash "$DIR/../scripts/install.sh" 2>&1)
+assert_contains "$OUT" "DRY RUN: npm install --prefix <tool-dir> --ignore-scripts fallow-type-aware@3.11.0" "sidecar: version input wins for sidecar version"
+
+OUT=$(INPUT_ROOT="$INSTALL_TMP/empty" INPUT_TYPE_AWARE=bogus FALLOW_VERSION="" FALLOW_INSTALL_DRY_RUN=true bash "$DIR/../scripts/install.sh" 2>&1)
+cmd_status=$?
+if [ "$cmd_status" -ne 0 ]; then
+  pass "sidecar: invalid type-aware input fails"
+else
+  fail "sidecar: invalid type-aware input fails" "expected non-zero exit"
+fi
+assert_contains "$OUT" "Invalid 'type-aware' input" "sidecar: invalid type-aware input explains failure"
+
+# --- Binary verification integration ---
+#
+# Exercises the same verifier path used by install.sh against a controlled
+# fake `node_modules/fallow` tree.
+# We can't sign with the production key from a test, so we override the
+# verifier with a test keypair via the verifyFn knob. The goal is to prove
+# that bad signatures produce a non-zero exit, that good signatures
+# produce a zero exit, and that the SKIP_ENV escape hatch is honored.
+
+VERIFY_TMP=$(mktemp -d)
+trap 'rm -rf "$INSTALL_TMP" "$VERIFY_TMP"' EXIT
+
+PLATFORM_PKG=$(node -e "
+const { getPlatformPackage } = require('$DIR/../../npm/fallow/scripts/platform-package');
+let pkg;
+if (process.platform !== 'linux') {
+  pkg = getPlatformPackage(process.platform, process.arch);
+} else {
+  let lib;
+  try { lib = require('detect-libc').familySync(); } catch {}
+  pkg = getPlatformPackage(process.platform, process.arch, lib);
+}
+console.log(pkg);
+" 2>&1)
+
+if [ -z "$PLATFORM_PKG" ] || [ "$PLATFORM_PKG" = "null" ]; then
+  echo "  (skipping binary verification tests on unsupported platform $(node -e 'console.log(process.platform + \"-\" + process.arch)'))"
+else
+  # Build a fake `node_modules/fallow` tree with our scripts and a fake
+  # platform package. Use a generated keypair, sign the binaries with it,
+  # and have the test invocation override the embedded production key.
+  mkdir -p "$VERIFY_TMP/node_modules/fallow/scripts"
+  mkdir -p "$VERIFY_TMP/node_modules/$PLATFORM_PKG"
+  cp "$DIR/../../npm/fallow/scripts/verify-binary.js" "$VERIFY_TMP/node_modules/fallow/scripts/"
+  cp "$DIR/../../npm/fallow/scripts/platform-package.js" "$VERIFY_TMP/node_modules/fallow/scripts/"
+
+  # Generate a keypair, write both verified binaries, and sign them. Also write a
+  # minimal package.json so require.resolve('@fallow-cli/<platform>/package.json')
+  # succeeds.
+  node -e "
+const crypto = require('node:crypto');
+const fs = require('node:fs');
+const path = require('node:path');
+const { privateKey, publicKey } = crypto.generateKeyPairSync('ed25519');
+const der = publicKey.export({ format: 'der', type: 'spki' });
+const rawPub = der.subarray(der.length - 32);
+const dir = '$VERIFY_TMP/node_modules/$PLATFORM_PKG';
+fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ name: '$PLATFORM_PKG', version: '0.0.0' }));
+const ext = process.platform === 'win32' ? '.exe' : '';
+for (const base of ['fallow', 'fallow-similar-code']) {
+  const bin = path.join(dir, base + ext);
+  const data = Buffer.from('mock ' + base);
+  fs.writeFileSync(bin, data);
+  fs.writeFileSync(bin + '.sig', crypto.sign(null, data, privateKey));
+}
+fs.writeFileSync('$VERIFY_TMP/testkey.bin', rawPub);
+fs.writeFileSync('$VERIFY_TMP/testkey.pem', privateKey.export({ format: 'pem', type: 'pkcs8' }));
+"
+
+  # Good sig + digest + override key -> ok=true via test injections.
+  GOOD=$(cd "$VERIFY_TMP" && node -e "
+const fs = require('node:fs');
+const crypto = require('node:crypto');
+const rawPub = fs.readFileSync('$VERIFY_TMP/testkey.bin');
+const { verifyInstalled, _verifyWithKey } = require('fallow/scripts/verify-binary');
+(async () => {
+  const result = await verifyInstalled({
+    verifyFn: (p) => _verifyWithKey(p, rawPub),
+    digestProvider: ({ binaryPath }) => crypto.createHash('sha256').update(fs.readFileSync(binaryPath)).digest('hex'),
+  });
+  if (!result.ok) { console.error('FAIL: ' + result.code + ': ' + result.message); process.exit(1); }
+  console.log('OK ' + result.package);
+})().catch((err) => { console.error(err.message); process.exit(1); });
+" 2>&1)
+  good_status=$?
+  if [ "$good_status" -eq 0 ]; then
+    pass "install verify: good signatures succeed"
+  else
+    fail "install verify: good signatures succeed" "exit $good_status, output: $GOOD"
+  fi
+
+  # Corrupt the fallow sig and confirm verifyInstalled returns a failure.
+  ext=""
+  if [ "$(node -p 'process.platform')" = "win32" ]; then ext=".exe"; fi
+  node -e "
+const fs = require('node:fs');
+const p = '$VERIFY_TMP/node_modules/$PLATFORM_PKG/fallow${ext}.sig';
+const sig = fs.readFileSync(p);
+sig[0] ^= 0xff;
+fs.writeFileSync(p, sig);
+"
+
+  BAD=$(cd "$VERIFY_TMP" && node -e "
+const fs = require('node:fs');
+const crypto = require('node:crypto');
+const rawPub = fs.readFileSync('$VERIFY_TMP/testkey.bin');
+const { verifyInstalled, _verifyWithKey } = require('fallow/scripts/verify-binary');
+(async () => {
+  const result = await verifyInstalled({
+    verifyFn: (p) => _verifyWithKey(p, rawPub),
+    digestProvider: ({ binaryPath }) => crypto.createHash('sha256').update(fs.readFileSync(binaryPath)).digest('hex'),
+  });
+  if (result.ok) { console.error('FAIL: expected ok=false'); process.exit(2); }
+  console.log('FAILED ' + result.code + ' ' + (result.binary || ''));
+  process.exit(1);
+})().catch((err) => { console.error(err.message); process.exit(2); });
+" 2>&1)
+  bad_status=$?
+  if [ "$bad_status" -eq 1 ]; then
+    pass "install verify: bad signature aborts with non-zero exit"
+  else
+    fail "install verify: bad signature aborts with non-zero exit" "exit $bad_status, output: $BAD"
+  fi
+  assert_contains "$BAD" "FAILED sig-invalid" "install verify: bad signature reports sig-invalid"
+  assert_contains "$BAD" "fallow" "install verify: bad signature names the offending binary"
+
+  node -e "
+const crypto = require('node:crypto');
+const fs = require('node:fs');
+const privateKey = crypto.createPrivateKey(fs.readFileSync('$VERIFY_TMP/testkey.pem', 'utf8'));
+const bin = '$VERIFY_TMP/node_modules/$PLATFORM_PKG/fallow${ext}';
+fs.writeFileSync(bin + '.sig', crypto.sign(null, fs.readFileSync(bin), privateKey));
+"
+
+  DIGEST_BAD=$(cd "$VERIFY_TMP" && node -e "
+const fs = require('node:fs');
+const crypto = require('node:crypto');
+const rawPub = fs.readFileSync('$VERIFY_TMP/testkey.bin');
+const { verifyInstalled, _verifyWithKey } = require('fallow/scripts/verify-binary');
+(async () => {
+  const result = await verifyInstalled({
+    verifyFn: (p) => _verifyWithKey(p, rawPub),
+    digestProvider: ({ binaryPath }) => {
+      const digest = crypto.createHash('sha256').update(fs.readFileSync(binaryPath)).digest('hex');
+      return /fallow/.test(binaryPath) ? '0'.repeat(64) : digest;
+    },
+  });
+  if (result.ok) { console.error('FAIL: expected ok=false'); process.exit(2); }
+  console.log('FAILED ' + result.code + ' ' + (result.binary || ''));
+  process.exit(1);
+})().catch((err) => { console.error(err.message); process.exit(2); });
+" 2>&1)
+  digest_bad_status=$?
+  if [ "$digest_bad_status" -eq 1 ]; then
+    pass "install verify: digest mismatch aborts with non-zero exit"
+  else
+    fail "install verify: digest mismatch aborts with non-zero exit" "exit $digest_bad_status, output: $DIGEST_BAD"
+  fi
+  assert_contains "$DIGEST_BAD" "FAILED digest-mismatch" "install verify: digest mismatch reports digest-mismatch"
+  assert_contains "$DIGEST_BAD" "fallow" "install verify: digest mismatch names the offending binary"
+
+  # sig-missing: binary present, .sig file absent (partial-deploy scenario,
+  # most likely real-world failure mode after a botched release).
+  rm -f "$VERIFY_TMP/node_modules/$PLATFORM_PKG/fallow${ext}.sig"
+  MISSING=$(cd "$VERIFY_TMP" && node -e "
+const fs = require('node:fs');
+const crypto = require('node:crypto');
+const rawPub = fs.readFileSync('$VERIFY_TMP/testkey.bin');
+const { verifyInstalled, _verifyWithKey } = require('fallow/scripts/verify-binary');
+(async () => {
+  const result = await verifyInstalled({
+    verifyFn: (p) => _verifyWithKey(p, rawPub),
+    digestProvider: ({ binaryPath }) => crypto.createHash('sha256').update(fs.readFileSync(binaryPath)).digest('hex'),
+  });
+  if (result.ok) { console.error('FAIL: expected ok=false'); process.exit(2); }
+  console.log('FAILED ' + result.code + ' ' + (result.binary || ''));
+  process.exit(1);
+})().catch((err) => { console.error(err.message); process.exit(2); });
+" 2>&1)
+  missing_status=$?
+  if [ "$missing_status" -eq 1 ]; then
+    pass "install verify: missing .sig file aborts with non-zero exit"
+  else
+    fail "install verify: missing .sig file aborts with non-zero exit" "exit $missing_status, output: $MISSING"
+  fi
+  assert_contains "$MISSING" "FAILED sig-missing" "install verify: missing .sig reports sig-missing"
+  assert_contains "$MISSING" "fallow" "install verify: missing .sig names the offending binary"
+
+  # Restore a valid-length .sig so the skip-env test sees an otherwise
+  # intact-but-wrong setup.
+  node -e "
+const fs = require('node:fs');
+fs.writeFileSync('$VERIFY_TMP/node_modules/$PLATFORM_PKG/fallow${ext}.sig', Buffer.alloc(64));
+"
+
+  # FALLOW_SKIP_BINARY_VERIFY=1 with intact-but-wrong setup short-circuits.
+  SKIP=$(cd "$VERIFY_TMP" && FALLOW_SKIP_BINARY_VERIFY=1 node -e "
+const { verifyInstalled } = require('fallow/scripts/verify-binary');
+(async () => {
+  const result = await verifyInstalled();
+  console.log(JSON.stringify(result));
+})().catch((err) => { console.error(err.message); process.exit(1); });
+" 2>&1)
+  skip_status=$?
+  if [ "$skip_status" -eq 0 ]; then
+    pass "install verify: FALLOW_SKIP_BINARY_VERIFY short-circuits"
+  else
+    fail "install verify: FALLOW_SKIP_BINARY_VERIFY short-circuits" "exit $skip_status, output: $SKIP"
+  fi
+  assert_contains "$SKIP" "skipped" "install verify: skip env reports skipped=true"
+fi
+
+echo ""
+echo "=== Analyze script failure handling ==="
+
+ANALYZE_TMP=$(mktemp -d)
+trap 'rm -rf "$INSTALL_TMP" "$ANALYZE_TMP"' EXIT
+mkdir -p "$ANALYZE_TMP/bin" "$ANALYZE_TMP/work"
+cat > "$ANALYZE_TMP/bin/fallow" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' '{"error":true,"message":"bad audit config","exit_code":2}'
+exit 2
+SH
+chmod +x "$ANALYZE_TMP/bin/fallow"
+
+OUT=$(cd "$ANALYZE_TMP/work" && PATH="$ANALYZE_TMP/bin:$PATH" GITHUB_OUTPUT="$ANALYZE_TMP/output" INPUT_ROOT="." INPUT_COMMAND="audit" INPUT_FORMAT="json" bash "$DIR/../scripts/analyze.sh" 2>&1)
+cmd_status=$?
+if [ "$cmd_status" -eq 2 ]; then
+  pass "analyze: structured fallow errors fail"
+else
+  fail "analyze: structured fallow errors fail" "expected exit 2, got $cmd_status"
+fi
+assert_contains "$OUT" "bad audit config" "analyze: surfaces structured error message"
+
+OUT=$(cd "$ANALYZE_TMP/work" && PATH="$ANALYZE_TMP/bin:$PATH" GITHUB_OUTPUT="$ANALYZE_TMP/output" INPUT_ROOT="." INPUT_COMMAND="audit" INPUT_FORMAT="json" INPUT_BASELINE="baseline.json" bash "$DIR/../scripts/analyze.sh" 2>&1)
+cmd_status=$?
+if [ "$cmd_status" -eq 2 ]; then
+  pass "analyze: audit rejects generic baseline input"
+else
+  fail "analyze: audit rejects generic baseline input" "expected exit 2, got $cmd_status"
+fi
+assert_contains "$OUT" "dead-code-baseline" "analyze: baseline error points to audit baselines"
+
+cat > "$ANALYZE_TMP/bin/fallow" <<'SH'
+#!/usr/bin/env bash
+case "$*" in
+  *"--help"*)
+    printf '%s\n' 'Usage: fallow dead-code --sarif-file <PATH>'
+    ;;
+  *"--type-aware"*)
+    if [ "${MOCK_TYPE_AWARE_INCOMPLETE:-false}" = "true" ]; then
+      printf '%s\n' '{"total_issues":0,"_meta":{"type_aware":{"identity":{"completeness":"partial"},"queries":[]}}}'
+      exit 1
+    fi
+    printf '%s\n' '{"total_issues":0,"_meta":{"type_aware":{"identity":{"completeness":"complete"},"queries":[]}}}'
+    ;;
+  *)
+    printf '%s\n' '{"total_issues":0}'
+    ;;
+esac
+SH
+chmod +x "$ANALYZE_TMP/bin/fallow"
+
+cat > "$ANALYZE_TMP/bin/git" <<'SH'
+#!/usr/bin/env bash
+[ -n "${FAKE_GIT_LOG:-}" ] && printf '%s\n' "$*" >> "$FAKE_GIT_LOG"
+case "$1" in
+  diff)
+    shift
+    name_only=false
+    nul_delimited=false
+    for arg in "$@"; do
+      if [ "$arg" = "--name-only" ]; then
+        name_only=true
+      elif [ "$arg" = "-z" ]; then
+        nul_delimited=true
+      fi
+    done
+    if [ "$name_only" = "true" ]; then
+      if [ "$nul_delimited" = "true" ]; then
+        printf '%s\0' "${FAKE_CHANGED_FILES:-src/a.ts}"
+      else
+        printf '%s\n' "${FAKE_CHANGED_FILES:-src/a.ts}"
+      fi
+      exit 0
+    fi
+    printf '%s\n' 'diff --git a/src/a.ts b/src/a.ts'
+    printf '%s\n' '--- a/src/a.ts'
+    printf '%s\n' '+++ b/src/a.ts'
+    printf '%s\n' '@@ -0,0 +1 @@'
+    printf '%s\n' '+export const a = 1;'
+    ;;
+  cat-file)
+    exit 0
+    ;;
+  fetch)
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+SH
+chmod +x "$ANALYZE_TMP/bin/git"
+
+run_analyze_input_case() {
+  local case_name=$1
+  local changed_since=$2
+  local diff_file=$3
+  local work="$ANALYZE_TMP/input-$case_name"
+  local output="$ANALYZE_TMP/input-output-$case_name"
+  local env_file="$ANALYZE_TMP/input-env-$case_name"
+  local git_log="$ANALYZE_TMP/input-git-$case_name"
+  mkdir -p "$work"
+  : > "$output"
+  : > "$env_file"
+  : > "$git_log"
+
+  (
+    cd "$work" || exit 1
+    PATH="$ANALYZE_TMP/bin:$PATH" \
+      FAKE_GIT_LOG="$git_log" \
+      GITHUB_OUTPUT="$output" \
+      GITHUB_ENV="$env_file" \
+      INPUT_ROOT="." \
+      INPUT_COMMAND="dead-code" \
+      INPUT_FORMAT="json" \
+      INPUT_AUTO_CHANGED_SINCE="false" \
+      INPUT_CHANGED_SINCE="$changed_since" \
+      FALLOW_DIFF_FILE="$diff_file" \
+      bash "$DIR/../scripts/analyze.sh"
+  ) 2>&1
+}
+
+OUT=$(run_analyze_input_case "option-like-ref" "-main" "")
+cmd_status=$?
+if [ "$cmd_status" -eq 2 ]; then
+  pass "analyze: rejects option-like changed-since"
+else
+  fail "analyze: rejects option-like changed-since" "expected exit 2, got $cmd_status"
+fi
+assert_contains "$OUT" "::error::changed-since must not begin with '-'" "analyze: option-like changed-since error is stable"
+if [ ! -s "$ANALYZE_TMP/input-git-option-like-ref" ]; then
+  pass "analyze: rejects option-like changed-since before Git"
+else
+  fail "analyze: rejects option-like changed-since before Git" "Git was invoked"
+fi
+if [ ! -s "$ANALYZE_TMP/input-output-option-like-ref" ] && [ ! -s "$ANALYZE_TMP/input-env-option-like-ref" ]; then
+  pass "analyze: rejects option-like changed-since before file-command writes"
+else
+  fail "analyze: rejects option-like changed-since before file-command writes" "output or env file was modified"
+fi
+
+OUT=$(run_analyze_input_case "control-ref" $'main\ninjected=value' "")
+cmd_status=$?
+if [ "$cmd_status" -eq 2 ]; then
+  pass "analyze: rejects control characters in changed-since"
+else
+  fail "analyze: rejects control characters in changed-since" "expected exit 2, got $cmd_status"
+fi
+assert_contains "$OUT" "::error::changed-since must not contain ASCII control characters" "analyze: changed-since control-character error is stable"
+if [ ! -s "$ANALYZE_TMP/input-output-control-ref" ] && [ ! -s "$ANALYZE_TMP/input-env-control-ref" ]; then
+  pass "analyze: rejects changed-since newline before file-command writes"
+else
+  fail "analyze: rejects changed-since newline before file-command writes" "output or env file was modified"
+fi
+
+OUT=$(run_analyze_input_case "control-diff" "" $'reports/diff\nINJECTED=value')
+cmd_status=$?
+if [ "$cmd_status" -eq 2 ]; then
+  pass "analyze: rejects control characters in diff-file"
+else
+  fail "analyze: rejects control characters in diff-file" "expected exit 2, got $cmd_status"
+fi
+assert_contains "$OUT" "::error::diff-file must not contain ASCII control characters" "analyze: diff-file control-character error is stable"
+if [ ! -s "$ANALYZE_TMP/input-output-control-diff" ] && [ ! -s "$ANALYZE_TMP/input-env-control-diff" ]; then
+  pass "analyze: rejects diff-file newline before file-command writes"
+else
+  fail "analyze: rejects diff-file newline before file-command writes" "output or env file was modified"
+fi
+
+VALID_DIFF="$ANALYZE_TMP/diff files/current change.patch"
+mkdir -p "$(dirname "$VALID_DIFF")"
+printf '%s\n' 'diff --git a/src/a.ts b/src/a.ts' > "$VALID_DIFF"
+OUT=$(run_analyze_input_case "valid-scalars" "refs/remotes/origin/main~1" "$VALID_DIFF")
+cmd_status=$?
+if [ "$cmd_status" -eq 0 ]; then
+  pass "analyze: preserves valid ref and spaced diff-file path"
+else
+  fail "analyze: preserves valid ref and spaced diff-file path" "exit $cmd_status, output: $OUT"
+fi
+assert_contains "$(cat "$ANALYZE_TMP/input-output-valid-scalars")" "changed_since=refs/remotes/origin/main~1" "analyze: preserves valid relative ref"
+assert_contains "$(cat "$ANALYZE_TMP/input-env-valid-scalars")" "FALLOW_DIFF_FILE=$VALID_DIFF" "analyze: preserves diff-file path containing spaces"
+
+TYPE_AWARE_WORK="$ANALYZE_TMP/type-aware-options"
+mkdir -p "$TYPE_AWARE_WORK"
+OUT=$(
+  cd "$TYPE_AWARE_WORK" || exit 1
+  PATH="$ANALYZE_TMP/bin:$PATH" \
+    GITHUB_OUTPUT="$ANALYZE_TMP/type-aware-output" \
+    GITHUB_ENV="$ANALYZE_TMP/type-aware-env" \
+    INPUT_ROOT="." \
+    INPUT_COMMAND="dead-code" \
+    INPUT_FORMAT="json" \
+    INPUT_AUTO_CHANGED_SINCE="false" \
+    INPUT_TYPE_AWARE="true" \
+    INPUT_TYPE_AWARE_PROJECTS="tsconfig.app.json,tsconfig.test.json" \
+    INPUT_TYPE_AWARE_REQUIRE="complete" \
+    bash "$DIR/../scripts/analyze.sh"
+)
+cmd_status=$?
+if [ "$cmd_status" -eq 0 ]; then
+  pass "analyze: type-aware inputs run successfully"
+else
+  fail "analyze: type-aware inputs run successfully" "exit $cmd_status, output: $OUT"
+fi
+ARGS=$(cat "$TYPE_AWARE_WORK/fallow-analysis-args.sh")
+assert_contains "$ARGS" "--type-aware" "analyze: forwards type-aware"
+assert_contains "$ARGS" "--type-aware-project tsconfig.app.json" "analyze: forwards first type-aware project"
+assert_contains "$ARGS" "--type-aware-project tsconfig.test.json" "analyze: forwards second type-aware project"
+assert_contains "$ARGS" "--type-aware-require complete" "analyze: forwards type-aware completeness policy"
+
+TYPE_AWARE_INCOMPLETE_WORK="$ANALYZE_TMP/type-aware-incomplete"
+mkdir -p "$TYPE_AWARE_INCOMPLETE_WORK"
+OUT=$(
+  cd "$TYPE_AWARE_INCOMPLETE_WORK" || exit 1
+  PATH="$ANALYZE_TMP/bin:$PATH" \
+    GITHUB_OUTPUT="$ANALYZE_TMP/type-aware-incomplete-output" \
+    INPUT_ROOT="." \
+    INPUT_COMMAND="dead-code" \
+    INPUT_FORMAT="json" \
+    INPUT_AUTO_CHANGED_SINCE="false" \
+    INPUT_TYPE_AWARE="true" \
+    INPUT_TYPE_AWARE_REQUIRE="complete" \
+    MOCK_TYPE_AWARE_INCOMPLETE="true" \
+    bash "$DIR/../scripts/analyze.sh" 2>&1
+)
+cmd_status=$?
+if [ "$cmd_status" -eq 1 ]; then
+  pass "analyze: complete policy fails partial semantic output with zero findings"
+else
+  fail "analyze: complete policy fails partial semantic output with zero findings" "expected exit 1, got $cmd_status"
+fi
+assert_contains "$OUT" "Type-aware completeness gate failed" "analyze: completeness failure is explicit"
+
+run_analyze_scope_case() {
+  local case_name=$1
+  local changed_files=$2
+  local baseline=$3
+  local changed_since=$4
+  local diff_file=$5
+  local root=${6:-.}
+  local config=${7:-}
+  local work="$ANALYZE_TMP/scope-$case_name"
+  mkdir -p "$work/$root"
+  rm -f "$ANALYZE_TMP/output-$case_name" "$ANALYZE_TMP/env-$case_name"
+  if [ -n "$diff_file" ]; then
+    printf '%s\n' 'diff --git a/src/a.ts b/src/a.ts' > "$diff_file"
+  fi
+
+  (
+    cd "$work" || exit 1
+    PATH="$ANALYZE_TMP/bin:$PATH" \
+      FAKE_CHANGED_FILES="$changed_files" \
+      GITHUB_OUTPUT="$ANALYZE_TMP/output-$case_name" \
+      GITHUB_ENV="$ANALYZE_TMP/env-$case_name" \
+      INPUT_ROOT="$root" \
+      INPUT_CONFIG="$config" \
+      INPUT_COMMAND="dead-code" \
+      INPUT_FORMAT="json" \
+      INPUT_AUTO_CHANGED_SINCE="true" \
+      INPUT_CHANGED_SINCE="$changed_since" \
+      EVENT_NAME="pull_request" \
+      PR_BASE_SHA="base1234" \
+      INPUT_BASELINE="$baseline" \
+      FALLOW_DIFF_FILE="$diff_file" \
+      bash "$DIR/../scripts/analyze.sh"
+  ) 2>&1
+}
+
+OUT=$(run_analyze_scope_case "config-baseline-auto" ".fallowrc.json" "baseline.json" "" "")
+ARGS=$(cat "$ANALYZE_TMP/scope-config-baseline-auto/fallow-analysis-args.sh")
+OUTPUTS=$(cat "$ANALYZE_TMP/output-config-baseline-auto")
+ENV_OUT=$(cat "$ANALYZE_TMP/env-config-baseline-auto")
+assert_not_contains "$ARGS" "--changed-since" "analyze: config baseline auto-scope removes changed-since"
+if grep -qx 'changed_since=' "$ANALYZE_TMP/output-config-baseline-auto"; then
+  pass "analyze: config baseline auto-scope clears changed_since output"
+else
+  fail "analyze: config baseline auto-scope clears changed_since output" "outputs were: $OUTPUTS"
+fi
+assert_not_contains "$ENV_OUT" "FALLOW_DIFF_FILE=" "analyze: config baseline auto-scope skips auto diff file"
+assert_contains "$OUT" "dead-code baseline comparison is running unscoped because '.fallowrc.json' changed" "analyze: config baseline auto-scope warns"
+
+OUT=$(run_analyze_scope_case "source-baseline-auto" "src/a.ts" "baseline.json" "" "")
+ARGS=$(cat "$ANALYZE_TMP/scope-source-baseline-auto/fallow-analysis-args.sh")
+OUTPUTS=$(cat "$ANALYZE_TMP/output-source-baseline-auto")
+ENV_OUT=$(cat "$ANALYZE_TMP/env-source-baseline-auto")
+assert_contains "$ARGS" "--changed-since base1234" "analyze: source baseline auto-scope keeps changed-since"
+assert_contains "$OUTPUTS" "changed_since=base1234" "analyze: source baseline auto-scope keeps changed_since output"
+assert_contains "$ENV_OUT" "FALLOW_DIFF_FILE=" "analyze: source baseline auto-scope writes auto diff file"
+
+OUT=$(run_analyze_scope_case "config-no-baseline" ".fallowrc.json" "" "" "")
+ARGS=$(cat "$ANALYZE_TMP/scope-config-no-baseline/fallow-analysis-args.sh")
+OUTPUTS=$(cat "$ANALYZE_TMP/output-config-no-baseline")
+assert_contains "$ARGS" "--changed-since base1234" "analyze: config without baseline keeps changed-since"
+assert_contains "$OUTPUTS" "changed_since=base1234" "analyze: config without baseline keeps changed_since output"
+
+OUT=$(run_analyze_scope_case "explicit-config-root-prefix" "packages/app/config/fallow.jsonc" "baseline.json" "" "" "packages/app" "config/fallow.jsonc")
+ARGS=$(cat "$ANALYZE_TMP/scope-explicit-config-root-prefix/fallow-analysis-args.sh")
+assert_not_contains "$ARGS" "--changed-since" "analyze: explicit config path with root prefix removes auto changed-since"
+assert_contains "$OUT" "because 'config/fallow.jsonc' changed" "analyze: explicit config path warning uses root-relative path"
+
+OUT=$(run_analyze_scope_case "config-explicit-changed-since" ".fallowrc.json" "baseline.json" "manual-base" "")
+ARGS=$(cat "$ANALYZE_TMP/scope-config-explicit-changed-since/fallow-analysis-args.sh")
+OUTPUTS=$(cat "$ANALYZE_TMP/output-config-explicit-changed-since")
+assert_contains "$ARGS" "--changed-since manual-base" "analyze: explicit changed-since is preserved"
+assert_contains "$OUTPUTS" "changed_since=manual-base" "analyze: explicit changed-since output is preserved"
+assert_contains "$OUT" "explicitly scoped" "analyze: explicit changed-since warns about baseline drift"
+
+EXPLICIT_DIFF="$ANALYZE_TMP/user.diff"
+OUT=$(run_analyze_scope_case "config-explicit-diff" ".fallowrc.json" "baseline.json" "" "$EXPLICIT_DIFF")
+ARGS=$(cat "$ANALYZE_TMP/scope-config-explicit-diff/fallow-analysis-args.sh")
+OUTPUTS=$(cat "$ANALYZE_TMP/output-config-explicit-diff")
+ENV_OUT=$(cat "$ANALYZE_TMP/env-config-explicit-diff")
+assert_not_contains "$ARGS" "--changed-since base1234" "analyze: explicit diff still clears auto changed-since"
+if grep -qx 'changed_since=' "$ANALYZE_TMP/output-config-explicit-diff"; then
+  pass "analyze: explicit diff clears auto changed_since output"
+else
+  fail "analyze: explicit diff clears auto changed_since output" "outputs were: $OUTPUTS"
+fi
+assert_contains "$ENV_OUT" "FALLOW_DIFF_FILE=$EXPLICIT_DIFF" "analyze: explicit diff file is preserved"
+assert_contains "$OUT" "explicit diff file remains active" "analyze: explicit diff warns about remaining scope"
+
+OUT=$(run_analyze_scope_case "newline-filename" $'src/line\nbreak.ts' "" "" "")
+CHANGED_FILE="$ANALYZE_TMP/scope-newline-filename/fallow-changed-files.json"
+if jq -e 'length == 1 and .[0] == "src/line\nbreak.ts"' "$CHANGED_FILE" >/dev/null; then
+  pass "analyze: changed-file JSON preserves newline-bearing filename"
+else
+  fail "analyze: changed-file JSON preserves newline-bearing filename" "got: $(cat "$CHANGED_FILE")"
+fi
+
+# Audit verdict + gate are emitted to GITHUB_OUTPUT for the Check threshold step.
+# Without this, the threshold step gates on raw introduced count, re-introducing
+# the issue #302 bug where warn-tier findings fail CI.
+cat > "$ANALYZE_TMP/bin/fallow" <<'SH'
+#!/usr/bin/env bash
+# Synthesize an audit JSON with verdict=warn, dead_code_introduced=1.
+# Mimics the warn-tier scenario from issue #302: a project with
+# `unused-exports: warn` has a PR introducing a new unused export.
+case "$*" in
+  *audit*)
+    printf '%s\n' '{"command":"audit","verdict":"warn","attribution":{"gate":"new-only","dead_code_introduced":1,"dead_code_inherited":0,"complexity_introduced":0,"complexity_inherited":0,"duplication_introduced":0,"duplication_inherited":0},"summary":{"dead_code_issues":1,"dead_code_has_errors":false,"complexity_findings":0,"max_cyclomatic":null,"duplication_clone_groups":0}}'
+    ;;
+  *) printf '{"total_issues":0}\n' ;;
+esac
+SH
+chmod +x "$ANALYZE_TMP/bin/fallow"
+
+cd "$ANALYZE_TMP/work" && rm -f "$ANALYZE_TMP/output"
+OUT=$(PATH="$ANALYZE_TMP/bin:$PATH" GITHUB_OUTPUT="$ANALYZE_TMP/output" \
+  INPUT_ROOT="." INPUT_COMMAND="audit" INPUT_FORMAT="json" \
+  bash "$DIR/../scripts/analyze.sh" 2>&1) || true
+cd "$DIR"
+VERDICT=$(grep '^verdict=' "$ANALYZE_TMP/output" | cut -d= -f2)
+GATE=$(grep '^gate=' "$ANALYZE_TMP/output" | cut -d= -f2)
+ISSUES=$(grep '^issues=' "$ANALYZE_TMP/output" | cut -d= -f2)
+[ "$VERDICT" = "warn" ] && pass "analyze: emits verdict to GITHUB_OUTPUT for audit" || fail "analyze: verdict output" "expected warn, got '$VERDICT'"
+[ "$GATE" = "new-only" ] && pass "analyze: emits gate to GITHUB_OUTPUT for audit" || fail "analyze: gate output" "expected new-only, got '$GATE'"
+[ "$ISSUES" = "1" ] && pass "analyze: still emits issues count for audit" || fail "analyze: issues output" "expected 1, got '$ISSUES'"
+
+cat > "$ANALYZE_TMP/bin/fallow" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' '{"command":"audit","verdict":"fail","attribution":{"gate":"new-only","dead_code_introduced":0,"complexity_introduced":0,"duplication_introduced":0,"styling_introduced":1},"summary":{"dead_code_issues":0,"complexity_findings":0,"duplication_clone_groups":0},"complexity":{"styling_findings":[{"effective_severity":"error","introduced":true}]}}'
+SH
+chmod +x "$ANALYZE_TMP/bin/fallow"
+cd "$ANALYZE_TMP/work" && rm -f "$ANALYZE_TMP/output"
+OUT=$(PATH="$ANALYZE_TMP/bin:$PATH" GITHUB_OUTPUT="$ANALYZE_TMP/output" \
+  INPUT_ROOT="." INPUT_COMMAND="audit" INPUT_FORMAT="json" \
+  bash "$DIR/../scripts/analyze.sh" 2>&1) || true
+cd "$DIR"
+ISSUES=$(grep '^issues=' "$ANALYZE_TMP/output" | cut -d= -f2)
+[ "$ISSUES" = "1" ] && pass "analyze: new-only audit counts introduced styling findings" || fail "analyze: new-only styling issues" "expected 1, got '$ISSUES'"
+
+cat > "$ANALYZE_TMP/bin/fallow" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' '{"command":"audit","verdict":"fail","attribution":{"gate":"all"},"summary":{"dead_code_issues":0,"complexity_findings":0,"duplication_clone_groups":0},"complexity":{"styling_findings":[{"effective_severity":"error"},{"effective_severity":"warn"}]}}'
+SH
+chmod +x "$ANALYZE_TMP/bin/fallow"
+cd "$ANALYZE_TMP/work" && rm -f "$ANALYZE_TMP/output"
+OUT=$(PATH="$ANALYZE_TMP/bin:$PATH" GITHUB_OUTPUT="$ANALYZE_TMP/output" \
+  INPUT_ROOT="." INPUT_COMMAND="audit" INPUT_FORMAT="json" \
+  bash "$DIR/../scripts/analyze.sh" 2>&1) || true
+cd "$DIR"
+ISSUES=$(grep '^issues=' "$ANALYZE_TMP/output" | cut -d= -f2)
+[ "$ISSUES" = "2" ] && pass "analyze: all-gate audit counts every styling finding" || fail "analyze: all-gate styling issues" "expected 2, got '$ISSUES'"
+
+cat > "$ANALYZE_TMP/bin/fallow" <<'SH'
+#!/usr/bin/env bash
+case "$*" in
+  *"security"*"--gate newly-reachable"*)
+    printf '%s\n' '{"kind":"security","gate":{"mode":"newly-reachable","verdict":"fail","new_count":2},"summary":{"security_findings":5},"security_findings":[]}'
+    ;;
+  *"security"*)
+    printf '%s\n' '{"kind":"security","summary":{"security_findings":3},"security_findings":[]}'
+    ;;
+  *) printf '{"total_issues":0}\n' ;;
+esac
+SH
+chmod +x "$ANALYZE_TMP/bin/fallow"
+
+cd "$ANALYZE_TMP/work" && rm -f "$ANALYZE_TMP/output"
+OUT=$(PATH="$ANALYZE_TMP/bin:$PATH" GITHUB_OUTPUT="$ANALYZE_TMP/output" \
+  INPUT_ROOT="." INPUT_COMMAND="security" INPUT_FORMAT="json" INPUT_SECURITY_GATE="newly-reachable" \
+  bash "$DIR/../scripts/analyze.sh" 2>&1) || true
+cd "$DIR"
+GATE=$(grep '^gate=' "$ANALYZE_TMP/output" | cut -d= -f2)
+ISSUES=$(grep '^issues=' "$ANALYZE_TMP/output" | cut -d= -f2)
+ARGS=$(cat "$ANALYZE_TMP/work/fallow-analysis-args.sh")
+[ "$GATE" = "newly-reachable" ] && pass "analyze: emits gate to GITHUB_OUTPUT for security" || fail "analyze: security gate output" "expected newly-reachable, got '$GATE'"
+[ "$ISSUES" = "2" ] && pass "analyze: security gate uses new_count for issues" || fail "analyze: security gate issues" "expected 2, got '$ISSUES'"
+assert_contains "$ARGS" "--gate newly-reachable" "analyze: forwards security-gate to fallow"
+
+cd "$ANALYZE_TMP/work" && rm -f "$ANALYZE_TMP/output"
+OUT=$(PATH="$ANALYZE_TMP/bin:$PATH" GITHUB_OUTPUT="$ANALYZE_TMP/output" \
+  INPUT_ROOT="." INPUT_COMMAND="security" INPUT_FORMAT="json" INPUT_SECURITY_GATE="all" \
+  bash "$DIR/../scripts/analyze.sh" 2>&1)
+cmd_status=$?
+cd "$DIR"
+if [ "$cmd_status" -eq 2 ]; then
+  pass "analyze: rejects invalid security-gate"
+else
+  fail "analyze: rejects invalid security-gate" "expected exit 2, got $cmd_status"
+fi
+assert_contains "$OUT" "security-gate must be 'new' or 'newly-reachable'" "analyze: invalid security-gate error is clear"
+
+# Non-audit commands must NOT emit verdict / gate (empty values are fine).
+cat > "$ANALYZE_TMP/bin/fallow" <<'SH'
+#!/usr/bin/env bash
+case "$*" in
+  *dead-code*) printf '{"total_issues":3}\n' ;;
+  *) printf '{"check":{"total_issues":3}}\n' ;;
+esac
+SH
+chmod +x "$ANALYZE_TMP/bin/fallow"
+cd "$ANALYZE_TMP/work" && rm -f "$ANALYZE_TMP/output"
+OUT=$(PATH="$ANALYZE_TMP/bin:$PATH" GITHUB_OUTPUT="$ANALYZE_TMP/output" \
+  INPUT_ROOT="." INPUT_COMMAND="dead-code" INPUT_FORMAT="json" \
+  bash "$DIR/../scripts/analyze.sh" 2>&1) || true
+cd "$DIR"
+VERDICT=$(grep '^verdict=' "$ANALYZE_TMP/output" | cut -d= -f2)
+[ -z "$VERDICT" ] && pass "analyze: verdict empty for non-audit command" || fail "analyze: non-audit verdict" "expected empty, got '$VERDICT'"
+
+cd "$ANALYZE_TMP/work" && rm -f "$ANALYZE_TMP/output"
+OUT=$(PATH="$ANALYZE_TMP/bin:$PATH" GITHUB_OUTPUT="$ANALYZE_TMP/output" \
+  INPUT_ROOT="." INPUT_COMMAND="" INPUT_FORMAT="json" \
+  INPUT_COVERAGE="coverage/coverage-final.json" INPUT_COVERAGE_ROOT="/ci/workspace" \
+  bash "$DIR/../scripts/analyze.sh" 2>&1) || true
+cd "$DIR"
+ARGS=$(cat "$ANALYZE_TMP/work/fallow-analysis-args.sh")
+assert_contains "$ARGS" "--coverage coverage/coverage-final.json" "analyze: forwards coverage to default combined command"
+assert_contains "$ARGS" "--coverage-root /ci/workspace" "analyze: forwards coverage-root to default combined command"
+
+cd "$ANALYZE_TMP/work" && rm -f "$ANALYZE_TMP/output" "$ANALYZE_TMP/github-env"
+OUT=$(PATH="$ANALYZE_TMP/bin:$PATH" GITHUB_OUTPUT="$ANALYZE_TMP/output" \
+  GITHUB_ENV="$ANALYZE_TMP/github-env" INPUT_ROOT="." INPUT_COMMAND="dead-code" \
+  INPUT_FORMAT="json" INPUT_ARGS="--report-path-prefix custom/base --unused-files" \
+  bash "$DIR/../scripts/analyze.sh" 2>&1) || true
+cd "$DIR"
+ARGS=$(cat "$ANALYZE_TMP/work/fallow-analysis-args.sh")
+RENDER_ENV=$(cat "$ANALYZE_TMP/github-env")
+assert_not_contains "$ARGS" "--report-path-prefix" "analyze: keeps renderer prefix out of JSON analysis args"
+assert_contains "$ARGS" "--unused-files" "analyze: preserves non-presentation extra args"
+assert_contains "$RENDER_ENV" "FALLOW_RENDER_PATH_PREFIX_SET=1" "analyze: marks explicit renderer prefix"
+assert_contains "$RENDER_ENV" "FALLOW_RENDER_PATH_PREFIX=custom/base" "analyze: propagates renderer prefix"
+assert_contains "$RENDER_ENV" "FALLOW_ANALYSIS_ARGS_JSON=[" "analyze: propagates safe JSON fallback arguments"
+assert_contains "$RENDER_ENV" '"--unused-files"' "analyze: JSON fallback arguments preserve non-presentation flags"
+
+cd "$ANALYZE_TMP/work"
+OUT=$(PATH="$ANALYZE_TMP/bin:$PATH" GITHUB_OUTPUT="$ANALYZE_TMP/output" \
+  GITHUB_ENV="$ANALYZE_TMP/github-env" INPUT_ROOT="." INPUT_COMMAND="dead-code" \
+  INPUT_FORMAT="json" bash "$DIR/../scripts/analyze.sh" 2>&1) || true
+cd "$DIR"
+RENDER_ENV_TAIL=$(tail -3 "$ANALYZE_TMP/github-env")
+assert_contains "$RENDER_ENV_TAIL" "FALLOW_RENDER_PATH_PREFIX_SET=0" "analyze: clears a prior renderer prefix on the next invocation"
+assert_contains "$RENDER_ENV_TAIL" "FALLOW_RENDER_PATH_PREFIX=" "analyze: clears the prior renderer prefix value"
+
+cat > "$ANALYZE_TMP/bin/fallow" <<'SH'
+#!/usr/bin/env bash
+case "$*" in
+  *"--help"*)
+    printf '%s\n' 'Usage: fallow dead-code --sarif-file <PATH>'
+    ;;
+  *)
+    printf '%s\n' '{"check":{"total_issues":0},"dupes":{"clone_groups":[],"clone_families":[],"stats":{"clone_groups":2,"clone_instances":5,"files_with_clones":4,"duplicated_lines":59,"duplication_percentage":0.16}},"health":{"summary":{"functions_above_threshold":0},"runtime_coverage":{"findings":[]}}}'
+    ;;
+esac
+SH
+chmod +x "$ANALYZE_TMP/bin/fallow"
+cd "$ANALYZE_TMP/work" && rm -f "$ANALYZE_TMP/output"
+OUT=$(PATH="$ANALYZE_TMP/bin:$PATH" GITHUB_OUTPUT="$ANALYZE_TMP/output" \
+  INPUT_ROOT="." INPUT_COMMAND="" INPUT_FORMAT="json" \
+  bash "$DIR/../scripts/analyze.sh" 2>&1) || true
+cd "$DIR"
+ISSUES=$(grep '^issues=' "$ANALYZE_TMP/output" | cut -d= -f2)
+[ "$ISSUES" = "0" ] && pass "analyze: combined empty dupes groups ignore nonzero stats" || fail "analyze: combined empty dupes groups" "expected 0, got '$ISSUES'"
+assert_not_contains "$OUT" "Fallow found 2 issues" "analyze: combined empty dupes groups do not fail"
+
+# Issue #735: generated artifacts can be moved out of the workspace root.
+cat > "$ANALYZE_TMP/bin/fallow" <<'SH'
+#!/usr/bin/env bash
+case "$*" in
+  *"--help"*)
+    printf '%s\n' 'Usage: fallow dead-code --sarif-file <PATH>'
+    ;;
+  *"--format sarif"*)
+    printf '%s\n' '{"version":"2.1.0","runs":[{"results":[{"ruleId":"fallow/test"}]}]}'
+    ;;
+  *)
+    printf '%s\n' '{"total_issues":0}'
+    ;;
+esac
+SH
+chmod +x "$ANALYZE_TMP/bin/fallow"
+
+CUSTOM_WORK="$ANALYZE_TMP/custom-artifacts"
+mkdir -p "$CUSTOM_WORK"
+cd "$CUSTOM_WORK" && rm -f "$ANALYZE_TMP/output" "$ANALYZE_TMP/env"
+OUT=$(PATH="$ANALYZE_TMP/bin:$PATH" GITHUB_OUTPUT="$ANALYZE_TMP/output" GITHUB_ENV="$ANALYZE_TMP/env" \
+  INPUT_ROOT="." INPUT_COMMAND="dead-code" INPUT_FORMAT="sarif" INPUT_SARIF="true" INPUT_ARTIFACTS_DIR=".var/fallow" \
+  bash "$DIR/../scripts/analyze.sh" 2>&1) || true
+cd "$DIR"
+assert_contains "$(grep '^results=' "$ANALYZE_TMP/output")" "results=.var/fallow/fallow-results.json" "analyze: custom artifacts-dir emits results path"
+assert_contains "$(grep '^sarif=' "$ANALYZE_TMP/output")" "sarif=.var/fallow/fallow-results.sarif" "analyze: custom artifacts-dir emits sarif path"
+[ -f "$CUSTOM_WORK/.var/fallow/fallow-results.json" ] && pass "analyze: custom artifacts-dir writes results file" || fail "analyze: custom artifacts-dir writes results file" "missing results file"
+[ -f "$CUSTOM_WORK/.var/fallow/fallow-stderr.log" ] && pass "analyze: custom artifacts-dir writes stderr log" || fail "analyze: custom artifacts-dir writes stderr log" "missing stderr log"
+[ -f "$CUSTOM_WORK/.var/fallow/fallow-analysis-args.sh" ] && pass "analyze: custom artifacts-dir writes args file" || fail "analyze: custom artifacts-dir writes args file" "missing args file"
+[ ! -e "$CUSTOM_WORK/fallow-results.json" ] && pass "analyze: custom artifacts-dir keeps root clean" || fail "analyze: custom artifacts-dir keeps root clean" "root results file exists"
+assert_contains "$(cat "$ANALYZE_TMP/env")" "FALLOW_ANALYSIS_ARGS_FILE=.var/fallow/fallow-analysis-args.sh" "analyze: custom artifacts-dir propagates args path"
+assert_contains "$(cat "$CUSTOM_WORK/.var/fallow/fallow-analysis-args.sh")" "--sarif-file .var/fallow/fallow-results.sarif" "analyze: custom artifacts-dir passes sarif path to fallow"
+
+DEFAULT_WORK="$ANALYZE_TMP/default-artifacts"
+mkdir -p "$DEFAULT_WORK"
+cd "$DEFAULT_WORK" && rm -f "$ANALYZE_TMP/output"
+OUT=$(PATH="$ANALYZE_TMP/bin:$PATH" GITHUB_OUTPUT="$ANALYZE_TMP/output" \
+  INPUT_ROOT="." INPUT_COMMAND="dead-code" INPUT_FORMAT="json" \
+  bash "$DIR/../scripts/analyze.sh" 2>&1) || true
+cd "$DIR"
+assert_contains "$(grep '^results=' "$ANALYZE_TMP/output")" "results=fallow-results.json" "analyze: default artifacts path is unchanged"
+[ -f "$DEFAULT_WORK/fallow-results.json" ] && pass "analyze: default writes root results file" || fail "analyze: default writes root results file" "missing root results file"
+
+INVALID_WORK="$ANALYZE_TMP/invalid-artifacts"
+mkdir -p "$INVALID_WORK"
+cd "$INVALID_WORK" && rm -f "$ANALYZE_TMP/output"
+OUT=$(PATH="$ANALYZE_TMP/bin:$PATH" GITHUB_OUTPUT="$ANALYZE_TMP/output" \
+  INPUT_ROOT="." INPUT_COMMAND="dead-code" INPUT_FORMAT="json" INPUT_ARTIFACTS_DIR="../outside" \
+  bash "$DIR/../scripts/analyze.sh" 2>&1)
+cmd_status=$?
+cd "$DIR"
+if [ "$cmd_status" -eq 2 ]; then
+  pass "analyze: artifacts-dir rejects traversal"
+else
+  fail "analyze: artifacts-dir rejects traversal" "expected exit 2, got $cmd_status"
+fi
+assert_contains "$OUT" "artifacts-dir must be a relative path inside the workspace" "analyze: artifacts-dir traversal error is clear"
+
+# Issue #813: the saved-envelope SARIF renderer must validate the produced file,
+# not gate on the exit code. The primary analysis may exit 1 when findings exist.
+# The renderer must still produce valid SARIF without a second health analysis.
+cat > "$ANALYZE_TMP/bin/fallow" <<'SH'
+#!/usr/bin/env bash
+[ -n "${MOCK_CALL_LOG:-}" ] && printf '%s\n' "$*" >> "$MOCK_CALL_LOG"
+if [ "${1:-}" = "report" ] && [ "${2:-}" = "--help" ]; then
+  printf '%s\n' 'Usage: fallow report --from <PATH>'
+  exit 0
+fi
+fmt=""
+prev=""
+for arg in "$@"; do
+  [ "$prev" = "--format" ] && fmt="$arg"
+  prev="$arg"
+done
+if [ "$fmt" = "sarif" ]; then
+  if [ "${MOCK_SARIF_MODE:-valid}" = "valid" ] || \
+     { [ "${MOCK_SARIF_MODE:-valid}" = "report-empty-direct-valid" ] && [ "${1:-}" != "report" ]; }; then
+    printf '%s\n' '{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"fallow"}},"results":[{"ruleId":"fallow/test"}]}]}'
+  fi
+  # exit 1 = issues found (valid mode) OR genuine failure (empty mode writes nothing)
+  exit 1
+fi
+# Primary run is always --format json.
+printf '%s\n' '{"summary":{"functions_above_threshold":0}}'
+exit 1
+SH
+chmod +x "$ANALYZE_TMP/bin/fallow"
+
+SARIF_OK_WORK="$ANALYZE_TMP/sarif-exit1-valid"
+mkdir -p "$SARIF_OK_WORK"
+cd "$SARIF_OK_WORK" && rm -f "$ANALYZE_TMP/output"
+rm -f "$ANALYZE_TMP/sarif-calls"
+OUT=$(PATH="$ANALYZE_TMP/bin:$PATH" GITHUB_OUTPUT="$ANALYZE_TMP/output" \
+  INPUT_ROOT="." INPUT_COMMAND="health" INPUT_FORMAT="sarif" MOCK_SARIF_MODE="valid" \
+  MOCK_CALL_LOG="$ANALYZE_TMP/sarif-calls" \
+  bash "$DIR/../scripts/analyze.sh" 2>&1) || true
+cd "$DIR"
+assert_not_contains "$OUT" "SARIF generation failed" "analyze: valid SARIF + exit 1 does not warn (issue #813)"
+[ -s "$SARIF_OK_WORK/fallow-results.sarif" ] && pass "analyze: valid SARIF + exit 1 still writes the file" || fail "analyze: valid SARIF + exit 1 still writes the file" "missing sarif file"
+HEALTH_ANALYSIS_CALLS=$(grep -c '^health ' "$ANALYZE_TMP/sarif-calls" || true)
+[ "$HEALTH_ANALYSIS_CALLS" -eq 1 ] && pass "analyze: SARIF reuses the saved JSON analysis" || fail "analyze: SARIF reuses the saved JSON analysis" "expected one health analysis, got $HEALTH_ANALYSIS_CALLS"
+
+SARIF_BAD_WORK="$ANALYZE_TMP/sarif-empty"
+mkdir -p "$SARIF_BAD_WORK"
+cd "$SARIF_BAD_WORK" && rm -f "$ANALYZE_TMP/output"
+OUT=$(PATH="$ANALYZE_TMP/bin:$PATH" GITHUB_OUTPUT="$ANALYZE_TMP/output" \
+  INPUT_ROOT="." INPUT_COMMAND="health" INPUT_FORMAT="sarif" MOCK_SARIF_MODE="empty" \
+  bash "$DIR/../scripts/analyze.sh" 2>&1) || true
+cd "$DIR"
+assert_contains "$OUT" "SARIF generation failed" "analyze: empty/invalid SARIF still warns (issue #813)"
+[ ! -e "$SARIF_BAD_WORK/fallow-results.sarif" ] && pass "analyze: empty SARIF is not published" || fail "analyze: empty SARIF is not published" "empty SARIF file remains"
+
+SARIF_COMPAT_WORK="$ANALYZE_TMP/sarif-report-empty-direct-valid"
+mkdir -p "$SARIF_COMPAT_WORK"
+cd "$SARIF_COMPAT_WORK" && rm -f "$ANALYZE_TMP/output"
+rm -f "$ANALYZE_TMP/sarif-compat-calls"
+OUT=$(PATH="$ANALYZE_TMP/bin:$PATH" GITHUB_OUTPUT="$ANALYZE_TMP/output" \
+  INPUT_ROOT="." INPUT_COMMAND="health" INPUT_FORMAT="sarif" \
+  MOCK_SARIF_MODE="report-empty-direct-valid" \
+  MOCK_CALL_LOG="$ANALYZE_TMP/sarif-compat-calls" \
+  bash "$DIR/../scripts/analyze.sh" 2>&1) || true
+cd "$DIR"
+assert_not_contains "$OUT" "SARIF generation failed" "analyze: report-capable older binary falls back to direct SARIF"
+[ -s "$SARIF_COMPAT_WORK/fallow-results.sarif" ] && pass "analyze: compatibility fallback publishes valid SARIF" || fail "analyze: compatibility fallback publishes valid SARIF" "missing sarif file"
+HEALTH_COMPAT_CALLS=$(grep -c '^health ' "$ANALYZE_TMP/sarif-compat-calls" || true)
+[ "$HEALTH_COMPAT_CALLS" -eq 2 ] && pass "analyze: compatibility fallback reruns only when saved rendering fails" || fail "analyze: compatibility fallback reruns only when saved rendering fails" "expected two health calls, got $HEALTH_COMPAT_CALLS"
+
 # --- Summary jq tests ---
 
 echo ""
@@ -85,19 +1189,263 @@ assert_valid_markdown "$OUT" "produces output"
 assert_contains "$OUT" "Fallow Analysis" "has title"
 assert_contains "$OUT" "issues" "mentions issues"
 assert_contains "$OUT" "Unused" "lists unused categories"
+assert_contains "$OUT" "Imported elsewhere" "shows dependency workspace context column"
+assert_contains "$OUT" 'packages/client' "shows dependency workspace context value"
+assert_contains "$OUT" "Empty catalog groups" "shows empty catalog group row"
+assert_contains "$OUT" 'legacy' "shows empty catalog group name"
+
+OUT_POLICY=$(jq '.policy_violations = [{"path": "src/app.ts", "line": 7, "col": 2, "pack": "team-policy", "rule_id": "no-moment", "kind": "banned-import", "matched": "moment", "severity": "error", "actions": []}] | .total_issues = (.total_issues + 1)' "$FIXTURES/check.json" | jq -r -f "$JQ_DIR/summary-check.jq" 2>&1)
+assert_contains "$OUT_POLICY" "Policy violations" "policy: shows summary row and section"
+assert_contains "$OUT_POLICY" "team-policy/no-moment" "policy: shows pack/rule identity"
+
+OUT_POLICY_ANNOTATIONS=$(jq '.policy_violations = [{"path": "src/app.ts", "line": 7, "col": 2, "pack": "team-policy", "rule_id": "no-moment", "kind": "banned-import", "matched": "moment", "severity": "error", "message": "Use date-fns.", "actions": []}]' "$FIXTURES/check.json" | jq -r -f "$JQ_DIR/annotations-check.jq" 2>&1)
+assert_contains "$OUT_POLICY_ANNOTATIONS" "::error file=src/app.ts,line=7,col=3,title=Policy violation::" "policy: error-severity annotation"
+assert_contains "$OUT_POLICY_ANNOTATIONS" "banned by rule 'team-policy/no-moment'" "policy: annotation names the rule"
+assert_contains "$OUT_POLICY_ANNOTATIONS" "Use date-fns." "policy: annotation carries the rule message"
+
+OUT_POLICY_FILTERED=$(jq '.policy_violations = [{"path": "src/app.ts", "line": 7, "col": 2, "pack": "team-policy", "rule_id": "no-moment", "kind": "banned-import", "matched": "moment", "severity": "warn", "actions": []}, {"path": "src/other.ts", "line": 1, "col": 0, "pack": "team-policy", "rule_id": "no-moment", "kind": "banned-import", "matched": "moment", "severity": "warn", "actions": []}]' "$FIXTURES/check.json" | jq --argjson changed '["src/app.ts"]' -f "$JQ_DIR/filter-changed.jq" 2>&1)
+assert_json_value "$OUT_POLICY_FILTERED" '.policy_violations | length' "1" "policy: filter-changed keeps only changed-file findings"
+
+OUT_ICE=$(jq '.invalid_client_exports = [{"path": "src/app.ts", "line": 5, "col": 0, "export_name": "metadata", "directive": "use client", "actions": []}] | .total_issues = (.total_issues + 1)' "$FIXTURES/check.json" | jq -r -f "$JQ_DIR/summary-check.jq" 2>&1)
+assert_contains "$OUT_ICE" "Invalid client exports" "ice: shows summary row and section"
+assert_contains "$OUT_ICE" "metadata" "ice: shows export name in section"
+
+OUT_ICE_ANN=$(jq '.invalid_client_exports = [{"path": "src/app.ts", "line": 5, "col": 2, "export_name": "metadata", "directive": "use client", "actions": []}]' "$FIXTURES/check.json" | jq -r -f "$JQ_DIR/annotations-check.jq" 2>&1)
+assert_contains "$OUT_ICE_ANN" "::warning file=src/app.ts,line=5,col=3,title=Invalid client export::" "ice: warning-severity annotation"
+
+OUT_ICE_FILTERED=$(jq '.invalid_client_exports = [{"path": "src/app.ts", "line": 5, "col": 0, "export_name": "metadata", "directive": "use client", "actions": []}, {"path": "src/other.ts", "line": 3, "col": 0, "export_name": "generateMetadata", "directive": "use client", "actions": []}]' "$FIXTURES/check.json" | jq --argjson changed '["src/app.ts"]' -f "$JQ_DIR/filter-changed.jq" 2>&1)
+assert_json_value "$OUT_ICE_FILTERED" '.invalid_client_exports | length' "1" "ice: filter-changed keeps only changed-file findings"
+
+OUT_MCSB=$(jq '.mixed_client_server_barrels = [{"path": "src/index.ts", "line": 2, "col": 0, "client_origin": "./Button", "server_origin": "./fetchUser", "actions": []}] | .total_issues = (.total_issues + 1)' "$FIXTURES/check.json" | jq -r -f "$JQ_DIR/summary-check.jq" 2>&1)
+assert_contains "$OUT_MCSB" "Mixed client/server barrels" "mcsb: shows summary row and section"
+assert_contains "$OUT_MCSB" "./fetchUser" "mcsb: shows server origin in section"
+
+OUT_MCSB_ANN=$(jq '.mixed_client_server_barrels = [{"path": "src/index.ts", "line": 2, "col": 2, "client_origin": "./Button", "server_origin": "./fetchUser", "actions": []}]' "$FIXTURES/check.json" | jq -r -f "$JQ_DIR/annotations-check.jq" 2>&1)
+assert_contains "$OUT_MCSB_ANN" "::warning file=src/index.ts,line=2,col=3,title=Mixed client/server barrel::" "mcsb: warning-severity annotation"
+
+OUT_MCSB_FILTERED=$(jq '.mixed_client_server_barrels = [{"path": "src/index.ts", "line": 2, "col": 0, "client_origin": "./Button", "server_origin": "./fetchUser", "actions": []}, {"path": "src/other/index.ts", "line": 1, "col": 0, "client_origin": "./Widget", "server_origin": "./loadData", "actions": []}]' "$FIXTURES/check.json" | jq --argjson changed '["src/index.ts"]' -f "$JQ_DIR/filter-changed.jq" 2>&1)
+assert_json_value "$OUT_MCSB_FILTERED" '.mixed_client_server_barrels | length' "1" "mcsb: filter-changed keeps only changed-file findings"
+
+OUT_MD=$(jq '.misplaced_directives = [{"path": "src/widget.tsx", "line": 4, "col": 0, "directive": "use client", "actions": []}] | .total_issues = (.total_issues + 1)' "$FIXTURES/check.json" | jq -r -f "$JQ_DIR/summary-check.jq" 2>&1)
+assert_contains "$OUT_MD" "Misplaced directives" "md: shows summary row and section"
+assert_contains "$OUT_MD" "use client" "md: shows directive in section"
+
+OUT_MD_ANN=$(jq '.misplaced_directives = [{"path": "src/widget.tsx", "line": 4, "col": 2, "directive": "use client", "actions": []}]' "$FIXTURES/check.json" | jq -r -f "$JQ_DIR/annotations-check.jq" 2>&1)
+assert_contains "$OUT_MD_ANN" "::warning file=src/widget.tsx,line=4,col=3,title=Misplaced directive::" "md: warning-severity annotation"
+
+OUT_MD_FILTERED=$(jq '.misplaced_directives = [{"path": "src/widget.tsx", "line": 4, "col": 0, "directive": "use client", "actions": []}, {"path": "src/other.tsx", "line": 6, "col": 0, "directive": "use server", "actions": []}]' "$FIXTURES/check.json" | jq --argjson changed '["src/widget.tsx"]' -f "$JQ_DIR/filter-changed.jq" 2>&1)
+assert_json_value "$OUT_MD_FILTERED" '.misplaced_directives | length' "1" "md: filter-changed keeps only changed-file findings"
+
+# Directive column renders with the surrounding quotes from the `\"\(.directive)\"` template.
+# Asserting the export-cell + directive-cell pair so a regression in quote escaping is caught
+# (the bare "use client" string also appears in the section header text).
+assert_contains "$OUT_ICE" '`metadata` | `"use client"` |' "ice: directive column renders with surrounding quotes"
+# `"use server"` directive path (the section description mentions both, so a use-server-only
+# fixture proves the row template, not just the header text).
+OUT_MD_SERVER=$(jq '.misplaced_directives = [{"path": "src/action.ts", "line": 3, "col": 0, "directive": "use server", "actions": []}] | .total_issues = (.total_issues + 1)' "$FIXTURES/check.json" | jq -r -f "$JQ_DIR/summary-check.jq" 2>&1)
+assert_contains "$OUT_MD_SERVER" '`"use server"` |' "md: use-server directive renders in section row"
+
+# Vue/Next framework IssueKinds: summary row + section + annotation + filter parity.
+OUT_USA=$(jq '.unused_server_actions = [{"path": "src/actions.ts", "line": 9, "col": 0, "action_name": "submitForm", "actions": []}] | .total_issues = (.total_issues + 1)' "$FIXTURES/check.json" | jq -r -f "$JQ_DIR/summary-check.jq" 2>&1)
+assert_contains "$OUT_USA" "Unused server actions" "usa: shows summary row and section"
+assert_contains "$OUT_USA" "submitForm" "usa: shows action name in section"
+OUT_USA_ANN=$(jq '.unused_server_actions = [{"path": "src/actions.ts", "line": 9, "col": 2, "action_name": "submitForm", "actions": []}]' "$FIXTURES/check.json" | jq -r -f "$JQ_DIR/annotations-check.jq" 2>&1)
+assert_contains "$OUT_USA_ANN" "::warning file=src/actions.ts,line=9,col=3,title=Unused server action::" "usa: warning-severity annotation"
+OUT_USA_FILTERED=$(jq '.unused_server_actions = [{"path": "src/actions.ts", "line": 9, "col": 0, "action_name": "submitForm", "actions": []}, {"path": "src/other.ts", "line": 1, "col": 0, "action_name": "delUser", "actions": []}]' "$FIXTURES/check.json" | jq --argjson changed '["src/actions.ts"]' -f "$JQ_DIR/filter-changed.jq" 2>&1)
+assert_json_value "$OUT_USA_FILTERED" '.unused_server_actions | length' "1" "usa: filter-changed keeps only changed-file findings"
+
+OUT_URC=$(jq '.unrendered_components = [{"path": "src/Foo.vue", "line": 1, "col": 0, "component_name": "Foo", "framework": "vue", "actions": []}] | .total_issues = (.total_issues + 1)' "$FIXTURES/check.json" | jq -r -f "$JQ_DIR/summary-check.jq" 2>&1)
+assert_contains "$OUT_URC" "Unrendered components" "urc: shows summary row and section"
+assert_contains "$OUT_URC" "Foo" "urc: shows component name in section"
+OUT_URC_ANN=$(jq '.unrendered_components = [{"path": "src/Foo.vue", "line": 1, "col": 0, "component_name": "Foo", "framework": "vue", "actions": []}]' "$FIXTURES/check.json" | jq -r -f "$JQ_DIR/annotations-check.jq" 2>&1)
+assert_contains "$OUT_URC_ANN" "::warning file=src/Foo.vue,line=1,col=1,title=Unrendered component::" "urc: warning-severity annotation"
+OUT_URC_FILTERED=$(jq '.unrendered_components = [{"path": "src/Foo.vue", "line": 1, "col": 0, "component_name": "Foo", "framework": "vue", "actions": []}, {"path": "src/Bar.vue", "line": 1, "col": 0, "component_name": "Bar", "framework": "vue", "actions": []}]' "$FIXTURES/check.json" | jq --argjson changed '["src/Foo.vue"]' -f "$JQ_DIR/filter-changed.jq" 2>&1)
+assert_json_value "$OUT_URC_FILTERED" '.unrendered_components | length' "1" "urc: filter-changed keeps only changed-file findings"
+
+OUT_UCP=$(jq '.unused_component_props = [{"path": "src/Widget.vue", "line": 12, "col": 0, "component_name": "Widget", "prop_name": "variant", "actions": []}] | .total_issues = (.total_issues + 1)' "$FIXTURES/check.json" | jq -r -f "$JQ_DIR/summary-check.jq" 2>&1)
+assert_contains "$OUT_UCP" "Unused component props" "ucp: shows summary row and section"
+assert_contains "$OUT_UCP" "variant" "ucp: shows prop name in section"
+OUT_UCP_ANN=$(jq '.unused_component_props = [{"path": "src/Widget.vue", "line": 12, "col": 4, "component_name": "Widget", "prop_name": "variant", "actions": []}]' "$FIXTURES/check.json" | jq -r -f "$JQ_DIR/annotations-check.jq" 2>&1)
+assert_contains "$OUT_UCP_ANN" "::warning file=src/Widget.vue,line=12,col=5,title=Unused component prop::" "ucp: warning-severity annotation"
+OUT_UCP_FILTERED=$(jq '.unused_component_props = [{"path": "src/Widget.vue", "line": 12, "col": 0, "component_name": "Widget", "prop_name": "variant", "actions": []}, {"path": "src/Other.vue", "line": 3, "col": 0, "component_name": "Other", "prop_name": "size", "actions": []}]' "$FIXTURES/check.json" | jq --argjson changed '["src/Widget.vue"]' -f "$JQ_DIR/filter-changed.jq" 2>&1)
+assert_json_value "$OUT_UCP_FILTERED" '.unused_component_props | length' "1" "ucp: filter-changed keeps only changed-file findings"
+
+OUT_UCE=$(jq '.unused_component_emits = [{"path": "src/Widget.vue", "line": 14, "col": 0, "component_name": "Widget", "emit_name": "submit", "actions": []}] | .total_issues = (.total_issues + 1)' "$FIXTURES/check.json" | jq -r -f "$JQ_DIR/summary-check.jq" 2>&1)
+assert_contains "$OUT_UCE" "Unused component emits" "uce: shows summary row and section"
+assert_contains "$OUT_UCE" "submit" "uce: shows emit name in section"
+OUT_UCE_ANN=$(jq '.unused_component_emits = [{"path": "src/Widget.vue", "line": 14, "col": 4, "component_name": "Widget", "emit_name": "submit", "actions": []}]' "$FIXTURES/check.json" | jq -r -f "$JQ_DIR/annotations-check.jq" 2>&1)
+assert_contains "$OUT_UCE_ANN" "::warning file=src/Widget.vue,line=14,col=5,title=Unused component emit::" "uce: warning-severity annotation"
+OUT_UCE_FILTERED=$(jq '.unused_component_emits = [{"path": "src/Widget.vue", "line": 14, "col": 0, "component_name": "Widget", "emit_name": "submit", "actions": []}, {"path": "src/Other.vue", "line": 5, "col": 0, "component_name": "Other", "emit_name": "close", "actions": []}]' "$FIXTURES/check.json" | jq --argjson changed '["src/Widget.vue"]' -f "$JQ_DIR/filter-changed.jq" 2>&1)
+assert_json_value "$OUT_UCE_FILTERED" '.unused_component_emits | length' "1" "uce: filter-changed keeps only changed-file findings"
+
+OUT_UCI=$(jq '.unused_component_inputs = [{"path": "src/widget.component.ts", "line": 12, "col": 0, "component_name": "Widget", "input_name": "variant", "actions": []}] | .total_issues = (.total_issues + 1)' "$FIXTURES/check.json" | jq -r -f "$JQ_DIR/summary-check.jq" 2>&1)
+assert_contains "$OUT_UCI" "Unused component inputs" "uci: shows summary row and section"
+assert_contains "$OUT_UCI" "variant" "uci: shows input name in section"
+OUT_UCI_ANN=$(jq '.unused_component_inputs = [{"path": "src/widget.component.ts", "line": 12, "col": 4, "component_name": "Widget", "input_name": "variant", "actions": []}]' "$FIXTURES/check.json" | jq -r -f "$JQ_DIR/annotations-check.jq" 2>&1)
+assert_contains "$OUT_UCI_ANN" "::warning file=src/widget.component.ts,line=12,col=5,title=Unused component input::" "uci: warning-severity annotation"
+OUT_UCI_FILTERED=$(jq '.unused_component_inputs = [{"path": "src/widget.component.ts", "line": 12, "col": 0, "component_name": "Widget", "input_name": "variant", "actions": []}, {"path": "src/other.component.ts", "line": 3, "col": 0, "component_name": "Other", "input_name": "size", "actions": []}]' "$FIXTURES/check.json" | jq --argjson changed '["src/widget.component.ts"]' -f "$JQ_DIR/filter-changed.jq" 2>&1)
+assert_json_value "$OUT_UCI_FILTERED" '.unused_component_inputs | length' "1" "uci: filter-changed keeps only changed-file findings"
+
+OUT_UCO=$(jq '.unused_component_outputs = [{"path": "src/widget.component.ts", "line": 14, "col": 0, "component_name": "Widget", "output_name": "submit", "actions": []}] | .total_issues = (.total_issues + 1)' "$FIXTURES/check.json" | jq -r -f "$JQ_DIR/summary-check.jq" 2>&1)
+assert_contains "$OUT_UCO" "Unused component outputs" "uco: shows summary row and section"
+assert_contains "$OUT_UCO" "submit" "uco: shows output name in section"
+OUT_UCO_ANN=$(jq '.unused_component_outputs = [{"path": "src/widget.component.ts", "line": 14, "col": 4, "component_name": "Widget", "output_name": "submit", "actions": []}]' "$FIXTURES/check.json" | jq -r -f "$JQ_DIR/annotations-check.jq" 2>&1)
+assert_contains "$OUT_UCO_ANN" "::warning file=src/widget.component.ts,line=14,col=5,title=Unused component output::" "uco: warning-severity annotation"
+OUT_UCO_FILTERED=$(jq '.unused_component_outputs = [{"path": "src/widget.component.ts", "line": 14, "col": 0, "component_name": "Widget", "output_name": "submit", "actions": []}, {"path": "src/other.component.ts", "line": 5, "col": 0, "component_name": "Other", "output_name": "close", "actions": []}]' "$FIXTURES/check.json" | jq --argjson changed '["src/widget.component.ts"]' -f "$JQ_DIR/filter-changed.jq" 2>&1)
+assert_json_value "$OUT_UCO_FILTERED" '.unused_component_outputs | length' "1" "uco: filter-changed keeps only changed-file findings"
+
+OUT_USE=$(jq '.unused_svelte_events = [{"path": "src/Child.svelte", "line": 6, "col": 0, "component_name": "Child", "event_name": "dead", "actions": []}] | .total_issues = (.total_issues + 1)' "$FIXTURES/check.json" | jq -r -f "$JQ_DIR/summary-check.jq" 2>&1)
+assert_contains "$OUT_USE" "Unused Svelte events" "use: shows summary row and section"
+assert_contains "$OUT_USE" "dead" "use: shows event name in section"
+OUT_USE_ANN=$(jq '.unused_svelte_events = [{"path": "src/Child.svelte", "line": 6, "col": 4, "component_name": "Child", "event_name": "dead", "actions": []}]' "$FIXTURES/check.json" | jq -r -f "$JQ_DIR/annotations-check.jq" 2>&1)
+assert_contains "$OUT_USE_ANN" "::warning file=src/Child.svelte,line=6,col=5,title=Unused Svelte event::" "use: warning-severity annotation"
+OUT_USE_FILTERED=$(jq '.unused_svelte_events = [{"path": "src/Child.svelte", "line": 6, "col": 0, "component_name": "Child", "event_name": "dead", "actions": []}, {"path": "src/Other.svelte", "line": 5, "col": 0, "component_name": "Other", "event_name": "gone", "actions": []}]' "$FIXTURES/check.json" | jq --argjson changed '["src/Child.svelte"]' -f "$JQ_DIR/filter-changed.jq" 2>&1)
+assert_json_value "$OUT_USE_FILTERED" '.unused_svelte_events | length' "1" "use: filter-changed keeps only changed-file findings"
+
+OUT_UPI=$(jq '.unprovided_injects =[{"path": "src/useTheme.ts", "line": 7, "col": 0, "key_name": "themeKey", "framework": "vue", "actions": []}] | .total_issues = (.total_issues + 1)' "$FIXTURES/check.json" | jq -r -f "$JQ_DIR/summary-check.jq" 2>&1)
+assert_contains "$OUT_UPI" "Unprovided injects" "upi: shows summary row and section"
+assert_contains "$OUT_UPI" "themeKey" "upi: shows inject key in section"
+OUT_UPI_ANN=$(jq '.unprovided_injects = [{"path": "src/useTheme.ts", "line": 7, "col": 2, "key_name": "themeKey", "framework": "vue", "actions": []}]' "$FIXTURES/check.json" | jq -r -f "$JQ_DIR/annotations-check.jq" 2>&1)
+assert_contains "$OUT_UPI_ANN" "::warning file=src/useTheme.ts,line=7,col=3,title=Unprovided inject::" "upi: warning-severity annotation"
+OUT_UPI_FILTERED=$(jq '.unprovided_injects = [{"path": "src/useTheme.ts", "line": 7, "col": 0, "key_name": "themeKey", "framework": "vue", "actions": []}, {"path": "src/other.ts", "line": 2, "col": 0, "key_name": "authKey", "framework": "svelte", "actions": []}]' "$FIXTURES/check.json" | jq --argjson changed '["src/useTheme.ts"]' -f "$JQ_DIR/filter-changed.jq" 2>&1)
+assert_json_value "$OUT_UPI_FILTERED" '.unprovided_injects | length' "1" "upi: filter-changed keeps only changed-file findings"
+
+# Missing keys must never crash jq (defensive `// []` / null-safe helpers). Strip every
+# framework array and confirm the summary still renders.
+OUT_NO_FRAMEWORK_KEYS=$(jq 'del(.unused_server_actions, .unrendered_components, .unused_component_props, .unused_component_emits, .unused_component_inputs, .unused_component_outputs, .unused_svelte_events, .unprovided_injects, .route_collisions, .dynamic_segment_name_conflicts, .invalid_client_exports, .mixed_client_server_barrels, .misplaced_directives)' "$FIXTURES/check.json" | jq -r -f "$JQ_DIR/summary-check.jq" 2>&1)
+assert_contains "$OUT_NO_FRAMEWORK_KEYS" "Fallow Analysis" "missing-keys: summary-check survives absent framework keys"
+
+# filter-changed recalculates total_issues from the surviving arrays (synthetic minimal input
+# so the assertion does not depend on the base fixture's other findings).
+OUT_RSC_RECALC=$(jq -n '{total_issues: 2, invalid_client_exports: [{"path": "src/a.tsx", "line": 1, "col": 0, "export_name": "metadata", "directive": "use client", "actions": []}, {"path": "src/b.tsx", "line": 1, "col": 0, "export_name": "revalidate", "directive": "use client", "actions": []}]}' | jq --argjson changed '["src/a.tsx"]' -f "$JQ_DIR/filter-changed.jq" 2>&1)
+assert_json_value "$OUT_RSC_RECALC" '.total_issues' "1" "rsc: filter-changed recalculates total_issues after dropping non-changed finding"
 
 OUT_CLEAN=$(jq -r -f "$JQ_DIR/summary-check.jq" "$FIXTURES/check-clean.json" 2>&1)
 assert_contains "$OUT_CLEAN" "No issues found" "clean: shows no issues"
 assert_not_contains "$OUT_CLEAN" "WARNING" "clean: no warning"
+
+# Issue #449: kind_known: false renders "unknown kind \`token\`" in the table,
+# distinguishing it from a stale-but-known kind which renders just \`token\`.
+OUT_UNKNOWN_KIND_SUMMARY=$(jq '.unused_files = [] | .unused_exports = [] | .unused_types = [] | .unused_dependencies = [] | .unused_dev_dependencies = [] | .unused_optional_dependencies = [] | .unused_enum_members = [] | .unused_class_members = [] | .unresolved_imports = [] | .unlisted_dependencies = [] | .duplicate_exports = [] | .circular_dependencies = [] | .boundary_violations = [] | .type_only_dependencies = [] | .test_only_dependencies = [] | .unused_catalog_entries = [] | .empty_catalog_groups = [] | .unresolved_catalog_references = [] | .unused_dependency_overrides = [] | .misconfigured_dependency_overrides = [] | .private_type_leaks = [] | .stale_suppressions = [{"path": "src/utils.ts", "line": 1, "col": 0, "origin": {"type": "comment", "issue_kind": "complexity-typo", "is_file_level": false, "kind_known": false}}] | .total_issues = 1' "$FIXTURES/check.json" | jq -r -f "$JQ_DIR/summary-check.jq" 2>&1)
+assert_contains "$OUT_UNKNOWN_KIND_SUMMARY" 'unknown kind' "summary unknown kind: prefix renders"
+assert_contains "$OUT_UNKNOWN_KIND_SUMMARY" 'complexity-typo' "summary unknown kind: verbatim token renders"
+
+echo "  summary-security.jq:"
+OUT=$(jq -n '{
+  kind: "security",
+  elapsed_ms: 12,
+  gate: {mode: "new", verdict: "fail", new_count: 1},
+  security_findings: [{
+    path: "src/api.ts",
+    line: 10,
+    kind: "tainted-sink",
+    severity: "high",
+    candidate: {sink: {callee: "exec"}}
+  }]
+}' | jq -r -f "$JQ_DIR/summary-security.jq" 2>&1)
+assert_valid_markdown "$OUT" "produces output"
+assert_contains "$OUT" "Fallow Security" "security: has title"
+assert_contains "$OUT" "Security gate: \`new\`" "security: shows gate"
+assert_contains "$OUT" "src/api.ts:10" "security: lists candidate location"
+
+OUT_NO_LINE=$(jq -n '{
+  kind: "security",
+  elapsed_ms: 1,
+  security_findings: [{
+    path: "src/a.ts",
+    kind: "tainted-sink",
+    candidate: {sink: {}}
+  }]
+}' | jq -r -f "$JQ_DIR/summary-security.jq" 2>&1)
+assert_contains "$OUT_NO_LINE" "\`src/a.ts\`" "security: missing line renders path only"
+assert_not_contains "$OUT_NO_LINE" "null" "security: missing line does not render null"
+
+echo "  summary-fix.jq:"
+OUT=$(jq -r -f "$JQ_DIR/summary-fix.jq" "$FIXTURES/fix.json" 2>&1)
+assert_valid_markdown "$OUT" "produces output"
+assert_contains "$OUT" "Auto-fix" "has title"
+assert_contains "$OUT" "1 fixes" "counts the real fix attempt, not the skip record"
+assert_contains "$OUT" "Export removals | 1" "lists the export removal count"
+# Issue #602: low-confidence off-graph skips surface in the headline and
+# are NOT counted as fix attempts (the skip record carries skipped: true).
+assert_contains "$OUT" "kept exports in 1 file" "surfaces low-confidence skip count"
+assert_not_contains "$OUT" "2 fixes" "skip record does not inflate the fix-attempt headline"
+
+# A run whose ONLY outcome is a low-confidence skip must still suppress the
+# "No fixable issues found" headline (issue #602): exports were found, just
+# not auto-removed.
+OUT_ONLY_SKIP=$(jq '.fixes = [.fixes[1]] | .total_fixed = 0' "$FIXTURES/fix.json" | jq -r -f "$JQ_DIR/summary-fix.jq" 2>&1)
+assert_not_contains "$OUT_ONLY_SKIP" "No fixable issues found" "low-confidence-only run is not reported as clean"
+assert_contains "$OUT_ONLY_SKIP" "kept exports in 1 file" "low-confidence-only run surfaces the skip"
 
 echo "  summary-dupes.jq:"
 OUT=$(jq -r -f "$JQ_DIR/summary-dupes.jq" "$FIXTURES/dupes.json" 2>&1)
 assert_valid_markdown "$OUT" "produces output"
 assert_contains "$OUT" "clone groups" "mentions clone groups"
 assert_contains "$OUT" "Duplicated lines" "shows duplication stats"
+assert_contains "$OUT" "content-parser.ts:27-50" "shows clone instance line range"
+
+OUT_FAMILY_RANK=$(jq -n '{
+  elapsed_ms: 1,
+  stats: {
+    total_files: 4, files_with_clones: 4, clone_groups: 2,
+    clone_instances: 4, duplicated_lines: 20, total_lines: 100,
+    duplication_percentage: 20
+  },
+  clone_groups: [],
+  clone_families: [
+    {
+      files: ["a-local.ts", "b-local.ts"],
+      total_duplicated_lines: 10,
+      groups: [{
+        line_count: 10, token_count: 110, spread: 0,
+        instances: [
+          {file: "a-local.ts", start_line: 1, end_line: 10},
+          {file: "b-local.ts", start_line: 1, end_line: 10}
+        ]
+      }],
+      suggestions: []
+    },
+    {
+      files: ["z-distant-a.ts", "z-distant-b.ts"],
+      total_duplicated_lines: 10,
+      groups: [
+        {
+          line_count: 2, token_count: 5, spread: 0,
+          instances: [
+            {file: "ignored-first-a.ts", start_line: 1, end_line: 2},
+            {file: "ignored-first-b.ts", start_line: 1, end_line: 2}
+          ]
+        },
+        {
+          line_count: 10, token_count: 100, spread: 8,
+          instances: [
+            {file: "z-distant-a.ts", start_line: 1, end_line: 10},
+            {file: "z-distant-b.ts", start_line: 1, end_line: 10}
+          ]
+        }
+      ],
+      suggestions: []
+    }
+  ]
+}' | jq -r -f "$JQ_DIR/summary-dupes.jq" 2>&1)
+FIRST_RANKED_FAMILY=$(printf '%s\n' "$OUT_FAMILY_RANK" | grep '^- \*\*' | head -1)
+assert_contains "$FIRST_RANKED_FAMILY" "z-distant-a.ts" "families use their best spread-aware group rank"
+FIRST_RANKED_INSTANCE=$(printf '%s\n' "$OUT_FAMILY_RANK" | grep '^  -' | head -1)
+assert_contains "$FIRST_RANKED_INSTANCE" "z-distant-a.ts:1-10" "families show their best-ranked group"
 
 OUT_CLEAN=$(jq -r -f "$JQ_DIR/summary-dupes.jq" "$FIXTURES/dupes-clean.json" 2>&1)
 assert_contains "$OUT_CLEAN" "No code duplication" "clean: no duplication"
+
+# clone_groups bullet branch (no clone_families): line ranges per group
+OUT_GROUPS=$(jq '.clone_families = []' "$FIXTURES/dupes.json" | jq -r -f "$JQ_DIR/summary-dupes.jq" 2>&1)
+assert_contains "$OUT_GROUPS" "content-parser.ts:27-50" "groups branch: shows line range"
+assert_contains "$OUT_GROUPS" "24 lines, 125 tokens" "groups branch: shows lines/tokens lead"
+
+# Null duplication_percentage must not crash the standalone summary
+OUT_DUPES_NULL_PCT=$(jq 'del(.stats.duplication_percentage)' "$FIXTURES/dupes.json" | jq -r -f "$JQ_DIR/summary-dupes.jq" 2>&1)
+assert_contains "$OUT_DUPES_NULL_PCT" "66 / 478 (0%)" "summary-dupes: missing duplication_percentage renders as 0%"
+assert_not_contains "$OUT_DUPES_NULL_PCT" "cannot be multiplied" "summary-dupes: null does not crash"
 
 echo "  summary-health.jq:"
 OUT=$(jq -r -f "$JQ_DIR/summary-health.jq" "$FIXTURES/health.json" 2>&1)
@@ -127,12 +1475,101 @@ echo "  summary-health.jq (no delta header without score):"
 OUT_NO_SCORE=$(jq 'del(.health_score) | del(.health_trend)' "$FIXTURES/health.json" | jq -r -f "$JQ_DIR/summary-health.jq" 2>&1)
 assert_not_contains "$OUT_NO_SCORE" "Health:" "no-score: no delta header"
 
-echo "  summary-health.jq (production coverage findings and hot paths):"
-OUT_PROD=$(jq '.production_coverage = {"verdict":"cold-code-detected","summary":{"functions_tracked":4,"functions_hit":2,"functions_unhit":1,"functions_untracked":1,"coverage_percent":50,"trace_count":1200,"period_days":7,"deployments_seen":2},"findings":[{"path":"src/cold.ts","function":"coldPath","line":14,"verdict":"review_required","invocations":0,"confidence":"medium"},{"path":"src/lazy.ts","function":"lateBound","line":8,"verdict":"coverage_unavailable","confidence":"none"}],"hot_paths":[{"path":"src/hot.ts","function":"hotPath","line":3,"invocations":250,"percentile":99}]}' "$FIXTURES/health-clean.json" | jq -r -f "$JQ_DIR/summary-health.jq" 2>&1)
-assert_contains "$OUT_PROD" "Production Coverage" "prod: has production coverage section"
+echo "  summary-health.jq (runtime coverage findings and hot paths):"
+OUT_PROD=$(jq '.runtime_coverage = {"verdict":"cold-code-detected","summary":{"functions_tracked":4,"functions_hit":2,"functions_unhit":1,"functions_untracked":1,"coverage_percent":50,"trace_count":1200,"period_days":7,"deployments_seen":2},"findings":[{"path":"src/cold.ts","function":"coldPath","line":14,"verdict":"review_required","invocations":0,"confidence":"medium"},{"path":"src/lazy.ts","function":"lateBound","line":8,"verdict":"coverage_unavailable","confidence":"none"}],"hot_paths":[{"path":"src/hot.ts","function":"hotPath","line":3,"invocations":250,"percentile":99}]}' "$FIXTURES/health-clean.json" | jq -r -f "$JQ_DIR/summary-health.jq" 2>&1)
+assert_contains "$OUT_PROD" "Runtime Coverage" "prod: has runtime coverage section"
 assert_contains "$OUT_PROD" "review_required" "prod: shows production verdict"
 assert_contains "$OUT_PROD" "Hot Paths" "prod: has hot paths section"
 assert_contains "$OUT_PROD" "hotPath" "prod: shows hot path function"
+
+echo "  summary-audit.jq:"
+OUT_AUDIT=$(jq -n --slurpfile h "$FIXTURES/health.json" --slurpfile c "$FIXTURES/check.json" --slurpfile d "$FIXTURES/dupes.json" '{
+  schema_version: 3,
+  command: "audit",
+  verdict: "fail",
+  changed_files_count: 2,
+  elapsed_ms: 42,
+  summary: {dead_code_issues: 1, complexity_findings: 3, duplication_clone_groups: 1},
+  attribution: {gate: "new-only", dead_code_introduced: 1, dead_code_inherited: 0, complexity_introduced: 2, complexity_inherited: 1, duplication_introduced: 0, duplication_inherited: 1, styling_introduced: 1, styling_inherited: 1, duplication_demoted: 1},
+  dead_code: ($c[0] | .unused_exports |= map(. + {introduced: true}) | .unused_dependencies |= map(. + {introduced: false})),
+  complexity: ($h[0]
+    | .findings |= [.[0] + {coverage_tier: "partial"}, .[1] + {coverage_tier: "high"}, .[2]]
+    | .summary.coverage_model = "istanbul"
+    | .summary.istanbul_matched = 8
+    | .summary.istanbul_total = 10
+    | .styling_findings = [
+        {code: "css-selector-complexity", sub_kind: "high-specificity", path: "src/styles.css", line: 4, value: "#app .card .title", effective_severity: "error", introduced: true},
+        {code: "css-important", sub_kind: "important", path: "src/legacy.css", line: 9, value: "!important", effective_severity: "warn", introduced: false}
+      ]),
+  duplication: ($d[0] | .clone_groups |= map(. + {introduced: false, demotion_reason: "no-added-lines"}))
+}' | jq -r -f "$JQ_DIR/summary-audit.jq" 2>&1)
+assert_valid_markdown "$OUT_AUDIT" "produces audit output"
+assert_contains "$OUT_AUDIT" "Fallow Audit" "audit: has title"
+assert_contains "$OUT_AUDIT" "Audit failed" "audit: shows failed verdict"
+assert_contains "$OUT_AUDIT" "Dead Code" "audit: has dead-code details"
+assert_contains "$OUT_AUDIT" "fetchFromApi" "audit: lists dead-code findings"
+assert_contains "$OUT_AUDIT" "parseContentBlocks" "audit: lists complexity findings"
+assert_contains "$OUT_AUDIT" "Duplication" "audit: has duplication details"
+assert_contains "$OUT_AUDIT" "24 lines / 125 tokens" "audit: lists clone group size"
+assert_contains "$OUT_AUDIT" "Inherited" "audit: has inherited column"
+assert_contains "$OUT_AUDIT" "Coverage |" "audit: has coverage column header"
+assert_contains "$OUT_AUDIT" "| partial |" "audit: shows coverage tier value"
+assert_contains "$OUT_AUDIT" "| high |" "audit: shows alt coverage tier"
+assert_contains "$OUT_AUDIT" "| - |" "audit: missing coverage_tier renders as dash"
+assert_contains "$OUT_AUDIT" "Coverage model: istanbul" "audit: shows istanbul coverage model footer"
+assert_contains "$OUT_AUDIT" "Matched 8/10" "audit: shows istanbul match rate"
+assert_contains "$OUT_AUDIT" "### Styling" "audit: has styling details"
+assert_contains "$OUT_AUDIT" "css-selector-complexity" "audit: lists styling rule"
+assert_contains "$OUT_AUDIT" "src/styles.css:4" "audit: lists styling location"
+assert_contains "$OUT_AUDIT" "1 introduced clone group demoted to inherited" "audit: shows demotion footnote"
+
+OUT_AUDIT_STYLE_NEW=$(jq -n '{
+  command: "audit", verdict: "fail", changed_files_count: 1, elapsed_ms: 4,
+  summary: {dead_code_issues: 0, complexity_findings: 0, duplication_clone_groups: 0},
+  attribution: {gate: "new-only", styling_introduced: 1, styling_inherited: 0},
+  complexity: {styling_findings: [{code: "css-important", path: "src/styles.css", line: 2, value: "!important", effective_severity: "error", introduced: true}]}
+}' | jq -r -f "$JQ_DIR/summary-audit.jq" 2>&1)
+assert_contains "$OUT_AUDIT_STYLE_NEW" "| Styling | 1 | 1 | 0 |" "audit: styling-only new-only totals are visible"
+assert_contains "$OUT_AUDIT_STYLE_NEW" "| new |" "audit: styling-only new-only status is visible"
+assert_not_contains "$OUT_AUDIT_STYLE_NEW" "demoted to inherited" "audit: no demotion footnote without demotions"
+
+OUT_AUDIT_STYLE_ALL=$(jq -n '{
+  command: "audit", verdict: "fail", changed_files_count: 1, elapsed_ms: 4,
+  summary: {dead_code_issues: 0, complexity_findings: 0, duplication_clone_groups: 0},
+  attribution: {gate: "all"},
+  complexity: {styling_findings: [{code: "css-important", path: null, line: null, value: "!important", effective_severity: "error"}]}
+}' | jq -r -f "$JQ_DIR/summary-audit.jq" 2>&1)
+assert_contains "$OUT_AUDIT_STYLE_ALL" "| Styling | 1 | 0 | 0 |" "audit: styling-only all totals are visible"
+assert_contains "$OUT_AUDIT_STYLE_ALL" '| - | `css-important`' "audit: null styling path uses a safe placeholder"
+assert_contains "$OUT_AUDIT_STYLE_ALL" "Audit gate: all" "audit: styling-only all gate is visible"
+
+# Low match-rate variant: footer should warn about --coverage-root
+OUT_AUDIT_LOWMATCH=$(jq -n --slurpfile h "$FIXTURES/health.json" '{
+  schema_version: 3, command: "audit", verdict: "fail", changed_files_count: 2, elapsed_ms: 42,
+  summary: {dead_code_issues: 0, complexity_findings: 3, duplication_clone_groups: 0},
+  attribution: {gate: "new-only", dead_code_introduced: 0, dead_code_inherited: 0, complexity_introduced: 3, complexity_inherited: 0, duplication_introduced: 0, duplication_inherited: 0},
+  complexity: ($h[0] | .summary.coverage_model = "istanbul" | .summary.istanbul_matched = 1 | .summary.istanbul_total = 10)
+}' | jq -r -f "$JQ_DIR/summary-audit.jq" 2>&1)
+assert_contains "$OUT_AUDIT_LOWMATCH" "Low match rate" "audit: low match rate flags --coverage-root"
+
+# Static-estimate variant: footer should suggest --coverage
+OUT_AUDIT_STATIC=$(jq -n --slurpfile h "$FIXTURES/health.json" --slurpfile c "$FIXTURES/check.json" --slurpfile d "$FIXTURES/dupes.json" '{
+  schema_version: 3, command: "audit", verdict: "fail", changed_files_count: 2, elapsed_ms: 42,
+  summary: {dead_code_issues: 0, complexity_findings: 3, duplication_clone_groups: 0},
+  attribution: {gate: "new-only", dead_code_introduced: 0, dead_code_inherited: 0, complexity_introduced: 3, complexity_inherited: 0, duplication_introduced: 0, duplication_inherited: 0},
+  complexity: ($h[0] | .summary.coverage_model = "static_estimated")
+}' | jq -r -f "$JQ_DIR/summary-audit.jq" 2>&1)
+assert_contains "$OUT_AUDIT_STATIC" "Coverage model: static (estimated)" "audit: static-estimate footer suggests --coverage"
+assert_contains "$OUT_AUDIT_STATIC" "for measured coverage" "audit: static branch reworded"
+
+# Absent-model variant: footer should not be present at all
+OUT_AUDIT_NOMODEL=$(jq -n --slurpfile h "$FIXTURES/health.json" '{
+  schema_version: 3, command: "audit", verdict: "fail", changed_files_count: 2, elapsed_ms: 42,
+  summary: {dead_code_issues: 0, complexity_findings: 3, duplication_clone_groups: 0},
+  attribution: {gate: "new-only", dead_code_introduced: 0, dead_code_inherited: 0, complexity_introduced: 3, complexity_inherited: 0, duplication_introduced: 0, duplication_inherited: 0},
+  complexity: ($h[0] | del(.summary.coverage_model))
+}' | jq -r -f "$JQ_DIR/summary-audit.jq" 2>&1)
+assert_not_contains "$OUT_AUDIT_NOMODEL" "Coverage model:" "audit: absent coverage_model omits footer"
 
 echo "  summary-combined.jq:"
 OUT=$(jq -r -f "$JQ_DIR/summary-combined.jq" "$FIXTURES/combined.json" 2>&1)
@@ -142,7 +1579,131 @@ assert_contains "$OUT" "code issues" "mentions code issues"
 assert_contains "$OUT" "Maintainability" "shows vital signs"
 
 assert_contains "$OUT" "Codebase health" "has codebase health header"
+assert_contains "$OUT" "CRAP" "combined: shows CRAP column"
+assert_contains "$OUT" "thresholds: cyclomatic" "combined: shows complexity threshold line"
+
+# Duplication block: locations table replaces metric-only table
+assert_contains "$OUT" "Locations | Lines | Tokens" "dupes: locations table header"
+assert_contains "$OUT" "content-parser.ts:27-50" "dupes: shows first clone instance line range"
+assert_contains "$OUT" "content-parser.ts:168-191" "dupes: shows second clone instance line range"
+assert_contains "$OUT" "Across 2 files" "dupes: footer reports file count"
+assert_contains "$OUT" "2 groups · 66 lines" "dupes: header carries group count and total lines"
+assert_not_contains "$OUT" "| [Duplicated lines]" "dupes: old metric table is gone"
+assert_not_contains "$OUT" "| Files with clones | 2 |" "dupes: old files-with-clones row is gone"
+
+OUT_EMPTY_DUPES=$(jq '.dupes.clone_groups = [] | .dupes.clone_families = [] | .dupes.stats.clone_groups = 2 | .dupes.stats.clone_instances = 5 | .dupes.stats.files_with_clones = 4 | .dupes.stats.duplicated_lines = 59 | .dupes.stats.duplication_percentage = 0.16' "$FIXTURES/combined-clean.json" | jq -r -f "$JQ_DIR/summary-combined.jq" 2>&1)
+assert_contains "$OUT_EMPTY_DUPES" "Quality gate passed" "combined: empty dupes groups keep clean summary"
+assert_contains "$OUT_EMPTY_DUPES" "No duplication" "combined: empty dupes groups render no duplication"
+assert_not_contains "$OUT_EMPTY_DUPES" "2 groups" "combined: nonzero dupes stats do not render actionable groups"
+
+# Linkified cells engage when GH_REPO + PR_HEAD_SHA are set
+OUT_LINKED=$(GH_REPO="fallow-rs/fallow" PR_HEAD_SHA="abcdef1234567890" jq -r -f "$JQ_DIR/summary-combined.jq" "$FIXTURES/combined.json" 2>&1)
+assert_contains "$OUT_LINKED" "https://github.com/fallow-rs/fallow/blob/abcdef1234567890/src/helpers/content-parser.ts#L27-L50" "dupes: file_link engages with env vars"
+
+# Deep paths (>3 segments): display is rel_path-truncated but URL keeps the full path
+OUT_DEEP=$(jq '.dupes.clone_groups = [{line_count: 10, token_count: 50, instances: [{file: "apps/web/src/services/billing/calculator.ts", start_line: 5, end_line: 15}, {file: "apps/api/src/services/billing/calculator.ts", start_line: 8, end_line: 18}]}] | .dupes.stats.clone_groups = 1 | .dupes.stats.files_with_clones = 2' "$FIXTURES/combined.json" | GH_REPO="fallow-rs/fallow" PR_HEAD_SHA="deadbeef" jq -r -f "$JQ_DIR/summary-combined.jq" 2>&1)
+# Display truncates to last 3 segments
+assert_contains "$OUT_DEEP" "\`services/billing/calculator.ts:5-15\`" "deep-path: display uses rel_path"
+# URL must contain the FULL path including 'apps/web/' prefix, otherwise the link 404s
+assert_contains "$OUT_DEEP" "/blob/deadbeef/apps/web/src/services/billing/calculator.ts#L5-L15" "deep-path: URL keeps full path"
+assert_contains "$OUT_DEEP" "/blob/deadbeef/apps/api/src/services/billing/calculator.ts#L8-L18" "deep-path: URL keeps full path (sibling)"
+
+# Singular-group header: 1 group renders "group" not "groups"
+OUT_ONE=$(jq '.dupes.stats.clone_groups = 1 | .dupes.clone_groups = [.dupes.clone_groups[0]]' "$FIXTURES/combined.json" | jq -r -f "$JQ_DIR/summary-combined.jq" 2>&1)
+assert_contains "$OUT_ONE" "(1 group ·" "dupes: singular group header"
+assert_not_contains "$OUT_ONE" "(1 groups ·" "dupes: no '1 groups' grammar"
+
+# Status-bar pluralization: 1 of each renders singular
+OUT_SINGULAR=$(jq '.check.unused_files = [.check.unused_files[0]] | .check.unused_exports = [] | .check.unused_dependencies = [] | .check.unused_dev_dependencies = [] | .check.unused_optional_dependencies = [] | .check.unused_types = [] | .check.unused_enum_members = [] | .check.unused_class_members = [] | .check.unresolved_imports = [] | .check.unlisted_dependencies = [] | .check.duplicate_exports = [] | .check.circular_dependencies = [] | .check.boundary_violations = [] | .check.type_only_dependencies = [] | .check.test_only_dependencies = [] | .check.stale_suppressions = [] | .check.unused_catalog_entries = [] | .check.unresolved_catalog_references = [] | .check.unused_dependency_overrides = [] | .check.misconfigured_dependency_overrides = [] | .check.private_type_leaks = [] | .check.total_issues = 1 | .dupes.stats.clone_groups = 1 | .dupes.clone_groups = [.dupes.clone_groups[0]] | .health.summary.functions_above_threshold = 1 | .health.findings = [.health.findings[0]]' "$FIXTURES/combined.json" | jq -r -f "$JQ_DIR/summary-combined.jq" 2>&1)
+assert_contains "$OUT_SINGULAR" "**1** code issue " "status-bar: singular code issue"
+assert_not_contains "$OUT_SINGULAR" "**1** code issues" "status-bar: no '1 code issues' grammar"
+assert_contains "$OUT_SINGULAR" "**1** clone group " "status-bar: singular clone group"
+assert_not_contains "$OUT_SINGULAR" "**1** clone groups" "status-bar: no '1 clone groups' grammar"
+assert_not_contains "$OUT_SINGULAR" "**1** health findings" "status-bar: no '1 health findings' grammar"
+
+# Complexity <details> summary pluralizes when functions_above_threshold == 1
+assert_contains "$OUT_SINGULAR" "(1 function above threshold)" "complexity dropdown: singular function"
+assert_not_contains "$OUT_SINGULAR" "(1 functions above threshold)" "complexity dropdown: no '1 functions' grammar"
+
+# RSC findings appear in the combined-mode Code issues breakdown table (not just
+# summary-check.jq standalone). All three RSC types injected into .check at once.
+OUT_RSC=$(jq '.check.invalid_client_exports = [{"path": "src/app.tsx", "line": 5, "col": 0, "export_name": "metadata", "directive": "use client", "actions": []}] | .check.mixed_client_server_barrels = [{"path": "src/index.ts", "line": 2, "col": 0, "client_origin": "./Button", "server_origin": "./fetchUser", "actions": []}] | .check.misplaced_directives = [{"path": "src/widget.tsx", "line": 4, "col": 0, "directive": "use server", "actions": []}] | .check.total_issues = (.check.total_issues + 3)' "$FIXTURES/combined.json" | jq -r -f "$JQ_DIR/summary-combined.jq" 2>&1)
+assert_contains "$OUT_RSC" "| [Invalid client exports](" "combined: RSC invalid-client-exports row in breakdown"
+assert_contains "$OUT_RSC" "| [Mixed client/server barrels](" "combined: RSC mixed-barrel row in breakdown"
+assert_contains "$OUT_RSC" "| [Misplaced directives](" "combined: RSC misplaced-directives row in breakdown"
+
+# Next.js routing keys (route_collisions + dynamic_segment_name_conflicts) were previously
+# absent from the combined-mode Code issues breakdown; assert they now render.
+OUT_ROUTING=$(jq '.check.route_collisions = [{"path": "src/app/(a)/p/page.tsx", "url": "/p", "conflicting_paths": ["src/app/(b)/p/page.tsx"], "actions": []}] | .check.dynamic_segment_name_conflicts = [{"path": "src/app/[id]/page.tsx", "position": "0", "conflicting_segments": ["id", "slug"], "actions": []}] | .check.total_issues = (.check.total_issues + 2)' "$FIXTURES/combined.json" | jq -r -f "$JQ_DIR/summary-combined.jq" 2>&1)
+assert_contains "$OUT_ROUTING" "| [Route collisions](" "combined: route-collisions row in breakdown"
+assert_contains "$OUT_ROUTING" "| [Dynamic segment conflicts](" "combined: dynamic-segment-conflicts row in breakdown"
+
+# Vue/Next framework keys appear in the combined-mode Code issues breakdown table.
+OUT_FRAMEWORK=$(jq '.check.unused_server_actions = [{"path": "src/actions.ts", "line": 9, "col": 0, "action_name": "submitForm", "actions": []}] | .check.unrendered_components = [{"path": "src/Foo.vue", "line": 1, "col": 0, "component_name": "Foo", "framework": "vue", "actions": []}] | .check.unused_component_props = [{"path": "src/Widget.vue", "line": 12, "col": 0, "component_name": "Widget", "prop_name": "variant", "actions": []}] | .check.unused_component_emits = [{"path": "src/Widget.vue", "line": 14, "col": 0, "component_name": "Widget", "emit_name": "submit", "actions": []}] | .check.unused_component_inputs = [{"path": "src/widget.component.ts", "line": 12, "col": 0, "component_name": "Widget", "input_name": "variant", "actions": []}] | .check.unused_component_outputs = [{"path": "src/widget.component.ts", "line": 14, "col": 0, "component_name": "Widget", "output_name": "submit", "actions": []}] | .check.unused_svelte_events = [{"path": "src/Child.svelte", "line": 6, "col": 0, "component_name": "Child", "event_name": "dead", "actions": []}] | .check.unprovided_injects = [{"path": "src/useTheme.ts", "line": 7, "col": 0, "key_name": "themeKey", "framework": "vue", "actions": []}] | .check.total_issues = (.check.total_issues + 8)' "$FIXTURES/combined.json" | jq -r -f "$JQ_DIR/summary-combined.jq" 2>&1)
+assert_contains "$OUT_FRAMEWORK" "| [Unused server actions](" "combined: unused-server-actions row in breakdown"
+assert_contains "$OUT_FRAMEWORK" "| [Unrendered components](" "combined: unrendered-components row in breakdown"
+assert_contains "$OUT_FRAMEWORK" "| [Unused component props](" "combined: unused-component-props row in breakdown"
+assert_contains "$OUT_FRAMEWORK" "| [Unused component emits](" "combined: unused-component-emits row in breakdown"
+assert_contains "$OUT_FRAMEWORK" "| [Unused component inputs](" "combined: unused-component-inputs row in breakdown"
+assert_contains "$OUT_FRAMEWORK" "| [Unused component outputs](" "combined: unused-component-outputs row in breakdown"
+assert_contains "$OUT_FRAMEWORK" "| [Unused Svelte events](" "combined: unused-svelte-events row in breakdown"
+assert_contains "$OUT_FRAMEWORK" "| [Unprovided injects](" "combined: unprovided-injects row in breakdown"
+
+# Worst-case truncation: 50 groups synthesized (paths differentiated per-group via `. as $g |`),
+# top-5 displayed + "and N more" line, total under 65k chars.
+# line_count is ASCENDING in input order (group_0 has line_count=1, group_49 has line_count=50)
+# so the sort_by + reverse in summary-combined.jq must actually do work to surface the largest
+# groups. If the sort is reverted, group_0 (smallest) would lead and the regression assertions fail.
+OUT_LARGE=$(jq -n '
+  {
+    schema_version: 3,
+    check: {total_issues: 0, unused_files: [], unused_exports: [], unused_types: [], unused_dependencies: [], unused_dev_dependencies: [], unused_optional_dependencies: [], unused_enum_members: [], unused_class_members: [], unresolved_imports: [], unlisted_dependencies: [], duplicate_exports: [], circular_dependencies: [], boundary_violations: [], type_only_dependencies: [], test_only_dependencies: [], stale_suppressions: [], unused_catalog_entries: [], unresolved_catalog_references: [], unused_dependency_overrides: [], misconfigured_dependency_overrides: [], private_type_leaks: []},
+    dupes: {
+      stats: {clone_groups: 50, clone_instances: 200, files_with_clones: 50, duplicated_lines: 5000, total_lines: 100000, duplication_percentage: 5.0},
+      clone_groups: ([range(0;50)] | map(. as $g | {line_count: ($g + 1), token_count: ($g * 5 + 50), instances: ([range(0;4)] | map(. as $i | {file: ("src/group_\($g)/file_\($i).ts"), start_line: ($i * 10 + 1), end_line: ($i * 10 + 9)}))}))
+    },
+    health: {summary: {functions_above_threshold: 0}, vital_signs: {}, file_scores: [], findings: []}
+  }
+' | jq -r -f "$JQ_DIR/summary-combined.jq" 2>&1)
+assert_contains "$OUT_LARGE" "and 45 more groups" "dupes: large input truncates with overflow line"
+assert_contains "$OUT_LARGE" "Across 50 files" "dupes: large input footer count is correct"
+LARGE_LEN=${#OUT_LARGE}
+if [ "$LARGE_LEN" -lt 65000 ]; then
+  pass "dupes: large input stays under GitHub PR comment cap (got $LARGE_LEN chars)"
+else
+  fail "dupes: large input over PR comment cap" "got $LARGE_LEN chars (cap 65000)"
+fi
+# Top-5 sort order: largest line_count first. group_49 has line_count=50, group_45=46, group_44=45 is just outside top-5.
+# This assertion fails if sort_by is reverted: input order would put group_0 (line_count=1) first.
+assert_contains "$OUT_LARGE" "src/group_49/file_0.ts:1-9" "dupes: largest group (49) ranks first after sort"
+assert_contains "$OUT_LARGE" "src/group_45/file_0.ts" "dupes: top-5 contains group_45 (5th largest)"
+assert_not_contains "$OUT_LARGE" "src/group_44/file_0.ts" "dupes: group_44 (6th largest) is truncated"
+assert_not_contains "$OUT_LARGE" "src/group_0/file_0.ts" "dupes: smallest group is truncated"
+
+# Null duplication_percentage must not crash pct(); render as 0%
+OUT_NULL_PCT=$(jq 'del(.dupes.stats.duplication_percentage)' "$FIXTURES/combined.json" | jq -r -f "$JQ_DIR/summary-combined.jq" 2>&1)
+assert_contains "$OUT_NULL_PCT" "66 lines · 0%" "dupes: missing duplication_percentage renders as 0%"
+assert_not_contains "$OUT_NULL_PCT" "cannot be multiplied" "dupes: pct(null) does not crash"
+
 assert_not_contains "$OUT" "Dead exports" "no dead_export_pct in PR comment"
+
+OUT_CRAP_ONLY=$(jq '.health.summary.functions_above_threshold = 1 | .health.findings = [{"path":"src/ui/pagination.tsx","name":"buildPageItems","line":42,"col":0,"cyclomatic":17,"cognitive":8,"crap":30,"line_count":13,"severity":"moderate","exceeded":"crap"}]' "$FIXTURES/combined.json" | jq -r -f "$JQ_DIR/summary-combined.jq" 2>&1)
+assert_contains "$OUT_CRAP_ONLY" "buildPageItems" "combined: renders CRAP-only finding"
+assert_contains "$OUT_CRAP_ONLY" "CRAP >= 30" "combined: explains CRAP threshold"
+
+OUT_CRAP_SORT=$(jq '.health.summary.functions_above_threshold = 6 | .health.findings = [
+  {"path":"src/a.ts","name":"cyclo1","line":1,"col":0,"cyclomatic":80,"cognitive":4,"line_count":10,"severity":"critical","exceeded":"cyclomatic"},
+  {"path":"src/a.ts","name":"cyclo2","line":2,"col":0,"cyclomatic":70,"cognitive":4,"line_count":10,"severity":"critical","exceeded":"cyclomatic"},
+  {"path":"src/a.ts","name":"cyclo3","line":3,"col":0,"cyclomatic":60,"cognitive":4,"line_count":10,"severity":"critical","exceeded":"cyclomatic"},
+  {"path":"src/a.ts","name":"cyclo4","line":4,"col":0,"cyclomatic":50,"cognitive":4,"line_count":10,"severity":"critical","exceeded":"cyclomatic"},
+  {"path":"src/a.ts","name":"cyclo5","line":5,"col":0,"cyclomatic":40,"cognitive":4,"line_count":10,"severity":"high","exceeded":"cyclomatic"},
+  {"path":"src/a.ts","name":"crapOnly","line":6,"col":0,"cyclomatic":8,"cognitive":4,"crap":30,"line_count":10,"severity":"moderate","exceeded":"crap"}
+]' "$FIXTURES/combined.json" | jq -r -f "$JQ_DIR/summary-combined.jq" 2>&1)
+assert_contains "$OUT_CRAP_SORT" "crapOnly" "combined: severity sort surfaces CRAP-only finding in visible rows"
+
+OUT_OLD_HEALTH=$(jq 'del(.health.summary.max_cyclomatic_threshold) | del(.health.summary.max_cognitive_threshold) | del(.health.summary.max_crap_threshold) | .health.findings = [{"path":"src/a.ts","name":"legacyComplex","line":1,"col":0,"cyclomatic":25,"cognitive":20,"line_count":10,"severity":"moderate","exceeded":"both"}]' "$FIXTURES/combined.json" | jq -r -f "$JQ_DIR/summary-combined.jq" 2>&1)
+assert_contains "$OUT_OLD_HEALTH" "thresholds: cyclomatic > default, cognitive > default" "combined: old JSON threshold fallback is explicit"
+assert_not_contains "$OUT_OLD_HEALTH" "CRAP" "combined: old JSON without CRAP metadata hides CRAP column"
 
 echo "  summary-combined.jq (scoped maintainability):"
 # Simulate --changed-since filtering: keep only 1 file_score (76.2) vs codebase avg (86.8)
@@ -165,7 +1726,7 @@ assert_not_contains "$OUT_NO_FIX" "@public" "tip: no @public tip when no unused 
 
 echo "  summary-combined.jq (clean state):"
 OUT_CLEAN=$(jq -r -f "$JQ_DIR/summary-combined.jq" "$FIXTURES/combined-clean.json" 2>&1)
-assert_contains "$OUT_CLEAN" "No issues found" "clean: no issues"
+assert_contains "$OUT_CLEAN" "Quality gate passed" "clean: no issues"
 assert_contains "$OUT_CLEAN" "Maintainability" "clean: shows maintainability"
 
 echo "  summary-combined.jq (delta header with trend):"
@@ -188,10 +1749,24 @@ echo "  summary-combined.jq (delta header with increasing dead exports shows sup
 OUT_WORSE=$(jq '.health.health_trend.metrics[1].delta = 5.0 | .health.health_trend.metrics[1].current = 50.0' "$FIXTURES/combined.json" | jq -r -f "$JQ_DIR/summary-combined.jq" 2>&1)
 assert_contains "$OUT_WORSE" "suppress?" "worsening: shows suppress link when dead exports increase"
 
-echo "  summary-combined.jq (production coverage details):"
-OUT_COMBINED_PROD=$(jq '.health.production_coverage = {"verdict":"hot-path-changes-needed","summary":{"functions_tracked":4,"functions_hit":3,"functions_unhit":0,"functions_untracked":1,"coverage_percent":75,"trace_count":2400,"period_days":7,"deployments_seen":2},"findings":[{"path":"src/cold.ts","function":"coldPath","line":14,"verdict":"review_required","invocations":0,"confidence":"medium"}],"hot_paths":[{"path":"src/hot.ts","function":"hotPath","line":3,"invocations":250,"percentile":99}]}' "$FIXTURES/combined-clean.json" | jq -r -f "$JQ_DIR/summary-combined.jq" 2>&1)
-assert_contains "$OUT_COMBINED_PROD" "Production coverage" "combined prod: has production coverage details"
+echo "  summary-combined.jq (runtime coverage details):"
+OUT_COMBINED_PROD=$(jq '.health.runtime_coverage = {"verdict":"hot-path-touched","summary":{"functions_tracked":4,"functions_hit":3,"functions_unhit":0,"functions_untracked":1,"coverage_percent":75,"trace_count":2400,"period_days":7,"deployments_seen":2},"findings":[{"path":"src/cold.ts","function":"coldPath","line":14,"verdict":"review_required","invocations":0,"confidence":"medium"}],"hot_paths":[{"path":"src/hot.ts","function":"hotPath","line":3,"invocations":250,"percentile":99}]}' "$FIXTURES/combined-clean.json" | jq -r -f "$JQ_DIR/summary-combined.jq" 2>&1)
+assert_contains "$OUT_COMBINED_PROD" "Runtime coverage" "combined prod: has runtime coverage details"
 assert_contains "$OUT_COMBINED_PROD" "hotPath" "combined prod: shows hot path"
+# Verdict hot-path-touched: header should say "hot path[s] touched", not the
+# project-wide "hot path[s]" framing. Single-path counts use the singular form.
+assert_contains "$OUT_COMBINED_PROD" "hot path touched" "combined prod (verdict hot-path-touched): header uses 'touched' framing"
+
+echo "  summary-combined.jq (no diff/changed-since: standalone framing):"
+OUT_COMBINED_STANDALONE=$(jq '.health.runtime_coverage = {"verdict":"clean","summary":{"functions_tracked":4,"functions_hit":4,"functions_unhit":0,"functions_untracked":0,"coverage_percent":100,"trace_count":2400,"period_days":7,"deployments_seen":2},"findings":[],"hot_paths":[{"path":"src/hot.ts","function":"hotPath","line":3,"invocations":250,"percentile":99}]}' "$FIXTURES/combined-clean.json" | jq -r -f "$JQ_DIR/summary-combined.jq" 2>&1)
+# Verdict NOT hot-path-touched (running outside PR context): keep the
+# project-wide "hot path" framing so the line does not falsely imply the
+# hot path is on this change.
+assert_contains "$OUT_COMBINED_STANDALONE" "hot path" "combined prod (verdict clean): header uses 'hot path' framing"
+if echo "$OUT_COMBINED_STANDALONE" | grep -q "hot path touched"; then
+  echo "  FAIL: standalone (verdict=clean) must not say 'hot path touched'"
+  exit 1
+fi
 
 # --- Annotation jq tests ---
 
@@ -203,14 +1778,32 @@ OUT=$(jq -r -f "$JQ_DIR/annotations-check.jq" "$FIXTURES/check.json" 2>&1)
 assert_contains "$OUT" "::warning" "emits warning commands"
 assert_contains "$OUT" "file=" "has file references"
 assert_contains "$OUT" "title=" "has titles"
+assert_contains "$OUT" "Imported in other workspaces" "dependency annotation includes workspace context"
+assert_contains "$OUT" "Move this dependency to the consuming workspace package.json" "dependency annotation avoids unsafe remove hint"
+assert_contains "$OUT" "Empty catalog group" "annotation includes empty catalog group title"
+assert_contains "$OUT" "legacy" "annotation includes empty catalog group name"
+
+OUT_ESCAPED_PATH=$(jq '.unused_files[0].path = "src/a%,b:c\r\nd.ts"' "$FIXTURES/check.json" | jq -r -f "$JQ_DIR/annotations-check.jq" 2>&1)
+assert_contains "$OUT_ESCAPED_PATH" "file=src/a%25%2Cb%3Ac%0D%0Ad.ts" "check annotation escapes workflow-command properties"
 
 OUT_CLEAN=$(jq -r -f "$JQ_DIR/annotations-check.jq" "$FIXTURES/check-clean.json" 2>&1)
 [ -z "$OUT_CLEAN" ] && pass "clean: no annotations" || fail "clean: no annotations" "got output"
+
+# Issue #449: kind_known: false branch renders a typo-fix annotation rather
+# than the "no longer matches any active issue" copy used for stale-but-known.
+OUT_UNKNOWN_KIND=$(jq '.unused_files = [] | .unused_exports = [] | .unused_types = [] | .unused_dependencies = [] | .unused_dev_dependencies = [] | .unused_optional_dependencies = [] | .unused_enum_members = [] | .unused_class_members = [] | .unresolved_imports = [] | .unlisted_dependencies = [] | .duplicate_exports = [] | .circular_dependencies = [] | .boundary_violations = [] | .type_only_dependencies = [] | .test_only_dependencies = [] | .unused_catalog_entries = [] | .empty_catalog_groups = [] | .unresolved_catalog_references = [] | .unused_dependency_overrides = [] | .misconfigured_dependency_overrides = [] | .private_type_leaks = [] | .stale_suppressions = [{"path": "src/utils.ts", "line": 1, "col": 0, "origin": {"type": "comment", "issue_kind": "complexity-typo", "is_file_level": false, "kind_known": false}}] | .total_issues = 1' "$FIXTURES/check.json" | jq -r -f "$JQ_DIR/annotations-check.jq" 2>&1)
+assert_contains "$OUT_UNKNOWN_KIND" "Unknown suppression kind" "unknown kind: typo title"
+assert_contains "$OUT_UNKNOWN_KIND" "complexity-typo" "unknown kind: verbatim token in message"
+assert_contains "$OUT_UNKNOWN_KIND" "fallow-ignore-next-line" "unknown kind: directive type preserved"
+assert_contains "$OUT_UNKNOWN_KIND" "Fix the typo" "unknown kind: actionable next step"
 
 echo "  annotations-dupes.jq:"
 OUT=$(jq -r -f "$JQ_DIR/annotations-dupes.jq" "$FIXTURES/dupes.json" 2>&1)
 assert_contains "$OUT" "::warning" "emits warning commands"
 assert_contains "$OUT" "Code duplication" "mentions duplication"
+
+OUT_ESCAPED_PATH=$(jq '.clone_groups[0].instances[0].file = "src/a%,b:c\r\nd.ts"' "$FIXTURES/dupes.json" | jq -r -f "$JQ_DIR/annotations-dupes.jq" 2>&1)
+assert_contains "$OUT_ESCAPED_PATH" "file=src/a%25%2Cb%3Ac%0D%0Ad.ts" "dupes annotation escapes workflow-command properties"
 
 echo "  annotations-health.jq:"
 OUT=$(jq -r -f "$JQ_DIR/annotations-health.jq" "$FIXTURES/health.json" 2>&1)
@@ -220,183 +1813,118 @@ assert_contains "$OUT" "(critical)" "critical severity in annotation title"
 assert_contains "$OUT" "(high)" "high severity in annotation title"
 assert_contains "$OUT" "parseContentBlocks" "includes function name"
 
-OUT_PROD_ANN=$(jq '.production_coverage = {"verdict":"cold-code-detected","summary":{"functions_tracked":2,"functions_hit":1,"functions_unhit":1,"functions_untracked":0,"coverage_percent":50,"trace_count":1200,"period_days":7,"deployments_seen":2},"findings":[{"path":"src/cold.ts","function":"coldPath","line":14,"verdict":"review_required","invocations":0,"confidence":"medium","evidence":{"static_status":"used","test_coverage":"not_covered","v8_tracking":"tracked"},"actions":[{"description":"Review before deleting."}]},{"path":"src/lazy.ts","function":"lateBound","line":8,"verdict":"coverage_unavailable","confidence":"none","evidence":{"static_status":"used","test_coverage":"not_covered","v8_tracking":"untracked","untracked_reason":"lazy_parsed"}}]}' "$FIXTURES/health-clean.json" | jq -r -f "$JQ_DIR/annotations-health.jq" 2>&1)
-assert_contains "$OUT_PROD_ANN" "Production coverage" "prod annotation: title present"
+OUT_ESCAPED_PATH=$(jq '.findings[0].path = "src/a%,b:c\r\nd.ts"' "$FIXTURES/health.json" | jq -r -f "$JQ_DIR/annotations-health.jq" 2>&1)
+assert_contains "$OUT_ESCAPED_PATH" "file=src/a%25%2Cb%3Ac%0D%0Ad.ts" "health annotation escapes workflow-command properties"
+
+# An override-affected finding is described against the ceiling it was measured
+# with, not the run-global summary ceiling. Mirrors the native renderer test
+# `annotations_use_the_finding_effective_threshold` (issue #2163).
+OUT_OVERRIDE=$(jq '.findings = [{"path":"src/Board.astro","name":"<template>","line":6,"col":3,"cyclomatic":11,"cognitive":4,"line_count":20,"param_count":0,"exceeded":"crap","severity":"critical","crap":132.0,"threshold_source":"override","effective_thresholds":{"max_cyclomatic":20,"max_cognitive":15,"max_crap":100,"max_unit_size":60}}]' "$FIXTURES/health.json" | jq -r -f "$JQ_DIR/annotations-health.jq" 2>&1)
+assert_contains "$OUT_OVERRIDE" "threshold: 100" "health annotation uses the finding's override ceiling"
+assert_not_contains "$OUT_OVERRIDE" "threshold: 30" "health annotation drops the global ceiling under an override"
+
+OUT_PROD_ANN=$(jq '.runtime_coverage = {"verdict":"cold-code-detected","summary":{"functions_tracked":2,"functions_hit":1,"functions_unhit":1,"functions_untracked":0,"coverage_percent":50,"trace_count":1200,"period_days":7,"deployments_seen":2},"findings":[{"path":"src/cold.ts","function":"coldPath","line":14,"verdict":"review_required","invocations":0,"confidence":"medium","evidence":{"static_status":"used","test_coverage":"not_covered","v8_tracking":"tracked"},"actions":[{"description":"Review before deleting."}]},{"path":"src/lazy.ts","function":"lateBound","line":8,"verdict":"coverage_unavailable","confidence":"none","evidence":{"static_status":"used","test_coverage":"not_covered","v8_tracking":"untracked","untracked_reason":"lazy_parsed"}}]}' "$FIXTURES/health-clean.json" | jq -r -f "$JQ_DIR/annotations-health.jq" 2>&1)
+assert_contains "$OUT_PROD_ANN" "Runtime coverage" "prod annotation: title present"
 assert_contains "$OUT_PROD_ANN" "coldPath" "prod annotation: function name present"
 
-# --- Review comment jq tests ---
+render_direct_annotations() {
+  local kind="$1" input="$2"
+  case "$kind" in
+    dead-code) jq -r -f "$JQ_DIR/annotations-check.jq" "$input" ;;
+    dupes) jq -r -f "$JQ_DIR/annotations-dupes.jq" "$input" ;;
+    health) jq -r -f "$JQ_DIR/annotations-health.jq" "$input" ;;
+    audit)
+      {
+        jq '.dead_code // empty' "$input" | jq -r -f "$JQ_DIR/annotations-check.jq"
+        jq '.complexity // empty' "$input" | jq -r -f "$JQ_DIR/annotations-health.jq"
+        jq '.duplication // empty' "$input" | jq -r -f "$JQ_DIR/annotations-dupes.jq"
+      }
+      ;;
+    combined)
+      {
+        jq '.check // empty' "$input" | jq -r -f "$JQ_DIR/annotations-check.jq"
+        jq '.health // empty' "$input" | jq -r -f "$JQ_DIR/annotations-health.jq"
+        jq '.dupes // empty' "$input" | jq -r -f "$JQ_DIR/annotations-dupes.jq"
+      }
+      ;;
+  esac
+}
 
-echo ""
-echo "=== Review comment scripts ==="
+render_forced_fallback_annotations() {
+  local kind="$1" input="$2" command="$1"
+  [ "$kind" = "combined" ] && command=""
+  HAS_NATIVE_REPORT=false \
+    FALLOW_PR_DECISION_FILE="" \
+    FALLOW_COMMAND="$command" \
+    MAX_ANNOTATIONS="50" \
+    ACTION_JQ_DIR="$JQ_DIR" \
+    FALLOW_RESULTS_FILE="$input" \
+    bash "$DIR/../scripts/annotate.sh" 2>/dev/null
+}
 
-export PREFIX="website/" MAX=50 FALLOW_ROOT="website" GH_REPO="test/repo" PR_NUMBER=1 PR_HEAD_SHA="abc123"
+ANNOTATION_SAFETY_DIR=$(mktemp -d)
+ANNOTATION_ATTACK=$'value%\r\n::error::injected'
+ANNOTATION_PATH=$'src/a%,b:c\r\nd.ts'
+ANNOTATION_EXPECTED_PATH="file=src/a%25%2Cb%3Ac%0D%0Ad.ts"
 
-echo "  review-comments-check.jq:"
-OUT=$(jq -f "$JQ_DIR/review-comments-check.jq" "$FIXTURES/check.json" 2>&1)
-assert_valid_json "$OUT" "produces valid JSON"
-assert_contains "$OUT" "Unused" "contains unused findings"
-assert_contains "$OUT" "@public" "mentions @public JSDoc tag"
-assert_contains "$OUT" "docs.fallow.tools" "has docs links"
-assert_contains "$OUT" "Configure or suppress" "has suppress link"
+jq -n --arg path "$ANNOTATION_PATH" --arg attack "$ANNOTATION_ATTACK" '{
+  unused_exports: [
+    {path: $path, line: 4, col: 1, export_name: $attack, is_re_export: false, is_type_only: false},
+    {path: null, line: 5, col: 1, export_name: $attack, is_re_export: false, is_type_only: false},
+    {path: 42, line: 6, col: 1, export_name: $attack, is_re_export: false, is_type_only: false}
+  ]
+}' > "$ANNOTATION_SAFETY_DIR/dead-code.json"
 
-OUT_CLEAN=$(jq -f "$JQ_DIR/review-comments-check.jq" "$FIXTURES/check-clean.json" 2>&1)
-assert_json_length "$OUT_CLEAN" "0" "clean: no comments"
+jq -n --arg path "$ANNOTATION_PATH" --arg attack "$ANNOTATION_ATTACK" '{
+  clone_groups: [{
+    line_count: $attack,
+    token_count: $attack,
+    instances: [
+      {file: $path, start_line: 1, end_line: 3, start_col: 0},
+      {file: null, start_line: 4, end_line: 6, start_col: 0},
+      {file: 42, start_line: 7, end_line: 9, start_col: 0}
+    ]
+  }]
+}' > "$ANNOTATION_SAFETY_DIR/dupes.json"
 
-echo "  review-comments-dupes.jq:"
-OUT=$(jq -f "$JQ_DIR/review-comments-dupes.jq" "$FIXTURES/dupes.json" 2>&1)
-assert_valid_json "$OUT" "produces valid JSON"
-assert_contains "$OUT" "duplication" "mentions duplication"
-assert_contains "$OUT" "github.com" "has GitHub links"
-assert_contains "$OUT" "View duplicated code" "includes code fragment"
+jq -n --arg path "$ANNOTATION_PATH" --arg attack "$ANNOTATION_ATTACK" '{
+  summary: {max_cyclomatic_threshold: 20, max_cognitive_threshold: 15, max_crap_threshold: 30},
+  findings: [
+    {path: $path, name: $attack, line: 2, col: 0, cyclomatic: 21, cognitive: 16, line_count: 8, severity: "moderate", exceeded: "both"},
+    {path: null, name: $attack, line: 3, col: 0, cyclomatic: 21, cognitive: 16, line_count: 8, severity: "moderate", exceeded: "both"},
+    {path: 42, name: $attack, line: 4, col: 0, cyclomatic: 21, cognitive: 16, line_count: 8, severity: "moderate", exceeded: "both"}
+  ]
+}' > "$ANNOTATION_SAFETY_DIR/health.json"
 
-echo "  review-comments-health.jq:"
-OUT=$(jq -f "$JQ_DIR/review-comments-health.jq" "$FIXTURES/health.json" 2>&1)
-assert_valid_json "$OUT" "produces valid JSON"
-assert_contains "$OUT" "critical" "includes severity in review comment"
-assert_contains "$OUT" "parseContentBlocks" "includes function name"
+jq -n \
+  --slurpfile dead "$ANNOTATION_SAFETY_DIR/dead-code.json" \
+  --slurpfile health "$ANNOTATION_SAFETY_DIR/health.json" \
+  --slurpfile dupes "$ANNOTATION_SAFETY_DIR/dupes.json" \
+  '{dead_code: $dead[0], complexity: $health[0], duplication: $dupes[0]}' \
+  > "$ANNOTATION_SAFETY_DIR/audit.json"
 
-OUT_PROD_REVIEW=$(jq '.production_coverage = {"verdict":"cold-code-detected","summary":{"functions_tracked":2,"functions_hit":1,"functions_unhit":1,"functions_untracked":0,"coverage_percent":50,"trace_count":1200,"period_days":7,"deployments_seen":2},"findings":[{"path":"src/cold.ts","function":"coldPath","line":14,"verdict":"review_required","invocations":0,"confidence":"medium","evidence":{"static_status":"used","test_coverage":"not_covered","v8_tracking":"tracked"},"actions":[{"description":"Review before deleting."}]}]}' "$FIXTURES/health-clean.json" | jq -f "$JQ_DIR/review-comments-health.jq" 2>&1)
-assert_valid_json "$OUT_PROD_REVIEW" "prod review comments: valid JSON"
-assert_contains "$OUT_PROD_REVIEW" "coldPath" "prod review comments: function present"
-assert_contains "$OUT_PROD_REVIEW" "review_required" "prod review comments: verdict present"
+jq -n \
+  --slurpfile dead "$ANNOTATION_SAFETY_DIR/dead-code.json" \
+  --slurpfile health "$ANNOTATION_SAFETY_DIR/health.json" \
+  --slurpfile dupes "$ANNOTATION_SAFETY_DIR/dupes.json" \
+  '{check: $dead[0], health: $health[0], dupes: $dupes[0]}' \
+  > "$ANNOTATION_SAFETY_DIR/combined.json"
 
-echo "  review-body.jq:"
-OUT=$(jq -r -f "$JQ_DIR/review-body.jq" "$FIXTURES/combined.json" 2>&1)
-assert_valid_markdown "$OUT" "produces output"
-assert_contains "$OUT" "Fallow Review" "has review title"
-assert_contains "$OUT" "fallow-review" "has marker comment"
-assert_contains "$OUT" "Maintainability" "shows metrics"
+for kind in dead-code dupes health audit combined; do
+  expected_lines=1
+  [ "$kind" = "audit" ] || [ "$kind" = "combined" ] && expected_lines=3
+  DIRECT_SAFE=$(render_direct_annotations "$kind" "$ANNOTATION_SAFETY_DIR/$kind.json")
+  assert_contains "$DIRECT_SAFE" "$ANNOTATION_EXPECTED_PATH" "$kind direct renderer preserves property encoding"
+  assert_contains "$DIRECT_SAFE" "value%25%0D%0A::error::injected" "$kind direct renderer escapes message data"
+  assert_safe_workflow_output "$DIRECT_SAFE" "$expected_lines" "$kind direct renderer skips malformed paths without command injection"
 
-OUT_REVIEW_PROD=$(jq '.health.production_coverage = {"verdict":"hot-path-changes-needed","summary":{"functions_tracked":4,"functions_hit":3,"functions_unhit":0,"functions_untracked":1,"coverage_percent":75,"trace_count":2400,"period_days":7,"deployments_seen":2},"findings":[{"path":"src/lazy.ts","function":"lateBound","line":8,"verdict":"coverage_unavailable","confidence":"none"}],"hot_paths":[{"path":"src/hot.ts","function":"hotPath","line":3,"invocations":250,"percentile":99}]}' "$FIXTURES/combined-clean.json" | jq -r -f "$JQ_DIR/review-body.jq" 2>&1)
-assert_contains "$OUT_REVIEW_PROD" "Production coverage:" "review body prod: summary line present"
-assert_contains "$OUT_REVIEW_PROD" "hot path" "review body prod: hot path mentioned"
+  FALLBACK_SAFE=$(render_forced_fallback_annotations "$kind" "$ANNOTATION_SAFETY_DIR/$kind.json")
+  assert_contains "$FALLBACK_SAFE" "$ANNOTATION_EXPECTED_PATH" "$kind forced fallback preserves property encoding"
+  assert_contains "$FALLBACK_SAFE" "value%25%0D%0A::error::injected" "$kind forced fallback escapes message data"
+  assert_safe_workflow_output "$FALLBACK_SAFE" "$expected_lines" "$kind forced fallback skips malformed paths without command injection"
+done
 
-# --- Suggestion block tests ---
-
-echo ""
-echo "=== Suggestion blocks ==="
-
-echo "  unused-export type field:"
-OUT=$(jq -f "$JQ_DIR/review-comments-check.jq" "$FIXTURES/check.json" 2>&1)
-TYPES=$(echo "$OUT" | jq -r '[.[].type] | unique | join(",")')
-assert_contains "$TYPES" "unused-export" "exports have type field for suggestion enrichment"
-
-echo "  single export keeps type:"
-SINGLE='{"total_issues":1,"unused_files":[],"unused_exports":[{"path":"x.ts","export_name":"foo","is_type_only":false,"line":5,"col":0,"span_start":0,"is_re_export":false}],"unused_types":[],"unused_dependencies":[],"unused_dev_dependencies":[],"unused_optional_dependencies":[],"unused_enum_members":[],"unused_class_members":[],"unresolved_imports":[],"unlisted_dependencies":[],"duplicate_exports":[],"circular_dependencies":[],"boundary_violations":[],"type_only_dependencies":[]}'
-OUT=$(echo "$SINGLE" | jq -f "$JQ_DIR/review-comments-check.jq" 2>&1)
-assert_json_length "$OUT" "1" "single export produces 1 comment"
-SINGLE_TYPE=$(echo "$OUT" | jq -r '.[0].type')
-[ "$SINGLE_TYPE" = "unused-export" ] && pass "type is unused-export (not grouped)" || fail "type is unused-export" "got $SINGLE_TYPE"
-
-echo "  grouped exports get different type:"
-MULTI='{"total_issues":2,"unused_files":[],"unused_exports":[{"path":"x.ts","export_name":"foo","is_type_only":false,"line":5,"col":0,"span_start":0,"is_re_export":false},{"path":"x.ts","export_name":"bar","is_type_only":false,"line":10,"col":0,"span_start":0,"is_re_export":false}],"unused_types":[],"unused_dependencies":[],"unused_dev_dependencies":[],"unused_optional_dependencies":[],"unused_enum_members":[],"unused_class_members":[],"unresolved_imports":[],"unlisted_dependencies":[],"duplicate_exports":[],"circular_dependencies":[],"boundary_violations":[],"type_only_dependencies":[]}'
-OUT=$(echo "$MULTI" | jq -f "$JQ_DIR/review-comments-check.jq" | jq --argjson max 50 -f "$JQ_DIR/merge-comments.jq" 2>&1)
-assert_json_length "$OUT" "1" "2 exports from same file grouped into 1"
-GROUP_TYPE=$(echo "$OUT" | jq -r '.[0].type')
-[ "$GROUP_TYPE" = "unused-export-group" ] && pass "grouped type is unused-export-group" || fail "grouped type" "got $GROUP_TYPE"
-assert_contains "$OUT" "2 unused exports" "grouped comment mentions count"
-
-echo "  boundary violation produces review comment:"
-BV_INPUT='{"total_issues":1,"unused_files":[],"unused_exports":[],"unused_types":[],"unused_dependencies":[],"unused_dev_dependencies":[],"unused_optional_dependencies":[],"unused_enum_members":[],"unused_class_members":[],"unresolved_imports":[],"unlisted_dependencies":[],"duplicate_exports":[],"circular_dependencies":[],"boundary_violations":[{"from_path":"src/ui/App.ts","to_path":"src/db/query.ts","from_zone":"ui","to_zone":"db","import_specifier":"src/db/query.ts","line":5,"col":9}],"type_only_dependencies":[]}'
-OUT=$(echo "$BV_INPUT" | MAX=50 jq -f "$JQ_DIR/review-comments-check.jq" 2>&1)
-assert_valid_json "$OUT" "boundary violation JSON valid"
-assert_json_length "$OUT" "1" "boundary violation produces 1 comment"
-assert_contains "$OUT" "Boundary violation" "comment mentions boundary violation"
-assert_contains "$OUT" "ui" "comment mentions from_zone"
-assert_contains "$OUT" "db" "comment mentions to_zone"
-assert_contains "$OUT" "src/ui/App.ts" "comment mentions from_path"
-assert_contains "$OUT" "src/db/query.ts" "comment mentions to_path"
-BV_PATH=$(echo "$OUT" | jq -r '.[0].path')
-[ "$BV_PATH" = "${PREFIX}src/ui/App.ts" ] && pass "path has prefix + from_path" || fail "path has prefix + from_path" "got $BV_PATH"
-BV_LINE=$(echo "$OUT" | jq -r '.[0].line')
-[ "$BV_LINE" = "5" ] && pass "line is 5" || fail "line is 5" "got $BV_LINE"
-
-echo "  boundary violation produces annotation:"
-ANN=$(echo "$BV_INPUT" | jq -rf "$JQ_DIR/annotations-check.jq" 2>&1)
-assert_contains "$ANN" "::warning" "annotation is warning level"
-assert_contains "$ANN" "file=src/ui/App.ts" "annotation has correct file"
-assert_contains "$ANN" "line=5" "annotation has correct line"
-assert_contains "$ANN" "Boundary violation" "annotation title"
-assert_contains "$ANN" "zone" "annotation mentions zone"
-
-echo "  boundary violation appears in summary:"
-SUMMARY=$(echo "$BV_INPUT" | jq -rf "$JQ_DIR/summary-check.jq" 2>&1)
-assert_contains "$SUMMARY" "Boundary violations" "summary has boundary section"
-assert_contains "$SUMMARY" "src/ui/App.ts" "summary mentions file"
-assert_contains "$SUMMARY" "ui" "summary mentions zone"
-
-echo "  review-body clean state:"
-OUT_CLEAN=$(jq -r -f "$JQ_DIR/review-body.jq" "$FIXTURES/combined-clean.json" 2>&1)
-assert_contains "$OUT_CLEAN" "No code issues" "clean: no code issues"
-assert_contains "$OUT_CLEAN" "No duplication" "clean: no duplication"
-assert_contains "$OUT_CLEAN" "fallow-review" "clean: has marker"
-
-# --- Merge script tests ---
-
-echo ""
-echo "=== Merge script ==="
-
-echo "  merge-comments.jq:"
-
-# Test grouping unused exports
-EXPORTS='[
-  {"type":"unused-export","export_name":"foo","path":"a.ts","line":1,"body":"unused foo"},
-  {"type":"unused-export","export_name":"bar","path":"a.ts","line":5,"body":"unused bar"},
-  {"type":"unused-export","export_name":"baz","path":"b.ts","line":1,"body":"unused baz"},
-  {"type":"other","path":"c.ts","line":1,"body":"something else"}
-]'
-OUT=$(echo "$EXPORTS" | jq --argjson max 50 -f "$JQ_DIR/merge-comments.jq" 2>&1)
-assert_valid_json "$OUT" "valid JSON"
-assert_json_length "$OUT" "3" "groups 2 exports from a.ts into 1 (2 + 1 other = 3)"
-assert_contains "$OUT" "2 unused exports" "grouped comment mentions count"
-assert_contains "$OUT" "foo" "grouped comment lists export names"
-assert_contains "$OUT" "bar" "grouped comment lists export names"
-
-# Test dedup clones
-CLONES='[
-  {"type":"duplication","group_id":"g1","path":"a.ts","line":5,"body":"clone 1 instance 1"},
-  {"type":"duplication","group_id":"g1","path":"a.ts","line":20,"body":"clone 1 instance 2"},
-  {"type":"duplication","group_id":"g2","path":"b.ts","line":10,"body":"clone 2 instance 1"},
-  {"type":"duplication","group_id":"g2","path":"b.ts","line":30,"body":"clone 2 instance 2"}
-]'
-OUT=$(echo "$CLONES" | jq --argjson max 50 -f "$JQ_DIR/merge-comments.jq" 2>&1)
-assert_valid_json "$OUT" "valid JSON"
-assert_json_length "$OUT" "2" "deduplicates to 1 per clone group (4 → 2)"
-
-# Test drop refactoring targets
-TARGETS='[
-  {"type":"other","path":"a.ts","line":1,"body":"finding"},
-  {"type":"refactoring-target","path":"a.ts","line":1,"body":"target"}
-]'
-OUT=$(echo "$TARGETS" | jq --argjson max 50 -f "$JQ_DIR/merge-comments.jq" 2>&1)
-assert_json_length "$OUT" "1" "drops refactoring targets"
-assert_not_contains "$OUT" "target" "target body is removed"
-
-# Test merge same line
-SAME_LINE='[
-  {"type":"other","path":"a.ts","line":5,"body":"complexity warning"},
-  {"type":"other","path":"a.ts","line":5,"body":"unused export warning"}
-]'
-OUT=$(echo "$SAME_LINE" | jq --argjson max 50 -f "$JQ_DIR/merge-comments.jq" 2>&1)
-assert_json_length "$OUT" "1" "merges same-line comments"
-assert_contains "$OUT" "complexity warning" "merged comment has first body"
-assert_contains "$OUT" "unused export warning" "merged comment has second body"
-assert_contains "$OUT" "\\\\n---\\\\n" "merged comment has separator"
-
-# Test empty input
-OUT=$(echo '[]' | jq --argjson max 50 -f "$JQ_DIR/merge-comments.jq" 2>&1)
-assert_json_length "$OUT" "0" "empty input produces empty output"
-
-# Test max limit
-MANY='[
-  {"type":"other","path":"a.ts","line":1,"body":"1"},
-  {"type":"other","path":"a.ts","line":2,"body":"2"},
-  {"type":"other","path":"a.ts","line":3,"body":"3"},
-  {"type":"other","path":"a.ts","line":4,"body":"4"},
-  {"type":"other","path":"a.ts","line":5,"body":"5"}
-]'
-OUT=$(echo "$MANY" | jq --argjson max 3 -f "$JQ_DIR/merge-comments.jq" 2>&1)
-assert_json_length "$OUT" "3" "respects max limit"
+rm -rf "$ANNOTATION_SAFETY_DIR"
 
 # --- Changed-file filter tests ---
 
@@ -409,7 +1937,7 @@ assert_valid_json "$OUT" "valid JSON"
 assert_json_value "$OUT" '.unused_exports | length' "3" "keeps only exports in changed files"
 assert_json_value "$OUT" '.unused_files | length' "0" "no unused files match changed path"
 assert_json_value "$OUT" '.unused_dependencies | length' "3" "preserves dependency issues (not file-scoped)"
-assert_json_value "$OUT" '.total_issues' "6" "recalculates total_issues"
+assert_json_value "$OUT" '.total_issues' "7" "recalculates total_issues"
 
 echo "  check with no matching files:"
 OUT=$(jq --argjson changed '["nonexistent.ts"]' -f "$JQ_DIR/filter-changed.jq" "$FIXTURES/check.json" 2>&1)
@@ -458,6 +1986,698 @@ assert_json_value "$OUT" '.circular_dependencies | length' "1" "keeps cycle if a
 OUT=$(echo "$CD_INPUT" | jq --argjson changed '["src/c.ts"]' -f "$JQ_DIR/filter-changed.jq" 2>&1)
 assert_json_value "$OUT" '.circular_dependencies | length' "0" "removes cycle if no file changed"
 
+# --- Typed Action script integration tests ---
+
+echo ""
+echo "=== Typed Action script integration ==="
+
+ACTION_TYPED_WORK=$(mktemp -d)
+ACTION_TYPED_BIN="$ACTION_TYPED_WORK/bin"
+ACTION_TYPED_LOG="$ACTION_TYPED_WORK/mock.log"
+SCRIPTS_DIR="$DIR/../scripts"
+mkdir -p "$ACTION_TYPED_BIN"
+
+cat > "$ACTION_TYPED_BIN/fallow" <<'SH'
+#!/usr/bin/env bash
+printf 'fallow %s\n' "$*" >> "$MOCK_LOG"
+printf 'summary_scope=%s\n' "${FALLOW_SUMMARY_SCOPE:-}" >> "$MOCK_LOG"
+if [ "${1:-}" = "ci" ]; then
+  if [ "${2:-}" = "post-pr-comment" ]; then
+    printf '{"action":"create","marker_id":"fallow-results","body":"smoke"}\n'
+    exit 0
+  fi
+  if [ "${2:-}" = "post-review" ]; then
+    printf '{"action":"post_review","comments_posted":1,"apply_errors":[],"post_errors":[]}\n'
+    exit 0
+  fi
+  printf '{"schema":"fallow-review-reconcile/v1","stale":[]}\n'
+  exit 0
+fi
+if [ "${1:-}" = "report" ] && [ "${MOCK_LEGACY_REPORT_TARGETS:-}" = "1" ]; then
+  echo 'fallow report supports --format github-annotations, github-summary, codeclimate, or sarif only' >&2
+  exit 2
+fi
+if [ "${MOCK_RENDER_FAILURE:-}" = "1" ]; then
+  echo 'saved audit envelope is missing required field `version`' >&2
+  exit 2
+fi
+format=""
+previous=""
+for arg in "$@"; do
+  if [ "$previous" = "--format" ]; then
+    format="$arg"
+    break
+  fi
+  previous="$arg"
+done
+case "$format" in
+  pr-comment-github)
+    if [ -n "${FALLOW_PR_DECISION_FILE:-}" ]; then
+      printf '{"schema":"fallow-pr-decision/v1","title":"Fallow","conclusion":"success","gates":[],"annotations":[],"details":{"summary_markdown":"Clean","full_report_path":null,"details_url":null}}\n' > "$FALLOW_PR_DECISION_FILE"
+    fi
+    if [ -n "${FALLOW_PR_DETAILS_FILE:-}" ]; then
+      printf '{"schema":"fallow-pr-details/v1","title":"Fallow","sections":[]}\n' > "$FALLOW_PR_DETAILS_FILE"
+    fi
+    printf '<!-- fallow-id: fallow-results -->\n### Fallow smoke\n\nGenerated by fallow.\n'
+    ;;
+  review-github)
+    if [ "${MOCK_ZERO_REVIEW:-}" = "1" ]; then
+      cat <<'JSON'
+{"event":"COMMENT","body":"### Fallow smoke\n\n<!-- fallow-review -->","comments":[],"meta":{"schema":"fallow-review-envelope/v1","provider":"github"}}
+JSON
+      exit 0
+    fi
+    cat <<'JSON'
+{"event":"COMMENT","body":"### Fallow smoke\n\n<!-- fallow-review -->","comments":[{"path":"src/a.ts","line":1,"side":"RIGHT","body":"**warn** `fallow/smoke`: smoke\n\n<!-- fallow-fingerprint: abc -->","fingerprint":"abc"}],"meta":{"schema":"fallow-review-envelope/v1","provider":"github"}}
+JSON
+    ;;
+  github-annotations)
+    printf '::notice file=src/a.ts,line=1::smoke\n'
+    ;;
+  github-summary)
+    printf '# Fallow smoke\n'
+    ;;
+  *)
+    printf '{}\n'
+    ;;
+esac
+if [ "${MOCK_LEGACY_FINDINGS_EXIT:-}" = "1" ] && [ "${1:-}" != "report" ]; then
+  exit 1
+fi
+SH
+chmod +x "$ACTION_TYPED_BIN/fallow"
+
+cat > "$ACTION_TYPED_BIN/gh" <<'SH'
+#!/usr/bin/env bash
+printf 'gh %s\n' "$*" >> "$MOCK_LOG"
+if [ "${1:-}" = "pr" ] && [ "${2:-}" = "diff" ]; then
+  printf 'diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -0,0 +1 @@\n+export const a = 1;\n'
+  exit 0
+fi
+if [ "${1:-}" = "api" ]; then
+  if printf '%s\n' "$*" | grep -q -- '--input -'; then
+    cat > /dev/null
+  fi
+  if printf '%s\n' "$*" | grep -q -- '--jq'; then
+    if [ "${MOCK_EXISTING_REVIEW:-}" = "1" ] && printf '%s\n' "$*" | grep -q 'issues/123/comments'; then
+      printf '777\n'
+    fi
+    exit 0
+  fi
+  printf '{}\n'
+fi
+SH
+chmod +x "$ACTION_TYPED_BIN/gh"
+
+printf '{"kind":"dead-code","schema_version":9}\n' > "$ACTION_TYPED_WORK/fallow-results.json"
+printf 'FALLOW_ANALYSIS_ARGS=(check --format json --root .)\n' > "$ACTION_TYPED_WORK/fallow-analysis-args.sh"
+(
+  cd "$ACTION_TYPED_WORK"
+  PATH="$ACTION_TYPED_BIN:$PATH" \
+    MOCK_LOG="$ACTION_TYPED_LOG" \
+    GH_TOKEN="test" \
+    PR_NUMBER="123" \
+    GH_REPO="owner/repo" \
+    GITHUB_SHA="abc123" \
+    PR_HEAD_SHA="head456" \
+    FALLOW_COMMAND="check" \
+    FALLOW_RENDER_PATH_PREFIX_SET="1" \
+    FALLOW_RENDER_PATH_PREFIX="custom/base" \
+    FALLOW_SUMMARY_SCOPE="diff" \
+    bash "$SCRIPTS_DIR/comment.sh" > /dev/null
+  PATH="$ACTION_TYPED_BIN:$PATH" \
+    MOCK_LOG="$ACTION_TYPED_LOG" \
+    GH_TOKEN="test" \
+    PR_NUMBER="123" \
+    GH_REPO="owner/repo" \
+    FALLOW_COMMAND="check" \
+    FALLOW_RENDER_PATH_PREFIX_SET="1" \
+    FALLOW_RENDER_PATH_PREFIX="custom/base" \
+    FALLOW_ROOT="." \
+    MAX_COMMENTS="5" \
+    bash "$SCRIPTS_DIR/review.sh" > /dev/null
+  PATH="$ACTION_TYPED_BIN:$PATH" \
+    MOCK_LOG="$ACTION_TYPED_LOG" \
+    MOCK_ZERO_REVIEW="1" \
+    MOCK_EXISTING_REVIEW="1" \
+    GH_TOKEN="test" \
+    PR_NUMBER="123" \
+    GH_REPO="owner/repo" \
+    FALLOW_COMMAND="check" \
+    FALLOW_ROOT="." \
+    MAX_COMMENTS="5" \
+    bash "$SCRIPTS_DIR/review.sh" > "$ACTION_TYPED_WORK/review-clean.out"
+  PATH="$ACTION_TYPED_BIN:$PATH" \
+    MOCK_LOG="$ACTION_TYPED_LOG" \
+    MOCK_RENDER_FAILURE="1" \
+    GH_TOKEN="test" \
+    PR_NUMBER="123" \
+    GH_REPO="owner/repo" \
+    FALLOW_COMMAND="check" \
+    bash "$SCRIPTS_DIR/comment.sh" > "$ACTION_TYPED_WORK/comment-render-failure.out"
+  PATH="$ACTION_TYPED_BIN:$PATH" \
+    MOCK_LOG="$ACTION_TYPED_LOG" \
+    MOCK_RENDER_FAILURE="1" \
+    GH_TOKEN="test" \
+    PR_NUMBER="123" \
+    GH_REPO="owner/repo" \
+    FALLOW_COMMAND="check" \
+    FALLOW_DIFF_FILE="$ACTION_TYPED_WORK/fallow-pr.diff" \
+    bash "$SCRIPTS_DIR/review.sh" > "$ACTION_TYPED_WORK/review-render-failure.out"
+)
+ACTION_TYPED_OUT=$(cat "$ACTION_TYPED_LOG")
+assert_contains "$ACTION_TYPED_OUT" "--format pr-comment-github" "comment.sh invokes typed PR comment format"
+assert_contains "$ACTION_TYPED_OUT" "--format review-github" "review.sh invokes typed GitHub review format"
+assert_contains "$ACTION_TYPED_OUT" "report --from fallow-results.json" "GitHub renderers reuse the saved analysis envelope"
+assert_contains "$ACTION_TYPED_OUT" "--report-path-prefix custom/base" "GitHub renderers preserve presentation path prefixes"
+assert_contains "$ACTION_TYPED_OUT" "summary_scope=diff" "comment.sh passes FALLOW_SUMMARY_SCOPE to typed PR comment render"
+ACTION_BLANK_SUMMARY_SCOPE_COUNT=$(printf '%s\n' "$ACTION_TYPED_OUT" | grep -c '^summary_scope=$' || true)
+if [ "$ACTION_BLANK_SUMMARY_SCOPE_COUNT" -ge 1 ]; then
+  pass "review.sh does not receive FALLOW_SUMMARY_SCOPE by default"
+else
+  fail "review.sh does not receive FALLOW_SUMMARY_SCOPE by default" "$ACTION_TYPED_OUT"
+fi
+assert_contains "$ACTION_TYPED_OUT" "fallow ci post-review --provider github" "review.sh invokes GitHub review post command"
+assert_contains "$(cat "$ACTION_TYPED_WORK/review-clean.out")" \
+  "0 resolution replies posted, 0 threads resolved" \
+  "review.sh exposes successful reconciliation counters"
+assert_contains "$ACTION_TYPED_OUT" "fallow ci post-pr-comment --provider github" "comment.sh invokes GitHub PR comment post command"
+assert_contains "$ACTION_TYPED_OUT" "fallow ci post-check-run --provider github" "comment.sh invokes GitHub Check Run post command"
+assert_contains "$ACTION_TYPED_OUT" "--head-sha head456" "comment.sh posts Check Run against the PR head SHA"
+assert_contains "$(cat "$ACTION_TYPED_WORK/comment-render-failure.out")" \
+  'saved audit envelope is missing required field `version`' \
+  "comment.sh surfaces saved-render stderr"
+assert_contains "$(cat "$ACTION_TYPED_WORK/review-render-failure.out")" \
+  'saved audit envelope is missing required field `version`' \
+  "review.sh surfaces saved-render stderr"
+assert_not_contains "$ACTION_TYPED_OUT" "fallow check " "malformed saved artifacts do not trigger direct-analysis fallback"
+
+: > "$ACTION_TYPED_LOG"
+(
+  cd "$ACTION_TYPED_WORK"
+  PATH="$ACTION_TYPED_BIN:$PATH" \
+    MOCK_LOG="$ACTION_TYPED_LOG" \
+    MOCK_LEGACY_REPORT_TARGETS="1" \
+    MOCK_LEGACY_FINDINGS_EXIT="1" \
+    HAS_NATIVE_REPORT="true" \
+    FALLOW_ANALYSIS_ARGS_JSON='["check","--root","packages/app one","--quiet","--format","json"]' \
+    FALLOW_RENDER_PATH_PREFIX_SET="1" \
+    FALLOW_RENDER_PATH_PREFIX="custom/base" \
+    GH_TOKEN="test" \
+    PR_NUMBER="123" \
+    GH_REPO="owner/repo" \
+    FALLOW_COMMAND="check" \
+    bash "$SCRIPTS_DIR/comment.sh" > /dev/null
+  PATH="$ACTION_TYPED_BIN:$PATH" \
+    MOCK_LOG="$ACTION_TYPED_LOG" \
+    MOCK_LEGACY_REPORT_TARGETS="1" \
+    MOCK_LEGACY_FINDINGS_EXIT="1" \
+    HAS_NATIVE_REPORT="true" \
+    FALLOW_ANALYSIS_ARGS_JSON='["check","--root","packages/app one","--quiet","--format","json"]' \
+    FALLOW_RENDER_PATH_PREFIX_SET="1" \
+    FALLOW_RENDER_PATH_PREFIX="custom/base" \
+    GH_TOKEN="test" \
+    PR_NUMBER="123" \
+    GH_REPO="owner/repo" \
+    FALLOW_COMMAND="check" \
+    FALLOW_DIFF_FILE="$ACTION_TYPED_WORK/fallow-pr.diff" \
+    MAX_COMMENTS="5" \
+    bash "$SCRIPTS_DIR/review.sh" > /dev/null
+)
+ACTION_LEGACY_OUT=$(cat "$ACTION_TYPED_LOG")
+assert_contains "$ACTION_LEGACY_OUT" "fallow report --from fallow-results.json" "pinned CLI compatibility probes saved rendering first"
+assert_contains "$ACTION_LEGACY_OUT" "fallow check --root packages/app one --quiet --format pr-comment-github" "comment.sh falls back to direct rendering for pinned CLIs"
+assert_contains "$ACTION_LEGACY_OUT" "fallow check --root packages/app one --quiet --format review-github" "review.sh falls back to direct rendering for pinned CLIs"
+assert_contains "$ACTION_LEGACY_OUT" "--report-path-prefix custom/base" "pinned CLI fallback preserves presentation path prefixes"
+assert_contains "$ACTION_LEGACY_OUT" "fallow ci post-pr-comment --provider github" "comment.sh posts valid pinned-CLI findings output"
+assert_contains "$ACTION_LEGACY_OUT" "fallow ci post-review --provider github" "review.sh posts valid pinned-CLI findings output"
+assert_not_contains "$(cat "$SCRIPTS_DIR/comment.sh")$(cat "$SCRIPTS_DIR/review.sh")" "source \"\$FALLOW_ANALYSIS_ARGS_FILE\"" "pinned CLI fallback does not source workspace shell"
+
+: > "$ACTION_TYPED_LOG"
+(
+  cd "$ACTION_TYPED_WORK"
+  PATH="$ACTION_TYPED_BIN:$PATH" \
+    MOCK_LOG="$ACTION_TYPED_LOG" \
+    HAS_NATIVE_REPORT="true" \
+    FALLOW_BIN="$ACTION_TYPED_BIN/fallow" \
+    FALLOW_COMMAND="dead-code" \
+    INPUT_ROOT="packages/app" \
+    MAX_ANNOTATIONS="5" \
+    ACTION_JQ_DIR="$JQ_DIR" \
+    FALLOW_RESULTS_FILE="$ACTION_TYPED_WORK/fallow-results.json" \
+    FALLOW_RENDER_PATH_PREFIX_SET="1" \
+    FALLOW_RENDER_PATH_PREFIX="custom/base" \
+    bash "$SCRIPTS_DIR/annotate.sh" > /dev/null
+  HAS_NATIVE_REPORT="true" \
+    MOCK_LOG="$ACTION_TYPED_LOG" \
+    FALLOW_BIN="$ACTION_TYPED_BIN/fallow" \
+    FALLOW_COMMAND="dead-code" \
+    INPUT_ROOT="packages/app" \
+    ACTION_JQ_DIR="$JQ_DIR" \
+    GITHUB_STEP_SUMMARY="$ACTION_TYPED_WORK/summary.md" \
+    FALLOW_RESULTS_FILE="$ACTION_TYPED_WORK/fallow-results.json" \
+    FALLOW_RENDER_PATH_PREFIX_SET="1" \
+    FALLOW_RENDER_PATH_PREFIX="custom/base" \
+    bash "$SCRIPTS_DIR/summary.sh" > /dev/null
+)
+ACTION_NATIVE_OUT=$(cat "$ACTION_TYPED_LOG")
+assert_contains "$ACTION_NATIVE_OUT" "--root packages/app --format github-annotations --report-path-prefix custom/base" "annotation saved renderer preserves root and path prefix"
+assert_contains "$ACTION_NATIVE_OUT" "--root packages/app --format github-summary --report-path-prefix custom/base" "summary saved renderer preserves root and path prefix"
+assert_contains "$(cat "$SCRIPTS_DIR/comment.sh")" "FALLOW_PR_COMMENT_ENVELOPE_FILE" "comment.sh asks fallow for typed PR comment envelope"
+assert_contains "$(cat "$SCRIPTS_DIR/comment.sh")" "FALLOW_PR_DECISION_FILE" "comment.sh asks fallow for typed PR decision sidecar"
+assert_contains "$(cat "$SCRIPTS_DIR/comment.sh")" "FALLOW_PR_DETAILS_FILE" "comment.sh asks fallow for typed PR details artifact"
+assert_contains "$(cat "$SCRIPTS_DIR/comment.sh")" "--envelope" "comment.sh passes typed PR comment envelope when present"
+assert_contains "$(cat "$SCRIPTS_DIR/review.sh")" "apply_errors" "review.sh checks reconcile apply errors"
+assert_contains "$(cat "$SCRIPTS_DIR/review.sh")" "apply_hint" "review.sh emits reconcile apply hint"
+assert_contains "$(cat "$DIR/../../action.yml")" "review-guidance:" "action.yml exposes review-guidance input"
+assert_contains "$(cat "$DIR/../../action.yml")" "FALLOW_REVIEW_GUIDANCE: \${{ inputs.review-guidance }}" "action.yml maps review-guidance to env"
+assert_contains "$(cat "$DIR/../../action.yml")" "review-id:" "action.yml exposes review-id input"
+assert_contains "$(cat "$DIR/../../action.yml")" "FALLOW_REVIEW_ID: \${{ inputs.review-id }}" "action.yml maps review-id to env"
+assert_contains "$(cat "$DIR/../../action.yml")" "summary-scope:" "action.yml exposes summary-scope input"
+assert_contains "$(cat "$DIR/../../action.yml")" "FALLOW_SUMMARY_SCOPE: \${{ inputs.summary-scope }}" "action.yml maps summary-scope to comment env"
+assert_contains "$(cat "$DIR/../../action.yml")" "comment-layout:" "action.yml exposes comment-layout input"
+assert_contains "$(cat "$DIR/../../action.yml")" "FALLOW_PR_COMMENT_LAYOUT: \${{ inputs.comment-layout }}" "action.yml maps comment-layout to comment env"
+assert_contains "$(cat "$DIR/../../action.yml")" "FALLOW_PR_COMMENT_ENVELOPE_FILE: \${{ inputs.artifacts-dir }}/fallow-pr-comment-envelope.json" "action.yml maps typed envelope to job summary"
+assert_contains "$(cat "$DIR/../../action.yml")" "FALLOW_PR_DECISION_FILE: \${{ inputs.artifacts-dir }}/fallow-pr-decision.json" "action.yml maps typed decision to annotations"
+assert_contains "$(cat "$DIR/../../action.yml")" "FALLOW_ARTIFACTS_DIR: \${{ inputs.artifacts-dir }}" "action.yml maps artifacts dir to typed scripts"
+assert_contains "$(cat "$DIR/../../action.yml")" "PR_HEAD_SHA: \${{ github.event.pull_request.head.sha }}" "action.yml maps PR head SHA for native Check Runs"
+assert_contains "$(cat "$DIR/../../crates/cli/src/ci.rs")" "with_rate_limit_retry(\"GitHub\"" "Rust CI adapter wraps GitHub API calls with retry"
+assert_contains "$(cat "$DIR/../../crates/cli/src/ci.rs")" "rate-limited" "Rust CI adapter reports GitHub rate-limit retries"
+assert_contains "$(cat "$SCRIPTS_DIR/comment.sh")" "Unsupported FALLOW_SUMMARY_SCOPE" "comment.sh warns on invalid summary scope"
+assert_not_contains "$(cat "$SCRIPTS_DIR/review.sh")" "FALLOW_SUMMARY_SCOPE" "review.sh does not consume summary scope"
+if sed -n '/name: Post review comments/,/run: bash/p' "$DIR/../../action.yml" | /usr/bin/grep -q "FALLOW_SUMMARY_SCOPE"; then
+  fail "Post review comments action env excludes FALLOW_SUMMARY_SCOPE" "summary scope must not affect inline review comments"
+else
+  pass "Post review comments action env excludes FALLOW_SUMMARY_SCOPE"
+fi
+assert_contains "$(cat "$SCRIPTS_DIR/review.sh")" "fallow ci post-review" "review.sh delegates retryable provider work to Rust"
+assert_contains "$(cat "$SCRIPTS_DIR/review.sh")" "RESOLUTION_NOUN" "review.sh logs and pluralizes reconciliation reply counts"
+assert_contains "$(cat "$SCRIPTS_DIR/review.sh")" "THREAD_NOUN" "review.sh logs and pluralizes resolved-thread counts"
+assert_not_contains "$(cat "$SCRIPTS_DIR/review.sh")" "--input -" "review.sh does not retry with consumed stdin"
+if sed -n '/name: Post review comments/,/run: bash/p' "$DIR/../../action.yml" | /usr/bin/grep -q "steps.analyze.outputs.issues != '0'"; then
+  fail "Post review comments action condition" "must run on zero-issue analyses so stale inline review threads can be resolved"
+else
+  pass "Post review comments action condition runs on zero-issue analyses"
+fi
+rm -rf "$ACTION_TYPED_WORK"
+
+# =========================================================================
+# API failure handling: changed-files marker + dedup-lookup abort
+# =========================================================================
+# Covers issue #470: silent gh api failures must surface as both a
+# structured GITHUB_OUTPUT marker AND a stderr ::warning::, never as
+# unscoped analysis or duplicate PR comments.
+
+echo ""
+echo "=== API failure handling (issue #470) ==="
+
+API_FAIL_WORK=$(mktemp -d)
+API_FAIL_BIN="$API_FAIL_WORK/bin"
+mkdir -p "$API_FAIL_BIN"
+SCRIPTS_DIR="$DIR/../scripts"
+
+# --- Test 1: analyze.sh emits changed_files_unavailable=true when gh api fails ---
+# Simulate a 500 from the GitHub API. The mock fails the gh api --paginate call
+# unconditionally; analyze.sh's git diff fallback also fails (no real git
+# history against the bogus SHA), so the script lands in the gh api branch.
+
+cat > "$API_FAIL_BIN/gh" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = "api" ]; then
+  case " $* " in
+    *" --paginate "*) ;;
+    *) echo "missing --paginate" >&2; exit 2 ;;
+  esac
+  echo "gh: HTTP 500: Internal Server Error (api.github.com/repos/owner/repo/pulls/123/files)" >&2
+  exit 1
+fi
+exit 0
+SH
+chmod +x "$API_FAIL_BIN/gh"
+
+API_FAIL_OUTPUT="$API_FAIL_WORK/github_output"
+: > "$API_FAIL_OUTPUT"
+API_FAIL_STDERR=$(cd "$API_FAIL_WORK" \
+  && PATH="$API_FAIL_BIN:$PATH" \
+  GITHUB_OUTPUT="$API_FAIL_OUTPUT" \
+  INPUT_ROOT="." \
+  INPUT_COMMAND="check" \
+  INPUT_FORMAT="json" \
+  INPUT_CHANGED_SINCE="0000000000000000000000000000000000000000" \
+  PR_NUMBER="123" \
+  GH_REPO="owner/repo" \
+  GH_TOKEN="test" \
+  FALLOW_API_RETRIES=1 \
+  FALLOW_API_RETRY_DELAY=0 \
+  bash "$SCRIPTS_DIR/analyze.sh" 2>&1 1>/dev/null) || true
+
+assert_contains "$(cat "$API_FAIL_OUTPUT")" "changed_files_unavailable=true" \
+  "analyze: emits changed_files_unavailable=true on gh api failure"
+assert_contains "$API_FAIL_STDERR" "GitHub API call to list PR files failed" \
+  "analyze: stderr names API failure mode (not shallow-clone)"
+assert_contains "$API_FAIL_STDERR" "gh auth status" \
+  "analyze: warning includes actionable hint (gh auth status)"
+
+# --- Test 2: analyze.sh emits changed_files_unavailable=false when gh api succeeds ---
+
+cat > "$API_FAIL_BIN/gh" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = "api" ]; then
+  case " $* " in
+    *" --paginate "*) ;;
+    *) echo "missing --paginate" >&2; exit 2 ;;
+  esac
+  printf '%s\n' \
+    '"src/a.ts"' \
+    '"src/line\nbreak.ts"' \
+    '"src/quote\"file.ts"' \
+    '"src/back\\slash.ts"'
+  exit 0
+fi
+exit 0
+SH
+chmod +x "$API_FAIL_BIN/gh"
+
+: > "$API_FAIL_OUTPUT"
+(cd "$API_FAIL_WORK" \
+  && PATH="$API_FAIL_BIN:$PATH" \
+  GITHUB_OUTPUT="$API_FAIL_OUTPUT" \
+  INPUT_ROOT="." \
+  INPUT_COMMAND="check" \
+  INPUT_FORMAT="json" \
+  INPUT_CHANGED_SINCE="0000000000000000000000000000000000000000" \
+  PR_NUMBER="123" \
+  GH_REPO="owner/repo" \
+  GH_TOKEN="test" \
+  FALLOW_API_RETRIES=1 \
+  FALLOW_API_RETRY_DELAY=0 \
+  bash "$SCRIPTS_DIR/analyze.sh" >/dev/null 2>&1) || true
+
+if grep -q '^changed_files_unavailable=false$' "$API_FAIL_OUTPUT" \
+    && ! grep -q '^changed_files_unavailable=true$' "$API_FAIL_OUTPUT"; then
+  pass "analyze: emits changed_files_unavailable=false on gh api success"
+else
+  fail "analyze: emits changed_files_unavailable=false on gh api success" \
+    "expected only =false, got: $(grep changed_files_unavailable "$API_FAIL_OUTPUT" || echo 'absent')"
+fi
+API_CHANGED_FILE="$API_FAIL_WORK/fallow-changed-files.json"
+if jq -e '
+  length == 4
+  and .[0] == "src/a.ts"
+  and .[1] == "src/line\nbreak.ts"
+  and .[2] == "src/quote\"file.ts"
+  and .[3] == "src/back\\slash.ts"
+' "$API_CHANGED_FILE" >/dev/null; then
+  pass "analyze: API fallback preserves JSON-escaped filenames"
+else
+  fail "analyze: API fallback preserves JSON-escaped filenames" \
+    "got: $(cat "$API_CHANGED_FILE" 2>/dev/null || echo absent)"
+fi
+
+# --- Test 2a: API fallback scopes repo-relative paths for an absolute root ---
+
+mkdir -p "$API_FAIL_WORK/packages/app"
+cat > "$API_FAIL_BIN/gh" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = "api" ]; then
+  printf '%s\n' \
+    '"packages/app/src/a.ts"' \
+    '"packages/other/src/ignored.ts"'
+  exit 0
+fi
+exit 0
+SH
+chmod +x "$API_FAIL_BIN/gh"
+
+: > "$API_FAIL_OUTPUT"
+(cd "$API_FAIL_WORK" \
+  && PATH="$API_FAIL_BIN:$PATH" \
+  GITHUB_WORKSPACE="$API_FAIL_WORK" \
+  GITHUB_OUTPUT="$API_FAIL_OUTPUT" \
+  INPUT_ROOT="$API_FAIL_WORK/packages/app" \
+  INPUT_COMMAND="check" \
+  INPUT_FORMAT="json" \
+  INPUT_CHANGED_SINCE="0000000000000000000000000000000000000000" \
+  PR_NUMBER="123" \
+  GH_REPO="owner/repo" \
+  GH_TOKEN="test" \
+  FALLOW_API_RETRIES=1 \
+  FALLOW_API_RETRY_DELAY=0 \
+  bash "$SCRIPTS_DIR/analyze.sh" >/dev/null 2>&1) || true
+
+if jq -e 'length == 1 and .[0] == "src/a.ts"' "$API_CHANGED_FILE" >/dev/null; then
+  pass "analyze: API fallback scopes changed files for an absolute root"
+else
+  fail "analyze: API fallback scopes changed files for an absolute root" \
+    "got: $(cat "$API_CHANGED_FILE" 2>/dev/null || echo absent)"
+fi
+
+# --- Test 2b: analyze.sh emits changed_files_unavailable=false even without INPUT_CHANGED_SINCE ---
+# The marker must be unconditional so downstream `if:` gates can match on it
+# as a positive signal (== 'false') without seeing an absent-vs-false ambiguity.
+
+: > "$API_FAIL_OUTPUT"
+(cd "$API_FAIL_WORK" \
+  && PATH="$API_FAIL_BIN:$PATH" \
+  GITHUB_OUTPUT="$API_FAIL_OUTPUT" \
+  INPUT_ROOT="." \
+  INPUT_COMMAND="check" \
+  INPUT_FORMAT="json" \
+  bash "$SCRIPTS_DIR/analyze.sh" >/dev/null 2>&1) || true
+
+if grep -q '^changed_files_unavailable=false$' "$API_FAIL_OUTPUT"; then
+  pass "analyze: emits changed_files_unavailable=false even without INPUT_CHANGED_SINCE"
+else
+  fail "analyze: emits changed_files_unavailable=false even without INPUT_CHANGED_SINCE" \
+    "expected =false (unconditional init), got: $(grep changed_files_unavailable "$API_FAIL_OUTPUT" || echo 'absent')"
+fi
+
+# --- Test 3-5: review.sh dedup-lookup failure paths ---
+# Shared mock harness: fallow renders the typed envelope; gh fails on the
+# pulls/.../comments paginate (multi-comment dedup endpoint) and on the
+# issues/.../comments paginate (summary-only dedup endpoint), but succeeds
+# on every other gh api call (POST to reviews / comments / reconcile).
+
+api_fail_review_run() {
+  local label=$1
+  local exit_status_var=$2
+  local output_var=$3
+  local stderr_var=$4
+  local mock_zero=$5     # "1" for summary-only path, empty for multi-comment
+  local fail_mode=$6     # "5xx" or "4xx"
+  local stderr_msg
+  case "$fail_mode" in
+    5xx) stderr_msg="HTTP 502: Bad Gateway (api.github.com)" ;;
+    4xx) stderr_msg="HTTP 403: Forbidden (api.github.com)" ;;
+    *)   stderr_msg="HTTP 502: Bad Gateway" ;;
+  esac
+  cat > "$API_FAIL_BIN/gh" <<SH
+#!/usr/bin/env bash
+printf 'gh %s\n' "\$*" >> "\$MOCK_LOG"
+if [ "\${1:-}" = "api" ]; then
+  if printf '%s\n' "\$*" | grep -q -- '--paginate' && printf '%s\n' "\$*" | grep -qE 'pulls/[0-9]+/comments|issues/[0-9]+/comments'; then
+    echo "gh: ${stderr_msg}" >&2
+    exit 1
+  fi
+  exit 0
+fi
+SH
+  chmod +x "$API_FAIL_BIN/gh"
+
+  cat > "$API_FAIL_BIN/fallow" <<'SH'
+#!/usr/bin/env bash
+printf 'fallow %s\n' "$*" >> "$MOCK_LOG"
+if [ "${1:-}" = "ci" ]; then
+  if [ "${2:-}" = "post-review" ]; then
+    printf '{"action":"post_review","comments_posted":1,"apply_errors":[],"post_errors":[]}\n'
+  else
+    printf '{"schema":"fallow-review-reconcile/v1","stale":[]}\n'
+  fi
+  exit 0
+fi
+format=""
+previous=""
+for arg in "$@"; do
+  if [ "$previous" = "--format" ]; then
+    format="$arg"; break
+  fi
+  previous="$arg"
+done
+if [ "$format" = "review-github" ]; then
+  if [ "${MOCK_ZERO_REVIEW:-}" = "1" ]; then
+    cat <<'JSON'
+{"event":"COMMENT","body":"### Fallow smoke\n\n<!-- fallow-review -->","comments":[],"meta":{"schema":"fallow-review-envelope/v1","provider":"github"}}
+JSON
+  else
+    cat <<'JSON'
+{"event":"COMMENT","body":"### Fallow smoke\n\n<!-- fallow-review -->","comments":[{"path":"src/a.ts","line":1,"side":"RIGHT","body":"**warn** `fallow/smoke`: smoke\n\n<!-- fallow-fingerprint: abc -->","fingerprint":"abc"}],"meta":{"schema":"fallow-review-envelope/v1","provider":"github"}}
+JSON
+  fi
+fi
+SH
+  chmod +x "$API_FAIL_BIN/fallow"
+
+  : > "$API_FAIL_OUTPUT"
+  : > "$API_FAIL_WORK/mock.log"
+  printf '{"kind":"dead-code","schema_version":9}\n' > "$API_FAIL_WORK/fallow-results.json"
+  local _stderr _status
+  _stderr=$(cd "$API_FAIL_WORK" \
+    && PATH="$API_FAIL_BIN:$PATH" \
+    MOCK_LOG="$API_FAIL_WORK/mock.log" \
+    MOCK_ZERO_REVIEW="$mock_zero" \
+    GH_TOKEN="test" \
+    PR_NUMBER="123" \
+    GH_REPO="owner/repo" \
+    GITHUB_OUTPUT="$API_FAIL_OUTPUT" \
+    FALLOW_COMMAND="check" \
+    FALLOW_ROOT="." \
+    MAX_COMMENTS="5" \
+    FALLOW_API_RETRIES=1 \
+    FALLOW_API_RETRY_DELAY=0 \
+    bash "$SCRIPTS_DIR/review.sh" 2>&1 1>/dev/null)
+  _status=$?
+  printf -v "$exit_status_var" '%s' "$_status"
+  printf -v "$output_var" '%s' "$(cat "$API_FAIL_OUTPUT")"
+  printf -v "$stderr_var" '%s' "$_stderr"
+}
+
+# Test 3: review.sh delegates provider posting and dedup to Rust.
+api_fail_review_run "multi-5xx" R3_STATUS R3_OUTPUT R3_STDERR "" "5xx"
+[ "$R3_STATUS" -eq 0 ] && pass "review.sh: Rust-delegated review post exits 0" \
+  || fail "review.sh: Rust-delegated review post exits 0" "got $R3_STATUS"
+assert_contains "$R3_OUTPUT" "post_skipped_reason=none" \
+  "review.sh: initializes post skip marker while Rust owns dedup policy"
+assert_contains "$R3_OUTPUT" "dedup_lookup_failed=false" \
+  "review.sh: initializes dedup lookup marker while Rust owns dedup policy"
+assert_contains "$(cat "$API_FAIL_WORK/mock.log")" "fallow ci post-review --provider github" \
+  "review.sh: delegates provider review posting to Rust"
+if cat "$API_FAIL_WORK/mock.log" 2>/dev/null | /usr/bin/grep -q "gh api"; then
+  fail "review.sh: does not call gh api for review posting" "$(cat "$API_FAIL_WORK/mock.log")"
+else
+  pass "review.sh: does not call gh api for review posting"
+fi
+
+# Test 4: retry-exhausted 429 behavior now lives in the Rust post-review
+# command; the shell wrapper should still delegate and stay non-fatal.
+cat > "$API_FAIL_BIN/gh" <<'SH'
+#!/usr/bin/env bash
+printf 'gh %s\n' "$*" >> "$MOCK_LOG"
+if [ "${1:-}" = "api" ]; then
+  if printf '%s\n' "$*" | grep -q -- '--paginate' && printf '%s\n' "$*" | grep -qE 'pulls/[0-9]+/comments'; then
+    echo "gh: HTTP 429: API rate limit exceeded (api.github.com)" >&2
+    exit 1
+  fi
+  exit 0
+fi
+SH
+chmod +x "$API_FAIL_BIN/gh"
+write_fallow_review_mock_inline() { :; }
+cat > "$API_FAIL_BIN/fallow" <<'SH'
+#!/usr/bin/env bash
+printf 'fallow %s\n' "$*" >> "$MOCK_LOG"
+if [ "${1:-}" = "ci" ]; then
+  if [ "${2:-}" = "post-review" ]; then
+    printf '{"action":"post_review","comments_posted":1,"apply_errors":[],"post_errors":[]}\n'
+  else
+    printf '{"schema":"fallow-review-reconcile/v1","stale":[]}\n'
+  fi
+  exit 0
+fi
+format=""; previous=""
+for arg in "$@"; do
+  if [ "$previous" = "--format" ]; then format="$arg"; break; fi
+  previous="$arg"
+done
+if [ "$format" = "review-github" ]; then
+  cat <<'JSON'
+{"event":"COMMENT","body":"### Fallow smoke\n\n<!-- fallow-review -->","comments":[{"path":"src/a.ts","line":1,"side":"RIGHT","body":"**warn** `fallow/smoke`: smoke\n\n<!-- fallow-fingerprint: abc -->","fingerprint":"abc"}],"meta":{"schema":"fallow-review-envelope/v1","provider":"github"}}
+JSON
+fi
+SH
+chmod +x "$API_FAIL_BIN/fallow"
+
+: > "$API_FAIL_OUTPUT"
+: > "$API_FAIL_WORK/mock.log"
+R5B_STDERR=$(cd "$API_FAIL_WORK" \
+  && PATH="$API_FAIL_BIN:$PATH" \
+  MOCK_LOG="$API_FAIL_WORK/mock.log" \
+  GH_TOKEN=test PR_NUMBER=123 GH_REPO=owner/repo \
+  GITHUB_OUTPUT="$API_FAIL_OUTPUT" \
+  FALLOW_COMMAND=check FALLOW_ROOT=. MAX_COMMENTS=5 \
+  FALLOW_API_RETRIES=1 FALLOW_API_RETRY_DELAY=0 \
+  bash "$SCRIPTS_DIR/review.sh" 2>&1 1>/dev/null)
+R5B_STATUS=$?
+[ "$R5B_STATUS" -eq 0 ] \
+  && pass "review.sh: retry-exhausted 429 remains non-fatal in shell wrapper" \
+  || fail "review.sh: retry-exhausted 429 remains non-fatal in shell wrapper" "got $R5B_STATUS"
+assert_contains "$(cat "$API_FAIL_WORK/mock.log")" "fallow ci post-review --provider github" \
+  "review.sh: 429 path still delegates review posting to Rust"
+
+# Test 6: comment.sh delegates sticky summary posting to the Rust adapter
+cat > "$API_FAIL_BIN/gh" <<'SH'
+#!/usr/bin/env bash
+printf 'gh %s\n' "$*" >> "$MOCK_LOG"
+if [ "${1:-}" = "pr" ] && [ "${2:-}" = "diff" ]; then
+  printf 'diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -0,0 +1 @@\n+export const a = 1;\n'
+  exit 0
+fi
+if [ "${1:-}" = "api" ]; then
+  echo "gh api should not be called by comment.sh summary posting" >&2
+  exit 1
+fi
+SH
+chmod +x "$API_FAIL_BIN/gh"
+
+cat > "$API_FAIL_BIN/fallow" <<'SH'
+#!/usr/bin/env bash
+printf 'fallow %s\n' "$*" >> "$MOCK_LOG"
+if [ "${1:-}" = "ci" ] && [ "${2:-}" = "post-pr-comment" ]; then
+  printf '{"action":"create","marker_id":"fallow-results","body":"smoke"}\n'
+  exit 0
+fi
+format=""; previous=""
+for arg in "$@"; do
+  if [ "$previous" = "--format" ]; then format="$arg"; break; fi
+  previous="$arg"
+done
+if [ "$format" = "pr-comment-github" ]; then
+  cat <<'BODY'
+<!-- fallow-id: fallow-results -->
+### Fallow smoke
+
+Generated by fallow.
+BODY
+fi
+SH
+chmod +x "$API_FAIL_BIN/fallow"
+
+: > "$API_FAIL_OUTPUT"
+: > "$API_FAIL_WORK/mock.log"
+C6_STDERR=$(cd "$API_FAIL_WORK" \
+  && PATH="$API_FAIL_BIN:$PATH" \
+  MOCK_LOG="$API_FAIL_WORK/mock.log" \
+  GH_TOKEN="test" \
+  PR_NUMBER="123" \
+  GH_REPO="owner/repo" \
+  GITHUB_OUTPUT="$API_FAIL_OUTPUT" \
+  FALLOW_COMMAND="check" \
+  FALLOW_API_RETRIES=1 \
+  FALLOW_API_RETRY_DELAY=0 \
+  bash "$SCRIPTS_DIR/comment.sh" 2>&1 1>/dev/null) || true
+
+assert_contains "$(cat "$API_FAIL_OUTPUT")" "dedup_lookup_failed=false" \
+  "comment.sh: initializes dedup lookup marker"
+assert_contains "$(cat "$API_FAIL_WORK/mock.log")" "fallow ci post-pr-comment --provider github" \
+  "comment.sh: delegates summary posting to Rust"
+if /usr/bin/grep -q "gh api" "$API_FAIL_WORK/mock.log"; then
+  fail "comment.sh: does not call gh api for summary posting" \
+    "$(cat "$API_FAIL_WORK/mock.log")"
+else
+  pass "comment.sh: does not call gh api for summary posting"
+fi
+
+rm -rf "$API_FAIL_WORK"
+
 # --- Pre-computed changed files (shallow clone fallback) tests ---
 
 echo ""
@@ -493,7 +2713,7 @@ OUT=$(cd "$WORK_DIR" && \
     fi
     jq -r ".total_issues" "$RESULTS_FILE"
   ' 2>&1)
-[ "$OUT" = "6" ] && pass "filters to 6 issues (pre-computed)" || fail "pre-computed filter" "expected 6, got $OUT"
+[ "$OUT" = "7" ] && pass "filters to 7 issues (pre-computed)" || fail "pre-computed filter" "expected 7, got $OUT"
 
 echo "  fallback to unfiltered when no pre-computed file:"
 rm -f "$WORK_DIR/fallow-changed-files.json"
@@ -573,113 +2793,327 @@ OUT=$(cd "$WORK_DIR" && \
   ' 2>&1)
 [ "$OUT" = "$EXPECTED_TOTAL" ] && pass "no CHANGED_SINCE skips filtering" || fail "no CHANGED_SINCE guard" "expected $EXPECTED_TOTAL, got $OUT"
 
+echo "  summary.sh and annotate.sh with custom artifact paths:"
+CUSTOM_ARTIFACTS="$WORK_DIR/.var/fallow"
+mkdir -p "$CUSTOM_ARTIFACTS"
+cp "$FIXTURES/check.json" "$CUSTOM_ARTIFACTS/fallow-results.json"
+echo '["src/helpers/api.ts"]' > "$CUSTOM_ARTIFACTS/fallow-changed-files.json"
+SUMMARY_FILE="$WORK_DIR/summary.md"
+OUT=$(cd "$WORK_DIR" && \
+  GITHUB_STEP_SUMMARY="$SUMMARY_FILE" \
+  FALLOW_COMMAND="dead-code" \
+  ACTION_JQ_DIR="$JQ_DIR" \
+  CHANGED_SINCE="abc123" \
+  FALLOW_RESULTS_FILE=".var/fallow/fallow-results.json" \
+  FALLOW_SCOPED_RESULTS_FILE=".var/fallow/fallow-results-scoped.json" \
+  FALLOW_CHANGED_FILES_FILE=".var/fallow/fallow-changed-files.json" \
+  bash "$SCRIPTS_DIR/summary.sh" 2>&1)
+cmd_status=$?
+if [ "$cmd_status" -eq 0 ] && [ -f "$CUSTOM_ARTIFACTS/fallow-results-scoped.json" ]; then
+  pass "summary.sh: custom artifacts path writes scoped results beside source"
+else
+  fail "summary.sh: custom artifacts path writes scoped results beside source" "exit $cmd_status, output: $OUT"
+fi
+assert_contains "$(cat "$SUMMARY_FILE")" "Issue counts scoped" "summary.sh: custom artifacts path still appends scoping note"
+
+TYPED_SUMMARY_FILE="$WORK_DIR/typed-summary.md"
+printf '{"body":"# Fallow typed summary\\n\\nGenerated by fallow."}\n' > "$CUSTOM_ARTIFACTS/fallow-pr-comment-envelope.json"
+OUT=$(cd "$WORK_DIR" && \
+  GITHUB_STEP_SUMMARY="$TYPED_SUMMARY_FILE" \
+  FALLOW_COMMAND="dead-code" \
+  ACTION_JQ_DIR="$JQ_DIR" \
+  FALLOW_RESULTS_FILE="missing-results.json" \
+  FALLOW_PR_COMMENT_ENVELOPE_FILE=".var/fallow/fallow-pr-comment-envelope.json" \
+  bash "$SCRIPTS_DIR/summary.sh" 2>&1)
+cmd_status=$?
+if [ "$cmd_status" -eq 0 ]; then
+  pass "summary.sh: typed envelope path succeeds without jq results"
+else
+  fail "summary.sh: typed envelope path succeeds without jq results" "exit $cmd_status, output: $OUT"
+fi
+assert_contains "$(cat "$TYPED_SUMMARY_FILE")" "# Fallow typed summary" "summary.sh: typed envelope body wins"
+
+printf '{"annotations":[{"path":"src/a.ts","line":0,"level":"failure","title":"fallow/high-crap-score","message":"Needs work","raw_details":null},{"path":"src/b.ts","line":12,"level":"notice","title":"fallow/info","message":"FYI","raw_details":null}]}\n' > "$CUSTOM_ARTIFACTS/fallow-pr-decision.json"
+OUT=$(cd "$WORK_DIR" && \
+  FALLOW_COMMAND="dead-code" \
+  MAX_ANNOTATIONS="1" \
+  ACTION_JQ_DIR="$JQ_DIR" \
+  FALLOW_RESULTS_FILE="missing-results.json" \
+  FALLOW_PR_DECISION_FILE=".var/fallow/fallow-pr-decision.json" \
+  bash "$SCRIPTS_DIR/annotate.sh" 2>&1)
+cmd_status=$?
+if [ "$cmd_status" -eq 0 ]; then
+  pass "annotate.sh: typed decision path succeeds without jq results"
+else
+  fail "annotate.sh: typed decision path succeeds without jq results" "exit $cmd_status, output: $OUT"
+fi
+assert_contains "$OUT" "::error file=src/a.ts,line=1,title=fallow/high-crap-score::Needs work" "annotate.sh: typed decision emits workflow command"
+assert_contains "$OUT" "Showing 1 of 2 annotations" "annotate.sh: typed decision honors max annotations"
+
+OUT=$(cd "$WORK_DIR" && \
+  FALLOW_COMMAND="dead-code" \
+  MAX_ANNOTATIONS="3" \
+  ACTION_JQ_DIR="$JQ_DIR" \
+  CHANGED_SINCE="abc123" \
+  FALLOW_RESULTS_FILE=".var/fallow/fallow-results.json" \
+  FALLOW_SCOPED_RESULTS_FILE=".var/fallow/fallow-results-scoped.json" \
+  FALLOW_CHANGED_FILES_FILE=".var/fallow/fallow-changed-files.json" \
+  bash "$SCRIPTS_DIR/annotate.sh" 2>&1)
+cmd_status=$?
+if [ "$cmd_status" -eq 0 ]; then
+  pass "annotate.sh: custom artifacts path succeeds"
+else
+  fail "annotate.sh: custom artifacts path succeeds" "exit $cmd_status, output: $OUT"
+fi
+assert_contains "$OUT" "::" "annotate.sh: custom artifacts path emits annotations"
+
 rm -rf "$WORK_DIR"
 
-# --- Diff-hunk filter tests ---
+# --- Native report fastpath (annotate.sh / summary.sh) ---
+# Exercise the native github-annotations / github-summary fastpath. These need a
+# report-capable fallow binary (on PATH or at $FALLOW_BIN); without one the whole
+# section skips, and older binaries keep the jq path covered by the tests above.
 
 echo ""
-echo "=== Diff-hunk filter (filter-diff-hunks.jq) ==="
+echo "=== Native report fastpath ==="
 
-# Mock PR files API response with patch hunks
-PR_FILES='[
-  {"filename": "src/foo.ts", "patch": "@@ -10,3 +10,5 @@ function foo() {\n+  added line\n+  another added line\n context\n"},
-  {"filename": "src/bar.ts", "patch": "@@ -1,2 +1,3 @@ header\n+new\n@@ -20,3 +21,4 @@ other\n+more\n"},
-  {"filename": "src/binary.png", "patch": null},
-  {"filename": "src/big-file.ts"}
-]'
+FASTPATH_SCRIPTS="$DIR/../scripts"
+FASTPATH_ENVELOPE="$FIXTURES/dead-code-envelope.json"
 
-# Comments: some inside hunks, some outside
-COMMENTS='[
-  {"type": "other", "path": "src/foo.ts", "line": 12, "body": "inside hunk"},
-  {"type": "other", "path": "src/foo.ts", "line": 50, "body": "outside hunk"},
-  {"type": "other", "path": "src/bar.ts", "line": 2, "body": "inside first hunk"},
-  {"type": "other", "path": "src/bar.ts", "line": 22, "body": "inside second hunk"},
-  {"type": "other", "path": "src/bar.ts", "line": 100, "body": "outside all hunks"},
-  {"type": "other", "path": "src/binary.png", "line": 5, "body": "null patch file"},
-  {"type": "other", "path": "src/big-file.ts", "line": 3, "body": "missing patch field"},
-  {"type": "other", "path": "src/unknown.ts", "line": 1, "body": "file not in PR"}
-]'
+# Resolve a report-capable binary the same way issuekind-drift-guard.sh does:
+# explicit $FALLOW_BIN, else a locally built target/{release,debug}/fallow, else
+# a PATH lookup. Absolute so the check survives the cwd changes above.
+FASTPATH_REPO_ROOT="$(cd "$DIR/../.." && pwd)"
+FASTPATH_BIN="${FALLOW_BIN:-}"
+if [ -z "$FASTPATH_BIN" ]; then
+  for FASTPATH_CAND in "$FASTPATH_REPO_ROOT/target/release/fallow" "$FASTPATH_REPO_ROOT/target/debug/fallow"; do
+    if [ -x "$FASTPATH_CAND" ]; then FASTPATH_BIN="$FASTPATH_CAND"; break; fi
+  done
+fi
+[ -n "$FASTPATH_BIN" ] || FASTPATH_BIN="fallow"
 
-echo "  filter-diff-hunks.jq:"
-OUT=$(echo "$COMMENTS" | jq --argjson pr_files "$PR_FILES" -f "$JQ_DIR/filter-diff-hunks.jq" 2>&1)
-assert_valid_json "$OUT" "produces valid JSON"
+if ! command -v "$FASTPATH_BIN" > /dev/null 2>&1 || ! "$FASTPATH_BIN" report --help > /dev/null 2>&1; then
+  echo "  (skipped: no fallow binary with 'report' support on PATH or at \$FALLOW_BIN)"
+else
+  FASTPATH_WORK=$(mktemp -d)
 
-echo "  keeps comments inside hunks:"
-assert_json_value "$OUT" '[.[] | select(.body == "inside hunk")] | length' "1" "foo.ts line 12 inside hunk kept"
-assert_json_value "$OUT" '[.[] | select(.body == "inside first hunk")] | length' "1" "bar.ts line 2 inside first hunk kept"
-assert_json_value "$OUT" '[.[] | select(.body == "inside second hunk")] | length' "1" "bar.ts line 22 inside second hunk kept"
+  # (a) byte-equality: the action layers only the cap on the native stream.
+  FASTPATH_EXPECTED=$("$FASTPATH_BIN" report --from "$FASTPATH_ENVELOPE" --format github-annotations | head -n 999)
+  FASTPATH_ACTUAL=$(
+    HAS_NATIVE_REPORT=true \
+      FALLOW_BIN="$FASTPATH_BIN" \
+      FALLOW_COMMAND="dead-code" \
+      MAX_ANNOTATIONS="999" \
+      ACTION_JQ_DIR="$JQ_DIR" \
+      FALLOW_RESULTS_FILE="$FASTPATH_ENVELOPE" \
+      bash "$FASTPATH_SCRIPTS/annotate.sh" 2>/dev/null
+  )
+  if [ "$FASTPATH_ACTUAL" = "$FASTPATH_EXPECTED" ]; then
+    pass "annotate.sh native fastpath is byte-identical to report --from | head"
+  else
+    fail "annotate.sh native fastpath is byte-identical to report --from | head" "diverged from the native render"
+  fi
 
-echo "  removes comments outside hunks:"
-assert_json_value "$OUT" '[.[] | select(.body == "outside hunk")] | length' "0" "foo.ts line 50 outside hunk removed"
-assert_json_value "$OUT" '[.[] | select(.body == "outside all hunks")] | length' "0" "bar.ts line 100 outside all hunks removed"
+  # (b) truncation notice fires with a small cap.
+  FASTPATH_TRUNC=$(
+    HAS_NATIVE_REPORT=true \
+      FALLOW_BIN="$FASTPATH_BIN" \
+      FALLOW_COMMAND="dead-code" \
+      MAX_ANNOTATIONS="2" \
+      ACTION_JQ_DIR="$JQ_DIR" \
+      FALLOW_RESULTS_FILE="$FASTPATH_ENVELOPE" \
+      bash "$FASTPATH_SCRIPTS/annotate.sh" 2>/dev/null
+  )
+  assert_contains "$FASTPATH_TRUNC" "Showing 2 of " "annotate.sh native fastpath honors max-annotations"
 
-echo "  fail-open for null/missing patch:"
-assert_json_value "$OUT" '[.[] | select(.body == "null patch file")] | length' "1" "null patch: comment kept (fail-open)"
-assert_json_value "$OUT" '[.[] | select(.body == "missing patch field")] | length' "1" "missing patch: comment kept (fail-open)"
+  # (c) summary fastpath writes the native heading.
+  FASTPATH_SUMMARY="$FASTPATH_WORK/summary.md"
+  HAS_NATIVE_REPORT=true \
+    FALLOW_BIN="$FASTPATH_BIN" \
+    FALLOW_COMMAND="dead-code" \
+    ACTION_JQ_DIR="$JQ_DIR" \
+    GITHUB_STEP_SUMMARY="$FASTPATH_SUMMARY" \
+    FALLOW_RESULTS_FILE="$FASTPATH_ENVELOPE" \
+    bash "$FASTPATH_SCRIPTS/summary.sh" > /dev/null 2>&1
+  assert_contains "$(cat "$FASTPATH_SUMMARY")" "# Fallow Analysis" "summary.sh native fastpath writes the native heading"
 
-echo "  fail-open for files not in PR:"
-assert_json_value "$OUT" '[.[] | select(.body == "file not in PR")] | length' "1" "unknown file: comment kept (fail-open)"
+  # (d) fix has no report kind: the fastpath is bypassed for the jq summary.
+  FASTPATH_FIX_SUMMARY="$FASTPATH_WORK/fix-summary.md"
+  FASTPATH_FIX_LOG=$(
+    HAS_NATIVE_REPORT=true \
+      FALLOW_BIN="$FASTPATH_BIN" \
+      FALLOW_COMMAND="fix" \
+      ACTION_JQ_DIR="$JQ_DIR" \
+      GITHUB_STEP_SUMMARY="$FASTPATH_FIX_SUMMARY" \
+      FALLOW_RESULTS_FILE="$FIXTURES/fix.json" \
+      bash "$FASTPATH_SCRIPTS/summary.sh" 2>&1
+  )
+  assert_contains "$FASTPATH_FIX_LOG" "summary rendered via jq fallback" "summary.sh routes fix to jq even with native support"
+  assert_not_contains "$FASTPATH_FIX_LOG" "rendered via native" "summary.sh never renders fix natively"
 
-echo "  total filtered count:"
-assert_json_length "$OUT" "6" "keeps 6 of 8 comments (2 outside hunks removed)"
+  # (e) probe-false pins the exact jq behavior for older binaries.
+  FASTPATH_PROBE_FALSE=$(
+    HAS_NATIVE_REPORT=false \
+      FALLOW_COMMAND="dead-code" \
+      MAX_ANNOTATIONS="50" \
+      ACTION_JQ_DIR="$JQ_DIR" \
+      FALLOW_RESULTS_FILE="$FIXTURES/check.json" \
+      bash "$FASTPATH_SCRIPTS/annotate.sh" 2>/dev/null
+  )
+  FASTPATH_JQ_ONLY=$(jq -r -f "$JQ_DIR/annotations-check.jq" "$FIXTURES/check.json" 2>/dev/null | head -n 50)
+  if [ "$FASTPATH_PROBE_FALSE" = "$FASTPATH_JQ_ONLY" ]; then
+    pass "annotate.sh probe-false keeps the exact jq annotation output"
+  else
+    fail "annotate.sh probe-false keeps the exact jq annotation output" "diverged from the jq render"
+  fi
 
-echo "  single-line hunk (no count in @@):"
-SINGLE_LINE_PR='[{"filename": "src/x.ts", "patch": "@@ -5 +5 @@ ctx\n-old\n+new"}]'
-SINGLE_LINE_COMMENTS='[
-  {"type": "other", "path": "src/x.ts", "line": 5, "body": "on single-line hunk"},
-  {"type": "other", "path": "src/x.ts", "line": 6, "body": "outside single-line hunk"}
-]'
-OUT=$(echo "$SINGLE_LINE_COMMENTS" | jq --argjson pr_files "$SINGLE_LINE_PR" -f "$JQ_DIR/filter-diff-hunks.jq" 2>&1)
-assert_json_length "$OUT" "1" "single-line hunk: keeps line 5, removes line 6"
-assert_json_value "$OUT" '.[0].line' "5" "single-line hunk: kept line is 5"
+  FASTPATH_ESCAPE_ENVELOPE="$FASTPATH_WORK/escape.json"
+  jq '.unused_files[0].path = "src/a%,b:c\r\nd.ts"' "$FIXTURES/check.json" > "$FASTPATH_ESCAPE_ENVELOPE"
+  FASTPATH_ESCAPED=$(
+    HAS_NATIVE_REPORT=false \
+      FALLOW_COMMAND="dead-code" \
+      MAX_ANNOTATIONS="50" \
+      ACTION_JQ_DIR="$JQ_DIR" \
+      FALLOW_RESULTS_FILE="$FASTPATH_ESCAPE_ENVELOPE" \
+      bash "$FASTPATH_SCRIPTS/annotate.sh" 2>/dev/null
+  )
+  assert_contains "$FASTPATH_ESCAPED" "file=src/a%25%2Cb%3Ac%0D%0Ad.ts" "annotate.sh jq fallback escapes workflow-command properties"
 
-echo "  empty comments array:"
-OUT=$(echo '[]' | jq --argjson pr_files "$PR_FILES" -f "$JQ_DIR/filter-diff-hunks.jq" 2>&1)
-assert_json_length "$OUT" "0" "empty input produces empty output"
+  rm -rf "$FASTPATH_WORK"
+fi
 
-echo "  empty PR files array:"
-OUT=$(echo "$COMMENTS" | jq --argjson pr_files '[]' -f "$JQ_DIR/filter-diff-hunks.jq" 2>&1)
-assert_json_length "$OUT" "8" "empty PR files: all comments kept (fail-open)"
-
-echo "  deleted file (count=0 hunk):"
-DELETED_PR='[{"filename": "src/gone.ts", "patch": "@@ -1,5 +0,0 @@ removed\n-line1\n-line2"}]'
-DELETED_COMMENTS='[{"type": "other", "path": "src/gone.ts", "line": 1, "body": "in deleted file"}]'
-OUT=$(echo "$DELETED_COMMENTS" | jq --argjson pr_files "$DELETED_PR" -f "$JQ_DIR/filter-diff-hunks.jq" 2>&1)
-assert_json_length "$OUT" "0" "deleted file (count=0): no new-side lines, comment removed"
-
-echo "  --slurpfile format (outer array wrapper):"
-SLURP_TMP=$(mktemp)
-echo "$PR_FILES" > "$SLURP_TMP"
-OUT=$(echo "$COMMENTS" | jq --slurpfile pr_files "$SLURP_TMP" -f "$JQ_DIR/filter-diff-hunks.jq" 2>&1)
-rm -f "$SLURP_TMP"
-assert_valid_json "$OUT" "slurpfile produces valid JSON"
-assert_json_length "$OUT" "6" "slurpfile: same result as argjson (6 of 8 kept)"
-
-# --- Review body with filtered counts ---
+# --- Code Scanning availability gate (check-code-scanning.sh) ---
 
 echo ""
-echo "=== Review body with diff-hunk counts ==="
+echo "=== Code Scanning gate ==="
 
-echo "  review-body.jq with filtered findings:"
-OUT=$(INLINE_COUNT=5 FILTERED_COUNT=3 jq -r -f "$JQ_DIR/review-body.jq" "$FIXTURES/combined.json" 2>&1)
-assert_contains "$OUT" "inline comments" "shows inline count"
-assert_contains "$OUT" "findings in files not changed in this PR" "shows filtered count"
-assert_not_contains "$OUT" "See inline comments for details" "no generic message when filtered"
+CSCRIPT="$DIR/../scripts/check-code-scanning.sh"
+GATE_DIR=$(mktemp -d)
+GATE_BIN="$GATE_DIR/bin"
+mkdir -p "$GATE_BIN"
 
-echo "  review-body.jq with no filtered findings:"
-OUT=$(INLINE_COUNT=5 FILTERED_COUNT=0 jq -r -f "$JQ_DIR/review-body.jq" "$FIXTURES/combined.json" 2>&1)
-assert_contains "$OUT" "inline comments on your changes" "shows inline count when no filtered"
-assert_not_contains "$OUT" "additional findings" "no filtered mention when count is 0"
+# Parameterized gh mock. MOCK_VISIBILITY sets the repos/{repo} --jq .visibility
+# response; empty simulates a failed metadata read (gh exits non-zero).
+# MOCK_ALERTS_EXIT sets the code-scanning/alerts probe exit code (0 = available).
+cat > "$GATE_BIN/gh" <<'SH'
+#!/usr/bin/env bash
+case "$*" in
+  *"code-scanning/alerts"*)
+    exit "${MOCK_ALERTS_EXIT:-1}"
+    ;;
+  *"--jq"*".visibility"*)
+    if [ -n "${MOCK_VISIBILITY:-}" ]; then
+      printf '%s\n' "$MOCK_VISIBILITY"
+      exit 0
+    fi
+    exit 1
+    ;;
+esac
+exit 1
+SH
+chmod +x "$GATE_BIN/gh"
 
-echo "  review-body.jq with all findings filtered (body-only):"
-OUT=$(INLINE_COUNT=0 FILTERED_COUNT=8 jq -r -f "$JQ_DIR/review-body.jq" "$FIXTURES/combined.json" 2>&1)
-assert_not_contains "$OUT" "See inline comments" "no inline mention when all filtered"
-assert_contains "$OUT" "none are on lines changed" "body-only explains why no inline comments"
-assert_contains "$OUT" "fallow-review" "still has marker"
+GATE_OUT=""
+GATE_LOG=""
+run_gate() {
+  # $1 = visibility value (empty simulates read failure), $2 = alerts probe exit code
+  local out_file
+  out_file=$(mktemp)
+  GATE_LOG=$(PATH="$GATE_BIN:$PATH" GH_REPO="acme/web" GITHUB_OUTPUT="$out_file" \
+    MOCK_VISIBILITY="$1" MOCK_ALERTS_EXIT="$2" \
+    bash "$CSCRIPT" 2>&1)
+  GATE_OUT=$(cat "$out_file")
+  rm -f "$out_file"
+}
 
-echo "  review-body.jq without env vars (backwards compat):"
-OUT=$(jq -r -f "$JQ_DIR/review-body.jq" "$FIXTURES/combined.json" 2>&1)
-assert_contains "$OUT" "fallow-review" "marker present without env vars"
+# Case 1: public repo is available even when the alerts probe would fail
+# (the first upload initializes Code Scanning; this is the issue #817 fix).
+run_gate "public" 1
+assert_contains "$GATE_OUT" "available=true" "gate: public repo is available"
+assert_not_contains "$GATE_LOG" "::warning::" "gate: public repo emits no skip warning"
+
+# Case 2: private repo with GHAS (alerts probe succeeds) is available.
+run_gate "private" 0
+assert_contains "$GATE_OUT" "available=true" "gate: private repo with GHAS is available"
+assert_not_contains "$GATE_LOG" "::warning::" "gate: private repo with GHAS emits no warning"
+
+# Case 3: private repo without GHAS (alerts probe fails) skips with a warning.
+run_gate "private" 1
+assert_contains "$GATE_OUT" "available=false" "gate: private repo without GHAS is unavailable"
+assert_contains "$GATE_LOG" "::warning::" "gate: private repo without GHAS warns"
+assert_contains "$GATE_LOG" "private or internal repository" "gate: warning names private or internal repos"
+
+# Case 4: internal (enterprise) repo with GHAS is available via the probe.
+# This is the row the rejected `.private == false` approach would have broken.
+run_gate "internal" 0
+assert_contains "$GATE_OUT" "available=true" "gate: internal repo with GHAS is available"
+assert_not_contains "$GATE_LOG" "::warning::" "gate: internal repo with GHAS emits no warning"
+
+# Case 5: internal repo without GHAS skips with a warning; no fallback debug note
+# (visibility was read successfully, so this is the intended probe, not a fallback).
+run_gate "internal" 1
+assert_contains "$GATE_OUT" "available=false" "gate: internal repo without GHAS is unavailable"
+assert_contains "$GATE_LOG" "::warning::" "gate: internal repo without GHAS warns"
+assert_contains "$GATE_LOG" "private or internal repository" "gate: internal warning names private or internal repos"
+assert_not_contains "$GATE_LOG" "::debug::" "gate: internal repo emits no fallback debug note"
+
+# Case 6: visibility read fails (empty) but the probe succeeds -> available via fallback.
+run_gate "" 0
+assert_contains "$GATE_OUT" "available=true" "gate: unreadable visibility falls back to probe (available)"
+assert_contains "$GATE_LOG" "::debug::" "gate: unreadable visibility emits a fallback debug note"
+assert_not_contains "$GATE_LOG" "::warning::" "gate: unreadable visibility with probe success emits no warning"
+
+# Case 7: visibility read fails (empty) and the probe fails -> skip with warning + debug note.
+run_gate "" 1
+assert_contains "$GATE_OUT" "available=false" "gate: unreadable visibility with probe failure is unavailable"
+assert_contains "$GATE_LOG" "::warning::" "gate: unreadable visibility with probe failure warns"
+assert_contains "$GATE_LOG" "::debug::" "gate: unreadable visibility with probe failure emits a fallback debug note"
+
+rm -rf "$GATE_DIR"
+
+# --- IssueKind summary drift guard ---
+#
+# A new fallow dead-code IssueKind must be wired into every GitHub jq surface
+# that is supposed to carry the full dead-code set, or it vanishes silently
+# from PR output. This guard derives the canonical dead-code id set (from
+# `fallow schema`, falling back to issue_meta.rs) and asserts each one's JSON
+# key is referenced by every gated surface.
+#
+# Surface expectations (every GitHub surface is now gated "all"):
+#   summary-check.jq      "all"    dead-code summary table
+#   summary-combined.jq   "all"    combined-mode Code-issues breakdown
+#   summary-audit.jq      "all"    audit dead_code_rows
+#   annotations-check.jq  "all"    ::warning annotations
+#   filter-changed.jq     "all"    per-changed-file filter + total_issues recount
+#
+# History: annotations-check.jq and filter-changed.jq once omitted
+# `test-only-dependency` (no ::warning was emitted, and the key was absent from
+# the total_issues recount so a --changed-since count undercounted it) while its
+# sibling type-only-dependency was carried on both. That omission is now closed
+# (the annotation and the recount entry were added), so both surfaces gate "all"
+# with no allow-list. The `allow:<ids>` machinery in the guard remains available
+# for any future surface that legitimately carries only a documented subset.
+
+echo ""
+echo "=== IssueKind summary drift guard ==="
+
+GUARD_DIR="$DIR"
+# shellcheck source=action/tests/issuekind-drift-guard.sh
+. "$DIR/issuekind-drift-guard.sh"
+assert_issuekind_summary_coverage "github summary-check"    "$JQ_DIR/summary-check.jq"
+assert_issuekind_summary_table_contract "github summary-check" "$JQ_DIR/summary-check.jq"
+assert_issuekind_summary_coverage "github summary-combined" "$JQ_DIR/summary-combined.jq"
+assert_issuekind_summary_coverage "github summary-audit"    "$JQ_DIR/summary-audit.jq"
+assert_issuekind_summary_coverage "github annotations-check" "$JQ_DIR/annotations-check.jq"
+assert_issuekind_summary_coverage "github filter-changed"   "$JQ_DIR/filter-changed.jq"
+
+# VS Code DIAGNOSTIC_CATEGORIES is the LSP diagnostic-code catalog the extension
+# uses to filter, count, and render editor findings. It is provider-agnostic
+# (not GitHub- or GitLab-specific), so it is checked once here. A new LSP-visible
+# dead-code kind missing from it leaves the kind uncounted and unfilterable in
+# the editor sidebar even though the server emits a squiggle for it.
+assert_issuekind_vscode_category_coverage "vscode DIAGNOSTIC_CATEGORIES" \
+  "$DIR/../../editors/vscode/src/generated/issue-types.ts"
 
 # --- Summary ---
 

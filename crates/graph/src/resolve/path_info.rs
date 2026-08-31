@@ -8,22 +8,15 @@
 /// `Unresolvable` (not `NpmPackage`) when resolution fails.
 #[must_use]
 pub fn is_path_alias(specifier: &str) -> bool {
-    // `#` prefix is Node.js imports maps (package.json "imports" field)
     if specifier.starts_with('#') {
         return true;
     }
-    // `~/`, `~~/`, and `@@/` prefixes are common alias conventions
-    // (e.g., Nuxt, custom tsconfig)
     if specifier.starts_with("~/") || specifier.starts_with("~~/") || specifier.starts_with("@@/") {
         return true;
     }
-    // `@/` is a very common path alias (e.g., `@/components/Foo`)
     if specifier.starts_with("@/") {
         return true;
     }
-    // npm scoped packages MUST be lowercase (npm registry requirement).
-    // PascalCase `@Scope` or `@Scope/path` patterns are tsconfig path aliases,
-    // not npm packages. E.g., `@Components`, `@Hooks/useApi`, `@Services/auth`.
     if specifier.starts_with('@') {
         let scope = specifier.split('/').next().unwrap_or(specifier);
         if scope.len() > 1 && scope.chars().nth(1).is_some_and(|c| c.is_ascii_uppercase()) {
@@ -55,23 +48,18 @@ pub fn is_valid_package_name(name: &str) -> bool {
         return false;
     }
     let first = name.as_bytes()[0];
-    // Reject shell variables, shebangs, and similar non-package prefixes
     if first == b'$' || first == b'!' || first == b'#' {
         return false;
     }
-    // Reject bundler-internal specifiers (webpack loaders, turbopack barrel optimization)
     if name.contains('?') || name.contains('!') || name.starts_with("__") {
         return false;
     }
-    // Pure numeric strings (like "1", "123") are not package names
     if name.bytes().all(|b| b.is_ascii_digit()) {
         return false;
     }
-    // Must contain at least one letter or @ sign to be a plausible package name
     if !name.bytes().any(|b| b.is_ascii_alphabetic() || b == b'@') {
         return false;
     }
-    // Reject strings with spaces or backslashes (not valid in npm names)
     !name.contains(' ') && !name.contains('\\')
 }
 
@@ -92,6 +80,39 @@ pub fn extract_package_name(specifier: &str) -> String {
     }
 }
 
+/// Normalize the body of a Deno `npm:` specifier into a plain npm package
+/// reference by dropping the `@<version>` selector while preserving the package
+/// name (including scope) and any subpath.
+///
+/// `rest` is the substring after the `npm:` scheme. Deno `npm:` specifiers are
+/// `<package>[@<version>][/<subpath>]`, so the version selector is the first
+/// `@` that follows the package name (after the scope's own `@scope/` for
+/// scoped packages). Examples:
+/// `@supabase/supabase-js@2` -> `@supabase/supabase-js`,
+/// `preact@10/hooks` -> `preact/hooks`, `express@^4.18.0` -> `express`,
+/// `foo` -> `foo`.
+#[must_use]
+pub fn normalize_npm_specifier(rest: &str) -> String {
+    let search_from = if rest.starts_with('@') {
+        match rest.find('/') {
+            Some(slash) => slash + 1,
+            None => return rest.to_string(),
+        }
+    } else {
+        0
+    };
+
+    let Some(at_rel) = rest[search_from..].find('@') else {
+        return rest.to_string();
+    };
+    let at = search_from + at_rel;
+    let end = rest[at..].find('/').map_or(rest.len(), |slash| at + slash);
+    let mut out = String::with_capacity(rest.len() - (end - at));
+    out.push_str(&rest[..at]);
+    out.push_str(&rest[end..]);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -102,6 +123,45 @@ mod tests {
         assert_eq!(extract_package_name("lodash/merge"), "lodash");
         assert_eq!(extract_package_name("@scope/pkg"), "@scope/pkg");
         assert_eq!(extract_package_name("@scope/pkg/foo"), "@scope/pkg");
+    }
+
+    #[test]
+    fn normalize_npm_specifier_scoped_with_version() {
+        assert_eq!(
+            normalize_npm_specifier("@supabase/supabase-js@2"),
+            "@supabase/supabase-js"
+        );
+    }
+
+    #[test]
+    fn normalize_npm_specifier_unscoped_with_version() {
+        assert_eq!(normalize_npm_specifier("express@^4.18.0"), "express");
+    }
+
+    #[test]
+    fn normalize_npm_specifier_version_then_subpath() {
+        assert_eq!(normalize_npm_specifier("preact@10/hooks"), "preact/hooks");
+        assert_eq!(
+            normalize_npm_specifier("@scope/name@1.2.3/sub"),
+            "@scope/name/sub"
+        );
+    }
+
+    #[test]
+    fn normalize_npm_specifier_no_version() {
+        assert_eq!(normalize_npm_specifier("foo"), "foo");
+        assert_eq!(normalize_npm_specifier("lodash/merge"), "lodash/merge");
+        assert_eq!(normalize_npm_specifier("@scope/pkg/sub"), "@scope/pkg/sub");
+    }
+
+    #[test]
+    fn normalize_npm_specifier_scope_only() {
+        assert_eq!(normalize_npm_specifier("@scope"), "@scope");
+    }
+
+    #[test]
+    fn normalize_npm_specifier_empty() {
+        assert_eq!(normalize_npm_specifier(""), "");
     }
 
     #[test]
@@ -120,8 +180,6 @@ mod tests {
         assert!(!is_bare_specifier("http://example.com/module"));
         assert!(!is_bare_specifier("data:text/javascript,export default 42"));
     }
-
-    // ── is_path_alias ───────────────────────────────────────────────
 
     #[test]
     fn path_alias_hash_prefix() {
@@ -144,7 +202,6 @@ mod tests {
 
     #[test]
     fn path_alias_pascal_case_scope() {
-        // PascalCase scoped packages are tsconfig aliases, not npm packages
         assert!(is_path_alias("@Components/Button"));
         assert!(is_path_alias("@Hooks/useApi"));
         assert!(is_path_alias("@Services/auth"));
@@ -152,7 +209,6 @@ mod tests {
 
     #[test]
     fn path_alias_lowercase_scope_is_not_alias() {
-        // Lowercase scoped packages are regular npm packages
         assert!(!is_path_alias("@babel/core"));
         assert!(!is_path_alias("@types/react"));
         assert!(!is_path_alias("@scope/pkg"));
@@ -167,11 +223,8 @@ mod tests {
 
     #[test]
     fn path_alias_tilde_without_slash_is_not_alias() {
-        // `~something` without a slash is not a path alias convention
         assert!(!is_path_alias("~something"));
     }
-
-    // ── is_valid_package_name ────────────────────────────────────────
 
     #[test]
     fn valid_package_names() {
@@ -195,11 +248,8 @@ mod tests {
         assert!(!is_valid_package_name("back\\slash"));
     }
 
-    // ── extract_package_name edge cases ─────────────────────────────
-
     #[test]
     fn extract_package_name_bare_scope_only() {
-        // Edge case: just `@scope` without a package name
         assert_eq!(extract_package_name("@scope"), "@scope");
     }
 

@@ -1,23 +1,24 @@
 name: Allocation Tracking
 
 on:
-  # Temporarily disabled to conserve CI minutes; run locally or via workflow_dispatch.
-  # push:
-  #   branches: [main]
-  #   paths:
-  #     - 'crates/**/*.rs'
-  #     - 'Cargo.toml'
-  #     - 'Cargo.lock'
-  #     - 'alloc-baseline.json'
-  #     - '.github/workflows/allocs.yml'
-  # pull_request:
-  #   branches: [main]
-  #   paths:
-  #     - 'crates/**/*.rs'
-  #     - 'Cargo.toml'
-  #     - 'Cargo.lock'
-  #     - 'alloc-baseline.json'
-  #     - '.github/workflows/allocs.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'alloc-baseline.json'
+      - '.github/workflows/allocs.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'alloc-baseline.json'
+      - '.github/workflows/allocs.yml'
   workflow_dispatch:
 
 concurrency:
@@ -37,7 +38,7 @@ jobs:
       contents: write
       pull-requests: write
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - uses: ./.github/actions/setup-rust
         with:
@@ -54,14 +55,16 @@ jobs:
           max_bytes=$(grep '^alloc_max_bytes:' alloc-output.txt | awk '{print $2}')
           max_blocks=$(grep '^alloc_max_blocks:' alloc-output.txt | awk '{print $2}')
 
-          echo "## Allocation Stats" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Metric | Value |" >> "$GITHUB_STEP_SUMMARY"
-          echo "|--------|-------|" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Total bytes allocated | $total_bytes |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Total allocations | $total_blocks |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Peak memory (bytes) | $max_bytes |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Peak allocations | $max_blocks |" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "## Allocation Stats"
+            echo ""
+            echo "| Metric | Value |"
+            echo "|--------|-------|"
+            echo "| Total bytes allocated | $total_bytes |"
+            echo "| Total allocations | $total_blocks |"
+            echo "| Peak memory (bytes) | $max_bytes |"
+            echo "| Peak allocations | $max_blocks |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
           # Write custom JSON for benchmark-action tracking
           python3 -c "
@@ -76,8 +79,10 @@ jobs:
           " > alloc-bench.json
 
           if [ ! -f alloc-baseline.json ]; then
-            echo "" >> "$GITHUB_STEP_SUMMARY"
-            echo "> No baseline found. Run \`scripts/alloc-check.sh --save\` to create one." >> "$GITHUB_STEP_SUMMARY"
+            {
+              echo ""
+              echo "> No baseline found. Run \`scripts/alloc-check.sh --save\` to create one."
+            } >> "$GITHUB_STEP_SUMMARY"
             echo "::notice::No alloc-baseline.json found — skipping regression check"
             exit 0
           fi

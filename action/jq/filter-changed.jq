@@ -8,14 +8,16 @@ def in_changed: . as $path | $changed | any(. == $path);
 
 # Filter dead-code (check) results and recalculate total_issues.
 # Dependency-level issues (unused_dependencies, unused_dev_dependencies, unused_optional_dependencies,
-# type_only_dependencies) are intentionally NOT filtered — they are project-wide concerns not
-# attributable to individual changed files. They are still included in total_issues.
+# type_only_dependencies, test_only_dependencies, dev_dependencies_in_production) are intentionally NOT filtered: they are
+# project-wide concerns not attributable to individual changed files. They are still counted in total_issues.
 def filter_check:
   (if .unused_files         then .unused_files         |= map(select(.path | in_changed))      else . end) |
   (if .unused_exports       then .unused_exports       |= map(select(.path | in_changed))      else . end) |
   (if .unused_types         then .unused_types         |= map(select(.path | in_changed))      else . end) |
+  (if .private_type_leaks   then .private_type_leaks   |= map(select(.path | in_changed))      else . end) |
   (if .unused_enum_members  then .unused_enum_members  |= map(select(.path | in_changed))      else . end) |
   (if .unused_class_members then .unused_class_members |= map(select(.path | in_changed))      else . end) |
+  (if .unused_store_members then .unused_store_members |= map(select(.path | in_changed))      else . end) |
   (if .unresolved_imports   then .unresolved_imports   |= map(select(.path | in_changed))      else . end) |
   (if .unlisted_dependencies then
     .unlisted_dependencies |= map(select(.imported_from | any(.path | in_changed)))
@@ -26,11 +28,77 @@ def filter_check:
   (if .circular_dependencies then
     .circular_dependencies |= map(select(.files | any(in_changed)))
   else . end) |
+  (if .re_export_cycles then
+    .re_export_cycles |= map(select(.files | any(in_changed)))
+  else . end) |
   (if .boundary_violations then
     .boundary_violations |= map(select(.from_path | in_changed))
   else . end) |
+  (if .boundary_coverage_violations then
+    .boundary_coverage_violations |= map(select(.path | in_changed))
+  else . end) |
+  (if .boundary_call_violations then
+    .boundary_call_violations |= map(select(.path | in_changed))
+  else . end) |
+  (if .policy_violations then
+    .policy_violations |= map(select(.path | in_changed))
+  else . end) |
   (if .stale_suppressions then
     .stale_suppressions |= map(select(.path | in_changed))
+  else . end) |
+  (if .unresolved_catalog_references then
+    .unresolved_catalog_references |= map(select(.path | in_changed))
+  else . end) |
+  (if .empty_catalog_groups then
+    .empty_catalog_groups |= map(select(.path | in_changed))
+  else . end) |
+  (if .unused_dependency_overrides then
+    .unused_dependency_overrides |= map(select(.path | in_changed))
+  else . end) |
+  (if .misconfigured_dependency_overrides then
+    .misconfigured_dependency_overrides |= map(select(.path | in_changed))
+  else . end) |
+  (if .invalid_client_exports then
+    .invalid_client_exports |= map(select(.path | in_changed))
+  else . end) |
+  (if .mixed_client_server_barrels then
+    .mixed_client_server_barrels |= map(select(.path | in_changed))
+  else . end) |
+  (if .misplaced_directives then
+    .misplaced_directives |= map(select(.path | in_changed))
+  else . end) |
+  (if .route_collisions then
+    .route_collisions |= map(select(.path | in_changed))
+  else . end) |
+  (if .dynamic_segment_name_conflicts then
+    .dynamic_segment_name_conflicts |= map(select(.path | in_changed))
+  else . end) |
+  (if .unused_server_actions then
+    .unused_server_actions |= map(select(.path | in_changed))
+  else . end) |
+  (if .unrendered_components then
+    .unrendered_components |= map(select(.path | in_changed))
+  else . end) |
+  (if .unused_component_props then
+    .unused_component_props |= map(select(.path | in_changed))
+  else . end) |
+  (if .unused_component_emits then
+    .unused_component_emits |= map(select(.path | in_changed))
+  else . end) |
+  (if .unused_component_inputs then
+    .unused_component_inputs |= map(select(.path | in_changed))
+  else . end) |
+  (if .unused_component_outputs then
+    .unused_component_outputs |= map(select(.path | in_changed))
+  else . end) |
+  (if .unused_svelte_events then
+    .unused_svelte_events |= map(select(.path | in_changed))
+  else . end) |
+  (if .unprovided_injects then
+    .unprovided_injects |= map(select(.path | in_changed))
+  else . end) |
+  (if .unused_load_data_keys then
+    .unused_load_data_keys |= map(select(.path | in_changed))
   else . end) |
   # Recalculate total_issues from filtered arrays
   (if .total_issues != null then
@@ -38,18 +106,45 @@ def filter_check:
       (.unused_files // [] | length) +
       (.unused_exports // [] | length) +
       (.unused_types // [] | length) +
+      (.private_type_leaks // [] | length) +
       (.unused_dependencies // [] | length) +
       (.unused_dev_dependencies // [] | length) +
       (.unused_optional_dependencies // [] | length) +
       (.unused_enum_members // [] | length) +
       (.unused_class_members // [] | length) +
+      (.unused_store_members // [] | length) +
       (.unresolved_imports // [] | length) +
       (.unlisted_dependencies // [] | length) +
       (.duplicate_exports // [] | length) +
       (.circular_dependencies // [] | length) +
+      (.re_export_cycles // [] | length) +
       (.boundary_violations // [] | length) +
+      (.boundary_coverage_violations // [] | length) +
+      (.boundary_call_violations // [] | length) +
+      (.policy_violations // [] | length) +
       (.type_only_dependencies // [] | length) +
-      (.stale_suppressions // [] | length)
+      (.test_only_dependencies // [] | length) +
+      (.dev_dependencies_in_production // [] | length) +
+      (.stale_suppressions // [] | length) +
+      (.unused_catalog_entries // [] | length) +
+      (.empty_catalog_groups // [] | length) +
+      (.unresolved_catalog_references // [] | length) +
+      (.unused_dependency_overrides // [] | length) +
+      (.misconfigured_dependency_overrides // [] | length) +
+      (.invalid_client_exports // [] | length) +
+      (.mixed_client_server_barrels // [] | length) +
+      (.misplaced_directives // [] | length) +
+      (.route_collisions // [] | length) +
+      (.dynamic_segment_name_conflicts // [] | length) +
+      (.unused_server_actions // [] | length) +
+      (.unrendered_components // [] | length) +
+      (.unused_component_props // [] | length) +
+      (.unused_component_emits // [] | length) +
+      (.unused_component_inputs // [] | length) +
+      (.unused_component_outputs // [] | length) +
+      (.unused_svelte_events // [] | length) +
+      (.unprovided_injects // [] | length) +
+      (.unused_load_data_keys // [] | length)
     )
   else . end);
 

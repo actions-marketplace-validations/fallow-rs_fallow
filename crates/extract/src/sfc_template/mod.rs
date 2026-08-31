@@ -1,17 +1,50 @@
-//! Heuristic template scanners for Vue and Svelte single-file components.
+//! Heuristic template scanners for frameworks whose templates carry import
+//! and class-member references the JavaScript AST cannot see. Intentionally
+//! conservative: we support the common template constructs that can be
+//! analysed reliably with lightweight scanning, without pretending to be a
+//! full framework compiler.
 //!
-//! This module only handles markup-visible import usage that the JavaScript AST
-//! cannot see. It is intentionally conservative: we support the common template
-//! constructs that can be analyzed reliably with lightweight scanning, without
-//! pretending to be a full framework compiler.
+//! Four scanners live here, dispatched in two different ways:
+//!
+//! - **Vue (`vue`) / Svelte (`svelte`)**: `.vue` / `.svelte` files are not
+//!   valid JS until their `<script>` blocks are extracted, so `crate::sfc`
+//!   runs a per-SFC pipeline that builds a fresh `ModuleInfo`, then folds in
+//!   per-script and per-style results. These two share the `SfcKind` enum
+//!   and the `collect_template_usage_with_bound_targets` dispatcher below.
+//!
+//! - **Angular (`angular`)**: Angular components live in regular `.ts`
+//!   files; templates appear as decorator metadata (`template: \`...\``) or
+//!   external `.html` siblings (`templateUrl`). The scanner is invoked
+//!   directly from `crate::visitor::visit_impl::visit_class` for inline
+//!   templates and from `crate::html::parse_html_to_module_with_complexity`
+//!   for external templates. Bare identifier references are persisted as typed
+//!   semantic facts so the analysis phase can bridge them to the importing
+//!   component's class members.
+//!
+//! - **Glimmer (`glimmer`)**: Ember `.gts` / `.gjs` single-file components.
+//!   The host file IS valid JS once `<template>...</template>` blocks are
+//!   blanked by `crate::glimmer::strip_glimmer_templates`, so the standard
+//!   `crate::parse::parse_source_to_module` pipeline handles parsing. The
+//!   Glimmer scanner is invoked from `parse.rs::
+//!   collect_glimmer_template_into_extractor` against the un-stripped source
+//!   AFTER `extractor.visit_program(...)` but BEFORE
+//!   `compute_import_binding_usage`. Results push directly onto
+//!   `extractor.member_accesses` (matching Angular's flow) and feed
+//!   `compute_import_binding_usage`'s `template_used` skip-set so
+//!   template-only imports never enter the `unused` vector.
+//!
+//! Angular and Glimmer do not participate in `SfcKind` / the dispatcher
+//! below because they don't need per-file `ModuleInfo` construction:
+//! their host files are normal `.ts` / `.gts` / `.gjs` sources.
 
 pub mod angular;
+pub mod glimmer;
 mod scanners;
 mod shared;
 mod svelte;
 mod vue;
 
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::template_usage::TemplateUsage;
 
@@ -24,6 +57,7 @@ pub enum SfcKind {
 }
 
 /// Collect template-visible import usage from Vue or Svelte markup.
+#[cfg(test)]
 pub fn collect_template_usage(
     kind: SfcKind,
     source: &str,
@@ -35,7 +69,44 @@ pub fn collect_template_usage(
     }
 }
 
-#[cfg(test)]
+/// Collect Svelte custom-event listener names from template `on:<name>`
+/// bindings on component tags (PascalCase). DOM-element `on:click` is excluded.
+/// Feeds the `unused-svelte-event` detector's liberal project-wide listened set.
+#[must_use]
+pub fn collect_svelte_listened_events(source: &str) -> Vec<String> {
+    svelte::collect_listened_events(source)
+}
+
+/// Collect template-visible usage, including framework template references to
+/// script-local instance bindings such as `const counter = new Counter()`.
+pub fn collect_template_usage_with_bound_targets(
+    kind: SfcKind,
+    source: &str,
+    imported_bindings: &FxHashSet<String>,
+    bound_targets: &FxHashMap<String, String>,
+    iterable_types: &FxHashMap<String, String>,
+) -> TemplateUsage {
+    match kind {
+        // `iterable_types` maps a template-visible binding to its array element
+        // class; both scanners consume it to type an iteration variable (Vue
+        // `v-for`, Svelte `{#each}`) so member accesses on the item credit the
+        // element class. See issue #1707 and its follow-up.
+        SfcKind::Vue => vue::collect_template_usage_with_bound_targets(
+            source,
+            imported_bindings,
+            bound_targets,
+            iterable_types,
+        ),
+        SfcKind::Svelte => svelte::collect_template_usage_with_bound_targets(
+            source,
+            imported_bindings,
+            bound_targets,
+            iterable_types,
+        ),
+    }
+}
+
+#[cfg(all(test, not(miri)))]
 mod tests {
     use super::*;
 

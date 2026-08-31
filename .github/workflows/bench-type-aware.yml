@@ -1,0 +1,53 @@
+name: Type-aware Benchmarks
+
+# The walltime instrument lives in its own workflow so each CodSpeed run carries
+# a single instrument. Uploading walltime alongside the Rust simulation shards
+# under one run left CodSpeed unable to assemble a report (see issue #2024).
+
+on:
+  merge_group:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'tools/type-aware-sidecar/**'
+      - '.github/workflows/bench-type-aware.yml'
+      - 'scripts/check-benchmark-harness.py'
+  push:
+    branches: [main]
+    paths:
+      - 'tools/type-aware-sidecar/**'
+      - '.github/workflows/bench-type-aware.yml'
+      - 'scripts/check-benchmark-harness.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark-type-aware:
+    name: CodSpeed walltime (type-aware cold and warm)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: tools/type-aware-sidecar/package-lock.json
+
+      - name: Install type-aware benchmark dependencies
+        run: npm ci --no-audit --no-fund
+        working-directory: tools/type-aware-sidecar
+
+      - name: Run type-aware benchmarks
+        uses: CodSpeedHQ/action@4296e51e7041e24dadb86d1d6e8b9320d223dbe8 # v5.0.3
+        with:
+          mode: walltime
+          run: npm run bench --prefix tools/type-aware-sidecar

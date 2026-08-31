@@ -50,7 +50,55 @@ Review changes to fallow's CI-oriented output formats. Each format serves a spec
 2. **Determinism**: Same input produces identical output across runs
 3. **Severity mapping**: Consistent translation from fallow severity to format-specific severity
 4. **Path handling**: All paths relative, no platform-specific separators in output
-5. **Integration testing**: Do consumers (action/jq/, ci/jq/) still parse the output correctly after changes?
+5. **Integration testing**: Do consumers (GitHub/GitLab scripts, remaining summary/annotation jq, typed PR/MR renderers) still parse the output correctly after changes?
+
+## Surface-specific checks (Phase 3 audits)
+
+For each CI-format diff, run the format-specific audit alongside the generic checks above.
+
+### Compact format audit (Phase 3c)
+
+```bash
+FALLOW_QUIET=1 fallow <command> --format compact --root benchmarks/fixtures/real-world/zod 2>/dev/null
+```
+
+Check:
+- [ ] One line per item, parseable by grep/awk
+- [ ] Colon-separated fields, consistent with existing compact output
+
+### Markdown format audit (Phase 3d)
+
+```bash
+FALLOW_QUIET=1 fallow <command> --format markdown --root benchmarks/fixtures/real-world/zod 2>/dev/null
+```
+
+Check:
+- [ ] Valid GFM (GitHub-Flavored Markdown)
+- [ ] Tables have header + separator + rows
+- [ ] Summary line present
+
+### SARIF format audit (Phase 3e)
+
+```bash
+FALLOW_QUIET=1 fallow <command> --format sarif --root benchmarks/fixtures/real-world/zod 2>/dev/null | jq -r '.version'
+```
+
+Check:
+- [ ] Valid SARIF 2.1.0
+- [ ] If feature doesn't apply to SARIF (e.g., metric scores), verify it's intentionally omitted with a code comment
+
+### CodeClimate format audit (Phase 3f)
+
+```bash
+FALLOW_QUIET=1 fallow <command> --format codeclimate --root benchmarks/fixtures/real-world/zod 2>/dev/null | jq 'length as $count | "\($count) issues", (if length > 0 then .[0] else "empty" end)'
+```
+
+Check:
+- [ ] Valid CodeClimate JSON array (GitLab Code Quality compatible)
+- [ ] Each issue has: type, check_name, description, categories, severity, fingerprint, location
+- [ ] Severity mapping correct: error to major, warn to minor, complexity graduated (minor/major/critical)
+- [ ] Fingerprints deterministic (run twice, compare)
+- [ ] Paths are relative with forward slashes
 
 ## Key files
 

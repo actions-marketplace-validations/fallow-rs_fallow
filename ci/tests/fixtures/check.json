@@ -2,7 +2,7 @@
   "schema_version": 3,
   "version": "2.2.2",
   "elapsed_ms": 4,
-  "total_issues": 10,
+  "total_issues": 16,
   "unused_files": [],
   "unused_exports": [
     {
@@ -70,12 +70,16 @@
     }
   ],
   "unused_types": [],
+  "private_type_leaks": [],
   "unused_dependencies": [
     {
       "package_name": "react",
       "location": "dependencies",
       "path": "package.json",
-      "line": 24
+      "line": 24,
+      "used_in_workspaces": [
+        "packages/client"
+      ]
     },
     {
       "package_name": "jotai",
@@ -100,5 +104,77 @@
   "type_only_dependencies": [],
   "circular_dependencies": [],
   "boundary_violations": [],
-  "stale_suppressions": []
+  "stale_suppressions": [],
+  "unused_catalog_entries": [
+    {
+      "entry_name": "is-even",
+      "catalog_name": "default",
+      "path": "pnpm-workspace.yaml",
+      "line": 6,
+      "hardcoded_consumers": []
+    }
+  ],
+  "empty_catalog_groups": [
+    {
+      "catalog_name": "legacy",
+      "path": "pnpm-workspace.yaml",
+      "line": 10
+    }
+  ],
+  "unresolved_catalog_references": [
+    {
+      "entry_name": "old-react",
+      "catalog_name": "react17",
+      "path": "packages/app/package.json",
+      "line": 14,
+      "available_in_catalogs": [
+        "react18"
+      ]
+    }
+  ],
+  "unused_dependency_overrides": [
+    {
+      "raw_key": "axios",
+      "target_package": "axios",
+      "version_range": "^1.6.0",
+      "source": "pnpm-workspace.yaml",
+      "path": "pnpm-workspace.yaml",
+      "line": 9,
+      "hint": "May be an intentional pin for a transitive CVE that no workspace package depends on directly"
+    }
+  ],
+  "misconfigured_dependency_overrides": [
+    {
+      "raw_key": "@types/react@<<18",
+      "raw_value": "18.0.0",
+      "reason": "unparsable-key",
+      "source": "package.json",
+      "path": "package.json",
+      "line": 3
+    }
+  ],
+  "re_export_cycles": [
+    {
+      "files": [
+        "src/api/index.ts",
+        "src/api/internal/index.ts"
+      ],
+      "kind": "multi-node",
+      "actions": [
+        {
+          "type": "fix",
+          "kind": "refactor-re-export-cycle",
+          "auto_fixable": false,
+          "description": "Remove one `export * from` statement on any one member to break the cycle"
+        },
+        {
+          "type": "suppress-file",
+          "kind": "suppress-file",
+          "auto_fixable": false,
+          "description": "Suppress with a file-level comment at the top of this file.",
+          "comment": "// fallow-ignore-file re-export-cycle"
+        }
+      ]
+    }
+  ]
 }

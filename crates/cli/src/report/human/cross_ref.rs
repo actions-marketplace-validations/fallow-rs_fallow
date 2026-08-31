@@ -1,3 +1,4 @@
+use crate::report::sink::outln;
 use std::path::Path;
 
 use colored::Colorize;
@@ -6,7 +7,7 @@ use fallow_config::OutputFormat;
 use super::{plural, relative_path};
 
 pub(in crate::report) fn print_cross_reference_findings(
-    cross_ref: &fallow_core::cross_reference::CrossReferenceResult,
+    cross_ref: &fallow_engine::cross_reference::CrossReferenceResult,
     root: &Path,
     quiet: bool,
     output: OutputFormat,
@@ -15,8 +16,6 @@ pub(in crate::report) fn print_cross_reference_findings(
         return;
     }
 
-    // Only emit human-readable output; structured formats (JSON, SARIF, Compact)
-    // should not have unstructured text mixed into stdout.
     if !matches!(output, OutputFormat::Human) {
         return;
     }
@@ -26,7 +25,7 @@ pub(in crate::report) fn print_cross_reference_findings(
     }
 
     for line in build_cross_reference_lines(cross_ref, root) {
-        println!("{line}");
+        outln!("{line}");
     }
 
     let total = cross_ref.total();
@@ -44,11 +43,11 @@ pub(in crate::report) fn print_cross_reference_findings(
 }
 
 /// Build human-readable output lines for cross-reference findings.
-pub(in crate::report) fn build_cross_reference_lines(
-    cross_ref: &fallow_core::cross_reference::CrossReferenceResult,
+fn build_cross_reference_lines(
+    cross_ref: &fallow_engine::cross_reference::CrossReferenceResult,
     root: &Path,
 ) -> Vec<String> {
-    use fallow_core::cross_reference::DeadCodeKind;
+    use fallow_engine::cross_reference::DeadCodeKind;
 
     let mut lines = Vec::new();
 
@@ -98,8 +97,8 @@ pub(in crate::report) fn build_cross_reference_lines(
 mod tests {
     use super::super::plain;
     use super::*;
-    use fallow_core::cross_reference::{CombinedFinding, CrossReferenceResult, DeadCodeKind};
-    use fallow_core::duplicates::CloneInstance;
+    use fallow_engine::cross_reference::{CombinedFinding, CrossReferenceResult, DeadCodeKind};
+    use fallow_types::duplicates::CloneInstance;
     use std::path::PathBuf;
 
     #[test]

@@ -1,7 +1,126 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::{LazyLock, Mutex, OnceLock};
 
-use fallow_config::{FallowConfig, OutputFormat, ResolvedConfig};
+use fallow_config::{
+    FallowConfig, OutputFormat, PartialRulesConfig, ProductionAnalysis, ResolvedConfig, RulesConfig,
+};
+use fallow_output::GroupByMode;
+use rustc_hash::FxHashSet;
+
+static CONFIG_LOADED_LOGGED: LazyLock<Mutex<FxHashSet<PathBuf>>> =
+    LazyLock::new(|| Mutex::new(FxHashSet::default()));
+
+/// Process-wide dedup of `security.categories` typo warnings so combined mode's
+/// repeated config loads emit each at most once.
+static SECURITY_CATEGORY_WARNED: LazyLock<Mutex<FxHashSet<String>>> =
+    LazyLock::new(|| Mutex::new(FxHashSet::default()));
+
+/// An unknown `security.categories` id plus the closest valid suggestion.
+pub struct UnknownSecurityCategory {
+    /// `include` or `exclude`.
+    pub field: &'static str,
+    /// The unrecognized category id.
+    pub id: String,
+    /// The closest valid category id, when one is near enough to suggest.
+    pub suggestion: Option<String>,
+}
+
+/// Find ids in `security.categories.{include,exclude}` that are not real
+/// catalogue categories, each with a closest-match suggestion. Pure: no output.
+///
+/// The security config crate cannot depend on `fallow-security` (the catalogue
+/// lives there), so this validation runs at the CLI layer where both are
+/// available, mirroring the config crate's own unknown-rule-key check.
+#[must_use]
+pub fn find_unknown_security_categories(
+    security: &fallow_config::SecurityConfig,
+) -> Vec<UnknownSecurityCategory> {
+    let Some(categories) = &security.categories else {
+        return Vec::new();
+    };
+    let valid: Vec<String> = fallow_security::security_categories()
+        .into_iter()
+        .map(|category| category.id)
+        .collect();
+    let valid_set: FxHashSet<&str> = valid.iter().map(String::as_str).collect();
+    let mut unknown = Vec::new();
+    for (field, ids) in [
+        ("include", categories.include.as_ref()),
+        ("exclude", categories.exclude.as_ref()),
+    ] {
+        let Some(ids) = ids else { continue };
+        for id in ids {
+            if valid_set.contains(id.as_str()) {
+                continue;
+            }
+            unknown.push(UnknownSecurityCategory {
+                field,
+                id: id.clone(),
+                suggestion: fallow_config::levenshtein::closest_match(
+                    id,
+                    valid.iter().map(String::as_str),
+                )
+                .map(str::to_owned),
+            });
+        }
+    }
+    unknown
+}
+
+/// Emit one deduped `tracing::warn!` per unknown `security.categories` id.
+///
+/// Advisory only: an unknown id is silently ignored by the detector, so a typo
+/// otherwise disables a category with no signal at all.
+pub fn warn_unknown_security_categories(security: &fallow_config::SecurityConfig) {
+    for unknown in find_unknown_security_categories(security) {
+        let dedup_key = format!("{}:{}", unknown.field, unknown.id);
+        if let Ok(mut seen) = SECURITY_CATEGORY_WARNED.lock()
+            && !seen.insert(dedup_key)
+        {
+            continue;
+        }
+        if let Some(suggestion) = &unknown.suggestion {
+            tracing::warn!(
+                "unknown security category '{}' in security.categories.{} (did you mean '{}'?); it is ignored. Valid ids: fallow schema (security_categories) or fallow security --help",
+                unknown.id,
+                unknown.field,
+                suggestion
+            );
+        } else {
+            tracing::warn!(
+                "unknown security category '{}' in security.categories.{}; it is ignored. Valid ids: fallow schema (security_categories) or fallow security --help",
+                unknown.id,
+                unknown.field
+            );
+        }
+    }
+}
+
+/// The `--max-file-size` global flag value, set once from `main()` after clap
+/// parse. `Some(Some(mb))` means the flag was passed; `Some(None)` / unset
+/// means it was not. Held in a `OnceLock` rather than threaded through the ten
+/// `load_config_for_analysis` callers (the skill-endorsed set-once-read-by-many
+/// pattern; avoids `set_var`, which is unsafe under edition 2024).
+static MAX_FILE_SIZE_OVERRIDE: OnceLock<Option<u32>> = OnceLock::new();
+
+/// Record the `--max-file-size` flag value (megabytes; `Some(0)` = unlimited).
+/// Called once from `main()` before dispatch. Subsequent calls are ignored.
+pub fn set_max_file_size_override(max_file_size_mb: Option<u32>) {
+    let _ = MAX_FILE_SIZE_OVERRIDE.set(max_file_size_mb);
+}
+
+/// Resolve the effective per-file size ceiling override (in megabytes): the
+/// `--max-file-size` flag wins, then `FALLOW_MAX_FILE_SIZE`, else `None` (the
+/// built-in default applies). `Some(0)` from either source means unlimited.
+fn resolve_max_file_size_mb() -> Option<u32> {
+    if let Some(Some(mb)) = MAX_FILE_SIZE_OVERRIDE.get() {
+        return Some(*mb);
+    }
+    std::env::var("FALLOW_MAX_FILE_SIZE")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u32>().ok())
+}
 
 /// Analysis types for --only/--skip selection.
 #[derive(Clone, PartialEq, Eq, clap::ValueEnum)]
@@ -30,6 +149,17 @@ pub enum GroupBy {
     Section,
 }
 
+impl From<GroupBy> for GroupByMode {
+    fn from(value: GroupBy) -> Self {
+        match value {
+            GroupBy::Owner => Self::Owner,
+            GroupBy::Directory => Self::Directory,
+            GroupBy::Package => Self::Package,
+            GroupBy::Section => Self::Section,
+        }
+    }
+}
+
 /// Build an `OwnershipResolver` from CLI `--group-by` and config settings.
 ///
 /// Returns `None` when no grouping is requested. Returns `Err(ExitCode)` when
@@ -40,15 +170,25 @@ pub fn build_ownership_resolver(
     codeowners_path: Option<&str>,
     output: OutputFormat,
 ) -> Result<Option<crate::report::OwnershipResolver>, ExitCode> {
+    build_ownership_resolver_for_mode(group_by.map(Into::into), root, codeowners_path, output)
+}
+
+/// Build an `OwnershipResolver` from a typed output grouping mode.
+pub fn build_ownership_resolver_for_mode(
+    group_by: Option<GroupByMode>,
+    root: &Path,
+    codeowners_path: Option<&str>,
+    output: OutputFormat,
+) -> Result<Option<crate::report::OwnershipResolver>, ExitCode> {
     let Some(mode) = group_by else {
         return Ok(None);
     };
     match mode {
-        GroupBy::Owner => match crate::codeowners::CodeOwners::load(root, codeowners_path) {
+        GroupByMode::Owner => match crate::codeowners::CodeOwners::load(root, codeowners_path) {
             Ok(co) => Ok(Some(crate::report::OwnershipResolver::Owner(co))),
             Err(e) => Err(crate::error::emit_error(&e, 2, output)),
         },
-        GroupBy::Section => match crate::codeowners::CodeOwners::load(root, codeowners_path) {
+        GroupByMode::Section => match crate::codeowners::CodeOwners::load(root, codeowners_path) {
             Ok(co) => {
                 if co.has_sections() {
                     Ok(Some(crate::report::OwnershipResolver::Section(co)))
@@ -64,13 +204,14 @@ pub fn build_ownership_resolver(
             }
             Err(e) => Err(crate::error::emit_error(&e, 2, output)),
         },
-        GroupBy::Directory => Ok(Some(crate::report::OwnershipResolver::Directory)),
-        GroupBy::Package => {
-            let workspaces = fallow_config::discover_workspaces(root);
+        GroupByMode::Directory => Ok(Some(crate::report::OwnershipResolver::Directory)),
+        GroupByMode::Package => {
+            let workspaces = fallow_engine::discover::discover_workspace_packages(root);
             if workspaces.is_empty() {
                 Err(crate::error::emit_error(
                     "--group-by package requires a monorepo with workspace packages \
-                     (package.json workspaces, pnpm-workspace.yaml, or tsconfig references)",
+                     (package.json workspaces, pnpm-workspace.yaml, or tsconfig references). \
+                     For single-package projects try --group-by directory instead.",
                     2,
                     output,
                 ))
@@ -91,54 +232,404 @@ fn log_config_loaded(path: &Path, output: OutputFormat, quiet: bool) {
     if quiet || !matches!(output, OutputFormat::Human) {
         return;
     }
+    if !should_log_config_loaded(path) {
+        return;
+    }
     eprintln!("loaded config: {}", path.display());
+}
+
+fn should_log_config_loaded(path: &Path) -> bool {
+    let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    CONFIG_LOADED_LOGGED
+        .lock()
+        .is_ok_and(|mut logged| logged.insert(key))
+}
+
+#[derive(Clone, Copy)]
+pub struct ConfigLoadOptions {
+    pub output: OutputFormat,
+    pub no_cache: bool,
+    pub threads: usize,
+    pub production_override: Option<bool>,
+    pub quiet: bool,
+    pub allow_remote_extends: bool,
+}
+
+/// The scalar config-loading knobs for [`load_config`], bundled so the entry
+/// point takes the root + config path plus one args struct instead of seven
+/// positional parameters.
+#[derive(Clone, Copy)]
+pub struct LoadConfigArgs {
+    pub output: OutputFormat,
+    pub no_cache: bool,
+    pub threads: usize,
+    pub production: bool,
+    pub quiet: bool,
+    pub allow_remote_extends: bool,
 }
 
 #[expect(clippy::ref_option, reason = "&Option matches clap's field type")]
 pub fn load_config(
     root: &Path,
     config_path: &Option<PathBuf>,
-    output: OutputFormat,
-    no_cache: bool,
-    threads: usize,
-    production: bool,
-    quiet: bool,
+    args: LoadConfigArgs,
 ) -> Result<ResolvedConfig, ExitCode> {
-    let user_config = if let Some(path) = config_path {
-        match FallowConfig::load(path) {
+    let LoadConfigArgs {
+        output,
+        no_cache,
+        threads,
+        production,
+        quiet,
+        allow_remote_extends,
+    } = args;
+    load_config_for_analysis(
+        root,
+        config_path,
+        ConfigLoadOptions {
+            output,
+            no_cache,
+            threads,
+            production_override: production.then_some(true),
+            quiet,
+            allow_remote_extends,
+        },
+        ProductionAnalysis::DeadCode,
+    )
+}
+
+#[expect(clippy::ref_option, reason = "&Option matches clap's field type")]
+pub fn load_config_for_analysis(
+    root: &Path,
+    config_path: &Option<PathBuf>,
+    options: ConfigLoadOptions,
+    analysis: ProductionAnalysis,
+) -> Result<ResolvedConfig, ExitCode> {
+    let user_config = load_user_config(root, config_path, &options)?;
+
+    let loaded_user_config = user_config.is_some();
+    let final_config = match user_config {
+        Some(mut config) => {
+            let production = options
+                .production_override
+                .unwrap_or_else(|| config.production.for_analysis(analysis));
+            config.production = production.into();
+            config
+        }
+        None => FallowConfig {
+            production: options.production_override.unwrap_or(false).into(),
+            ..FallowConfig::default()
+        },
+    };
+    crate::telemetry::note_config_shape(config_shape_for(&final_config, loaded_user_config));
+
+    validate_config_extensions(root, &final_config, &options)?;
+
+    let cache_max_size_mb = resolve_cache_max_size_env();
+    let mut resolved = final_config.resolve(
+        root.to_path_buf(),
+        options.output,
+        options.threads,
+        options.no_cache,
+        options.quiet,
+        cache_max_size_mb,
+    );
+    if let Some(mb) = resolve_max_file_size_mb() {
+        resolved.max_file_size_bytes = fallow_config::resolve_max_file_size_bytes(Some(mb));
+    }
+    apply_cache_dir_env_override(root, &mut resolved, resolve_cache_dir_env());
+    crate::cache_notice::record_candidate(
+        root,
+        &resolved.cache_dir,
+        options.output,
+        options.quiet,
+        resolved.no_cache,
+    );
+
+    report_workspace_diagnostics(root, &resolved, &options)?;
+    warn_unknown_security_categories(&resolved.security);
+
+    Ok(resolved)
+}
+
+/// Load the user config from an explicit `--config` path or via auto-discovery,
+/// logging the resolved path. Returns `None` when no config file is found.
+#[expect(clippy::ref_option, reason = "&Option matches clap's field type")]
+fn load_user_config(
+    root: &Path,
+    config_path: &Option<PathBuf>,
+    options: &ConfigLoadOptions,
+) -> Result<Option<FallowConfig>, ExitCode> {
+    let load_options = fallow_config::ConfigLoadOptions {
+        allow_remote_extends: options.allow_remote_extends,
+    };
+    if let Some(path) = config_path {
+        return match FallowConfig::load_with_options(path, load_options) {
             Ok(c) => {
-                log_config_loaded(path, output, quiet);
-                Some(c)
+                log_config_loaded(path, options.output, options.quiet);
+                Ok(Some(c))
             }
             Err(e) => {
                 let msg = format!("failed to load config '{}': {e}", path.display());
-                return Err(crate::error::emit_error(&msg, 2, output));
+                Err(crate::error::emit_error(&msg, 2, options.output))
             }
+        };
+    }
+    match FallowConfig::find_and_load_with_options(root, load_options) {
+        Ok(Some((config, found_path))) => {
+            log_config_loaded(&found_path, options.output, options.quiet);
+            Ok(Some(config))
         }
-    } else {
-        match FallowConfig::find_and_load(root) {
-            Ok(Some((config, found_path))) => {
-                log_config_loaded(&found_path, output, quiet);
-                Some(config)
-            }
-            Ok(None) => None,
-            Err(e) => {
-                return Err(crate::error::emit_error(&e, 2, output));
-            }
+        Ok(None) => Ok(None),
+        Err(e) => Err(crate::error::emit_error(&e, 2, options.output)),
+    }
+}
+
+/// Join a list of validation errors into one indented `emit_error` exit code.
+fn emit_joined_config_errors<E: ToString>(
+    label: &str,
+    errors: &[E],
+    output: OutputFormat,
+) -> ExitCode {
+    let joined = errors
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n  - ");
+    crate::error::emit_error(&format!("{label}:\n  - {joined}"), 2, output)
+}
+
+/// Validate external plugins, resolved boundaries, and rule packs. A rule pack
+/// that fails to load must fail the run: silently skipping policy is the exact
+/// failure mode rule packs document themselves as preventing.
+fn validate_config_extensions(
+    root: &Path,
+    config: &FallowConfig,
+    options: &ConfigLoadOptions,
+) -> Result<(), ExitCode> {
+    if let Err(errors) =
+        fallow_config::discover_and_validate_external_plugins(root, &config.plugins)
+    {
+        return Err(emit_joined_config_errors(
+            "invalid external plugin definition",
+            &errors,
+            options.output,
+        ));
+    }
+    if let Err(errors) = config.validate_resolved_boundaries(root) {
+        return Err(emit_joined_config_errors(
+            "invalid boundary configuration",
+            &errors,
+            options.output,
+        ));
+    }
+    let packs = match fallow_config::load_rule_packs(root, &config.rule_packs) {
+        Ok(packs) => packs,
+        Err(errors) => {
+            return Err(emit_joined_config_errors(
+                "invalid rule pack",
+                &errors,
+                options.output,
+            ));
         }
     };
+    let boundaries =
+        fallow_config::resolve_boundaries_for_rule_pack_validation(config.boundaries.clone(), root);
+    let zone_errors = fallow_config::validate_rule_pack_zone_references(
+        root,
+        &config.rule_packs,
+        &packs,
+        &boundaries,
+    );
+    if !zone_errors.is_empty() {
+        return Err(emit_joined_config_errors(
+            "invalid rule pack",
+            &zone_errors,
+            options.output,
+        ));
+    }
+    Ok(())
+}
 
-    Ok(match user_config {
-        Some(mut config) => {
-            if production {
-                config.production = true;
+/// Discover and stash workspace diagnostics, surfacing a one-line stderr notice
+/// in human mode when any are present.
+fn report_workspace_diagnostics(
+    root: &Path,
+    resolved: &ResolvedConfig,
+    options: &ConfigLoadOptions,
+) -> Result<(), ExitCode> {
+    match fallow_engine::discover::discover_workspace_packages_with_diagnostics(
+        root,
+        &resolved.ignore_patterns,
+    ) {
+        Ok((_, diagnostics)) => {
+            fallow_config::stash_workspace_diagnostics(root, diagnostics.clone());
+            if !diagnostics.is_empty()
+                && matches!(options.output, OutputFormat::Human)
+                && !options.quiet
+            {
+                eprintln!(
+                    "fallow: {} workspace discovery diagnostic{}. \
+                     Run `fallow list --workspaces` for detail.",
+                    diagnostics.len(),
+                    if diagnostics.len() == 1 { "" } else { "s" }
+                );
             }
-            config.resolve(root.to_path_buf(), output, threads, no_cache, quiet)
+            Ok(())
         }
-        None => FallowConfig {
-            production,
-            ..FallowConfig::default()
+        Err(err) => Err(crate::error::emit_error(err.message(), 2, options.output)),
+    }
+}
+
+fn config_shape_for(
+    config: &FallowConfig,
+    loaded_user_config: bool,
+) -> crate::telemetry::ConfigShape {
+    if !config.plugins.is_empty() || !config.framework.is_empty() {
+        return crate::telemetry::ConfigShape::PluginsEnabled;
+    }
+    if config.rules != RulesConfig::default()
+        || config
+            .overrides
+            .iter()
+            .any(|entry| partial_rules_config_has_values(&entry.rules))
+    {
+        return crate::telemetry::ConfigShape::CustomRules;
+    }
+    if loaded_user_config {
+        return crate::telemetry::ConfigShape::CustomConfig;
+    }
+    crate::telemetry::ConfigShape::Default
+}
+
+fn partial_rules_config_has_values(rules: &PartialRulesConfig) -> bool {
+    serde_json::to_value(rules)
+        .ok()
+        .and_then(|value| value.as_object().map(|object| !object.is_empty()))
+        .unwrap_or(false)
+}
+
+/// Read `FALLOW_CACHE_MAX_SIZE` (megabytes) into `Option<u32>`, returning
+/// `None` when the env var is unset or fails to parse as a positive integer.
+/// Resolved here rather than as a clap flag because the cache cap is a
+/// platform/CI ergonomic concern, not an analysis input; an env var keeps
+/// it out of the `--help` surface (see ADR-009).
+fn resolve_cache_max_size_env() -> Option<u32> {
+    std::env::var("FALLOW_CACHE_MAX_SIZE")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u32>().ok())
+        .filter(|mb| *mb > 0)
+}
+
+/// Read `FALLOW_CACHE_DIR` into an optional project-root-resolved cache path.
+/// Relative values use the same project-root base as `cache.dir`.
+fn resolve_cache_dir_env() -> Option<PathBuf> {
+    std::env::var_os("FALLOW_CACHE_DIR")
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+}
+
+fn resolve_cache_dir_value(root: &Path, path: PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        path
+    } else {
+        root.join(path)
+    }
+}
+
+fn apply_cache_dir_env_override(
+    root: &Path,
+    resolved: &mut ResolvedConfig,
+    env_value: Option<PathBuf>,
+) {
+    if let Some(path) = env_value {
+        resolved.cache_dir = resolve_cache_dir_value(root, path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn find_unknown_security_categories_flags_typos_with_suggestion() {
+        let security = fallow_config::SecurityConfig {
+            categories: Some(fallow_config::SecurityCategories {
+                include: Some(vec!["sql-injection".to_owned(), "sql-injektion".to_owned()]),
+                exclude: Some(vec!["hardcoded-secret".to_owned()]),
+            }),
+            ..fallow_config::SecurityConfig::default()
+        };
+        let unknown = find_unknown_security_categories(&security);
+        assert_eq!(unknown.len(), 1, "only the typo is unknown");
+        assert_eq!(unknown[0].id, "sql-injektion");
+        assert_eq!(unknown[0].field, "include");
+        assert_eq!(unknown[0].suggestion.as_deref(), Some("sql-injection"));
+    }
+
+    #[test]
+    fn find_unknown_security_categories_empty_when_all_valid_or_unset() {
+        assert!(
+            find_unknown_security_categories(&fallow_config::SecurityConfig::default()).is_empty()
+        );
+        let security = fallow_config::SecurityConfig {
+            categories: Some(fallow_config::SecurityCategories {
+                include: Some(vec!["secret-to-network".to_owned()]),
+                exclude: None,
+            }),
+            ..fallow_config::SecurityConfig::default()
+        };
+        assert!(find_unknown_security_categories(&security).is_empty());
+    }
+
+    #[test]
+    fn config_loaded_notice_dedupes_by_config_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.fallow.json");
+        let second = dir.path().join("second.fallow.json");
+        std::fs::write(&first, "{}").unwrap();
+        std::fs::write(&second, "{}").unwrap();
+
+        assert!(should_log_config_loaded(&first));
+        assert!(!should_log_config_loaded(&first));
+        assert!(should_log_config_loaded(&second));
+    }
+
+    #[test]
+    fn cache_dir_env_value_resolves_relative_to_project_root() {
+        assert_eq!(
+            resolve_cache_dir_value(Path::new("/repo"), PathBuf::from(".cache/fallow")),
+            PathBuf::from("/repo/.cache/fallow")
+        );
+        assert_eq!(
+            resolve_cache_dir_value(Path::new("/repo"), PathBuf::from("/tmp/fallow-cache")),
+            PathBuf::from("/tmp/fallow-cache")
+        );
+    }
+
+    #[test]
+    fn cache_dir_env_value_wins_over_configured_cache_dir() {
+        let mut resolved = FallowConfig {
+            cache: fallow_config::CacheConfig {
+                dir: Some(PathBuf::from(".cache/from-config")),
+                ..Default::default()
+            },
+            ..Default::default()
         }
-        .resolve(root.to_path_buf(), output, threads, no_cache, quiet),
-    })
+        .resolve(
+            PathBuf::from("/repo"),
+            OutputFormat::Human,
+            1,
+            false,
+            true,
+            None,
+        );
+
+        apply_cache_dir_env_override(
+            Path::new("/repo"),
+            &mut resolved,
+            Some(PathBuf::from(".cache/from-env")),
+        );
+
+        assert_eq!(resolved.cache_dir, PathBuf::from("/repo/.cache/from-env"));
+    }
 }

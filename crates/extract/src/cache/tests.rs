@@ -6,6 +6,8 @@ use oxc_span::Span;
 
 use crate::*;
 use fallow_types::discover::FileId;
+use fallow_types::extract::{SkippedSecurityCalleeExpressionKind, SkippedSecurityCalleeReason};
+use fallow_types::source_fingerprint::SourceFingerprint;
 
 use super::*;
 
@@ -23,29 +25,325 @@ fn cache_store_default_is_empty() {
 }
 
 #[test]
+fn cache_roundtrip_preserves_declaration_merge_facts() {
+    let module = parse_from_content(
+        FileId(0),
+        Path::new("src/merged.ts"),
+        "export interface Merged {}\nexport namespace Merged {}",
+    );
+    let cached = module_to_cached_from_parts(&module, 10, 20);
+    let encoded = bitcode::encode(&cached);
+    let decoded: CachedModule = bitcode::decode(&encoded).expect("decode cached module");
+    let restored = cached_to_module(&decoded, FileId(0));
+
+    assert!(restored.semantic_facts.iter().any(|fact| matches!(
+        fact,
+        fallow_types::extract::SemanticFact::DeclarationMerge(group)
+            if group.export_spans.len() == 2
+    )));
+}
+
+#[test]
+fn cache_roundtrip_preserves_single_static_cjs_object_map_provenance() {
+    let module = parse_from_content(
+        FileId(0),
+        Path::new("src/theme.cjs"),
+        "module.exports = { default: 'blue', primary: 'red' };",
+    );
+    let cached = module_to_cached_from_parts(&module, 10, 20);
+    let encoded = bitcode::encode(&cached);
+    let decoded: CachedModule = bitcode::decode(&encoded).expect("decode cached module");
+    let restored = cached_to_module(&decoded, FileId(0));
+
+    assert!(
+        restored
+            .semantic_facts
+            .contains(&SemanticFact::CjsSingleStaticObjectMap)
+    );
+}
+
+#[test]
+fn cache_roundtrip_preserves_default_import_whole_object_use() {
+    let module = parse_from_content(
+        FileId(0),
+        Path::new("src/consumer.ts"),
+        "import value from './value'; hand(value);",
+    );
+    let cached = module_to_cached_from_parts(&module, 10, 20);
+    let encoded = bitcode::encode(&cached);
+    let decoded: CachedModule = bitcode::decode(&encoded).expect("decode cached module");
+    let restored = cached_to_module(&decoded, FileId(0));
+
+    assert!(restored.semantic_facts.iter().any(|fact| matches!(
+        fact,
+        SemanticFact::DefaultImportWholeObjectUse(use_fact)
+            if use_fact.local_name == "value"
+    )));
+}
+
+#[test]
+fn cache_roundtrip_preserves_type_alias_surface_targets() {
+    let module = parse_from_content(
+        FileId(0),
+        Path::new("src/alias.ts"),
+        "export type Surface = Pick<Target, 'used'> & { nested: Nested }",
+    );
+    let cached = module_to_cached_from_parts(&module, 10, 20);
+    let encoded = bitcode::encode(&cached);
+    let decoded: CachedModule = bitcode::decode(&encoded).expect("decode cached module");
+    let restored = cached_to_module(&decoded, FileId(0));
+
+    assert!(restored.semantic_facts.iter().any(|fact| matches!(
+        fact,
+        fallow_types::extract::SemanticFact::TypeAliasSurfaceTarget(edge)
+            if edge.alias_name == "Surface" && edge.target_name == "Target"
+    )));
+    assert!(!restored.semantic_facts.iter().any(|fact| matches!(
+        fact,
+        fallow_types::extract::SemanticFact::TypeAliasSurfaceTarget(edge)
+            if edge.target_name == "Nested"
+    )));
+}
+
+#[test]
+fn cache_roundtrip_preserves_computed_enum_key_facts() {
+    let module = parse_from_content(
+        FileId(0),
+        Path::new("src/key.ts"),
+        "export enum Key { Protocol = '__protocol' }\nvalue[Key.Protocol]",
+    );
+    let cached = module_to_cached_from_parts(&module, 10, 20);
+    let encoded = bitcode::encode(&cached);
+    let decoded: CachedModule = bitcode::decode(&encoded).expect("decode cached module");
+    let restored = cached_to_module(&decoded, FileId(0));
+
+    assert!(restored.semantic_facts.iter().any(|fact| matches!(
+        fact,
+        fallow_types::extract::SemanticFact::StringEnumMemberValue(value)
+            if value.value == "__protocol"
+    )));
+    assert!(restored.semantic_facts.iter().any(|fact| matches!(
+        fact,
+        fallow_types::extract::SemanticFact::ComputedEnumKeyUse(usage)
+            if usage.key_object == "Key" && usage.key_member == "Protocol"
+    )));
+}
+
+#[test]
+fn cache_roundtrip_preserves_unresolved_callee_diagnostics() {
+    let module = parse_from_content(
+        FileId(7),
+        Path::new("src/security.ts"),
+        "client[method](req.body.name);",
+    );
+    assert_eq!(module.security_sinks_skipped, 1);
+    assert_eq!(module.security_unresolved_callee_sites.len(), 1);
+
+    let cached = module_to_cached_from_parts(&module, 10, 20);
+    assert!(cached.semantic_facts.is_none());
+    let restored = cached_to_module(&cached, FileId(7));
+    let diagnostic = restored
+        .security_unresolved_callee_sites
+        .first()
+        .expect("diagnostic round-tripped");
+
+    assert_eq!(restored.security_sinks_skipped, 1);
+    assert_eq!(
+        diagnostic.reason,
+        SkippedSecurityCalleeReason::ComputedMember
+    );
+    assert_eq!(
+        diagnostic.expression_kind,
+        SkippedSecurityCalleeExpressionKind::ComputedMemberExpression
+    );
+}
+
+#[test]
+fn cache_roundtrip_preserves_react_structural_ir() {
+    let module = parse_from_content(
+        FileId(7),
+        Path::new("src/App.tsx"),
+        "import { useEffect } from 'react';\nexport const App = ({ name }) => { useEffect(() => {}, [name]); return <Child id={name} />; };",
+    );
+    assert_eq!(module.component_functions.len(), 1);
+    assert_eq!(module.react_props.len(), 1);
+    assert_eq!(module.hook_uses.len(), 1);
+    assert_eq!(module.render_edges.len(), 1);
+
+    let cached = module_to_cached_from_parts(&module, 10, 20);
+    let restored = cached_to_module(&cached, FileId(7));
+
+    assert_eq!(restored.component_functions.len(), 1);
+    assert_eq!(restored.component_functions[0].name, "App");
+    assert_eq!(restored.react_props.len(), 1);
+    assert_eq!(restored.react_props[0].name, "name");
+    assert_eq!(restored.hook_uses.len(), 1);
+    assert_eq!(restored.hook_uses[0].dep_array_arity, Some(1));
+    assert_eq!(restored.render_edges.len(), 1);
+    assert_eq!(restored.render_edges[0].child_component_name, "Child");
+    assert_eq!(restored.render_edges[0].attr_names, vec!["id".to_string()]);
+}
+
+#[test]
+fn cache_omits_empty_exported_factory_returns_but_roundtrips_non_empty() {
+    let empty = parse_from_content(
+        FileId(7),
+        Path::new("src/plain.ts"),
+        "export const value = 1;",
+    );
+    assert!(empty.exported_factory_returns.is_empty());
+    let cached_empty = module_to_cached_from_parts(&empty, 10, 20);
+    assert!(cached_empty.exported_factory_returns.is_none());
+
+    let module = parse_from_content(
+        FileId(8),
+        Path::new("src/factory.ts"),
+        "class RESTApi {}\nexport function useApi() { return new RESTApi(); }",
+    );
+    assert_eq!(module.exported_factory_returns.len(), 1);
+    let cached = module_to_cached_from_parts(&module, 10, 20);
+    assert!(cached.exported_factory_returns.is_some());
+    let restored = cached_to_module(&cached, FileId(8));
+
+    assert_eq!(
+        restored.exported_factory_returns,
+        module.exported_factory_returns
+    );
+}
+
+#[test]
+fn cache_omits_empty_object_shapes_but_roundtrips_non_empty() {
+    // Issue #1858: the object-literal factory-return shape is compacted to `None`
+    // when empty and roundtrips byte-identically when populated. Without this a
+    // warm cache would drop the shape and re-flag the credited members.
+    let empty = parse_from_content(
+        FileId(7),
+        Path::new("src/plain.ts"),
+        "export const value = 1;",
+    );
+    assert!(empty.exported_factory_return_object_shapes.is_empty());
+    let cached_empty = module_to_cached_from_parts(&empty, 10, 20);
+    assert!(cached_empty.exported_factory_return_object_shapes.is_none());
+
+    let module = parse_from_content(
+        FileId(8),
+        Path::new("src/factory.ts"),
+        "class D { m() {} }\nexport class F { readonly p: D = new D() }\nexport function createUi() { const f = new F(); return { orders: f.p } }",
+    );
+    assert_eq!(module.exported_factory_return_object_shapes.len(), 1);
+    let cached = module_to_cached_from_parts(&module, 10, 20);
+    assert!(cached.exported_factory_return_object_shapes.is_some());
+    let restored = cached_to_module(&cached, FileId(8));
+
+    assert_eq!(
+        restored.exported_factory_return_object_shapes,
+        module.exported_factory_return_object_shapes
+    );
+}
+
+#[test]
+fn cache_omits_empty_type_member_types_but_roundtrips_non_empty() {
+    let empty = parse_from_content(
+        FileId(7),
+        Path::new("src/plain.ts"),
+        "export const value = 1;",
+    );
+    assert!(empty.type_member_types.is_empty());
+    let cached_empty = module_to_cached_from_parts(&empty, 10, 20);
+    assert!(cached_empty.type_member_types.is_none());
+
+    let module = parse_from_content(
+        FileId(8),
+        Path::new("src/opts.ts"),
+        "import type { OptDep } from './dep';\nexport interface SharedOpts { c: OptDep }",
+    );
+    assert_eq!(module.type_member_types.len(), 1);
+    let cached = module_to_cached_from_parts(&module, 10, 20);
+    assert!(cached.type_member_types.is_some());
+    let restored = cached_to_module(&cached, FileId(8));
+
+    assert_eq!(restored.type_member_types, module.type_member_types);
+}
+
+#[test]
 fn cache_store_insert_and_get() {
     let mut store = CacheStore::new();
     let module = CachedModule {
         content_hash: 42,
-        mtime_secs: 0,
+        mtime_ns: 0,
         file_size: 0,
+        last_access_secs: 0,
         exports: vec![],
         imports: vec![],
         re_exports: vec![],
         dynamic_imports: vec![],
         require_calls: vec![],
+        package_path_references: Box::default(),
         member_accesses: vec![],
-        whole_object_uses: vec![],
+        semantic_facts: None,
+        whole_object_uses: Box::default(),
         dynamic_import_patterns: vec![],
         has_cjs_exports: false,
+        has_angular_component_template_url: false,
         unused_import_bindings: vec![],
         type_referenced_import_bindings: vec![],
         value_referenced_import_bindings: vec![],
         suppressions: vec![],
+        unknown_suppression_kinds: vec![],
         line_offsets: vec![],
         complexity: vec![],
         flag_uses: vec![],
         class_heritage: vec![],
+        exported_factory_returns: None,
+        exported_factory_return_object_shapes: None,
+        type_member_types: None,
+        injection_tokens: vec![],
+        local_type_declarations: Vec::new(),
+        public_signature_type_references: Vec::new(),
+        namespace_object_aliases: Vec::new(),
+        iconify_prefixes: Vec::new(),
+        iconify_icon_names: Vec::new(),
+        auto_import_candidates: Vec::new(),
+        directives: Vec::new(),
+        client_only_dynamic_import_spans: Vec::new(),
+        security_sinks: Vec::new(),
+        security_sinks_skipped: 0,
+        security_unresolved_callee_sites: Vec::new(),
+        tainted_bindings: Vec::new(),
+        sanitized_sink_args: Vec::new(),
+        security_control_sites: Vec::new(),
+        callee_uses: Vec::new(),
+        misplaced_directives: Vec::new(),
+        inline_server_action_exports: Vec::new(),
+        di_key_sites: Vec::new(),
+        has_dynamic_provide: false,
+        component_props: Vec::new(),
+        has_props_attrs_fallthrough: false,
+        has_define_expose: false,
+        has_define_model: false,
+        has_unharvestable_props: false,
+        component_emits: Vec::new(),
+        angular_inputs: Vec::new(),
+        angular_outputs: Vec::new(),
+        has_unharvestable_emits: false,
+        has_dynamic_emit: false,
+        has_emit_whole_object_use: false,
+        load_return_keys: Vec::new(),
+        has_unharvestable_load: false,
+        has_load_data_whole_use: false,
+        component_functions: Vec::new(),
+        react_props: Vec::new(),
+        hook_uses: Vec::new(),
+        render_edges: Vec::new(),
+        svelte_dispatched_events: Vec::new(),
+        svelte_listened_events: Vec::new(),
+        angular_component_selectors: Vec::new(),
+        registered_custom_elements: Vec::new(),
+        used_custom_element_tags: Vec::new(),
+        angular_used_selectors: Vec::new(),
+        angular_entry_component_refs: Vec::new(),
+        has_dynamic_component_render: false,
+        has_dynamic_dispatch: false,
     };
     store.insert(Path::new("test.ts"), module);
     assert_eq!(store.len(), 1);
@@ -58,25 +356,80 @@ fn cache_store_hash_mismatch_returns_none() {
     let mut store = CacheStore::new();
     let module = CachedModule {
         content_hash: 42,
-        mtime_secs: 0,
+        mtime_ns: 0,
         file_size: 0,
+        last_access_secs: 0,
         exports: vec![],
         imports: vec![],
         re_exports: vec![],
         dynamic_imports: vec![],
         require_calls: vec![],
+        package_path_references: Box::default(),
         member_accesses: vec![],
-        whole_object_uses: vec![],
+        semantic_facts: None,
+        whole_object_uses: Box::default(),
         dynamic_import_patterns: vec![],
         has_cjs_exports: false,
+        has_angular_component_template_url: false,
         unused_import_bindings: vec![],
         type_referenced_import_bindings: vec![],
         value_referenced_import_bindings: vec![],
         suppressions: vec![],
+        unknown_suppression_kinds: vec![],
         line_offsets: vec![],
         complexity: vec![],
         flag_uses: vec![],
         class_heritage: vec![],
+        exported_factory_returns: None,
+        exported_factory_return_object_shapes: None,
+        type_member_types: None,
+        injection_tokens: vec![],
+        local_type_declarations: Vec::new(),
+        public_signature_type_references: Vec::new(),
+        namespace_object_aliases: Vec::new(),
+        iconify_prefixes: Vec::new(),
+        iconify_icon_names: Vec::new(),
+        auto_import_candidates: Vec::new(),
+        directives: Vec::new(),
+        client_only_dynamic_import_spans: Vec::new(),
+        security_sinks: Vec::new(),
+        security_sinks_skipped: 0,
+        security_unresolved_callee_sites: Vec::new(),
+        tainted_bindings: Vec::new(),
+        sanitized_sink_args: Vec::new(),
+        security_control_sites: Vec::new(),
+        callee_uses: Vec::new(),
+        misplaced_directives: Vec::new(),
+        inline_server_action_exports: Vec::new(),
+        di_key_sites: Vec::new(),
+        has_dynamic_provide: false,
+        component_props: Vec::new(),
+        has_props_attrs_fallthrough: false,
+        has_define_expose: false,
+        has_define_model: false,
+        has_unharvestable_props: false,
+        component_emits: Vec::new(),
+        angular_inputs: Vec::new(),
+        angular_outputs: Vec::new(),
+        has_unharvestable_emits: false,
+        has_dynamic_emit: false,
+        has_emit_whole_object_use: false,
+        load_return_keys: Vec::new(),
+        has_unharvestable_load: false,
+        has_load_data_whole_use: false,
+        component_functions: Vec::new(),
+        react_props: Vec::new(),
+        hook_uses: Vec::new(),
+        render_edges: Vec::new(),
+        svelte_dispatched_events: Vec::new(),
+        svelte_listened_events: Vec::new(),
+        angular_component_selectors: Vec::new(),
+        registered_custom_elements: Vec::new(),
+        used_custom_element_tags: Vec::new(),
+        angular_used_selectors: Vec::new(),
+        angular_entry_component_refs: Vec::new(),
+        has_dynamic_component_render: false,
+        has_dynamic_dispatch: false,
     };
     store.insert(Path::new("test.ts"), module);
     assert!(store.get(Path::new("test.ts"), 99).is_none());
@@ -89,51 +442,165 @@ fn cache_store_missing_key_returns_none() {
 }
 
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "test fixture; linear setup/assert, length is not a maintainability concern"
+)]
 fn cache_store_overwrite_entry() {
     let mut store = CacheStore::new();
     let m1 = CachedModule {
         content_hash: 1,
-        mtime_secs: 0,
+        mtime_ns: 0,
         file_size: 0,
+        last_access_secs: 0,
         exports: vec![],
         imports: vec![],
         re_exports: vec![],
         dynamic_imports: vec![],
         require_calls: vec![],
+        package_path_references: Box::default(),
         member_accesses: vec![],
-        whole_object_uses: vec![],
+        semantic_facts: None,
+        whole_object_uses: Box::default(),
         dynamic_import_patterns: vec![],
         has_cjs_exports: false,
+        has_angular_component_template_url: false,
         unused_import_bindings: vec![],
         type_referenced_import_bindings: vec![],
         value_referenced_import_bindings: vec![],
         suppressions: vec![],
+        unknown_suppression_kinds: vec![],
         line_offsets: vec![],
         complexity: vec![],
         flag_uses: vec![],
         class_heritage: vec![],
+        exported_factory_returns: None,
+        exported_factory_return_object_shapes: None,
+        type_member_types: None,
+        injection_tokens: vec![],
+        local_type_declarations: Vec::new(),
+        public_signature_type_references: Vec::new(),
+        namespace_object_aliases: Vec::new(),
+        iconify_prefixes: Vec::new(),
+        iconify_icon_names: Vec::new(),
+        auto_import_candidates: Vec::new(),
+        directives: Vec::new(),
+        client_only_dynamic_import_spans: Vec::new(),
+        security_sinks: Vec::new(),
+        security_sinks_skipped: 0,
+        security_unresolved_callee_sites: Vec::new(),
+        tainted_bindings: Vec::new(),
+        sanitized_sink_args: Vec::new(),
+        security_control_sites: Vec::new(),
+        callee_uses: Vec::new(),
+        misplaced_directives: Vec::new(),
+        inline_server_action_exports: Vec::new(),
+        di_key_sites: Vec::new(),
+        has_dynamic_provide: false,
+        component_props: Vec::new(),
+        has_props_attrs_fallthrough: false,
+        has_define_expose: false,
+        has_define_model: false,
+        has_unharvestable_props: false,
+        component_emits: Vec::new(),
+        angular_inputs: Vec::new(),
+        angular_outputs: Vec::new(),
+        has_unharvestable_emits: false,
+        has_dynamic_emit: false,
+        has_emit_whole_object_use: false,
+        load_return_keys: Vec::new(),
+        has_unharvestable_load: false,
+        has_load_data_whole_use: false,
+        component_functions: Vec::new(),
+        react_props: Vec::new(),
+        hook_uses: Vec::new(),
+        render_edges: Vec::new(),
+        svelte_dispatched_events: Vec::new(),
+        svelte_listened_events: Vec::new(),
+        angular_component_selectors: Vec::new(),
+        registered_custom_elements: Vec::new(),
+        used_custom_element_tags: Vec::new(),
+        angular_used_selectors: Vec::new(),
+        angular_entry_component_refs: Vec::new(),
+        has_dynamic_component_render: false,
+        has_dynamic_dispatch: false,
     };
     let m2 = CachedModule {
         content_hash: 2,
-        mtime_secs: 0,
+        mtime_ns: 0,
         file_size: 0,
+        last_access_secs: 0,
         exports: vec![],
         imports: vec![],
         re_exports: vec![],
         dynamic_imports: vec![],
         require_calls: vec![],
+        package_path_references: Box::default(),
         member_accesses: vec![],
-        whole_object_uses: vec![],
+        semantic_facts: None,
+        whole_object_uses: Box::default(),
         dynamic_import_patterns: vec![],
         has_cjs_exports: false,
+        has_angular_component_template_url: false,
         unused_import_bindings: vec![],
         type_referenced_import_bindings: vec![],
         value_referenced_import_bindings: vec![],
         suppressions: vec![],
+        unknown_suppression_kinds: vec![],
         line_offsets: vec![],
         complexity: vec![],
         flag_uses: vec![],
         class_heritage: vec![],
+        exported_factory_returns: None,
+        exported_factory_return_object_shapes: None,
+        type_member_types: None,
+        injection_tokens: vec![],
+        local_type_declarations: Vec::new(),
+        public_signature_type_references: Vec::new(),
+        namespace_object_aliases: Vec::new(),
+        iconify_prefixes: Vec::new(),
+        iconify_icon_names: Vec::new(),
+        auto_import_candidates: Vec::new(),
+        directives: Vec::new(),
+        client_only_dynamic_import_spans: Vec::new(),
+        security_sinks: Vec::new(),
+        security_sinks_skipped: 0,
+        security_unresolved_callee_sites: Vec::new(),
+        tainted_bindings: Vec::new(),
+        sanitized_sink_args: Vec::new(),
+        security_control_sites: Vec::new(),
+        callee_uses: Vec::new(),
+        misplaced_directives: Vec::new(),
+        inline_server_action_exports: Vec::new(),
+        di_key_sites: Vec::new(),
+        has_dynamic_provide: false,
+        component_props: Vec::new(),
+        has_props_attrs_fallthrough: false,
+        has_define_expose: false,
+        has_define_model: false,
+        has_unharvestable_props: false,
+        component_emits: Vec::new(),
+        angular_inputs: Vec::new(),
+        angular_outputs: Vec::new(),
+        has_unharvestable_emits: false,
+        has_dynamic_emit: false,
+        has_emit_whole_object_use: false,
+        load_return_keys: Vec::new(),
+        has_unharvestable_load: false,
+        has_load_data_whole_use: false,
+        component_functions: Vec::new(),
+        react_props: Vec::new(),
+        hook_uses: Vec::new(),
+        render_edges: Vec::new(),
+        svelte_dispatched_events: Vec::new(),
+        svelte_listened_events: Vec::new(),
+        angular_component_selectors: Vec::new(),
+        registered_custom_elements: Vec::new(),
+        used_custom_element_tags: Vec::new(),
+        angular_used_selectors: Vec::new(),
+        angular_entry_component_refs: Vec::new(),
+        has_dynamic_component_render: false,
+        has_dynamic_dispatch: false,
     };
     store.insert(Path::new("test.ts"), m1);
     store.insert(Path::new("test.ts"), m2);
@@ -143,6 +610,10 @@ fn cache_store_overwrite_entry() {
 }
 
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "test fixture; linear setup/assert, length is not a maintainability concern"
+)]
 fn module_to_cached_roundtrip_named_export() {
     let module = ModuleInfo {
         file_id: FileId(0),
@@ -151,32 +622,105 @@ fn module_to_cached_roundtrip_named_export() {
             local_name: Some("foo".to_string()),
             is_type_only: false,
             visibility: VisibilityTag::None,
+            expected_unused_reason: None,
             span: Span::new(10, 20),
             members: vec![],
+            is_side_effect_used: false,
             super_class: None,
-        }],
+        }]
+        .into(),
         imports: vec![],
         re_exports: vec![],
         dynamic_imports: vec![],
         require_calls: vec![],
-        member_accesses: vec![],
-        whole_object_uses: vec![],
+        package_path_references: Box::default(),
+        member_accesses: vec![].into(),
+        semantic_facts: std::sync::Arc::default(),
+        whole_object_uses: std::sync::Arc::default(),
         dynamic_import_patterns: vec![],
         has_cjs_exports: false,
+        has_angular_component_template_url: false,
         unused_import_bindings: vec![],
         type_referenced_import_bindings: vec![],
         value_referenced_import_bindings: vec![],
         content_hash: 123,
         suppressions: vec![],
+        unknown_suppression_kinds: vec![],
         line_offsets: vec![],
         complexity: Vec::new(),
         flag_uses: Vec::new(),
         class_heritage: vec![],
+        exported_factory_returns: std::sync::Arc::default(),
+        exported_factory_return_object_shapes: std::sync::Arc::default(),
+        type_member_types: std::sync::Arc::default(),
+        injection_tokens: vec![],
+        local_type_declarations: Vec::new(),
+        public_signature_type_references: Vec::new(),
+        namespace_object_aliases: Vec::new(),
+        iconify_prefixes: vec!["jam".to_string(), "ic".to_string()],
+        iconify_icon_names: vec!["simple-icons-github".to_string()],
+        auto_import_candidates: vec!["Card001".to_string(), "BaseButton".to_string()],
+        directives: Vec::new(),
+        client_only_dynamic_import_spans: Vec::new(),
+        security_sinks: Vec::new(),
+        security_sinks_skipped: 0,
+        security_unresolved_callee_sites: Vec::new(),
+        tainted_bindings: Vec::new(),
+        sanitized_sink_args: Vec::new(),
+        security_control_sites: Vec::new(),
+        callee_uses: Vec::new(),
+        misplaced_directives: Vec::new(),
+        inline_server_action_exports: Vec::new(),
+        di_key_sites: Vec::new(),
+        has_dynamic_provide: false,
+        referenced_import_bindings: vec![],
+        component_props: Vec::new(),
+        has_props_attrs_fallthrough: false,
+        has_define_expose: false,
+        has_define_model: false,
+        has_unharvestable_props: false,
+        component_emits: Vec::new(),
+        angular_inputs: Vec::new(),
+        angular_outputs: Vec::new(),
+        has_unharvestable_emits: false,
+        has_dynamic_emit: false,
+        has_emit_whole_object_use: false,
+        load_return_keys: Vec::new(),
+        has_unharvestable_load: false,
+        has_load_data_whole_use: false,
+        has_page_data_store_whole_use: false,
+        has_route_loader_data_whole_use: false,
+        component_functions: Vec::new(),
+        react_props: Vec::new(),
+        hook_uses: Vec::new(),
+        render_edges: Vec::new(),
+        svelte_dispatched_events: Vec::new(),
+        svelte_listened_events: Vec::new(),
+        angular_component_selectors: Vec::new(),
+        registered_custom_elements: Vec::new(),
+        used_custom_element_tags: Vec::new(),
+        angular_used_selectors: Vec::new(),
+        angular_entry_component_refs: Vec::new(),
+        has_dynamic_component_render: false,
+        has_dynamic_dispatch: false,
     };
 
-    let cached = module_to_cached(&module, 0, 0);
+    let cached = module_to_cached_from_parts(&module, 0, 0);
+    assert!(cached.semantic_facts.is_none());
     let restored = cached_to_module(&cached, FileId(0));
 
+    assert_eq!(
+        restored.iconify_prefixes,
+        vec!["jam".to_string(), "ic".to_string()]
+    );
+    assert_eq!(
+        restored.iconify_icon_names,
+        vec!["simple-icons-github".to_string()]
+    );
+    assert_eq!(
+        restored.auto_import_candidates,
+        vec!["Card001".to_string(), "BaseButton".to_string()]
+    );
     assert_eq!(restored.exports.len(), 1);
     assert_eq!(
         restored.exports[0].name,
@@ -189,6 +733,110 @@ fn module_to_cached_roundtrip_named_export() {
 }
 
 #[test]
+fn module_to_cached_roundtrip_side_effect_used_export() {
+    let module = ModuleInfo {
+        file_id: FileId(0),
+        exports: vec![ExportInfo {
+            name: ExportName::Named("MyElement".to_string()),
+            local_name: Some("MyElement".to_string()),
+            is_type_only: false,
+            is_side_effect_used: true,
+            visibility: VisibilityTag::None,
+            expected_unused_reason: None,
+            span: Span::new(10, 20),
+            members: vec![],
+            super_class: Some("HTMLElement".to_string()),
+        }]
+        .into(),
+        imports: vec![],
+        re_exports: vec![],
+        dynamic_imports: vec![],
+        require_calls: vec![],
+        package_path_references: Box::default(),
+        member_accesses: vec![].into(),
+        semantic_facts: std::sync::Arc::default(),
+        whole_object_uses: std::sync::Arc::default(),
+        dynamic_import_patterns: vec![],
+        has_cjs_exports: false,
+        has_angular_component_template_url: false,
+        unused_import_bindings: vec![],
+        type_referenced_import_bindings: vec![],
+        value_referenced_import_bindings: vec![],
+        content_hash: 789,
+        suppressions: vec![],
+        unknown_suppression_kinds: vec![],
+        line_offsets: vec![],
+        complexity: Vec::new(),
+        flag_uses: Vec::new(),
+        class_heritage: vec![],
+        exported_factory_returns: std::sync::Arc::default(),
+        exported_factory_return_object_shapes: std::sync::Arc::default(),
+        type_member_types: std::sync::Arc::default(),
+        injection_tokens: vec![],
+        local_type_declarations: Vec::new(),
+        public_signature_type_references: Vec::new(),
+        namespace_object_aliases: Vec::new(),
+        iconify_prefixes: Vec::new(),
+        iconify_icon_names: Vec::new(),
+        auto_import_candidates: Vec::new(),
+        directives: Vec::new(),
+        client_only_dynamic_import_spans: Vec::new(),
+        security_sinks: Vec::new(),
+        security_sinks_skipped: 0,
+        security_unresolved_callee_sites: Vec::new(),
+        tainted_bindings: Vec::new(),
+        sanitized_sink_args: Vec::new(),
+        security_control_sites: Vec::new(),
+        callee_uses: Vec::new(),
+        misplaced_directives: Vec::new(),
+        inline_server_action_exports: Vec::new(),
+        di_key_sites: Vec::new(),
+        has_dynamic_provide: false,
+        referenced_import_bindings: vec![],
+        component_props: Vec::new(),
+        has_props_attrs_fallthrough: false,
+        has_define_expose: false,
+        has_define_model: false,
+        has_unharvestable_props: false,
+        component_emits: Vec::new(),
+        angular_inputs: Vec::new(),
+        angular_outputs: Vec::new(),
+        has_unharvestable_emits: false,
+        has_dynamic_emit: false,
+        has_emit_whole_object_use: false,
+        load_return_keys: Vec::new(),
+        has_unharvestable_load: false,
+        has_load_data_whole_use: false,
+        has_page_data_store_whole_use: false,
+        has_route_loader_data_whole_use: false,
+        component_functions: Vec::new(),
+        react_props: Vec::new(),
+        hook_uses: Vec::new(),
+        render_edges: Vec::new(),
+        svelte_dispatched_events: Vec::new(),
+        svelte_listened_events: Vec::new(),
+        angular_component_selectors: Vec::new(),
+        registered_custom_elements: Vec::new(),
+        used_custom_element_tags: Vec::new(),
+        angular_used_selectors: Vec::new(),
+        angular_entry_component_refs: Vec::new(),
+        has_dynamic_component_render: false,
+        has_dynamic_dispatch: false,
+    };
+
+    let cached = module_to_cached_from_parts(&module, 0, 0);
+    assert!(cached.semantic_facts.is_none());
+    let restored = cached_to_module(&cached, FileId(0));
+
+    assert_eq!(restored.exports.len(), 1);
+    assert!(restored.exports[0].is_side_effect_used);
+    assert_eq!(
+        restored.exports[0].super_class.as_deref(),
+        Some("HTMLElement")
+    );
+}
+
+#[test]
 fn module_to_cached_roundtrip_default_export() {
     let module = ModuleInfo {
         file_id: FileId(0),
@@ -197,46 +845,113 @@ fn module_to_cached_roundtrip_default_export() {
             local_name: None,
             is_type_only: false,
             visibility: VisibilityTag::None,
+            expected_unused_reason: None,
             span: Span::new(0, 10),
             members: vec![],
+            is_side_effect_used: false,
             super_class: None,
-        }],
+        }]
+        .into(),
         imports: vec![],
         re_exports: vec![],
         dynamic_imports: vec![],
         require_calls: vec![],
-        member_accesses: vec![],
-        whole_object_uses: vec![],
+        package_path_references: Box::default(),
+        member_accesses: vec![].into(),
+        semantic_facts: std::sync::Arc::default(),
+        whole_object_uses: std::sync::Arc::default(),
         dynamic_import_patterns: vec![],
         has_cjs_exports: false,
+        has_angular_component_template_url: false,
         unused_import_bindings: vec![],
         type_referenced_import_bindings: vec![],
         value_referenced_import_bindings: vec![],
         content_hash: 456,
         suppressions: vec![],
+        unknown_suppression_kinds: vec![],
         line_offsets: vec![],
         complexity: Vec::new(),
         flag_uses: Vec::new(),
         class_heritage: vec![],
+        exported_factory_returns: std::sync::Arc::default(),
+        exported_factory_return_object_shapes: std::sync::Arc::default(),
+        type_member_types: std::sync::Arc::default(),
+        injection_tokens: vec![],
+        local_type_declarations: Vec::new(),
+        public_signature_type_references: Vec::new(),
+        namespace_object_aliases: Vec::new(),
+        iconify_prefixes: Vec::new(),
+        iconify_icon_names: Vec::new(),
+        auto_import_candidates: Vec::new(),
+        directives: Vec::new(),
+        client_only_dynamic_import_spans: Vec::new(),
+        security_sinks: Vec::new(),
+        security_sinks_skipped: 0,
+        security_unresolved_callee_sites: Vec::new(),
+        tainted_bindings: Vec::new(),
+        sanitized_sink_args: Vec::new(),
+        security_control_sites: Vec::new(),
+        callee_uses: Vec::new(),
+        misplaced_directives: Vec::new(),
+        inline_server_action_exports: Vec::new(),
+        di_key_sites: Vec::new(),
+        has_dynamic_provide: false,
+        referenced_import_bindings: vec![],
+        component_props: Vec::new(),
+        has_props_attrs_fallthrough: false,
+        has_define_expose: false,
+        has_define_model: false,
+        has_unharvestable_props: false,
+        component_emits: Vec::new(),
+        angular_inputs: Vec::new(),
+        angular_outputs: Vec::new(),
+        has_unharvestable_emits: false,
+        has_dynamic_emit: false,
+        has_emit_whole_object_use: false,
+        load_return_keys: Vec::new(),
+        has_unharvestable_load: false,
+        has_load_data_whole_use: false,
+        has_page_data_store_whole_use: false,
+        has_route_loader_data_whole_use: false,
+        component_functions: Vec::new(),
+        react_props: Vec::new(),
+        hook_uses: Vec::new(),
+        render_edges: Vec::new(),
+        svelte_dispatched_events: Vec::new(),
+        svelte_listened_events: Vec::new(),
+        angular_component_selectors: Vec::new(),
+        registered_custom_elements: Vec::new(),
+        used_custom_element_tags: Vec::new(),
+        angular_used_selectors: Vec::new(),
+        angular_entry_component_refs: Vec::new(),
+        has_dynamic_component_render: false,
+        has_dynamic_dispatch: false,
     };
 
-    let cached = module_to_cached(&module, 0, 0);
+    let cached = module_to_cached_from_parts(&module, 0, 0);
+    assert!(cached.semantic_facts.is_none());
     let restored = cached_to_module(&cached, FileId(0));
 
     assert_eq!(restored.exports[0].name, ExportName::Default);
 }
 
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "test fixture; linear setup/assert, length is not a maintainability concern"
+)]
 fn module_to_cached_roundtrip_imports() {
     let module = ModuleInfo {
         file_id: FileId(0),
-        exports: vec![],
+        exports: vec![].into(),
         imports: vec![
             ImportInfo {
                 source: "./utils".to_string(),
                 imported_name: ImportedName::Named("foo".to_string()),
                 local_name: "foo".to_string(),
                 is_type_only: false,
+                is_type_only_star: false,
+                from_style: false,
                 span: Span::new(0, 10),
                 source_span: Span::new(5, 10),
             },
@@ -245,6 +960,8 @@ fn module_to_cached_roundtrip_imports() {
                 imported_name: ImportedName::Default,
                 local_name: "React".to_string(),
                 is_type_only: false,
+                is_type_only_star: false,
+                from_style: false,
                 span: Span::new(15, 30),
                 source_span: Span::new(20, 30),
             },
@@ -253,6 +970,8 @@ fn module_to_cached_roundtrip_imports() {
                 imported_name: ImportedName::Namespace,
                 local_name: "all".to_string(),
                 is_type_only: false,
+                is_type_only_star: false,
+                from_style: false,
                 span: Span::new(35, 50),
                 source_span: Span::new(40, 50),
             },
@@ -261,6 +980,8 @@ fn module_to_cached_roundtrip_imports() {
                 imported_name: ImportedName::SideEffect,
                 local_name: String::new(),
                 is_type_only: false,
+                is_type_only_star: false,
+                from_style: false,
                 span: Span::new(55, 70),
                 source_span: Span::new(60, 70),
             },
@@ -268,22 +989,79 @@ fn module_to_cached_roundtrip_imports() {
         re_exports: vec![],
         dynamic_imports: vec![],
         require_calls: vec![],
-        member_accesses: vec![],
-        whole_object_uses: vec![],
+        package_path_references: Box::default(),
+        member_accesses: vec![].into(),
+        semantic_facts: std::sync::Arc::default(),
+        whole_object_uses: std::sync::Arc::default(),
         dynamic_import_patterns: vec![],
         has_cjs_exports: false,
+        has_angular_component_template_url: false,
         unused_import_bindings: vec![],
         type_referenced_import_bindings: vec![],
         value_referenced_import_bindings: vec![],
         content_hash: 789,
         suppressions: vec![],
+        unknown_suppression_kinds: vec![],
         line_offsets: vec![],
         complexity: Vec::new(),
         flag_uses: Vec::new(),
         class_heritage: vec![],
+        exported_factory_returns: std::sync::Arc::default(),
+        exported_factory_return_object_shapes: std::sync::Arc::default(),
+        type_member_types: std::sync::Arc::default(),
+        injection_tokens: vec![],
+        local_type_declarations: Vec::new(),
+        public_signature_type_references: Vec::new(),
+        namespace_object_aliases: Vec::new(),
+        iconify_prefixes: Vec::new(),
+        iconify_icon_names: Vec::new(),
+        auto_import_candidates: Vec::new(),
+        directives: Vec::new(),
+        client_only_dynamic_import_spans: Vec::new(),
+        security_sinks: Vec::new(),
+        security_sinks_skipped: 0,
+        security_unresolved_callee_sites: Vec::new(),
+        tainted_bindings: Vec::new(),
+        sanitized_sink_args: Vec::new(),
+        security_control_sites: Vec::new(),
+        callee_uses: Vec::new(),
+        misplaced_directives: Vec::new(),
+        inline_server_action_exports: Vec::new(),
+        di_key_sites: Vec::new(),
+        has_dynamic_provide: false,
+        referenced_import_bindings: vec![],
+        component_props: Vec::new(),
+        has_props_attrs_fallthrough: false,
+        has_define_expose: false,
+        has_define_model: false,
+        has_unharvestable_props: false,
+        component_emits: Vec::new(),
+        angular_inputs: Vec::new(),
+        angular_outputs: Vec::new(),
+        has_unharvestable_emits: false,
+        has_dynamic_emit: false,
+        has_emit_whole_object_use: false,
+        load_return_keys: Vec::new(),
+        has_unharvestable_load: false,
+        has_load_data_whole_use: false,
+        has_page_data_store_whole_use: false,
+        has_route_loader_data_whole_use: false,
+        component_functions: Vec::new(),
+        react_props: Vec::new(),
+        hook_uses: Vec::new(),
+        render_edges: Vec::new(),
+        svelte_dispatched_events: Vec::new(),
+        svelte_listened_events: Vec::new(),
+        angular_component_selectors: Vec::new(),
+        registered_custom_elements: Vec::new(),
+        used_custom_element_tags: Vec::new(),
+        angular_used_selectors: Vec::new(),
+        angular_entry_component_refs: Vec::new(),
+        has_dynamic_component_render: false,
+        has_dynamic_dispatch: false,
     };
 
-    let cached = module_to_cached(&module, 0, 0);
+    let cached = module_to_cached_from_parts(&module, 0, 0);
     let restored = cached_to_module(&cached, FileId(0));
 
     assert_eq!(restored.imports.len(), 4);
@@ -308,7 +1086,7 @@ fn module_to_cached_roundtrip_imports() {
 fn module_to_cached_roundtrip_re_exports() {
     let module = ModuleInfo {
         file_id: FileId(0),
-        exports: vec![],
+        exports: vec![].into(),
         imports: vec![],
         re_exports: vec![ReExportInfo {
             source: "./module".to_string(),
@@ -316,25 +1094,84 @@ fn module_to_cached_roundtrip_re_exports() {
             exported_name: "bar".to_string(),
             is_type_only: true,
             span: oxc_span::Span::default(),
+            statement_span: oxc_span::Span::new(0, 0),
+            source_span: oxc_span::Span::new(0, 0),
         }],
         dynamic_imports: vec![],
         require_calls: vec![],
-        member_accesses: vec![],
-        whole_object_uses: vec![],
+        package_path_references: Box::default(),
+        member_accesses: vec![].into(),
+        semantic_facts: std::sync::Arc::default(),
+        whole_object_uses: std::sync::Arc::default(),
         dynamic_import_patterns: vec![],
         has_cjs_exports: false,
+        has_angular_component_template_url: false,
         unused_import_bindings: vec![],
         type_referenced_import_bindings: vec![],
         value_referenced_import_bindings: vec![],
         content_hash: 0,
         suppressions: vec![],
+        unknown_suppression_kinds: vec![],
         line_offsets: vec![],
         complexity: Vec::new(),
         flag_uses: Vec::new(),
         class_heritage: vec![],
+        exported_factory_returns: std::sync::Arc::default(),
+        exported_factory_return_object_shapes: std::sync::Arc::default(),
+        type_member_types: std::sync::Arc::default(),
+        injection_tokens: vec![],
+        local_type_declarations: Vec::new(),
+        public_signature_type_references: Vec::new(),
+        namespace_object_aliases: Vec::new(),
+        iconify_prefixes: Vec::new(),
+        iconify_icon_names: Vec::new(),
+        auto_import_candidates: Vec::new(),
+        directives: Vec::new(),
+        client_only_dynamic_import_spans: Vec::new(),
+        security_sinks: Vec::new(),
+        security_sinks_skipped: 0,
+        security_unresolved_callee_sites: Vec::new(),
+        tainted_bindings: Vec::new(),
+        sanitized_sink_args: Vec::new(),
+        security_control_sites: Vec::new(),
+        callee_uses: Vec::new(),
+        misplaced_directives: Vec::new(),
+        inline_server_action_exports: Vec::new(),
+        di_key_sites: Vec::new(),
+        has_dynamic_provide: false,
+        referenced_import_bindings: vec![],
+        component_props: Vec::new(),
+        has_props_attrs_fallthrough: false,
+        has_define_expose: false,
+        has_define_model: false,
+        has_unharvestable_props: false,
+        component_emits: Vec::new(),
+        angular_inputs: Vec::new(),
+        angular_outputs: Vec::new(),
+        has_unharvestable_emits: false,
+        has_dynamic_emit: false,
+        has_emit_whole_object_use: false,
+        load_return_keys: Vec::new(),
+        has_unharvestable_load: false,
+        has_load_data_whole_use: false,
+        has_page_data_store_whole_use: false,
+        has_route_loader_data_whole_use: false,
+        component_functions: Vec::new(),
+        react_props: Vec::new(),
+        hook_uses: Vec::new(),
+        render_edges: Vec::new(),
+        svelte_dispatched_events: Vec::new(),
+        svelte_listened_events: Vec::new(),
+        angular_component_selectors: Vec::new(),
+        registered_custom_elements: Vec::new(),
+        used_custom_element_tags: Vec::new(),
+        angular_used_selectors: Vec::new(),
+        angular_entry_component_refs: Vec::new(),
+        has_dynamic_component_render: false,
+        has_dynamic_dispatch: false,
     };
 
-    let cached = module_to_cached(&module, 0, 0);
+    let cached = module_to_cached_from_parts(&module, 0, 0);
     let restored = cached_to_module(&cached, FileId(0));
 
     assert_eq!(restored.re_exports.len(), 1);
@@ -345,10 +1182,14 @@ fn module_to_cached_roundtrip_re_exports() {
 }
 
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "exhaustive ModuleInfo round-trip fixture literal"
+)]
 fn module_to_cached_roundtrip_dynamic_imports() {
     let module = ModuleInfo {
         file_id: FileId(0),
-        exports: vec![],
+        exports: vec![].into(),
         imports: vec![],
         re_exports: vec![],
         dynamic_imports: vec![DynamicImportInfo {
@@ -356,32 +1197,162 @@ fn module_to_cached_roundtrip_dynamic_imports() {
             span: Span::new(0, 10),
             destructured_names: Vec::new(),
             local_name: None,
+            is_speculative: false,
         }],
         require_calls: vec![RequireCallInfo {
             source: "fs".to_string(),
             span: Span::new(15, 25),
             destructured_names: Vec::new(),
             local_name: None,
+            source_span: oxc_span::Span::default(),
+            is_type_only: false,
         }],
+        package_path_references: Box::default(),
         member_accesses: vec![MemberAccess {
             object: "Status".to_string(),
             member: "Active".to_string(),
-        }],
-        whole_object_uses: vec![],
+        }]
+        .into(),
+        semantic_facts: vec![
+            SemanticFact::AngularTemplateMemberAccess(AngularTemplateMemberAccessFact {
+                member: "title".to_string(),
+            }),
+            SemanticFact::FactoryCallMemberAccess(FactoryCallMemberAccessFact {
+                callee_object: "MyClass".to_string(),
+                callee_method: "getInstance".to_string(),
+                member: "getData".to_string(),
+            }),
+            SemanticFact::FluentChainMemberAccess(FluentChainMemberAccessFact {
+                root_object: "EventBuilder".to_string(),
+                root_method: "create".to_string(),
+                chain: vec!["setProcessId".to_string(), "setSubject".to_string()],
+                member: "build".to_string(),
+            }),
+            SemanticFact::FluentChainNewMemberAccess(FluentChainNewMemberAccessFact {
+                class_name: "OptionBuilder".to_string(),
+                chain: vec!["addDefault".to_string(), "addFromCli".to_string()],
+                member: "build".to_string(),
+            }),
+            SemanticFact::PlaywrightFixtureUse(PlaywrightFixtureUseFact {
+                test_name: "test".to_string(),
+                fixture_name: "adminPage".to_string(),
+                member: "assertGreeting".to_string(),
+            }),
+            SemanticFact::PlaywrightFixtureDefinition(PlaywrightFixtureDefinitionFact {
+                test_name: "test".to_string(),
+                fixture_name: "adminPage".to_string(),
+                type_name: "AdminPage".to_string(),
+            }),
+            SemanticFact::PlaywrightFixtureAlias(PlaywrightFixtureAliasFact {
+                test_name: "mergedTest".to_string(),
+                base_name: "test".to_string(),
+            }),
+            SemanticFact::PlaywrightFixtureType(PlaywrightFixtureTypeFact {
+                alias_name: "Pages".to_string(),
+                fixture_name: "adminPage".to_string(),
+                type_name: "AdminPage".to_string(),
+            }),
+            SemanticFact::InstanceExportBinding(InstanceExportBindingFact {
+                export_name: "service".to_string(),
+                target_name: "Service".to_string(),
+            }),
+            SemanticFact::ClassThisMemberAccess(ClassThisMemberAccessFact {
+                class_local_name: "Service".to_string(),
+                object: "this.client".to_string(),
+                member: "run".to_string(),
+            }),
+            SemanticFact::ClassThisWholeObjectUse(ClassThisWholeObjectUseFact {
+                class_local_name: "Service".to_string(),
+                object: "this.client".to_string(),
+            }),
+            SemanticFact::VitestModuleMockOperation(VitestModuleMockOperationFact {
+                source: "./dependency".to_string(),
+                call_start: 42,
+                action: VitestModuleMockAction::Mock {
+                    factory_replaces_original: true,
+                },
+            }),
+        ]
+        .into(),
+        whole_object_uses: std::sync::Arc::default(),
         dynamic_import_patterns: vec![],
         has_cjs_exports: true,
+        has_angular_component_template_url: false,
         content_hash: 0,
         suppressions: vec![],
+        unknown_suppression_kinds: vec![],
         unused_import_bindings: vec![],
         type_referenced_import_bindings: vec![],
         value_referenced_import_bindings: vec![],
         line_offsets: vec![],
         complexity: Vec::new(),
         flag_uses: Vec::new(),
-        class_heritage: vec![],
+        class_heritage: vec![ClassHeritageInfo {
+            export_name: "Service".to_string(),
+            super_class: Some("BaseService".to_string()),
+            implements: Vec::new(),
+            type_parameters: vec!["TClient".to_string()],
+            instance_bindings: Vec::new(),
+            super_class_type_args: vec!["TClient".to_string()],
+            generic_instance_bindings: Vec::new(),
+        }],
+        exported_factory_returns: std::sync::Arc::default(),
+        exported_factory_return_object_shapes: std::sync::Arc::default(),
+        type_member_types: std::sync::Arc::default(),
+        injection_tokens: vec![],
+        local_type_declarations: Vec::new(),
+        public_signature_type_references: Vec::new(),
+        namespace_object_aliases: Vec::new(),
+        iconify_prefixes: Vec::new(),
+        iconify_icon_names: Vec::new(),
+        auto_import_candidates: Vec::new(),
+        directives: Vec::new(),
+        client_only_dynamic_import_spans: Vec::new(),
+        security_sinks: Vec::new(),
+        security_sinks_skipped: 0,
+        security_unresolved_callee_sites: Vec::new(),
+        tainted_bindings: Vec::new(),
+        sanitized_sink_args: Vec::new(),
+        security_control_sites: Vec::new(),
+        callee_uses: Vec::new(),
+        misplaced_directives: Vec::new(),
+        inline_server_action_exports: Vec::new(),
+        di_key_sites: Vec::new(),
+        has_dynamic_provide: false,
+        referenced_import_bindings: vec![],
+        component_props: Vec::new(),
+        has_props_attrs_fallthrough: false,
+        has_define_expose: false,
+        has_define_model: false,
+        has_unharvestable_props: false,
+        component_emits: Vec::new(),
+        angular_inputs: Vec::new(),
+        angular_outputs: Vec::new(),
+        has_unharvestable_emits: false,
+        has_dynamic_emit: false,
+        has_emit_whole_object_use: false,
+        load_return_keys: Vec::new(),
+        has_unharvestable_load: false,
+        has_load_data_whole_use: false,
+        has_page_data_store_whole_use: false,
+        has_route_loader_data_whole_use: false,
+        component_functions: Vec::new(),
+        react_props: Vec::new(),
+        hook_uses: Vec::new(),
+        render_edges: Vec::new(),
+        svelte_dispatched_events: Vec::new(),
+        svelte_listened_events: Vec::new(),
+        angular_component_selectors: Vec::new(),
+        registered_custom_elements: Vec::new(),
+        used_custom_element_tags: Vec::new(),
+        angular_used_selectors: Vec::new(),
+        angular_entry_component_refs: Vec::new(),
+        has_dynamic_component_render: false,
+        has_dynamic_dispatch: false,
     };
 
-    let cached = module_to_cached(&module, 0, 0);
+    let cached = module_to_cached_from_parts(&module, 0, 0);
+    assert!(cached.semantic_facts.is_some());
     let restored = cached_to_module(&cached, FileId(0));
 
     assert_eq!(restored.dynamic_imports.len(), 1);
@@ -395,10 +1366,78 @@ fn module_to_cached_roundtrip_dynamic_imports() {
     assert_eq!(restored.member_accesses.len(), 1);
     assert_eq!(restored.member_accesses[0].object, "Status");
     assert_eq!(restored.member_accesses[0].member, "Active");
+    assert_eq!(
+        restored.semantic_facts.as_ref(),
+        &[
+            SemanticFact::AngularTemplateMemberAccess(AngularTemplateMemberAccessFact {
+                member: "title".to_string(),
+            }),
+            SemanticFact::FactoryCallMemberAccess(FactoryCallMemberAccessFact {
+                callee_object: "MyClass".to_string(),
+                callee_method: "getInstance".to_string(),
+                member: "getData".to_string(),
+            }),
+            SemanticFact::FluentChainMemberAccess(FluentChainMemberAccessFact {
+                root_object: "EventBuilder".to_string(),
+                root_method: "create".to_string(),
+                chain: vec!["setProcessId".to_string(), "setSubject".to_string()],
+                member: "build".to_string(),
+            }),
+            SemanticFact::FluentChainNewMemberAccess(FluentChainNewMemberAccessFact {
+                class_name: "OptionBuilder".to_string(),
+                chain: vec!["addDefault".to_string(), "addFromCli".to_string()],
+                member: "build".to_string(),
+            }),
+            SemanticFact::PlaywrightFixtureUse(PlaywrightFixtureUseFact {
+                test_name: "test".to_string(),
+                fixture_name: "adminPage".to_string(),
+                member: "assertGreeting".to_string(),
+            }),
+            SemanticFact::PlaywrightFixtureDefinition(PlaywrightFixtureDefinitionFact {
+                test_name: "test".to_string(),
+                fixture_name: "adminPage".to_string(),
+                type_name: "AdminPage".to_string(),
+            }),
+            SemanticFact::PlaywrightFixtureAlias(PlaywrightFixtureAliasFact {
+                test_name: "mergedTest".to_string(),
+                base_name: "test".to_string(),
+            }),
+            SemanticFact::PlaywrightFixtureType(PlaywrightFixtureTypeFact {
+                alias_name: "Pages".to_string(),
+                fixture_name: "adminPage".to_string(),
+                type_name: "AdminPage".to_string(),
+            }),
+            SemanticFact::InstanceExportBinding(InstanceExportBindingFact {
+                export_name: "service".to_string(),
+                target_name: "Service".to_string(),
+            }),
+            SemanticFact::ClassThisMemberAccess(ClassThisMemberAccessFact {
+                class_local_name: "Service".to_string(),
+                object: "this.client".to_string(),
+                member: "run".to_string(),
+            }),
+            SemanticFact::ClassThisWholeObjectUse(ClassThisWholeObjectUseFact {
+                class_local_name: "Service".to_string(),
+                object: "this.client".to_string(),
+            }),
+            SemanticFact::VitestModuleMockOperation(VitestModuleMockOperationFact {
+                source: "./dependency".to_string(),
+                call_start: 42,
+                action: VitestModuleMockAction::Mock {
+                    factory_replaces_original: true,
+                },
+            }),
+        ][..]
+    );
+    assert_eq!(restored.class_heritage, module.class_heritage);
     assert!(restored.has_cjs_exports);
 }
 
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "test fixture; linear setup/assert, length is not a maintainability concern"
+)]
 fn module_to_cached_roundtrip_members() {
     let module = ModuleInfo {
         file_id: FileId(0),
@@ -407,6 +1446,7 @@ fn module_to_cached_roundtrip_members() {
             local_name: Some("Color".to_string()),
             is_type_only: false,
             visibility: VisibilityTag::None,
+            expected_unused_reason: None,
             span: Span::new(0, 50),
             members: vec![
                 MemberInfo {
@@ -414,42 +1454,110 @@ fn module_to_cached_roundtrip_members() {
                     kind: MemberKind::EnumMember,
                     span: Span::new(10, 15),
                     has_decorator: false,
+                    decorator_names: Vec::new(),
+                    is_instance_returning_static: false,
+                    is_self_returning: false,
                 },
                 MemberInfo {
                     name: "greet".to_string(),
                     kind: MemberKind::ClassMethod,
                     span: Span::new(20, 30),
                     has_decorator: false,
+                    decorator_names: Vec::new(),
+                    is_instance_returning_static: false,
+                    is_self_returning: false,
                 },
                 MemberInfo {
                     name: "name".to_string(),
                     kind: MemberKind::ClassProperty,
                     span: Span::new(35, 45),
                     has_decorator: false,
+                    decorator_names: Vec::new(),
+                    is_instance_returning_static: false,
+                    is_self_returning: false,
                 },
             ],
+            is_side_effect_used: false,
             super_class: None,
-        }],
+        }]
+        .into(),
         imports: vec![],
         re_exports: vec![],
         dynamic_imports: vec![],
         require_calls: vec![],
-        member_accesses: vec![],
-        whole_object_uses: vec![],
+        package_path_references: Box::default(),
+        member_accesses: vec![].into(),
+        semantic_facts: std::sync::Arc::default(),
+        whole_object_uses: std::sync::Arc::default(),
         dynamic_import_patterns: vec![],
         has_cjs_exports: false,
+        has_angular_component_template_url: false,
         unused_import_bindings: vec![],
         type_referenced_import_bindings: vec![],
         value_referenced_import_bindings: vec![],
         content_hash: 0,
         suppressions: vec![],
+        unknown_suppression_kinds: vec![],
         line_offsets: vec![],
         complexity: Vec::new(),
         flag_uses: Vec::new(),
         class_heritage: vec![],
+        exported_factory_returns: std::sync::Arc::default(),
+        exported_factory_return_object_shapes: std::sync::Arc::default(),
+        type_member_types: std::sync::Arc::default(),
+        injection_tokens: vec![],
+        local_type_declarations: Vec::new(),
+        public_signature_type_references: Vec::new(),
+        namespace_object_aliases: Vec::new(),
+        iconify_prefixes: Vec::new(),
+        iconify_icon_names: Vec::new(),
+        auto_import_candidates: Vec::new(),
+        directives: Vec::new(),
+        client_only_dynamic_import_spans: Vec::new(),
+        security_sinks: Vec::new(),
+        security_sinks_skipped: 0,
+        security_unresolved_callee_sites: Vec::new(),
+        tainted_bindings: Vec::new(),
+        sanitized_sink_args: Vec::new(),
+        security_control_sites: Vec::new(),
+        callee_uses: Vec::new(),
+        misplaced_directives: Vec::new(),
+        inline_server_action_exports: Vec::new(),
+        di_key_sites: Vec::new(),
+        has_dynamic_provide: false,
+        referenced_import_bindings: vec![],
+        component_props: Vec::new(),
+        has_props_attrs_fallthrough: false,
+        has_define_expose: false,
+        has_define_model: false,
+        has_unharvestable_props: false,
+        component_emits: Vec::new(),
+        angular_inputs: Vec::new(),
+        angular_outputs: Vec::new(),
+        has_unharvestable_emits: false,
+        has_dynamic_emit: false,
+        has_emit_whole_object_use: false,
+        load_return_keys: Vec::new(),
+        has_unharvestable_load: false,
+        has_load_data_whole_use: false,
+        has_page_data_store_whole_use: false,
+        has_route_loader_data_whole_use: false,
+        component_functions: Vec::new(),
+        react_props: Vec::new(),
+        hook_uses: Vec::new(),
+        render_edges: Vec::new(),
+        svelte_dispatched_events: Vec::new(),
+        svelte_listened_events: Vec::new(),
+        angular_component_selectors: Vec::new(),
+        registered_custom_elements: Vec::new(),
+        used_custom_element_tags: Vec::new(),
+        angular_used_selectors: Vec::new(),
+        angular_entry_component_refs: Vec::new(),
+        has_dynamic_component_render: false,
+        has_dynamic_dispatch: false,
     };
 
-    let cached = module_to_cached(&module, 0, 0);
+    let cached = module_to_cached_from_parts(&module, 0, 0);
     let restored = cached_to_module(&cached, FileId(0));
 
     assert_eq!(restored.exports[0].members.len(), 3);
@@ -463,7 +1571,7 @@ fn module_to_cached_roundtrip_members() {
 
 #[test]
 fn cache_load_nonexistent_returns_none() {
-    let result = CacheStore::load(Path::new("/nonexistent/path"));
+    let result = CacheStore::load(Path::new("/nonexistent/path"), 0, DEFAULT_CACHE_MAX_SIZE);
     assert!(result.is_none());
 }
 
@@ -473,7 +1581,6 @@ fn test_cache_dir(name: &str) -> std::path::PathBuf {
         .join("fallow_cache_tests")
         .join(name)
         .join(format!("{}", std::process::id()));
-    // Clean up any leftover from previous runs
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir
@@ -485,34 +1592,93 @@ fn cache_save_and_load_roundtrip() {
     let mut store = CacheStore::new();
     let module = CachedModule {
         content_hash: 42,
-        mtime_secs: 0,
+        mtime_ns: 0,
         file_size: 0,
+        last_access_secs: 0,
         exports: vec![],
         imports: vec![],
         re_exports: vec![],
         dynamic_imports: vec![],
         require_calls: vec![],
+        package_path_references: Box::default(),
         member_accesses: vec![],
-        whole_object_uses: vec![],
+        semantic_facts: None,
+        whole_object_uses: Box::default(),
         dynamic_import_patterns: vec![],
         has_cjs_exports: false,
+        has_angular_component_template_url: false,
         unused_import_bindings: vec![],
         type_referenced_import_bindings: vec![],
         value_referenced_import_bindings: vec![],
         suppressions: vec![],
+        unknown_suppression_kinds: vec![],
         line_offsets: vec![],
         complexity: vec![],
         flag_uses: vec![],
         class_heritage: vec![],
+        exported_factory_returns: None,
+        exported_factory_return_object_shapes: None,
+        type_member_types: None,
+        injection_tokens: vec![],
+        local_type_declarations: Vec::new(),
+        public_signature_type_references: Vec::new(),
+        namespace_object_aliases: Vec::new(),
+        iconify_prefixes: Vec::new(),
+        iconify_icon_names: Vec::new(),
+        auto_import_candidates: Vec::new(),
+        directives: Vec::new(),
+        client_only_dynamic_import_spans: Vec::new(),
+        security_sinks: Vec::new(),
+        security_sinks_skipped: 0,
+        security_unresolved_callee_sites: Vec::new(),
+        tainted_bindings: Vec::new(),
+        sanitized_sink_args: Vec::new(),
+        security_control_sites: Vec::new(),
+        callee_uses: Vec::new(),
+        misplaced_directives: Vec::new(),
+        inline_server_action_exports: Vec::new(),
+        di_key_sites: Vec::new(),
+        has_dynamic_provide: false,
+        component_props: Vec::new(),
+        has_props_attrs_fallthrough: false,
+        has_define_expose: false,
+        has_define_model: false,
+        has_unharvestable_props: false,
+        component_emits: Vec::new(),
+        angular_inputs: Vec::new(),
+        angular_outputs: Vec::new(),
+        has_unharvestable_emits: false,
+        has_dynamic_emit: false,
+        has_emit_whole_object_use: false,
+        load_return_keys: Vec::new(),
+        has_unharvestable_load: false,
+        has_load_data_whole_use: false,
+        component_functions: Vec::new(),
+        react_props: Vec::new(),
+        hook_uses: Vec::new(),
+        render_edges: Vec::new(),
+        svelte_dispatched_events: Vec::new(),
+        svelte_listened_events: Vec::new(),
+        angular_component_selectors: Vec::new(),
+        registered_custom_elements: Vec::new(),
+        used_custom_element_tags: Vec::new(),
+        angular_used_selectors: Vec::new(),
+        angular_entry_component_refs: Vec::new(),
+        has_dynamic_component_render: false,
+        has_dynamic_dispatch: false,
     };
     store.insert(Path::new("test.ts"), module);
-    store.save(&dir).unwrap();
+    store.save(&dir, 0, DEFAULT_CACHE_MAX_SIZE).unwrap();
 
-    let loaded = CacheStore::load(&dir);
+    let loaded = CacheStore::load(&dir, 0, DEFAULT_CACHE_MAX_SIZE);
     assert!(loaded.is_some());
     let loaded = loaded.unwrap();
     assert_eq!(loaded.len(), 1);
     assert!(loaded.get(Path::new("test.ts"), 42).is_some());
+    assert_eq!(
+        std::fs::read_to_string(dir.join(".gitignore")).unwrap(),
+        "*\n"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -523,86 +1689,218 @@ fn cache_version_mismatch_returns_none() {
     let mut store = CacheStore::new();
     let module = CachedModule {
         content_hash: 42,
-        mtime_secs: 0,
+        mtime_ns: 0,
         file_size: 0,
+        last_access_secs: 0,
         exports: vec![],
         imports: vec![],
         re_exports: vec![],
         dynamic_imports: vec![],
         require_calls: vec![],
+        package_path_references: Box::default(),
         member_accesses: vec![],
-        whole_object_uses: vec![],
+        semantic_facts: None,
+        whole_object_uses: Box::default(),
         dynamic_import_patterns: vec![],
         has_cjs_exports: false,
+        has_angular_component_template_url: false,
         unused_import_bindings: vec![],
         type_referenced_import_bindings: vec![],
         value_referenced_import_bindings: vec![],
         suppressions: vec![],
+        unknown_suppression_kinds: vec![],
         line_offsets: vec![],
         complexity: vec![],
         flag_uses: vec![],
         class_heritage: vec![],
+        exported_factory_returns: None,
+        exported_factory_return_object_shapes: None,
+        type_member_types: None,
+        injection_tokens: vec![],
+        local_type_declarations: Vec::new(),
+        public_signature_type_references: Vec::new(),
+        namespace_object_aliases: Vec::new(),
+        iconify_prefixes: Vec::new(),
+        iconify_icon_names: Vec::new(),
+        auto_import_candidates: Vec::new(),
+        directives: Vec::new(),
+        client_only_dynamic_import_spans: Vec::new(),
+        security_sinks: Vec::new(),
+        security_sinks_skipped: 0,
+        security_unresolved_callee_sites: Vec::new(),
+        tainted_bindings: Vec::new(),
+        sanitized_sink_args: Vec::new(),
+        security_control_sites: Vec::new(),
+        callee_uses: Vec::new(),
+        misplaced_directives: Vec::new(),
+        inline_server_action_exports: Vec::new(),
+        di_key_sites: Vec::new(),
+        has_dynamic_provide: false,
+        component_props: Vec::new(),
+        has_props_attrs_fallthrough: false,
+        has_define_expose: false,
+        has_define_model: false,
+        has_unharvestable_props: false,
+        component_emits: Vec::new(),
+        angular_inputs: Vec::new(),
+        angular_outputs: Vec::new(),
+        has_unharvestable_emits: false,
+        has_dynamic_emit: false,
+        has_emit_whole_object_use: false,
+        load_return_keys: Vec::new(),
+        has_unharvestable_load: false,
+        has_load_data_whole_use: false,
+        component_functions: Vec::new(),
+        react_props: Vec::new(),
+        hook_uses: Vec::new(),
+        render_edges: Vec::new(),
+        svelte_dispatched_events: Vec::new(),
+        svelte_listened_events: Vec::new(),
+        angular_component_selectors: Vec::new(),
+        registered_custom_elements: Vec::new(),
+        used_custom_element_tags: Vec::new(),
+        angular_used_selectors: Vec::new(),
+        angular_entry_component_refs: Vec::new(),
+        has_dynamic_component_render: false,
+        has_dynamic_dispatch: false,
     };
     store.insert(Path::new("test.ts"), module);
-    store.save(&dir).unwrap();
+    store.save(&dir, 0, DEFAULT_CACHE_MAX_SIZE).unwrap();
 
-    // Verify the cache loads correctly before tampering
-    assert!(CacheStore::load(&dir).is_some());
+    assert!(CacheStore::load(&dir, 0, DEFAULT_CACHE_MAX_SIZE).is_some());
 
-    // Read raw bytes and modify the version field.
-    // The version (CACHE_VERSION) is the first encoded field.
-    // Replace the first byte with a different version value (e.g., 255)
-    // to simulate a version mismatch.
     let cache_file = dir.join("cache.bin");
     let mut data = std::fs::read(&cache_file).unwrap();
     assert!(!data.is_empty());
     data[0] = 255; // Corrupt the version byte
     std::fs::write(&cache_file, &data).unwrap();
 
-    // Loading should return None due to version mismatch
-    let result = CacheStore::load(&dir);
+    let result = CacheStore::load(&dir, 0, DEFAULT_CACHE_MAX_SIZE);
     assert!(result.is_none());
 
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "test fixture; linear setup/assert, length is not a maintainability concern"
+)]
 fn module_to_cached_roundtrip_type_only_import() {
     let module = ModuleInfo {
         file_id: FileId(0),
-        exports: vec![],
-        imports: vec![ImportInfo {
-            source: "./types".to_string(),
-            imported_name: ImportedName::Named("Foo".to_string()),
-            local_name: "Foo".to_string(),
-            is_type_only: true,
-            span: Span::new(0, 10),
-            source_span: Span::new(5, 10),
-        }],
+        exports: vec![].into(),
+        imports: vec![
+            ImportInfo {
+                source: "./types".to_string(),
+                imported_name: ImportedName::Named("Foo".to_string()),
+                local_name: "Foo".to_string(),
+                is_type_only: true,
+                is_type_only_star: false,
+                from_style: false,
+                span: Span::new(0, 10),
+                source_span: Span::new(5, 10),
+            },
+            ImportInfo {
+                source: "./impl".to_string(),
+                imported_name: ImportedName::Namespace,
+                local_name: String::new(),
+                is_type_only: true,
+                is_type_only_star: true,
+                from_style: false,
+                span: Span::new(20, 40),
+                source_span: Span::new(30, 40),
+            },
+        ],
         re_exports: vec![],
         dynamic_imports: vec![],
         require_calls: vec![],
-        member_accesses: vec![],
-        whole_object_uses: vec![],
+        package_path_references: Box::default(),
+        member_accesses: vec![].into(),
+        semantic_facts: std::sync::Arc::default(),
+        whole_object_uses: std::sync::Arc::default(),
         dynamic_import_patterns: vec![],
         has_cjs_exports: false,
+        has_angular_component_template_url: false,
         unused_import_bindings: vec![],
         type_referenced_import_bindings: vec![],
         value_referenced_import_bindings: vec![],
         content_hash: 0,
         suppressions: vec![],
+        unknown_suppression_kinds: vec![],
         line_offsets: vec![],
         complexity: Vec::new(),
         flag_uses: Vec::new(),
         class_heritage: vec![],
+        exported_factory_returns: std::sync::Arc::default(),
+        exported_factory_return_object_shapes: std::sync::Arc::default(),
+        type_member_types: std::sync::Arc::default(),
+        injection_tokens: vec![],
+        local_type_declarations: Vec::new(),
+        public_signature_type_references: Vec::new(),
+        namespace_object_aliases: Vec::new(),
+        iconify_prefixes: Vec::new(),
+        iconify_icon_names: Vec::new(),
+        auto_import_candidates: Vec::new(),
+        directives: Vec::new(),
+        client_only_dynamic_import_spans: Vec::new(),
+        security_sinks: Vec::new(),
+        security_sinks_skipped: 0,
+        security_unresolved_callee_sites: Vec::new(),
+        tainted_bindings: Vec::new(),
+        sanitized_sink_args: Vec::new(),
+        security_control_sites: Vec::new(),
+        callee_uses: Vec::new(),
+        misplaced_directives: Vec::new(),
+        inline_server_action_exports: Vec::new(),
+        di_key_sites: Vec::new(),
+        has_dynamic_provide: false,
+        referenced_import_bindings: vec![],
+        component_props: Vec::new(),
+        has_props_attrs_fallthrough: false,
+        has_define_expose: false,
+        has_define_model: false,
+        has_unharvestable_props: false,
+        component_emits: Vec::new(),
+        angular_inputs: Vec::new(),
+        angular_outputs: Vec::new(),
+        has_unharvestable_emits: false,
+        has_dynamic_emit: false,
+        has_emit_whole_object_use: false,
+        load_return_keys: Vec::new(),
+        has_unharvestable_load: false,
+        has_load_data_whole_use: false,
+        has_page_data_store_whole_use: false,
+        has_route_loader_data_whole_use: false,
+        component_functions: Vec::new(),
+        react_props: Vec::new(),
+        hook_uses: Vec::new(),
+        render_edges: Vec::new(),
+        svelte_dispatched_events: Vec::new(),
+        svelte_listened_events: Vec::new(),
+        angular_component_selectors: Vec::new(),
+        registered_custom_elements: Vec::new(),
+        used_custom_element_tags: Vec::new(),
+        angular_used_selectors: Vec::new(),
+        angular_entry_component_refs: Vec::new(),
+        has_dynamic_component_render: false,
+        has_dynamic_dispatch: false,
     };
 
-    let cached = module_to_cached(&module, 0, 0);
+    let cached = module_to_cached_from_parts(&module, 0, 0);
     let restored = cached_to_module(&cached, FileId(0));
 
     assert!(restored.imports[0].is_type_only);
     assert_eq!(restored.imports[0].span.start, 0);
     assert_eq!(restored.imports[0].span.end, 10);
+    assert!(
+        !restored.imports[0].is_type_only_star,
+        "a bound `import type {{ Foo }}` is not the ambient type star"
+    );
+    assert!(
+        restored.imports[1].is_type_only_star,
+        "the ambient `export type *` shape must survive the cache round trip (issue #2375)"
+    );
 }
 
 #[test]
@@ -610,29 +1908,83 @@ fn get_by_path_only_returns_entry_regardless_of_hash() {
     let mut store = CacheStore::new();
     let module = CachedModule {
         content_hash: 42,
-        mtime_secs: 0,
+        mtime_ns: 0,
         file_size: 0,
+        last_access_secs: 0,
         exports: vec![],
         imports: vec![],
         re_exports: vec![],
         dynamic_imports: vec![],
         require_calls: vec![],
+        package_path_references: Box::default(),
         member_accesses: vec![],
-        whole_object_uses: vec![],
+        semantic_facts: None,
+        whole_object_uses: Box::default(),
         dynamic_import_patterns: vec![],
         has_cjs_exports: false,
+        has_angular_component_template_url: false,
         unused_import_bindings: vec![],
         type_referenced_import_bindings: vec![],
         value_referenced_import_bindings: vec![],
         suppressions: vec![],
+        unknown_suppression_kinds: vec![],
         line_offsets: vec![],
         complexity: vec![],
         flag_uses: vec![],
         class_heritage: vec![],
+        exported_factory_returns: None,
+        exported_factory_return_object_shapes: None,
+        type_member_types: None,
+        injection_tokens: vec![],
+        local_type_declarations: Vec::new(),
+        public_signature_type_references: Vec::new(),
+        namespace_object_aliases: Vec::new(),
+        iconify_prefixes: Vec::new(),
+        iconify_icon_names: Vec::new(),
+        auto_import_candidates: Vec::new(),
+        directives: Vec::new(),
+        client_only_dynamic_import_spans: Vec::new(),
+        security_sinks: Vec::new(),
+        security_sinks_skipped: 0,
+        security_unresolved_callee_sites: Vec::new(),
+        tainted_bindings: Vec::new(),
+        sanitized_sink_args: Vec::new(),
+        security_control_sites: Vec::new(),
+        callee_uses: Vec::new(),
+        misplaced_directives: Vec::new(),
+        inline_server_action_exports: Vec::new(),
+        di_key_sites: Vec::new(),
+        has_dynamic_provide: false,
+        component_props: Vec::new(),
+        has_props_attrs_fallthrough: false,
+        has_define_expose: false,
+        has_define_model: false,
+        has_unharvestable_props: false,
+        component_emits: Vec::new(),
+        angular_inputs: Vec::new(),
+        angular_outputs: Vec::new(),
+        has_unharvestable_emits: false,
+        has_dynamic_emit: false,
+        has_emit_whole_object_use: false,
+        load_return_keys: Vec::new(),
+        has_unharvestable_load: false,
+        has_load_data_whole_use: false,
+        component_functions: Vec::new(),
+        react_props: Vec::new(),
+        hook_uses: Vec::new(),
+        render_edges: Vec::new(),
+        svelte_dispatched_events: Vec::new(),
+        svelte_listened_events: Vec::new(),
+        angular_component_selectors: Vec::new(),
+        registered_custom_elements: Vec::new(),
+        used_custom_element_tags: Vec::new(),
+        angular_used_selectors: Vec::new(),
+        angular_entry_component_refs: Vec::new(),
+        has_dynamic_component_render: false,
+        has_dynamic_dispatch: false,
     };
     store.insert(Path::new("test.ts"), module);
 
-    // get_by_path_only should return the entry without checking hash
     let result = store.get_by_path_only(Path::new("test.ts"));
     assert!(result.is_some());
     assert_eq!(result.unwrap().content_hash, 42);
@@ -649,6 +2001,10 @@ fn get_by_path_only_returns_none_for_missing() {
 }
 
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "test fixture; linear setup/assert, length is not a maintainability concern"
+)]
 fn retain_paths_removes_stale_entries() {
     use fallow_types::discover::DiscoveredFile;
     use std::path::PathBuf;
@@ -656,25 +2012,80 @@ fn retain_paths_removes_stale_entries() {
     let mut store = CacheStore::new();
     let m = || CachedModule {
         content_hash: 1,
-        mtime_secs: 0,
+        mtime_ns: 0,
         file_size: 0,
+        last_access_secs: 0,
         exports: vec![],
         imports: vec![],
         re_exports: vec![],
         dynamic_imports: vec![],
         require_calls: vec![],
+        package_path_references: Box::default(),
         member_accesses: vec![],
-        whole_object_uses: vec![],
+        semantic_facts: None,
+        whole_object_uses: Box::default(),
         dynamic_import_patterns: vec![],
         has_cjs_exports: false,
+        has_angular_component_template_url: false,
         unused_import_bindings: vec![],
         type_referenced_import_bindings: vec![],
         value_referenced_import_bindings: vec![],
         suppressions: vec![],
+        unknown_suppression_kinds: vec![],
         line_offsets: vec![],
         complexity: vec![],
         flag_uses: vec![],
         class_heritage: vec![],
+        exported_factory_returns: None,
+        exported_factory_return_object_shapes: None,
+        type_member_types: None,
+        injection_tokens: vec![],
+        local_type_declarations: Vec::new(),
+        public_signature_type_references: Vec::new(),
+        namespace_object_aliases: Vec::new(),
+        iconify_prefixes: Vec::new(),
+        iconify_icon_names: Vec::new(),
+        auto_import_candidates: Vec::new(),
+        directives: Vec::new(),
+        client_only_dynamic_import_spans: Vec::new(),
+        security_sinks: Vec::new(),
+        security_sinks_skipped: 0,
+        security_unresolved_callee_sites: Vec::new(),
+        tainted_bindings: Vec::new(),
+        sanitized_sink_args: Vec::new(),
+        security_control_sites: Vec::new(),
+        callee_uses: Vec::new(),
+        misplaced_directives: Vec::new(),
+        inline_server_action_exports: Vec::new(),
+        di_key_sites: Vec::new(),
+        has_dynamic_provide: false,
+        component_props: Vec::new(),
+        has_props_attrs_fallthrough: false,
+        has_define_expose: false,
+        has_define_model: false,
+        has_unharvestable_props: false,
+        component_emits: Vec::new(),
+        angular_inputs: Vec::new(),
+        angular_outputs: Vec::new(),
+        has_unharvestable_emits: false,
+        has_dynamic_emit: false,
+        has_emit_whole_object_use: false,
+        load_return_keys: Vec::new(),
+        has_unharvestable_load: false,
+        has_load_data_whole_use: false,
+        component_functions: Vec::new(),
+        react_props: Vec::new(),
+        hook_uses: Vec::new(),
+        render_edges: Vec::new(),
+        svelte_dispatched_events: Vec::new(),
+        svelte_listened_events: Vec::new(),
+        angular_component_selectors: Vec::new(),
+        registered_custom_elements: Vec::new(),
+        used_custom_element_tags: Vec::new(),
+        angular_used_selectors: Vec::new(),
+        angular_entry_component_refs: Vec::new(),
+        has_dynamic_component_render: false,
+        has_dynamic_dispatch: false,
     };
 
     store.insert(Path::new("/project/a.ts"), m());
@@ -682,7 +2093,6 @@ fn retain_paths_removes_stale_entries() {
     store.insert(Path::new("/project/c.ts"), m());
     assert_eq!(store.len(), 3);
 
-    // Only a.ts and c.ts still exist in the project
     let files = vec![
         DiscoveredFile {
             id: FileId(0),
@@ -696,11 +2106,12 @@ fn retain_paths_removes_stale_entries() {
         },
     ];
 
-    store.retain_paths(&files);
+    assert!(store.retain_paths(&files));
     assert_eq!(store.len(), 2);
     assert!(store.get_by_path_only(Path::new("/project/a.ts")).is_some());
     assert!(store.get_by_path_only(Path::new("/project/b.ts")).is_none());
     assert!(store.get_by_path_only(Path::new("/project/c.ts")).is_some());
+    assert!(!store.retain_paths(&files));
 }
 
 #[test]
@@ -708,31 +2119,87 @@ fn retain_paths_with_empty_files_clears_cache() {
     let mut store = CacheStore::new();
     let m = CachedModule {
         content_hash: 1,
-        mtime_secs: 0,
+        mtime_ns: 0,
         file_size: 0,
+        last_access_secs: 0,
         exports: vec![],
         imports: vec![],
         re_exports: vec![],
         dynamic_imports: vec![],
         require_calls: vec![],
+        package_path_references: Box::default(),
         member_accesses: vec![],
-        whole_object_uses: vec![],
+        semantic_facts: None,
+        whole_object_uses: Box::default(),
         dynamic_import_patterns: vec![],
         has_cjs_exports: false,
+        has_angular_component_template_url: false,
         unused_import_bindings: vec![],
         type_referenced_import_bindings: vec![],
         value_referenced_import_bindings: vec![],
         suppressions: vec![],
+        unknown_suppression_kinds: vec![],
         line_offsets: vec![],
         complexity: vec![],
         flag_uses: vec![],
         class_heritage: vec![],
+        exported_factory_returns: None,
+        exported_factory_return_object_shapes: None,
+        type_member_types: None,
+        injection_tokens: vec![],
+        local_type_declarations: Vec::new(),
+        public_signature_type_references: Vec::new(),
+        namespace_object_aliases: Vec::new(),
+        iconify_prefixes: Vec::new(),
+        iconify_icon_names: Vec::new(),
+        auto_import_candidates: Vec::new(),
+        directives: Vec::new(),
+        client_only_dynamic_import_spans: Vec::new(),
+        security_sinks: Vec::new(),
+        security_sinks_skipped: 0,
+        security_unresolved_callee_sites: Vec::new(),
+        tainted_bindings: Vec::new(),
+        sanitized_sink_args: Vec::new(),
+        security_control_sites: Vec::new(),
+        callee_uses: Vec::new(),
+        misplaced_directives: Vec::new(),
+        inline_server_action_exports: Vec::new(),
+        di_key_sites: Vec::new(),
+        has_dynamic_provide: false,
+        component_props: Vec::new(),
+        has_props_attrs_fallthrough: false,
+        has_define_expose: false,
+        has_define_model: false,
+        has_unharvestable_props: false,
+        component_emits: Vec::new(),
+        angular_inputs: Vec::new(),
+        angular_outputs: Vec::new(),
+        has_unharvestable_emits: false,
+        has_dynamic_emit: false,
+        has_emit_whole_object_use: false,
+        load_return_keys: Vec::new(),
+        has_unharvestable_load: false,
+        has_load_data_whole_use: false,
+        component_functions: Vec::new(),
+        react_props: Vec::new(),
+        hook_uses: Vec::new(),
+        render_edges: Vec::new(),
+        svelte_dispatched_events: Vec::new(),
+        svelte_listened_events: Vec::new(),
+        angular_component_selectors: Vec::new(),
+        registered_custom_elements: Vec::new(),
+        used_custom_element_tags: Vec::new(),
+        angular_used_selectors: Vec::new(),
+        angular_entry_component_refs: Vec::new(),
+        has_dynamic_component_render: false,
+        has_dynamic_dispatch: false,
     };
     store.insert(Path::new("a.ts"), m);
     assert_eq!(store.len(), 1);
 
-    store.retain_paths(&[]);
+    assert!(store.retain_paths(&[]));
     assert!(store.is_empty());
+    assert!(!store.retain_paths(&[]));
 }
 
 #[test]
@@ -740,29 +2207,84 @@ fn get_by_metadata_returns_entry_on_match() {
     let mut store = CacheStore::new();
     let module = CachedModule {
         content_hash: 42,
-        mtime_secs: 1000,
+        mtime_ns: 1000,
         file_size: 500,
+        last_access_secs: 0,
         exports: vec![],
         imports: vec![],
         re_exports: vec![],
         dynamic_imports: vec![],
         require_calls: vec![],
+        package_path_references: Box::default(),
         member_accesses: vec![],
-        whole_object_uses: vec![],
+        semantic_facts: None,
+        whole_object_uses: Box::default(),
         dynamic_import_patterns: vec![],
         has_cjs_exports: false,
+        has_angular_component_template_url: false,
         unused_import_bindings: vec![],
         type_referenced_import_bindings: vec![],
         value_referenced_import_bindings: vec![],
         suppressions: vec![],
+        unknown_suppression_kinds: vec![],
         line_offsets: vec![],
         complexity: vec![],
         flag_uses: vec![],
         class_heritage: vec![],
+        exported_factory_returns: None,
+        exported_factory_return_object_shapes: None,
+        type_member_types: None,
+        injection_tokens: vec![],
+        local_type_declarations: Vec::new(),
+        public_signature_type_references: Vec::new(),
+        namespace_object_aliases: Vec::new(),
+        iconify_prefixes: Vec::new(),
+        iconify_icon_names: Vec::new(),
+        auto_import_candidates: Vec::new(),
+        directives: Vec::new(),
+        client_only_dynamic_import_spans: Vec::new(),
+        security_sinks: Vec::new(),
+        security_sinks_skipped: 0,
+        security_unresolved_callee_sites: Vec::new(),
+        tainted_bindings: Vec::new(),
+        sanitized_sink_args: Vec::new(),
+        security_control_sites: Vec::new(),
+        callee_uses: Vec::new(),
+        misplaced_directives: Vec::new(),
+        inline_server_action_exports: Vec::new(),
+        di_key_sites: Vec::new(),
+        has_dynamic_provide: false,
+        component_props: Vec::new(),
+        has_props_attrs_fallthrough: false,
+        has_define_expose: false,
+        has_define_model: false,
+        has_unharvestable_props: false,
+        component_emits: Vec::new(),
+        angular_inputs: Vec::new(),
+        angular_outputs: Vec::new(),
+        has_unharvestable_emits: false,
+        has_dynamic_emit: false,
+        has_emit_whole_object_use: false,
+        load_return_keys: Vec::new(),
+        has_unharvestable_load: false,
+        has_load_data_whole_use: false,
+        component_functions: Vec::new(),
+        react_props: Vec::new(),
+        hook_uses: Vec::new(),
+        render_edges: Vec::new(),
+        svelte_dispatched_events: Vec::new(),
+        svelte_listened_events: Vec::new(),
+        angular_component_selectors: Vec::new(),
+        registered_custom_elements: Vec::new(),
+        used_custom_element_tags: Vec::new(),
+        angular_used_selectors: Vec::new(),
+        angular_entry_component_refs: Vec::new(),
+        has_dynamic_component_render: false,
+        has_dynamic_dispatch: false,
     };
     store.insert(Path::new("test.ts"), module);
 
-    let result = store.get_by_metadata(Path::new("test.ts"), 1000, 500);
+    let result = store.get_by_metadata(Path::new("test.ts"), SourceFingerprint::new(1000, 500));
     assert!(result.is_some());
     assert_eq!(result.unwrap().content_hash, 42);
 }
@@ -772,31 +2294,86 @@ fn get_by_metadata_returns_none_on_mtime_mismatch() {
     let mut store = CacheStore::new();
     let module = CachedModule {
         content_hash: 42,
-        mtime_secs: 1000,
+        mtime_ns: 1000,
         file_size: 500,
+        last_access_secs: 0,
         exports: vec![],
         imports: vec![],
         re_exports: vec![],
         dynamic_imports: vec![],
         require_calls: vec![],
+        package_path_references: Box::default(),
         member_accesses: vec![],
-        whole_object_uses: vec![],
+        semantic_facts: None,
+        whole_object_uses: Box::default(),
         dynamic_import_patterns: vec![],
         has_cjs_exports: false,
+        has_angular_component_template_url: false,
         unused_import_bindings: vec![],
         type_referenced_import_bindings: vec![],
         value_referenced_import_bindings: vec![],
         suppressions: vec![],
+        unknown_suppression_kinds: vec![],
         line_offsets: vec![],
         complexity: vec![],
         flag_uses: vec![],
         class_heritage: vec![],
+        exported_factory_returns: None,
+        exported_factory_return_object_shapes: None,
+        type_member_types: None,
+        injection_tokens: vec![],
+        local_type_declarations: Vec::new(),
+        public_signature_type_references: Vec::new(),
+        namespace_object_aliases: Vec::new(),
+        iconify_prefixes: Vec::new(),
+        iconify_icon_names: Vec::new(),
+        auto_import_candidates: Vec::new(),
+        directives: Vec::new(),
+        client_only_dynamic_import_spans: Vec::new(),
+        security_sinks: Vec::new(),
+        security_sinks_skipped: 0,
+        security_unresolved_callee_sites: Vec::new(),
+        tainted_bindings: Vec::new(),
+        sanitized_sink_args: Vec::new(),
+        security_control_sites: Vec::new(),
+        callee_uses: Vec::new(),
+        misplaced_directives: Vec::new(),
+        inline_server_action_exports: Vec::new(),
+        di_key_sites: Vec::new(),
+        has_dynamic_provide: false,
+        component_props: Vec::new(),
+        has_props_attrs_fallthrough: false,
+        has_define_expose: false,
+        has_define_model: false,
+        has_unharvestable_props: false,
+        component_emits: Vec::new(),
+        angular_inputs: Vec::new(),
+        angular_outputs: Vec::new(),
+        has_unharvestable_emits: false,
+        has_dynamic_emit: false,
+        has_emit_whole_object_use: false,
+        load_return_keys: Vec::new(),
+        has_unharvestable_load: false,
+        has_load_data_whole_use: false,
+        component_functions: Vec::new(),
+        react_props: Vec::new(),
+        hook_uses: Vec::new(),
+        render_edges: Vec::new(),
+        svelte_dispatched_events: Vec::new(),
+        svelte_listened_events: Vec::new(),
+        angular_component_selectors: Vec::new(),
+        registered_custom_elements: Vec::new(),
+        used_custom_element_tags: Vec::new(),
+        angular_used_selectors: Vec::new(),
+        angular_entry_component_refs: Vec::new(),
+        has_dynamic_component_render: false,
+        has_dynamic_dispatch: false,
     };
     store.insert(Path::new("test.ts"), module);
 
     assert!(
         store
-            .get_by_metadata(Path::new("test.ts"), 2000, 500)
+            .get_by_metadata(Path::new("test.ts"), SourceFingerprint::new(2000, 500))
             .is_none()
     );
 }
@@ -806,31 +2383,86 @@ fn get_by_metadata_returns_none_on_size_mismatch() {
     let mut store = CacheStore::new();
     let module = CachedModule {
         content_hash: 42,
-        mtime_secs: 1000,
+        mtime_ns: 1000,
         file_size: 500,
+        last_access_secs: 0,
         exports: vec![],
         imports: vec![],
         re_exports: vec![],
         dynamic_imports: vec![],
         require_calls: vec![],
+        package_path_references: Box::default(),
         member_accesses: vec![],
-        whole_object_uses: vec![],
+        semantic_facts: None,
+        whole_object_uses: Box::default(),
         dynamic_import_patterns: vec![],
         has_cjs_exports: false,
+        has_angular_component_template_url: false,
         unused_import_bindings: vec![],
         type_referenced_import_bindings: vec![],
         value_referenced_import_bindings: vec![],
         suppressions: vec![],
+        unknown_suppression_kinds: vec![],
         line_offsets: vec![],
         complexity: vec![],
         flag_uses: vec![],
         class_heritage: vec![],
+        exported_factory_returns: None,
+        exported_factory_return_object_shapes: None,
+        type_member_types: None,
+        injection_tokens: vec![],
+        local_type_declarations: Vec::new(),
+        public_signature_type_references: Vec::new(),
+        namespace_object_aliases: Vec::new(),
+        iconify_prefixes: Vec::new(),
+        iconify_icon_names: Vec::new(),
+        auto_import_candidates: Vec::new(),
+        directives: Vec::new(),
+        client_only_dynamic_import_spans: Vec::new(),
+        security_sinks: Vec::new(),
+        security_sinks_skipped: 0,
+        security_unresolved_callee_sites: Vec::new(),
+        tainted_bindings: Vec::new(),
+        sanitized_sink_args: Vec::new(),
+        security_control_sites: Vec::new(),
+        callee_uses: Vec::new(),
+        misplaced_directives: Vec::new(),
+        inline_server_action_exports: Vec::new(),
+        di_key_sites: Vec::new(),
+        has_dynamic_provide: false,
+        component_props: Vec::new(),
+        has_props_attrs_fallthrough: false,
+        has_define_expose: false,
+        has_define_model: false,
+        has_unharvestable_props: false,
+        component_emits: Vec::new(),
+        angular_inputs: Vec::new(),
+        angular_outputs: Vec::new(),
+        has_unharvestable_emits: false,
+        has_dynamic_emit: false,
+        has_emit_whole_object_use: false,
+        load_return_keys: Vec::new(),
+        has_unharvestable_load: false,
+        has_load_data_whole_use: false,
+        component_functions: Vec::new(),
+        react_props: Vec::new(),
+        hook_uses: Vec::new(),
+        render_edges: Vec::new(),
+        svelte_dispatched_events: Vec::new(),
+        svelte_listened_events: Vec::new(),
+        angular_component_selectors: Vec::new(),
+        registered_custom_elements: Vec::new(),
+        used_custom_element_tags: Vec::new(),
+        angular_used_selectors: Vec::new(),
+        angular_entry_component_refs: Vec::new(),
+        has_dynamic_component_render: false,
+        has_dynamic_dispatch: false,
     };
     store.insert(Path::new("test.ts"), module);
 
     assert!(
         store
-            .get_by_metadata(Path::new("test.ts"), 1000, 999)
+            .get_by_metadata(Path::new("test.ts"), SourceFingerprint::new(1000, 999))
             .is_none()
     );
 }
@@ -840,32 +2472,86 @@ fn get_by_metadata_returns_none_for_zero_mtime() {
     let mut store = CacheStore::new();
     let module = CachedModule {
         content_hash: 42,
-        mtime_secs: 0,
+        mtime_ns: 0,
         file_size: 500,
+        last_access_secs: 0,
         exports: vec![],
         imports: vec![],
         re_exports: vec![],
         dynamic_imports: vec![],
         require_calls: vec![],
+        package_path_references: Box::default(),
         member_accesses: vec![],
-        whole_object_uses: vec![],
+        semantic_facts: None,
+        whole_object_uses: Box::default(),
         dynamic_import_patterns: vec![],
         has_cjs_exports: false,
+        has_angular_component_template_url: false,
         unused_import_bindings: vec![],
         type_referenced_import_bindings: vec![],
         value_referenced_import_bindings: vec![],
         suppressions: vec![],
+        unknown_suppression_kinds: vec![],
         line_offsets: vec![],
         complexity: vec![],
         flag_uses: vec![],
         class_heritage: vec![],
+        exported_factory_returns: None,
+        exported_factory_return_object_shapes: None,
+        type_member_types: None,
+        injection_tokens: vec![],
+        local_type_declarations: Vec::new(),
+        public_signature_type_references: Vec::new(),
+        namespace_object_aliases: Vec::new(),
+        iconify_prefixes: Vec::new(),
+        iconify_icon_names: Vec::new(),
+        auto_import_candidates: Vec::new(),
+        directives: Vec::new(),
+        client_only_dynamic_import_spans: Vec::new(),
+        security_sinks: Vec::new(),
+        security_sinks_skipped: 0,
+        security_unresolved_callee_sites: Vec::new(),
+        tainted_bindings: Vec::new(),
+        sanitized_sink_args: Vec::new(),
+        security_control_sites: Vec::new(),
+        callee_uses: Vec::new(),
+        misplaced_directives: Vec::new(),
+        inline_server_action_exports: Vec::new(),
+        di_key_sites: Vec::new(),
+        has_dynamic_provide: false,
+        component_props: Vec::new(),
+        has_props_attrs_fallthrough: false,
+        has_define_expose: false,
+        has_define_model: false,
+        has_unharvestable_props: false,
+        component_emits: Vec::new(),
+        angular_inputs: Vec::new(),
+        angular_outputs: Vec::new(),
+        has_unharvestable_emits: false,
+        has_dynamic_emit: false,
+        has_emit_whole_object_use: false,
+        load_return_keys: Vec::new(),
+        has_unharvestable_load: false,
+        has_load_data_whole_use: false,
+        component_functions: Vec::new(),
+        react_props: Vec::new(),
+        hook_uses: Vec::new(),
+        render_edges: Vec::new(),
+        svelte_dispatched_events: Vec::new(),
+        svelte_listened_events: Vec::new(),
+        angular_component_selectors: Vec::new(),
+        registered_custom_elements: Vec::new(),
+        used_custom_element_tags: Vec::new(),
+        angular_used_selectors: Vec::new(),
+        angular_entry_component_refs: Vec::new(),
+        has_dynamic_component_render: false,
+        has_dynamic_dispatch: false,
     };
     store.insert(Path::new("test.ts"), module);
 
-    // Zero mtime should never match (falls through to content hash check)
     assert!(
         store
-            .get_by_metadata(Path::new("test.ts"), 0, 500)
+            .get_by_metadata(Path::new("test.ts"), SourceFingerprint::new(0, 500))
             .is_none()
     );
 }
@@ -875,7 +2561,10 @@ fn get_by_metadata_returns_none_for_missing_file() {
     let store = CacheStore::new();
     assert!(
         store
-            .get_by_metadata(Path::new("nonexistent.ts"), 1000, 500)
+            .get_by_metadata(
+                Path::new("nonexistent.ts"),
+                SourceFingerprint::new(1000, 500)
+            )
             .is_none()
     );
 }
@@ -884,28 +2573,85 @@ fn get_by_metadata_returns_none_for_missing_file() {
 fn module_to_cached_stores_mtime_and_size() {
     let module = ModuleInfo {
         file_id: FileId(0),
-        exports: vec![],
+        exports: vec![].into(),
         imports: vec![],
         re_exports: vec![],
         dynamic_imports: vec![],
         require_calls: vec![],
-        member_accesses: vec![],
-        whole_object_uses: vec![],
+        package_path_references: Box::default(),
+        member_accesses: vec![].into(),
+        semantic_facts: std::sync::Arc::default(),
+        whole_object_uses: std::sync::Arc::default(),
         dynamic_import_patterns: vec![],
         has_cjs_exports: false,
+        has_angular_component_template_url: false,
         unused_import_bindings: vec![],
         type_referenced_import_bindings: vec![],
         value_referenced_import_bindings: vec![],
         content_hash: 42,
         suppressions: vec![],
+        unknown_suppression_kinds: vec![],
         line_offsets: vec![],
         complexity: Vec::new(),
         flag_uses: Vec::new(),
         class_heritage: vec![],
+        exported_factory_returns: std::sync::Arc::default(),
+        exported_factory_return_object_shapes: std::sync::Arc::default(),
+        type_member_types: std::sync::Arc::default(),
+        injection_tokens: vec![],
+        local_type_declarations: Vec::new(),
+        public_signature_type_references: Vec::new(),
+        namespace_object_aliases: Vec::new(),
+        iconify_prefixes: Vec::new(),
+        iconify_icon_names: Vec::new(),
+        auto_import_candidates: Vec::new(),
+        directives: Vec::new(),
+        client_only_dynamic_import_spans: Vec::new(),
+        security_sinks: Vec::new(),
+        security_sinks_skipped: 0,
+        security_unresolved_callee_sites: Vec::new(),
+        tainted_bindings: Vec::new(),
+        sanitized_sink_args: Vec::new(),
+        security_control_sites: Vec::new(),
+        callee_uses: Vec::new(),
+        misplaced_directives: Vec::new(),
+        inline_server_action_exports: Vec::new(),
+        di_key_sites: Vec::new(),
+        has_dynamic_provide: false,
+        referenced_import_bindings: vec![],
+        component_props: Vec::new(),
+        has_props_attrs_fallthrough: false,
+        has_define_expose: false,
+        has_define_model: false,
+        has_unharvestable_props: false,
+        component_emits: Vec::new(),
+        angular_inputs: Vec::new(),
+        angular_outputs: Vec::new(),
+        has_unharvestable_emits: false,
+        has_dynamic_emit: false,
+        has_emit_whole_object_use: false,
+        load_return_keys: Vec::new(),
+        has_unharvestable_load: false,
+        has_load_data_whole_use: false,
+        has_page_data_store_whole_use: false,
+        has_route_loader_data_whole_use: false,
+        component_functions: Vec::new(),
+        react_props: Vec::new(),
+        hook_uses: Vec::new(),
+        render_edges: Vec::new(),
+        svelte_dispatched_events: Vec::new(),
+        svelte_listened_events: Vec::new(),
+        angular_component_selectors: Vec::new(),
+        registered_custom_elements: Vec::new(),
+        used_custom_element_tags: Vec::new(),
+        angular_used_selectors: Vec::new(),
+        angular_entry_component_refs: Vec::new(),
+        has_dynamic_component_render: false,
+        has_dynamic_dispatch: false,
     };
 
-    let cached = module_to_cached(&module, 12345, 6789);
-    assert_eq!(cached.mtime_secs, 12345);
+    let cached = module_to_cached_from_parts(&module, 12345, 6789);
+    assert_eq!(cached.mtime_ns, 12345);
     assert_eq!(cached.file_size, 6789);
     assert_eq!(cached.content_hash, 42);
 }
@@ -914,84 +2660,316 @@ fn module_to_cached_stores_mtime_and_size() {
 fn module_to_cached_roundtrip_line_offsets() {
     let module = ModuleInfo {
         file_id: FileId(0),
-        exports: vec![],
+        exports: vec![].into(),
         imports: vec![],
         re_exports: vec![],
         dynamic_imports: vec![],
         require_calls: vec![],
-        member_accesses: vec![],
-        whole_object_uses: vec![],
+        package_path_references: Box::default(),
+        member_accesses: vec![].into(),
+        semantic_facts: std::sync::Arc::default(),
+        whole_object_uses: std::sync::Arc::default(),
         dynamic_import_patterns: vec![],
         has_cjs_exports: false,
+        has_angular_component_template_url: false,
         unused_import_bindings: vec![],
         type_referenced_import_bindings: vec![],
         value_referenced_import_bindings: vec![],
         content_hash: 0,
         suppressions: vec![],
+        unknown_suppression_kinds: vec![],
         line_offsets: vec![0, 15, 30, 45],
         complexity: Vec::new(),
         flag_uses: Vec::new(),
         class_heritage: vec![],
+        exported_factory_returns: std::sync::Arc::default(),
+        exported_factory_return_object_shapes: std::sync::Arc::default(),
+        type_member_types: std::sync::Arc::default(),
+        injection_tokens: vec![],
+        local_type_declarations: Vec::new(),
+        public_signature_type_references: Vec::new(),
+        namespace_object_aliases: Vec::new(),
+        iconify_prefixes: Vec::new(),
+        iconify_icon_names: Vec::new(),
+        auto_import_candidates: Vec::new(),
+        directives: Vec::new(),
+        client_only_dynamic_import_spans: Vec::new(),
+        security_sinks: Vec::new(),
+        security_sinks_skipped: 0,
+        security_unresolved_callee_sites: Vec::new(),
+        tainted_bindings: Vec::new(),
+        sanitized_sink_args: Vec::new(),
+        security_control_sites: Vec::new(),
+        callee_uses: Vec::new(),
+        misplaced_directives: Vec::new(),
+        inline_server_action_exports: Vec::new(),
+        di_key_sites: Vec::new(),
+        has_dynamic_provide: false,
+        referenced_import_bindings: vec![],
+        component_props: Vec::new(),
+        has_props_attrs_fallthrough: false,
+        has_define_expose: false,
+        has_define_model: false,
+        has_unharvestable_props: false,
+        component_emits: Vec::new(),
+        angular_inputs: Vec::new(),
+        angular_outputs: Vec::new(),
+        has_unharvestable_emits: false,
+        has_dynamic_emit: false,
+        has_emit_whole_object_use: false,
+        load_return_keys: Vec::new(),
+        has_unharvestable_load: false,
+        has_load_data_whole_use: false,
+        has_page_data_store_whole_use: false,
+        has_route_loader_data_whole_use: false,
+        component_functions: Vec::new(),
+        react_props: Vec::new(),
+        hook_uses: Vec::new(),
+        render_edges: Vec::new(),
+        svelte_dispatched_events: Vec::new(),
+        svelte_listened_events: Vec::new(),
+        angular_component_selectors: Vec::new(),
+        registered_custom_elements: Vec::new(),
+        used_custom_element_tags: Vec::new(),
+        angular_used_selectors: Vec::new(),
+        angular_entry_component_refs: Vec::new(),
+        has_dynamic_component_render: false,
+        has_dynamic_dispatch: false,
     };
-    let cached = module_to_cached(&module, 0, 0);
+    let cached = module_to_cached_from_parts(&module, 0, 0);
     let restored = cached_to_module(&cached, FileId(0));
     assert_eq!(restored.line_offsets, vec![0, 15, 30, 45]);
 }
 
-// ── Additional coverage ─────────────────────────────────────
-
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "exhaustive ModuleInfo round-trip fixture literal"
+)]
 fn module_to_cached_roundtrip_suppressions_with_kinds() {
     use crate::suppress::{IssueKind, Suppression};
 
     let module = ModuleInfo {
         file_id: FileId(0),
-        exports: vec![],
+        exports: vec![].into(),
         imports: vec![],
         re_exports: vec![],
         dynamic_imports: vec![],
         require_calls: vec![],
-        member_accesses: vec![],
-        whole_object_uses: vec![],
+        package_path_references: Box::default(),
+        member_accesses: vec![].into(),
+        semantic_facts: std::sync::Arc::default(),
+        whole_object_uses: std::sync::Arc::default(),
         dynamic_import_patterns: vec![],
         has_cjs_exports: false,
+        has_angular_component_template_url: false,
         unused_import_bindings: vec![],
         type_referenced_import_bindings: vec![],
         value_referenced_import_bindings: vec![],
         content_hash: 0,
         suppressions: vec![
-            Suppression {
-                line: 0,
-                comment_line: 1,
-                kind: None,
+            Suppression::all(0, 1),
+            Suppression::issue(5, 4, IssueKind::UnusedExport),
+            Suppression::issue(10, 9, IssueKind::UnusedFile),
+            Suppression::policy_rule(12, 11, "team-policy", "no-child-process"),
+        ],
+        unknown_suppression_kinds: vec![],
+        line_offsets: vec![],
+        complexity: Vec::new(),
+        flag_uses: Vec::new(),
+        class_heritage: vec![],
+        exported_factory_returns: std::sync::Arc::default(),
+        exported_factory_return_object_shapes: std::sync::Arc::default(),
+        type_member_types: std::sync::Arc::default(),
+        injection_tokens: vec![],
+        local_type_declarations: Vec::new(),
+        public_signature_type_references: Vec::new(),
+        namespace_object_aliases: Vec::new(),
+        iconify_prefixes: Vec::new(),
+        iconify_icon_names: Vec::new(),
+        auto_import_candidates: Vec::new(),
+        directives: Vec::new(),
+        client_only_dynamic_import_spans: Vec::new(),
+        security_sinks: Vec::new(),
+        security_sinks_skipped: 0,
+        security_unresolved_callee_sites: Vec::new(),
+        tainted_bindings: Vec::new(),
+        sanitized_sink_args: Vec::new(),
+        security_control_sites: Vec::new(),
+        callee_uses: Vec::new(),
+        misplaced_directives: Vec::new(),
+        inline_server_action_exports: Vec::new(),
+        di_key_sites: Vec::new(),
+        has_dynamic_provide: false,
+        referenced_import_bindings: vec![],
+        component_props: Vec::new(),
+        has_props_attrs_fallthrough: false,
+        has_define_expose: false,
+        has_define_model: false,
+        has_unharvestable_props: false,
+        component_emits: Vec::new(),
+        angular_inputs: Vec::new(),
+        angular_outputs: Vec::new(),
+        has_unharvestable_emits: false,
+        has_dynamic_emit: false,
+        has_emit_whole_object_use: false,
+        load_return_keys: Vec::new(),
+        has_unharvestable_load: false,
+        has_load_data_whole_use: false,
+        has_page_data_store_whole_use: false,
+        has_route_loader_data_whole_use: false,
+        component_functions: Vec::new(),
+        react_props: Vec::new(),
+        hook_uses: Vec::new(),
+        render_edges: Vec::new(),
+        svelte_dispatched_events: Vec::new(),
+        svelte_listened_events: Vec::new(),
+        angular_component_selectors: Vec::new(),
+        registered_custom_elements: Vec::new(),
+        used_custom_element_tags: Vec::new(),
+        angular_used_selectors: Vec::new(),
+        angular_entry_component_refs: Vec::new(),
+        has_dynamic_component_render: false,
+        has_dynamic_dispatch: false,
+    };
+
+    let cached = module_to_cached_from_parts(&module, 0, 0);
+    let restored = cached_to_module(&cached, FileId(0));
+
+    assert_eq!(restored.suppressions.len(), 4);
+    assert_eq!(restored.suppressions[0].line, 0);
+    assert!(restored.suppressions[0].issue_kind_target().is_none());
+    assert_eq!(restored.suppressions[1].line, 5);
+    assert_eq!(
+        restored.suppressions[1].issue_kind_target(),
+        Some(IssueKind::UnusedExport)
+    );
+    assert_eq!(restored.suppressions[2].line, 10);
+    assert_eq!(
+        restored.suppressions[2].issue_kind_target(),
+        Some(IssueKind::UnusedFile)
+    );
+    assert_eq!(restored.suppressions[3].line, 12);
+    let policy = restored.suppressions[3]
+        .policy_rule_target()
+        .expect("scoped policy target should round-trip");
+    assert_eq!(policy.pack, "team-policy");
+    assert_eq!(policy.rule_id, "no-child-process");
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "roundtrip fixture enumerates cache fields"
+)]
+fn module_to_cached_roundtrip_unknown_suppression_kinds() {
+    use fallow_types::suppress::UnknownSuppressionKind;
+
+    let module = ModuleInfo {
+        file_id: FileId(0),
+        exports: vec![].into(),
+        imports: vec![],
+        re_exports: vec![],
+        dynamic_imports: vec![],
+        require_calls: vec![],
+        package_path_references: Box::default(),
+        member_accesses: vec![].into(),
+        semantic_facts: std::sync::Arc::default(),
+        whole_object_uses: std::sync::Arc::default(),
+        dynamic_import_patterns: vec![],
+        has_cjs_exports: false,
+        has_angular_component_template_url: false,
+        unused_import_bindings: vec![],
+        type_referenced_import_bindings: vec![],
+        value_referenced_import_bindings: vec![],
+        content_hash: 0,
+        suppressions: vec![],
+        unknown_suppression_kinds: vec![
+            UnknownSuppressionKind {
+                comment_line: 3,
+                is_file_level: false,
+                token: "complexity-typo".to_string(),
+                reason: None,
             },
-            Suppression {
-                line: 5,
-                comment_line: 4,
-                kind: Some(IssueKind::UnusedExport),
-            },
-            Suppression {
-                line: 10,
-                comment_line: 9,
-                kind: Some(IssueKind::UnusedFile),
+            UnknownSuppressionKind {
+                comment_line: 7,
+                is_file_level: true,
+                token: "unsed-export".to_string(),
+                reason: None,
             },
         ],
         line_offsets: vec![],
         complexity: Vec::new(),
         flag_uses: Vec::new(),
         class_heritage: vec![],
+        exported_factory_returns: std::sync::Arc::default(),
+        exported_factory_return_object_shapes: std::sync::Arc::default(),
+        type_member_types: std::sync::Arc::default(),
+        injection_tokens: vec![],
+        local_type_declarations: Vec::new(),
+        public_signature_type_references: Vec::new(),
+        namespace_object_aliases: Vec::new(),
+        iconify_prefixes: Vec::new(),
+        iconify_icon_names: Vec::new(),
+        auto_import_candidates: Vec::new(),
+        directives: Vec::new(),
+        client_only_dynamic_import_spans: Vec::new(),
+        security_sinks: Vec::new(),
+        security_sinks_skipped: 0,
+        security_unresolved_callee_sites: Vec::new(),
+        tainted_bindings: Vec::new(),
+        sanitized_sink_args: Vec::new(),
+        security_control_sites: Vec::new(),
+        callee_uses: Vec::new(),
+        misplaced_directives: Vec::new(),
+        inline_server_action_exports: Vec::new(),
+        di_key_sites: Vec::new(),
+        has_dynamic_provide: false,
+        referenced_import_bindings: vec![],
+        component_props: Vec::new(),
+        has_props_attrs_fallthrough: false,
+        has_define_expose: false,
+        has_define_model: false,
+        has_unharvestable_props: false,
+        component_emits: Vec::new(),
+        angular_inputs: Vec::new(),
+        angular_outputs: Vec::new(),
+        has_unharvestable_emits: false,
+        has_dynamic_emit: false,
+        has_emit_whole_object_use: false,
+        load_return_keys: Vec::new(),
+        has_unharvestable_load: false,
+        has_load_data_whole_use: false,
+        has_page_data_store_whole_use: false,
+        has_route_loader_data_whole_use: false,
+        component_functions: Vec::new(),
+        react_props: Vec::new(),
+        hook_uses: Vec::new(),
+        render_edges: Vec::new(),
+        svelte_dispatched_events: Vec::new(),
+        svelte_listened_events: Vec::new(),
+        angular_component_selectors: Vec::new(),
+        registered_custom_elements: Vec::new(),
+        used_custom_element_tags: Vec::new(),
+        angular_used_selectors: Vec::new(),
+        angular_entry_component_refs: Vec::new(),
+        has_dynamic_component_render: false,
+        has_dynamic_dispatch: false,
     };
 
-    let cached = module_to_cached(&module, 0, 0);
+    let cached = module_to_cached_from_parts(&module, 0, 0);
     let restored = cached_to_module(&cached, FileId(0));
 
-    assert_eq!(restored.suppressions.len(), 3);
-    assert_eq!(restored.suppressions[0].line, 0);
-    assert!(restored.suppressions[0].kind.is_none());
-    assert_eq!(restored.suppressions[1].line, 5);
-    assert_eq!(restored.suppressions[1].kind, Some(IssueKind::UnusedExport));
-    assert_eq!(restored.suppressions[2].line, 10);
-    assert_eq!(restored.suppressions[2].kind, Some(IssueKind::UnusedFile));
+    assert_eq!(restored.unknown_suppression_kinds.len(), 2);
+    assert_eq!(restored.unknown_suppression_kinds[0].comment_line, 3);
+    assert!(!restored.unknown_suppression_kinds[0].is_file_level);
+    assert_eq!(
+        restored.unknown_suppression_kinds[0].token,
+        "complexity-typo"
+    );
+    assert_eq!(restored.unknown_suppression_kinds[1].comment_line, 7);
+    assert!(restored.unknown_suppression_kinds[1].is_file_level);
+    assert_eq!(restored.unknown_suppression_kinds[1].token, "unsed-export");
 }
 
 #[test]
@@ -1003,30 +2981,90 @@ fn module_to_cached_roundtrip_visibility() {
             local_name: Some("publicFoo".to_string()),
             is_type_only: false,
             visibility: VisibilityTag::Public,
+            expected_unused_reason: None,
             span: Span::new(0, 10),
             members: vec![],
+            is_side_effect_used: false,
             super_class: None,
-        }],
+        }]
+        .into(),
         imports: vec![],
         re_exports: vec![],
         dynamic_imports: vec![],
         require_calls: vec![],
-        member_accesses: vec![],
-        whole_object_uses: vec![],
+        package_path_references: Box::default(),
+        member_accesses: vec![].into(),
+        semantic_facts: std::sync::Arc::default(),
+        whole_object_uses: std::sync::Arc::default(),
         dynamic_import_patterns: vec![],
         has_cjs_exports: false,
+        has_angular_component_template_url: false,
         unused_import_bindings: vec![],
         type_referenced_import_bindings: vec![],
         value_referenced_import_bindings: vec![],
         content_hash: 0,
         suppressions: vec![],
+        unknown_suppression_kinds: vec![],
         line_offsets: vec![],
         complexity: Vec::new(),
         flag_uses: Vec::new(),
         class_heritage: vec![],
+        exported_factory_returns: std::sync::Arc::default(),
+        exported_factory_return_object_shapes: std::sync::Arc::default(),
+        type_member_types: std::sync::Arc::default(),
+        injection_tokens: vec![],
+        local_type_declarations: Vec::new(),
+        public_signature_type_references: Vec::new(),
+        namespace_object_aliases: Vec::new(),
+        iconify_prefixes: Vec::new(),
+        iconify_icon_names: Vec::new(),
+        auto_import_candidates: Vec::new(),
+        directives: Vec::new(),
+        client_only_dynamic_import_spans: Vec::new(),
+        security_sinks: Vec::new(),
+        security_sinks_skipped: 0,
+        security_unresolved_callee_sites: Vec::new(),
+        tainted_bindings: Vec::new(),
+        sanitized_sink_args: Vec::new(),
+        security_control_sites: Vec::new(),
+        callee_uses: Vec::new(),
+        misplaced_directives: Vec::new(),
+        inline_server_action_exports: Vec::new(),
+        di_key_sites: Vec::new(),
+        has_dynamic_provide: false,
+        referenced_import_bindings: vec![],
+        component_props: Vec::new(),
+        has_props_attrs_fallthrough: false,
+        has_define_expose: false,
+        has_define_model: false,
+        has_unharvestable_props: false,
+        component_emits: Vec::new(),
+        angular_inputs: Vec::new(),
+        angular_outputs: Vec::new(),
+        has_unharvestable_emits: false,
+        has_dynamic_emit: false,
+        has_emit_whole_object_use: false,
+        load_return_keys: Vec::new(),
+        has_unharvestable_load: false,
+        has_load_data_whole_use: false,
+        has_page_data_store_whole_use: false,
+        has_route_loader_data_whole_use: false,
+        component_functions: Vec::new(),
+        react_props: Vec::new(),
+        hook_uses: Vec::new(),
+        render_edges: Vec::new(),
+        svelte_dispatched_events: Vec::new(),
+        svelte_listened_events: Vec::new(),
+        angular_component_selectors: Vec::new(),
+        registered_custom_elements: Vec::new(),
+        used_custom_element_tags: Vec::new(),
+        angular_used_selectors: Vec::new(),
+        angular_entry_component_refs: Vec::new(),
+        has_dynamic_component_render: false,
+        has_dynamic_dispatch: false,
     };
 
-    let cached = module_to_cached(&module, 0, 0);
+    let cached = module_to_cached_from_parts(&module, 0, 0);
     let restored = cached_to_module(&cached, FileId(0));
 
     assert_eq!(restored.exports[0].visibility, VisibilityTag::Public);
@@ -1041,30 +3079,90 @@ fn module_to_cached_roundtrip_visibility_internal() {
             local_name: Some("internalHelper".to_string()),
             is_type_only: false,
             visibility: VisibilityTag::Internal,
+            expected_unused_reason: None,
             span: Span::new(0, 20),
             members: vec![],
+            is_side_effect_used: false,
             super_class: None,
-        }],
+        }]
+        .into(),
         imports: vec![],
         re_exports: vec![],
         dynamic_imports: vec![],
         require_calls: vec![],
-        member_accesses: vec![],
-        whole_object_uses: vec![],
+        package_path_references: Box::default(),
+        member_accesses: vec![].into(),
+        semantic_facts: std::sync::Arc::default(),
+        whole_object_uses: std::sync::Arc::default(),
         dynamic_import_patterns: vec![],
         has_cjs_exports: false,
+        has_angular_component_template_url: false,
         unused_import_bindings: vec![],
         type_referenced_import_bindings: vec![],
         value_referenced_import_bindings: vec![],
         content_hash: 0,
         suppressions: vec![],
+        unknown_suppression_kinds: vec![],
         line_offsets: vec![],
         complexity: Vec::new(),
         flag_uses: Vec::new(),
         class_heritage: vec![],
+        exported_factory_returns: std::sync::Arc::default(),
+        exported_factory_return_object_shapes: std::sync::Arc::default(),
+        type_member_types: std::sync::Arc::default(),
+        injection_tokens: vec![],
+        local_type_declarations: Vec::new(),
+        public_signature_type_references: Vec::new(),
+        namespace_object_aliases: Vec::new(),
+        iconify_prefixes: Vec::new(),
+        iconify_icon_names: Vec::new(),
+        auto_import_candidates: Vec::new(),
+        directives: Vec::new(),
+        client_only_dynamic_import_spans: Vec::new(),
+        security_sinks: Vec::new(),
+        security_sinks_skipped: 0,
+        security_unresolved_callee_sites: Vec::new(),
+        tainted_bindings: Vec::new(),
+        sanitized_sink_args: Vec::new(),
+        security_control_sites: Vec::new(),
+        callee_uses: Vec::new(),
+        misplaced_directives: Vec::new(),
+        inline_server_action_exports: Vec::new(),
+        di_key_sites: Vec::new(),
+        has_dynamic_provide: false,
+        referenced_import_bindings: vec![],
+        component_props: Vec::new(),
+        has_props_attrs_fallthrough: false,
+        has_define_expose: false,
+        has_define_model: false,
+        has_unharvestable_props: false,
+        component_emits: Vec::new(),
+        angular_inputs: Vec::new(),
+        angular_outputs: Vec::new(),
+        has_unharvestable_emits: false,
+        has_dynamic_emit: false,
+        has_emit_whole_object_use: false,
+        load_return_keys: Vec::new(),
+        has_unharvestable_load: false,
+        has_load_data_whole_use: false,
+        has_page_data_store_whole_use: false,
+        has_route_loader_data_whole_use: false,
+        component_functions: Vec::new(),
+        react_props: Vec::new(),
+        hook_uses: Vec::new(),
+        render_edges: Vec::new(),
+        svelte_dispatched_events: Vec::new(),
+        svelte_listened_events: Vec::new(),
+        angular_component_selectors: Vec::new(),
+        registered_custom_elements: Vec::new(),
+        used_custom_element_tags: Vec::new(),
+        angular_used_selectors: Vec::new(),
+        angular_entry_component_refs: Vec::new(),
+        has_dynamic_component_render: false,
+        has_dynamic_dispatch: false,
     };
 
-    let cached = module_to_cached(&module, 0, 0);
+    let cached = module_to_cached_from_parts(&module, 0, 0);
     assert_eq!(cached.exports[0].visibility, 2);
     let restored = cached_to_module(&cached, FileId(0));
     assert_eq!(restored.exports[0].visibility, VisibilityTag::Internal);
@@ -1079,30 +3177,90 @@ fn module_to_cached_roundtrip_visibility_beta() {
             local_name: Some("betaFeature".to_string()),
             is_type_only: false,
             visibility: VisibilityTag::Beta,
+            expected_unused_reason: None,
             span: Span::new(0, 20),
             members: vec![],
+            is_side_effect_used: false,
             super_class: None,
-        }],
+        }]
+        .into(),
         imports: vec![],
         re_exports: vec![],
         dynamic_imports: vec![],
         require_calls: vec![],
-        member_accesses: vec![],
-        whole_object_uses: vec![],
+        package_path_references: Box::default(),
+        member_accesses: vec![].into(),
+        semantic_facts: std::sync::Arc::default(),
+        whole_object_uses: std::sync::Arc::default(),
         dynamic_import_patterns: vec![],
         has_cjs_exports: false,
+        has_angular_component_template_url: false,
         unused_import_bindings: vec![],
         type_referenced_import_bindings: vec![],
         value_referenced_import_bindings: vec![],
         content_hash: 0,
         suppressions: vec![],
+        unknown_suppression_kinds: vec![],
         line_offsets: vec![],
         complexity: Vec::new(),
         flag_uses: Vec::new(),
         class_heritage: vec![],
+        exported_factory_returns: std::sync::Arc::default(),
+        exported_factory_return_object_shapes: std::sync::Arc::default(),
+        type_member_types: std::sync::Arc::default(),
+        injection_tokens: vec![],
+        local_type_declarations: Vec::new(),
+        public_signature_type_references: Vec::new(),
+        namespace_object_aliases: Vec::new(),
+        iconify_prefixes: Vec::new(),
+        iconify_icon_names: Vec::new(),
+        auto_import_candidates: Vec::new(),
+        directives: Vec::new(),
+        client_only_dynamic_import_spans: Vec::new(),
+        security_sinks: Vec::new(),
+        security_sinks_skipped: 0,
+        security_unresolved_callee_sites: Vec::new(),
+        tainted_bindings: Vec::new(),
+        sanitized_sink_args: Vec::new(),
+        security_control_sites: Vec::new(),
+        callee_uses: Vec::new(),
+        misplaced_directives: Vec::new(),
+        inline_server_action_exports: Vec::new(),
+        di_key_sites: Vec::new(),
+        has_dynamic_provide: false,
+        referenced_import_bindings: vec![],
+        component_props: Vec::new(),
+        has_props_attrs_fallthrough: false,
+        has_define_expose: false,
+        has_define_model: false,
+        has_unharvestable_props: false,
+        component_emits: Vec::new(),
+        angular_inputs: Vec::new(),
+        angular_outputs: Vec::new(),
+        has_unharvestable_emits: false,
+        has_dynamic_emit: false,
+        has_emit_whole_object_use: false,
+        load_return_keys: Vec::new(),
+        has_unharvestable_load: false,
+        has_load_data_whole_use: false,
+        has_page_data_store_whole_use: false,
+        has_route_loader_data_whole_use: false,
+        component_functions: Vec::new(),
+        react_props: Vec::new(),
+        hook_uses: Vec::new(),
+        render_edges: Vec::new(),
+        svelte_dispatched_events: Vec::new(),
+        svelte_listened_events: Vec::new(),
+        angular_component_selectors: Vec::new(),
+        registered_custom_elements: Vec::new(),
+        used_custom_element_tags: Vec::new(),
+        angular_used_selectors: Vec::new(),
+        angular_entry_component_refs: Vec::new(),
+        has_dynamic_component_render: false,
+        has_dynamic_dispatch: false,
     };
 
-    let cached = module_to_cached(&module, 0, 0);
+    let cached = module_to_cached_from_parts(&module, 0, 0);
     assert_eq!(cached.exports[0].visibility, 3);
     let restored = cached_to_module(&cached, FileId(0));
     assert_eq!(restored.exports[0].visibility, VisibilityTag::Beta);
@@ -1117,71 +3275,194 @@ fn module_to_cached_roundtrip_visibility_alpha() {
             local_name: Some("alphaFeature".to_string()),
             is_type_only: false,
             visibility: VisibilityTag::Alpha,
+            expected_unused_reason: None,
             span: Span::new(0, 20),
             members: vec![],
+            is_side_effect_used: false,
             super_class: None,
-        }],
+        }]
+        .into(),
         imports: vec![],
         re_exports: vec![],
         dynamic_imports: vec![],
         require_calls: vec![],
-        member_accesses: vec![],
-        whole_object_uses: vec![],
+        package_path_references: Box::default(),
+        member_accesses: vec![].into(),
+        semantic_facts: std::sync::Arc::default(),
+        whole_object_uses: std::sync::Arc::default(),
         dynamic_import_patterns: vec![],
         has_cjs_exports: false,
+        has_angular_component_template_url: false,
         unused_import_bindings: vec![],
         type_referenced_import_bindings: vec![],
         value_referenced_import_bindings: vec![],
         content_hash: 0,
         suppressions: vec![],
+        unknown_suppression_kinds: vec![],
         line_offsets: vec![],
         complexity: Vec::new(),
         flag_uses: Vec::new(),
         class_heritage: vec![],
+        exported_factory_returns: std::sync::Arc::default(),
+        exported_factory_return_object_shapes: std::sync::Arc::default(),
+        type_member_types: std::sync::Arc::default(),
+        injection_tokens: vec![],
+        local_type_declarations: Vec::new(),
+        public_signature_type_references: Vec::new(),
+        namespace_object_aliases: Vec::new(),
+        iconify_prefixes: Vec::new(),
+        iconify_icon_names: Vec::new(),
+        auto_import_candidates: Vec::new(),
+        directives: Vec::new(),
+        client_only_dynamic_import_spans: Vec::new(),
+        security_sinks: Vec::new(),
+        security_sinks_skipped: 0,
+        security_unresolved_callee_sites: Vec::new(),
+        tainted_bindings: Vec::new(),
+        sanitized_sink_args: Vec::new(),
+        security_control_sites: Vec::new(),
+        callee_uses: Vec::new(),
+        misplaced_directives: Vec::new(),
+        inline_server_action_exports: Vec::new(),
+        di_key_sites: Vec::new(),
+        has_dynamic_provide: false,
+        referenced_import_bindings: vec![],
+        component_props: Vec::new(),
+        has_props_attrs_fallthrough: false,
+        has_define_expose: false,
+        has_define_model: false,
+        has_unharvestable_props: false,
+        component_emits: Vec::new(),
+        angular_inputs: Vec::new(),
+        angular_outputs: Vec::new(),
+        has_unharvestable_emits: false,
+        has_dynamic_emit: false,
+        has_emit_whole_object_use: false,
+        load_return_keys: Vec::new(),
+        has_unharvestable_load: false,
+        has_load_data_whole_use: false,
+        has_page_data_store_whole_use: false,
+        has_route_loader_data_whole_use: false,
+        component_functions: Vec::new(),
+        react_props: Vec::new(),
+        hook_uses: Vec::new(),
+        render_edges: Vec::new(),
+        svelte_dispatched_events: Vec::new(),
+        svelte_listened_events: Vec::new(),
+        angular_component_selectors: Vec::new(),
+        registered_custom_elements: Vec::new(),
+        used_custom_element_tags: Vec::new(),
+        angular_used_selectors: Vec::new(),
+        angular_entry_component_refs: Vec::new(),
+        has_dynamic_component_render: false,
+        has_dynamic_dispatch: false,
     };
 
-    let cached = module_to_cached(&module, 0, 0);
+    let cached = module_to_cached_from_parts(&module, 0, 0);
     assert_eq!(cached.exports[0].visibility, 4);
     let restored = cached_to_module(&cached, FileId(0));
     assert_eq!(restored.exports[0].visibility, VisibilityTag::Alpha);
 }
 
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "exhaustive CachedModule field roundtrip literal"
+)]
 fn module_to_cached_roundtrip_dynamic_import_patterns() {
     let module = ModuleInfo {
         file_id: FileId(0),
-        exports: vec![],
+        exports: vec![].into(),
         imports: vec![],
         re_exports: vec![],
         dynamic_imports: vec![],
         require_calls: vec![],
-        member_accesses: vec![],
-        whole_object_uses: vec![],
+        package_path_references: Box::default(),
+        member_accesses: vec![].into(),
+        semantic_facts: std::sync::Arc::default(),
+        whole_object_uses: std::sync::Arc::default(),
         dynamic_import_patterns: vec![
             crate::DynamicImportPattern {
                 prefix: "./components/".to_string(),
                 suffix: Some(".vue".to_string()),
                 span: Span::new(0, 50),
+                mechanism: crate::ModuleLoadMechanism::EsModule,
             },
             crate::DynamicImportPattern {
                 prefix: "./pages/**/".to_string(),
                 suffix: None,
                 span: Span::new(60, 100),
+                mechanism: crate::ModuleLoadMechanism::CommonJsRequire,
             },
         ],
         has_cjs_exports: false,
+        has_angular_component_template_url: false,
         unused_import_bindings: vec![],
         type_referenced_import_bindings: vec![],
         value_referenced_import_bindings: vec![],
         content_hash: 0,
         suppressions: vec![],
+        unknown_suppression_kinds: vec![],
         line_offsets: vec![],
         complexity: Vec::new(),
         flag_uses: Vec::new(),
         class_heritage: vec![],
+        exported_factory_returns: std::sync::Arc::default(),
+        exported_factory_return_object_shapes: std::sync::Arc::default(),
+        type_member_types: std::sync::Arc::default(),
+        injection_tokens: vec![],
+        local_type_declarations: Vec::new(),
+        public_signature_type_references: Vec::new(),
+        namespace_object_aliases: Vec::new(),
+        iconify_prefixes: Vec::new(),
+        iconify_icon_names: Vec::new(),
+        auto_import_candidates: Vec::new(),
+        directives: Vec::new(),
+        client_only_dynamic_import_spans: Vec::new(),
+        security_sinks: Vec::new(),
+        security_sinks_skipped: 0,
+        security_unresolved_callee_sites: Vec::new(),
+        tainted_bindings: Vec::new(),
+        sanitized_sink_args: Vec::new(),
+        security_control_sites: Vec::new(),
+        callee_uses: Vec::new(),
+        misplaced_directives: Vec::new(),
+        inline_server_action_exports: Vec::new(),
+        di_key_sites: Vec::new(),
+        has_dynamic_provide: false,
+        referenced_import_bindings: vec![],
+        component_props: Vec::new(),
+        has_props_attrs_fallthrough: false,
+        has_define_expose: false,
+        has_define_model: false,
+        has_unharvestable_props: false,
+        component_emits: Vec::new(),
+        angular_inputs: Vec::new(),
+        angular_outputs: Vec::new(),
+        has_unharvestable_emits: false,
+        has_dynamic_emit: false,
+        has_emit_whole_object_use: false,
+        load_return_keys: Vec::new(),
+        has_unharvestable_load: false,
+        has_load_data_whole_use: false,
+        has_page_data_store_whole_use: false,
+        has_route_loader_data_whole_use: false,
+        component_functions: Vec::new(),
+        react_props: Vec::new(),
+        hook_uses: Vec::new(),
+        render_edges: Vec::new(),
+        svelte_dispatched_events: Vec::new(),
+        svelte_listened_events: Vec::new(),
+        angular_component_selectors: Vec::new(),
+        registered_custom_elements: Vec::new(),
+        used_custom_element_tags: Vec::new(),
+        angular_used_selectors: Vec::new(),
+        angular_entry_component_refs: Vec::new(),
+        has_dynamic_component_render: false,
+        has_dynamic_dispatch: false,
     };
 
-    let cached = module_to_cached(&module, 0, 0);
+    let cached = module_to_cached_from_parts(&module, 0, 0);
     let restored = cached_to_module(&cached, FileId(0));
 
     assert_eq!(restored.dynamic_import_patterns.len(), 2);
@@ -1192,35 +3473,100 @@ fn module_to_cached_roundtrip_dynamic_import_patterns() {
     );
     assert_eq!(restored.dynamic_import_patterns[0].span.start, 0);
     assert_eq!(restored.dynamic_import_patterns[0].span.end, 50);
+    assert_eq!(
+        restored.dynamic_import_patterns[0].mechanism,
+        crate::ModuleLoadMechanism::EsModule
+    );
     assert_eq!(restored.dynamic_import_patterns[1].prefix, "./pages/**/");
     assert!(restored.dynamic_import_patterns[1].suffix.is_none());
+    assert_eq!(
+        restored.dynamic_import_patterns[1].mechanism,
+        crate::ModuleLoadMechanism::CommonJsRequire
+    );
 }
 
 #[test]
 fn module_to_cached_roundtrip_unused_import_bindings() {
     let module = ModuleInfo {
         file_id: FileId(0),
-        exports: vec![],
+        exports: vec![].into(),
         imports: vec![],
         re_exports: vec![],
         dynamic_imports: vec![],
         require_calls: vec![],
-        member_accesses: vec![],
-        whole_object_uses: vec!["Status".to_string()],
+        package_path_references: Box::default(),
+        member_accesses: vec![].into(),
+        semantic_facts: std::sync::Arc::default(),
+        whole_object_uses: vec!["Status".to_string()].into(),
         dynamic_import_patterns: vec![],
         has_cjs_exports: false,
+        has_angular_component_template_url: false,
         unused_import_bindings: vec!["unusedFoo".to_string(), "unusedBar".to_string()],
         type_referenced_import_bindings: vec![],
         value_referenced_import_bindings: vec![],
         content_hash: 0,
         suppressions: vec![],
+        unknown_suppression_kinds: vec![],
         line_offsets: vec![],
         complexity: Vec::new(),
         flag_uses: Vec::new(),
         class_heritage: vec![],
+        exported_factory_returns: std::sync::Arc::default(),
+        exported_factory_return_object_shapes: std::sync::Arc::default(),
+        type_member_types: std::sync::Arc::default(),
+        injection_tokens: vec![],
+        local_type_declarations: Vec::new(),
+        public_signature_type_references: Vec::new(),
+        namespace_object_aliases: Vec::new(),
+        iconify_prefixes: Vec::new(),
+        iconify_icon_names: Vec::new(),
+        auto_import_candidates: Vec::new(),
+        directives: Vec::new(),
+        client_only_dynamic_import_spans: Vec::new(),
+        security_sinks: Vec::new(),
+        security_sinks_skipped: 0,
+        security_unresolved_callee_sites: Vec::new(),
+        tainted_bindings: Vec::new(),
+        sanitized_sink_args: Vec::new(),
+        security_control_sites: Vec::new(),
+        callee_uses: Vec::new(),
+        misplaced_directives: Vec::new(),
+        inline_server_action_exports: Vec::new(),
+        di_key_sites: Vec::new(),
+        has_dynamic_provide: false,
+        referenced_import_bindings: vec![],
+        component_props: Vec::new(),
+        has_props_attrs_fallthrough: false,
+        has_define_expose: false,
+        has_define_model: false,
+        has_unharvestable_props: false,
+        component_emits: Vec::new(),
+        angular_inputs: Vec::new(),
+        angular_outputs: Vec::new(),
+        has_unharvestable_emits: false,
+        has_dynamic_emit: false,
+        has_emit_whole_object_use: false,
+        load_return_keys: Vec::new(),
+        has_unharvestable_load: false,
+        has_load_data_whole_use: false,
+        has_page_data_store_whole_use: false,
+        has_route_loader_data_whole_use: false,
+        component_functions: Vec::new(),
+        react_props: Vec::new(),
+        hook_uses: Vec::new(),
+        render_edges: Vec::new(),
+        svelte_dispatched_events: Vec::new(),
+        svelte_listened_events: Vec::new(),
+        angular_component_selectors: Vec::new(),
+        registered_custom_elements: Vec::new(),
+        used_custom_element_tags: Vec::new(),
+        angular_used_selectors: Vec::new(),
+        angular_entry_component_refs: Vec::new(),
+        has_dynamic_component_render: false,
+        has_dynamic_dispatch: false,
     };
 
-    let cached = module_to_cached(&module, 0, 0);
+    let cached = module_to_cached_from_parts(&module, 0, 0);
     let restored = cached_to_module(&cached, FileId(0));
 
     assert_eq!(restored.unused_import_bindings.len(), 2);
@@ -1238,59 +3584,164 @@ fn module_to_cached_roundtrip_unused_import_bindings() {
 }
 
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "test fixture; linear setup/assert, length is not a maintainability concern"
+)]
 fn module_to_cached_roundtrip_complexity() {
-    use fallow_types::extract::FunctionComplexity;
+    use fallow_types::extract::{
+        ComplexityContribution, ComplexityContributionKind, ComplexityMetric, FunctionComplexity,
+    };
 
     let module = ModuleInfo {
         file_id: FileId(0),
-        exports: vec![],
+        exports: vec![].into(),
         imports: vec![],
         re_exports: vec![],
         dynamic_imports: vec![],
         require_calls: vec![],
-        member_accesses: vec![],
-        whole_object_uses: vec![],
+        package_path_references: Box::default(),
+        member_accesses: vec![].into(),
+        semantic_facts: std::sync::Arc::default(),
+        whole_object_uses: std::sync::Arc::default(),
         dynamic_import_patterns: vec![],
         has_cjs_exports: false,
+        has_angular_component_template_url: false,
         unused_import_bindings: vec![],
         type_referenced_import_bindings: vec![],
         value_referenced_import_bindings: vec![],
         content_hash: 0,
         suppressions: vec![],
+        unknown_suppression_kinds: vec![],
         line_offsets: vec![],
         complexity: vec![
             FunctionComplexity {
                 name: "complex".to_string(),
+                is_private_member: true,
                 line: 5,
                 col: 0,
                 cyclomatic: 8,
                 cognitive: 15,
                 line_count: 20,
                 param_count: 4,
+                react_hook_count: 0,
+                react_jsx_max_depth: 0,
+                react_prop_count: 0,
+                source_hash: Some("0123456789abcdef".to_string()),
+                contributions: vec![
+                    ComplexityContribution {
+                        line: 6,
+                        col: 2,
+                        metric: ComplexityMetric::Cyclomatic,
+                        kind: ComplexityContributionKind::Await,
+                        weight: 1,
+                        nesting: 0,
+                    },
+                    ComplexityContribution {
+                        line: 8,
+                        col: 2,
+                        metric: ComplexityMetric::Cognitive,
+                        kind: ComplexityContributionKind::Then,
+                        weight: 1,
+                        nesting: 0,
+                    },
+                ],
             },
             FunctionComplexity {
                 name: "simple".to_string(),
+                is_private_member: false,
                 line: 30,
                 col: 4,
                 cyclomatic: 1,
                 cognitive: 0,
                 line_count: 3,
                 param_count: 0,
+                react_hook_count: 0,
+                react_jsx_max_depth: 0,
+                react_prop_count: 0,
+                source_hash: None,
+                contributions: Vec::new(),
             },
         ],
         flag_uses: Vec::new(),
         class_heritage: vec![],
+        exported_factory_returns: std::sync::Arc::default(),
+        exported_factory_return_object_shapes: std::sync::Arc::default(),
+        type_member_types: std::sync::Arc::default(),
+        injection_tokens: vec![],
+        local_type_declarations: Vec::new(),
+        public_signature_type_references: Vec::new(),
+        namespace_object_aliases: Vec::new(),
+        iconify_prefixes: Vec::new(),
+        iconify_icon_names: Vec::new(),
+        auto_import_candidates: Vec::new(),
+        directives: Vec::new(),
+        client_only_dynamic_import_spans: Vec::new(),
+        security_sinks: Vec::new(),
+        security_sinks_skipped: 0,
+        security_unresolved_callee_sites: Vec::new(),
+        tainted_bindings: Vec::new(),
+        sanitized_sink_args: Vec::new(),
+        security_control_sites: Vec::new(),
+        callee_uses: Vec::new(),
+        misplaced_directives: Vec::new(),
+        inline_server_action_exports: Vec::new(),
+        di_key_sites: Vec::new(),
+        has_dynamic_provide: false,
+        referenced_import_bindings: vec![],
+        component_props: Vec::new(),
+        has_props_attrs_fallthrough: false,
+        has_define_expose: false,
+        has_define_model: false,
+        has_unharvestable_props: false,
+        component_emits: Vec::new(),
+        angular_inputs: Vec::new(),
+        angular_outputs: Vec::new(),
+        has_unharvestable_emits: false,
+        has_dynamic_emit: false,
+        has_emit_whole_object_use: false,
+        load_return_keys: Vec::new(),
+        has_unharvestable_load: false,
+        has_load_data_whole_use: false,
+        has_page_data_store_whole_use: false,
+        has_route_loader_data_whole_use: false,
+        component_functions: Vec::new(),
+        react_props: Vec::new(),
+        hook_uses: Vec::new(),
+        render_edges: Vec::new(),
+        svelte_dispatched_events: Vec::new(),
+        svelte_listened_events: Vec::new(),
+        angular_component_selectors: Vec::new(),
+        registered_custom_elements: Vec::new(),
+        used_custom_element_tags: Vec::new(),
+        angular_used_selectors: Vec::new(),
+        angular_entry_component_refs: Vec::new(),
+        has_dynamic_component_render: false,
+        has_dynamic_dispatch: false,
     };
 
-    let cached = module_to_cached(&module, 0, 0);
+    let cached = module_to_cached_from_parts(&module, 0, 0);
     let restored = cached_to_module(&cached, FileId(0));
 
     assert_eq!(restored.complexity.len(), 2);
     assert_eq!(restored.complexity[0].name, "complex");
+    assert!(restored.complexity[0].is_private_member);
     assert_eq!(restored.complexity[0].cyclomatic, 8);
     assert_eq!(restored.complexity[0].cognitive, 15);
     assert_eq!(restored.complexity[0].line_count, 20);
+    assert_eq!(
+        restored.complexity[0]
+            .contributions
+            .iter()
+            .map(|contribution| contribution.kind)
+            .collect::<Vec<_>>(),
+        [
+            ComplexityContributionKind::Await,
+            ComplexityContributionKind::Then,
+        ]
+    );
     assert_eq!(restored.complexity[1].name, "simple");
+    assert!(!restored.complexity[1].is_private_member);
     assert_eq!(restored.complexity[1].cyclomatic, 1);
     assert_eq!(restored.complexity[1].cognitive, 0);
 }
@@ -1299,7 +3750,7 @@ fn module_to_cached_roundtrip_complexity() {
 fn module_to_cached_roundtrip_require_with_destructured() {
     let module = ModuleInfo {
         file_id: FileId(0),
-        exports: vec![],
+        exports: vec![].into(),
         imports: vec![],
         re_exports: vec![],
         dynamic_imports: vec![],
@@ -1308,23 +3759,82 @@ fn module_to_cached_roundtrip_require_with_destructured() {
             span: Span::new(0, 30),
             destructured_names: vec!["readFile".to_string(), "writeFile".to_string()],
             local_name: None,
+            source_span: oxc_span::Span::default(),
+            is_type_only: false,
         }],
-        member_accesses: vec![],
-        whole_object_uses: vec![],
+        package_path_references: Box::default(),
+        member_accesses: vec![].into(),
+        semantic_facts: std::sync::Arc::default(),
+        whole_object_uses: std::sync::Arc::default(),
         dynamic_import_patterns: vec![],
         has_cjs_exports: false,
+        has_angular_component_template_url: false,
         unused_import_bindings: vec![],
         type_referenced_import_bindings: vec![],
         value_referenced_import_bindings: vec![],
         content_hash: 0,
         suppressions: vec![],
+        unknown_suppression_kinds: vec![],
         line_offsets: vec![],
         complexity: Vec::new(),
         flag_uses: Vec::new(),
         class_heritage: vec![],
+        exported_factory_returns: std::sync::Arc::default(),
+        exported_factory_return_object_shapes: std::sync::Arc::default(),
+        type_member_types: std::sync::Arc::default(),
+        injection_tokens: vec![],
+        local_type_declarations: Vec::new(),
+        public_signature_type_references: Vec::new(),
+        namespace_object_aliases: Vec::new(),
+        iconify_prefixes: Vec::new(),
+        iconify_icon_names: Vec::new(),
+        auto_import_candidates: Vec::new(),
+        directives: Vec::new(),
+        client_only_dynamic_import_spans: Vec::new(),
+        security_sinks: Vec::new(),
+        security_sinks_skipped: 0,
+        security_unresolved_callee_sites: Vec::new(),
+        tainted_bindings: Vec::new(),
+        sanitized_sink_args: Vec::new(),
+        security_control_sites: Vec::new(),
+        callee_uses: Vec::new(),
+        misplaced_directives: Vec::new(),
+        inline_server_action_exports: Vec::new(),
+        di_key_sites: Vec::new(),
+        has_dynamic_provide: false,
+        referenced_import_bindings: vec![],
+        component_props: Vec::new(),
+        has_props_attrs_fallthrough: false,
+        has_define_expose: false,
+        has_define_model: false,
+        has_unharvestable_props: false,
+        component_emits: Vec::new(),
+        angular_inputs: Vec::new(),
+        angular_outputs: Vec::new(),
+        has_unharvestable_emits: false,
+        has_dynamic_emit: false,
+        has_emit_whole_object_use: false,
+        load_return_keys: Vec::new(),
+        has_unharvestable_load: false,
+        has_load_data_whole_use: false,
+        has_page_data_store_whole_use: false,
+        has_route_loader_data_whole_use: false,
+        component_functions: Vec::new(),
+        react_props: Vec::new(),
+        hook_uses: Vec::new(),
+        render_edges: Vec::new(),
+        svelte_dispatched_events: Vec::new(),
+        svelte_listened_events: Vec::new(),
+        angular_component_selectors: Vec::new(),
+        registered_custom_elements: Vec::new(),
+        used_custom_element_tags: Vec::new(),
+        angular_used_selectors: Vec::new(),
+        angular_entry_component_refs: Vec::new(),
+        has_dynamic_component_render: false,
+        has_dynamic_dispatch: false,
     };
 
-    let cached = module_to_cached(&module, 0, 0);
+    let cached = module_to_cached_from_parts(&module, 0, 0);
     let restored = cached_to_module(&cached, FileId(0));
 
     assert_eq!(restored.require_calls.len(), 1);
@@ -1340,7 +3850,7 @@ fn module_to_cached_roundtrip_require_with_destructured() {
 fn module_to_cached_roundtrip_dynamic_import_with_local() {
     let module = ModuleInfo {
         file_id: FileId(0),
-        exports: vec![],
+        exports: vec![].into(),
         imports: vec![],
         re_exports: vec![],
         dynamic_imports: vec![DynamicImportInfo {
@@ -1348,24 +3858,82 @@ fn module_to_cached_roundtrip_dynamic_import_with_local() {
             span: Span::new(0, 20),
             destructured_names: vec![],
             local_name: Some("mod".to_string()),
+            is_speculative: false,
         }],
         require_calls: vec![],
-        member_accesses: vec![],
-        whole_object_uses: vec![],
+        package_path_references: Box::default(),
+        member_accesses: vec![].into(),
+        semantic_facts: std::sync::Arc::default(),
+        whole_object_uses: std::sync::Arc::default(),
         dynamic_import_patterns: vec![],
         has_cjs_exports: false,
+        has_angular_component_template_url: false,
         unused_import_bindings: vec![],
         type_referenced_import_bindings: vec![],
         value_referenced_import_bindings: vec![],
         content_hash: 0,
         suppressions: vec![],
+        unknown_suppression_kinds: vec![],
         line_offsets: vec![],
         complexity: Vec::new(),
         flag_uses: Vec::new(),
         class_heritage: vec![],
+        exported_factory_returns: std::sync::Arc::default(),
+        exported_factory_return_object_shapes: std::sync::Arc::default(),
+        type_member_types: std::sync::Arc::default(),
+        injection_tokens: vec![],
+        local_type_declarations: Vec::new(),
+        public_signature_type_references: Vec::new(),
+        namespace_object_aliases: Vec::new(),
+        iconify_prefixes: Vec::new(),
+        iconify_icon_names: Vec::new(),
+        auto_import_candidates: Vec::new(),
+        directives: Vec::new(),
+        client_only_dynamic_import_spans: Vec::new(),
+        security_sinks: Vec::new(),
+        security_sinks_skipped: 0,
+        security_unresolved_callee_sites: Vec::new(),
+        tainted_bindings: Vec::new(),
+        sanitized_sink_args: Vec::new(),
+        security_control_sites: Vec::new(),
+        callee_uses: Vec::new(),
+        misplaced_directives: Vec::new(),
+        inline_server_action_exports: Vec::new(),
+        di_key_sites: Vec::new(),
+        has_dynamic_provide: false,
+        referenced_import_bindings: vec![],
+        component_props: Vec::new(),
+        has_props_attrs_fallthrough: false,
+        has_define_expose: false,
+        has_define_model: false,
+        has_unharvestable_props: false,
+        component_emits: Vec::new(),
+        angular_inputs: Vec::new(),
+        angular_outputs: Vec::new(),
+        has_unharvestable_emits: false,
+        has_dynamic_emit: false,
+        has_emit_whole_object_use: false,
+        load_return_keys: Vec::new(),
+        has_unharvestable_load: false,
+        has_load_data_whole_use: false,
+        has_page_data_store_whole_use: false,
+        has_route_loader_data_whole_use: false,
+        component_functions: Vec::new(),
+        react_props: Vec::new(),
+        hook_uses: Vec::new(),
+        render_edges: Vec::new(),
+        svelte_dispatched_events: Vec::new(),
+        svelte_listened_events: Vec::new(),
+        angular_component_selectors: Vec::new(),
+        registered_custom_elements: Vec::new(),
+        used_custom_element_tags: Vec::new(),
+        angular_used_selectors: Vec::new(),
+        angular_entry_component_refs: Vec::new(),
+        has_dynamic_component_render: false,
+        has_dynamic_dispatch: false,
     };
 
-    let cached = module_to_cached(&module, 0, 0);
+    let cached = module_to_cached_from_parts(&module, 0, 0);
     let restored = cached_to_module(&cached, FileId(0));
 
     assert_eq!(
@@ -1378,34 +3946,93 @@ fn module_to_cached_roundtrip_dynamic_import_with_local() {
 fn module_to_cached_roundtrip_source_span() {
     let module = ModuleInfo {
         file_id: FileId(0),
-        exports: vec![],
+        exports: vec![].into(),
         imports: vec![ImportInfo {
             source: "./utils".to_string(),
             imported_name: ImportedName::Named("foo".to_string()),
             local_name: "foo".to_string(),
             is_type_only: false,
+            is_type_only_star: false,
+            from_style: false,
             span: Span::new(0, 30),
             source_span: Span::new(25, 33),
         }],
         re_exports: vec![],
         dynamic_imports: vec![],
         require_calls: vec![],
-        member_accesses: vec![],
-        whole_object_uses: vec![],
+        package_path_references: Box::default(),
+        member_accesses: vec![].into(),
+        semantic_facts: std::sync::Arc::default(),
+        whole_object_uses: std::sync::Arc::default(),
         dynamic_import_patterns: vec![],
         has_cjs_exports: false,
+        has_angular_component_template_url: false,
         unused_import_bindings: vec![],
         type_referenced_import_bindings: vec![],
         value_referenced_import_bindings: vec![],
         content_hash: 0,
         suppressions: vec![],
+        unknown_suppression_kinds: vec![],
         line_offsets: vec![],
         complexity: Vec::new(),
         flag_uses: Vec::new(),
         class_heritage: vec![],
+        exported_factory_returns: std::sync::Arc::default(),
+        exported_factory_return_object_shapes: std::sync::Arc::default(),
+        type_member_types: std::sync::Arc::default(),
+        injection_tokens: vec![],
+        local_type_declarations: Vec::new(),
+        public_signature_type_references: Vec::new(),
+        namespace_object_aliases: Vec::new(),
+        iconify_prefixes: Vec::new(),
+        iconify_icon_names: Vec::new(),
+        auto_import_candidates: Vec::new(),
+        directives: Vec::new(),
+        client_only_dynamic_import_spans: Vec::new(),
+        security_sinks: Vec::new(),
+        security_sinks_skipped: 0,
+        security_unresolved_callee_sites: Vec::new(),
+        tainted_bindings: Vec::new(),
+        sanitized_sink_args: Vec::new(),
+        security_control_sites: Vec::new(),
+        callee_uses: Vec::new(),
+        misplaced_directives: Vec::new(),
+        inline_server_action_exports: Vec::new(),
+        di_key_sites: Vec::new(),
+        has_dynamic_provide: false,
+        referenced_import_bindings: vec![],
+        component_props: Vec::new(),
+        has_props_attrs_fallthrough: false,
+        has_define_expose: false,
+        has_define_model: false,
+        has_unharvestable_props: false,
+        component_emits: Vec::new(),
+        angular_inputs: Vec::new(),
+        angular_outputs: Vec::new(),
+        has_unharvestable_emits: false,
+        has_dynamic_emit: false,
+        has_emit_whole_object_use: false,
+        load_return_keys: Vec::new(),
+        has_unharvestable_load: false,
+        has_load_data_whole_use: false,
+        has_page_data_store_whole_use: false,
+        has_route_loader_data_whole_use: false,
+        component_functions: Vec::new(),
+        react_props: Vec::new(),
+        hook_uses: Vec::new(),
+        render_edges: Vec::new(),
+        svelte_dispatched_events: Vec::new(),
+        svelte_listened_events: Vec::new(),
+        angular_component_selectors: Vec::new(),
+        registered_custom_elements: Vec::new(),
+        used_custom_element_tags: Vec::new(),
+        angular_used_selectors: Vec::new(),
+        angular_entry_component_refs: Vec::new(),
+        has_dynamic_component_render: false,
+        has_dynamic_dispatch: false,
     };
 
-    let cached = module_to_cached(&module, 0, 0);
+    let cached = module_to_cached_from_parts(&module, 0, 0);
     let restored = cached_to_module(&cached, FileId(0));
 
     assert_eq!(restored.imports[0].source_span.start, 25);
@@ -1413,6 +4040,10 @@ fn module_to_cached_roundtrip_source_span() {
 }
 
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "exhaustive CachedModule field roundtrip literal"
+)]
 fn module_to_cached_roundtrip_member_decorators() {
     let module = ModuleInfo {
         file_id: FileId(0),
@@ -1421,38 +4052,567 @@ fn module_to_cached_roundtrip_member_decorators() {
             local_name: Some("Svc".to_string()),
             is_type_only: false,
             visibility: VisibilityTag::None,
+            expected_unused_reason: None,
             span: Span::new(0, 100),
             members: vec![MemberInfo {
                 name: "handler".to_string(),
                 kind: MemberKind::ClassMethod,
                 span: Span::new(50, 80),
                 has_decorator: true,
+                decorator_names: vec!["Inject".to_string()],
+                is_instance_returning_static: false,
+                is_self_returning: false,
             }],
+            is_side_effect_used: false,
             super_class: None,
-        }],
+        }]
+        .into(),
         imports: vec![],
         re_exports: vec![],
         dynamic_imports: vec![],
         require_calls: vec![],
-        member_accesses: vec![],
-        whole_object_uses: vec![],
+        package_path_references: Box::default(),
+        member_accesses: vec![].into(),
+        semantic_facts: std::sync::Arc::default(),
+        whole_object_uses: std::sync::Arc::default(),
         dynamic_import_patterns: vec![],
         has_cjs_exports: false,
+        has_angular_component_template_url: false,
         unused_import_bindings: vec![],
         type_referenced_import_bindings: vec![],
         value_referenced_import_bindings: vec![],
         content_hash: 0,
         suppressions: vec![],
+        unknown_suppression_kinds: vec![],
         line_offsets: vec![],
         complexity: Vec::new(),
         flag_uses: Vec::new(),
         class_heritage: vec![],
+        exported_factory_returns: std::sync::Arc::default(),
+        exported_factory_return_object_shapes: std::sync::Arc::default(),
+        type_member_types: std::sync::Arc::default(),
+        injection_tokens: vec![],
+        local_type_declarations: Vec::new(),
+        public_signature_type_references: Vec::new(),
+        namespace_object_aliases: Vec::new(),
+        iconify_prefixes: Vec::new(),
+        iconify_icon_names: Vec::new(),
+        auto_import_candidates: Vec::new(),
+        directives: Vec::new(),
+        client_only_dynamic_import_spans: Vec::new(),
+        security_sinks: Vec::new(),
+        security_sinks_skipped: 0,
+        security_unresolved_callee_sites: Vec::new(),
+        tainted_bindings: Vec::new(),
+        sanitized_sink_args: Vec::new(),
+        security_control_sites: Vec::new(),
+        callee_uses: Vec::new(),
+        misplaced_directives: Vec::new(),
+        inline_server_action_exports: Vec::new(),
+        di_key_sites: Vec::new(),
+        has_dynamic_provide: false,
+        referenced_import_bindings: vec![],
+        component_props: Vec::new(),
+        has_props_attrs_fallthrough: false,
+        has_define_expose: false,
+        has_define_model: false,
+        has_unharvestable_props: false,
+        component_emits: Vec::new(),
+        angular_inputs: Vec::new(),
+        angular_outputs: Vec::new(),
+        has_unharvestable_emits: false,
+        has_dynamic_emit: false,
+        has_emit_whole_object_use: false,
+        load_return_keys: Vec::new(),
+        has_unharvestable_load: false,
+        has_load_data_whole_use: false,
+        has_page_data_store_whole_use: false,
+        has_route_loader_data_whole_use: false,
+        component_functions: Vec::new(),
+        react_props: Vec::new(),
+        hook_uses: Vec::new(),
+        render_edges: Vec::new(),
+        svelte_dispatched_events: Vec::new(),
+        svelte_listened_events: Vec::new(),
+        angular_component_selectors: Vec::new(),
+        registered_custom_elements: Vec::new(),
+        used_custom_element_tags: Vec::new(),
+        angular_used_selectors: Vec::new(),
+        angular_entry_component_refs: Vec::new(),
+        has_dynamic_component_render: false,
+        has_dynamic_dispatch: false,
     };
 
-    let cached = module_to_cached(&module, 0, 0);
+    let cached = module_to_cached_from_parts(&module, 0, 0);
     let restored = cached_to_module(&cached, FileId(0));
 
     assert!(restored.exports[0].members[0].has_decorator);
     assert_eq!(restored.exports[0].members[0].span.start, 50);
     assert_eq!(restored.exports[0].members[0].span.end, 80);
+}
+
+/// Build a minimal `CachedModule` whose serialized size is roughly
+/// proportional to `payload_kb`. Used by the eviction tests to populate
+/// a store with predictable byte cost.
+fn synthetic_module(content_hash: u64, last_access_secs: u64, payload_kb: usize) -> CachedModule {
+    let payload = "a".repeat(payload_kb * 1024);
+    CachedModule {
+        content_hash,
+        mtime_ns: 0,
+        file_size: 0,
+        last_access_secs,
+        exports: vec![],
+        imports: vec![],
+        re_exports: vec![],
+        dynamic_imports: vec![],
+        require_calls: vec![],
+        package_path_references: Box::default(),
+        member_accesses: vec![],
+        semantic_facts: None,
+        whole_object_uses: vec![payload].into(),
+        dynamic_import_patterns: vec![],
+        has_cjs_exports: false,
+        has_angular_component_template_url: false,
+        unused_import_bindings: vec![],
+        type_referenced_import_bindings: vec![],
+        value_referenced_import_bindings: vec![],
+        suppressions: vec![],
+        unknown_suppression_kinds: vec![],
+        line_offsets: vec![],
+        complexity: vec![],
+        flag_uses: vec![],
+        class_heritage: vec![],
+        exported_factory_returns: None,
+        exported_factory_return_object_shapes: None,
+        type_member_types: None,
+        injection_tokens: vec![],
+        local_type_declarations: Vec::new(),
+        public_signature_type_references: Vec::new(),
+        namespace_object_aliases: Vec::new(),
+        iconify_prefixes: Vec::new(),
+        iconify_icon_names: Vec::new(),
+        auto_import_candidates: Vec::new(),
+        directives: Vec::new(),
+        client_only_dynamic_import_spans: Vec::new(),
+        security_sinks: Vec::new(),
+        security_sinks_skipped: 0,
+        security_unresolved_callee_sites: Vec::new(),
+        tainted_bindings: Vec::new(),
+        sanitized_sink_args: Vec::new(),
+        security_control_sites: Vec::new(),
+        callee_uses: Vec::new(),
+        misplaced_directives: Vec::new(),
+        inline_server_action_exports: Vec::new(),
+        di_key_sites: Vec::new(),
+        has_dynamic_provide: false,
+        component_props: Vec::new(),
+        has_props_attrs_fallthrough: false,
+        has_define_expose: false,
+        has_define_model: false,
+        has_unharvestable_props: false,
+        component_emits: Vec::new(),
+        angular_inputs: Vec::new(),
+        angular_outputs: Vec::new(),
+        has_unharvestable_emits: false,
+        has_dynamic_emit: false,
+        has_emit_whole_object_use: false,
+        load_return_keys: Vec::new(),
+        has_unharvestable_load: false,
+        has_load_data_whole_use: false,
+        component_functions: Vec::new(),
+        react_props: Vec::new(),
+        hook_uses: Vec::new(),
+        render_edges: Vec::new(),
+        svelte_dispatched_events: Vec::new(),
+        svelte_listened_events: Vec::new(),
+        angular_component_selectors: Vec::new(),
+        registered_custom_elements: Vec::new(),
+        used_custom_element_tags: Vec::new(),
+        angular_used_selectors: Vec::new(),
+        angular_entry_component_refs: Vec::new(),
+        has_dynamic_component_render: false,
+        has_dynamic_dispatch: false,
+    }
+}
+
+#[test]
+fn cache_save_no_eviction_when_under_threshold() {
+    let dir = test_cache_dir("no_evict");
+    let mut store = CacheStore::new();
+    for i in 0..10u64 {
+        store.insert(Path::new(&format!("file{i}.ts")), synthetic_module(i, i, 1));
+    }
+    store
+        .save(&dir, 42, DEFAULT_CACHE_MAX_SIZE)
+        .expect("save under threshold");
+
+    let loaded = CacheStore::load(&dir, 42, DEFAULT_CACHE_MAX_SIZE).expect("load round-trip");
+    assert_eq!(loaded.len(), 10, "all 10 entries survive");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn cache_save_evicts_when_over_threshold() {
+    let dir = test_cache_dir("evict_over_threshold");
+    let mut store = CacheStore::new();
+    for i in 0..50u64 {
+        store.insert(Path::new(&format!("file{i}.ts")), synthetic_module(i, i, 1));
+    }
+    let cap = 40 * 1024;
+    store.save(&dir, 99, cap).expect("save with eviction");
+
+    let loaded = CacheStore::load(&dir, 99, DEFAULT_CACHE_MAX_SIZE).expect("load after eviction");
+    assert!(loaded.len() < 50, "eviction removed entries");
+    let kept_max = (0..50u64)
+        .filter(|i| {
+            loaded
+                .get(&std::path::PathBuf::from(format!("file{i}.ts")), *i)
+                .is_some()
+        })
+        .max()
+        .expect("at least one entry remains");
+    let kept_min = (0..50u64)
+        .filter(|i| {
+            loaded
+                .get(&std::path::PathBuf::from(format!("file{i}.ts")), *i)
+                .is_some()
+        })
+        .min()
+        .expect("at least one entry remains");
+    assert_eq!(kept_max, 49, "newest entry survives eviction");
+    assert!(
+        kept_min > 0,
+        "oldest entry was evicted (kept_min = {kept_min})"
+    );
+
+    let on_disk = std::fs::read(dir.join("cache.bin")).unwrap();
+    assert!(
+        on_disk.len() < cap * 80 / 100,
+        "post-eviction size ({on_disk_kb} KB) < 80% of cap ({cap_kb} KB)",
+        on_disk_kb = on_disk.len() / 1024,
+        cap_kb = cap / 1024,
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn cache_eviction_bounds_full_store_encoding_work() {
+    let dir = test_cache_dir("bounded_eviction_encoding");
+    let mut store = CacheStore::new();
+    for i in 0..2_000u64 {
+        store.insert(Path::new(&format!("file{i}.ts")), synthetic_module(i, i, 1));
+    }
+    store
+        .save(&dir, 99, DEFAULT_CACHE_MAX_SIZE)
+        .expect("measure unbounded cache size");
+    let unbounded_size = std::fs::metadata(dir.join("cache.bin"))
+        .expect("cache metadata")
+        .len() as usize;
+
+    CacheStore::reset_full_store_encode_count();
+    store
+        .save(&dir, 99, unbounded_size)
+        .expect("save with eviction");
+    let encode_count = CacheStore::full_store_encode_count();
+
+    assert!(
+        encode_count <= 5,
+        "eviction encoded the full store {encode_count} times"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn cache_eviction_budget_avoids_intermediate_overflow() {
+    let large = usize::MAX / 2;
+    let expected = ((large as u128 * large as u128 / large as u128) * 9_800 / 10_000) as usize;
+
+    assert_eq!(
+        super::store::estimated_eviction_budget(large, large, large, 9_800),
+        expected
+    );
+}
+
+#[test]
+fn cache_eviction_preserves_recent_entries_with_skewed_sizes() {
+    let dir = test_cache_dir("skewed_eviction_sizes");
+    let mut store = CacheStore::new();
+    for i in 0..1_000u64 {
+        store.insert(
+            Path::new(&format!("small{i}.ts")),
+            synthetic_module(i, i, 1),
+        );
+    }
+    store.insert(Path::new("large.ts"), synthetic_module(10_000, 1_000, 512));
+    store
+        .save(&dir, 99, DEFAULT_CACHE_MAX_SIZE)
+        .expect("measure unbounded cache size");
+    let unbounded_size = std::fs::metadata(dir.join("cache.bin"))
+        .expect("cache metadata")
+        .len() as usize;
+    let cap = unbounded_size * 9 / 10;
+
+    CacheStore::reset_full_store_encode_count();
+    store.save(&dir, 99, cap).expect("save skewed cache");
+    let encode_count = CacheStore::full_store_encode_count();
+    let loaded = CacheStore::load(&dir, 99, DEFAULT_CACHE_MAX_SIZE).expect("load skewed cache");
+
+    assert!(
+        loaded.len() > 200,
+        "size skew should retain recent small entries, retained {}",
+        loaded.len()
+    );
+    assert!(
+        loaded.get(Path::new("large.ts"), 10_000).is_some(),
+        "newest large entry survives"
+    );
+    assert!(
+        loaded.get(Path::new("small0.ts"), 0).is_none(),
+        "oldest small entry is evicted"
+    );
+    assert!(
+        encode_count <= 5,
+        "full-store encode count was {encode_count}"
+    );
+    let on_disk = std::fs::metadata(dir.join("cache.bin"))
+        .expect("cache metadata")
+        .len() as usize;
+    assert!(on_disk <= cap * 60 / 100, "cache exceeds eviction target");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn cache_save_always_honors_cap_with_huge_entries() {
+    let dir = test_cache_dir("huge_entry_overshoot");
+    let mut store = CacheStore::new();
+    store.insert(Path::new("huge.ts"), synthetic_module(7, 0, 10));
+    store
+        .save(&dir, 5, 1024)
+        .expect("save honors cap with overshoot");
+
+    let loaded =
+        CacheStore::load(&dir, 5, DEFAULT_CACHE_MAX_SIZE).expect("load after overshoot save");
+    assert_eq!(loaded.len(), 1, "single entry preserved under overshoot");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn cache_load_returns_none_on_config_hash_mismatch() {
+    let dir = test_cache_dir("config_hash_mismatch");
+    let mut store = CacheStore::new();
+    store.insert(Path::new("test.ts"), synthetic_module(1, 0, 1));
+    store
+        .save(&dir, 0xDEAD_BEEF, DEFAULT_CACHE_MAX_SIZE)
+        .expect("save with config_hash A");
+
+    assert!(
+        CacheStore::load(&dir, 0xCAFE_BABE, DEFAULT_CACHE_MAX_SIZE).is_none(),
+        "mismatched config_hash invalidates cache"
+    );
+    assert!(
+        CacheStore::load(&dir, 0xDEAD_BEEF, DEFAULT_CACHE_MAX_SIZE).is_some(),
+        "matching config_hash round-trips"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn cache_load_round_trip_with_matching_config_hash() {
+    let dir = test_cache_dir("config_hash_roundtrip");
+    let mut store = CacheStore::new();
+    store.insert(Path::new("a.ts"), synthetic_module(1, 0, 1));
+    store.insert(Path::new("b.ts"), synthetic_module(2, 1, 1));
+    let hash = 0xABCD_1234_5678_9ABC_u64;
+    store
+        .save(&dir, hash, DEFAULT_CACHE_MAX_SIZE)
+        .expect("save with hash");
+
+    let loaded =
+        CacheStore::load(&dir, hash, DEFAULT_CACHE_MAX_SIZE).expect("load with matching hash");
+    assert_eq!(loaded.len(), 2);
+    assert!(loaded.get(Path::new("a.ts"), 1).is_some());
+    assert!(loaded.get(Path::new("b.ts"), 2).is_some());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn cache_load_honors_user_max_size_above_default() {
+    let dir = test_cache_dir("load_honors_user_max");
+    let mut store = CacheStore::new();
+    store.insert(Path::new("a.ts"), synthetic_module(1, 0, 1));
+    store
+        .save(&dir, 0, DEFAULT_CACHE_MAX_SIZE)
+        .expect("save under default");
+
+    assert!(
+        CacheStore::load(&dir, 0, 1).is_some(),
+        "tiny user cap does not discard valid existing cache"
+    );
+
+    assert!(
+        CacheStore::load(&dir, 0, DEFAULT_CACHE_MAX_SIZE * 2).is_some(),
+        "user cap above default round-trips"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn cache_load_returns_none_on_bitcode_decode_failure() {
+    let dir = test_cache_dir("decode_fail_info");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("cache.bin"), b"not-a-valid-bitcode-payload").unwrap();
+    assert!(CacheStore::load(&dir, 0, DEFAULT_CACHE_MAX_SIZE).is_none());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn cache_save_atomic_write_leaves_no_tmp_on_success() {
+    let dir = test_cache_dir("atomic_no_tmp");
+    let mut store = CacheStore::new();
+    store.insert(Path::new("test.ts"), synthetic_module(1, 0, 1));
+    store
+        .save(&dir, 0, DEFAULT_CACHE_MAX_SIZE)
+        .expect("save atomic");
+
+    assert!(dir.join("cache.bin").exists(), "cache.bin present");
+    assert!(
+        !dir.join("cache.bin.tmp").exists(),
+        "tmp file cleaned up after rename"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A result loaded from a warm cache must be byte-for-byte identical to the one
+/// produced by a fresh (cold) parse of the same source. Guards against a
+/// forgotten `CACHE_VERSION` bump or a serialization bug silently returning
+/// WRONG analysis results from disk.
+const WARM_CACHE_SOURCE: &str = "import { useEffect } from 'react';\n\
+     import { vi } from 'vitest';\n\
+     import { ProtocolKey } from './protocol';\n\
+     import type { Props } from './types';\n\
+     export interface Runner { run(): void; optionalRun?(): void }\n\
+     class OuterContext { outer(): void {} }\n\
+     class InnerContext { used(): void {} }\n\
+     type Handler = (context: OuterContext) => void;\n\
+     type GenericHandler<T> = (context: T) => void;\n\
+     export const genericHandler: GenericHandler<InnerContext> = context => context.used();\n\
+     export function createHandler() {\n\
+       const handler: Handler = context => context.used();\n\
+       type Handler = (context: InnerContext) => void;\n\
+       return handler;\n\
+     }\n\
+     export function readShadowedKey(\n\
+       target: object,\n\
+       ProtocolKey: { Protocol: string },\n\
+     ) {\n\
+       return target[ProtocolKey.Protocol];\n\
+     }\n\
+     vi.mock('./dependency', () => ({ dependency: vi.fn() }));\n\
+     export const App = ({ name }: Props) => {\n\
+       useEffect(() => {}, [name]);\n\
+       return <Child id={name} />;\n\
+     };\n\
+     export default App;";
+
+#[test]
+fn warm_cache_load_matches_cold_parse() {
+    let dir = test_cache_dir("warm_equals_cold");
+    let path = Path::new("src/warm.tsx");
+
+    // Cold parse -> the cache unit that a fresh run would write to disk.
+    let cold_module = parse_from_content(FileId(0), path, WARM_CACHE_SOURCE);
+    let cold_cached = module_to_cached_from_parts(&cold_module, 10, 20);
+    let cold_bytes = bitcode::encode(&cold_cached);
+
+    // Warm path: store, persist, and reload through the on-disk cache.
+    let mut store = CacheStore::new();
+    store.insert(path, cold_cached);
+    store.save(&dir, 0, DEFAULT_CACHE_MAX_SIZE).unwrap();
+
+    let loaded = CacheStore::load(&dir, 0, DEFAULT_CACHE_MAX_SIZE).expect("warm cache loads");
+    let warm_cached = loaded
+        .get(path, cold_module.content_hash)
+        .expect("entry present in warm cache");
+
+    // The serialized cache unit recovered from disk must equal the cold-parse
+    // unit exactly (no dropped field, no reordered wire shape).
+    assert_eq!(
+        bitcode::encode(warm_cached),
+        cold_bytes,
+        "warm-cache entry must serialize identically to the cold-parse entry"
+    );
+
+    // And the reconstructed module must agree with the fresh parse on the
+    // analysis-bearing fields a consumer reads back.
+    let warm_module = cached_to_module(warm_cached, FileId(0));
+    assert_eq!(warm_module.content_hash, cold_module.content_hash);
+    assert_eq!(warm_module.exports.len(), cold_module.exports.len());
+    assert_eq!(warm_module.imports.len(), cold_module.imports.len());
+    assert_eq!(
+        warm_module.component_functions.len(),
+        cold_module.component_functions.len()
+    );
+    assert_eq!(warm_module.react_props.len(), cold_module.react_props.len());
+    assert_eq!(warm_module.hook_uses.len(), cold_module.hook_uses.len());
+    let member_accesses = |module: &ModuleInfo| {
+        module
+            .member_accesses
+            .iter()
+            .map(|access| (access.object.clone(), access.member.clone()))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(member_accesses(&warm_module), member_accesses(&cold_module));
+    assert_eq!(
+        warm_module.render_edges.len(),
+        cold_module.render_edges.len()
+    );
+    assert_eq!(warm_module.semantic_facts, cold_module.semantic_facts);
+    assert_eq!(
+        warm_module.public_signature_type_references,
+        cold_module.public_signature_type_references
+    );
+    assert!(
+        warm_module
+            .member_accesses
+            .iter()
+            .any(|access| access.object == "InnerContext" && access.member == "used"),
+        "warm cache should retain the receiver selected by the nearest alias"
+    );
+    assert!(
+        warm_module.semantic_facts.iter().any(|fact| matches!(
+            fact,
+            SemanticFact::VitestModuleMockOperation(operation)
+                if operation.source == "./dependency"
+                    && operation.action.replaces_original()
+        )),
+        "warm cache should retain the proven replacement operation"
+    );
+    assert!(
+        warm_module.semantic_facts.iter().any(|fact| matches!(
+            fact,
+            SemanticFact::RequiredTypeMember(required)
+                if required.type_name == "Runner" && required.member == "run"
+        )),
+        "warm cache should retain required structural members"
+    );
+    assert!(
+        !warm_module.semantic_facts.iter().any(|fact| matches!(
+            fact,
+            SemanticFact::RequiredTypeMember(required)
+                if required.type_name == "Runner" && required.member == "optionalRun"
+        )),
+        "optional structural members must remain removable"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -2,7 +2,8 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use fallow_config::OutputFormat;
-use fallow_core::results::AnalysisResults;
+use fallow_engine::changed_files::clear_ambient_git_env;
+use fallow_types::results::AnalysisResults;
 
 use super::counts::{CheckCounts, DupesCounts, REGRESSION_SCHEMA_VERSION, RegressionBaseline};
 use super::outcome::RegressionOutcome;
@@ -13,14 +14,12 @@ use crate::error::emit_error;
 /// Number of seconds in one day.
 const SECS_PER_DAY: u64 = 86_400;
 
-// ── Public API ──────────────────────────────────────────────────
-
 /// Where to save the regression baseline.
 #[derive(Clone, Copy)]
 pub enum SaveRegressionTarget<'a> {
     /// Don't save.
     None,
-    /// Save into the config file (.fallowrc.json / fallow.toml).
+    /// Save into the config file (.fallowrc.json / .fallowrc.jsonc / fallow.toml / .fallow.toml).
     Config,
     /// Save to an explicit file path.
     File(&'a Path),
@@ -38,48 +37,68 @@ pub struct RegressionOpts<'a> {
     /// Whether --changed-since or --workspace is active (makes counts incomparable).
     pub scoped: bool,
     pub quiet: bool,
+    /// Output format. Drives whether load errors are emitted as structured JSON on stdout
+    /// (for `--format json` CI consumers) or human text on stderr.
+    pub output: OutputFormat,
 }
 
 /// Check whether a path is likely gitignored by running `git check-ignore`.
 /// Returns `false` if git is unavailable or the check fails (conservative).
 fn is_likely_gitignored(path: &Path, root: &Path) -> bool {
-    std::process::Command::new("git")
+    let mut command = std::process::Command::new("git");
+    command
         .args(["check-ignore", "-q"])
         .arg(path)
-        .current_dir(root)
-        .output()
-        .ok()
-        .is_some_and(|o| o.status.success())
+        .current_dir(root);
+    clear_ambient_git_env(&mut command);
+    command.output().ok().is_some_and(|o| o.status.success())
 }
 
 /// Get the current git SHA, if available.
 fn current_git_sha(root: &Path) -> Option<String> {
-    std::process::Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .current_dir(root)
+    let mut command = std::process::Command::new("git");
+    command.args(["rev-parse", "HEAD"]).current_dir(root);
+    clear_ambient_git_env(&mut command);
+    command
         .output()
         .ok()
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
 }
 
-/// Save the current analysis results as a regression baseline.
-///
-/// # Errors
-///
-/// Returns an error if the baseline cannot be serialized or written to disk.
-pub fn save_regression_baseline(
+#[cfg(test)]
+fn save_regression_baseline(
     path: &Path,
     root: &Path,
     check_counts: Option<&CheckCounts>,
     dupes_counts: Option<&DupesCounts>,
     output: OutputFormat,
 ) -> Result<(), ExitCode> {
+    save_regression_baseline_with_identity(
+        path,
+        root,
+        check_counts,
+        dupes_counts,
+        output,
+        &fallow_types::semantic::SemanticAnalysisIdentity::syntactic(),
+    )
+}
+
+/// Save counts with the compatibility identity of the producing analysis.
+pub fn save_regression_baseline_with_identity(
+    path: &Path,
+    root: &Path,
+    check_counts: Option<&CheckCounts>,
+    dupes_counts: Option<&DupesCounts>,
+    output: OutputFormat,
+    analysis_identity: &fallow_types::semantic::SemanticAnalysisIdentity,
+) -> Result<(), ExitCode> {
     let baseline = RegressionBaseline {
         schema_version: REGRESSION_SCHEMA_VERSION,
         fallow_version: env!("CARGO_PKG_VERSION").to_string(),
         timestamp: chrono_now(),
         git_sha: current_git_sha(root),
+        analysis_identity: analysis_identity.clone(),
         check: check_counts.cloned(),
         dupes: dupes_counts.cloned(),
     };
@@ -90,7 +109,6 @@ pub fn save_regression_baseline(
             output,
         )
     })?;
-    // Ensure parent directory exists
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -101,10 +119,7 @@ pub fn save_regression_baseline(
             output,
         )
     })?;
-    // Always print save confirmation — this is a side effect the user must verify,
-    // not progress noise that --quiet should suppress.
     eprintln!("Regression baseline saved to {}", path.display());
-    // Warn if the saved path appears to be gitignored
     if is_likely_gitignored(path, root) {
         eprintln!(
             "Warning: '{}' may be gitignored. Commit this file so CI can compare against it.",
@@ -114,21 +129,27 @@ pub fn save_regression_baseline(
     Ok(())
 }
 
-/// Save regression baseline counts into the project's config file.
-///
-/// Reads the existing config, adds/updates the `regression.baseline` section,
-/// and writes it back. For JSONC files, comments are preserved using a targeted
-/// insertion/replacement strategy.
-///
-/// # Errors
-///
-/// Returns an error if the config file cannot be read, updated, or written back.
-pub fn save_baseline_to_config(
+/// Save config-embedded counts with their analysis compatibility identity.
+#[cfg(test)]
+fn save_baseline_to_config(
     config_path: &Path,
     counts: &CheckCounts,
     output: OutputFormat,
 ) -> Result<(), ExitCode> {
-    // If the config file doesn't exist yet, create a minimal one
+    save_baseline_to_config_with_identity(
+        config_path,
+        counts,
+        output,
+        &fallow_types::semantic::SemanticAnalysisIdentity::syntactic(),
+    )
+}
+
+pub fn save_baseline_to_config_with_identity(
+    config_path: &Path,
+    counts: &CheckCounts,
+    output: OutputFormat,
+    analysis_identity: &fallow_types::semantic::SemanticAnalysisIdentity,
+) -> Result<(), ExitCode> {
     let content = match std::fs::read_to_string(config_path) {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -151,7 +172,8 @@ pub fn save_baseline_to_config(
         }
     };
 
-    let baseline = counts.to_config_baseline();
+    let mut baseline = counts.to_config_baseline();
+    baseline.analysis_identity = analysis_identity.clone();
     let is_toml = config_path.extension().is_some_and(|ext| ext == "toml");
 
     let updated = if is_toml {
@@ -196,14 +218,12 @@ fn find_json_key(content: &str, key: &str) -> Option<usize> {
     let mut search_from = 0;
     while let Some(pos) = content[search_from..].find(&needle) {
         let abs_pos = search_from + pos;
-        // Check if this match is inside a // comment line
         let line_start = content[..abs_pos].rfind('\n').map_or(0, |i| i + 1);
         let line_prefix = content[line_start..abs_pos].trim_start();
         if line_prefix.starts_with("//") {
             search_from = abs_pos + needle.len();
             continue;
         }
-        // Check if inside a /* */ block comment
         let before = &content[..abs_pos];
         let last_open = before.rfind("/*");
         let last_close = before.rfind("*/");
@@ -218,6 +238,46 @@ fn find_json_key(content: &str, key: &str) -> Option<usize> {
     None
 }
 
+/// Replace an existing `"regression": { ... }` object whose key starts at
+/// `key_start`. Returns `Ok(None)` when the key is not followed by an object
+/// (caller falls back to append), `Err` on an unmatched brace.
+fn replace_json_regression_object(
+    content: &str,
+    key_start: usize,
+    regression_block: &str,
+) -> Result<Option<String>, String> {
+    let after_key = &content[key_start..];
+    let Some(brace_start) = after_key.find('{') else {
+        return Ok(None);
+    };
+    let abs_brace = key_start + brace_start;
+    let mut depth = 0;
+    let mut end = abs_brace;
+    let mut found_close = false;
+    for (i, ch) in content[abs_brace..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = abs_brace + i + 1;
+                    found_close = true;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    if !found_close {
+        return Err("malformed JSON: unmatched brace in regression object".to_string());
+    }
+    let mut result = String::new();
+    result.push_str(&content[..key_start]);
+    result.push_str(&regression_block[2..]); // skip leading two spaces: reuse original indent
+    result.push_str(&content[end..]);
+    Ok(Some(result))
+}
+
 fn update_json_regression(
     content: &str,
     baseline: &fallow_config::RegressionBaseline,
@@ -225,7 +285,6 @@ fn update_json_regression(
     let baseline_json =
         serde_json::to_string_pretty(baseline).map_err(|e| format!("serialization error: {e}"))?;
 
-    // Indent the baseline JSON by 4 spaces (nested inside "regression": { "baseline": ... })
     let indented: String = baseline_json
         .lines()
         .enumerate()
@@ -240,44 +299,13 @@ fn update_json_regression(
 
     let regression_block = format!("  \"regression\": {{\n    \"baseline\": {indented}\n  }}");
 
-    // Check if "regression" key already exists — replace it.
-    // Only match "regression" that appears as a JSON key (preceded by whitespace or line start),
-    // not inside comments or string values.
-    if let Some(start) = find_json_key(content, "regression") {
-        let after_key = &content[start..];
-        if let Some(brace_start) = after_key.find('{') {
-            let abs_brace = start + brace_start;
-            let mut depth = 0;
-            let mut end = abs_brace;
-            let mut found_close = false;
-            for (i, ch) in content[abs_brace..].char_indices() {
-                match ch {
-                    '{' => depth += 1,
-                    '}' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            end = abs_brace + i + 1;
-                            found_close = true;
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            if !found_close {
-                return Err("malformed JSON: unmatched brace in regression object".to_string());
-            }
-            let mut result = String::new();
-            result.push_str(&content[..start]);
-            result.push_str(&regression_block[2..]); // skip leading "  " — reuse original indent
-            result.push_str(&content[end..]);
-            return Ok(result);
-        }
+    if let Some(start) = find_json_key(content, "regression")
+        && let Some(replaced) = replace_json_regression_object(content, start, &regression_block)?
+    {
+        return Ok(replaced);
     }
 
-    // No existing regression key — insert before the last `}`
     if let Some(last_brace) = content.rfind('}') {
-        // Find the last non-whitespace character before the closing brace
         let before_brace = content[..last_brace].trim_end();
         let needs_comma = !before_brace.ends_with('{') && !before_brace.ends_with(',');
 
@@ -298,13 +326,38 @@ fn update_json_regression(
 
 /// Update a TOML config file with regression baseline.
 fn update_toml_regression(content: &str, baseline: &fallow_config::RegressionBaseline) -> String {
-    use std::fmt::Write;
-    // Build the TOML section
+    let section = render_toml_regression_section(baseline);
+    splice_toml_regression_section(content, &section)
+}
+
+/// Render the `[regression.baseline]` TOML section body from the baseline.
+fn render_toml_regression_section(baseline: &fallow_config::RegressionBaseline) -> String {
     let mut section = String::from("[regression.baseline]\n");
+    render_toml_core_baseline_fields(&mut section, baseline);
+    render_toml_unused_dependency_baseline_fields(&mut section, baseline);
+    render_toml_member_baseline_fields(&mut section, baseline);
+    render_toml_import_dependency_baseline_fields(&mut section, baseline);
+    render_toml_graph_baseline_fields(&mut section, baseline);
+    render_toml_usage_dependency_baseline_fields(&mut section, baseline);
+    section
+}
+
+fn render_toml_core_baseline_fields(
+    section: &mut String,
+    baseline: &fallow_config::RegressionBaseline,
+) {
+    use std::fmt::Write;
     let _ = writeln!(section, "totalIssues = {}", baseline.total_issues);
     let _ = writeln!(section, "unusedFiles = {}", baseline.unused_files);
     let _ = writeln!(section, "unusedExports = {}", baseline.unused_exports);
     let _ = writeln!(section, "unusedTypes = {}", baseline.unused_types);
+}
+
+fn render_toml_unused_dependency_baseline_fields(
+    section: &mut String,
+    baseline: &fallow_config::RegressionBaseline,
+) {
+    use std::fmt::Write;
     let _ = writeln!(
         section,
         "unusedDependencies = {}",
@@ -320,6 +373,13 @@ fn update_toml_regression(content: &str, baseline: &fallow_config::RegressionBas
         "unusedOptionalDependencies = {}",
         baseline.unused_optional_dependencies
     );
+}
+
+fn render_toml_member_baseline_fields(
+    section: &mut String,
+    baseline: &fallow_config::RegressionBaseline,
+) {
+    use std::fmt::Write;
     let _ = writeln!(
         section,
         "unusedEnumMembers = {}",
@@ -330,6 +390,13 @@ fn update_toml_regression(content: &str, baseline: &fallow_config::RegressionBas
         "unusedClassMembers = {}",
         baseline.unused_class_members
     );
+}
+
+fn render_toml_import_dependency_baseline_fields(
+    section: &mut String,
+    baseline: &fallow_config::RegressionBaseline,
+) {
+    use std::fmt::Write;
     let _ = writeln!(
         section,
         "unresolvedImports = {}",
@@ -340,12 +407,26 @@ fn update_toml_regression(content: &str, baseline: &fallow_config::RegressionBas
         "unlistedDependencies = {}",
         baseline.unlisted_dependencies
     );
+}
+
+fn render_toml_graph_baseline_fields(
+    section: &mut String,
+    baseline: &fallow_config::RegressionBaseline,
+) {
+    use std::fmt::Write;
     let _ = writeln!(section, "duplicateExports = {}", baseline.duplicate_exports);
     let _ = writeln!(
         section,
         "circularDependencies = {}",
         baseline.circular_dependencies
     );
+}
+
+fn render_toml_usage_dependency_baseline_fields(
+    section: &mut String,
+    baseline: &fallow_config::RegressionBaseline,
+) {
+    use std::fmt::Write;
     let _ = writeln!(
         section,
         "typeOnlyDependencies = {}",
@@ -356,10 +437,17 @@ fn update_toml_regression(content: &str, baseline: &fallow_config::RegressionBas
         "testOnlyDependencies = {}",
         baseline.test_only_dependencies
     );
+    let _ = writeln!(
+        section,
+        "devDependenciesInProduction = {}",
+        baseline.dev_dependencies_in_production
+    );
+}
 
-    // Check if [regression.baseline] already exists — replace it
+/// Replace an existing `[regression.baseline]` section in `content`, or append
+/// the rendered `section` when none is present.
+fn splice_toml_regression_section(content: &str, section: &str) -> String {
     if let Some(start) = content.find("[regression.baseline]") {
-        // Find the next section header or end of file
         let after = &content[start + "[regression.baseline]".len()..];
         let end_offset = after.find("\n[").map_or(content.len(), |i| {
             start + "[regression.baseline]".len() + i + 1
@@ -367,74 +455,147 @@ fn update_toml_regression(content: &str, baseline: &fallow_config::RegressionBas
 
         let mut result = String::new();
         result.push_str(&content[..start]);
-        result.push_str(&section);
+        result.push_str(section);
         if end_offset < content.len() {
             result.push_str(&content[end_offset..]);
         }
         result
     } else {
-        // Append the section
         let mut result = content.to_string();
         if !result.ends_with('\n') {
             result.push('\n');
         }
         result.push('\n');
-        result.push_str(&section);
+        result.push_str(section);
         result
     }
 }
 
-/// Load a regression baseline from disk.
-///
-/// # Errors
-///
-/// Returns an error if the file does not exist, cannot be read, or contains invalid JSON.
-pub fn load_regression_baseline(path: &Path) -> Result<RegressionBaseline, ExitCode> {
-    let content = std::fs::read_to_string(path).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            eprintln!(
-                "Error: no regression baseline found at '{}'.\n\
-                 Run with --save-regression-baseline on your main branch to create one.",
-                path.display()
-            );
-        } else {
-            eprintln!(
-                "Error: failed to read regression baseline '{}': {e}",
-                path.display()
-            );
-        }
-        ExitCode::from(2)
-    })?;
-    serde_json::from_str(&content).map_err(|e| {
-        eprintln!(
-            "Error: failed to parse regression baseline '{}': {e}",
-            path.display()
-        );
-        ExitCode::from(2)
-    })
+/// Build the human-readable schema-version mismatch message. Factored out so
+/// tests can assert on the wording without capturing stderr.
+fn format_schema_mismatch_error(
+    path: &Path,
+    expected: u32,
+    actual: u32,
+    writer_version: &str,
+) -> String {
+    let path_display = path.display();
+    if actual == 0 {
+        format!(
+            "regression baseline '{path_display}' appears to predate schema versioning \
+             (schema_version is 0; this fallow build expects {expected}).\n\
+             The baseline was written by fallow {writer_version}.\n\
+             Regenerate it by running: fallow dead-code --save-regression-baseline {path_display}"
+        )
+    } else {
+        format!(
+            "regression baseline '{path_display}' has schema_version {actual} but this fallow build expects {expected}.\n\
+             The baseline was written by fallow {writer_version}.\n\
+             Regenerate it by running: fallow dead-code --save-regression-baseline {path_display}"
+        )
+    }
 }
 
-/// Compare current check results against a regression baseline.
+/// Build the message for a baseline missing `schema_version` entirely. Pre-versioning
+/// baselines (hand-edited or written by a very old fallow) hit this path; the raw
+/// serde error ("missing field `schema_version`") is unhelpful to a CI user.
+fn format_missing_schema_version_error(path: &Path) -> String {
+    let path_display = path.display();
+    let expected = REGRESSION_SCHEMA_VERSION;
+    format!(
+        "regression baseline '{path_display}' is missing the schema_version field; \
+         this fallow build expects schema_version {expected}.\n\
+         The baseline likely predates schema versioning or was hand-edited.\n\
+         Regenerate it by running: fallow dead-code --save-regression-baseline {path_display}"
+    )
+}
+
+/// Load a regression baseline from disk.
 ///
-/// Resolution order for the baseline:
-/// 1. Explicit file via `--regression-baseline <PATH>`
-/// 2. Config-embedded `regression.baseline` section
-/// 3. Error with actionable message
+/// Validates that `schema_version` matches `REGRESSION_SCHEMA_VERSION`. Mismatches
+/// (including baselines missing the field entirely) fail loud with an actionable
+/// regenerate hint rather than silently loading default-zero fields, which would
+/// mask real regressions.
 ///
 /// # Errors
 ///
-/// Returns an error if the baseline file cannot be loaded, is missing check data,
-/// or no baseline source is available.
-pub fn compare_check_regression(
+/// Returns an error if the file does not exist, cannot be read, contains invalid
+/// JSON, or has a `schema_version` that does not match the current build's
+/// `REGRESSION_SCHEMA_VERSION`.
+pub fn load_regression_baseline(
+    path: &Path,
+    output: OutputFormat,
+) -> Result<RegressionBaseline, ExitCode> {
+    let content = std::fs::read_to_string(path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            emit_error(
+                &format!(
+                    "no regression baseline found at '{}'.\n\
+                     Run with --save-regression-baseline on your main branch to create one.",
+                    path.display()
+                ),
+                2,
+                output,
+            )
+        } else {
+            emit_error(
+                &format!(
+                    "failed to read regression baseline '{}': {e}",
+                    path.display()
+                ),
+                2,
+                output,
+            )
+        }
+    })?;
+    let baseline: RegressionBaseline = serde_json::from_str(&content).map_err(|e| {
+        let message = if e.to_string().contains("missing field `schema_version`") {
+            format_missing_schema_version_error(path)
+        } else {
+            format!(
+                "failed to parse regression baseline '{}': {e}",
+                path.display()
+            )
+        };
+        emit_error(&message, 2, output)
+    })?;
+    if !matches!(baseline.schema_version, 1 | REGRESSION_SCHEMA_VERSION) {
+        let message = format_schema_mismatch_error(
+            path,
+            REGRESSION_SCHEMA_VERSION,
+            baseline.schema_version,
+            &baseline.fallow_version,
+        );
+        return Err(emit_error(&message, 2, output));
+    }
+    Ok(baseline)
+}
+
+/// Compare counts only when the stored and live semantic identities match.
+#[cfg(test)]
+fn compare_check_regression(
     results: &AnalysisResults,
     opts: &RegressionOpts<'_>,
     config_baseline: Option<&fallow_config::RegressionBaseline>,
+) -> Result<Option<RegressionOutcome>, ExitCode> {
+    compare_check_regression_with_identity(
+        results,
+        opts,
+        config_baseline,
+        &fallow_types::semantic::SemanticAnalysisIdentity::syntactic(),
+    )
+}
+
+pub fn compare_check_regression_with_identity(
+    results: &AnalysisResults,
+    opts: &RegressionOpts<'_>,
+    config_baseline: Option<&fallow_config::RegressionBaseline>,
+    analysis_identity: &fallow_types::semantic::SemanticAnalysisIdentity,
 ) -> Result<Option<RegressionOutcome>, ExitCode> {
     if !opts.fail_on_regression {
         return Ok(None);
     }
 
-    // Skip if results are scoped (counts not comparable to full-project baseline)
     if opts.scoped {
         let reason = "--changed-since or --workspace is active; regression check skipped \
                       (counts not comparable to full-project baseline)";
@@ -444,29 +605,42 @@ pub fn compare_check_regression(
         return Ok(Some(RegressionOutcome::Skipped { reason }));
     }
 
-    // Resolution order: explicit file > config section > error
     let baseline_counts: CheckCounts = if let Some(baseline_path) = opts.regression_baseline_file {
-        // Explicit --regression-baseline <PATH>: load from file
-        let baseline = load_regression_baseline(baseline_path)?;
+        let baseline = load_regression_baseline(baseline_path, opts.output)?;
+        ensure_regression_identity(
+            &baseline.analysis_identity,
+            analysis_identity,
+            baseline_path,
+            opts.output,
+        )?;
         let Some(counts) = baseline.check else {
-            eprintln!(
-                "Error: regression baseline '{}' has no check data",
-                baseline_path.display()
-            );
-            return Err(ExitCode::from(2));
+            return Err(emit_error(
+                &format!(
+                    "regression baseline '{}' has no check data",
+                    baseline_path.display()
+                ),
+                2,
+                opts.output,
+            ));
         };
         counts
     } else if let Some(config_baseline) = config_baseline {
-        // Config-embedded baseline: read from .fallowrc.json / fallow.toml
+        ensure_regression_identity(
+            &config_baseline.analysis_identity,
+            analysis_identity,
+            Path::new("project config"),
+            opts.output,
+        )?;
         CheckCounts::from_config_baseline(config_baseline)
     } else {
-        eprintln!(
-            "Error: no regression baseline found.\n\
+        return Err(emit_error(
+            "no regression baseline found.\n\
              Either add a `regression.baseline` section to your config file\n\
              (run with --save-regression-baseline to generate it),\n\
-             or provide an explicit file via --regression-baseline <PATH>."
-        );
-        return Err(ExitCode::from(2));
+             or provide an explicit file via --regression-baseline <PATH>.",
+            2,
+            opts.output,
+        ));
     };
 
     let current_total = results.total_issues();
@@ -489,19 +663,47 @@ pub fn compare_check_regression(
     }
 }
 
+fn ensure_regression_identity(
+    stored: &fallow_types::semantic::SemanticAnalysisIdentity,
+    current: &fallow_types::semantic::SemanticAnalysisIdentity,
+    path: &Path,
+    output: OutputFormat,
+) -> Result<(), ExitCode> {
+    let incompatible = stored.incompatible_fields(current);
+    if incompatible.is_empty() {
+        return Ok(());
+    }
+    let type_aware_flag = if matches!(
+        current.mode,
+        fallow_types::semantic::SemanticAnalysisMode::TypeAware
+    ) {
+        " --type-aware"
+    } else {
+        ""
+    };
+    Err(emit_error(
+        &format!(
+            "regression baseline '{}' has an incompatible analysis identity in: {}. Regenerate it with: fallow dead-code{type_aware_flag} --save-regression-baseline {}",
+            path.display(),
+            incompatible.join(", "),
+            path.display(),
+        ),
+        2,
+        output,
+    ))
+}
+
 /// ISO 8601 UTC timestamp without external dependencies.
 fn chrono_now() -> String {
     let duration = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
     let secs = duration.as_secs();
-    // Manual UTC decomposition — avoids chrono dependency
     let days = secs / SECS_PER_DAY;
     let time_secs = secs % SECS_PER_DAY;
     let hours = time_secs / 3600;
     let minutes = (time_secs % 3600) / 60;
     let seconds = time_secs % 60;
-    // Days since epoch to Y-M-D (civil date algorithm)
     let z = days + 719_468;
     let era = z / 146_097;
     let doe = z - era * 146_097;
@@ -518,10 +720,9 @@ fn chrono_now() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fallow_core::results::*;
+    use fallow_types::output_dead_code::*;
+    use fallow_types::results::*;
     use std::path::PathBuf;
-
-    // ── update_json_regression ──────────────────────────────────────
 
     fn sample_baseline() -> fallow_config::RegressionBaseline {
         fallow_config::RegressionBaseline {
@@ -536,7 +737,6 @@ mod tests {
         let result = update_json_regression("{}", &sample_baseline()).unwrap();
         assert!(result.contains("\"regression\""));
         assert!(result.contains("\"totalIssues\": 5"));
-        // Should be valid JSON
         serde_json::from_str::<serde_json::Value>(&result).unwrap();
     }
 
@@ -563,7 +763,6 @@ mod tests {
   }
 }"#;
         let result = update_json_regression(config, &sample_baseline()).unwrap();
-        // Old value replaced
         assert!(!result.contains("99"));
         assert!(result.contains("\"totalIssues\": 5"));
         serde_json::from_str::<serde_json::Value>(&result).unwrap();
@@ -573,20 +772,16 @@ mod tests {
     fn json_skips_regression_in_comment() {
         let config = "{\n  // See \"regression\" docs\n  \"entry\": []\n}";
         let result = update_json_regression(config, &sample_baseline()).unwrap();
-        // Should insert new regression, not try to replace the comment
         assert!(result.contains("\"regression\":"));
         assert!(result.contains("\"entry\""));
     }
 
     #[test]
     fn json_malformed_brace_returns_error() {
-        // regression key exists but no matching closing brace
         let config = r#"{ "regression": { "baseline": { "totalIssues": 1 }"#;
         let result = update_json_regression(config, &sample_baseline());
         assert!(result.is_err());
     }
-
-    // ── update_toml_regression ──────────────────────────────────────
 
     #[test]
     fn toml_insert_into_empty() {
@@ -614,8 +809,6 @@ mod tests {
         assert!(result.contains("[rules]"));
     }
 
-    // ── find_json_key ───────────────────────────────────────────────
-
     #[test]
     fn find_json_key_basic() {
         assert_eq!(find_json_key(r#"{"foo": 1}"#, "foo"), Some(1));
@@ -636,17 +829,13 @@ mod tests {
     #[test]
     fn find_json_key_skips_block_comment() {
         let content = "{\n  /* \"foo\": old value */\n  \"foo\": 1\n}";
-        // Should find the real key, not the one inside /* */
         let pos = find_json_key(content, "foo").unwrap();
         assert!(content[pos..].starts_with("\"foo\": 1"));
     }
 
-    // ── chrono_now ─────────────────────────────────────────────────
-
     #[test]
     fn chrono_now_format() {
         let ts = chrono_now();
-        // Should be ISO 8601 format: YYYY-MM-DDTHH:MM:SSZ
         assert_eq!(ts.len(), 20);
         assert!(ts.ends_with('Z'));
         assert_eq!(&ts[4..5], "-");
@@ -655,8 +844,6 @@ mod tests {
         assert_eq!(&ts[13..14], ":");
         assert_eq!(&ts[16..17], ":");
     }
-
-    // ── save/load roundtrip ────────────────────────────────────────
 
     #[test]
     fn save_load_roundtrip() {
@@ -672,13 +859,28 @@ mod tests {
             unused_optional_dependencies: 0,
             unused_enum_members: 1,
             unused_class_members: 0,
+            unused_store_members: 0,
+            unprovided_injects: 0,
+            unrendered_components: 0,
+            unused_component_props: 0,
+            unused_component_emits: 0,
+            unused_component_inputs: 0,
+            unused_component_outputs: 0,
+            unused_svelte_events: 0,
+            unused_server_actions: 0,
+            unused_load_data_keys: 0,
             unresolved_imports: 1,
             unlisted_dependencies: 0,
             duplicate_exports: 1,
             circular_dependencies: 0,
+            re_export_cycles: 0,
             type_only_dependencies: 0,
             test_only_dependencies: 0,
+            dev_dependencies_in_production: 0,
             boundary_violations: 0,
+            boundary_coverage_violations: 0,
+            boundary_call_violations: 0,
+            policy_violations: 0,
         };
         let dupes = DupesCounts {
             clone_groups: 4,
@@ -693,7 +895,7 @@ mod tests {
             OutputFormat::Human,
         )
         .unwrap();
-        let loaded = load_regression_baseline(&path).unwrap();
+        let loaded = load_regression_baseline(&path, OutputFormat::Human).unwrap();
 
         assert_eq!(loaded.schema_version, REGRESSION_SCHEMA_VERSION);
         let check = loaded.check.unwrap();
@@ -721,7 +923,7 @@ mod tests {
 
         save_regression_baseline(&path, dir.path(), Some(&counts), None, OutputFormat::Human)
             .unwrap();
-        let loaded = load_regression_baseline(&path).unwrap();
+        let loaded = load_regression_baseline(&path, OutputFormat::Human).unwrap();
 
         assert!(loaded.check.is_some());
         assert!(loaded.dupes.is_none());
@@ -745,7 +947,10 @@ mod tests {
 
     #[test]
     fn load_nonexistent_file_returns_error() {
-        let result = load_regression_baseline(Path::new("/tmp/nonexistent-baseline-12345.json"));
+        let result = load_regression_baseline(
+            Path::new("/tmp/nonexistent-baseline-12345.json"),
+            OutputFormat::Human,
+        );
         assert!(result.is_err());
     }
 
@@ -754,11 +959,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("bad.json");
         std::fs::write(&path, "not valid json {{{").unwrap();
-        let result = load_regression_baseline(&path);
+        let result = load_regression_baseline(&path, OutputFormat::Human);
         assert!(result.is_err());
     }
-
-    // ── save_baseline_to_config ────────────────────────────────────
 
     #[test]
     fn save_baseline_to_json_config() {
@@ -777,7 +980,6 @@ mod tests {
         let content = std::fs::read_to_string(&config_path).unwrap();
         assert!(content.contains("\"regression\""));
         assert!(content.contains("\"totalIssues\": 7"));
-        // Should still be valid JSON
         serde_json::from_str::<serde_json::Value>(&content).unwrap();
     }
 
@@ -805,7 +1007,6 @@ mod tests {
     fn save_baseline_to_nonexistent_json_config() {
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join(".fallowrc.json");
-        // File doesn't exist — should create it from scratch
 
         let counts = CheckCounts {
             total_issues: 1,
@@ -835,14 +1036,11 @@ mod tests {
         assert!(content.contains("totalIssues = 0"));
     }
 
-    // ── update_json_regression edge cases ──────────────────────────
-
     #[test]
     fn json_insert_with_trailing_comma() {
         let config = r#"{
   "entry": ["src/main.ts"],
 }"#;
-        // Trailing comma — our insertion should still produce reasonable output
         let result = update_json_regression(config, &sample_baseline()).unwrap();
         assert!(result.contains("\"regression\""));
     }
@@ -870,8 +1068,6 @@ mod tests {
         assert!(result.contains("\"totalIssues\": 5"));
         assert!(result.contains("\"entry\""));
     }
-
-    // ── update_toml_regression edge cases ──────────────────────────
 
     #[test]
     fn toml_content_without_trailing_newline() {
@@ -901,11 +1097,8 @@ mod tests {
         assert!(result.contains("[rules]"));
     }
 
-    // ── find_json_key edge cases ────────────────────────────────────
-
     #[test]
     fn find_json_key_multiple_same_keys() {
-        // Returns the first occurrence
         let content = r#"{"foo": 1, "bar": {"foo": 2}}"#;
         let pos = find_json_key(content, "foo").unwrap();
         assert_eq!(pos, 1);
@@ -917,8 +1110,6 @@ mod tests {
         let pos = find_json_key(content, "entry").unwrap();
         assert!(content[pos..].starts_with("\"entry\": []"));
     }
-
-    // ── compare_check_regression ────────────────────────────────────
 
     fn make_opts(
         fail: bool,
@@ -933,6 +1124,7 @@ mod tests {
             save_target: SaveRegressionTarget::None,
             scoped,
             quiet: true,
+            output: OutputFormat::Human,
         }
     }
 
@@ -984,12 +1176,16 @@ mod tests {
     #[test]
     fn compare_exceeded_with_config_baseline() {
         let mut results = AnalysisResults::default();
-        results.unused_files.push(UnusedFile {
-            path: PathBuf::from("a.ts"),
-        });
-        results.unused_files.push(UnusedFile {
-            path: PathBuf::from("b.ts"),
-        });
+        results
+            .unused_files
+            .push(UnusedFileFinding::with_actions(UnusedFile {
+                path: PathBuf::from("a.ts"),
+            }));
+        results
+            .unused_files
+            .push(UnusedFileFinding::with_actions(UnusedFile {
+                path: PathBuf::from("b.ts"),
+            }));
         let opts = make_opts(true, Tolerance::Absolute(0), false, None);
         let config_baseline = fallow_config::RegressionBaseline {
             total_issues: 0,
@@ -1012,9 +1208,11 @@ mod tests {
     #[test]
     fn compare_pass_within_tolerance() {
         let mut results = AnalysisResults::default();
-        results.unused_files.push(UnusedFile {
-            path: PathBuf::from("a.ts"),
-        });
+        results
+            .unused_files
+            .push(UnusedFileFinding::with_actions(UnusedFile {
+                path: PathBuf::from("a.ts"),
+            }));
         let opts = make_opts(true, Tolerance::Absolute(5), false, None);
         let config_baseline = fallow_config::RegressionBaseline {
             total_issues: 0,
@@ -1026,7 +1224,6 @@ mod tests {
 
     #[test]
     fn compare_improvement_is_pass() {
-        // Current has fewer issues than baseline
         let results = AnalysisResults::default(); // 0 issues
         let opts = make_opts(true, Tolerance::Absolute(0), false, None);
         let config_baseline = fallow_config::RegressionBaseline {
@@ -1053,7 +1250,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let baseline_path = dir.path().join("baseline.json");
 
-        // Save a baseline to file
         let counts = CheckCounts {
             total_issues: 5,
             unused_files: 5,
@@ -1068,7 +1264,6 @@ mod tests {
         )
         .unwrap();
 
-        // Compare with empty results -> pass (improvement)
         let results = AnalysisResults::default();
         let opts = make_opts(true, Tolerance::Absolute(0), false, Some(&baseline_path));
         let outcome = compare_check_regression(&results, &opts, None).unwrap();
@@ -1080,7 +1275,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let baseline_path = dir.path().join("baseline.json");
 
-        // Save a baseline with no check data (dupes only)
         save_regression_baseline(
             &baseline_path,
             dir.path(),
@@ -1110,21 +1304,27 @@ mod tests {
     #[test]
     fn compare_exceeded_includes_type_deltas() {
         let mut results = AnalysisResults::default();
-        results.unused_files.push(UnusedFile {
-            path: PathBuf::from("a.ts"),
-        });
-        results.unused_files.push(UnusedFile {
-            path: PathBuf::from("b.ts"),
-        });
-        results.unused_exports.push(UnusedExport {
-            path: PathBuf::from("c.ts"),
-            export_name: "foo".into(),
-            is_type_only: false,
-            line: 1,
-            col: 0,
-            span_start: 0,
-            is_re_export: false,
-        });
+        results
+            .unused_files
+            .push(UnusedFileFinding::with_actions(UnusedFile {
+                path: PathBuf::from("a.ts"),
+            }));
+        results
+            .unused_files
+            .push(UnusedFileFinding::with_actions(UnusedFile {
+                path: PathBuf::from("b.ts"),
+            }));
+        results
+            .unused_exports
+            .push(UnusedExportFinding::with_actions(UnusedExport {
+                path: PathBuf::from("c.ts"),
+                export_name: "foo".into(),
+                is_type_only: false,
+                line: 1,
+                col: 0,
+                span_start: 0,
+                is_re_export: false,
+            }));
 
         let opts = make_opts(true, Tolerance::Absolute(0), false, None);
         let config_baseline = fallow_config::RegressionBaseline {
@@ -1145,15 +1345,13 @@ mod tests {
     #[test]
     fn compare_with_percentage_tolerance() {
         let mut results = AnalysisResults::default();
-        // Add 1 issue
-        results.unused_files.push(UnusedFile {
-            path: PathBuf::from("a.ts"),
-        });
+        results
+            .unused_files
+            .push(UnusedFileFinding::with_actions(UnusedFile {
+                path: PathBuf::from("a.ts"),
+            }));
 
         let opts = make_opts(true, Tolerance::Percentage(50.0), false, None);
-        // baseline=10, 50% of 10 = 5, delta=1-10=-9 (improvement, should pass)
-        // Wait, total_issues in config is the baseline for comparison.
-        // results has 1 issue, baseline has 10 -> improvement -> pass
         let config_baseline = fallow_config::RegressionBaseline {
             total_issues: 10,
             unused_files: 10,
@@ -1161,5 +1359,110 @@ mod tests {
         };
         let outcome = compare_check_regression(&results, &opts, Some(&config_baseline)).unwrap();
         assert!(matches!(outcome, Some(RegressionOutcome::Pass { .. })));
+    }
+
+    fn write_baseline_with_schema_version(dir: &Path, version: u32) -> PathBuf {
+        let path = dir.join("baseline.json");
+        let body = format!(
+            r#"{{
+  "schema_version": {version},
+  "fallow_version": "3.0.0",
+  "timestamp": "2026-05-21T00:00:00Z",
+  "check": {{
+    "total_issues": 0,
+    "unused_files": 0
+  }}
+}}"#
+        );
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    #[test]
+    fn load_rejects_schema_version_too_high() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_baseline_with_schema_version(dir.path(), REGRESSION_SCHEMA_VERSION + 1);
+        let result = load_regression_baseline(&path, OutputFormat::Human);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn load_rejects_schema_version_zero_predates_versioning() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_baseline_with_schema_version(dir.path(), 0);
+        let result = load_regression_baseline(&path, OutputFormat::Human);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn load_accepts_current_schema_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_baseline_with_schema_version(dir.path(), REGRESSION_SCHEMA_VERSION);
+        let loaded = load_regression_baseline(&path, OutputFormat::Human).unwrap();
+        assert_eq!(loaded.schema_version, REGRESSION_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn load_rewrites_missing_schema_version_field_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("baseline.json");
+        std::fs::write(
+            &path,
+            r#"{
+  "fallow_version": "1.0.0",
+  "timestamp": "2026-05-21T00:00:00Z",
+  "check": {}
+}"#,
+        )
+        .unwrap();
+        let result = load_regression_baseline(&path, OutputFormat::Human);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn format_schema_mismatch_error_too_high() {
+        let msg =
+            format_schema_mismatch_error(Path::new("/repo/.fallow-baseline.json"), 1, 99, "3.0.0");
+        assert!(msg.contains("schema_version 99"));
+        assert!(msg.contains("expects 1"));
+        assert!(msg.contains("fallow 3.0.0"));
+        assert!(
+            msg.contains("fallow dead-code --save-regression-baseline /repo/.fallow-baseline.json")
+        );
+        assert!(!msg.to_lowercase().contains("refresh"));
+        assert!(msg.contains("schema_version"));
+    }
+
+    #[test]
+    fn format_schema_mismatch_error_actual_zero_special_case() {
+        let msg =
+            format_schema_mismatch_error(Path::new("/repo/.fallow-baseline.json"), 1, 0, "2.0.0");
+        assert!(msg.contains("predate"));
+        assert!(msg.contains("fallow 2.0.0"));
+        assert!(
+            msg.contains("fallow dead-code --save-regression-baseline /repo/.fallow-baseline.json")
+        );
+    }
+
+    #[test]
+    fn format_missing_schema_version_error_includes_regenerate_command() {
+        let msg = format_missing_schema_version_error(Path::new("/repo/baseline.json"));
+        assert!(msg.contains("missing the schema_version field"));
+        assert!(msg.contains("fallow dead-code --save-regression-baseline /repo/baseline.json"));
+    }
+
+    #[test]
+    fn save_load_preserves_schema_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("baseline.json");
+        let counts = CheckCounts {
+            total_issues: 1,
+            unused_files: 1,
+            ..CheckCounts::from_config_baseline(&fallow_config::RegressionBaseline::default())
+        };
+        save_regression_baseline(&path, dir.path(), Some(&counts), None, OutputFormat::Human)
+            .unwrap();
+        let loaded = load_regression_baseline(&path, OutputFormat::Human).unwrap();
+        assert_eq!(loaded.schema_version, REGRESSION_SCHEMA_VERSION);
     }
 }

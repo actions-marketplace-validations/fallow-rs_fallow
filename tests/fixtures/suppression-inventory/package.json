@@ -1,0 +1,4 @@
+{
+  "name": "suppression-inventory",
+  "main": "src/index.ts"
+}

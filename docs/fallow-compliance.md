@@ -1,18 +1,36 @@
 # Fallow Compliance Happy Path
 
+Fallow compliance defines the maintainability and codebase-quality expectations for a repository.
+
+A compliant project stays within agreed thresholds across the full pillar set: quality score, changed-code risk, complexity hotspots, duplication, architecture boundaries, dependency hygiene, and cleanup opportunities. Cleanup (dead code, unused exports, unused dependencies) is one compliance signal, not the compliance model.
+
 This is the shortest path from "we installed fallow" to "this repo is fallow-compliant."
 
 For most teams, **fallow-compliant** means:
 
-- repo-wide dead code and duplication findings are fixed or intentionally excluded
 - `fallow health` shows **`Above threshold: 0`** for the thresholds the team chose on purpose
+- repo-wide duplication and architecture violations are either fixed or intentionally documented
+- repo-wide cleanup opportunities (unused code, unused dependencies, stale suppressions) are either resolved or narrowly documented
 - every exclusion is narrow, documented, and tied to a real reason
 - stale suppressions are removed instead of carried forward
 - if the team uses staged adoption, `fallow audit` passes on the current change set with intentionally chosen per-analysis baselines
 
+## Compliance signals
+
+In priority order:
+
+1. **Quality score** -- `fallow health --score` reaches the team's agreed minimum
+2. **Changed-code risk** -- `fallow audit` returns verdict `pass` for the current change set
+3. **Complexity and hotspots** -- `fallow health` shows `Above threshold: 0`
+4. **Duplication** -- clone families either consolidated or documented
+5. **Architecture boundaries** -- no unintended boundary violations or new circular dependencies
+6. **Dependency hygiene** -- no unused, unresolved, or unlisted dependencies; package-manager catalogs and overrides clean
+7. **Cleanup opportunities** -- unused files, exports, types either deleted or explicitly kept with a documented reason
+8. **Suppression hygiene** -- no stale suppression comments, no broad ignore patterns covering real issues
+
 If you want one sentence for agents, it is this:
 
-> Keep fixing repo-wide findings until dead code and duplication are either resolved or narrowly documented and `fallow health` has `Above threshold: 0`; if adoption is staged, use per-analysis baselines so `fallow audit` only gates new issues.
+> Keep fixing repo-wide findings across all compliance signals until quality score meets the team's target, `fallow health` has `Above threshold: 0`, and duplication / architecture / cleanup findings are either resolved or narrowly documented; if adoption is staged, use per-analysis baselines so `fallow audit` only gates new issues.
 
 ## What "done" looks like
 

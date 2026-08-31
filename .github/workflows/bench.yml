@@ -1,85 +1,163 @@
 name: Benchmarks
 
 on:
-  # Temporarily disabled to conserve CI minutes; run locally or via workflow_dispatch.
-  # pull_request:
-  #   branches: [main]
-  #   paths:
-  #     - 'crates/**/*.rs'
-  #     - 'Cargo.toml'
-  #     - 'Cargo.lock'
-  #     - '.github/workflows/bench.yml'
-  # push:
-  #   branches: [main]
-  #   paths:
-  #     - 'crates/**/*.rs'
-  #     - 'Cargo.toml'
-  #     - 'Cargo.lock'
-  #     - '.github/workflows/bench.yml'
+  merge_group:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.github/workflows/bench.yml'
+      - '.github/actions/setup-rust/**'
+      - '.github/scripts/generate-benchmark-matrix.mjs'
+      - '.github/scripts/generate-benchmark-matrix.test.mjs'
+      - 'scripts/check-benchmark-harness.py'
+  push:
+    branches: [main]
+    paths:
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.github/workflows/bench.yml'
+      - '.github/actions/setup-rust/**'
+      - '.github/scripts/generate-benchmark-matrix.mjs'
+      - '.github/scripts/generate-benchmark-matrix.test.mjs'
+      - 'scripts/check-benchmark-harness.py'
   workflow_dispatch:
 
 concurrency:
   group: bench-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
-permissions: {}
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-C debuginfo=1 -C strip=none -g --cfg codspeed"
 
 jobs:
-  benchmark:
-    name: Performance regression check
+  benchmark-harness:
+    name: Benchmark harness
     runs-on: ubuntu-latest
-    timeout-minutes: 30
     permissions:
-      contents: write
-      pull-requests: write
+      contents: read
+    timeout-minutes: 5
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check benchmark harness drift
+        run: python3 scripts/check-benchmark-harness.py
+
+  determine-matrix:
+    name: Determine benchmark matrix
+    needs: benchmark-harness
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 5
+    outputs:
+      fast_matrix: ${{ steps.matrix.outputs.fast_matrix }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Determine affected benchmark shards
+        id: matrix
+        env:
+          BENCH_EVENT_BEFORE: ${{ github.event.before }}
+        run: |
+          MATRIX=$(node .github/scripts/generate-benchmark-matrix.mjs)
+          echo "fast_matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+          echo "Fast benchmark matrix: $MATRIX"
+
+  benchmark:
+    name: CodSpeed fast simulation (${{ matrix.label }})
+    needs:
+      - benchmark-harness
+      - determine-matrix
+    if: needs.determine-matrix.outputs.fast_matrix != '[]'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.determine-matrix.outputs.fast_matrix) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: ./.github/actions/setup-rust
         with:
-          cache-key: bench
+          cache-key: bench-${{ matrix.cache_key }}
 
-      - name: Run benchmarks
-        # Only run the `analysis` bench target (not `large_analysis` which
-        # contains 5000+ file benchmarks that take 5+ minutes each).
-        run: cargo bench --bench analysis -- --output-format bencher | tee bench-output.txt
-
-      - name: Store benchmark result
-        uses: ./.github/actions/store-benchmark
+      - name: Install cargo-codspeed
+        uses: taiki-e/install-action@6cd13508893c0e7eab5f273c2575d3859bd7229a # v2.86.6
         with:
-          name: Fallow Benchmarks
-          tool: cargo
-          output-file-path: bench-output.txt
-          data-dir: bench
-          alert-threshold: '150%'
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          continue-on-error: ${{ github.event_name == 'pull_request' }}
+          tool: cargo-codspeed@4.7.0
 
-      - name: Deploy dashboard
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        run: |
-          # Save the dashboard page before switching branches
-          cp .github/pages/index.html /tmp/dashboard-index.html
+      - name: Build benchmark shard
+        # Keep PR feedback focused on deterministic API/session/cache paths.
+        run: cargo codspeed build -p ${{ matrix.package }} --bench ${{ matrix.bench }} --features codspeed
 
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+      - name: Run benchmark shard
+        uses: CodSpeedHQ/action@4296e51e7041e24dadb86d1d6e8b9320d223dbe8 # v5.0.3
+        with:
+          mode: simulation
+          run: cargo codspeed run -p ${{ matrix.package }} --bench ${{ matrix.bench }}
 
-          # Fetch latest gh-pages (benchmark-action may have just pushed)
-          git fetch origin gh-pages
+  benchmark-full:
+    name: CodSpeed full simulation (${{ matrix.label }})
+    needs: benchmark-harness
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: scaling analysis
+            cache_key: full-scaling-analysis
+            package: fallow-core
+            bench: scaling_analysis
+          - label: engine dupes pipeline
+            cache_key: full-engine-dupes-pipeline
+            package: fallow-engine
+            bench: dupes_pipeline
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-          # Use worktree to avoid losing the main checkout
-          git worktree add /tmp/gh-pages origin/gh-pages
-          cd /tmp/gh-pages
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: bench-${{ matrix.cache_key }}
 
-          cp /tmp/dashboard-index.html index.html
-          git add index.html
-          if ! git diff --cached --quiet; then
-            git commit -m "chore: update dashboard index.html"
-            git push origin HEAD:gh-pages
-          fi
+      - name: Install cargo-codspeed
+        uses: taiki-e/install-action@6cd13508893c0e7eab5f273c2575d3859bd7229a # v2.86.6
+        with:
+          tool: cargo-codspeed@4.7.0
 
-          cd "$GITHUB_WORKSPACE"
-          git worktree remove /tmp/gh-pages
+      - name: Build full benchmark shard
+        # Full suites include audit/git-heavy and scaling paths that are useful but noisier.
+        run: cargo codspeed build -p ${{ matrix.package }} --bench ${{ matrix.bench }} --features codspeed
+
+      - name: Run full benchmark shard
+        uses: CodSpeedHQ/action@4296e51e7041e24dadb86d1d6e8b9320d223dbe8 # v5.0.3
+        with:
+          mode: simulation
+          run: cargo codspeed run -p ${{ matrix.package }} --bench ${{ matrix.bench }}

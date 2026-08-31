@@ -1,0 +1,69 @@
+use ls_types::{
+    ClientCapabilities, CodeActionKind, CodeActionOptions, CodeActionProviderCapability,
+    CodeLensOptions, DiagnosticOptions, DiagnosticServerCapabilities, HoverProviderCapability,
+    PositionEncodingKind, ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncKind,
+    WorkDoneProgressOptions,
+};
+
+pub fn build_server_capabilities(advertise_pull_diagnostics: bool) -> ServerCapabilities {
+    ServerCapabilities {
+        text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
+        code_action_provider: Some(CodeActionProviderCapability::Options(CodeActionOptions {
+            code_action_kinds: Some(vec![CodeActionKind::QUICKFIX]),
+            ..Default::default()
+        })),
+        code_lens_provider: Some(CodeLensOptions {
+            resolve_provider: Some(false),
+        }),
+        hover_provider: Some(HoverProviderCapability::Simple(true)),
+        position_encoding: Some(PositionEncodingKind::UTF16),
+        diagnostic_provider: advertise_pull_diagnostics.then(|| {
+            DiagnosticServerCapabilities::Options(DiagnosticOptions {
+                identifier: Some("fallow".to_string()),
+                inter_file_dependencies: true,
+                workspace_diagnostics: false,
+                work_done_progress_options: WorkDoneProgressOptions::default(),
+            })
+        }),
+        ..Default::default()
+    }
+}
+
+pub fn client_supports_workspace_diagnostic_refresh(capabilities: &ClientCapabilities) -> bool {
+    capabilities
+        .workspace
+        .as_ref()
+        .and_then(|workspace| workspace.diagnostics.as_ref())
+        .and_then(|diagnostics| diagnostics.refresh_support)
+        .unwrap_or(false)
+}
+
+pub fn client_supports_watched_file_registration(capabilities: &ClientCapabilities) -> bool {
+    capabilities
+        .workspace
+        .as_ref()
+        .and_then(|workspace| workspace.did_change_watched_files.as_ref())
+        .and_then(|watched_files| watched_files.dynamic_registration)
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ls_types::{DidChangeWatchedFilesClientCapabilities, WorkspaceClientCapabilities};
+
+    #[test]
+    fn watched_file_registration_requires_explicit_dynamic_support() {
+        let mut capabilities = ClientCapabilities::default();
+        assert!(!client_supports_watched_file_registration(&capabilities));
+
+        capabilities.workspace = Some(WorkspaceClientCapabilities {
+            did_change_watched_files: Some(DidChangeWatchedFilesClientCapabilities {
+                dynamic_registration: Some(true),
+                relative_pattern_support: None,
+            }),
+            ..Default::default()
+        });
+        assert!(client_supports_watched_file_registration(&capabilities));
+    }
+}

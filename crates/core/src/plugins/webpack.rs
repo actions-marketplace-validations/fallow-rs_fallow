@@ -27,7 +27,7 @@ define_plugin!(
         "webpack-dev-server",
         "html-webpack-plugin",
     ],
-    resolve_config(config_path, source, _root) {
+    resolve_config(config_path, source, root) {
         let mut result = PluginResult::default();
 
         let imports = config_parser::extract_imports(source, config_path);
@@ -36,12 +36,27 @@ define_plugin!(
             result.referenced_dependencies.push(dep);
         }
 
-        // entry → entry points (string, array, or object with string values)
         let entries =
             config_parser::extract_config_string_or_array(source, config_path, &["entry"]);
-        result.extend_entry_patterns(entries);
+        let context = config_parser::extract_config_path(source, config_path, &["context"])
+            .and_then(|raw| config_parser::normalize_config_path_buf(&raw, config_path, root));
+        result.extend_entry_patterns(entries.into_iter().map(|entry| {
+            context
+                .as_ref()
+                .map(|context| normalize_context_entry(&entry, context, config_path, root))
+                .unwrap_or(entry)
+        }));
 
-        // require() calls for loaders/plugins in CJS configs
+        for (find, replacement) in
+            config_parser::extract_config_path_aliases(source, config_path, &["resolve", "alias"])
+        {
+            if let Some(normalized) =
+                config_parser::normalize_config_path(&replacement, config_path, root)
+            {
+                result.path_aliases.push((find, normalized));
+            }
+        }
+
         let require_deps =
             config_parser::extract_config_require_strings(source, config_path, "plugins");
         for dep in &require_deps {
@@ -50,7 +65,6 @@ define_plugin!(
                 .push(crate::resolve::extract_package_name(dep));
         }
 
-        // externals → referenced dependencies (string array form)
         let externals =
             config_parser::extract_config_shallow_strings(source, config_path, "externals");
         for ext in &externals {
@@ -59,7 +73,6 @@ define_plugin!(
                 .push(crate::resolve::extract_package_name(ext));
         }
 
-        // module.rules → extract loader package names
         parse_webpack_loaders(source, config_path, &mut result);
 
         result
@@ -87,7 +100,6 @@ pub(super) fn parse_webpack_loaders(source: &str, path: &Path, result: &mut Plug
         return;
     };
 
-    // Navigate to module.rules
     let Some(module_prop) = find_obj_prop(obj, "module") else {
         return;
     };
@@ -147,14 +159,12 @@ fn walk_rule(rule: &oxc_ast::ast::ObjectExpression, result: &mut PluginResult) {
         };
 
         match key_name {
-            // loader: 'ts-loader'
             "loader" => {
                 if let Expression::StringLiteral(s) = &p.value {
                     let dep = crate::resolve::extract_package_name(&s.value);
                     result.referenced_dependencies.push(dep);
                 }
             }
-            // use: 'babel-loader' or use: ['style-loader', { loader: 'css-loader' }]
             "use" => match &p.value {
                 Expression::StringLiteral(s) => {
                     let dep = crate::resolve::extract_package_name(&s.value);
@@ -183,7 +193,6 @@ fn walk_rule(rule: &oxc_ast::ast::ObjectExpression, result: &mut PluginResult) {
                 }
                 _ => {}
             },
-            // oneOf: [...rules] → recurse
             "oneOf" => {
                 if let Expression::ArrayExpression(one_of) = &p.value {
                     walk_rules(one_of, result);
@@ -192,6 +201,29 @@ fn walk_rule(rule: &oxc_ast::ast::ObjectExpression, result: &mut PluginResult) {
             _ => {}
         }
     }
+}
+
+fn normalize_context_entry(entry: &str, context: &Path, config_path: &Path, root: &Path) -> String {
+    let entry_path = config_parser::path_from_config_string(entry);
+    if entry.starts_with('/') || entry_path.is_absolute() {
+        return config_parser::normalize_config_path(entry, config_path, root)
+            .unwrap_or_else(|| entry.to_string());
+    }
+
+    if entry.starts_with("./")
+        || entry.starts_with("../")
+        || entry.starts_with(".\\")
+        || entry.starts_with("..\\")
+    {
+        return normalize_project_relative_join(context, &entry_path);
+    }
+
+    entry.to_string()
+}
+
+fn normalize_project_relative_join(base: &Path, child: &Path) -> String {
+    let normalized = config_parser::lexical_normalize(&base.join(child));
+    config_parser::path_to_config_string(&normalized)
 }
 
 #[cfg(test)]
@@ -207,7 +239,99 @@ mod tests {
             source,
             std::path::Path::new("/project"),
         );
-        assert_eq!(result.entry_patterns, vec!["./src/app.js"]);
+        assert_eq!(result.entry_patterns, vec!["src/app.js"]);
+    }
+
+    #[test]
+    fn resolve_config_entry_descriptor() {
+        let source = r#"
+            module.exports = {
+                entry: {
+                    app: { import: "./src/app.js", filename: "pages/app.js" },
+                    admin: { import: ["./src/admin-polyfill.js", "./src/admin.js"] },
+                    shared: ["react", "react-dom"],
+                },
+            };
+        "#;
+        let plugin = WebpackPlugin;
+        let result = plugin.resolve_config(
+            std::path::Path::new("webpack.config.js"),
+            source,
+            std::path::Path::new("/project"),
+        );
+        assert_eq!(
+            result.entry_patterns,
+            vec![
+                "src/app.js",
+                "src/admin-polyfill.js",
+                "src/admin.js",
+                "react",
+                "react-dom",
+            ]
+        );
+    }
+
+    #[test]
+    fn resolve_config_context_roots_relative_entries() {
+        let source = r#"
+            const path = require("path");
+
+            module.exports = {
+                context: path.resolve(__dirname, "app"),
+                entry: {
+                    main: { import: "./main.ts" },
+                    admin: ["./admin-polyfill.ts", "./admin.ts"],
+                    shared: ["react", "react-dom"],
+                },
+            };
+        "#;
+        let plugin = WebpackPlugin;
+        let result = plugin.resolve_config(
+            std::path::Path::new("/project/webpack.config.js"),
+            source,
+            std::path::Path::new("/project"),
+        );
+        assert_eq!(
+            result.entry_patterns,
+            vec![
+                "app/main.ts",
+                "app/admin-polyfill.ts",
+                "app/admin.ts",
+                "react",
+                "react-dom",
+            ]
+        );
+    }
+
+    #[test]
+    fn resolve_config_context_normalizes_mixed_separator_entries() {
+        let source = r#"
+            module.exports = {
+                context: "./app/features",
+                entry: {
+                    main: ".\\dashboard\\main.ts",
+                    shared: "../shared/index.ts",
+                },
+            };
+        "#;
+        let plugin = WebpackPlugin;
+        let result = plugin.resolve_config(
+            std::path::Path::new("/project/webpack.config.js"),
+            source,
+            std::path::Path::new("/project"),
+        );
+        assert_eq!(
+            result.entry_patterns,
+            vec!["app/features/dashboard/main.ts", "app/shared/index.ts"]
+        );
+        assert!(
+            result
+                .entry_patterns
+                .iter()
+                .all(|entry| !entry.contains('\\')),
+            "entry patterns should use forward slashes: {:?}",
+            result.entry_patterns
+        );
     }
 
     #[test]
@@ -277,5 +401,63 @@ mod tests {
         let deps = &result.referenced_dependencies;
         assert!(deps.contains(&"react".to_string()));
         assert!(deps.contains(&"react-dom".to_string()));
+    }
+
+    #[test]
+    fn resolve_config_extracts_cjs_path_aliases() {
+        let source = r"
+            const path = require('path');
+
+            module.exports = {
+                resolve: {
+                    alias: {
+                        '@components': path.resolve(__dirname, 'src/components'),
+                        '@utils': path.join(__dirname, 'src/utils'),
+                    },
+                },
+            };
+        ";
+        let plugin = WebpackPlugin;
+        let result = plugin.resolve_config(
+            std::path::Path::new("/project/webpack.config.js"),
+            source,
+            std::path::Path::new("/project"),
+        );
+
+        assert_eq!(
+            result.path_aliases,
+            vec![
+                ("@components".to_string(), "src/components".to_string()),
+                ("@utils".to_string(), "src/utils".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn resolve_config_extracts_esm_string_aliases() {
+        let source = r#"
+            export default {
+                resolve: {
+                    alias: {
+                        "@components": "./src/components",
+                        "@utils": "src/utils",
+                    },
+                },
+            };
+        "#;
+        let plugin = WebpackPlugin;
+        let result = plugin.resolve_config(
+            std::path::Path::new("/project/webpack.config.mjs"),
+            source,
+            std::path::Path::new("/project"),
+        );
+
+        assert_eq!(
+            result.path_aliases,
+            vec![
+                ("@components".to_string(), "src/components".to_string()),
+                ("@utils".to_string(), "src/utils".to_string()),
+            ]
+        );
     }
 }

@@ -1,0 +1,29 @@
+{
+  // House rules: every entry is pure data, nothing here executes.
+  "version": 1,
+  "name": "team-policy",
+  "description": "Fixture pack exercising both rule kinds",
+  "rules": [
+    {
+      "id": "no-child-process",
+      "kind": "banned-call",
+      "callees": ["child_process.*"],
+      "exclude": ["src/tooling/**"],
+      "message": "Use the sandboxed runner.",
+      "severity": "error"
+    },
+    {
+      "id": "no-moment",
+      "kind": "banned-import",
+      "specifiers": ["moment"],
+      "ignoreTypeOnly": true,
+      "message": "Use date-fns."
+    },
+    {
+      "id": "no-network",
+      "kind": "banned-effect",
+      "effects": ["network"],
+      "message": "Keep this fixture side-effect free."
+    }
+  ]
+}

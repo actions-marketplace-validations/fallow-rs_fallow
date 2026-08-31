@@ -9,23 +9,54 @@ use std::path::Path;
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use super::{parse_script, resolve_binary_to_package};
+use super::{ScriptCatalog, analyze_commands_with_context, could_be_file_path};
 
-/// Analyze CI config files for package binary invocations.
+/// Result of scanning CI config files: package names used by CI tooling AND
+/// project-relative file paths referenced as command-line arguments.
+#[derive(Debug, Default)]
+pub struct CiAnalysis {
+    /// npm package names used as binaries in CI shell commands.
+    pub used_packages: FxHashSet<String>,
+    /// File paths extracted as positional arguments or `--config` values
+    /// (e.g., `node scripts/deploy.ts` in a GitHub Actions `run:` block).
+    /// Paths are project-root-relative; CI files always live at the root.
+    pub entry_files: Vec<String>,
+}
+
+/// Analyze CI config files for package binary invocations and file references.
 ///
 /// Scans GitLab CI and GitHub Actions workflow files for shell commands,
-/// extracts binary names, and returns the set of npm package names used.
-pub fn analyze_ci_files(root: &Path, bin_map: &FxHashMap<String, String>) -> FxHashSet<String> {
+/// extracts binary names AND positional file path arguments, and returns both
+/// the set of npm package names used and the file paths referenced as command
+/// arguments. The file paths are seeded as entry points so scripts invoked from
+/// CI (`node scripts/deploy.ts`) do not get reported as `unused-files`.
+///
+/// CI files always live at `.gitlab-ci.yml` or `.github/workflows/*.yml`
+/// relative to the project root, so no workspace-prefix transformation applies.
+/// The catalog spans the whole project, so a CI step that resolves to a script
+/// declared only by a workspace package credits that body's dependencies but
+/// contributes none of its file arguments, which are relative to that package.
+pub fn analyze_ci_files(
+    root: &Path,
+    bin_map: &FxHashMap<String, String>,
+    declared_packages: &FxHashSet<String>,
+    scripts: &ScriptCatalog,
+) -> CiAnalysis {
     let _span = tracing::info_span!("analyze_ci_files").entered();
-    let mut used_packages = FxHashSet::default();
+    let mut analysis = CiAnalysis::default();
 
-    // GitLab CI
     let gitlab_ci = root.join(".gitlab-ci.yml");
     if let Ok(content) = std::fs::read_to_string(&gitlab_ci) {
-        extract_ci_packages(&content, root, bin_map, &mut used_packages);
+        extract_ci_signals(
+            &content,
+            root,
+            bin_map,
+            declared_packages,
+            scripts,
+            &mut analysis,
+        );
     }
 
-    // GitHub Actions workflows
     let workflows_dir = root.join(".github/workflows");
     if let Ok(entries) = std::fs::read_dir(&workflows_dir) {
         for entry in entries.flatten() {
@@ -34,36 +65,50 @@ pub fn analyze_ci_files(root: &Path, bin_map: &FxHashMap<String, String>) -> FxH
             if (name_str.ends_with(".yml") || name_str.ends_with(".yaml"))
                 && let Ok(content) = std::fs::read_to_string(entry.path())
             {
-                extract_ci_packages(&content, root, bin_map, &mut used_packages);
+                extract_ci_signals(
+                    &content,
+                    root,
+                    bin_map,
+                    declared_packages,
+                    scripts,
+                    &mut analysis,
+                );
             }
         }
     }
 
-    used_packages
+    analysis.entry_files.sort();
+    analysis.entry_files.dedup();
+    analysis
 }
 
-/// Extract package names from shell commands found in a CI config file.
+/// Extract package names AND file path references from shell commands found in
+/// a CI config file.
 ///
 /// Uses line-based heuristics to find shell command lines in YAML CI configs.
 /// This intentionally avoids a full YAML parser to keep dependencies minimal.
-/// Since results only mark packages as "used" (never as "unused"), false
-/// positives from non-command YAML lines are safe — they only reduce
-/// false positive unused dependency reports.
-fn extract_ci_packages(
+/// Known limitations (line-based parsing): variable interpolation
+/// (`${{ matrix.env }}/deploy.ts`), `\` line-continuations, YAML anchors
+/// (`<<: *defaults`) are silently skipped.
+fn extract_ci_signals(
     content: &str,
     root: &Path,
     bin_map: &FxHashMap<String, String>,
-    packages: &mut FxHashSet<String>,
+    declared_packages: &FxHashSet<String>,
+    scripts: &ScriptCatalog,
+    analysis: &mut CiAnalysis,
 ) {
-    for command in extract_ci_commands(content) {
-        let parsed = parse_script(&command);
-        for cmd in parsed {
-            if !cmd.binary.is_empty() && !super::is_builtin_command(&cmd.binary) {
-                let pkg = resolve_binary_to_package(&cmd.binary, root, bin_map);
-                packages.insert(pkg);
-            }
-        }
-    }
+    let commands = extract_ci_commands(content);
+    let parsed =
+        analyze_commands_with_context(&commands, root, bin_map, declared_packages, scripts);
+    analysis.used_packages.extend(parsed.used_packages);
+    analysis.entry_files.extend(
+        parsed
+            .config_files
+            .into_iter()
+            .filter(|s| could_be_file_path(s)),
+    );
+    analysis.entry_files.extend(parsed.entry_files);
 }
 
 /// Extract shell command strings from a CI config file.
@@ -71,69 +116,150 @@ fn extract_ci_packages(
 /// Recognizes:
 /// - YAML list items in script blocks: `  - npx tool --flag`
 /// - GitHub Actions run fields: `  run: command`
-/// - Multi-line run blocks: `  run: |` followed by indented lines
+/// - Block scalar run blocks: `  run: |` or `  run: >` followed by indented lines
+/// - Plain multi-line scalars: `  run: command` whose continuation lines are
+///   indented past the `run` key column and fold into the same command
 fn extract_ci_commands(content: &str) -> Vec<String> {
     let mut commands = Vec::new();
-    let mut in_multiline_run = false;
-    let mut multiline_indent = 0;
+    let mut multiline_run = MultilineRunState::default();
 
     for line in content.lines() {
         let trimmed = line.trim();
 
-        // Skip comments and empty lines
-        if trimmed.is_empty() || trimmed.starts_with('#') {
+        if should_skip_ci_line(trimmed) {
             continue;
         }
 
-        // Track multi-line `run: |` blocks (GitHub Actions)
-        if in_multiline_run {
-            let indent = line.len() - line.trim_start().len();
-            if indent > multiline_indent && !trimmed.is_empty() {
-                commands.push(trimmed.to_string());
-                continue;
-            }
-            in_multiline_run = false;
-            // Fall through to re-classify this line normally
+        if push_multiline_run_command(line, trimmed, &mut multiline_run, &mut commands) {
+            continue;
         }
 
-        // GitHub Actions: `run: |` or `- run: command` (multi-line or inline)
-        // Check both bare `run:` and list-item `- run:` forms
-        let run_value = strip_yaml_key(trimmed, "run")
-            .or_else(|| {
-                trimmed
-                    .strip_prefix("- ")
-                    .and_then(|rest| strip_yaml_key(rest.trim(), "run"))
-            })
-            .map(str::trim);
-
-        if let Some(rest) = run_value {
-            if rest == "|" || rest == "|-" || rest == "|+" {
-                in_multiline_run = true;
-                multiline_indent = line.len() - line.trim_start().len();
+        if let Some(rest) = yaml_run_value(trimmed) {
+            if is_multiline_run_marker(rest) {
+                multiline_run.start(run_key_column(line, trimmed), false);
             } else if !rest.is_empty() {
-                // Inline run: `run: npm test` or `- run: npm test`
                 commands.push(rest.to_string());
+                multiline_run.start(run_key_column(line, trimmed), true);
             }
             continue;
         }
 
-        // YAML list items in script/before_script/after_script blocks
-        // GitLab CI: `  - npx @cyclonedx/cyclonedx-npm --output-file sbom.json`
-        // These are the most common form of CI commands
-        if let Some(rest) = trimmed.strip_prefix("- ") {
-            let rest = rest.trim();
-            // Skip YAML mappings (key: value), image references, and other non-commands
-            if !rest.is_empty()
-                && !rest.starts_with('{')
-                && !rest.starts_with('[')
-                && !is_yaml_mapping(rest)
-            {
-                commands.push(rest.to_string());
-            }
-        }
+        push_yaml_list_command(trimmed, &mut commands);
     }
 
     commands
+}
+
+#[derive(Default)]
+struct MultilineRunState {
+    active: bool,
+    indent: usize,
+    folding: bool,
+}
+
+impl MultilineRunState {
+    /// Anchor at the `run` key column so sibling step keys (`env:`, `with:`),
+    /// which sit at the same column, terminate the scalar instead of being
+    /// swallowed as continuation lines. `folding` marks a plain scalar whose
+    /// continuations fold into the already-pushed command.
+    fn start(&mut self, key_column: usize, folding: bool) {
+        self.active = true;
+        self.indent = key_column;
+        self.folding = folding;
+    }
+
+    fn stop(&mut self) {
+        self.active = false;
+        self.folding = false;
+    }
+}
+
+/// Column of the `run` key itself, past any leading `- ` list indicator.
+fn run_key_column(line: &str, trimmed: &str) -> usize {
+    let base = line.len() - line.trim_start().len();
+    match trimmed.strip_prefix("- ") {
+        Some(rest) => base + 2 + (rest.len() - rest.trim_start().len()),
+        None => base,
+    }
+}
+
+fn should_skip_ci_line(trimmed: &str) -> bool {
+    trimmed.is_empty() || trimmed.starts_with('#')
+}
+
+fn push_multiline_run_command(
+    line: &str,
+    trimmed: &str,
+    state: &mut MultilineRunState,
+    commands: &mut Vec<String>,
+) -> bool {
+    if !state.active {
+        return false;
+    }
+
+    let indent = line.len() - line.trim_start().len();
+    if indent > state.indent && !trimmed.is_empty() {
+        if state.folding {
+            if let Some(last) = commands.last_mut() {
+                last.push(' ');
+                last.push_str(trimmed);
+            }
+        } else {
+            commands.push(trimmed.to_string());
+        }
+        return true;
+    }
+
+    state.stop();
+    false
+}
+
+fn yaml_run_value(trimmed: &str) -> Option<&str> {
+    strip_yaml_key(trimmed, "run")
+        .or_else(|| {
+            trimmed
+                .strip_prefix("- ")
+                .and_then(|rest| strip_yaml_key(rest.trim(), "run"))
+        })
+        .map(str::trim)
+}
+
+/// Recognize a YAML block scalar header on a `run:` value.
+///
+/// Accepts the literal (`|`) and folded (`>`) styles with any combination of a
+/// chomping indicator (`-`, `+`) and an explicit indentation indicator (`1`-`9`),
+/// in either order, matching the YAML block header grammar. A header carrying a
+/// trailing comment is still not recognized.
+fn is_multiline_run_marker(value: &str) -> bool {
+    let mut chars = value.chars();
+    if !matches!(chars.next(), Some('|' | '>')) {
+        return false;
+    }
+
+    let mut chomping = false;
+    let mut indentation = false;
+    for ch in chars {
+        match ch {
+            '-' | '+' if !chomping => chomping = true,
+            '1'..='9' if !indentation => indentation = true,
+            _ => return false,
+        }
+    }
+    true
+}
+
+fn push_yaml_list_command(trimmed: &str, commands: &mut Vec<String>) {
+    let Some(rest) = trimmed.strip_prefix("- ") else {
+        return;
+    };
+    let rest = rest.trim();
+    if !rest.is_empty()
+        && !rest.starts_with('{')
+        && !rest.starts_with('[')
+        && !is_yaml_mapping(rest)
+    {
+        commands.push(rest.to_string());
+    }
 }
 
 /// Strip a YAML key prefix from a line, returning the value part.
@@ -146,8 +272,6 @@ fn strip_yaml_key<'a>(line: &'a str, key: &str) -> Option<&'a str> {
 
 /// Check if a string looks like a YAML mapping (key: value) rather than a shell command.
 fn is_yaml_mapping(s: &str) -> bool {
-    // Simple heuristic: if the first "word" ends with `:` and doesn't look like
-    // a protocol (http:, https:, ftp:), it's likely a YAML key
     if let Some(first_word) = s.split_whitespace().next()
         && first_word.ends_with(':')
         && !first_word.starts_with("http")
@@ -162,7 +286,38 @@ fn is_yaml_mapping(s: &str) -> bool {
 mod tests {
     use super::*;
 
-    // ── extract_ci_commands tests ──────────────────────────────────
+    fn empty_set() -> FxHashSet<String> {
+        FxHashSet::default()
+    }
+
+    fn set(values: &[&str]) -> FxHashSet<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    fn catalog(scripts: &[(&str, &str)]) -> ScriptCatalog {
+        #[expect(
+            clippy::disallowed_types,
+            reason = "ScriptCatalog is built from serde-deserialized HashMap"
+        )]
+        let scripts: std::collections::HashMap<String, String> = scripts
+            .iter()
+            .map(|(name, body)| ((*name).to_string(), (*body).to_string()))
+            .collect();
+        ScriptCatalog::from_scripts(&scripts)
+    }
+
+    fn analyze_content(content: &str) -> CiAnalysis {
+        let mut analysis = CiAnalysis::default();
+        extract_ci_signals(
+            content,
+            Path::new("/nonexistent"),
+            &FxHashMap::default(),
+            &empty_set(),
+            &catalog(&[]),
+            &mut analysis,
+        );
+        analysis
+    }
 
     #[test]
     fn gitlab_ci_script_items() {
@@ -219,6 +374,76 @@ jobs:
         assert!(commands.contains(&"npm run build".to_string()));
     }
 
+    /// The shape of GitHub's own code-scanning/eslint.yml starter workflow: a
+    /// plain (unquoted) scalar whose continuation lines are indented past the
+    /// `run` key column and fold into one command (issue #2016).
+    #[test]
+    fn github_actions_plain_multiline_run_folds_continuations() {
+        let content = r"
+jobs:
+  eslint:
+    steps:
+      - name: Run ESLint
+        run: npx eslint .
+          --config .eslintrc.js
+          --ext .js,.jsx,.ts,.tsx
+        continue-on-error: true
+";
+        let commands = extract_ci_commands(content);
+        assert!(
+            commands.contains(
+                &"npx eslint . --config .eslintrc.js --ext .js,.jsx,.ts,.tsx".to_string()
+            ),
+            "continuation lines must fold into the run command, got: {commands:?}"
+        );
+        assert!(
+            !commands.iter().any(|c| c.contains("continue-on-error")),
+            "sibling step keys must not be swallowed as continuations, got: {commands:?}"
+        );
+    }
+
+    /// Sibling keys sit at the `run` key column, so key-column anchoring must
+    /// terminate a plain scalar there; their path-looking values must not flow
+    /// into entry_files where they could hide genuinely unused files.
+    #[test]
+    fn plain_run_sibling_key_values_do_not_leak_into_entry_files() {
+        let content = r"
+jobs:
+  build:
+    steps:
+      - run: npx eslint .
+          --max-warnings 0
+        env:
+          CONFIG_PATH: scripts/config.ts
+";
+        let commands = extract_ci_commands(content);
+        assert!(commands.contains(&"npx eslint . --max-warnings 0".to_string()));
+        assert!(!commands.iter().any(|c| c.contains("CONFIG_PATH")));
+
+        let analysis = analyze_content(content);
+        assert!(
+            !analysis.entry_files.iter().any(|f| f.contains("config.ts")),
+            "env values must not seed entry files, got: {:?}",
+            analysis.entry_files
+        );
+    }
+
+    /// End-to-end coverage for folded block scalars, beyond the marker
+    /// predicate test: commands inside `run: >-` must reach package analysis.
+    #[test]
+    fn folded_run_block_commands_analyzed() {
+        let content = r"
+jobs:
+  sbom:
+    steps:
+      - run: >-
+          npx @cyclonedx/cyclonedx-npm
+          --output-file sbom.json
+";
+        let analysis = analyze_content(content);
+        assert!(analysis.used_packages.contains("@cyclonedx/cyclonedx-npm"));
+    }
+
     #[test]
     fn yaml_mappings_filtered() {
         let content = r"
@@ -232,7 +457,6 @@ build:
     - npm ci
 ";
         let commands = extract_ci_commands(content);
-        // "node:18" and "NODE_ENV: production" should NOT be treated as commands
         assert!(!commands.iter().any(|c| c.contains("node:18")));
         assert!(!commands.iter().any(|c| c.contains("NODE_ENV")));
         assert!(commands.contains(&"npm ci".to_string()));
@@ -252,8 +476,6 @@ build:
         assert_eq!(commands, vec!["npm ci"]);
     }
 
-    // ── extract_ci_packages tests ──────────────────────────────────
-
     #[test]
     fn npx_package_extracted() {
         let content = r"
@@ -261,13 +483,8 @@ build:
   script:
     - npx @cyclonedx/cyclonedx-npm --output-file sbom.json
 ";
-        let mut packages = FxHashSet::default();
-        extract_ci_packages(
-            content,
-            Path::new("/nonexistent"),
-            &FxHashMap::default(),
-            &mut packages,
-        );
+        let analysis = analyze_content(content);
+        let packages = &analysis.used_packages;
         assert!(
             packages.contains("@cyclonedx/cyclonedx-npm"),
             "packages: {packages:?}"
@@ -283,13 +500,8 @@ build:
     - npx prettier --check .
     - tsc --noEmit
 ";
-        let mut packages = FxHashSet::default();
-        extract_ci_packages(
-            content,
-            Path::new("/nonexistent"),
-            &FxHashMap::default(),
-            &mut packages,
-        );
+        let analysis = analyze_content(content);
+        let packages = &analysis.used_packages;
         assert!(packages.contains("eslint"));
         assert!(packages.contains("prettier"));
         assert!(packages.contains("typescript")); // tsc → typescript via resolve
@@ -304,13 +516,8 @@ build:
     - mkdir -p dist
     - cp -r build/* dist/
 ";
-        let mut packages = FxHashSet::default();
-        extract_ci_packages(
-            content,
-            Path::new("/nonexistent"),
-            &FxHashMap::default(),
-            &mut packages,
-        );
+        let analysis = analyze_content(content);
+        let packages = &analysis.used_packages;
         assert!(
             packages.is_empty(),
             "should not extract built-in commands: {packages:?}"
@@ -325,17 +532,166 @@ jobs:
     steps:
       - run: npx @cyclonedx/cyclonedx-npm --output-file sbom.json
 ";
-        let mut packages = FxHashSet::default();
-        extract_ci_packages(
-            content,
-            Path::new("/nonexistent"),
-            &FxHashMap::default(),
-            &mut packages,
-        );
+        let analysis = analyze_content(content);
+        let packages = &analysis.used_packages;
         assert!(packages.contains("@cyclonedx/cyclonedx-npm"));
     }
 
-    // ── helper tests ───────────────────────────────────────────────
+    #[test]
+    fn github_actions_pnpm_bare_declared_binary_extracted() {
+        let content = r"
+jobs:
+  info:
+    steps:
+      - run: pnpm envinfo --system
+";
+        let mut analysis = CiAnalysis::default();
+        extract_ci_signals(
+            content,
+            Path::new("/nonexistent"),
+            &FxHashMap::default(),
+            &set(&["envinfo"]),
+            &catalog(&[]),
+            &mut analysis,
+        );
+        assert!(analysis.used_packages.contains("envinfo"));
+    }
+
+    #[test]
+    fn github_actions_pnpm_script_name_shorthand_skipped() {
+        let content = r"
+jobs:
+  build:
+    steps:
+      - run: pnpm build
+";
+        let mut analysis = CiAnalysis::default();
+        extract_ci_signals(
+            content,
+            Path::new("/nonexistent"),
+            &FxHashMap::default(),
+            &set(&["build"]),
+            &catalog(&[("build", "vite build")]),
+            &mut analysis,
+        );
+        assert!(!analysis.used_packages.contains("build"));
+    }
+
+    /// The dominant real-world shape: CI never names the linter, it runs the
+    /// package.json script and adds the CI formatter flag (issue #2016).
+    #[test]
+    fn github_actions_npm_run_script_forwards_formatter_flag() {
+        let content = r"
+jobs:
+  lint:
+    steps:
+      - run: npm run lint -- --format gha
+";
+        let mut analysis = CiAnalysis::default();
+        extract_ci_signals(
+            content,
+            Path::new("/nonexistent"),
+            &FxHashMap::default(),
+            &set(&["eslint", "eslint-formatter-gha"]),
+            &catalog(&[("lint", "eslint .")]),
+            &mut analysis,
+        );
+        assert!(analysis.used_packages.contains("eslint"));
+        assert!(analysis.used_packages.contains("eslint-formatter-gha"));
+    }
+
+    /// A root CI step resolving to a workspace-only script must not turn that
+    /// body's file arguments into root-relative entry patterns (issue #2016).
+    #[test]
+    fn workspace_only_script_body_does_not_seed_root_entry_files() {
+        let content = r"
+jobs:
+  build:
+    steps:
+      - run: npm run build -- --mode ci
+";
+        #[expect(
+            clippy::disallowed_types,
+            reason = "ScriptCatalog is built from serde-deserialized HashMap"
+        )]
+        let ws_scripts: std::collections::HashMap<String, String> =
+            std::iter::once(("build".to_string(), "esbuild scripts/bundle.js".to_string()))
+                .collect();
+        let mut scripts = ScriptCatalog::default();
+        scripts.merge_workspace_scripts(&ws_scripts);
+
+        let mut analysis = CiAnalysis::default();
+        extract_ci_signals(
+            content,
+            Path::new("/nonexistent"),
+            &FxHashMap::default(),
+            &set(&["esbuild"]),
+            &scripts,
+            &mut analysis,
+        );
+        assert!(analysis.used_packages.contains("esbuild"));
+        assert!(analysis.entry_files.is_empty());
+    }
+
+    #[test]
+    fn github_actions_expression_fragments_not_entry_files() {
+        let content = r#"
+jobs:
+  health-check:
+    steps:
+      - run: |
+          RESPONSE_CODE=$(curl -s -o "$TMPFILE" -w "%{http_code}" -m 15 "${{ env.ENVIRONMENT_URL }}/api/health/ready")
+          echo "$RESPONSE_CODE"
+"#;
+        let analysis = analyze_content(content);
+        for path in &analysis.entry_files {
+            assert!(
+                !path.contains("${{") && !path.contains("}}"),
+                "entry_files must not contain GitHub Actions expression fragments, got: {path:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn jq_array_iterator_not_entry_file() {
+        let content = r#"
+jobs:
+  process:
+    steps:
+      - run: |
+          jq -c '.[]' /tmp/x.json | while read item; do echo "$item"; done
+          result=$(jq -r '.[]' data.json)
+"#;
+        let analysis = analyze_content(content);
+        for path in &analysis.entry_files {
+            assert!(
+                !path.contains(".[]"),
+                "entry_files must not contain jq array-iterator fragments, got: {path:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn grep_perl_regex_fragment_not_entry_file() {
+        let content = r"
+jobs:
+  deploy:
+    steps:
+      - run: |
+          grep -oP '(?<=Module )\./[^ ]+(?= has finished with an error)' deploy.log
+";
+        let analysis = analyze_content(content);
+        for path in &analysis.entry_files {
+            assert!(
+                !path.contains(r"\./"),
+                "entry_files must not contain regex escape fragments, got: {path:?}"
+            );
+            assert!(
+                !path.contains("[^"),
+                "entry_files must not contain unclosed character class fragments, got: {path:?}"
+            );
+        }
+    }
 
     #[test]
     fn strip_yaml_key_basic() {
@@ -351,5 +707,25 @@ jobs:
         assert!(!is_yaml_mapping("npm ci"));
         assert!(!is_yaml_mapping("npx eslint src"));
         assert!(!is_yaml_mapping("https://example.com"));
+    }
+
+    /// GitHub Actions accepts the folded style as readily as the literal one, and
+    /// fallow's own release-validation workflow uses it.
+    #[test]
+    fn folded_run_scalar_is_a_block_marker() {
+        for marker in ["|", "|-", "|+", ">", ">-", ">+", "|2", ">2-", ">-2"] {
+            assert!(
+                is_multiline_run_marker(marker),
+                "{marker} is a block header"
+            );
+        }
+        for value in [
+            "", "npm ci", "|foo", ">out.txt", "||", ">>", "-", "|0", "|--",
+        ] {
+            assert!(
+                !is_multiline_run_marker(value),
+                "{value} is a command, not a block header"
+            );
+        }
     }
 }

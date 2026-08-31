@@ -1,6 +1,22 @@
 use crate::params::FixParams;
 
-use super::{push_global, push_scope};
+use rmcp::ErrorData as McpError;
+use rmcp::model::CallToolResult;
+
+use super::{push_global, push_remote_extends, push_scope, run_tool};
+
+/// Run the read-only fix preview. It is CLI-backed because fix planning shares
+/// the same command-owned mutation safeguards as fix apply.
+pub async fn run_fix_preview(binary: &str, params: FixParams) -> Result<CallToolResult, McpError> {
+    let args = build_fix_preview_args(&params);
+    run_tool(binary, "fix_preview", &args).await
+}
+
+/// Run the mutating fix apply path. This intentionally remains CLI-backed.
+pub async fn run_fix_apply(binary: &str, params: FixParams) -> Result<CallToolResult, McpError> {
+    let args = build_fix_apply_args(&params);
+    run_tool(binary, "fix_apply", &args).await
+}
 
 /// Build CLI arguments for the `fix_preview` tool.
 pub fn build_fix_preview_args(params: &FixParams) -> Vec<String> {
@@ -11,6 +27,9 @@ pub fn build_fix_preview_args(params: &FixParams) -> Vec<String> {
         "json".to_string(),
         "--quiet".to_string(),
     ];
+    if params.no_create_config == Some(true) {
+        args.push("--no-create-config".to_string());
+    }
     push_global(
         &mut args,
         params.root.as_deref(),
@@ -18,6 +37,7 @@ pub fn build_fix_preview_args(params: &FixParams) -> Vec<String> {
         params.no_cache,
         params.threads,
     );
+    push_remote_extends(&mut args, params.allow_remote_extends);
     push_scope(&mut args, params.production, params.workspace.as_deref());
     args
 }
@@ -31,6 +51,9 @@ pub fn build_fix_apply_args(params: &FixParams) -> Vec<String> {
         "json".to_string(),
         "--quiet".to_string(),
     ];
+    if params.no_create_config == Some(true) {
+        args.push("--no-create-config".to_string());
+    }
     push_global(
         &mut args,
         params.root.as_deref(),
@@ -38,6 +61,7 @@ pub fn build_fix_apply_args(params: &FixParams) -> Vec<String> {
         params.no_cache,
         params.threads,
     );
+    push_remote_extends(&mut args, params.allow_remote_extends);
     push_scope(&mut args, params.production, params.workspace.as_deref());
     args
 }

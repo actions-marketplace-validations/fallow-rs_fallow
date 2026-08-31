@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 /// Known binary-name → package-name mappings where they diverge.
 static BINARY_TO_PACKAGE: &[(&str, &str)] = &[
@@ -19,18 +19,10 @@ static BINARY_TO_PACKAGE: &[(&str, &str)] = &[
     ("oxlint", "oxlint"),
 ];
 
-/// Build a reverse map from binary names to package names by reading
-/// each dependency's `package.json` from `node_modules/` and extracting
-/// its `bin` field entries.
+/// Build a reverse map from binary names to package names by reading each
+/// dependency's `package.json` from `node_modules/` and extracting `bin`.
 ///
-/// Probes `node_modules/` directories at each of the provided roots (project
-/// root first, then workspace roots). This handles non-hoisted setups where
-/// a dependency lives in a workspace-local `node_modules/` rather than the
-/// project root.
-///
-/// Handles both forms of the `bin` field:
-/// - String: `"bin": "./cli.js"` → binary name derived from package name
-/// - Object: `"bin": { "attw": "./bin/cli.js" }` → keys are binary names
+/// Probes each provided `node_modules/` root, which covers non-hoisted setups.
 #[must_use]
 pub fn build_bin_to_package_map(
     node_modules_roots: &[&Path],
@@ -39,7 +31,6 @@ pub fn build_bin_to_package_map(
     let mut map = FxHashMap::default();
 
     for dep_name in dep_names {
-        // Try each node_modules root until we find the dep's package.json
         let bin = node_modules_roots.iter().find_map(|root| {
             let pkg_path = root
                 .join("node_modules")
@@ -55,8 +46,6 @@ pub fn build_bin_to_package_map(
 
         match bin {
             serde_json::Value::String(_) => {
-                // String form: binary name = unscoped package name
-                // "@scope/foo" → "foo", "foo" → "foo"
                 let bin_name = dep_name.rsplit('/').next().unwrap_or(dep_name);
                 map.insert(bin_name.to_string(), dep_name.clone());
             }
@@ -73,24 +62,16 @@ pub fn build_bin_to_package_map(
 }
 
 /// Resolve a binary name to its npm package name.
-///
-/// Strategy:
-/// 1. Check known binary→package divergence map
-/// 2. Read `node_modules/.bin/<binary>` symlink target
-/// 3. Check dynamic bin-to-package map (built from dependency `package.json` `bin` fields)
-/// 4. Fall back: binary name = package name
 #[must_use]
 pub fn resolve_binary_to_package(
     binary: &str,
     root: &Path,
     bin_map: &FxHashMap<String, String>,
 ) -> String {
-    // 1. Known divergences
     if let Some(&(_, pkg)) = BINARY_TO_PACKAGE.iter().find(|(bin, _)| *bin == binary) {
         return pkg.to_string();
     }
 
-    // 2. Try reading the symlink in node_modules/.bin/
     let bin_link = root.join("node_modules/.bin").join(binary);
     if let Ok(target) = std::fs::read_link(&bin_link)
         && let Some(pkg_name) = extract_package_from_bin_path(&target)
@@ -98,13 +79,44 @@ pub fn resolve_binary_to_package(
         return pkg_name;
     }
 
-    // 3. Check dynamic bin-to-package map
     if let Some(pkg_name) = bin_map.get(binary) {
         return pkg_name.clone();
     }
 
-    // 4. Fallback: binary name = package name
     binary.to_string()
+}
+
+/// Resolve a binary only when it is known to belong to a declared dependency.
+#[must_use]
+pub fn resolve_known_dependency_binary(
+    binary: &str,
+    root: &Path,
+    bin_map: &FxHashMap<String, String>,
+    declared_packages: &FxHashSet<String>,
+) -> Option<String> {
+    if let Some(&(_, pkg)) = BINARY_TO_PACKAGE.iter().find(|(bin, _)| *bin == binary)
+        && declared_packages.contains(pkg)
+    {
+        return Some(pkg.to_string());
+    }
+
+    let bin_link = root.join("node_modules/.bin").join(binary);
+    if let Ok(target) = std::fs::read_link(&bin_link)
+        && let Some(pkg_name) = extract_package_from_bin_path(&target)
+        && declared_packages.contains(&pkg_name)
+    {
+        return Some(pkg_name);
+    }
+
+    if let Some(pkg_name) = bin_map.get(binary)
+        && declared_packages.contains(pkg_name)
+    {
+        return Some(pkg_name.clone());
+    }
+
+    declared_packages
+        .contains(binary)
+        .then(|| binary.to_string())
 }
 
 /// Extract a package name from a `node_modules/.bin` symlink target path.
@@ -120,11 +132,9 @@ pub fn extract_package_from_bin_path(target: &std::path::Path) -> Option<String>
         if *part == ".." {
             continue;
         }
-        // Scoped package: @scope/name
         if part.starts_with('@') && i + 1 < parts.len() {
             return Some(format!("{}/{}", part, parts[i + 1]));
         }
-        // Regular package
         return Some(part.to_string());
     }
 
@@ -139,7 +149,9 @@ mod tests {
         FxHashMap::default()
     }
 
-    // --- BINARY_TO_PACKAGE known mappings ---
+    fn declared(packages: &[&str]) -> FxHashSet<String> {
+        packages.iter().map(|pkg| (*pkg).to_string()).collect()
+    }
 
     #[test]
     fn tsserver_maps_to_typescript() {
@@ -183,8 +195,6 @@ mod tests {
         assert_eq!(pkg, "oxlint");
     }
 
-    // --- Dynamic bin map resolution ---
-
     #[test]
     fn bin_map_resolves_divergent_binary() {
         let mut map = FxHashMap::default();
@@ -209,8 +219,6 @@ mod tests {
         assert_eq!(pkg, "@scope/my-tool");
     }
 
-    // --- Unknown binary falls back to identity ---
-
     #[test]
     fn unknown_binary_returns_identity() {
         let pkg =
@@ -219,8 +227,53 @@ mod tests {
     }
 
     #[test]
+    fn known_dependency_binary_accepts_declared_identity() {
+        let pkg = resolve_known_dependency_binary(
+            "envinfo",
+            Path::new("/nonexistent"),
+            &empty_map(),
+            &declared(&["envinfo"]),
+        );
+        assert_eq!(pkg.as_deref(), Some("envinfo"));
+    }
+
+    #[test]
+    fn known_dependency_binary_accepts_static_mapping_when_declared() {
+        let pkg = resolve_known_dependency_binary(
+            "tsc",
+            Path::new("/nonexistent"),
+            &empty_map(),
+            &declared(&["typescript"]),
+        );
+        assert_eq!(pkg.as_deref(), Some("typescript"));
+    }
+
+    #[test]
+    fn known_dependency_binary_accepts_bin_map_when_declared() {
+        let mut map = FxHashMap::default();
+        map.insert("attw".to_string(), "@arethetypeswrong/cli".to_string());
+        let pkg = resolve_known_dependency_binary(
+            "attw",
+            Path::new("/nonexistent"),
+            &map,
+            &declared(&["@arethetypeswrong/cli"]),
+        );
+        assert_eq!(pkg.as_deref(), Some("@arethetypeswrong/cli"));
+    }
+
+    #[test]
+    fn known_dependency_binary_rejects_identity_fallback_when_not_declared() {
+        let pkg = resolve_known_dependency_binary(
+            "some-random-tool",
+            Path::new("/nonexistent"),
+            &empty_map(),
+            &FxHashSet::default(),
+        );
+        assert_eq!(pkg, None);
+    }
+
+    #[test]
     fn jest_identity_without_symlink() {
-        // jest is not in the divergence map, and no symlink exists at /nonexistent
         let pkg = resolve_binary_to_package("jest", Path::new("/nonexistent"), &empty_map());
         assert_eq!(pkg, "jest");
     }
@@ -230,8 +283,6 @@ mod tests {
         let pkg = resolve_binary_to_package("eslint", Path::new("/nonexistent"), &empty_map());
         assert_eq!(pkg, "eslint");
     }
-
-    // --- extract_package_from_bin_path ---
 
     #[test]
     fn bin_path_simple_package() {
@@ -283,8 +334,6 @@ mod tests {
             Some("@biomejs/biome".to_string())
         );
     }
-
-    // --- build_bin_to_package_map ---
 
     #[test]
     fn bin_map_object_form() {
@@ -371,7 +420,6 @@ mod tests {
 
     #[test]
     fn bin_map_workspace_fallback() {
-        // Dep not in root node_modules, but in workspace node_modules
         let root = tempfile::tempdir().unwrap();
         let ws = tempfile::tempdir().unwrap();
         let ws_nm = ws.path().join("node_modules/my-ws-tool");

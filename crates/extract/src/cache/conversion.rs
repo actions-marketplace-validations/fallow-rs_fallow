@@ -7,15 +7,33 @@
 //! analysis pipeline. Eliminating these clones would require shared ownership
 //! (`Arc<str>`) across the entire extraction + analysis pipeline.
 
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use oxc_span::Span;
 
 use crate::ExportName;
-use fallow_types::extract::VisibilityTag;
+use fallow_types::extract::{NamespaceObjectAlias, VisibilityTag};
+use fallow_types::suppress::{PolicyRuleSuppression, SuppressionTarget};
+
+/// Seconds-since-Unix-epoch from the wall clock, saturating to 0 if the
+/// system clock is set before the epoch. Used as the LRU bookkeeping
+/// timestamp on `CachedModule.last_access_secs`. Wall-clock (not monotonic)
+/// is the right source here because the value persists across process
+/// invocations.
+#[must_use]
+pub fn current_unix_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
 
 use super::types::{
-    CachedDynamicImport, CachedDynamicImportPattern, CachedExport, CachedImport, CachedMember,
-    CachedModule, CachedReExport, CachedRequireCall, CachedSuppression, IMPORT_KIND_DEFAULT,
-    IMPORT_KIND_NAMED, IMPORT_KIND_NAMESPACE, IMPORT_KIND_SIDE_EFFECT,
+    CachedDynamicImport, CachedDynamicImportPattern, CachedExport, CachedImport,
+    CachedLocalTypeDeclaration, CachedMember, CachedModule, CachedNamespaceObjectAlias,
+    CachedPublicSignatureTypeReference, CachedReExport, CachedRequireCall, CachedSuppression,
+    CachedUnknownSuppressionKind, IMPORT_KIND_DEFAULT, IMPORT_KIND_NAMED, IMPORT_KIND_NAMESPACE,
+    IMPORT_KIND_SIDE_EFFECT,
 };
 
 /// Reconstruct a [`ModuleInfo`](crate::ModuleInfo) from a [`CachedModule`].
@@ -24,23 +42,22 @@ pub fn cached_to_module(
     cached: &CachedModule,
     file_id: fallow_types::discover::FileId,
 ) -> crate::ModuleInfo {
-    use crate::{
-        DynamicImportInfo, ExportInfo, ImportInfo, ImportedName, MemberInfo, ModuleInfo,
-        ReExportInfo, RequireCallInfo,
-    };
+    cached_to_module_opts(cached, file_id, true)
+}
 
-    let exports = cached
-        .exports
+fn cached_exports_to_module(exports: &[CachedExport]) -> Vec<crate::ExportInfo> {
+    exports
         .iter()
-        .map(|e| ExportInfo {
-            name: if e.is_default {
+        .map(|export| crate::ExportInfo {
+            name: if export.is_default {
                 ExportName::Default
             } else {
-                ExportName::Named(e.name.clone())
+                ExportName::Named(export.name.clone())
             },
-            local_name: e.local_name.clone(),
-            is_type_only: e.is_type_only,
-            visibility: match e.visibility {
+            local_name: export.local_name.clone(),
+            is_type_only: export.is_type_only,
+            is_side_effect_used: export.is_side_effect_used,
+            visibility: match export.visibility {
                 1 => VisibilityTag::Public,
                 2 => VisibilityTag::Internal,
                 3 => VisibilityTag::Beta,
@@ -48,251 +65,627 @@ pub fn cached_to_module(
                 5 => VisibilityTag::ExpectedUnused,
                 _ => VisibilityTag::None,
             },
-            span: Span::new(e.span_start, e.span_end),
-            members: e
+            expected_unused_reason: export.expected_unused_reason.clone(),
+            span: Span::new(export.span_start, export.span_end),
+            members: export
                 .members
                 .iter()
-                .map(|m| MemberInfo {
-                    name: m.name.clone(),
-                    kind: m.kind,
-                    span: Span::new(m.span_start, m.span_end),
-                    has_decorator: m.has_decorator,
+                .map(|member| crate::MemberInfo {
+                    name: member.name.clone(),
+                    kind: member.kind,
+                    span: Span::new(member.span_start, member.span_end),
+                    has_decorator: member.has_decorator,
+                    decorator_names: member.decorator_names.clone(),
+                    is_instance_returning_static: member.is_instance_returning_static,
+                    is_self_returning: member.is_self_returning,
                 })
                 .collect(),
-            super_class: e.super_class.clone(),
+            super_class: export.super_class.clone(),
         })
-        .collect();
+        .collect()
+}
 
-    let imports = cached
-        .imports
+fn cached_imports_to_module(imports: &[CachedImport]) -> Vec<crate::ImportInfo> {
+    imports
         .iter()
-        .map(|i| ImportInfo {
-            source: i.source.clone(),
-            imported_name: match i.kind {
-                IMPORT_KIND_DEFAULT => ImportedName::Default,
-                IMPORT_KIND_NAMESPACE => ImportedName::Namespace,
-                IMPORT_KIND_SIDE_EFFECT => ImportedName::SideEffect,
-                // IMPORT_KIND_NAMED (0) and any unknown value default to Named
-                _ => ImportedName::Named(i.imported_name.clone()),
+        .map(|import| crate::ImportInfo {
+            source: import.source.clone(),
+            imported_name: match import.kind {
+                IMPORT_KIND_DEFAULT => crate::ImportedName::Default,
+                IMPORT_KIND_NAMESPACE => crate::ImportedName::Namespace,
+                IMPORT_KIND_SIDE_EFFECT => crate::ImportedName::SideEffect,
+                _ => crate::ImportedName::Named(import.imported_name.clone()),
             },
-            local_name: i.local_name.clone(),
-            is_type_only: i.is_type_only,
-            span: Span::new(i.span_start, i.span_end),
-            source_span: Span::new(i.source_span_start, i.source_span_end),
+            local_name: import.local_name.clone(),
+            is_type_only: import.is_type_only,
+            is_type_only_star: import.is_type_only_star,
+            from_style: import.from_style,
+            span: Span::new(import.span_start, import.span_end),
+            source_span: Span::new(import.source_span_start, import.source_span_end),
         })
-        .collect();
+        .collect()
+}
 
-    let re_exports = cached
-        .re_exports
+fn cached_re_exports_to_module(re_exports: &[CachedReExport]) -> Vec<crate::ReExportInfo> {
+    re_exports
         .iter()
-        .map(|r| ReExportInfo {
-            source: r.source.clone(),
-            imported_name: r.imported_name.clone(),
-            exported_name: r.exported_name.clone(),
-            is_type_only: r.is_type_only,
-            span: Span::new(r.span_start, r.span_end),
+        .map(|re_export| crate::ReExportInfo {
+            source: re_export.source.clone(),
+            imported_name: re_export.imported_name.clone(),
+            exported_name: re_export.exported_name.clone(),
+            is_type_only: re_export.is_type_only,
+            span: Span::new(re_export.span_start, re_export.span_end),
+            statement_span: Span::new(re_export.statement_span_start, re_export.statement_span_end),
+            source_span: Span::new(re_export.source_span_start, re_export.source_span_end),
         })
-        .collect();
+        .collect()
+}
 
-    let dynamic_imports = cached
-        .dynamic_imports
+fn cached_dynamic_imports_to_module(
+    dynamic_imports: &[CachedDynamicImport],
+) -> Vec<crate::DynamicImportInfo> {
+    dynamic_imports
         .iter()
-        .map(|d| DynamicImportInfo {
-            source: d.source.clone(),
-            span: Span::new(d.span_start, d.span_end),
-            destructured_names: d.destructured_names.clone(),
-            local_name: d.local_name.clone(),
+        .map(|dynamic_import| crate::DynamicImportInfo {
+            source: dynamic_import.source.clone(),
+            span: Span::new(dynamic_import.span_start, dynamic_import.span_end),
+            destructured_names: dynamic_import.destructured_names.clone(),
+            local_name: dynamic_import.local_name.clone(),
+            is_speculative: dynamic_import.is_speculative,
         })
-        .collect();
+        .collect()
+}
 
-    let require_calls = cached
-        .require_calls
+fn cached_require_calls_to_module(
+    require_calls: &[CachedRequireCall],
+) -> Vec<crate::RequireCallInfo> {
+    require_calls
         .iter()
-        .map(|r| RequireCallInfo {
-            source: r.source.clone(),
-            span: Span::new(r.span_start, r.span_end),
-            destructured_names: r.destructured_names.clone(),
-            local_name: r.local_name.clone(),
+        .map(|require_call| crate::RequireCallInfo {
+            source: require_call.source.clone(),
+            span: Span::new(require_call.span_start, require_call.span_end),
+            source_span: Span::new(require_call.source_span_start, require_call.source_span_end),
+            destructured_names: require_call.destructured_names.clone(),
+            local_name: require_call.local_name.clone(),
+            is_type_only: require_call.is_type_only,
         })
-        .collect();
+        .collect()
+}
 
-    let dynamic_import_patterns = cached
-        .dynamic_import_patterns
+fn cached_dynamic_patterns_to_module(
+    dynamic_import_patterns: &[CachedDynamicImportPattern],
+) -> Vec<crate::DynamicImportPattern> {
+    dynamic_import_patterns
         .iter()
-        .map(|p| crate::DynamicImportPattern {
-            prefix: p.prefix.clone(),
-            suffix: p.suffix.clone(),
-            span: Span::new(p.span_start, p.span_end),
+        .map(|pattern| crate::DynamicImportPattern {
+            prefix: pattern.prefix.clone(),
+            suffix: pattern.suffix.clone(),
+            span: Span::new(pattern.span_start, pattern.span_end),
+            mechanism: pattern.mechanism,
         })
-        .collect();
+        .collect()
+}
 
-    let suppressions = cached
-        .suppressions
+fn cached_suppressions_to_module(
+    suppressions: &[CachedSuppression],
+) -> Vec<crate::suppress::Suppression> {
+    suppressions
         .iter()
-        .map(|s| crate::suppress::Suppression {
-            line: s.line,
-            comment_line: s.comment_line,
-            kind: if s.kind == 0 {
+        .map(|suppression| {
+            let target = if suppression.kind == 0 {
                 None
+            } else if suppression.kind
+                == crate::suppress::IssueKind::PolicyViolation.to_discriminant()
+                && !suppression.policy_pack.is_empty()
+                && !suppression.policy_rule_id.is_empty()
+            {
+                Some(SuppressionTarget::PolicyRule(PolicyRuleSuppression::new(
+                    suppression.policy_pack.clone(),
+                    suppression.policy_rule_id.clone(),
+                )))
             } else {
-                crate::suppress::IssueKind::from_discriminant(s.kind)
-            },
+                crate::suppress::IssueKind::from_discriminant(suppression.kind)
+                    .map(SuppressionTarget::Issue)
+            };
+            crate::suppress::Suppression {
+                line: suppression.line,
+                comment_line: suppression.comment_line,
+                target,
+                reason: suppression.reason.clone(),
+            }
         })
-        .collect();
+        .collect()
+}
 
-    ModuleInfo {
+fn cached_unknown_suppressions_to_module(
+    unknown_suppression_kinds: &[CachedUnknownSuppressionKind],
+) -> Vec<fallow_types::suppress::UnknownSuppressionKind> {
+    unknown_suppression_kinds
+        .iter()
+        .map(|unknown| fallow_types::suppress::UnknownSuppressionKind {
+            comment_line: unknown.comment_line,
+            is_file_level: unknown.is_file_level,
+            token: unknown.token.clone(),
+            reason: unknown.reason.clone(),
+        })
+        .collect()
+}
+
+fn cached_local_types_to_module(
+    local_type_declarations: &[CachedLocalTypeDeclaration],
+) -> Vec<crate::LocalTypeDeclaration> {
+    local_type_declarations
+        .iter()
+        .map(|declaration| crate::LocalTypeDeclaration {
+            name: declaration.name.clone(),
+            span: Span::new(declaration.span_start, declaration.span_end),
+        })
+        .collect()
+}
+
+fn cached_signature_refs_to_module(
+    public_signature_type_references: &[CachedPublicSignatureTypeReference],
+) -> Vec<crate::PublicSignatureTypeReference> {
+    public_signature_type_references
+        .iter()
+        .map(|reference| crate::PublicSignatureTypeReference {
+            export_name: reference.export_name.clone(),
+            type_name: reference.type_name.clone(),
+            span: Span::new(reference.span_start, reference.span_end),
+        })
+        .collect()
+}
+
+fn cached_namespace_aliases_to_module(
+    namespace_object_aliases: &[CachedNamespaceObjectAlias],
+) -> Vec<NamespaceObjectAlias> {
+    namespace_object_aliases
+        .iter()
+        .map(|alias| NamespaceObjectAlias {
+            via_export_name: alias.via_export_name.clone(),
+            suffix: alias.suffix.clone(),
+            namespace_local: alias.namespace_local.clone(),
+        })
+        .collect()
+}
+
+fn module_exports_to_cached(exports: &[crate::ExportInfo]) -> Vec<CachedExport> {
+    exports
+        .iter()
+        .map(|export| CachedExport {
+            name: match &export.name {
+                ExportName::Named(name) => name.clone(),
+                ExportName::Default => String::new(),
+            },
+            is_default: matches!(export.name, ExportName::Default),
+            is_type_only: export.is_type_only,
+            is_side_effect_used: export.is_side_effect_used,
+            visibility: export.visibility as u8,
+            expected_unused_reason: export.expected_unused_reason.clone(),
+            local_name: export.local_name.clone(),
+            span_start: export.span.start,
+            span_end: export.span.end,
+            members: export
+                .members
+                .iter()
+                .map(|member| CachedMember {
+                    name: member.name.clone(),
+                    kind: member.kind,
+                    span_start: member.span.start,
+                    span_end: member.span.end,
+                    has_decorator: member.has_decorator,
+                    decorator_names: member.decorator_names.clone(),
+                    is_instance_returning_static: member.is_instance_returning_static,
+                    is_self_returning: member.is_self_returning,
+                })
+                .collect(),
+            super_class: export.super_class.clone(),
+        })
+        .collect()
+}
+
+fn module_imports_to_cached(imports: &[crate::ImportInfo]) -> Vec<CachedImport> {
+    imports
+        .iter()
+        .map(|import| {
+            let (kind, imported_name) = match &import.imported_name {
+                crate::ImportedName::Named(name) => (IMPORT_KIND_NAMED, name.clone()),
+                crate::ImportedName::Default => (IMPORT_KIND_DEFAULT, String::new()),
+                crate::ImportedName::Namespace => (IMPORT_KIND_NAMESPACE, String::new()),
+                crate::ImportedName::SideEffect => (IMPORT_KIND_SIDE_EFFECT, String::new()),
+            };
+            CachedImport {
+                source: import.source.clone(),
+                imported_name,
+                local_name: import.local_name.clone(),
+                is_type_only: import.is_type_only,
+                is_type_only_star: import.is_type_only_star,
+                from_style: import.from_style,
+                kind,
+                span_start: import.span.start,
+                span_end: import.span.end,
+                source_span_start: import.source_span.start,
+                source_span_end: import.source_span.end,
+            }
+        })
+        .collect()
+}
+
+fn module_re_exports_to_cached(re_exports: &[crate::ReExportInfo]) -> Vec<CachedReExport> {
+    re_exports
+        .iter()
+        .map(|re_export| CachedReExport {
+            source: re_export.source.clone(),
+            imported_name: re_export.imported_name.clone(),
+            exported_name: re_export.exported_name.clone(),
+            is_type_only: re_export.is_type_only,
+            span_start: re_export.span.start,
+            span_end: re_export.span.end,
+            statement_span_start: re_export.statement_span.start,
+            statement_span_end: re_export.statement_span.end,
+            source_span_start: re_export.source_span.start,
+            source_span_end: re_export.source_span.end,
+        })
+        .collect()
+}
+
+fn module_dynamic_imports_to_cached(
+    dynamic_imports: &[crate::DynamicImportInfo],
+) -> Vec<CachedDynamicImport> {
+    dynamic_imports
+        .iter()
+        .map(|dynamic_import| CachedDynamicImport {
+            source: dynamic_import.source.clone(),
+            span_start: dynamic_import.span.start,
+            span_end: dynamic_import.span.end,
+            destructured_names: dynamic_import.destructured_names.clone(),
+            local_name: dynamic_import.local_name.clone(),
+            is_speculative: dynamic_import.is_speculative,
+        })
+        .collect()
+}
+
+fn module_require_calls_to_cached(
+    require_calls: &[crate::RequireCallInfo],
+) -> Vec<CachedRequireCall> {
+    require_calls
+        .iter()
+        .map(|require_call| CachedRequireCall {
+            source: require_call.source.clone(),
+            span_start: require_call.span.start,
+            span_end: require_call.span.end,
+            source_span_start: require_call.source_span.start,
+            source_span_end: require_call.source_span.end,
+            destructured_names: require_call.destructured_names.clone(),
+            local_name: require_call.local_name.clone(),
+            is_type_only: require_call.is_type_only,
+        })
+        .collect()
+}
+
+fn module_dynamic_patterns_to_cached(
+    dynamic_import_patterns: &[crate::DynamicImportPattern],
+) -> Vec<CachedDynamicImportPattern> {
+    dynamic_import_patterns
+        .iter()
+        .map(|pattern| CachedDynamicImportPattern {
+            prefix: pattern.prefix.clone(),
+            suffix: pattern.suffix.clone(),
+            span_start: pattern.span.start,
+            span_end: pattern.span.end,
+            mechanism: pattern.mechanism,
+        })
+        .collect()
+}
+
+fn module_suppressions_to_cached(
+    suppressions: &[crate::suppress::Suppression],
+) -> Vec<CachedSuppression> {
+    suppressions
+        .iter()
+        .map(|suppression| {
+            let (kind, policy_pack, policy_rule_id) = match &suppression.target {
+                None => (0, String::new(), String::new()),
+                Some(SuppressionTarget::Issue(kind)) => {
+                    (kind.to_discriminant(), String::new(), String::new())
+                }
+                Some(SuppressionTarget::PolicyRule(target)) => (
+                    crate::suppress::IssueKind::PolicyViolation.to_discriminant(),
+                    target.pack.clone(),
+                    target.rule_id.clone(),
+                ),
+            };
+            CachedSuppression {
+                line: suppression.line,
+                comment_line: suppression.comment_line,
+                kind,
+                policy_pack,
+                policy_rule_id,
+                reason: suppression.reason.clone(),
+            }
+        })
+        .collect()
+}
+
+fn module_unknown_suppressions_to_cached(
+    unknown_suppression_kinds: &[fallow_types::suppress::UnknownSuppressionKind],
+) -> Vec<CachedUnknownSuppressionKind> {
+    unknown_suppression_kinds
+        .iter()
+        .map(|unknown| CachedUnknownSuppressionKind {
+            comment_line: unknown.comment_line,
+            is_file_level: unknown.is_file_level,
+            token: unknown.token.clone(),
+            reason: unknown.reason.clone(),
+        })
+        .collect()
+}
+
+fn module_local_types_to_cached(
+    local_type_declarations: &[crate::LocalTypeDeclaration],
+) -> Vec<CachedLocalTypeDeclaration> {
+    local_type_declarations
+        .iter()
+        .map(|declaration| CachedLocalTypeDeclaration {
+            name: declaration.name.clone(),
+            span_start: declaration.span.start,
+            span_end: declaration.span.end,
+        })
+        .collect()
+}
+
+fn module_signature_refs_to_cached(
+    public_signature_type_references: &[crate::PublicSignatureTypeReference],
+) -> Vec<CachedPublicSignatureTypeReference> {
+    public_signature_type_references
+        .iter()
+        .map(|reference| CachedPublicSignatureTypeReference {
+            export_name: reference.export_name.clone(),
+            type_name: reference.type_name.clone(),
+            span_start: reference.span.start,
+            span_end: reference.span.end,
+        })
+        .collect()
+}
+
+fn module_namespace_aliases_to_cached(
+    namespace_object_aliases: &[NamespaceObjectAlias],
+) -> Vec<CachedNamespaceObjectAlias> {
+    namespace_object_aliases
+        .iter()
+        .map(|alias| CachedNamespaceObjectAlias {
+            via_export_name: alias.via_export_name.clone(),
+            suffix: alias.suffix.clone(),
+            namespace_local: alias.namespace_local.clone(),
+        })
+        .collect()
+}
+
+/// Rehydrate an optional cached slice into the shared `Arc<[T]>` module form.
+fn cached_opt_to_arc<T: Clone>(cached: Option<&[T]>) -> Arc<[T]> {
+    cached.map(Arc::from).unwrap_or_default()
+}
+
+/// Reconstruct a [`ModuleInfo`](crate::ModuleInfo) from a [`CachedModule`], skipping
+/// the per-function complexity vec when `need_complexity` is `false`. Avoids the
+/// `Vec<FunctionComplexity>` clone on warm runs of commands (e.g. `fallow dead-code`)
+/// that don't consume complexity, which adds up across tens of thousands of files.
+#[must_use]
+pub fn cached_to_module_opts(
+    cached: &CachedModule,
+    file_id: fallow_types::discover::FileId,
+    need_complexity: bool,
+) -> crate::ModuleInfo {
+    crate::ModuleInfo {
         file_id,
-        exports,
-        imports,
-        re_exports,
-        dynamic_imports,
-        dynamic_import_patterns,
-        require_calls,
-        member_accesses: cached.member_accesses.clone(),
-        whole_object_uses: cached.whole_object_uses.clone(),
+        exports: cached_exports_to_module(&cached.exports).into(),
+        imports: cached_imports_to_module(&cached.imports),
+        re_exports: cached_re_exports_to_module(&cached.re_exports),
+        dynamic_imports: cached_dynamic_imports_to_module(&cached.dynamic_imports),
+        dynamic_import_patterns: cached_dynamic_patterns_to_module(&cached.dynamic_import_patterns),
+        require_calls: cached_require_calls_to_module(&cached.require_calls),
+        package_path_references: cached.package_path_references.clone(),
+        member_accesses: cached.member_accesses.clone().into(),
+        semantic_facts: cached_opt_to_arc(cached.semantic_facts.as_deref()),
+        whole_object_uses: Arc::from(&*cached.whole_object_uses),
         has_cjs_exports: cached.has_cjs_exports,
+        has_angular_component_template_url: cached.has_angular_component_template_url,
         content_hash: cached.content_hash,
-        suppressions,
+        suppressions: cached_suppressions_to_module(&cached.suppressions),
+        unknown_suppression_kinds: cached_unknown_suppressions_to_module(
+            &cached.unknown_suppression_kinds,
+        ),
         unused_import_bindings: cached.unused_import_bindings.clone(),
         type_referenced_import_bindings: cached.type_referenced_import_bindings.clone(),
         value_referenced_import_bindings: cached.value_referenced_import_bindings.clone(),
         line_offsets: cached.line_offsets.clone(),
-        complexity: cached.complexity.clone(),
+        complexity: if need_complexity {
+            cached.complexity.clone()
+        } else {
+            Vec::new()
+        },
         flag_uses: cached.flag_uses.clone(),
         class_heritage: cached.class_heritage.clone(),
+        exported_factory_returns: cached_opt_to_arc(cached.exported_factory_returns.as_deref()),
+        exported_factory_return_object_shapes: cached_opt_to_arc(
+            cached.exported_factory_return_object_shapes.as_deref(),
+        ),
+        type_member_types: cached_opt_to_arc(cached.type_member_types.as_deref()),
+        injection_tokens: cached.injection_tokens.clone(),
+        local_type_declarations: cached_local_types_to_module(&cached.local_type_declarations),
+        public_signature_type_references: cached_signature_refs_to_module(
+            &cached.public_signature_type_references,
+        ),
+        namespace_object_aliases: cached_namespace_aliases_to_module(
+            &cached.namespace_object_aliases,
+        ),
+        iconify_prefixes: cached.iconify_prefixes.clone(),
+        iconify_icon_names: cached.iconify_icon_names.clone(),
+        auto_import_candidates: cached.auto_import_candidates.clone(),
+        directives: cached.directives.clone(),
+        client_only_dynamic_import_spans: cached.client_only_dynamic_import_spans.clone(),
+        security_sinks: cached.security_sinks.clone(),
+        security_sinks_skipped: cached.security_sinks_skipped,
+        security_unresolved_callee_sites: cached.security_unresolved_callee_sites.clone(),
+        tainted_bindings: cached.tainted_bindings.clone(),
+        sanitized_sink_args: cached.sanitized_sink_args.clone(),
+        security_control_sites: cached.security_control_sites.clone(),
+        callee_uses: cached.callee_uses.clone(),
+        misplaced_directives: cached.misplaced_directives.clone(),
+        inline_server_action_exports: cached.inline_server_action_exports.clone(),
+        di_key_sites: cached.di_key_sites.clone(),
+        has_dynamic_provide: cached.has_dynamic_provide,
+        // Derived in `release_resolution_payload` from `imports` + `unused_import_bindings`
+        // (both cached); never persisted, so the cache-load path leaves it empty.
+        referenced_import_bindings: Vec::new(),
+        component_props: cached.component_props.clone(),
+        has_props_attrs_fallthrough: cached.has_props_attrs_fallthrough,
+        has_define_expose: cached.has_define_expose,
+        has_define_model: cached.has_define_model,
+        has_unharvestable_props: cached.has_unharvestable_props,
+        component_emits: cached.component_emits.clone(),
+        angular_inputs: cached.angular_inputs.clone(),
+        angular_outputs: cached.angular_outputs.clone(),
+        angular_component_selectors: cached.angular_component_selectors.clone(),
+        registered_custom_elements: cached.registered_custom_elements.clone(),
+        used_custom_element_tags: cached.used_custom_element_tags.clone(),
+        angular_used_selectors: cached.angular_used_selectors.clone(),
+        angular_entry_component_refs: cached.angular_entry_component_refs.clone(),
+        has_dynamic_component_render: cached.has_dynamic_component_render,
+        has_unharvestable_emits: cached.has_unharvestable_emits,
+        has_dynamic_emit: cached.has_dynamic_emit,
+        has_emit_whole_object_use: cached.has_emit_whole_object_use,
+        load_return_keys: cached.load_return_keys.clone(),
+        has_unharvestable_load: cached.has_unharvestable_load,
+        has_load_data_whole_use: cached.has_load_data_whole_use,
+        // Derived in `release_resolution_payload` from `whole_object_uses`.
+        has_page_data_store_whole_use: false,
+        // Derived in `release_resolution_payload` from `whole_object_uses`.
+        has_route_loader_data_whole_use: false,
+        component_functions: cached.component_functions.clone(),
+        react_props: cached.react_props.clone(),
+        hook_uses: cached.hook_uses.clone(),
+        render_edges: cached.render_edges.clone(),
+        svelte_dispatched_events: cached.svelte_dispatched_events.clone(),
+        svelte_listened_events: cached.svelte_listened_events.clone(),
+        has_dynamic_dispatch: cached.has_dynamic_dispatch,
     }
 }
 
 /// Convert a [`ModuleInfo`](crate::ModuleInfo) to a [`CachedModule`] for storage.
 ///
-/// `mtime_secs` and `file_size` come from `std::fs::metadata()` at parse time
-/// and enable fast cache validation on subsequent runs (skip file read when
-/// mtime+size match).
+/// The [`SourceFingerprint`](fallow_types::source_fingerprint::SourceFingerprint)
+/// comes from `std::fs::metadata()` at parse time and enables fast cache
+/// validation on subsequent runs.
 #[must_use]
 pub fn module_to_cached(
     module: &crate::ModuleInfo,
-    mtime_secs: u64,
-    file_size: u64,
+    fingerprint: fallow_types::source_fingerprint::SourceFingerprint,
 ) -> CachedModule {
     CachedModule {
         content_hash: module.content_hash,
-        mtime_secs,
-        file_size,
-        exports: module
-            .exports
-            .iter()
-            .map(|e| CachedExport {
-                name: match &e.name {
-                    ExportName::Named(n) => n.clone(),
-                    ExportName::Default => String::new(),
-                },
-                is_default: matches!(e.name, ExportName::Default),
-                is_type_only: e.is_type_only,
-                visibility: e.visibility as u8,
-                local_name: e.local_name.clone(),
-                span_start: e.span.start,
-                span_end: e.span.end,
-                members: e
-                    .members
-                    .iter()
-                    .map(|m| CachedMember {
-                        name: m.name.clone(),
-                        kind: m.kind,
-                        span_start: m.span.start,
-                        span_end: m.span.end,
-                        has_decorator: m.has_decorator,
-                    })
-                    .collect(),
-                super_class: e.super_class.clone(),
-            })
-            .collect(),
-        imports: module
-            .imports
-            .iter()
-            .map(|i| {
-                let (kind, imported_name) = match &i.imported_name {
-                    crate::ImportedName::Named(n) => (IMPORT_KIND_NAMED, n.clone()),
-                    crate::ImportedName::Default => (IMPORT_KIND_DEFAULT, String::new()),
-                    crate::ImportedName::Namespace => (IMPORT_KIND_NAMESPACE, String::new()),
-                    crate::ImportedName::SideEffect => (IMPORT_KIND_SIDE_EFFECT, String::new()),
-                };
-                CachedImport {
-                    source: i.source.clone(),
-                    imported_name,
-                    local_name: i.local_name.clone(),
-                    is_type_only: i.is_type_only,
-                    kind,
-                    span_start: i.span.start,
-                    span_end: i.span.end,
-                    source_span_start: i.source_span.start,
-                    source_span_end: i.source_span.end,
-                }
-            })
-            .collect(),
-        re_exports: module
-            .re_exports
-            .iter()
-            .map(|r| CachedReExport {
-                source: r.source.clone(),
-                imported_name: r.imported_name.clone(),
-                exported_name: r.exported_name.clone(),
-                is_type_only: r.is_type_only,
-                span_start: r.span.start,
-                span_end: r.span.end,
-            })
-            .collect(),
-        dynamic_imports: module
-            .dynamic_imports
-            .iter()
-            .map(|d| CachedDynamicImport {
-                source: d.source.clone(),
-                span_start: d.span.start,
-                span_end: d.span.end,
-                destructured_names: d.destructured_names.clone(),
-                local_name: d.local_name.clone(),
-            })
-            .collect(),
-        require_calls: module
-            .require_calls
-            .iter()
-            .map(|r| CachedRequireCall {
-                source: r.source.clone(),
-                span_start: r.span.start,
-                span_end: r.span.end,
-                destructured_names: r.destructured_names.clone(),
-                local_name: r.local_name.clone(),
-            })
-            .collect(),
-        member_accesses: module.member_accesses.clone(),
-        whole_object_uses: module.whole_object_uses.clone(),
-        dynamic_import_patterns: module
-            .dynamic_import_patterns
-            .iter()
-            .map(|p| CachedDynamicImportPattern {
-                prefix: p.prefix.clone(),
-                suffix: p.suffix.clone(),
-                span_start: p.span.start,
-                span_end: p.span.end,
-            })
-            .collect(),
+        mtime_ns: fingerprint.mtime_ns,
+        file_size: fingerprint.file_size,
+        last_access_secs: current_unix_seconds(),
+        exports: module_exports_to_cached(&module.exports),
+        imports: module_imports_to_cached(&module.imports),
+        re_exports: module_re_exports_to_cached(&module.re_exports),
+        dynamic_imports: module_dynamic_imports_to_cached(&module.dynamic_imports),
+        require_calls: module_require_calls_to_cached(&module.require_calls),
+        package_path_references: module.package_path_references.clone(),
+        member_accesses: module.member_accesses.to_vec(),
+        semantic_facts: (!module.semantic_facts.is_empty())
+            .then(|| Box::from(&*module.semantic_facts)),
+        whole_object_uses: Box::from(&*module.whole_object_uses),
+        dynamic_import_patterns: module_dynamic_patterns_to_cached(&module.dynamic_import_patterns),
         has_cjs_exports: module.has_cjs_exports,
+        has_angular_component_template_url: module.has_angular_component_template_url,
         unused_import_bindings: module.unused_import_bindings.clone(),
         type_referenced_import_bindings: module.type_referenced_import_bindings.clone(),
         value_referenced_import_bindings: module.value_referenced_import_bindings.clone(),
-        suppressions: module
-            .suppressions
-            .iter()
-            .map(|s| CachedSuppression {
-                line: s.line,
-                comment_line: s.comment_line,
-                kind: s
-                    .kind
-                    .map_or(0, crate::suppress::IssueKind::to_discriminant),
-            })
-            .collect(),
+        suppressions: module_suppressions_to_cached(&module.suppressions),
+        unknown_suppression_kinds: module_unknown_suppressions_to_cached(
+            &module.unknown_suppression_kinds,
+        ),
         line_offsets: module.line_offsets.clone(),
         complexity: module.complexity.clone(),
         flag_uses: module.flag_uses.clone(),
         class_heritage: module.class_heritage.clone(),
+        exported_factory_returns: (!module.exported_factory_returns.is_empty())
+            .then(|| Box::from(&*module.exported_factory_returns)),
+        exported_factory_return_object_shapes: (!module
+            .exported_factory_return_object_shapes
+            .is_empty())
+        .then(|| Box::from(&*module.exported_factory_return_object_shapes)),
+        type_member_types: (!module.type_member_types.is_empty())
+            .then(|| Box::from(&*module.type_member_types)),
+        injection_tokens: module.injection_tokens.clone(),
+        local_type_declarations: module_local_types_to_cached(&module.local_type_declarations),
+        public_signature_type_references: module_signature_refs_to_cached(
+            &module.public_signature_type_references,
+        ),
+        namespace_object_aliases: module_namespace_aliases_to_cached(
+            &module.namespace_object_aliases,
+        ),
+        iconify_prefixes: module.iconify_prefixes.clone(),
+        iconify_icon_names: module.iconify_icon_names.clone(),
+        auto_import_candidates: module.auto_import_candidates.clone(),
+        directives: module.directives.clone(),
+        client_only_dynamic_import_spans: module.client_only_dynamic_import_spans.clone(),
+        security_sinks: module.security_sinks.clone(),
+        security_sinks_skipped: module.security_sinks_skipped,
+        security_unresolved_callee_sites: module.security_unresolved_callee_sites.clone(),
+        tainted_bindings: module.tainted_bindings.clone(),
+        sanitized_sink_args: module.sanitized_sink_args.clone(),
+        security_control_sites: module.security_control_sites.clone(),
+        callee_uses: module.callee_uses.clone(),
+        misplaced_directives: module.misplaced_directives.clone(),
+        inline_server_action_exports: module.inline_server_action_exports.clone(),
+        di_key_sites: module.di_key_sites.clone(),
+        has_dynamic_provide: module.has_dynamic_provide,
+        component_props: module.component_props.clone(),
+        has_props_attrs_fallthrough: module.has_props_attrs_fallthrough,
+        has_define_expose: module.has_define_expose,
+        has_define_model: module.has_define_model,
+        has_unharvestable_props: module.has_unharvestable_props,
+        component_emits: module.component_emits.clone(),
+        angular_inputs: module.angular_inputs.clone(),
+        angular_outputs: module.angular_outputs.clone(),
+        angular_component_selectors: module.angular_component_selectors.clone(),
+        registered_custom_elements: module.registered_custom_elements.clone(),
+        used_custom_element_tags: module.used_custom_element_tags.clone(),
+        angular_used_selectors: module.angular_used_selectors.clone(),
+        angular_entry_component_refs: module.angular_entry_component_refs.clone(),
+        has_dynamic_component_render: module.has_dynamic_component_render,
+        has_unharvestable_emits: module.has_unharvestable_emits,
+        has_dynamic_emit: module.has_dynamic_emit,
+        has_emit_whole_object_use: module.has_emit_whole_object_use,
+        load_return_keys: module.load_return_keys.clone(),
+        has_unharvestable_load: module.has_unharvestable_load,
+        has_load_data_whole_use: module.has_load_data_whole_use,
+        component_functions: module.component_functions.clone(),
+        react_props: module.react_props.clone(),
+        hook_uses: module.hook_uses.clone(),
+        render_edges: module.render_edges.clone(),
+        svelte_dispatched_events: module.svelte_dispatched_events.clone(),
+        svelte_listened_events: module.svelte_listened_events.clone(),
+        has_dynamic_dispatch: module.has_dynamic_dispatch,
     }
+}
+
+/// Convert a module to a cache entry from explicit source-fingerprint parts.
+///
+/// Kept for tests that need literal invalidation inputs without filesystem
+/// metadata.
+#[cfg(test)]
+#[must_use]
+pub fn module_to_cached_from_parts(
+    module: &crate::ModuleInfo,
+    mtime_ns: u64,
+    file_size: u64,
+) -> CachedModule {
+    module_to_cached(
+        module,
+        fallow_types::source_fingerprint::SourceFingerprint::new(mtime_ns, file_size),
+    )
 }

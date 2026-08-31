@@ -4,16 +4,16 @@ def metric_delta(name):
   (.health_trend.metrics // []) | map(select(.name == name)) | first // null;
 def suppression_docs: "https://docs.fallow.tools/configuration/suppression";
 def complexity_findings: (.findings // []);
-def production_findings: (.production_coverage.findings // []);
-def production_hot_paths: (.production_coverage.hot_paths // []);
-def production_summary: (.production_coverage.summary // {});
+def production_findings: (.runtime_coverage.findings // []);
+def production_hot_paths: (.runtime_coverage.hot_paths // []);
+def production_summary: (.runtime_coverage.summary // {});
 def prod_phrase(complex; prod):
   if complex > 0 and prod > 0 then
-    "\(complex) complexity finding\(if complex == 1 then "" else "s" end) and \(prod) production coverage finding\(if prod == 1 then "" else "s" end)"
+    "\(complex) complexity finding\(if complex == 1 then "" else "s" end) and \(prod) runtime coverage finding\(if prod == 1 then "" else "s" end)"
   elif complex > 0 then
     "\(complex) complexity finding\(if complex == 1 then "" else "s" end)"
   else
-    "\(prod) production coverage finding\(if prod == 1 then "" else "s" end)"
+    "\(prod) runtime coverage finding\(if prod == 1 then "" else "s" end)"
   end;
 
 (complexity_findings | length) as $complex |
@@ -51,7 +51,7 @@ if $prod == 0 and $hot == 0 then
       "| `\(.path):\(.line)` | `\(.name)` | \(.severity // "moderate") | \(.cyclomatic)\(if (.exceeded // "") | test("cyclomatic|both|all") then " **!**" else "" end) | \(.cognitive)\(if (.exceeded // "") | test("cognitive|both|all") then " **!**" else "" end) | \(if .crap == null then "-" else (.crap | tostring) + (if (.exceeded // "") | test("crap|all") then " **!**" else "" end) end) | \(.line_count) |"
     ] | join("\n")) +
     (if $complex > 25 then "\n\n> \($complex - 25) more \u2014 run `fallow health` locally for the full list" else "" end) +
-    "\n\n**\(.summary.files_analyzed)** files, **\(.summary.functions_analyzed)** functions analyzed (thresholds: cyclomatic > \(.summary.max_cyclomatic_threshold), cognitive > \(.summary.max_cognitive_threshold), CRAP >= \(.summary.max_crap_threshold // 30))"
+    "\n\n**!** marks the dimension that breached.\n\n**\(.summary.files_analyzed)** files, **\(.summary.functions_analyzed)** functions analyzed (thresholds: cyclomatic > \(.summary.max_cyclomatic_threshold), cognitive > \(.summary.max_cognitive_threshold), CRAP >= \(.summary.max_crap_threshold // 30))"
   end
 else
   "## Fallow \u2014 Health\n\n" +
@@ -70,12 +70,12 @@ else
   else "" end) +
   (if $prod > 0 then
     (if $complex > 0 then "\n\n" else "" end) +
-    "### Production Coverage\n\n" +
+    "### Runtime Coverage\n\n" +
     "| File | Function | Verdict | Invocations | Confidence |\n|:-----|:---------|:--------|------------:|:-----------|\n" +
     ([production_findings[:25][] |
       "| `\(.path):\(.line)` | `\(.function)` | `\(.verdict)` | \(if .invocations == null then "\u2014" else (.invocations | tostring) end) | \(.confidence) |"
     ] | join("\n")) +
-    (if $prod > 25 then "\n\n> \($prod - 25) more production coverage findings \u2014 run `fallow health` locally for the full list" else "" end)
+    (if $prod > 25 then "\n\n> \($prod - 25) more runtime coverage findings \u2014 run `fallow health` locally for the full list" else "" end)
   else "" end) +
   (if $hot > 0 then
     (if $complex > 0 or $prod > 0 then "\n\n" else "" end) +
@@ -87,10 +87,10 @@ else
     (if $hot > 10 then "\n\n> \($hot - 10) more hot paths in the full report" else "" end)
   else "" end) +
   (if $complex > 0 then
-    "\n\n**\(.summary.files_analyzed)** files, **\(.summary.functions_analyzed)** functions analyzed (thresholds: cyclomatic > \(.summary.max_cyclomatic_threshold), cognitive > \(.summary.max_cognitive_threshold), CRAP >= \(.summary.max_crap_threshold // 30))"
+    "\n\n**!** marks the dimension that breached.\n\n**\(.summary.files_analyzed)** files, **\(.summary.functions_analyzed)** functions analyzed (thresholds: cyclomatic > \(.summary.max_cyclomatic_threshold), cognitive > \(.summary.max_cognitive_threshold), CRAP >= \(.summary.max_crap_threshold // 30))"
   elif $prod > 0 then
     "\n\n**\(production_summary.functions_tracked // 0)** tracked functions, **\(production_summary.functions_hit // 0)** hit, **\(production_summary.functions_unhit // 0)** unhit, **\(production_summary.functions_untracked // 0)** untracked"
   else
-    "\n\nObserved **\($hot)** hot path\(if $hot == 1 then "" else "s" end) in production coverage."
+    "\n\nObserved **\($hot)** hot path\(if $hot == 1 then "" else "s" end) in runtime coverage."
   end)
 end

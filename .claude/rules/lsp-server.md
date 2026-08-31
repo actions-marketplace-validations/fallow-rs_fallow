@@ -3,11 +3,12 @@ paths:
   - "crates/lsp/**"
 ---
 
-# fallow-lsp crate
+# LSP constraints
 
-Key modules:
-- `main.rs` — LSP server setup, `LanguageServer` trait impl, event handling
-- `diagnostics/` — Diagnostic generation: `mod.rs` (dispatch), `unused.rs`, `structural.rs`, `quality.rs`
-- `code_actions.rs` — Quick-fix and refactor code actions
-- `code_lens.rs` — Reference count Code Lens above export declarations
-- `hover.rs` — Hover information showing export usage, unused status, and duplicate block locations
+- Read `docs/reference/lsp-internals.md` for the affected protocol surface.
+- Preserve diagnostic URI, range, message, code, and related-information
+  identity across publication and code actions.
+- Resolve project-relative paths against the workspace root.
+- Keep push, pull, refresh, workspace-root selection, and single-root analysis
+  equivalent.
+- Verify with protocol-level and editor-facing tests.

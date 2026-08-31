@@ -1,0 +1,9 @@
+{
+  "name": "security-unsafe-deserialization-fixture",
+  "version": "0.0.0",
+  "private": true,
+  "dependencies": {
+    "js-yaml": "4.1.0",
+    "node-serialize": "0.0.4"
+  }
+}

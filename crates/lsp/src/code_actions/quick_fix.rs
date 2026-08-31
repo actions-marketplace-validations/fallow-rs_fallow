@@ -6,13 +6,199 @@ use std::collections::HashMap;
 use std::path::Path;
 
 #[allow(clippy::wildcard_imports, reason = "many LSP types used")]
-use tower_lsp::lsp_types::*;
+use ls_types::*;
 
-use fallow_core::results::AnalysisResults;
+use fallow_api::EditorAnalysisResults as AnalysisResults;
 
 use crate::diagnostics::FIRST_LINE_RANGE;
+use crate::position::PositionMapper;
+
+const PNPM_WORKSPACE_FILE: &str = "pnpm-workspace.yaml";
+
+/// Return true if `c` is a JS / TS identifier character.
+///
+/// Covers the ASCII identifier set (`[A-Za-z0-9_$]`) plus the non-ASCII
+/// alphabetic / numeric code points that JS allows in identifier names
+/// (CJK ideographs, Cyrillic, Arabic, etc.). `char::is_alphanumeric` is a
+/// strong approximation of the spec's `XID_Start` / `XID_Continue` for
+/// the purposes of bounded identifier matching: comparing a candidate
+/// identifier to the cached export name remains byte-equality, so the
+/// match still distinguishes `日本` from `日本語`.
+fn is_ident_char(c: char) -> bool {
+    matches!(c, 'A'..='Z' | 'a'..='z' | '0'..='9' | '_' | '$')
+        || (!c.is_ascii() && c.is_alphanumeric())
+}
+
+/// Extract the leading identifier from `s`. Returns the prefix of `s`
+/// containing identifier characters (empty if `s` does not start with an
+/// identifier character).
+fn leading_identifier(s: &str) -> &str {
+    let end = s
+        .char_indices()
+        .find(|(_, c)| !is_ident_char(*c))
+        .map_or(s.len(), |(i, _)| i);
+    &s[..end]
+}
+
+/// Iteratively strip leading declaration and modifier keywords (each
+/// followed by whitespace) from `s`. After this returns, `s` should begin
+/// with the declared identifier in well-formed source.
+///
+/// The set of keywords stripped covers the prefix shape of every named
+/// `export <decl>` form fallow's analyzer reports as an unused export:
+/// `const`, `let`, `var`, `function`, `function*`, `class`, `type`,
+/// `interface`, `enum`, `namespace`, plus the modifier keywords `async`,
+/// `abstract`, and `declare`. Anything beyond this prefix is the identifier
+/// (or its parse-truncated leading bytes).
+fn strip_declaration_keywords(s: &str) -> &str {
+    const KEYWORDS: &[&str] = &[
+        "async ",
+        "abstract ",
+        "declare ",
+        "const ",
+        "let ",
+        "var ",
+        "function* ",
+        "function ",
+        "class ",
+        "type ",
+        "interface ",
+        "enum ",
+        "namespace ",
+    ];
+    let mut cur = s.trim_start();
+    loop {
+        let mut changed = false;
+        for keyword in KEYWORDS {
+            if let Some(rest) = cur.strip_prefix(keyword) {
+                cur = rest.trim_start();
+                changed = true;
+                break;
+            }
+        }
+        if !changed {
+            return cur;
+        }
+    }
+}
+
+/// Verify the live document line at `line_content` actually declares
+/// `expected_name` as a top-level export after the `prefix` is stripped.
+///
+/// This is the load-bearing re-validation for `build_remove_export_actions`.
+/// A weaker "identifier appears anywhere on the line" check would still
+/// accept lines like `export const bar = foo;` for a cached finding on
+/// `foo`, silently producing an edit that strips `export ` from `bar`.
+/// The declaration-shape check rejects that: after stripping `export `
+/// and the `const ` keyword, the leading identifier is `bar`, not `foo`.
+///
+/// Returns `false` for re-export forms (`export { ... }` / `export { ... }
+/// from ...;`). The existing `remove unused export` action does not
+/// produce a valid edit for those shapes (removing `export ` from
+/// `export { foo };` leaves a `{ foo };` block-expression statement), so
+/// the conservative outcome is to suppress the action entirely until the
+/// re-export path gets its own dedicated handler.
+fn declares_export_name(line_content: &str, prefix: &str, expected_name: &str) -> bool {
+    if expected_name.is_empty() {
+        return false;
+    }
+    let trimmed = line_content.trim_start();
+    let Some(after_prefix) = trimmed.strip_prefix(prefix) else {
+        return false;
+    };
+    let after_prefix = after_prefix.trim_start();
+
+    if after_prefix.starts_with('{') {
+        return false;
+    }
+
+    let after_keywords = strip_declaration_keywords(after_prefix);
+    leading_identifier(after_keywords) == expected_name
+}
+
+/// Typed input for unused export quick-fix code actions.
+#[derive(Clone, Copy)]
+pub struct RemoveExportActionInput<'a> {
+    pub results: &'a AnalysisResults,
+    pub file_path: &'a Path,
+    pub uri: &'a Uri,
+    pub cursor_range: &'a Range,
+    pub file_lines: &'a [&'a str],
+}
+
+impl<'a> RemoveExportActionInput<'a> {
+    #[must_use]
+    pub const fn new(
+        results: &'a AnalysisResults,
+        file_path: &'a Path,
+        uri: &'a Uri,
+        cursor_range: &'a Range,
+        file_lines: &'a [&'a str],
+    ) -> Self {
+        Self {
+            results,
+            file_path,
+            uri,
+            cursor_range,
+            file_lines,
+        }
+    }
+}
 
 /// Build quick-fix code actions for unused exports (remove the `export` keyword).
+pub fn build_remove_export_actions(input: RemoveExportActionInput<'_>) -> Vec<CodeActionOrCommand> {
+    let RemoveExportActionInput {
+        results,
+        file_path,
+        uri,
+        cursor_range,
+        file_lines,
+    } = input;
+    let mut actions = Vec::new();
+
+    let exports_iter = results.unused_exports.iter().map(|f| &f.export);
+    let types_iter = results.unused_types.iter().map(|f| &f.export);
+    for (exports, msg_prefix) in [
+        (
+            Box::new(exports_iter)
+                as Box<dyn Iterator<Item = &fallow_api::editor_results::UnusedExport>>,
+            "Export",
+        ),
+        (
+            Box::new(types_iter)
+                as Box<dyn Iterator<Item = &fallow_api::editor_results::UnusedExport>>,
+            "Type export",
+        ),
+    ] {
+        for export in exports {
+            if let Some(action) =
+                remove_export_action(export, msg_prefix, file_path, uri, cursor_range, file_lines)
+            {
+                actions.push(action);
+            }
+        }
+    }
+
+    actions
+}
+
+#[cfg(test)]
+fn build_remove_export_actions_for_test(
+    results: &AnalysisResults,
+    file_path: &Path,
+    uri: &Uri,
+    cursor_range: &Range,
+    file_lines: &[&str],
+) -> Vec<CodeActionOrCommand> {
+    build_remove_export_actions(RemoveExportActionInput::new(
+        results,
+        file_path,
+        uri,
+        cursor_range,
+        file_lines,
+    ))
+}
+
 #[expect(
     clippy::disallowed_types,
     reason = "serde JSON deserialization produces std HashMap"
@@ -21,119 +207,752 @@ use crate::diagnostics::FIRST_LINE_RANGE;
     clippy::cast_possible_truncation,
     reason = "identifier/indent lengths are bounded by source size"
 )]
-pub fn build_remove_export_actions(
-    results: &AnalysisResults,
+fn remove_export_action(
+    export: &fallow_api::editor_results::UnusedExport,
+    msg_prefix: &str,
     file_path: &Path,
-    uri: &Url,
+    uri: &Uri,
     cursor_range: &Range,
     file_lines: &[&str],
+) -> Option<CodeActionOrCommand> {
+    let (export_line, indent_utf16, prefix) =
+        remove_export_span(export, file_path, cursor_range, file_lines)?;
+    let mut changes = HashMap::new();
+    changes.insert(
+        uri.clone(),
+        vec![TextEdit {
+            range: Range {
+                start: Position {
+                    line: export_line,
+                    character: indent_utf16 as u32,
+                },
+                end: Position {
+                    line: export_line,
+                    // `prefix` is static ASCII, so its byte length equals
+                    // its UTF-16 width.
+                    character: (indent_utf16 + prefix.len()) as u32,
+                },
+            },
+            new_text: String::new(),
+        }],
+    );
+
+    let mut position_mapper = PositionMapper::default();
+    Some(CodeActionOrCommand::CodeAction(CodeAction {
+        title: format!("Remove unused export `{}`", export.export_name),
+        kind: Some(CodeActionKind::QUICKFIX),
+        edit: Some(WorkspaceEdit {
+            changes: Some(changes),
+            ..Default::default()
+        }),
+        diagnostics: Some(vec![remove_export_diagnostic(
+            export,
+            msg_prefix,
+            export_line,
+            &mut position_mapper,
+        )]),
+        ..Default::default()
+    }))
+}
+
+/// Locate the removable `export ` / `export default ` prefix for a cached
+/// unused-export finding. Returns `(line, indent_utf16, prefix)` where
+/// `indent_utf16` is the leading-whitespace width in UTF-16 code units
+/// (the unit LSP `character` positions use).
+fn remove_export_span(
+    export: &fallow_api::editor_results::UnusedExport,
+    file_path: &Path,
+    cursor_range: &Range,
+    file_lines: &[&str],
+) -> Option<(u32, usize, &'static str)> {
+    if export.path != file_path {
+        return None;
+    }
+    let export_line = export.line.saturating_sub(1);
+    if export_line < cursor_range.start.line || export_line > cursor_range.end.line {
+        return None;
+    }
+
+    let line_content = file_lines.get(export_line as usize).copied().unwrap_or("");
+    let trimmed = line_content.trim_start();
+    let indent_bytes = line_content.len() - trimmed.len();
+    // Byte length diverges from UTF-16 width for non-ASCII whitespace
+    // (U+00A0, U+3000), which would desync the destructive edit range.
+    let indent_utf16 = line_content[..indent_bytes].encode_utf16().count();
+    let prefix = export_prefix_to_remove(trimmed)?;
+    if prefix != "export default "
+        && !declares_export_name(line_content, prefix, &export.export_name)
+    {
+        return None;
+    }
+    Some((export_line, indent_utf16, prefix))
+}
+
+fn export_prefix_to_remove(trimmed: &str) -> Option<&'static str> {
+    if trimmed.starts_with("export default ") {
+        Some("export default ")
+    } else if trimmed.starts_with("export ") {
+        Some("export ")
+    } else {
+        None
+    }
+}
+
+fn remove_export_diagnostic(
+    export: &fallow_api::editor_results::UnusedExport,
+    msg_prefix: &str,
+    export_line: u32,
+    mapper: &mut PositionMapper,
+) -> Diagnostic {
+    let (start, end) =
+        mapper.utf16_col_span(&export.path, export_line, export.col, &export.export_name);
+    Diagnostic {
+        range: Range {
+            start: Position {
+                line: export_line,
+                character: start,
+            },
+            end: Position {
+                line: export_line,
+                character: end,
+            },
+        },
+        severity: Some(DiagnosticSeverity::HINT),
+        source: Some("fallow".to_string()),
+        message: format!("{msg_prefix} '{}' is unused", export.export_name),
+        tags: Some(vec![DiagnosticTag::UNNECESSARY]),
+        ..Default::default()
+    }
+}
+
+/// Build quick-fix code actions for unused pnpm catalog entries
+/// (delete the line range from `pnpm-workspace.yaml`).
+///
+/// Only emits an action when the finding's `hardcoded_consumers` list is
+/// empty. Workspace packages that still pin a hardcoded version would
+/// break on the next `pnpm install` if the catalog entry were removed,
+/// so the user must migrate consumers to the `catalog:` protocol first.
+///
+/// The LSP diagnostic carries only the entry's start line, not the end.
+/// The deletion range is computed from the YAML source on disk by
+/// scanning forward for lines whose indent is strictly greater than the
+/// entry line's indent (covers object-form entries such as
+/// `react:\n    specifier: ^18.2.0`).
+///
+/// The `root` input field is required because `UnusedCatalogEntry.path` is
+/// stored project-root-relative; `Uri::from_file_path` would silently
+/// reject the relative path and the action would never appear.
+///
+/// `file_lines` is the caller-supplied content of `pnpm-workspace.yaml`
+/// (in-memory document text when available, otherwise on-disk content).
+/// Passing the buffer in mirrors `build_remove_export_actions` and keeps
+/// the deletion range consistent with what the user actually sees in
+/// their editor, even when there are unsaved edits to the YAML file.
+/// Empty `file_lines` short-circuits the function with no actions.
+#[derive(Clone, Copy)]
+pub struct CatalogEntryActionInput<'a> {
+    pub results: &'a AnalysisResults,
+    pub root: &'a Path,
+    pub uri: &'a Uri,
+    pub cursor_range: &'a Range,
+    pub file_lines: &'a [&'a str],
+}
+
+impl<'a> CatalogEntryActionInput<'a> {
+    #[must_use]
+    pub const fn new(
+        results: &'a AnalysisResults,
+        root: &'a Path,
+        uri: &'a Uri,
+        cursor_range: &'a Range,
+        file_lines: &'a [&'a str],
+    ) -> Self {
+        Self {
+            results,
+            root,
+            uri,
+            cursor_range,
+            file_lines,
+        }
+    }
+}
+
+pub fn build_remove_catalog_entry_actions(
+    input: CatalogEntryActionInput<'_>,
 ) -> Vec<CodeActionOrCommand> {
+    let CatalogEntryActionInput {
+        results,
+        root,
+        uri,
+        cursor_range,
+        file_lines,
+    } = input;
     let mut actions = Vec::new();
 
-    for (exports, msg_prefix) in [
-        (&results.unused_exports, "Export"),
-        (&results.unused_types, "Type export"),
-    ] {
-        for export in exports {
-            if export.path != file_path {
-                continue;
-            }
+    if file_lines.is_empty() {
+        return actions;
+    }
 
-            // export.line is a 1-based line number; convert to 0-based for LSP
-            let export_line = export.line.saturating_sub(1);
-
-            // Check if this diagnostic is in the requested range
-            if export_line < cursor_range.start.line || export_line > cursor_range.end.line {
-                continue;
-            }
-
-            // Determine the export prefix to remove by inspecting the line content
-            let line_content = file_lines.get(export_line as usize).copied().unwrap_or("");
-            let trimmed = line_content.trim_start();
-            let indent_len = line_content.len() - trimmed.len();
-
-            let prefix_to_remove = if trimmed.starts_with("export default ") {
-                Some("export default ")
-            } else if trimmed.starts_with("export ") {
-                // Handles: export const, export function, export class, export type,
-                // export interface, export enum, export abstract, export async,
-                // export let, export var, etc.
-                Some("export ")
-            } else {
-                None
-            };
-
-            let Some(prefix) = prefix_to_remove else {
-                continue;
-            };
-
-            let title = format!("Remove unused export `{}`", export.export_name);
-            let mut changes = HashMap::new();
-
-            // Create a text edit that removes the export keyword prefix
-            let edit = TextEdit {
-                range: Range {
-                    start: Position {
-                        line: export_line,
-                        character: indent_len as u32,
-                    },
-                    end: Position {
-                        line: export_line,
-                        character: (indent_len + prefix.len()) as u32,
-                    },
-                },
-                new_text: String::new(),
-            };
-
-            changes.insert(uri.clone(), vec![edit]);
-
-            actions.push(CodeActionOrCommand::CodeAction(CodeAction {
-                title,
-                kind: Some(CodeActionKind::QUICKFIX),
-                edit: Some(WorkspaceEdit {
-                    changes: Some(changes),
-                    ..Default::default()
-                }),
-                diagnostics: Some(vec![Diagnostic {
-                    range: Range {
-                        start: Position {
-                            line: export_line,
-                            character: export.col,
-                        },
-                        end: Position {
-                            line: export_line,
-                            character: export.col + export.export_name.len() as u32,
-                        },
-                    },
-                    severity: Some(DiagnosticSeverity::HINT),
-                    source: Some("fallow".to_string()),
-                    message: format!("{msg_prefix} '{}' is unused", export.export_name),
-                    tags: Some(vec![DiagnosticTag::UNNECESSARY]),
-                    ..Default::default()
-                }]),
-                ..Default::default()
-            }));
-        }
+    for entry in &results.unused_catalog_entries {
+        let entry = &entry.entry;
+        let Some((entry_line, start_idx, end_idx)) =
+            catalog_entry_delete_span(entry, root, uri, cursor_range, file_lines)
+        else {
+            continue;
+        };
+        actions.push(remove_catalog_entry_action(
+            entry, uri, file_lines, entry_line, start_idx, end_idx,
+        ));
     }
 
     actions
 }
 
-/// Build quick-fix code actions for unused files (delete the file).
-pub fn build_delete_file_actions(
+#[cfg(test)]
+fn build_remove_catalog_entry_actions_for_test(
     results: &AnalysisResults,
-    file_path: &Path,
-    uri: &Url,
+    root: &Path,
+    uri: &Uri,
     cursor_range: &Range,
+    file_lines: &[&str],
 ) -> Vec<CodeActionOrCommand> {
+    build_remove_catalog_entry_actions(CatalogEntryActionInput::new(
+        results,
+        root,
+        uri,
+        cursor_range,
+        file_lines,
+    ))
+}
+
+fn catalog_entry_delete_span(
+    entry: &fallow_api::editor_results::UnusedCatalogEntry,
+    root: &Path,
+    uri: &Uri,
+    cursor_range: &Range,
+    file_lines: &[&str],
+) -> Option<(u32, usize, usize)> {
+    if !entry.hardcoded_consumers.is_empty() {
+        return None;
+    }
+    if !is_pnpm_catalog_source(&entry.path) {
+        return None;
+    }
+
+    let entry_uri = Uri::from_file_path(root.join(&entry.path))?;
+    if entry_uri != *uri {
+        return None;
+    }
+
+    let entry_line = entry.line.saturating_sub(1);
+    if entry_line < cursor_range.start.line || entry_line > cursor_range.end.line {
+        return None;
+    }
+
+    let start_idx = entry_line as usize;
+    if start_idx >= file_lines.len() {
+        return None;
+    }
+    if !line_matches_catalog_key(file_lines[start_idx], &entry.entry_name) {
+        return None;
+    }
+
+    Some((
+        entry_line,
+        start_idx,
+        compute_catalog_deletion_end(file_lines, start_idx),
+    ))
+}
+
+#[expect(
+    clippy::disallowed_types,
+    reason = "WorkspaceEdit.changes is typed as std::collections::HashMap by ls-types"
+)]
+fn remove_catalog_entry_action(
+    entry: &fallow_api::editor_results::UnusedCatalogEntry,
+    uri: &Uri,
+    file_lines: &[&str],
+    entry_line: u32,
+    start_idx: usize,
+    end_idx: usize,
+) -> CodeActionOrCommand {
+    let title = catalog_entry_action_title(entry);
+    let mut changes = HashMap::new();
+    let mut edits = vec![TextEdit {
+        range: Range {
+            start: Position {
+                line: start_idx as u32,
+                character: 0,
+            },
+            end: Position {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "line index is bounded by source size"
+                )]
+                line: end_idx as u32,
+                character: 0,
+            },
+        },
+        new_text: String::new(),
+    }];
+
+    if let Some(parent_edit) =
+        build_parent_rewrite_edit(file_lines, start_idx, end_idx, &entry.catalog_name)
+    {
+        edits.push(parent_edit);
+    }
+    changes.insert(uri.clone(), edits);
+
+    CodeActionOrCommand::CodeAction(CodeAction {
+        title,
+        kind: Some(CodeActionKind::QUICKFIX),
+        edit: Some(WorkspaceEdit {
+            changes: Some(changes),
+            ..Default::default()
+        }),
+        diagnostics: Some(vec![catalog_entry_diagnostic(entry, entry_line)]),
+        ..Default::default()
+    })
+}
+
+/// Build the `unused-catalog-entry` diagnostic linked to the removal action.
+fn catalog_entry_diagnostic(
+    entry: &fallow_api::editor_results::UnusedCatalogEntry,
+    entry_line: u32,
+) -> Diagnostic {
+    Diagnostic {
+        range: Range {
+            start: Position {
+                line: entry_line,
+                character: 0,
+            },
+            end: Position {
+                line: entry_line,
+                character: u32::MAX,
+            },
+        },
+        severity: Some(DiagnosticSeverity::WARNING),
+        source: Some("fallow".to_string()),
+        code: Some(NumberOrString::String("unused-catalog-entry".to_string())),
+        message: catalog_entry_diagnostic_message(entry),
+        tags: Some(vec![DiagnosticTag::UNNECESSARY]),
+        ..Default::default()
+    }
+}
+
+fn catalog_entry_action_title(entry: &fallow_api::editor_results::UnusedCatalogEntry) -> String {
+    if entry.catalog_name == "default" {
+        format!("Remove unused catalog entry `{}`", entry.entry_name)
+    } else {
+        format!(
+            "Remove unused catalog entry `{}` from `{}`",
+            entry.entry_name, entry.catalog_name
+        )
+    }
+}
+
+fn catalog_entry_diagnostic_message(
+    entry: &fallow_api::editor_results::UnusedCatalogEntry,
+) -> String {
+    if entry.catalog_name == "default" {
+        format!(
+            "Unused catalog entry: '{}' is not referenced by any workspace package",
+            entry.entry_name
+        )
+    } else {
+        format!(
+            "Unused catalog entry: '{}' in catalog '{}' is not referenced by any workspace package",
+            entry.entry_name, entry.catalog_name
+        )
+    }
+}
+
+/// Build quick-fix code actions for empty pnpm catalog groups (delete the
+/// named `catalogs.<name>:` header line).
+///
+/// Mirrors `build_remove_catalog_entry_actions` but covers the case where
+/// the catalog group itself has no entries to delete: a single bare header
+/// line under `catalogs:`. The deletion is one line; no parent rewrite is
+/// needed (the parent `catalogs:` map keeps its other named-catalog
+/// siblings, or, if this was the only one, the user can remove the
+/// remaining `catalogs:` header by hand). Same conservative policy as the
+/// CLI `fallow fix` path in `crates/cli/src/fix/catalog.rs`.
+///
+/// The default catalog (top-level `catalog:`) is intentionally never
+/// flagged by the detector, so this function never offers to delete it.
+///
+/// `file_lines` is the caller-supplied content of `pnpm-workspace.yaml`;
+/// passing the buffer in mirrors the sibling so the deletion range
+/// matches what the user sees in their editor when there are unsaved
+/// edits.
+#[derive(Clone, Copy)]
+pub struct EmptyCatalogGroupActionInput<'a> {
+    pub results: &'a AnalysisResults,
+    pub root: &'a Path,
+    pub uri: &'a Uri,
+    pub cursor_range: &'a Range,
+    pub file_lines: &'a [&'a str],
+}
+
+impl<'a> EmptyCatalogGroupActionInput<'a> {
+    #[must_use]
+    pub const fn new(
+        results: &'a AnalysisResults,
+        root: &'a Path,
+        uri: &'a Uri,
+        cursor_range: &'a Range,
+        file_lines: &'a [&'a str],
+    ) -> Self {
+        Self {
+            results,
+            root,
+            uri,
+            cursor_range,
+            file_lines,
+        }
+    }
+}
+
+pub fn build_remove_empty_catalog_group_actions(
+    input: EmptyCatalogGroupActionInput<'_>,
+) -> Vec<CodeActionOrCommand> {
+    let EmptyCatalogGroupActionInput {
+        results,
+        root,
+        uri,
+        cursor_range,
+        file_lines,
+    } = input;
+    let mut actions = Vec::new();
+
+    if file_lines.is_empty() {
+        return actions;
+    }
+
+    for group in &results.empty_catalog_groups {
+        let group = &group.group;
+        let Some(group_line) =
+            empty_catalog_group_delete_line(group, root, uri, cursor_range, file_lines)
+        else {
+            continue;
+        };
+        actions.push(remove_empty_catalog_group_action(group, uri, group_line));
+    }
+
+    actions
+}
+
+#[cfg(test)]
+fn build_remove_empty_catalog_group_actions_for_test(
+    results: &AnalysisResults,
+    root: &Path,
+    uri: &Uri,
+    cursor_range: &Range,
+    file_lines: &[&str],
+) -> Vec<CodeActionOrCommand> {
+    build_remove_empty_catalog_group_actions(EmptyCatalogGroupActionInput::new(
+        results,
+        root,
+        uri,
+        cursor_range,
+        file_lines,
+    ))
+}
+
+/// Validate that an empty-catalog-group finding still anchors to a matching
+/// header line within the cursor range, returning the 0-based line to delete.
+fn empty_catalog_group_delete_line(
+    group: &fallow_api::editor_results::EmptyCatalogGroup,
+    root: &Path,
+    uri: &Uri,
+    cursor_range: &Range,
+    file_lines: &[&str],
+) -> Option<u32> {
+    if !is_pnpm_catalog_source(&group.path) {
+        return None;
+    }
+    let group_uri = Uri::from_file_path(root.join(&group.path))?;
+    if group_uri != *uri {
+        return None;
+    }
+
+    let group_line = group.line.saturating_sub(1);
+    if group_line < cursor_range.start.line || group_line > cursor_range.end.line {
+        return None;
+    }
+
+    let start_idx = group_line as usize;
+    if start_idx >= file_lines.len() {
+        return None;
+    }
+    if !line_matches_catalog_key(file_lines[start_idx], &group.catalog_name) {
+        return None;
+    }
+
+    Some(group_line)
+}
+
+/// Build the single-line deletion code action for an empty catalog group.
+#[expect(
+    clippy::disallowed_types,
+    reason = "WorkspaceEdit.changes is typed as std::collections::HashMap by ls-types"
+)]
+fn remove_empty_catalog_group_action(
+    group: &fallow_api::editor_results::EmptyCatalogGroup,
+    uri: &Uri,
+    group_line: u32,
+) -> CodeActionOrCommand {
+    let title = format!("Remove empty catalog group `{}`", group.catalog_name);
+
+    let mut changes = HashMap::new();
+    let edits = vec![TextEdit {
+        range: Range {
+            start: Position {
+                line: group_line,
+                character: 0,
+            },
+            end: Position {
+                line: group_line + 1,
+                character: 0,
+            },
+        },
+        new_text: String::new(),
+    }];
+    changes.insert(uri.clone(), edits);
+
+    let diagnostic_message = format!(
+        "Empty catalog group: '{}' has no entries",
+        group.catalog_name
+    );
+
+    CodeActionOrCommand::CodeAction(CodeAction {
+        title,
+        kind: Some(CodeActionKind::QUICKFIX),
+        edit: Some(WorkspaceEdit {
+            changes: Some(changes),
+            ..Default::default()
+        }),
+        diagnostics: Some(vec![Diagnostic {
+            range: Range {
+                start: Position {
+                    line: group_line,
+                    character: 0,
+                },
+                end: Position {
+                    line: group_line,
+                    character: u32::MAX,
+                },
+            },
+            severity: Some(DiagnosticSeverity::WARNING),
+            source: Some("fallow".to_string()),
+            code: Some(NumberOrString::String("empty-catalog-group".to_string())),
+            message: diagnostic_message,
+            tags: Some(vec![DiagnosticTag::UNNECESSARY]),
+            ..Default::default()
+        }]),
+        ..Default::default()
+    })
+}
+
+fn is_pnpm_catalog_source(path: &Path) -> bool {
+    path == Path::new(PNPM_WORKSPACE_FILE)
+}
+
+/// Anchored match for a catalog key on its declared line. Handles
+/// unquoted (`react:`), double-quoted (`"@scope/foo":`), and single-quoted
+/// (`'react':`) key forms; rejects substring matches in values or in
+/// sibling entries whose names share a prefix (`react` vs `react-native`).
+fn line_matches_catalog_key(line: &str, entry_name: &str) -> bool {
+    let trimmed = line.trim_start();
+    if let Some(rest) = trimmed.strip_prefix(entry_name)
+        && rest.trim_start().starts_with(':')
+    {
+        return true;
+    }
+    if let Some(rest) = trimmed
+        .strip_prefix('"')
+        .and_then(|s| s.strip_prefix(entry_name))
+        && (rest.starts_with("\":") || rest.starts_with("\" :"))
+    {
+        return true;
+    }
+    if let Some(rest) = trimmed
+        .strip_prefix('\'')
+        .and_then(|s| s.strip_prefix(entry_name))
+        && (rest.starts_with("':") || rest.starts_with("' :"))
+    {
+        return true;
+    }
+    false
+}
+
+/// Compute the end line index (exclusive) for a catalog entry whose key
+/// sits on `start_idx`. This mirrors the CLI's forward object-form entry
+/// scan, but intentionally does not delete leading comments; LSP quick fixes
+/// stay conservative even when `fallow fix` uses the default
+/// `fix.catalog.deletePrecedingComments = "auto"` policy.
+fn compute_catalog_deletion_end(lines: &[&str], start_idx: usize) -> usize {
+    let entry_indent = lines[start_idx].bytes().take_while(|&b| b == b' ').count();
+    let mut end_idx = start_idx + 1;
+    while end_idx < lines.len() {
+        let line = lines[end_idx];
+        if line.trim().is_empty() {
+            break;
+        }
+        let indent = line.bytes().take_while(|&b| b == b' ').count();
+        if indent <= entry_indent {
+            break;
+        }
+        end_idx += 1;
+    }
+    end_idx
+}
+
+/// Build a TextEdit that rewrites the parent catalog header to `key: {}`
+/// when removing the line range `[start_idx, end_idx)` would leave it
+/// with no children. Returns `None` if siblings remain or no parent is
+/// found. Mirrors the CLI fix module's `rewrite_empty_catalog_parents`.
+fn build_parent_rewrite_edit(
+    lines: &[&str],
+    start_idx: usize,
+    end_idx: usize,
+    catalog_name: &str,
+) -> Option<TextEdit> {
+    let parent_idx = find_parent_header_idx(lines, start_idx, catalog_name)?;
+    if parent_has_other_children(lines, parent_idx, start_idx, end_idx) {
+        return None;
+    }
+    let header = lines[parent_idx];
+    let trimmed_end = header.trim_end();
+    let new_text = format!("{trimmed_end} {{}}");
+    Some(TextEdit {
+        range: Range {
+            start: Position {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "line index is bounded by source size"
+                )]
+                line: parent_idx as u32,
+                character: 0,
+            },
+            end: Position {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "line index is bounded by source size"
+                )]
+                line: parent_idx as u32,
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "header length is bounded by source size"
+                )]
+                character: header.encode_utf16().count() as u32,
+            },
+        },
+        new_text,
+    })
+}
+
+/// Walk backwards from a catalog entry line to find its parent header
+/// line index. For default-catalog entries the parent is the line
+/// starting with `catalog:`; for named-catalog entries the parent is
+/// the indented `<name>:` line under `catalogs:`.
+fn find_parent_header_idx(lines: &[&str], entry_idx: usize, catalog_name: &str) -> Option<usize> {
+    if entry_idx >= lines.len() {
+        return None;
+    }
+    let entry_indent = lines[entry_idx].bytes().take_while(|&b| b == b' ').count();
+    for idx in (0..entry_idx).rev() {
+        let line = lines[idx];
+        let stripped = line.trim_end();
+        let content = stripped.trim_start();
+        if content.is_empty() || content.starts_with('#') {
+            continue;
+        }
+        let indent = stripped.bytes().take_while(|&b| b == b' ').count();
+        if indent >= entry_indent {
+            continue;
+        }
+        if catalog_name == "default" {
+            return content.starts_with("catalog:").then_some(idx);
+        }
+        let key = content
+            .trim_start_matches(['"', '\''])
+            .split([':', '"', '\''])
+            .next()
+            .unwrap_or("");
+        return (key == catalog_name).then_some(idx);
+    }
+    None
+}
+
+/// Return true if the parent at `parent_idx` has at least one child
+/// line that is NOT inside the deletion range `[del_start, del_end)`.
+/// Comments and blank lines are not counted as children.
+fn parent_has_other_children(
+    lines: &[&str],
+    parent_idx: usize,
+    del_start: usize,
+    del_end: usize,
+) -> bool {
+    let parent_indent = lines[parent_idx].bytes().take_while(|&b| b == b' ').count();
+    for (idx, line) in lines.iter().enumerate().skip(parent_idx + 1) {
+        let stripped = line.trim_end();
+        let content = stripped.trim_start();
+        if content.is_empty() || content.starts_with('#') {
+            continue;
+        }
+        let indent = stripped.bytes().take_while(|&b| b == b' ').count();
+        if indent <= parent_indent {
+            return false;
+        }
+        if idx < del_start || idx >= del_end {
+            return true;
+        }
+    }
+    false
+}
+
+/// Typed input for unused file delete quick-fix code actions.
+#[derive(Clone, Copy)]
+pub struct DeleteFileActionInput<'a> {
+    pub results: &'a AnalysisResults,
+    pub file_path: &'a Path,
+    pub uri: &'a Uri,
+    pub cursor_range: &'a Range,
+}
+
+impl<'a> DeleteFileActionInput<'a> {
+    #[must_use]
+    pub const fn new(
+        results: &'a AnalysisResults,
+        file_path: &'a Path,
+        uri: &'a Uri,
+        cursor_range: &'a Range,
+    ) -> Self {
+        Self {
+            results,
+            file_path,
+            uri,
+            cursor_range,
+        }
+    }
+}
+
+/// Build quick-fix code actions for unused files (delete the file).
+pub fn build_delete_file_actions(input: DeleteFileActionInput<'_>) -> Vec<CodeActionOrCommand> {
+    let DeleteFileActionInput {
+        results,
+        file_path,
+        uri,
+        cursor_range,
+    } = input;
     let mut actions = Vec::new();
 
     for file in &results.unused_files {
-        if file.path != file_path {
+        if file.file.path != file_path {
             continue;
         }
 
-        // The diagnostic is at line 0, col 0 — check if the request range overlaps
         if cursor_range.start.line > 0 {
             continue;
         }
@@ -145,8 +964,8 @@ pub fn build_delete_file_actions(
             options: Some(DeleteFileOptions {
                 recursive: Some(false),
                 ignore_if_not_exists: Some(true),
-                annotation_id: None,
             }),
+            annotation_id: None,
         }));
 
         actions.push(CodeActionOrCommand::CodeAction(CodeAction {
@@ -173,11 +992,28 @@ pub fn build_delete_file_actions(
 }
 
 #[cfg(test)]
+fn build_delete_file_actions_for_test(
+    results: &AnalysisResults,
+    file_path: &Path,
+    uri: &Uri,
+    cursor_range: &Range,
+) -> Vec<CodeActionOrCommand> {
+    build_delete_file_actions(DeleteFileActionInput::new(
+        results,
+        file_path,
+        uri,
+        cursor_range,
+    ))
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    use fallow_core::results::{UnusedExport, UnusedFile};
+    use fallow_api::editor_results::{
+        UnusedExport, UnusedFile, UnusedFileFinding, UnusedTypeFinding,
+    };
 
     fn test_root() -> PathBuf {
         if cfg!(windows) {
@@ -200,8 +1036,13 @@ mod tests {
         }
     }
 
-    fn make_unused_export(path: &Path, name: &str, line: u32, col: u32) -> UnusedExport {
-        UnusedExport {
+    fn make_unused_export(
+        path: &Path,
+        name: &str,
+        line: u32,
+        col: u32,
+    ) -> fallow_api::editor_results::UnusedExportFinding {
+        fallow_api::editor_results::UnusedExportFinding::with_actions(UnusedExport {
             path: path.to_path_buf(),
             export_name: name.to_string(),
             is_type_only: false,
@@ -209,7 +1050,7 @@ mod tests {
             col,
             span_start: 0,
             is_re_export: false,
-        }
+        })
     }
 
     fn unwrap_code_action(action: &CodeActionOrCommand) -> &CodeAction {
@@ -219,19 +1060,16 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // build_remove_export_actions
-    // -----------------------------------------------------------------------
-
     #[test]
     fn no_export_actions_when_results_empty() {
         let root = test_root();
         let file = root.join("utils.ts");
-        let uri = Url::from_file_path(&file).unwrap();
+        let uri = Uri::from_file_path(&file).unwrap();
         let results = AnalysisResults::default();
         let lines = vec!["export const foo = 1;"];
 
-        let actions = build_remove_export_actions(&results, &file, &uri, &make_range(0, 0), &lines);
+        let actions =
+            build_remove_export_actions_for_test(&results, &file, &uri, &make_range(0, 0), &lines);
         assert!(actions.is_empty());
     }
 
@@ -240,7 +1078,7 @@ mod tests {
         let root = test_root();
         let file_a = root.join("a.ts");
         let file_b = root.join("b.ts");
-        let uri_b = Url::from_file_path(&file_b).unwrap();
+        let uri_b = Uri::from_file_path(&file_b).unwrap();
 
         let mut results = AnalysisResults::default();
         results
@@ -248,8 +1086,13 @@ mod tests {
             .push(make_unused_export(&file_a, "foo", 1, 7));
 
         let lines = vec!["export const foo = 1;"];
-        let actions =
-            build_remove_export_actions(&results, &file_b, &uri_b, &make_range(0, 10), &lines);
+        let actions = build_remove_export_actions_for_test(
+            &results,
+            &file_b,
+            &uri_b,
+            &make_range(0, 10),
+            &lines,
+        );
         assert!(actions.is_empty());
     }
 
@@ -257,17 +1100,16 @@ mod tests {
     fn no_export_actions_when_cursor_outside_export_line() {
         let root = test_root();
         let file = root.join("utils.ts");
-        let uri = Url::from_file_path(&file).unwrap();
+        let uri = Uri::from_file_path(&file).unwrap();
 
         let mut results = AnalysisResults::default();
-        // Export on 1-based line 5 => 0-based line 4
         results
             .unused_exports
             .push(make_unused_export(&file, "bar", 5, 7));
 
         let lines = vec!["line0", "line1", "line2", "line3", "export const bar = 2;"];
-        // Cursor on lines 0-2, export is on line 4
-        let actions = build_remove_export_actions(&results, &file, &uri, &make_range(0, 2), &lines);
+        let actions =
+            build_remove_export_actions_for_test(&results, &file, &uri, &make_range(0, 2), &lines);
         assert!(actions.is_empty());
     }
 
@@ -275,7 +1117,7 @@ mod tests {
     fn generates_action_for_unused_export_const() {
         let root = test_root();
         let file = root.join("utils.ts");
-        let uri = Url::from_file_path(&file).unwrap();
+        let uri = Uri::from_file_path(&file).unwrap();
 
         let mut results = AnalysisResults::default();
         results
@@ -283,7 +1125,8 @@ mod tests {
             .push(make_unused_export(&file, "foo", 1, 13));
 
         let lines = vec!["export const foo = 42;"];
-        let actions = build_remove_export_actions(&results, &file, &uri, &make_range(0, 0), &lines);
+        let actions =
+            build_remove_export_actions_for_test(&results, &file, &uri, &make_range(0, 0), &lines);
 
         assert_eq!(actions.len(), 1);
         let ca = unwrap_code_action(&actions[0]);
@@ -291,12 +1134,11 @@ mod tests {
         assert_eq!(ca.title, "Remove unused export `foo`");
         assert_eq!(ca.kind, Some(CodeActionKind::QUICKFIX));
 
-        // The edit should remove "export " (7 chars starting at column 0)
         let changes = ca.edit.as_ref().unwrap().changes.as_ref().unwrap();
         let edits = changes.get(&uri).unwrap();
         assert_eq!(edits.len(), 1);
         assert_eq!(edits[0].range.start.character, 0);
-        assert_eq!(edits[0].range.end.character, 7); // "export " = 7 chars
+        assert_eq!(edits[0].range.end.character, 7);
         assert_eq!(edits[0].new_text, "");
     }
 
@@ -304,7 +1146,7 @@ mod tests {
     fn generates_action_for_export_default() {
         let root = test_root();
         let file = root.join("component.tsx");
-        let uri = Url::from_file_path(&file).unwrap();
+        let uri = Uri::from_file_path(&file).unwrap();
 
         let mut results = AnalysisResults::default();
         results
@@ -312,7 +1154,8 @@ mod tests {
             .push(make_unused_export(&file, "default", 1, 0));
 
         let lines = vec!["export default function App() {}"];
-        let actions = build_remove_export_actions(&results, &file, &uri, &make_range(0, 0), &lines);
+        let actions =
+            build_remove_export_actions_for_test(&results, &file, &uri, &make_range(0, 0), &lines);
 
         assert_eq!(actions.len(), 1);
         let ca = unwrap_code_action(&actions[0]);
@@ -320,7 +1163,6 @@ mod tests {
         let changes = ca.edit.as_ref().unwrap().changes.as_ref().unwrap();
         let edits = changes.get(&uri).unwrap();
         assert_eq!(edits.len(), 1);
-        // "export default " = 15 chars
         assert_eq!(edits[0].range.start.character, 0);
         assert_eq!(edits[0].range.end.character, 15);
         assert_eq!(edits[0].new_text, "");
@@ -330,10 +1172,9 @@ mod tests {
     fn preserves_indentation_in_edit_range() {
         let root = test_root();
         let file = root.join("nested.ts");
-        let uri = Url::from_file_path(&file).unwrap();
+        let uri = Uri::from_file_path(&file).unwrap();
 
         let mut results = AnalysisResults::default();
-        // Export on 1-based line 2 => 0-based line 1
         results
             .unused_exports
             .push(make_unused_export(&file, "helper", 2, 11));
@@ -343,7 +1184,8 @@ mod tests {
             "    export function helper() {}", // 4 spaces indent
             "}",
         ];
-        let actions = build_remove_export_actions(&results, &file, &uri, &make_range(1, 1), &lines);
+        let actions =
+            build_remove_export_actions_for_test(&results, &file, &uri, &make_range(1, 1), &lines);
 
         assert_eq!(actions.len(), 1);
         let ca = unwrap_code_action(&actions[0]);
@@ -351,36 +1193,37 @@ mod tests {
         let changes = ca.edit.as_ref().unwrap().changes.as_ref().unwrap();
         let edits = changes.get(&uri).unwrap();
         assert_eq!(edits.len(), 1);
-        // Edit should start at column 4 (after indent) and remove "export " (7 chars)
         assert_eq!(edits[0].range.start.line, 1);
         assert_eq!(edits[0].range.start.character, 4);
-        assert_eq!(edits[0].range.end.character, 11); // 4 + 7
+        assert_eq!(edits[0].range.end.character, 11);
     }
 
     #[test]
     fn handles_type_exports() {
         let root = test_root();
         let file = root.join("types.ts");
-        let uri = Url::from_file_path(&file).unwrap();
+        let uri = Uri::from_file_path(&file).unwrap();
 
         let mut results = AnalysisResults::default();
-        results.unused_types.push(UnusedExport {
-            path: file.clone(),
-            export_name: "MyType".to_string(),
-            is_type_only: true,
-            line: 1,
-            col: 12,
-            span_start: 0,
-            is_re_export: false,
-        });
+        results
+            .unused_types
+            .push(UnusedTypeFinding::with_actions(UnusedExport {
+                path: file.clone(),
+                export_name: "MyType".to_string(),
+                is_type_only: true,
+                line: 1,
+                col: 12,
+                span_start: 0,
+                is_re_export: false,
+            }));
 
         let lines = vec!["export type MyType = string;"];
-        let actions = build_remove_export_actions(&results, &file, &uri, &make_range(0, 0), &lines);
+        let actions =
+            build_remove_export_actions_for_test(&results, &file, &uri, &make_range(0, 0), &lines);
 
         assert_eq!(actions.len(), 1);
         let ca = unwrap_code_action(&actions[0]);
 
-        // Check the diagnostic message uses "Type export" prefix
         let diags = ca.diagnostics.as_ref().unwrap();
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].message, "Type export 'MyType' is unused");
@@ -393,24 +1236,27 @@ mod tests {
     fn combines_unused_exports_and_unused_types() {
         let root = test_root();
         let file = root.join("mixed.ts");
-        let uri = Url::from_file_path(&file).unwrap();
+        let uri = Uri::from_file_path(&file).unwrap();
 
         let mut results = AnalysisResults::default();
         results
             .unused_exports
             .push(make_unused_export(&file, "foo", 1, 13));
-        results.unused_types.push(UnusedExport {
-            path: file.clone(),
-            export_name: "Bar".to_string(),
-            is_type_only: true,
-            line: 2,
-            col: 12,
-            span_start: 0,
-            is_re_export: false,
-        });
+        results
+            .unused_types
+            .push(UnusedTypeFinding::with_actions(UnusedExport {
+                path: file.clone(),
+                export_name: "Bar".to_string(),
+                is_type_only: true,
+                line: 2,
+                col: 12,
+                span_start: 0,
+                is_re_export: false,
+            }));
 
         let lines = vec!["export const foo = 1;", "export type Bar = string;"];
-        let actions = build_remove_export_actions(&results, &file, &uri, &make_range(0, 1), &lines);
+        let actions =
+            build_remove_export_actions_for_test(&results, &file, &uri, &make_range(0, 1), &lines);
 
         assert_eq!(actions.len(), 2);
 
@@ -420,7 +1266,6 @@ mod tests {
         assert_eq!(ca0.title, "Remove unused export `foo`");
         assert_eq!(ca1.title, "Remove unused export `Bar`");
 
-        // Verify message prefixes differ
         let diag0 = &ca0.diagnostics.as_ref().unwrap()[0];
         let diag1 = &ca1.diagnostics.as_ref().unwrap()[0];
         assert!(diag0.message.starts_with("Export "));
@@ -431,17 +1276,16 @@ mod tests {
     fn skips_line_without_export_prefix() {
         let root = test_root();
         let file = root.join("odd.ts");
-        let uri = Url::from_file_path(&file).unwrap();
+        let uri = Uri::from_file_path(&file).unwrap();
 
         let mut results = AnalysisResults::default();
-        // The result says line 1 has an unused export, but the actual line content
-        // doesn't start with "export" (e.g., re-export or corrupted data)
         results
             .unused_exports
             .push(make_unused_export(&file, "foo", 1, 0));
 
         let lines = vec!["const foo = 1;"];
-        let actions = build_remove_export_actions(&results, &file, &uri, &make_range(0, 0), &lines);
+        let actions =
+            build_remove_export_actions_for_test(&results, &file, &uri, &make_range(0, 0), &lines);
         assert!(
             actions.is_empty(),
             "Should skip exports where line doesn't start with 'export'"
@@ -452,19 +1296,17 @@ mod tests {
     fn handles_export_on_line_0_saturating_sub() {
         let root = test_root();
         let file = root.join("edge.ts");
-        let uri = Url::from_file_path(&file).unwrap();
+        let uri = Uri::from_file_path(&file).unwrap();
 
         let mut results = AnalysisResults::default();
-        // line=0 is unusual (lines are 1-based), but saturating_sub(1) handles it
-        // gracefully by producing 0-based line 0 (same as line=1 would)
         results
             .unused_exports
             .push(make_unused_export(&file, "x", 0, 7));
 
         let lines = vec!["export const x = 1;"];
-        let actions = build_remove_export_actions(&results, &file, &uri, &make_range(0, 0), &lines);
+        let actions =
+            build_remove_export_actions_for_test(&results, &file, &uri, &make_range(0, 0), &lines);
 
-        // saturating_sub(0, 1) = 0, so it maps to line 0 which is in range
         assert_eq!(actions.len(), 1);
     }
 
@@ -472,7 +1314,7 @@ mod tests {
     fn multiple_exports_same_file_all_in_range() {
         let root = test_root();
         let file = root.join("multi.ts");
-        let uri = Url::from_file_path(&file).unwrap();
+        let uri = Uri::from_file_path(&file).unwrap();
 
         let mut results = AnalysisResults::default();
         results
@@ -490,7 +1332,8 @@ mod tests {
             "export function b() {}",
             "export function c() {}",
         ];
-        let actions = build_remove_export_actions(&results, &file, &uri, &make_range(0, 2), &lines);
+        let actions =
+            build_remove_export_actions_for_test(&results, &file, &uri, &make_range(0, 2), &lines);
 
         assert_eq!(actions.len(), 3);
         for action in &actions {
@@ -503,7 +1346,7 @@ mod tests {
     fn cursor_range_filters_subset_of_exports() {
         let root = test_root();
         let file = root.join("filter.ts");
-        let uri = Url::from_file_path(&file).unwrap();
+        let uri = Uri::from_file_path(&file).unwrap();
 
         let mut results = AnalysisResults::default();
         results
@@ -523,8 +1366,8 @@ mod tests {
             "const also_used = false;",
             "export const c = 3;",
         ];
-        // Cursor covers only line 2 (0-based), which is 1-based line 3 => export "b"
-        let actions = build_remove_export_actions(&results, &file, &uri, &make_range(2, 2), &lines);
+        let actions =
+            build_remove_export_actions_for_test(&results, &file, &uri, &make_range(2, 2), &lines);
 
         assert_eq!(actions.len(), 1);
         let ca = unwrap_code_action(&actions[0]);
@@ -535,16 +1378,16 @@ mod tests {
     fn diagnostic_range_matches_export_name_span() {
         let root = test_root();
         let file = root.join("span.ts");
-        let uri = Url::from_file_path(&file).unwrap();
+        let uri = Uri::from_file_path(&file).unwrap();
 
         let mut results = AnalysisResults::default();
-        // col=13 means "export const " (13 chars), name "myLongExport" is 12 chars
         results
             .unused_exports
             .push(make_unused_export(&file, "myLongExport", 1, 13));
 
         let lines = vec!["export const myLongExport = 42;"];
-        let actions = build_remove_export_actions(&results, &file, &uri, &make_range(0, 0), &lines);
+        let actions =
+            build_remove_export_actions_for_test(&results, &file, &uri, &make_range(0, 0), &lines);
 
         assert_eq!(actions.len(), 1);
         let ca = unwrap_code_action(&actions[0]);
@@ -560,17 +1403,16 @@ mod tests {
     fn handles_empty_file_lines() {
         let root = test_root();
         let file = root.join("empty.ts");
-        let uri = Url::from_file_path(&file).unwrap();
+        let uri = Uri::from_file_path(&file).unwrap();
 
         let mut results = AnalysisResults::default();
         results
             .unused_exports
             .push(make_unused_export(&file, "x", 1, 0));
 
-        // No lines at all — the get() call returns None, unwrap_or("")
         let lines: Vec<&str> = vec![];
-        let actions = build_remove_export_actions(&results, &file, &uri, &make_range(0, 0), &lines);
-        // Empty string doesn't start with "export", so no action
+        let actions =
+            build_remove_export_actions_for_test(&results, &file, &uri, &make_range(0, 0), &lines);
         assert!(actions.is_empty());
     }
 
@@ -578,37 +1420,101 @@ mod tests {
     fn handles_tab_indentation() {
         let root = test_root();
         let file = root.join("tabs.ts");
-        let uri = Url::from_file_path(&file).unwrap();
+        let uri = Uri::from_file_path(&file).unwrap();
 
         let mut results = AnalysisResults::default();
         results
             .unused_exports
             .push(make_unused_export(&file, "val", 1, 0));
 
-        let lines = vec!["\t\texport const val = 1;"]; // 2 tabs of indent
-        let actions = build_remove_export_actions(&results, &file, &uri, &make_range(0, 0), &lines);
+        let lines = vec!["\t\texport const val = 1;"];
+        let actions =
+            build_remove_export_actions_for_test(&results, &file, &uri, &make_range(0, 0), &lines);
 
         assert_eq!(actions.len(), 1);
         let ca = unwrap_code_action(&actions[0]);
         let changes = ca.edit.as_ref().unwrap().changes.as_ref().unwrap();
         let edits = changes.get(&uri).unwrap();
-        // 2 bytes of tab indent + "export " (7 chars) = columns 2..9
         assert_eq!(edits[0].range.start.character, 2);
         assert_eq!(edits[0].range.end.character, 9);
     }
 
-    // -----------------------------------------------------------------------
-    // build_delete_file_actions
-    // -----------------------------------------------------------------------
+    /// Apply a single-line `TextEdit` to `line` by splicing UTF-16 code
+    /// units, mirroring how an LSP client interprets `character` offsets.
+    fn apply_single_line_edit(line: &str, edit: &TextEdit) -> String {
+        let units: Vec<u16> = line.encode_utf16().collect();
+        let start = edit.range.start.character as usize;
+        let end = edit.range.end.character as usize;
+        let mut spliced = units[..start].to_vec();
+        spliced.extend(edit.new_text.encode_utf16());
+        spliced.extend_from_slice(&units[end..]);
+        String::from_utf16(&spliced).unwrap()
+    }
+
+    #[test]
+    fn handles_nbsp_indentation_with_utf16_offsets() {
+        let root = test_root();
+        let file = root.join("nbsp.ts");
+        let uri = Uri::from_file_path(&file).unwrap();
+
+        let mut results = AnalysisResults::default();
+        results
+            .unused_exports
+            .push(make_unused_export(&file, "helper", 1, 0));
+
+        // U+00A0 is 2 bytes in UTF-8 but 1 UTF-16 code unit: the indent
+        // width in LSP `character` units is 1, not 2.
+        let lines = vec!["\u{00A0}export const helper = 1;"];
+        let actions =
+            build_remove_export_actions_for_test(&results, &file, &uri, &make_range(0, 0), &lines);
+
+        assert_eq!(actions.len(), 1);
+        let ca = unwrap_code_action(&actions[0]);
+        let changes = ca.edit.as_ref().unwrap().changes.as_ref().unwrap();
+        let edits = changes.get(&uri).unwrap();
+        assert_eq!(edits[0].range.start.character, 1);
+        assert_eq!(edits[0].range.end.character, 8);
+        assert_eq!(
+            apply_single_line_edit(lines[0], &edits[0]),
+            "\u{00A0}const helper = 1;"
+        );
+    }
+
+    #[test]
+    fn ascii_indentation_edit_applies_cleanly() {
+        let root = test_root();
+        let file = root.join("ascii.ts");
+        let uri = Uri::from_file_path(&file).unwrap();
+
+        let mut results = AnalysisResults::default();
+        results
+            .unused_exports
+            .push(make_unused_export(&file, "helper", 1, 0));
+
+        let lines = vec!["  export const helper = 1;"];
+        let actions =
+            build_remove_export_actions_for_test(&results, &file, &uri, &make_range(0, 0), &lines);
+
+        assert_eq!(actions.len(), 1);
+        let ca = unwrap_code_action(&actions[0]);
+        let changes = ca.edit.as_ref().unwrap().changes.as_ref().unwrap();
+        let edits = changes.get(&uri).unwrap();
+        assert_eq!(edits[0].range.start.character, 2);
+        assert_eq!(edits[0].range.end.character, 9);
+        assert_eq!(
+            apply_single_line_edit(lines[0], &edits[0]),
+            "  const helper = 1;"
+        );
+    }
 
     #[test]
     fn no_delete_actions_when_no_unused_files() {
         let root = test_root();
         let file = root.join("used.ts");
-        let uri = Url::from_file_path(&file).unwrap();
+        let uri = Uri::from_file_path(&file).unwrap();
         let results = AnalysisResults::default();
 
-        let actions = build_delete_file_actions(&results, &file, &uri, &make_range(0, 10));
+        let actions = build_delete_file_actions_for_test(&results, &file, &uri, &make_range(0, 10));
         assert!(actions.is_empty());
     }
 
@@ -617,12 +1523,15 @@ mod tests {
         let root = test_root();
         let file_a = root.join("a.ts");
         let file_b = root.join("b.ts");
-        let uri_b = Url::from_file_path(&file_b).unwrap();
+        let uri_b = Uri::from_file_path(&file_b).unwrap();
 
         let mut results = AnalysisResults::default();
-        results.unused_files.push(UnusedFile { path: file_a });
+        results
+            .unused_files
+            .push(UnusedFileFinding::with_actions(UnusedFile { path: file_a }));
 
-        let actions = build_delete_file_actions(&results, &file_b, &uri_b, &make_range(0, 10));
+        let actions =
+            build_delete_file_actions_for_test(&results, &file_b, &uri_b, &make_range(0, 10));
         assert!(actions.is_empty());
     }
 
@@ -630,13 +1539,16 @@ mod tests {
     fn no_delete_action_when_cursor_not_at_line_0() {
         let root = test_root();
         let file = root.join("unused.ts");
-        let uri = Url::from_file_path(&file).unwrap();
+        let uri = Uri::from_file_path(&file).unwrap();
 
         let mut results = AnalysisResults::default();
-        results.unused_files.push(UnusedFile { path: file.clone() });
+        results
+            .unused_files
+            .push(UnusedFileFinding::with_actions(UnusedFile {
+                path: file.clone(),
+            }));
 
-        // Cursor starts at line 1, but diagnostic is at line 0
-        let actions = build_delete_file_actions(&results, &file, &uri, &make_range(1, 5));
+        let actions = build_delete_file_actions_for_test(&results, &file, &uri, &make_range(1, 5));
         assert!(actions.is_empty());
     }
 
@@ -644,12 +1556,16 @@ mod tests {
     fn generates_delete_action_when_cursor_at_line_0() {
         let root = test_root();
         let file = root.join("unused.ts");
-        let uri = Url::from_file_path(&file).unwrap();
+        let uri = Uri::from_file_path(&file).unwrap();
 
         let mut results = AnalysisResults::default();
-        results.unused_files.push(UnusedFile { path: file.clone() });
+        results
+            .unused_files
+            .push(UnusedFileFinding::with_actions(UnusedFile {
+                path: file.clone(),
+            }));
 
-        let actions = build_delete_file_actions(&results, &file, &uri, &make_range(0, 0));
+        let actions = build_delete_file_actions_for_test(&results, &file, &uri, &make_range(0, 0));
 
         assert_eq!(actions.len(), 1);
         let ca = unwrap_code_action(&actions[0]);
@@ -662,12 +1578,16 @@ mod tests {
     fn delete_action_uses_document_changes_with_delete_op() {
         let root = test_root();
         let file = root.join("unused.ts");
-        let uri = Url::from_file_path(&file).unwrap();
+        let uri = Uri::from_file_path(&file).unwrap();
 
         let mut results = AnalysisResults::default();
-        results.unused_files.push(UnusedFile { path: file.clone() });
+        results
+            .unused_files
+            .push(UnusedFileFinding::with_actions(UnusedFile {
+                path: file.clone(),
+            }));
 
-        let actions = build_delete_file_actions(&results, &file, &uri, &make_range(0, 0));
+        let actions = build_delete_file_actions_for_test(&results, &file, &uri, &make_range(0, 0));
         let ca = unwrap_code_action(&actions[0]);
 
         let doc_changes = ca.edit.as_ref().unwrap().document_changes.as_ref().unwrap();
@@ -693,12 +1613,16 @@ mod tests {
     fn delete_action_diagnostic_has_correct_properties() {
         let root = test_root();
         let file = root.join("unused.ts");
-        let uri = Url::from_file_path(&file).unwrap();
+        let uri = Uri::from_file_path(&file).unwrap();
 
         let mut results = AnalysisResults::default();
-        results.unused_files.push(UnusedFile { path: file.clone() });
+        results
+            .unused_files
+            .push(UnusedFileFinding::with_actions(UnusedFile {
+                path: file.clone(),
+            }));
 
-        let actions = build_delete_file_actions(&results, &file, &uri, &make_range(0, 0));
+        let actions = build_delete_file_actions_for_test(&results, &file, &uri, &make_range(0, 0));
         let ca = unwrap_code_action(&actions[0]);
 
         let diags = ca.diagnostics.as_ref().unwrap();
@@ -720,13 +1644,16 @@ mod tests {
     fn delete_action_with_cursor_spanning_line_0() {
         let root = test_root();
         let file = root.join("unused.ts");
-        let uri = Url::from_file_path(&file).unwrap();
+        let uri = Uri::from_file_path(&file).unwrap();
 
         let mut results = AnalysisResults::default();
-        results.unused_files.push(UnusedFile { path: file.clone() });
+        results
+            .unused_files
+            .push(UnusedFileFinding::with_actions(UnusedFile {
+                path: file.clone(),
+            }));
 
-        // Cursor from line 0 to line 50 — should still trigger because start.line == 0
-        let actions = build_delete_file_actions(&results, &file, &uri, &make_range(0, 50));
+        let actions = build_delete_file_actions_for_test(&results, &file, &uri, &make_range(0, 50));
         assert_eq!(actions.len(), 1);
     }
 
@@ -734,29 +1661,36 @@ mod tests {
     fn multiple_unused_files_same_path_produces_multiple_actions() {
         let root = test_root();
         let file = root.join("unused.ts");
-        let uri = Url::from_file_path(&file).unwrap();
+        let uri = Uri::from_file_path(&file).unwrap();
 
         let mut results = AnalysisResults::default();
-        // Unlikely in practice, but tests that the loop iterates all entries
-        results.unused_files.push(UnusedFile { path: file.clone() });
-        results.unused_files.push(UnusedFile { path: file.clone() });
+        results
+            .unused_files
+            .push(UnusedFileFinding::with_actions(UnusedFile {
+                path: file.clone(),
+            }));
+        results
+            .unused_files
+            .push(UnusedFileFinding::with_actions(UnusedFile {
+                path: file.clone(),
+            }));
 
-        let actions = build_delete_file_actions(&results, &file, &uri, &make_range(0, 0));
+        let actions = build_delete_file_actions_for_test(&results, &file, &uri, &make_range(0, 0));
         assert_eq!(actions.len(), 2);
     }
-
-    // -----------------------------------------------------------------------
-    // Integration: both functions together on same file
-    // -----------------------------------------------------------------------
 
     #[test]
     fn unused_file_and_unused_export_in_same_file() {
         let root = test_root();
         let file = root.join("orphan.ts");
-        let uri = Url::from_file_path(&file).unwrap();
+        let uri = Uri::from_file_path(&file).unwrap();
 
         let mut results = AnalysisResults::default();
-        results.unused_files.push(UnusedFile { path: file.clone() });
+        results
+            .unused_files
+            .push(UnusedFileFinding::with_actions(UnusedFile {
+                path: file.clone(),
+            }));
         results
             .unused_exports
             .push(make_unused_export(&file, "helper", 1, 16));
@@ -764,17 +1698,966 @@ mod tests {
         let lines = vec!["export function helper() {}"];
         let cursor = make_range(0, 0);
 
-        let export_actions = build_remove_export_actions(&results, &file, &uri, &cursor, &lines);
-        let delete_actions = build_delete_file_actions(&results, &file, &uri, &cursor);
+        let export_actions =
+            build_remove_export_actions_for_test(&results, &file, &uri, &cursor, &lines);
+        let delete_actions = build_delete_file_actions_for_test(&results, &file, &uri, &cursor);
 
-        // Both produce independent actions
         assert_eq!(export_actions.len(), 1);
         assert_eq!(delete_actions.len(), 1);
 
-        // They are different action types
         let export_ca = unwrap_code_action(&export_actions[0]);
         let delete_ca = unwrap_code_action(&delete_actions[0]);
         assert!(export_ca.title.contains("Remove unused export"));
         assert!(delete_ca.title.contains("Delete"));
+    }
+
+    use fallow_api::editor_results::{UnusedCatalogEntry, UnusedCatalogEntryFinding};
+
+    fn make_catalog_entry(
+        name: &str,
+        catalog: &str,
+        line: u32,
+        consumers: Vec<PathBuf>,
+    ) -> UnusedCatalogEntryFinding {
+        make_catalog_entry_in_file(
+            name,
+            catalog,
+            PathBuf::from("pnpm-workspace.yaml"),
+            line,
+            consumers,
+        )
+    }
+
+    fn make_catalog_entry_in_file(
+        name: &str,
+        catalog: &str,
+        path: PathBuf,
+        line: u32,
+        consumers: Vec<PathBuf>,
+    ) -> UnusedCatalogEntryFinding {
+        UnusedCatalogEntryFinding::with_actions(UnusedCatalogEntry {
+            entry_name: name.to_string(),
+            catalog_name: catalog.to_string(),
+            path,
+            line,
+            hardcoded_consumers: consumers,
+        })
+    }
+
+    fn workspace_yaml_uri(dir: &tempfile::TempDir) -> Uri {
+        Uri::from_file_path(dir.path().join("pnpm-workspace.yaml")).unwrap()
+    }
+
+    #[test]
+    fn no_catalog_action_when_no_findings() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = workspace_yaml_uri(&dir);
+        let results = AnalysisResults::default();
+        let lines = vec!["catalog:", "  is-even: ^1.0.0"];
+
+        let actions = build_remove_catalog_entry_actions_for_test(
+            &results,
+            dir.path(),
+            &uri,
+            &make_range(0, 100),
+            &lines,
+        );
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn catalog_action_uses_root_join_for_relative_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = workspace_yaml_uri(&dir);
+
+        let mut results = AnalysisResults::default();
+        results
+            .unused_catalog_entries
+            .push(make_catalog_entry("is-even", "default", 2, vec![]));
+
+        let lines = vec!["catalog:", "  is-even: ^1.0.0"];
+        let actions = build_remove_catalog_entry_actions_for_test(
+            &results,
+            dir.path(),
+            &uri,
+            &make_range(1, 1),
+            &lines,
+        );
+
+        assert_eq!(actions.len(), 1);
+        let ca = unwrap_code_action(&actions[0]);
+        assert!(ca.title.contains("is-even"));
+        assert_eq!(ca.kind, Some(CodeActionKind::QUICKFIX));
+    }
+
+    #[test]
+    fn catalog_action_skipped_when_hardcoded_consumers_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = workspace_yaml_uri(&dir);
+
+        let mut results = AnalysisResults::default();
+        results.unused_catalog_entries.push(make_catalog_entry(
+            "react",
+            "default",
+            2,
+            vec![PathBuf::from("apps/web/package.json")],
+        ));
+
+        let lines = vec!["catalog:", "  react: ^18.2.0"];
+        let actions = build_remove_catalog_entry_actions_for_test(
+            &results,
+            dir.path(),
+            &uri,
+            &make_range(1, 1),
+            &lines,
+        );
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn catalog_action_skips_bun_package_json_catalog_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = Uri::from_file_path(dir.path().join("package.json")).unwrap();
+
+        let mut results = AnalysisResults::default();
+        results
+            .unused_catalog_entries
+            .push(make_catalog_entry_in_file(
+                "unused",
+                "default",
+                PathBuf::from("package.json"),
+                4,
+                vec![],
+            ));
+
+        let lines = vec![
+            "{",
+            "  \"workspaces\": {",
+            "    \"catalog\": {",
+            "      \"unused\": \"^1.0.0\"",
+            "    }",
+            "  }",
+            "}",
+        ];
+        let actions = build_remove_catalog_entry_actions_for_test(
+            &results,
+            dir.path(),
+            &uri,
+            &make_range(3, 3),
+            &lines,
+        );
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn catalog_action_deletes_object_form_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = workspace_yaml_uri(&dir);
+
+        let mut results = AnalysisResults::default();
+        results
+            .unused_catalog_entries
+            .push(make_catalog_entry("react", "default", 2, vec![]));
+
+        let lines = vec![
+            "catalog:",
+            "  react:",
+            "    specifier: ^18.2.0",
+            "    publishConfig: {}",
+            "  is-even: ^1.0.0",
+        ];
+        let actions = build_remove_catalog_entry_actions_for_test(
+            &results,
+            dir.path(),
+            &uri,
+            &make_range(1, 1),
+            &lines,
+        );
+
+        assert_eq!(actions.len(), 1);
+        let ca = unwrap_code_action(&actions[0]);
+        let changes = ca.edit.as_ref().unwrap().changes.as_ref().unwrap();
+        let edits = changes.get(&uri).unwrap();
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].range.start.line, 1);
+        assert_eq!(edits[0].range.end.line, 4);
+        assert_eq!(edits[0].new_text, "");
+    }
+
+    #[test]
+    fn catalog_action_bails_when_line_does_not_match_entry_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = workspace_yaml_uri(&dir);
+
+        let mut results = AnalysisResults::default();
+        results
+            .unused_catalog_entries
+            .push(make_catalog_entry("is-even", "default", 2, vec![]));
+
+        let lines = vec!["catalog:", "  different-entry: ^2.0.0"];
+        let actions = build_remove_catalog_entry_actions_for_test(
+            &results,
+            dir.path(),
+            &uri,
+            &make_range(1, 1),
+            &lines,
+        );
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn catalog_action_bails_when_entry_name_is_substring_of_sibling() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = workspace_yaml_uri(&dir);
+
+        let mut results = AnalysisResults::default();
+        results
+            .unused_catalog_entries
+            .push(make_catalog_entry("react", "default", 2, vec![]));
+
+        let lines = vec!["catalog:", "  react-native: ^0.73.0"];
+        let actions = build_remove_catalog_entry_actions_for_test(
+            &results,
+            dir.path(),
+            &uri,
+            &make_range(1, 1),
+            &lines,
+        );
+        assert!(
+            actions.is_empty(),
+            "must NOT delete `react-native` when the finding reports `react`"
+        );
+    }
+
+    #[test]
+    fn catalog_action_bails_when_entry_name_appears_only_in_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = workspace_yaml_uri(&dir);
+
+        let mut results = AnalysisResults::default();
+        results
+            .unused_catalog_entries
+            .push(make_catalog_entry("react", "default", 2, vec![]));
+
+        let lines = vec!["catalog:", "  description: react fork"];
+        let actions = build_remove_catalog_entry_actions_for_test(
+            &results,
+            dir.path(),
+            &uri,
+            &make_range(1, 1),
+            &lines,
+        );
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn catalog_action_handles_quoted_key_forms() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = workspace_yaml_uri(&dir);
+
+        let mut results = AnalysisResults::default();
+        results
+            .unused_catalog_entries
+            .push(make_catalog_entry("@scope/foo", "default", 2, vec![]));
+
+        let lines = vec!["catalog:", "  \"@scope/foo\": ^1.0.0"];
+        let actions = build_remove_catalog_entry_actions_for_test(
+            &results,
+            dir.path(),
+            &uri,
+            &make_range(1, 1),
+            &lines,
+        );
+        assert_eq!(actions.len(), 1);
+    }
+
+    #[test]
+    fn catalog_action_outside_cursor_range_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = workspace_yaml_uri(&dir);
+
+        let mut results = AnalysisResults::default();
+        results
+            .unused_catalog_entries
+            .push(make_catalog_entry("is-even", "default", 3, vec![]));
+
+        let lines = vec!["catalog:", "  is-odd: ^1.0.0", "  is-even: ^1.0.0"];
+        let actions = build_remove_catalog_entry_actions_for_test(
+            &results,
+            dir.path(),
+            &uri,
+            &make_range(0, 1),
+            &lines,
+        );
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn catalog_action_named_catalog_uses_matching_diagnostic_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = workspace_yaml_uri(&dir);
+
+        let mut results = AnalysisResults::default();
+        results
+            .unused_catalog_entries
+            .push(make_catalog_entry("react", "react17", 3, vec![]));
+
+        let lines = vec!["catalogs:", "  react17:", "    react: ^17.0.2"];
+        let actions = build_remove_catalog_entry_actions_for_test(
+            &results,
+            dir.path(),
+            &uri,
+            &make_range(2, 2),
+            &lines,
+        );
+        assert_eq!(actions.len(), 1);
+        let ca = unwrap_code_action(&actions[0]);
+        let diag_msg = &ca.diagnostics.as_ref().unwrap()[0].message;
+        assert!(
+            diag_msg.contains("in catalog 'react17'"),
+            "named-catalog diagnostic must say `in catalog 'react17'`, got: {diag_msg}"
+        );
+    }
+
+    #[test]
+    fn catalog_action_emits_parent_rewrite_when_emptying_named_catalog() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = workspace_yaml_uri(&dir);
+
+        let mut results = AnalysisResults::default();
+        results
+            .unused_catalog_entries
+            .push(make_catalog_entry("react", "react17", 3, vec![]));
+
+        let lines = vec!["catalogs:", "  react17:", "    react: ^17.0.2"];
+        let actions = build_remove_catalog_entry_actions_for_test(
+            &results,
+            dir.path(),
+            &uri,
+            &make_range(2, 2),
+            &lines,
+        );
+
+        assert_eq!(actions.len(), 1);
+        let ca = unwrap_code_action(&actions[0]);
+        let changes = ca.edit.as_ref().unwrap().changes.as_ref().unwrap();
+        let edits = changes.get(&uri).unwrap();
+        assert_eq!(
+            edits.len(),
+            2,
+            "must emit deletion + parent rewrite, got {} edits",
+            edits.len()
+        );
+        assert_eq!(edits[0].range.start.line, 2);
+        assert_eq!(edits[0].new_text, "");
+        assert_eq!(edits[1].range.start.line, 1);
+        assert_eq!(edits[1].new_text, "  react17: {}");
+    }
+
+    #[test]
+    fn catalog_action_parent_rewrite_uses_utf16_character_offsets() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = workspace_yaml_uri(&dir);
+
+        let mut results = AnalysisResults::default();
+        results
+            .unused_catalog_entries
+            .push(make_catalog_entry("react", "日本", 3, vec![]));
+
+        let lines = vec!["catalogs:", "  \"日本\":", "    react: ^17.0.2"];
+        let actions = build_remove_catalog_entry_actions_for_test(
+            &results,
+            dir.path(),
+            &uri,
+            &make_range(2, 2),
+            &lines,
+        );
+
+        assert_eq!(actions.len(), 1);
+        let ca = unwrap_code_action(&actions[0]);
+        let changes = ca.edit.as_ref().unwrap().changes.as_ref().unwrap();
+        let edits = changes.get(&uri).unwrap();
+        assert_eq!(edits.len(), 2);
+        assert_eq!(edits[1].range.start.character, 0);
+        assert_eq!(
+            edits[1].range.end.character,
+            lines[1].encode_utf16().count() as u32
+        );
+        assert_eq!(edits[1].new_text, "  \"日本\": {}");
+    }
+
+    #[test]
+    fn catalog_action_no_parent_rewrite_when_siblings_remain() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = workspace_yaml_uri(&dir);
+
+        let mut results = AnalysisResults::default();
+        results
+            .unused_catalog_entries
+            .push(make_catalog_entry("react", "react17", 3, vec![]));
+
+        let lines = vec![
+            "catalogs:",
+            "  react17:",
+            "    react: ^17.0.2",
+            "    react-dom: ^17.0.2",
+        ];
+        let actions = build_remove_catalog_entry_actions_for_test(
+            &results,
+            dir.path(),
+            &uri,
+            &make_range(2, 2),
+            &lines,
+        );
+
+        assert_eq!(actions.len(), 1);
+        let ca = unwrap_code_action(&actions[0]);
+        let changes = ca.edit.as_ref().unwrap().changes.as_ref().unwrap();
+        let edits = changes.get(&uri).unwrap();
+        assert_eq!(
+            edits.len(),
+            1,
+            "react-dom remains so parent stays populated"
+        );
+    }
+
+    #[test]
+    fn catalog_action_emits_parent_rewrite_for_default_catalog() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = workspace_yaml_uri(&dir);
+
+        let mut results = AnalysisResults::default();
+        results
+            .unused_catalog_entries
+            .push(make_catalog_entry("is-even", "default", 2, vec![]));
+
+        let lines = vec!["catalog:", "  is-even: ^1.0.0"];
+        let actions = build_remove_catalog_entry_actions_for_test(
+            &results,
+            dir.path(),
+            &uri,
+            &make_range(1, 1),
+            &lines,
+        );
+
+        assert_eq!(actions.len(), 1);
+        let ca = unwrap_code_action(&actions[0]);
+        let edits = ca
+            .edit
+            .as_ref()
+            .unwrap()
+            .changes
+            .as_ref()
+            .unwrap()
+            .get(&uri)
+            .unwrap();
+        assert_eq!(edits.len(), 2);
+        assert_eq!(edits[1].new_text, "catalog: {}");
+    }
+
+    #[test]
+    fn compute_catalog_deletion_end_scalar() {
+        let lines: Vec<&str> = "catalog:\n  is-even: ^1.0.0\n  is-odd: ^1.0.0\n"
+            .split('\n')
+            .collect();
+        assert_eq!(compute_catalog_deletion_end(&lines, 1), 2);
+    }
+
+    #[test]
+    fn compute_catalog_deletion_end_object_form() {
+        let content = "catalog:\n  react:\n    specifier: ^18.2.0\n    publishConfig: {}\n  is-even: ^1.0.0\n";
+        let lines: Vec<&str> = content.split('\n').collect();
+        assert_eq!(compute_catalog_deletion_end(&lines, 1), 4);
+    }
+
+    use fallow_api::editor_results::{EmptyCatalogGroup, EmptyCatalogGroupFinding};
+
+    fn make_empty_group(name: &str, line: u32) -> EmptyCatalogGroupFinding {
+        make_empty_group_in_file(name, PathBuf::from("pnpm-workspace.yaml"), line)
+    }
+
+    fn make_empty_group_in_file(name: &str, path: PathBuf, line: u32) -> EmptyCatalogGroupFinding {
+        EmptyCatalogGroupFinding::with_actions(EmptyCatalogGroup {
+            catalog_name: name.to_string(),
+            path,
+            line,
+        })
+    }
+
+    #[test]
+    fn empty_catalog_group_action_deletes_single_header_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = workspace_yaml_uri(&dir);
+
+        let mut results = AnalysisResults::default();
+        results
+            .empty_catalog_groups
+            .push(make_empty_group("legacy", 3));
+
+        let lines = vec!["catalogs:", "  react17: {}", "  legacy:"];
+        let actions = build_remove_empty_catalog_group_actions_for_test(
+            &results,
+            dir.path(),
+            &uri,
+            &make_range(2, 2),
+            &lines,
+        );
+
+        assert_eq!(actions.len(), 1, "expected one action for legacy");
+        let ca = unwrap_code_action(&actions[0]);
+        assert_eq!(ca.title, "Remove empty catalog group `legacy`");
+        assert_eq!(ca.kind, Some(CodeActionKind::QUICKFIX));
+
+        let edit = ca.edit.as_ref().unwrap();
+        let changes = edit.changes.as_ref().unwrap();
+        let edits = changes.get(&uri).unwrap();
+        assert_eq!(edits.len(), 1, "empty groups need only one TextEdit");
+        assert_eq!(edits[0].range.start.line, 2);
+        assert_eq!(edits[0].range.start.character, 0);
+        assert_eq!(edits[0].range.end.line, 3);
+        assert_eq!(edits[0].range.end.character, 0);
+        assert_eq!(edits[0].new_text, "");
+
+        let diag = &ca.diagnostics.as_ref().unwrap()[0];
+        assert_eq!(diag.severity, Some(DiagnosticSeverity::WARNING));
+        assert_eq!(diag.source, Some("fallow".to_string()));
+        assert_eq!(
+            diag.code,
+            Some(NumberOrString::String("empty-catalog-group".to_string()))
+        );
+        assert_eq!(diag.message, "Empty catalog group: 'legacy' has no entries");
+        assert_eq!(diag.tags, Some(vec![DiagnosticTag::UNNECESSARY]));
+    }
+
+    #[test]
+    fn empty_catalog_group_action_skips_bun_package_json_groups() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = Uri::from_file_path(dir.path().join("package.json")).unwrap();
+
+        let mut results = AnalysisResults::default();
+        results.empty_catalog_groups.push(make_empty_group_in_file(
+            "empty",
+            PathBuf::from("package.json"),
+            4,
+        ));
+
+        let lines = vec![
+            "{",
+            "  \"workspaces\": {",
+            "    \"catalogs\": {",
+            "      \"empty\": {}",
+            "    }",
+            "  }",
+            "}",
+        ];
+        let actions = build_remove_empty_catalog_group_actions_for_test(
+            &results,
+            dir.path(),
+            &uri,
+            &make_range(3, 3),
+            &lines,
+        );
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn empty_catalog_group_action_skips_when_uri_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let other_uri = Uri::from_file_path(dir.path().join("not-the-workspace.yaml")).unwrap();
+
+        let mut results = AnalysisResults::default();
+        results
+            .empty_catalog_groups
+            .push(make_empty_group("legacy", 3));
+
+        let lines = vec!["catalogs:", "  react17: {}", "  legacy:"];
+        let actions = build_remove_empty_catalog_group_actions_for_test(
+            &results,
+            dir.path(),
+            &other_uri,
+            &make_range(0, 100),
+            &lines,
+        );
+        assert!(actions.is_empty(), "must not offer fix for unrelated URI");
+    }
+
+    #[test]
+    fn empty_catalog_group_action_skips_when_outside_cursor_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = workspace_yaml_uri(&dir);
+
+        let mut results = AnalysisResults::default();
+        results
+            .empty_catalog_groups
+            .push(make_empty_group("legacy", 3));
+
+        let lines = vec!["catalogs:", "  react17: {}", "  legacy:"];
+        let actions = build_remove_empty_catalog_group_actions_for_test(
+            &results,
+            dir.path(),
+            &uri,
+            &make_range(0, 0),
+            &lines,
+        );
+        assert!(
+            actions.is_empty(),
+            "must not offer fix when cursor is outside the finding's line"
+        );
+    }
+
+    #[test]
+    fn empty_catalog_group_action_skips_when_prefix_collision() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = workspace_yaml_uri(&dir);
+
+        let mut results = AnalysisResults::default();
+        results
+            .empty_catalog_groups
+            .push(make_empty_group("react17", 2));
+
+        let lines = vec!["catalogs:", "  react18:"];
+        let actions = build_remove_empty_catalog_group_actions_for_test(
+            &results,
+            dir.path(),
+            &uri,
+            &make_range(1, 1),
+            &lines,
+        );
+        assert!(
+            actions.is_empty(),
+            "anchored match must reject `react17` finding when line says `react18:`"
+        );
+    }
+
+    #[test]
+    fn empty_catalog_group_action_handles_quoted_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = workspace_yaml_uri(&dir);
+
+        let mut results = AnalysisResults::default();
+        results
+            .empty_catalog_groups
+            .push(make_empty_group("@scope/legacy", 2));
+
+        let lines = vec!["catalogs:", "  \"@scope/legacy\":"];
+        let actions = build_remove_empty_catalog_group_actions_for_test(
+            &results,
+            dir.path(),
+            &uri,
+            &make_range(1, 1),
+            &lines,
+        );
+        assert_eq!(actions.len(), 1, "quoted catalog names must match");
+        let ca = unwrap_code_action(&actions[0]);
+        assert!(ca.title.contains("@scope/legacy"));
+    }
+
+    #[test]
+    fn empty_catalog_group_action_handles_multiple_findings() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = workspace_yaml_uri(&dir);
+
+        let mut results = AnalysisResults::default();
+        results
+            .empty_catalog_groups
+            .push(make_empty_group("react17", 2));
+        results
+            .empty_catalog_groups
+            .push(make_empty_group("legacy", 3));
+
+        let lines = vec!["catalogs:", "  react17:", "  legacy:"];
+        let actions = build_remove_empty_catalog_group_actions_for_test(
+            &results,
+            dir.path(),
+            &uri,
+            &make_range(0, 100),
+            &lines,
+        );
+        assert_eq!(actions.len(), 2);
+        let titles: Vec<&str> = actions
+            .iter()
+            .map(|a| unwrap_code_action(a).title.as_str())
+            .collect();
+        assert!(titles.iter().any(|t| t.contains("react17")));
+        assert!(titles.iter().any(|t| t.contains("legacy")));
+    }
+
+    #[test]
+    fn empty_catalog_group_action_short_circuits_on_empty_file_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = workspace_yaml_uri(&dir);
+
+        let mut results = AnalysisResults::default();
+        results
+            .empty_catalog_groups
+            .push(make_empty_group("legacy", 3));
+
+        let actions = build_remove_empty_catalog_group_actions_for_test(
+            &results,
+            dir.path(),
+            &uri,
+            &make_range(0, 100),
+            &[],
+        );
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn build_remove_export_actions_skips_stale_line() {
+        let root = test_root();
+        let file = root.join("src/utils.ts");
+        let uri = Uri::from_file_path(&file).unwrap();
+        let mut results = AnalysisResults::default();
+        results.unused_exports.push(make_unused_export(
+            &file, "foo", 1, // 1-based
+            7,
+        ));
+        let lines = vec!["const foo = 1;"];
+        let actions =
+            build_remove_export_actions_for_test(&results, &file, &uri, &make_range(0, 0), &lines);
+        assert!(
+            actions.is_empty(),
+            "expected zero actions when live line lacks export prefix",
+        );
+    }
+
+    #[test]
+    fn build_remove_export_actions_skips_substring_collision() {
+        let root = test_root();
+        let file = root.join("src/utils.ts");
+        let uri = Uri::from_file_path(&file).unwrap();
+        let mut results = AnalysisResults::default();
+        results.unused_exports.push(make_unused_export(
+            &file, "foo", 1, // 1-based
+            7,
+        ));
+        let lines = vec!["export const foobar = 1;"];
+        let actions =
+            build_remove_export_actions_for_test(&results, &file, &uri, &make_range(0, 0), &lines);
+        assert!(
+            actions.is_empty(),
+            "expected zero actions when cached name only matches as a substring",
+        );
+    }
+
+    #[test]
+    fn build_remove_export_actions_skips_value_reference_collision() {
+        let root = test_root();
+        let file = root.join("src/utils.ts");
+        let uri = Uri::from_file_path(&file).unwrap();
+        let mut results = AnalysisResults::default();
+        results.unused_exports.push(make_unused_export(
+            &file, "foo", 1, // 1-based
+            7,
+        ));
+        let lines = vec!["export const bar = foo;"];
+        let actions =
+            build_remove_export_actions_for_test(&results, &file, &uri, &make_range(0, 0), &lines);
+        assert!(
+            actions.is_empty(),
+            "expected zero actions when cached name appears as a value, not a declaration",
+        );
+    }
+
+    #[test]
+    fn build_remove_export_actions_skips_reexport_block() {
+        let root = test_root();
+        let file = root.join("src/utils.ts");
+        let uri = Uri::from_file_path(&file).unwrap();
+        let mut results = AnalysisResults::default();
+        results.unused_exports.push(make_unused_export(
+            &file, "foo", 1, // 1-based
+            9,
+        ));
+        let lines = vec!["export { foo } from './bar';"];
+        let actions =
+            build_remove_export_actions_for_test(&results, &file, &uri, &make_range(0, 0), &lines);
+        assert!(
+            actions.is_empty(),
+            "expected zero actions on re-export blocks (action's output would be a syntax error)",
+        );
+    }
+
+    #[test]
+    fn build_remove_export_actions_accepts_matching_live_line() {
+        let root = test_root();
+        let file = root.join("src/utils.ts");
+        let uri = Uri::from_file_path(&file).unwrap();
+        let mut results = AnalysisResults::default();
+        results.unused_exports.push(make_unused_export(
+            &file, "foo", 1, // 1-based
+            7,
+        ));
+        let lines = vec!["export const foo = 1;"];
+        let actions =
+            build_remove_export_actions_for_test(&results, &file, &uri, &make_range(0, 0), &lines);
+        assert_eq!(
+            actions.len(),
+            1,
+            "expected one action when live line still matches the cached finding",
+        );
+    }
+
+    #[test]
+    fn declares_export_name_accepts_simple_declarations() {
+        assert!(declares_export_name(
+            "export const foo = 1;",
+            "export ",
+            "foo"
+        ));
+        assert!(declares_export_name(
+            "export let foo = 1;",
+            "export ",
+            "foo"
+        ));
+        assert!(declares_export_name(
+            "export var foo = 1;",
+            "export ",
+            "foo"
+        ));
+        assert!(declares_export_name(
+            "export function foo() {}",
+            "export ",
+            "foo"
+        ));
+        assert!(declares_export_name(
+            "export function* foo() {}",
+            "export ",
+            "foo",
+        ));
+        assert!(declares_export_name(
+            "export async function foo() {}",
+            "export ",
+            "foo",
+        ));
+        assert!(declares_export_name(
+            "export class foo {}",
+            "export ",
+            "foo"
+        ));
+        assert!(declares_export_name(
+            "export abstract class foo {}",
+            "export ",
+            "foo",
+        ));
+        assert!(declares_export_name(
+            "export type foo = string;",
+            "export ",
+            "foo",
+        ));
+        assert!(declares_export_name(
+            "export interface foo {}",
+            "export ",
+            "foo",
+        ));
+        assert!(declares_export_name("export enum foo {}", "export ", "foo"));
+        assert!(declares_export_name(
+            "export namespace foo {}",
+            "export ",
+            "foo",
+        ));
+        assert!(declares_export_name(
+            "export declare const foo: number;",
+            "export ",
+            "foo",
+        ));
+        assert!(declares_export_name(
+            "    export const foo = 1;",
+            "export ",
+            "foo"
+        ));
+    }
+
+    #[test]
+    fn declares_export_name_rejects_value_reference_collision() {
+        assert!(!declares_export_name(
+            "export const bar = foo;",
+            "export ",
+            "foo",
+        ));
+        assert!(!declares_export_name(
+            "export function bar() { return foo; }",
+            "export ",
+            "foo",
+        ));
+        assert!(!declares_export_name(
+            "export const foobar = 1;",
+            "export ",
+            "foo",
+        ));
+        assert!(!declares_export_name(
+            "export class Foo {}",
+            "export ",
+            "foo"
+        ));
+        assert!(!declares_export_name("const foo = 1;", "export ", "foo"));
+        assert!(!declares_export_name(
+            "export const foo = 1;",
+            "export ",
+            ""
+        ));
+    }
+
+    #[test]
+    fn declares_export_name_rejects_reexport_blocks() {
+        assert!(!declares_export_name("export { foo };", "export ", "foo",));
+        assert!(!declares_export_name(
+            "export { foo } from './bar';",
+            "export ",
+            "foo",
+        ));
+        assert!(!declares_export_name(
+            "export { type foo } from './bar';",
+            "export ",
+            "foo",
+        ));
+        assert!(!declares_export_name(
+            "export { foo as bar };",
+            "export ",
+            "foo",
+        ));
+    }
+
+    #[test]
+    fn declares_export_name_handles_multibyte_identifiers() {
+        assert!(declares_export_name(
+            "export const 日本 = 1;",
+            "export ",
+            "日本",
+        ));
+        assert!(!declares_export_name(
+            "export const 日本語 = 1;",
+            "export ",
+            "日本",
+        ));
+    }
+
+    #[test]
+    fn leading_identifier_handles_basic_shapes() {
+        assert_eq!(leading_identifier("foo"), "foo");
+        assert_eq!(leading_identifier("foo bar"), "foo");
+        assert_eq!(leading_identifier("foo()"), "foo");
+        assert_eq!(leading_identifier("foo = 1"), "foo");
+        assert_eq!(leading_identifier(""), "");
+        assert_eq!(leading_identifier("123foo"), "123foo");
+        assert_eq!(leading_identifier("_foo"), "_foo");
+        assert_eq!(leading_identifier("$foo"), "$foo");
+        assert_eq!(leading_identifier(" foo"), "");
+        assert_eq!(leading_identifier("{foo}"), "");
+    }
+
+    #[test]
+    fn strip_declaration_keywords_handles_modifier_stacks() {
+        assert_eq!(strip_declaration_keywords("const foo = 1"), "foo = 1");
+        assert_eq!(strip_declaration_keywords("function foo()"), "foo()");
+        assert_eq!(strip_declaration_keywords("function* foo()"), "foo()");
+        assert_eq!(strip_declaration_keywords("async function foo()"), "foo()",);
+        assert_eq!(strip_declaration_keywords("abstract class Foo"), "Foo",);
+        assert_eq!(
+            strip_declaration_keywords("declare const foo: number"),
+            "foo: number",
+        );
+        assert_eq!(strip_declaration_keywords("foo bar"), "foo bar");
+        assert_eq!(strip_declaration_keywords("    foo"), "foo");
     }
 }

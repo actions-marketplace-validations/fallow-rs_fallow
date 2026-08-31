@@ -1,4 +1,3 @@
-// Shared test harness — not all functions are used by every test file.
 #![allow(dead_code, reason = "shared harness included by multiple test crates")]
 
 use std::path::{Path, PathBuf};
@@ -36,6 +35,15 @@ pub fn fixture_path(name: &str) -> PathBuf {
     path.push("tests/fixtures");
     path.push(name);
     path
+}
+
+/// Drop the Istanbul coverage variables a developer shell may export, so a
+/// test that exercises the `health.coverage` / `health.coverageRoot` config
+/// fallback cannot pass or fail because of ambient `FALLOW_COVERAGE` /
+/// `FALLOW_COVERAGE_ROOT` values. Call before applying a test's own env.
+pub fn scrub_coverage_env(cmd: &mut Command) {
+    cmd.env_remove("FALLOW_COVERAGE")
+        .env_remove("FALLOW_COVERAGE_ROOT");
 }
 
 /// Run an arbitrary fallow command against a fixture, returning structured output.
@@ -92,6 +100,70 @@ pub fn run_fallow_raw(args: &[&str]) -> CommandOutput {
     let bin = fallow_bin();
     let mut cmd = Command::new(&bin);
     cmd.env("RUST_LOG", "").env("NO_COLOR", "1");
+    scrub_coverage_env(&mut cmd);
+    for arg in args {
+        cmd.arg(arg);
+    }
+    let output = cmd.output().expect("failed to run fallow binary");
+    CommandOutput {
+        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+        code: output.status.code().unwrap_or(-1),
+    }
+}
+
+/// Run fallow with raw args and string environment variables.
+pub fn run_fallow_raw_with_env(args: &[&str], env: &[(&str, &str)]) -> CommandOutput {
+    let bin = fallow_bin();
+    let mut cmd = Command::new(&bin);
+    cmd.env("RUST_LOG", "").env("NO_COLOR", "1");
+    scrub_coverage_env(&mut cmd);
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
+    for arg in args {
+        cmd.arg(arg);
+    }
+    let output = cmd.output().expect("failed to run fallow binary");
+    CommandOutput {
+        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+        code: output.status.code().unwrap_or(-1),
+    }
+}
+
+/// Configure a command to use the repository's real type-aware sidecar.
+///
+/// Windows cannot execute the `.mjs` entry point directly, so the harness
+/// mirrors the editor integration by launching the script through Node.
+pub fn configure_type_aware_sidecar(cmd: &mut Command) {
+    let mut sidecar = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    sidecar.pop(); // crates/
+    sidecar.pop(); // project root
+    sidecar.push("tools/type-aware-sidecar/fallow-type-aware.mjs");
+
+    #[cfg(windows)]
+    let sidecar_bin = {
+        let path = std::env::var_os("PATH").expect("PATH must contain the Node.js runtime");
+        std::env::split_paths(&path)
+            .map(|entry| entry.join("node.exe"))
+            .find(|candidate| candidate.is_file())
+            .expect("Node.js executable must be available for type-aware CLI tests")
+    };
+    #[cfg(not(windows))]
+    let sidecar_bin = sidecar.clone();
+
+    cmd.env("FALLOW_TYPE_AWARE_BIN", sidecar_bin);
+    #[cfg(windows)]
+    cmd.env("FALLOW_TYPE_AWARE_SCRIPT", sidecar);
+}
+
+/// Run fallow with the repository's real type-aware sidecar.
+pub fn run_fallow_raw_with_type_aware_sidecar(args: &[&str]) -> CommandOutput {
+    let bin = fallow_bin();
+    let mut cmd = Command::new(&bin);
+    cmd.env("RUST_LOG", "").env("NO_COLOR", "1");
+    configure_type_aware_sidecar(&mut cmd);
     for arg in args {
         cmd.arg(arg);
     }

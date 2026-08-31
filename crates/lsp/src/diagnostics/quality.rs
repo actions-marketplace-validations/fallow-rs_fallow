@@ -1,168 +1,215 @@
 use rustc_hash::FxHashMap;
 
-use tower_lsp::lsp_types::{
+use ls_types::{
     CodeDescription, Diagnostic, DiagnosticRelatedInformation, DiagnosticSeverity, DiagnosticTag,
-    Location, NumberOrString, Position, Range, Url,
+    Location, NumberOrString, Position, Range, Uri,
 };
 
-use fallow_core::duplicates::DuplicationReport;
-use fallow_core::results::AnalysisResults;
+use fallow_api::editor_results::{DuplicateExport, DuplicateLocation};
+use fallow_api::{
+    EditorAnalysisResults as AnalysisResults, EditorDuplicationReport as DuplicationReport,
+};
 
-use super::doc_link;
+use super::doc_link_for_code;
+use crate::position::PositionMapper;
 
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "export name lengths are bounded by source size"
-)]
 pub fn push_duplicate_export_diagnostics(
-    map: &mut FxHashMap<Url, Vec<Diagnostic>>,
+    map: &mut FxHashMap<Uri, Vec<Diagnostic>>,
     results: &AnalysisResults,
+    mapper: &mut PositionMapper,
 ) {
     for dup in &results.duplicate_exports {
-        // Build related information linking all duplicate locations together
+        let dup = &dup.export;
         for loc in &dup.locations {
-            if let Ok(uri) = Url::from_file_path(&loc.path) {
-                let related_info: Vec<DiagnosticRelatedInformation> = dup
-                    .locations
-                    .iter()
-                    .filter(|l| l.path != loc.path)
-                    .filter_map(|l| {
-                        let other_uri = Url::from_file_path(&l.path).ok()?;
-                        Some(DiagnosticRelatedInformation {
-                            location: Location {
-                                uri: other_uri,
-                                range: Range {
-                                    start: Position {
-                                        line: l.line.saturating_sub(1),
-                                        character: l.col,
-                                    },
-                                    end: Position {
-                                        line: l.line.saturating_sub(1),
-                                        character: l.col + dup.export_name.len() as u32,
-                                    },
-                                },
-                            },
-                            message: "Also exported here".to_string(),
-                        })
-                    })
-                    .collect();
-                let line = loc.line.saturating_sub(1);
-                map.entry(uri).or_default().push(Diagnostic {
-                    range: Range {
-                        start: Position {
-                            line,
-                            character: loc.col,
-                        },
-                        end: Position {
-                            line,
-                            character: loc.col + dup.export_name.len() as u32,
-                        },
-                    },
-                    severity: Some(DiagnosticSeverity::WARNING),
-                    source: Some("fallow".to_string()),
-                    code: Some(NumberOrString::String("duplicate-export".to_string())),
-                    code_description: doc_link("duplicate-exports"),
-                    message: format!("Duplicate export '{}'", dup.export_name),
-                    related_information: if related_info.is_empty() {
-                        None
-                    } else {
-                        Some(related_info)
-                    },
-                    ..Default::default()
-                });
-            }
+            push_duplicate_export_location_diagnostic(map, dup, loc, mapper);
         }
     }
 }
 
+fn push_duplicate_export_location_diagnostic(
+    map: &mut FxHashMap<Uri, Vec<Diagnostic>>,
+    dup: &DuplicateExport,
+    loc: &DuplicateLocation,
+    mapper: &mut PositionMapper,
+) {
+    let Some(uri) = Uri::from_file_path(&loc.path) else {
+        return;
+    };
+    let related_info = duplicate_export_related_info(dup, loc, mapper);
+    let line = loc.line.saturating_sub(1);
+    let (start, end) = mapper.utf16_col_span(&loc.path, line, loc.col, &dup.export_name);
+    map.entry(uri).or_default().push(Diagnostic {
+        range: Range {
+            start: Position {
+                line,
+                character: start,
+            },
+            end: Position {
+                line,
+                character: end,
+            },
+        },
+        severity: Some(DiagnosticSeverity::WARNING),
+        source: Some("fallow".to_string()),
+        code: Some(NumberOrString::String("duplicate-export".to_string())),
+        code_description: doc_link_for_code("duplicate-export"),
+        message: format!("Duplicate export '{}'", dup.export_name),
+        related_information: (!related_info.is_empty()).then_some(related_info),
+        ..Default::default()
+    });
+}
+
+fn duplicate_export_related_info(
+    dup: &DuplicateExport,
+    loc: &DuplicateLocation,
+    mapper: &mut PositionMapper,
+) -> Vec<DiagnosticRelatedInformation> {
+    let mut related = Vec::new();
+    for l in dup.locations.iter().filter(|l| l.path != loc.path) {
+        let Some(other_uri) = Uri::from_file_path(&l.path) else {
+            continue;
+        };
+        let line = l.line.saturating_sub(1);
+        let (start, end) = mapper.utf16_col_span(&l.path, line, l.col, &dup.export_name);
+        related.push(DiagnosticRelatedInformation {
+            location: Location {
+                uri: other_uri,
+                range: Range {
+                    start: Position {
+                        line,
+                        character: start,
+                    },
+                    end: Position {
+                        line,
+                        character: end,
+                    },
+                },
+            },
+            message: "Also exported here".to_string(),
+        });
+    }
+    related
+}
+
+pub fn push_duplication_diagnostics(
+    map: &mut FxHashMap<Uri, Vec<Diagnostic>>,
+    duplication: &DuplicationReport,
+    mapper: &mut PositionMapper,
+) {
+    for group in &duplication.clone_groups {
+        for instance in &group.instances {
+            push_duplication_instance_diagnostic(map, group, instance, mapper);
+        }
+    }
+}
+
+/// Push one INFORMATION diagnostic for a single clone instance, with the
+/// group's other instances linked as related info.
 #[expect(
     clippy::cast_possible_truncation,
     reason = "line/col numbers are bounded by source size"
 )]
-pub fn push_duplication_diagnostics(
-    map: &mut FxHashMap<Url, Vec<Diagnostic>>,
-    duplication: &DuplicationReport,
+fn push_duplication_instance_diagnostic(
+    map: &mut FxHashMap<Uri, Vec<Diagnostic>>,
+    group: &fallow_api::editor_duplicates::CloneGroup,
+    instance: &fallow_api::editor_duplicates::CloneInstance,
+    mapper: &mut PositionMapper,
 ) {
-    for group in &duplication.clone_groups {
-        for instance in &group.instances {
-            let Ok(inst_uri) = Url::from_file_path(&instance.file) else {
-                continue;
-            };
+    let Some(inst_uri) = Uri::from_file_path(&instance.file) else {
+        return;
+    };
 
-            let start_line = (instance.start_line as u32).saturating_sub(1);
-            let end_line = (instance.end_line as u32).saturating_sub(1);
+    let start_line = (instance.start_line as u32).saturating_sub(1);
+    let end_line = (instance.end_line as u32).saturating_sub(1);
+    let start_col = mapper.utf16_col(&instance.file, start_line, instance.start_col as u32);
 
-            // Build related information pointing to other instances in the group
-            let related_info: Vec<DiagnosticRelatedInformation> = group
-                .instances
-                .iter()
-                .filter(|other| {
-                    !(other.file == instance.file && other.start_line == instance.start_line)
-                })
-                .filter_map(|other| {
-                    let other_uri = Url::from_file_path(&other.file).ok()?;
-                    Some(DiagnosticRelatedInformation {
-                        location: Location {
-                            uri: other_uri,
-                            range: Range {
-                                start: Position {
-                                    line: (other.start_line as u32).saturating_sub(1),
-                                    character: other.start_col as u32,
-                                },
-                                end: Position {
-                                    line: (other.end_line as u32).saturating_sub(1),
-                                    character: u32::MAX,
-                                },
-                            },
-                        },
-                        message: "Also duplicated here".to_string(),
-                    })
-                })
-                .collect();
+    let related_info = duplication_related_info(group, instance, mapper);
 
-            map.entry(inst_uri).or_default().push(Diagnostic {
+    map.entry(inst_uri).or_default().push(Diagnostic {
+        range: Range {
+            start: Position {
+                line: start_line,
+                character: start_col,
+            },
+            end: Position {
+                line: end_line,
+                character: u32::MAX,
+            },
+        },
+        severity: Some(DiagnosticSeverity::INFORMATION),
+        source: Some("fallow".to_string()),
+        code: Some(NumberOrString::String("code-duplication".to_string())),
+        code_description: "https://docs.fallow.tools/explanations/duplication"
+            .parse::<Uri>()
+            .ok()
+            .map(|href| CodeDescription { href }),
+        message: format!(
+            "Duplicated code block ({} lines, {} instances)",
+            group.line_count,
+            group.instances.len()
+        ),
+        related_information: if related_info.is_empty() {
+            None
+        } else {
+            Some(related_info)
+        },
+        ..Default::default()
+    });
+}
+
+/// Build the "Also duplicated here" related-info entries for every clone
+/// instance in `group` other than `instance` itself.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "line/col numbers are bounded by source size"
+)]
+fn duplication_related_info(
+    group: &fallow_api::editor_duplicates::CloneGroup,
+    instance: &fallow_api::editor_duplicates::CloneInstance,
+    mapper: &mut PositionMapper,
+) -> Vec<DiagnosticRelatedInformation> {
+    let mut related = Vec::new();
+    for other in group
+        .instances
+        .iter()
+        .filter(|other| !(other.file == instance.file && other.start_line == instance.start_line))
+    {
+        let Some(other_uri) = Uri::from_file_path(&other.file) else {
+            continue;
+        };
+        let start_line = (other.start_line as u32).saturating_sub(1);
+        let start_col = mapper.utf16_col(&other.file, start_line, other.start_col as u32);
+        related.push(DiagnosticRelatedInformation {
+            location: Location {
+                uri: other_uri,
                 range: Range {
                     start: Position {
                         line: start_line,
-                        character: instance.start_col as u32,
+                        character: start_col,
                     },
                     end: Position {
-                        line: end_line,
-                        // Extend to end of last line to ensure full block is underlined
+                        line: (other.end_line as u32).saturating_sub(1),
                         character: u32::MAX,
                     },
                 },
-                severity: Some(DiagnosticSeverity::INFORMATION),
-                source: Some("fallow".to_string()),
-                code: Some(NumberOrString::String("code-duplication".to_string())),
-                code_description: Url::parse("https://docs.fallow.tools/explanations/duplication")
-                    .ok()
-                    .map(|href| CodeDescription { href }),
-                message: format!(
-                    "Duplicated code block ({} lines, {} instances)",
-                    group.line_count,
-                    group.instances.len()
-                ),
-                related_information: if related_info.is_empty() {
-                    None
-                } else {
-                    Some(related_info)
-                },
-                ..Default::default()
-            });
-        }
+            },
+            message: "Also duplicated here".to_string(),
+        });
     }
+    related
 }
 
 pub fn push_stale_suppression_diagnostics(
-    map: &mut FxHashMap<Url, Vec<Diagnostic>>,
+    map: &mut FxHashMap<Uri, Vec<Diagnostic>>,
     results: &AnalysisResults,
+    mapper: &mut PositionMapper,
 ) {
     for s in &results.stale_suppressions {
-        let Ok(uri) = Url::from_file_path(&s.path) else {
+        let Some(uri) = Uri::from_file_path(&s.path) else {
             continue;
         };
         let line = s.line.saturating_sub(1);
+        let col = mapper.utf16_col(&s.path, line, s.col);
         let message = format!(
             "Stale suppression: {} ({})",
             s.description(),
@@ -173,7 +220,7 @@ pub fn push_stale_suppression_diagnostics(
             range: Range {
                 start: Position {
                     line,
-                    character: s.col,
+                    character: col,
                 },
                 end: Position {
                     line,
@@ -183,7 +230,7 @@ pub fn push_stale_suppression_diagnostics(
             severity: Some(DiagnosticSeverity::HINT),
             source: Some("fallow".to_string()),
             code: Some(NumberOrString::String("stale-suppression".to_string())),
-            code_description: doc_link("stale-suppressions"),
+            code_description: doc_link_for_code("stale-suppression"),
             message,
             tags: Some(vec![DiagnosticTag::UNNECESSARY]),
             ..Default::default()
@@ -195,11 +242,16 @@ pub fn push_stale_suppression_diagnostics(
 mod tests {
     use std::path::PathBuf;
 
-    use fallow_core::duplicates::{CloneGroup, CloneInstance, DuplicationReport, DuplicationStats};
-    use fallow_core::results::{AnalysisResults, DuplicateExport, DuplicateLocation, UnusedExport};
-    use tower_lsp::lsp_types::{DiagnosticSeverity, NumberOrString, Url};
+    use fallow_api::editor_duplicates::{
+        CloneGroup, CloneInstance, DuplicationReport, DuplicationStats,
+    };
+    use fallow_api::editor_results::{
+        AnalysisResults, DuplicateExport, DuplicateExportFinding, DuplicateLocation, UnusedExport,
+        UnusedExportFinding, UnusedTypeFinding,
+    };
+    use ls_types::{DiagnosticSeverity, NumberOrString, Uri};
 
-    use crate::diagnostics::build_diagnostics;
+    use crate::diagnostics::build_diagnostics_for_test;
 
     fn test_root() -> PathBuf {
         if cfg!(windows) {
@@ -224,6 +276,9 @@ mod tests {
                 clone_groups: 0,
                 clone_instances: 0,
                 duplication_percentage: 0.0,
+                clone_groups_below_min_occurrences: 0,
+                clone_groups_ignored: 0,
+                near_candidates_skipped: 0,
             },
         }
     }
@@ -239,40 +294,38 @@ mod tests {
         let helpers_path = root.join("src/helpers.ts");
 
         let mut results = AnalysisResults::default();
-        results.duplicate_exports.push(DuplicateExport {
-            export_name: "formatDate".to_string(),
-            locations: vec![
-                DuplicateLocation {
-                    path: utils_path.clone(),
-                    line: 15,
-                    col: 0,
-                },
-                DuplicateLocation {
-                    path: helpers_path.clone(),
-                    line: 30,
-                    col: 0,
-                },
-            ],
-        });
+        results
+            .duplicate_exports
+            .push(DuplicateExportFinding::with_actions(DuplicateExport {
+                export_name: "formatDate".to_string(),
+                locations: vec![
+                    DuplicateLocation {
+                        path: utils_path.clone(),
+                        line: 15,
+                        col: 0,
+                    },
+                    DuplicateLocation {
+                        path: helpers_path.clone(),
+                        line: 30,
+                        col: 0,
+                    },
+                ],
+            }));
 
         let duplication = empty_duplication();
-        let diags = build_diagnostics(&results, &duplication, &root);
+        let diags = build_diagnostics_for_test(&results, &duplication, &root);
 
-        // Both files should have a diagnostic
-        let uri_utils = Url::from_file_path(&utils_path).unwrap();
-        let uri_helpers = Url::from_file_path(&helpers_path).unwrap();
+        let uri_utils = Uri::from_file_path(&utils_path).unwrap();
+        let uri_helpers = Uri::from_file_path(&helpers_path).unwrap();
 
         let utils_diags = &diags[&uri_utils];
         assert_eq!(utils_diags.len(), 1);
         let d = &utils_diags[0];
         assert_eq!(d.severity, Some(DiagnosticSeverity::WARNING));
         assert!(d.message.contains("formatDate"));
-        // line 15 (1-based) → 14 (0-based)
         assert_eq!(d.range.start.line, 14);
         assert_eq!(d.range.start.character, 0);
-        // Range spans the export name
         assert_eq!(d.range.end.character, "formatDate".len() as u32);
-        // Related info points to the other file
         let related = d.related_information.as_ref().unwrap();
         assert_eq!(related.len(), 1);
         assert_eq!(related[0].location.uri, uri_helpers);
@@ -311,6 +364,7 @@ mod tests {
                 ],
                 token_count: 50,
                 line_count: 6,
+                similarity: None,
             }],
             clone_families: vec![],
             mirrored_directories: vec![],
@@ -324,13 +378,15 @@ mod tests {
                 clone_groups: 1,
                 clone_instances: 2,
                 duplication_percentage: 12.0,
+                clone_groups_below_min_occurrences: 0,
+                clone_groups_ignored: 0,
+                near_candidates_skipped: 0,
             },
         };
 
-        let diags = build_diagnostics(&results, &duplication, &root);
+        let diags = build_diagnostics_for_test(&results, &duplication, &root);
 
-        // File a.ts should have a diagnostic with related info pointing to b.ts
-        let uri_a = Url::from_file_path(root.join("src/a.ts")).unwrap();
+        let uri_a = Uri::from_file_path(root.join("src/a.ts")).unwrap();
         let diags_a = &diags[&uri_a];
         assert_eq!(diags_a.len(), 1);
 
@@ -343,18 +399,15 @@ mod tests {
         assert!(d.message.contains("6 lines"));
         assert!(d.message.contains("2 instances"));
 
-        // Check related info
         let related = d.related_information.as_ref().unwrap();
         assert_eq!(related.len(), 1);
         assert_eq!(related[0].message, "Also duplicated here");
-        let related_uri = Url::from_file_path(root.join("src/b.ts")).unwrap();
+        let related_uri = Uri::from_file_path(root.join("src/b.ts")).unwrap();
         assert_eq!(related[0].location.uri, related_uri);
-        // b.ts start_line = 20 (1-based) → 19 (0-based)
         assert_eq!(related[0].location.range.start.line, 19);
         assert_eq!(related[0].location.range.start.character, 4);
 
-        // File b.ts should have related info pointing to a.ts
-        let uri_b = Url::from_file_path(root.join("src/b.ts")).unwrap();
+        let uri_b = Uri::from_file_path(root.join("src/b.ts")).unwrap();
         let diags_b = &diags[&uri_b];
         assert_eq!(diags_b.len(), 1);
         let related_b = diags_b[0].related_information.as_ref().unwrap();
@@ -378,6 +431,7 @@ mod tests {
                 }],
                 token_count: 20,
                 line_count: 5,
+                similarity: None,
             }],
             clone_families: vec![],
             mirrored_directories: vec![],
@@ -391,14 +445,16 @@ mod tests {
                 clone_groups: 1,
                 clone_instances: 1,
                 duplication_percentage: 25.0,
+                clone_groups_below_min_occurrences: 0,
+                clone_groups_ignored: 0,
+                near_candidates_skipped: 0,
             },
         };
 
-        let diags = build_diagnostics(&results, &duplication, &root);
-        let uri = Url::from_file_path(root.join("src/only.ts")).unwrap();
+        let diags = build_diagnostics_for_test(&results, &duplication, &root);
+        let uri = Uri::from_file_path(root.join("src/only.ts")).unwrap();
         let d = &diags[&uri][0];
 
-        // Single instance => no "other" instances => no related info
         assert!(d.related_information.is_none());
     }
 
@@ -408,21 +464,22 @@ mod tests {
         let path = root.join("src/solo.ts");
 
         let mut results = AnalysisResults::default();
-        results.duplicate_exports.push(DuplicateExport {
-            export_name: "helper".to_string(),
-            locations: vec![DuplicateLocation {
-                path: path.clone(),
-                line: 5,
-                col: 0,
-            }],
-        });
+        results
+            .duplicate_exports
+            .push(DuplicateExportFinding::with_actions(DuplicateExport {
+                export_name: "helper".to_string(),
+                locations: vec![DuplicateLocation {
+                    path: path.clone(),
+                    line: 5,
+                    col: 0,
+                }],
+            }));
 
         let duplication = empty_duplication();
-        let diags = build_diagnostics(&results, &duplication, &root);
+        let diags = build_diagnostics_for_test(&results, &duplication, &root);
 
-        let uri = Url::from_file_path(&path).unwrap();
+        let uri = Uri::from_file_path(&path).unwrap();
         let d = &diags[&uri][0];
-        // No other locations to relate to
         assert!(d.related_information.is_none());
     }
 
@@ -432,43 +489,50 @@ mod tests {
         let path = root.join("src/file.ts");
         let mut results = AnalysisResults::default();
 
-        // Add one of each issue type to verify all produce code_description
-        results.unused_exports.push(UnusedExport {
-            path: path.clone(),
-            export_name: "e".to_string(),
-            is_type_only: false,
-            line: 1,
-            col: 0,
-            span_start: 0,
-            is_re_export: false,
-        });
-        results.unused_types.push(UnusedExport {
-            path: path.clone(),
-            export_name: "T".to_string(),
-            is_type_only: true,
-            line: 2,
-            col: 0,
-            span_start: 0,
-            is_re_export: false,
-        });
+        results
+            .unused_exports
+            .push(UnusedExportFinding::with_actions(UnusedExport {
+                path: path.clone(),
+                export_name: "e".to_string(),
+                is_type_only: false,
+                line: 1,
+                col: 0,
+                span_start: 0,
+                is_re_export: false,
+            }));
+        results
+            .unused_types
+            .push(UnusedTypeFinding::with_actions(UnusedExport {
+                path: path.clone(),
+                export_name: "T".to_string(),
+                is_type_only: true,
+                line: 2,
+                col: 0,
+                span_start: 0,
+                is_re_export: false,
+            }));
         results
             .unused_files
-            .push(fallow_core::results::UnusedFile { path: path.clone() });
-        results
-            .unused_enum_members
-            .push(fallow_core::results::UnusedMember {
-                path: path.clone(),
-                parent_name: "E".to_string(),
-                member_name: "A".to_string(),
-                kind: fallow_core::extract::MemberKind::EnumMember,
-                line: 3,
-                col: 0,
-            });
+            .push(fallow_api::editor_results::UnusedFileFinding::with_actions(
+                fallow_api::editor_results::UnusedFile { path: path.clone() },
+            ));
+        results.unused_enum_members.push(
+            fallow_api::editor_results::UnusedEnumMemberFinding::with_actions(
+                fallow_api::editor_results::UnusedMember {
+                    path: path.clone(),
+                    parent_name: "E".to_string(),
+                    member_name: "A".to_string(),
+                    kind: fallow_api::editor_extract::MemberKind::EnumMember,
+                    line: 3,
+                    col: 0,
+                },
+            ),
+        );
 
         let duplication = empty_duplication();
-        let diags = build_diagnostics(&results, &duplication, &root);
+        let diags = build_diagnostics_for_test(&results, &duplication, &root);
 
-        let uri = Url::from_file_path(&path).unwrap();
+        let uri = Uri::from_file_path(&path).unwrap();
         let file_diags = &diags[&uri];
 
         for d in file_diags {
@@ -480,7 +544,7 @@ mod tests {
             let href = &d.code_description.as_ref().unwrap().href;
             assert!(
                 href.as_str().starts_with("https://docs.fallow.tools/"),
-                "Doc link should point to fallow docs: {href}"
+                "Doc link should point to fallow docs: {href:?}"
             );
         }
     }

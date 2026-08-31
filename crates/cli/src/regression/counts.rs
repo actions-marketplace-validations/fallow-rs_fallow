@@ -1,11 +1,15 @@
-use fallow_core::results::AnalysisResults;
-
-// ── Regression baseline ─────────────────────────────────────────
+use fallow_types::results::AnalysisResults;
 
 /// Regression baseline: stores issue counts per type for comparison.
 ///
 /// Unlike `BaselineData` which stores individual issue identities for suppression,
 /// this stores counts for "did the total go up?" regression detection.
+///
+/// `schema_version` is the forward-compatibility gate; unknown fields are tolerated
+/// intentionally (see `CheckCounts` `#[serde(default)]`) so adding a new issue type
+/// stays backwards-compatible with existing baselines. Bumping `schema_version`
+/// signals "this baseline cannot be safely loaded by older fallow builds" and
+/// triggers a hard-fail with a regenerate hint in `load_regression_baseline`.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct RegressionBaseline {
     /// Schema version for forward compatibility.
@@ -17,6 +21,10 @@ pub struct RegressionBaseline {
     /// Git SHA at baseline time, if available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git_sha: Option<String>,
+    /// Compatibility identity for the analysis that produced these counts.
+    /// Missing values in version 1 files are interpreted as syntactic.
+    #[serde(default)]
+    pub analysis_identity: fallow_types::semantic::SemanticAnalysisIdentity,
     /// Dead code issue counts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub check: Option<CheckCounts>,
@@ -25,7 +33,7 @@ pub struct RegressionBaseline {
     pub dupes: Option<DupesCounts>,
 }
 
-pub const REGRESSION_SCHEMA_VERSION: u32 = 1;
+pub const REGRESSION_SCHEMA_VERSION: u32 = 2;
 
 /// Per-type issue counts for dead code analysis.
 ///
@@ -53,6 +61,26 @@ pub struct CheckCounts {
     #[serde(default)]
     pub unused_class_members: usize,
     #[serde(default)]
+    pub unused_store_members: usize,
+    #[serde(default)]
+    pub unprovided_injects: usize,
+    #[serde(default)]
+    pub unrendered_components: usize,
+    #[serde(default)]
+    pub unused_component_props: usize,
+    #[serde(default)]
+    pub unused_component_emits: usize,
+    #[serde(default)]
+    pub unused_component_inputs: usize,
+    #[serde(default)]
+    pub unused_component_outputs: usize,
+    #[serde(default)]
+    pub unused_svelte_events: usize,
+    #[serde(default)]
+    pub unused_server_actions: usize,
+    #[serde(default)]
+    pub unused_load_data_keys: usize,
+    #[serde(default)]
     pub unresolved_imports: usize,
     #[serde(default)]
     pub unlisted_dependencies: usize,
@@ -61,11 +89,21 @@ pub struct CheckCounts {
     #[serde(default)]
     pub circular_dependencies: usize,
     #[serde(default)]
+    pub re_export_cycles: usize,
+    #[serde(default)]
     pub type_only_dependencies: usize,
     #[serde(default)]
     pub test_only_dependencies: usize,
     #[serde(default)]
+    pub dev_dependencies_in_production: usize,
+    #[serde(default)]
     pub boundary_violations: usize,
+    #[serde(default)]
+    pub boundary_coverage_violations: usize,
+    #[serde(default)]
+    pub boundary_call_violations: usize,
+    #[serde(default)]
+    pub policy_violations: usize,
 }
 
 impl CheckCounts {
@@ -81,13 +119,28 @@ impl CheckCounts {
             unused_optional_dependencies: results.unused_optional_dependencies.len(),
             unused_enum_members: results.unused_enum_members.len(),
             unused_class_members: results.unused_class_members.len(),
+            unused_store_members: results.unused_store_members.len(),
+            unprovided_injects: results.unprovided_injects.len(),
+            unrendered_components: results.unrendered_components.len(),
+            unused_component_props: results.unused_component_props.len(),
+            unused_component_emits: results.unused_component_emits.len(),
+            unused_component_inputs: results.unused_component_inputs.len(),
+            unused_component_outputs: results.unused_component_outputs.len(),
+            unused_svelte_events: results.unused_svelte_events.len(),
+            unused_server_actions: results.unused_server_actions.len(),
+            unused_load_data_keys: results.unused_load_data_keys.len(),
             unresolved_imports: results.unresolved_imports.len(),
             unlisted_dependencies: results.unlisted_dependencies.len(),
             duplicate_exports: results.duplicate_exports.len(),
             circular_dependencies: results.circular_dependencies.len(),
+            re_export_cycles: results.re_export_cycles.len(),
             type_only_dependencies: results.type_only_dependencies.len(),
             test_only_dependencies: results.test_only_dependencies.len(),
+            dev_dependencies_in_production: results.dev_dependencies_in_production.len(),
             boundary_violations: results.boundary_violations.len(),
+            boundary_coverage_violations: results.boundary_coverage_violations.len(),
+            boundary_call_violations: results.boundary_call_violations.len(),
+            policy_violations: results.policy_violations.len(),
         }
     }
 
@@ -104,20 +157,56 @@ impl CheckCounts {
             unused_optional_dependencies: b.unused_optional_dependencies,
             unused_enum_members: b.unused_enum_members,
             unused_class_members: b.unused_class_members,
+            // `fallow_config::RegressionBaseline` has no `unused_store_members`
+            // field; default to 0 until the config baseline schema gains one.
+            unused_store_members: 0,
+            // `fallow_config::RegressionBaseline` has no `unprovided_injects`
+            // field; default to 0 until the config baseline schema gains one.
+            unprovided_injects: 0,
+            // `fallow_config::RegressionBaseline` has no `unrendered_components`
+            // field; default to 0 until the config baseline schema gains one.
+            unrendered_components: 0,
+            // `fallow_config::RegressionBaseline` has no `unused_component_props`
+            // field; default to 0 until the config baseline schema gains one.
+            unused_component_props: 0,
+            // `fallow_config::RegressionBaseline` has no `unused_component_emits`
+            // field; default to 0 until the config baseline schema gains one.
+            unused_component_emits: 0,
+            // `fallow_config::RegressionBaseline` has no `unused_component_inputs`
+            // field; default to 0 until the config baseline schema gains one.
+            unused_component_inputs: 0,
+            // `fallow_config::RegressionBaseline` has no `unused_component_outputs`
+            // field; default to 0 until the config baseline schema gains one.
+            unused_component_outputs: 0,
+            // `fallow_config::RegressionBaseline` has no `unused_svelte_events`
+            // field; default to 0 until the config baseline schema gains one.
+            unused_svelte_events: 0,
+            // `fallow_config::RegressionBaseline` has no `unused_server_actions`
+            // field; default to 0 until the config baseline schema gains one.
+            unused_server_actions: 0,
+            // `fallow_config::RegressionBaseline` has no `unused_load_data_keys`
+            // field; default to 0 until the config baseline schema gains one.
+            unused_load_data_keys: 0,
             unresolved_imports: b.unresolved_imports,
             unlisted_dependencies: b.unlisted_dependencies,
             duplicate_exports: b.duplicate_exports,
             circular_dependencies: b.circular_dependencies,
+            re_export_cycles: b.re_export_cycles,
             type_only_dependencies: b.type_only_dependencies,
             test_only_dependencies: b.test_only_dependencies,
+            dev_dependencies_in_production: b.dev_dependencies_in_production,
             boundary_violations: b.boundary_violations,
+            boundary_coverage_violations: b.boundary_coverage_violations,
+            boundary_call_violations: b.boundary_call_violations,
+            policy_violations: b.policy_violations,
         }
     }
 
     /// Convert to config-embeddable baseline.
     #[must_use]
-    pub const fn to_config_baseline(&self) -> fallow_config::RegressionBaseline {
+    pub fn to_config_baseline(&self) -> fallow_config::RegressionBaseline {
         fallow_config::RegressionBaseline {
+            analysis_identity: fallow_types::semantic::SemanticAnalysisIdentity::syntactic(),
             total_issues: self.total_issues,
             unused_files: self.unused_files,
             unused_exports: self.unused_exports,
@@ -131,94 +220,69 @@ impl CheckCounts {
             unlisted_dependencies: self.unlisted_dependencies,
             duplicate_exports: self.duplicate_exports,
             circular_dependencies: self.circular_dependencies,
+            re_export_cycles: self.re_export_cycles,
             type_only_dependencies: self.type_only_dependencies,
             test_only_dependencies: self.test_only_dependencies,
+            dev_dependencies_in_production: self.dev_dependencies_in_production,
             boundary_violations: self.boundary_violations,
+            boundary_coverage_violations: self.boundary_coverage_violations,
+            boundary_call_violations: self.boundary_call_violations,
+            policy_violations: self.policy_violations,
         }
     }
 
     /// Per-type deltas (current - baseline) for display. Only includes types with changes.
     pub fn deltas(&self, current: &Self) -> Vec<(&'static str, isize)> {
-        let pairs: Vec<(&str, usize, usize)> = vec![
-            ("unused_files", self.unused_files, current.unused_files),
-            (
-                "unused_exports",
-                self.unused_exports,
-                current.unused_exports,
-            ),
-            ("unused_types", self.unused_types, current.unused_types),
-            (
-                "unused_dependencies",
-                self.unused_dependencies,
-                current.unused_dependencies,
-            ),
-            (
-                "unused_dev_dependencies",
-                self.unused_dev_dependencies,
-                current.unused_dev_dependencies,
-            ),
-            (
-                "unused_optional_dependencies",
-                self.unused_optional_dependencies,
-                current.unused_optional_dependencies,
-            ),
-            (
-                "unused_enum_members",
-                self.unused_enum_members,
-                current.unused_enum_members,
-            ),
-            (
-                "unused_class_members",
-                self.unused_class_members,
-                current.unused_class_members,
-            ),
-            (
-                "unresolved_imports",
-                self.unresolved_imports,
-                current.unresolved_imports,
-            ),
-            (
-                "unlisted_dependencies",
-                self.unlisted_dependencies,
-                current.unlisted_dependencies,
-            ),
-            (
-                "duplicate_exports",
-                self.duplicate_exports,
-                current.duplicate_exports,
-            ),
-            (
-                "circular_dependencies",
-                self.circular_dependencies,
-                current.circular_dependencies,
-            ),
-            (
-                "type_only_dependencies",
-                self.type_only_dependencies,
-                current.type_only_dependencies,
-            ),
-            (
-                "test_only_dependencies",
-                self.test_only_dependencies,
-                current.test_only_dependencies,
-            ),
-            (
-                "boundary_violations",
-                self.boundary_violations,
-                current.boundary_violations,
-            ),
-        ];
-        pairs
-            .into_iter()
-            .filter_map(|(name, baseline, current)| {
-                let delta = current as isize - baseline as isize;
-                if delta != 0 {
-                    Some((name, delta))
-                } else {
-                    None
-                }
-            })
-            .collect()
+        let mut deltas = Vec::new();
+        macro_rules! push_delta {
+            ($field:ident) => {
+                push_count_delta(&mut deltas, stringify!($field), self.$field, current.$field);
+            };
+        }
+
+        push_delta!(unused_files);
+        push_delta!(unused_exports);
+        push_delta!(unused_types);
+        push_delta!(unused_dependencies);
+        push_delta!(unused_dev_dependencies);
+        push_delta!(unused_optional_dependencies);
+        push_delta!(unused_enum_members);
+        push_delta!(unused_class_members);
+        push_delta!(unused_store_members);
+        push_delta!(unprovided_injects);
+        push_delta!(unrendered_components);
+        push_delta!(unused_component_props);
+        push_delta!(unused_component_emits);
+        push_delta!(unused_component_inputs);
+        push_delta!(unused_component_outputs);
+        push_delta!(unused_svelte_events);
+        push_delta!(unused_server_actions);
+        push_delta!(unused_load_data_keys);
+        push_delta!(unresolved_imports);
+        push_delta!(unlisted_dependencies);
+        push_delta!(duplicate_exports);
+        push_delta!(circular_dependencies);
+        push_delta!(re_export_cycles);
+        push_delta!(type_only_dependencies);
+        push_delta!(test_only_dependencies);
+        push_delta!(dev_dependencies_in_production);
+        push_delta!(boundary_violations);
+        push_delta!(boundary_coverage_violations);
+        push_delta!(boundary_call_violations);
+        push_delta!(policy_violations);
+        deltas
+    }
+}
+
+fn push_count_delta(
+    deltas: &mut Vec<(&'static str, isize)>,
+    name: &'static str,
+    baseline: usize,
+    current: usize,
+) {
+    let delta = current as isize - baseline as isize;
+    if delta != 0 {
+        deltas.push((name, delta));
     }
 }
 
@@ -234,34 +298,35 @@ pub struct DupesCounts {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fallow_core::results::*;
+    use fallow_types::output_dead_code::*;
+    use fallow_types::results::*;
     use std::path::PathBuf;
-
-    // ── CheckCounts::from_results ──────────────────────────────────
 
     #[test]
     fn check_counts_from_results() {
         let mut results = AnalysisResults::default();
-        results.unused_files.push(UnusedFile {
-            path: PathBuf::from("a.ts"),
-        });
-        results.unused_exports.push(UnusedExport {
-            path: PathBuf::from("b.ts"),
-            export_name: "foo".into(),
-            is_type_only: false,
-            line: 1,
-            col: 0,
-            span_start: 0,
-            is_re_export: false,
-        });
+        results
+            .unused_files
+            .push(UnusedFileFinding::with_actions(UnusedFile {
+                path: PathBuf::from("a.ts"),
+            }));
+        results
+            .unused_exports
+            .push(UnusedExportFinding::with_actions(UnusedExport {
+                path: PathBuf::from("b.ts"),
+                export_name: "foo".into(),
+                is_type_only: false,
+                line: 1,
+                col: 0,
+                span_start: 0,
+                is_re_export: false,
+            }));
         let counts = CheckCounts::from_results(&results);
         assert_eq!(counts.total_issues, 2);
         assert_eq!(counts.unused_files, 1);
         assert_eq!(counts.unused_exports, 1);
         assert_eq!(counts.unused_types, 0);
     }
-
-    // ── CheckCounts::deltas ────────────────────────────────────────
 
     #[test]
     fn deltas_reports_changes_only() {
@@ -275,13 +340,28 @@ mod tests {
             unused_optional_dependencies: 0,
             unused_enum_members: 0,
             unused_class_members: 0,
+            unused_store_members: 0,
+            unprovided_injects: 0,
+            unrendered_components: 0,
+            unused_component_props: 0,
+            unused_component_emits: 0,
+            unused_component_inputs: 0,
+            unused_component_outputs: 0,
+            unused_svelte_events: 0,
+            unused_server_actions: 0,
+            unused_load_data_keys: 0,
             unresolved_imports: 0,
             unlisted_dependencies: 0,
             duplicate_exports: 0,
             circular_dependencies: 0,
+            re_export_cycles: 0,
             type_only_dependencies: 0,
             test_only_dependencies: 0,
+            dev_dependencies_in_production: 0,
             boundary_violations: 0,
+            boundary_coverage_violations: 0,
+            boundary_call_violations: 0,
+            policy_violations: 0,
         };
         let current = CheckCounts {
             unused_files: 7,   // +2
@@ -295,11 +375,10 @@ mod tests {
         assert!(deltas.contains(&("unused_exports", -2)));
     }
 
-    // ── Regression baseline serialization roundtrip ────────────────
-
     #[test]
     fn regression_baseline_roundtrip() {
         let baseline = RegressionBaseline {
+            analysis_identity: fallow_types::semantic::SemanticAnalysisIdentity::default(),
             schema_version: 1,
             fallow_version: "2.4.0".into(),
             timestamp: "2026-03-27T10:00:00Z".into(),
@@ -314,13 +393,28 @@ mod tests {
                 unused_optional_dependencies: 0,
                 unused_enum_members: 1,
                 unused_class_members: 1,
+                unused_store_members: 0,
+                unprovided_injects: 0,
+                unrendered_components: 0,
+                unused_component_props: 0,
+                unused_component_emits: 0,
+                unused_component_inputs: 0,
+                unused_component_outputs: 0,
+                unused_svelte_events: 0,
+                unused_server_actions: 0,
+                unused_load_data_keys: 0,
                 unresolved_imports: 0,
                 unlisted_dependencies: 1,
                 duplicate_exports: 0,
                 circular_dependencies: 1,
+                re_export_cycles: 0,
                 type_only_dependencies: 0,
                 test_only_dependencies: 0,
+                dev_dependencies_in_production: 0,
                 boundary_violations: 0,
+                boundary_coverage_violations: 0,
+                boundary_call_violations: 0,
+                policy_violations: 0,
             }),
             dupes: Some(DupesCounts {
                 clone_groups: 12,
@@ -334,8 +428,6 @@ mod tests {
         assert_eq!(loaded.dupes.as_ref().unwrap().clone_groups, 12);
     }
 
-    // ── CheckCounts config baseline roundtrip ────────────────────────
-
     #[test]
     fn check_counts_config_roundtrip() {
         let counts = CheckCounts {
@@ -348,13 +440,28 @@ mod tests {
             unused_optional_dependencies: 1,
             unused_enum_members: 1,
             unused_class_members: 1,
+            unused_store_members: 0,
+            unprovided_injects: 0,
+            unrendered_components: 0,
+            unused_component_props: 0,
+            unused_component_emits: 0,
+            unused_component_inputs: 0,
+            unused_component_outputs: 0,
+            unused_svelte_events: 0,
+            unused_server_actions: 0,
+            unused_load_data_keys: 0,
             unresolved_imports: 0,
             unlisted_dependencies: 1,
             duplicate_exports: 0,
             circular_dependencies: 0,
+            re_export_cycles: 0,
             type_only_dependencies: 0,
             test_only_dependencies: 0,
+            dev_dependencies_in_production: 0,
             boundary_violations: 0,
+            boundary_coverage_violations: 0,
+            boundary_call_violations: 0,
+            policy_violations: 0,
         };
         let config_baseline = counts.to_config_baseline();
         let roundtripped = CheckCounts::from_config_baseline(&config_baseline);
@@ -387,21 +494,34 @@ mod tests {
             unused_optional_dependencies: 0,
             unused_enum_members: 0,
             unused_class_members: 0,
+            unused_store_members: 0,
+            unprovided_injects: 0,
+            unrendered_components: 0,
+            unused_component_props: 0,
+            unused_component_emits: 0,
+            unused_component_inputs: 0,
+            unused_component_outputs: 0,
+            unused_svelte_events: 0,
+            unused_server_actions: 0,
+            unused_load_data_keys: 0,
             unresolved_imports: 0,
             unlisted_dependencies: 0,
             duplicate_exports: 0,
             circular_dependencies: 0,
+            re_export_cycles: 0,
             type_only_dependencies: 0,
             test_only_dependencies: 0,
+            dev_dependencies_in_production: 0,
             boundary_violations: 0,
+            boundary_coverage_violations: 0,
+            boundary_call_violations: 0,
+            policy_violations: 0,
         };
         let config_baseline = counts.to_config_baseline();
         let roundtripped = CheckCounts::from_config_baseline(&config_baseline);
         assert_eq!(roundtripped.total_issues, 0);
         assert_eq!(roundtripped.unused_files, 0);
     }
-
-    // ── deltas edge cases ──────────────────────────────────────────
 
     #[test]
     fn deltas_empty_when_identical() {
@@ -415,13 +535,28 @@ mod tests {
             unused_optional_dependencies: 0,
             unused_enum_members: 0,
             unused_class_members: 0,
+            unused_store_members: 0,
+            unprovided_injects: 0,
+            unrendered_components: 0,
+            unused_component_props: 0,
+            unused_component_emits: 0,
+            unused_component_inputs: 0,
+            unused_component_outputs: 0,
+            unused_svelte_events: 0,
+            unused_server_actions: 0,
+            unused_load_data_keys: 0,
             unresolved_imports: 0,
             unlisted_dependencies: 0,
             duplicate_exports: 0,
             circular_dependencies: 0,
+            re_export_cycles: 0,
             type_only_dependencies: 0,
             test_only_dependencies: 0,
+            dev_dependencies_in_production: 0,
             boundary_violations: 0,
+            boundary_coverage_violations: 0,
+            boundary_call_violations: 0,
+            policy_violations: 0,
         };
         let deltas = counts.deltas(&counts);
         assert!(deltas.is_empty());
@@ -439,16 +574,31 @@ mod tests {
             unused_optional_dependencies: 0,
             unused_enum_members: 0,
             unused_class_members: 0,
+            unused_store_members: 0,
+            unprovided_injects: 0,
+            unrendered_components: 0,
+            unused_component_props: 0,
+            unused_component_emits: 0,
+            unused_component_inputs: 0,
+            unused_component_outputs: 0,
+            unused_svelte_events: 0,
+            unused_server_actions: 0,
+            unused_load_data_keys: 0,
             unresolved_imports: 0,
             unlisted_dependencies: 0,
             duplicate_exports: 0,
             circular_dependencies: 0,
+            re_export_cycles: 0,
             type_only_dependencies: 0,
             test_only_dependencies: 0,
+            dev_dependencies_in_production: 0,
             boundary_violations: 0,
+            boundary_coverage_violations: 0,
+            boundary_call_violations: 0,
+            policy_violations: 0,
         };
         let current = CheckCounts {
-            total_issues: 14,
+            total_issues: 15,
             unused_files: 1,
             unused_exports: 1,
             unused_types: 1,
@@ -457,17 +607,31 @@ mod tests {
             unused_optional_dependencies: 1,
             unused_enum_members: 1,
             unused_class_members: 1,
+            unused_store_members: 1,
+            unprovided_injects: 1,
+            unrendered_components: 1,
+            unused_component_props: 0,
+            unused_component_emits: 0,
+            unused_component_inputs: 0,
+            unused_component_outputs: 0,
+            unused_svelte_events: 0,
+            unused_server_actions: 0,
+            unused_load_data_keys: 0,
             unresolved_imports: 1,
             unlisted_dependencies: 1,
             duplicate_exports: 1,
             circular_dependencies: 1,
+            re_export_cycles: 0,
             type_only_dependencies: 1,
             test_only_dependencies: 1,
+            dev_dependencies_in_production: 0,
             boundary_violations: 1,
+            boundary_coverage_violations: 0,
+            boundary_call_violations: 0,
+            policy_violations: 0,
         };
         let deltas = baseline.deltas(&current);
-        // total_issues is not in deltas — only per-type fields
-        assert_eq!(deltas.len(), 15);
+        assert_eq!(deltas.len(), 18);
         for (_, d) in &deltas {
             assert_eq!(*d, 1);
         }
@@ -485,19 +649,34 @@ mod tests {
             unused_optional_dependencies: 0,
             unused_enum_members: 0,
             unused_class_members: 0,
+            unused_store_members: 0,
+            unprovided_injects: 0,
+            unrendered_components: 0,
+            unused_component_props: 0,
+            unused_component_emits: 0,
+            unused_component_inputs: 0,
+            unused_component_outputs: 0,
+            unused_svelte_events: 0,
+            unused_server_actions: 0,
+            unused_load_data_keys: 0,
             unresolved_imports: 0,
             unlisted_dependencies: 0,
             duplicate_exports: 0,
             circular_dependencies: 0,
+            re_export_cycles: 0,
             type_only_dependencies: 0,
             test_only_dependencies: 0,
+            dev_dependencies_in_production: 0,
             boundary_violations: 0,
+            boundary_coverage_violations: 0,
+            boundary_call_violations: 0,
+            policy_violations: 0,
         };
         let current = CheckCounts {
-            unused_files: 3,       // -2
-            unused_exports: 5,     // +2
-            unused_types: 0,       // -2
-            unresolved_imports: 1, // +1
+            unused_files: 3,
+            unused_exports: 5,
+            unused_types: 0,
+            unresolved_imports: 1,
             ..baseline
         };
         let deltas = baseline.deltas(&current);
@@ -507,8 +686,6 @@ mod tests {
         assert!(deltas.contains(&("unused_types", -2)));
         assert!(deltas.contains(&("unresolved_imports", 1)));
     }
-
-    // ── DupesCounts serialization ──────────────────────────────────
 
     #[test]
     fn dupes_counts_roundtrip() {
@@ -524,18 +701,16 @@ mod tests {
 
     #[test]
     fn dupes_counts_default_fields() {
-        // Deserializing with missing fields should default to zero
         let json = "{}";
         let loaded: DupesCounts = serde_json::from_str(json).unwrap();
         assert_eq!(loaded.clone_groups, 0);
         assert!((loaded.duplication_percentage).abs() < f64::EPSILON);
     }
 
-    // ── RegressionBaseline with missing optional sections ──────────
-
     #[test]
     fn baseline_without_check_section() {
         let baseline = RegressionBaseline {
+            analysis_identity: fallow_types::semantic::SemanticAnalysisIdentity::default(),
             schema_version: 1,
             fallow_version: "2.4.0".into(),
             timestamp: "2026-03-27T10:00:00Z".into(),
@@ -555,6 +730,7 @@ mod tests {
     #[test]
     fn baseline_without_dupes_section() {
         let baseline = RegressionBaseline {
+            analysis_identity: fallow_types::semantic::SemanticAnalysisIdentity::default(),
             schema_version: 1,
             fallow_version: "2.4.0".into(),
             timestamp: "2026-03-27T10:00:00Z".into(),
@@ -576,6 +752,7 @@ mod tests {
     #[test]
     fn baseline_without_git_sha() {
         let baseline = RegressionBaseline {
+            analysis_identity: fallow_types::semantic::SemanticAnalysisIdentity::default(),
             schema_version: 1,
             fallow_version: "2.4.0".into(),
             timestamp: "2026-03-27T10:00:00Z".into(),
@@ -584,13 +761,10 @@ mod tests {
             dupes: None,
         };
         let json = serde_json::to_string_pretty(&baseline).unwrap();
-        // git_sha should be skipped in serialization
         assert!(!json.contains("git_sha"));
         let loaded: RegressionBaseline = serde_json::from_str(&json).unwrap();
         assert!(loaded.git_sha.is_none());
     }
-
-    // ── Forward compatibility: extra fields are ignored ──────────────
 
     #[test]
     fn baseline_json_with_unknown_check_fields_deserializes() {
@@ -604,9 +778,7 @@ mod tests {
                 "some_future_field": 99
             }
         }"#;
-        // Should not fail — extra fields are ignored by serde default
         let loaded: Result<RegressionBaseline, _> = serde_json::from_str(json);
-        // Note: serde doesn't deny unknown fields by default, so this should work
         assert!(loaded.is_ok());
         let loaded = loaded.unwrap();
         assert_eq!(loaded.check.as_ref().unwrap().total_issues, 10);

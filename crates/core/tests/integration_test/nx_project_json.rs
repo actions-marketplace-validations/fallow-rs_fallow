@@ -49,9 +49,10 @@ fn nx_project_json_marks_nested_main_as_reachable_without_workspace_package_json
         .iter()
         .map(|issue| {
             issue
+                .file
                 .path
                 .strip_prefix(root)
-                .unwrap_or(&issue.path)
+                .unwrap_or(&issue.file.path)
                 .to_string_lossy()
                 .replace('\\', "/")
         })
@@ -68,7 +69,7 @@ fn nx_project_json_marks_nested_main_as_reachable_without_workspace_package_json
     let unused_exports: Vec<String> = results
         .unused_exports
         .iter()
-        .map(|issue| issue.export_name.clone())
+        .map(|issue| issue.export.export_name.clone())
         .collect();
     assert!(
         unused_exports.contains(&"unusedHelper".to_string()),
@@ -80,7 +81,7 @@ fn nx_project_json_marks_nested_main_as_reachable_without_workspace_package_json
         results
             .unresolved_imports
             .iter()
-            .map(|issue| issue.specifier.as_str())
+            .map(|issue| issue.import.specifier.as_str())
             .collect::<Vec<_>>()
     );
 }

@@ -2,8 +2,6 @@ use fallow_types::extract::{ExportName, ImportedName, VisibilityTag};
 
 use crate::tests::parse_ts as parse_source;
 
-// ---- JSDoc @public tag extraction tests ----
-
 #[test]
 fn jsdoc_public_tag_on_named_export() {
     let info = parse_source("/** @public */\nexport const foo = 1;");
@@ -83,7 +81,6 @@ fn no_jsdoc_tag_not_public() {
 
 #[test]
 fn line_comment_not_jsdoc() {
-    // Only /** */ JSDoc comments count, not // comments
     let info = parse_source("// @public\nexport const foo = 1;");
     assert_eq!(info.exports.len(), 1);
     assert_eq!(info.exports[0].visibility, VisibilityTag::None);
@@ -91,7 +88,6 @@ fn line_comment_not_jsdoc() {
 
 #[test]
 fn jsdoc_public_does_not_match_public_foo() {
-    // @publicFoo should NOT match @public
     let info = parse_source("/** @publicFoo */\nexport const foo = 1;");
     assert_eq!(info.exports.len(), 1);
     assert_eq!(info.exports[0].visibility, VisibilityTag::None);
@@ -99,7 +95,6 @@ fn jsdoc_public_does_not_match_public_foo() {
 
 #[test]
 fn jsdoc_public_does_not_match_public_underscore() {
-    // @public_api should NOT match @public (underscore is an identifier char)
     let info = parse_source("/** @public_api */\nexport const foo = 1;");
     assert_eq!(info.exports.len(), 1);
     assert_eq!(info.exports[0].visibility, VisibilityTag::None);
@@ -107,7 +102,6 @@ fn jsdoc_public_does_not_match_public_underscore() {
 
 #[test]
 fn jsdoc_apipublic_no_space_does_not_match() {
-    // @apipublic (no space) should NOT match @api public
     let info = parse_source("/** @apipublic */\nexport const foo = 1;");
     assert_eq!(info.exports.len(), 1);
     assert_eq!(info.exports[0].visibility, VisibilityTag::None);
@@ -117,7 +111,6 @@ fn jsdoc_apipublic_no_space_does_not_match() {
 fn jsdoc_public_on_export_specifier_list() {
     let source = "const foo = 1;\nconst bar = 2;\n/** @public */\nexport { foo, bar };";
     let info = parse_source(source);
-    // @public on the export statement applies to all specifiers
     assert_eq!(info.exports.len(), 2);
     assert_eq!(info.exports[0].visibility, VisibilityTag::Public);
     assert_eq!(info.exports[1].visibility, VisibilityTag::Public);
@@ -132,11 +125,8 @@ fn jsdoc_public_only_applies_to_attached_export() {
     assert_eq!(info.exports[1].visibility, VisibilityTag::None);
 }
 
-// ---- Additional JSDoc @public tag tests ----
-
 #[test]
 fn jsdoc_public_block_comment_not_jsdoc() {
-    // /* @public */ is a block comment, not a JSDoc comment (requires /**)
     let info = parse_source("/* @public */\nexport const foo = 1;");
     assert_eq!(info.exports.len(), 1);
     assert_eq!(info.exports[0].visibility, VisibilityTag::None);
@@ -176,7 +166,6 @@ fn jsdoc_public_on_let_export() {
 
 #[test]
 fn jsdoc_public_with_trailing_description() {
-    // @public followed by descriptive text (space-separated) should still match
     let info = parse_source("/** @public This is always exported */\nexport const foo = 1;");
     assert_eq!(info.exports.len(), 1);
     assert_eq!(info.exports[0].visibility, VisibilityTag::Public);
@@ -184,7 +173,6 @@ fn jsdoc_public_with_trailing_description() {
 
 #[test]
 fn jsdoc_api_public_with_extra_whitespace() {
-    // @api followed by multiple spaces then public
     let info = parse_source("/** @api   public */\nexport const foo = 1;");
     assert_eq!(info.exports.len(), 1);
     assert_eq!(info.exports[0].visibility, VisibilityTag::Public);
@@ -192,17 +180,13 @@ fn jsdoc_api_public_with_extra_whitespace() {
 
 #[test]
 fn jsdoc_api_public_with_newline() {
-    // @api on one line, public on the next
     let info = parse_source("/**\n * @api\n * public\n */\nexport const foo = 1;");
     assert_eq!(info.exports.len(), 1);
-    // trim_start includes newlines, so "* public\n */" starts with "* public", not "public"
-    // This should NOT match because there is a "* " prefix before "public"
     assert_eq!(info.exports[0].visibility, VisibilityTag::None);
 }
 
 #[test]
 fn jsdoc_api_publicfoo_does_not_match() {
-    // @api publicFoo should not match (publicFoo is not standalone "public")
     let info = parse_source("/** @api publicFoo */\nexport const foo = 1;");
     assert_eq!(info.exports.len(), 1);
     assert_eq!(info.exports[0].visibility, VisibilityTag::None);
@@ -229,7 +213,6 @@ fn jsdoc_public_mixed_three_exports() {
 
 #[test]
 fn jsdoc_public_does_not_match_numeric_suffix() {
-    // @public2 should NOT match @public (digit is an ident char)
     let info = parse_source("/** @public2 */\nexport const foo = 1;");
     assert_eq!(info.exports.len(), 1);
     assert_eq!(info.exports[0].visibility, VisibilityTag::None);
@@ -251,7 +234,6 @@ fn jsdoc_public_on_abstract_class_export() {
 
 #[test]
 fn jsdoc_public_star_prefix_in_multiline() {
-    // Standard JSDoc with * prefix on each line
     let info = parse_source(
         "/**\n * @param x - the value\n * @returns the result\n * @public\n */\nexport const foo = 1;",
     );
@@ -275,7 +257,6 @@ fn jsdoc_api_public_on_function() {
 
 #[test]
 fn jsdoc_api_private_does_not_set_public() {
-    // @api private is not @api public
     let info = parse_source("/** @api private */\nexport const foo = 1;");
     assert_eq!(info.exports.len(), 1);
     assert_eq!(info.exports[0].visibility, VisibilityTag::None);
@@ -283,14 +264,11 @@ fn jsdoc_api_private_does_not_set_public() {
 
 #[test]
 fn jsdoc_public_not_leaked_across_statements() {
-    // The @public tag is on a non-export statement; the export that follows should NOT inherit it
     let source = "/** @public */\nconst internal = 1;\nexport const foo = internal;";
     let info = parse_source(source);
     assert_eq!(info.exports.len(), 1);
     assert_eq!(info.exports[0].visibility, VisibilityTag::None);
 }
-
-// ── JSDoc @public tag detection ──────────────────────────────
 
 #[test]
 fn jsdoc_public_tag_marks_export_public() {
@@ -386,8 +364,6 @@ fn export_without_jsdoc_not_public() {
     assert_eq!(info.exports.len(), 1);
     assert_eq!(info.exports[0].visibility, VisibilityTag::None);
 }
-
-// ---- JSDoc import() type expression extraction tests ----
 
 #[test]
 fn jsdoc_import_type_in_param_recorded_as_type_import() {
@@ -514,7 +490,6 @@ fn jsdoc_import_without_member_recorded_as_side_effect() {
 
 #[test]
 fn jsdoc_import_type_not_extracted_from_plain_comment() {
-    // `/*` (single-star) is not a JSDoc block; the scanner should skip it.
     let info =
         parse_source("/* @param foo {import('./types').Foo} */\nfunction bar() { return 1; }");
     assert!(info.imports.iter().all(|i| i.source != "./types"));
@@ -540,8 +515,6 @@ fn jsdoc_import_type_empty_path_ignored() {
     let info = parse_source("/**\n * @param x {import('').Foo}\n */\nfunction f(x) { return x; }");
     assert!(info.imports.is_empty());
 }
-
-// ---- JSDoc @internal tag extraction tests ----
 
 #[test]
 fn internal_tag_basic() {
@@ -573,8 +546,6 @@ fn internal_tag_on_default_export() {
     assert_eq!(info.exports[0].visibility, VisibilityTag::Internal);
 }
 
-// ---- JSDoc @beta tag extraction tests ----
-
 #[test]
 fn beta_tag_basic() {
     let info = parse_source("/** @beta */ export const foo = 1;");
@@ -599,8 +570,6 @@ fn beta_tag_on_function_export() {
     assert_eq!(info.exports[0].visibility, VisibilityTag::Beta);
 }
 
-// ---- Visibility tag priority tests ----
-
 #[test]
 fn public_tag_still_works() {
     let info = parse_source("/** @public */ export const foo = 1;");
@@ -614,6 +583,31 @@ fn no_visibility_tag() {
 }
 
 #[test]
+fn expected_unused_tag_basic() {
+    let info = parse_source("/** @expected-unused */ export const foo = 1;");
+    assert_eq!(info.exports[0].visibility, VisibilityTag::ExpectedUnused);
+    assert_eq!(info.exports[0].expected_unused_reason, None);
+}
+
+#[test]
+fn expected_unused_tag_with_reason() {
+    let info =
+        parse_source("/** @expected-unused -- public package entry */ export const foo = 1;");
+    assert_eq!(info.exports[0].visibility, VisibilityTag::ExpectedUnused);
+    assert_eq!(
+        info.exports[0].expected_unused_reason.as_deref(),
+        Some("public package entry")
+    );
+}
+
+#[test]
+fn expected_unused_tag_empty_reason_is_missing() {
+    let info = parse_source("/** @expected-unused -- */ export const foo = 1;");
+    assert_eq!(info.exports[0].visibility, VisibilityTag::ExpectedUnused);
+    assert_eq!(info.exports[0].expected_unused_reason, None);
+}
+
+#[test]
 fn public_takes_priority_over_internal() {
     let info = parse_source("/** @public @internal */ export const foo = 1;");
     assert_eq!(info.exports[0].visibility, VisibilityTag::Public);
@@ -624,8 +618,6 @@ fn internal_takes_priority_over_beta() {
     let info = parse_source("/** @internal @beta */ export const foo = 1;");
     assert_eq!(info.exports[0].visibility, VisibilityTag::Internal);
 }
-
-// ---- JSDoc @alpha tag extraction tests ----
 
 #[test]
 fn alpha_tag_basic() {

@@ -8,7 +8,7 @@ homepage.workspace = true
 documentation.workspace = true
 keywords.workspace = true
 categories.workspace = true
-description = "Node.js bindings for fallow dead-code, duplication, and health analyses"
+description = "Node.js bindings for fallow: deterministic codebase intelligence (quality, risk, duplication, architecture, dependencies, styling, cleanup) for TypeScript and JavaScript"
 publish = false
 
 [lints]
@@ -16,14 +16,22 @@ workspace = true
 
 [lib]
 crate-type = ["cdylib"]
-test = false
 doctest = false
 
 [dependencies]
-fallow-cli = { workspace = true }
+fallow-api = { workspace = true }
 napi = { version = "3", features = ["serde-json", "tokio_rt"] }
 napi-derive = "3"
 serde_json = { workspace = true }
 
 [build-dependencies]
 napi-build = "2"
+
+[dev-dependencies]
+fallow-types = { workspace = true }
+tempfile = { workspace = true }
+
+[package.metadata.cargo-machete]
+ignored = [
+  "napi-build", # used from build.rs to emit NAPI build metadata; cargo-machete can miss build-script-only deps
+]

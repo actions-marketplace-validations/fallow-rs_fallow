@@ -3,8 +3,12 @@ use crate::tools::ISSUE_TYPE_FLAGS;
 
 #[test]
 fn issue_type_flags_are_complete() {
-    assert_eq!(ISSUE_TYPE_FLAGS.len(), 12);
-    for &(name, flag) in ISSUE_TYPE_FLAGS {
+    let expected = fallow_types::issue_meta::ISSUE_KIND_META
+        .iter()
+        .filter_map(|meta| meta.mcp_pair())
+        .count();
+    assert_eq!(ISSUE_TYPE_FLAGS.len(), expected);
+    for &(name, flag) in ISSUE_TYPE_FLAGS.iter() {
         assert!(
             flag.starts_with("--"),
             "flag for {name} should start with --"
@@ -60,21 +64,115 @@ fn check_changed_params_require_since() {
 }
 
 #[test]
-fn health_production_coverage_params_require_coverage() {
+fn security_candidates_params_minimal() {
+    let params: SecurityCandidatesParams = serde_json::from_str("{}").unwrap();
+    assert!(params.root.is_none());
+    assert!(params.config.is_none());
+    assert!(params.workspace.is_none());
+    assert!(params.changed_since.is_none());
+    assert!(params.paths.is_none());
+    assert!(params.changed_workspaces.is_none());
+    assert!(params.surface.is_none());
+    assert!(params.gate.is_none());
+    assert!(params.no_cache.is_none());
+    assert!(params.threads.is_none());
+}
+
+#[test]
+fn security_candidates_params_all_fields_deserialize() {
+    let json = r#"{
+        "root": "/project",
+        "config": "fallow.toml",
+        "workspace": "apps/web",
+        "changed_since": "HEAD~3",
+        "paths": ["src/app.tsx", "src/lib/secret.ts"],
+        "changed_workspaces": "origin/main",
+        "surface": true,
+        "gate": "newly-reachable",
+        "no_cache": true,
+        "threads": 4
+    }"#;
+    let params: SecurityCandidatesParams = serde_json::from_str(json).unwrap();
+    assert_eq!(params.root.as_deref(), Some("/project"));
+    assert_eq!(params.config.as_deref(), Some("fallow.toml"));
+    assert_eq!(params.workspace.as_deref(), Some("apps/web"));
+    assert_eq!(params.changed_since.as_deref(), Some("HEAD~3"));
+    assert_eq!(
+        params.paths.as_deref(),
+        Some(&["src/app.tsx".to_string(), "src/lib/secret.ts".to_string()][..])
+    );
+    assert_eq!(params.changed_workspaces.as_deref(), Some("origin/main"));
+    assert_eq!(params.surface, Some(true));
+    assert_eq!(params.gate.as_deref(), Some("newly-reachable"));
+    assert_eq!(params.no_cache, Some(true));
+    assert_eq!(params.threads, Some(4));
+}
+
+#[test]
+fn inspect_target_params_file_deserialize() {
+    let json = r#"{
+        "target": {"type": "file", "file": "src/utils.ts"},
+        "root": "/project",
+        "config": "fallow.toml",
+        "production": true,
+        "workspace": "apps/web",
+        "include_churn": true,
+        "no_cache": true,
+        "threads": 4
+    }"#;
+    let params: InspectTargetParams = serde_json::from_str(json).unwrap();
+    match params.target {
+        InspectTarget::File { file } => assert_eq!(file, "src/utils.ts"),
+        InspectTarget::Symbol { .. } => panic!("expected file target"),
+    }
+    assert_eq!(params.root.as_deref(), Some("/project"));
+    assert_eq!(params.config.as_deref(), Some("fallow.toml"));
+    assert_eq!(params.production, Some(true));
+    assert_eq!(params.workspace.as_deref(), Some("apps/web"));
+    assert_eq!(params.include_churn, Some(true));
+    assert_eq!(params.no_cache, Some(true));
+    assert_eq!(params.threads, Some(4));
+}
+
+#[test]
+fn inspect_target_params_symbol_deserialize() {
+    let json = r#"{"target":{"type":"symbol","file":"src/utils.ts","export_name":"usedFunction"}}"#;
+    let params: InspectTargetParams = serde_json::from_str(json).unwrap();
+    match params.target {
+        InspectTarget::Symbol { file, export_name } => {
+            assert_eq!(file, "src/utils.ts");
+            assert_eq!(export_name, "usedFunction");
+        }
+        InspectTarget::File { .. } => panic!("expected symbol target"),
+    }
+    assert!(params.root.is_none());
+    assert!(params.config.is_none());
+}
+
+#[test]
+fn inspect_target_params_require_target() {
+    let result: Result<InspectTargetParams, _> = serde_json::from_str("{}");
+    assert!(result.is_err());
+}
+
+#[test]
+fn check_runtime_coverage_params_require_coverage() {
     let json = "{}";
-    let result: Result<HealthProductionCoverageParams, _> = serde_json::from_str(json);
+    let result: Result<CheckRuntimeCoverageParams, _> = serde_json::from_str(json);
     assert!(result.is_err());
 
     let json = r#"{"coverage":"./coverage"}"#;
-    let params: HealthProductionCoverageParams = serde_json::from_str(json).unwrap();
+    let params: CheckRuntimeCoverageParams = serde_json::from_str(json).unwrap();
     assert_eq!(params.coverage, "./coverage");
     assert!(params.min_invocations_hot.is_none());
     assert!(params.min_observation_volume.is_none());
     assert!(params.low_traffic_threshold.is_none());
+    assert!(params.top.is_none());
+    assert!(params.group_by.is_none());
 }
 
 #[test]
-fn health_production_coverage_params_all_fields_deserialize() {
+fn check_runtime_coverage_params_all_fields_deserialize() {
     let json = r#"{
         "coverage": "./coverage/coverage-final.json",
         "root": "/project",
@@ -85,9 +183,12 @@ fn health_production_coverage_params_all_fields_deserialize() {
         "min_observation_volume": 7500,
         "low_traffic_threshold": 0.002,
         "no_cache": true,
-        "threads": 4
+        "threads": 4,
+        "max_crap": 35.0,
+        "top": 10,
+        "group_by": "owner"
     }"#;
-    let params: HealthProductionCoverageParams = serde_json::from_str(json).unwrap();
+    let params: CheckRuntimeCoverageParams = serde_json::from_str(json).unwrap();
     assert_eq!(params.coverage, "./coverage/coverage-final.json");
     assert_eq!(params.root.as_deref(), Some("/project"));
     assert_eq!(params.config.as_deref(), Some("fallow.toml"));
@@ -98,6 +199,9 @@ fn health_production_coverage_params_all_fields_deserialize() {
     assert_eq!(params.low_traffic_threshold, Some(0.002));
     assert_eq!(params.no_cache, Some(true));
     assert_eq!(params.threads, Some(4));
+    assert_eq!(params.max_crap, Some(35.0));
+    assert_eq!(params.top, Some(10));
+    assert_eq!(params.group_by.as_deref(), Some("owner"));
 }
 
 #[test]
@@ -190,6 +294,114 @@ fn project_info_params_with_global_flags() {
     let params: ProjectInfoParams = serde_json::from_str(json).unwrap();
     assert_eq!(params.no_cache, Some(true));
     assert_eq!(params.threads, Some(4));
+}
+
+#[test]
+fn trace_export_params_require_file_and_export_name() {
+    let json = "{}";
+    let result: Result<TraceExportParams, _> = serde_json::from_str(json);
+    assert!(result.is_err());
+
+    let json = r#"{"file":"src/utils.ts","export_name":"usedFunction"}"#;
+    let params: TraceExportParams = serde_json::from_str(json).unwrap();
+    assert_eq!(params.file, "src/utils.ts");
+    assert_eq!(params.export_name, "usedFunction");
+    assert!(params.root.is_none());
+}
+
+#[test]
+fn semantic_impact_params_accept_exactly_one_selector_shape() {
+    let export: SemanticImpactParams =
+        serde_json::from_str(r#"{"file":"src/repository.ts","export_name":"save"}"#).unwrap();
+    assert!(matches!(
+        export.target,
+        SemanticImpactSelector::Export(SemanticExportSelector { export_name })
+            if export_name == "save"
+    ));
+
+    let method: SemanticImpactParams = serde_json::from_str(
+        r#"{"file":"src/repository.ts","class_name":"UserRepository","member_name":"save"}"#,
+    )
+    .unwrap();
+    assert!(matches!(
+        method.target,
+        SemanticImpactSelector::ClassMethod(SemanticClassMethodSelector {
+            class_name,
+            member_name,
+        }) if class_name == "UserRepository" && member_name == "save"
+    ));
+
+    for invalid in [
+        r#"{"file":"src/repository.ts"}"#,
+        r#"{"file":"src/repository.ts","class_name":"UserRepository"}"#,
+        r#"{"file":"src/repository.ts","member_name":"save"}"#,
+        r#"{"file":"src/repository.ts","export_name":"save","class_name":"UserRepository","member_name":"save"}"#,
+        r#"{"file":"src/repository.ts","export_name":"save","unknown":true}"#,
+    ] {
+        assert!(serde_json::from_str::<SemanticImpactParams>(invalid).is_err());
+    }
+}
+
+#[test]
+fn trace_file_params_require_file() {
+    let json = "{}";
+    let result: Result<TraceFileParams, _> = serde_json::from_str(json);
+    assert!(result.is_err());
+
+    let json = r#"{"file":"src/utils.ts","production":true,"workspace":"apps/web"}"#;
+    let params: TraceFileParams = serde_json::from_str(json).unwrap();
+    assert_eq!(params.file, "src/utils.ts");
+    assert_eq!(params.production, Some(true));
+    assert_eq!(params.workspace.as_deref(), Some("apps/web"));
+}
+
+#[test]
+fn impact_closure_params_require_path() {
+    let json = "{}";
+    let result: Result<ImpactClosureParams, _> = serde_json::from_str(json);
+    assert!(result.is_err());
+
+    let json = r#"{"path":"src/utils.ts","production":true,"workspace":"apps/web"}"#;
+    let params: ImpactClosureParams = serde_json::from_str(json).unwrap();
+    assert_eq!(params.path, "src/utils.ts");
+    assert_eq!(params.production, Some(true));
+    assert_eq!(params.workspace.as_deref(), Some("apps/web"));
+}
+
+#[test]
+fn trace_dependency_params_require_package_name() {
+    let json = "{}";
+    let result: Result<TraceDependencyParams, _> = serde_json::from_str(json);
+    assert!(result.is_err());
+
+    let json = r#"{"package_name":"react","root":"/repo"}"#;
+    let params: TraceDependencyParams = serde_json::from_str(json).unwrap();
+    assert_eq!(params.package_name, "react");
+    assert_eq!(params.root.as_deref(), Some("/repo"));
+}
+
+#[test]
+fn trace_clone_params_optional_addressing() {
+    let empty: TraceCloneParams = serde_json::from_str("{}").unwrap();
+    assert!(empty.file.is_none() && empty.line.is_none() && empty.fingerprint.is_none());
+
+    let by_fp: TraceCloneParams =
+        serde_json::from_str(r#"{"fingerprint": "dup:7f3a2c1e"}"#).unwrap();
+    assert_eq!(by_fp.fingerprint.as_deref(), Some("dup:7f3a2c1e"));
+
+    let json = r#"{
+        "file": "src/original.ts",
+        "line": 2,
+        "mode": "semantic",
+        "min_tokens": 80,
+        "skip_local": true
+    }"#;
+    let params: TraceCloneParams = serde_json::from_str(json).unwrap();
+    assert_eq!(params.file.as_deref(), Some("src/original.ts"));
+    assert_eq!(params.line, Some(2));
+    assert_eq!(params.mode.as_deref(), Some("semantic"));
+    assert_eq!(params.min_tokens, Some(80));
+    assert_eq!(params.skip_local, Some(true));
 }
 
 #[test]
@@ -298,8 +510,6 @@ fn health_params_all_boolean_section_flags_deserialize() {
     assert_eq!(params.production, Some(true));
 }
 
-// ── HealthParams: targets and save_snapshot deserialization ────────
-
 #[test]
 fn health_params_targets_deserialize() {
     let json = r#"{"targets": true}"#;
@@ -335,17 +545,12 @@ fn health_params_missing_save_snapshot_is_none() {
     assert!(params.targets.is_none());
 }
 
-// ── AnalyzeParams: unknown fields are ignored ─────────────────────
-
 #[test]
 fn analyze_params_ignores_unknown_fields() {
     let json = r#"{"root": "/app", "unknown_field": 42}"#;
-    // serde default behavior: unknown fields are ignored (no deny_unknown_fields)
     let params: AnalyzeParams = serde_json::from_str(json).unwrap();
     assert_eq!(params.root.as_deref(), Some("/app"));
 }
-
-// ── CheckChangedParams: empty since string is accepted ────────────
 
 #[test]
 fn check_changed_params_empty_since_string() {
@@ -354,16 +559,12 @@ fn check_changed_params_empty_since_string() {
     assert_eq!(params.since, "");
 }
 
-// ── FindDupesParams: cross_language deserialization ────────────────
-
 #[test]
 fn find_dupes_params_cross_language_false_deserialize() {
     let json = r#"{"cross_language": false}"#;
     let params: FindDupesParams = serde_json::from_str(json).unwrap();
     assert_eq!(params.cross_language, Some(false));
 }
-
-// ── FindDupesParams: ignore_imports deserialization ──────────────
 
 #[test]
 fn find_dupes_params_ignore_imports_true_deserialize() {
@@ -378,8 +579,6 @@ fn find_dupes_params_ignore_imports_false_deserialize() {
     let params: FindDupesParams = serde_json::from_str(json).unwrap();
     assert_eq!(params.ignore_imports, Some(false));
 }
-
-// ── FixParams: all fields deserialize ─────────────────────────────
 
 #[test]
 fn fix_params_all_fields_deserialize() {
@@ -399,8 +598,6 @@ fn fix_params_all_fields_deserialize() {
     assert_eq!(params.no_cache, Some(true));
     assert_eq!(params.threads, Some(8));
 }
-
-// ── HealthParams: full deserialization including new fields ────────
 
 #[test]
 fn health_params_all_fields_including_new_deserialize() {
@@ -436,8 +633,6 @@ fn health_params_all_fields_including_new_deserialize() {
     assert_eq!(params.min_commits, Some(5));
 }
 
-// ── AnalyzeParams: issue_types with unicode values ────────────────
-
 #[test]
 fn analyze_params_unicode_values_deserialize() {
     let json = r#"{"root": "/home/ユーザー", "workspace": "パッケージ"}"#;
@@ -445,8 +640,6 @@ fn analyze_params_unicode_values_deserialize() {
     assert_eq!(params.root.as_deref(), Some("/home/ユーザー"));
     assert_eq!(params.workspace.as_deref(), Some("パッケージ"));
 }
-
-// ── FindDupesParams: threshold edge values ────────────────────────
 
 #[test]
 fn find_dupes_params_threshold_zero_deserialize() {
@@ -469,8 +662,6 @@ fn find_dupes_params_threshold_large_deserialize() {
     assert_eq!(params.threshold, Some(100.0));
 }
 
-// ── HealthParams: threads boundary values ─────────────────────────
-
 #[test]
 fn health_params_threads_zero_deserialize() {
     let json = r#"{"threads": 0}"#;
@@ -485,16 +676,12 @@ fn health_params_threads_large_deserialize() {
     assert_eq!(params.threads, Some(1024));
 }
 
-// ── CheckChangedParams: unicode in since ref ──────────────────────
-
 #[test]
 fn check_changed_params_unicode_since() {
     let json = r#"{"since": "feature/日本語-branch"}"#;
     let params: CheckChangedParams = serde_json::from_str(json).unwrap();
     assert_eq!(params.since, "feature/日本語-branch");
 }
-
-// ── HealthParams: save_snapshot with unicode path ─────────────────
 
 #[test]
 fn health_params_save_snapshot_unicode_path_deserialize() {
@@ -505,8 +692,6 @@ fn health_params_save_snapshot_unicode_path_deserialize() {
         Some("/home/ユーザー/スナップ.json")
     );
 }
-
-// ── FindDupesParams: min_tokens/min_lines boundary values ─────────
 
 #[test]
 fn find_dupes_params_min_tokens_zero_deserialize() {
@@ -522,8 +707,6 @@ fn find_dupes_params_min_lines_max_deserialize() {
     assert_eq!(params.min_lines, Some(u32::MAX));
 }
 
-// ── HealthParams: max_cyclomatic/max_cognitive boundary values ─────
-
 #[test]
 fn health_params_complexity_thresholds_boundary_deserialize() {
     let json = r#"{"max_cyclomatic": 0, "max_cognitive": 0}"#;
@@ -532,16 +715,12 @@ fn health_params_complexity_thresholds_boundary_deserialize() {
     assert_eq!(params.max_cognitive, Some(0));
 }
 
-// ── FixParams: ignores unknown fields ─────────────────────────────
-
 #[test]
 fn fix_params_ignores_unknown_fields() {
     let json = r#"{"root": "/app", "extra_field": true}"#;
     let params: FixParams = serde_json::from_str(json).unwrap();
     assert_eq!(params.root.as_deref(), Some("/app"));
 }
-
-// ── ProjectInfoParams: ignores unknown fields ─────────────────────
 
 #[test]
 fn project_info_params_ignores_unknown_fields() {
@@ -550,15 +729,15 @@ fn project_info_params_ignores_unknown_fields() {
     assert_eq!(params.root.as_deref(), Some("/app"));
 }
 
-// ── AuditParams ─────────────────────────────────────────────────
-
 #[test]
 fn audit_params_deserialize() {
-    let json = r#"{"root":"/tmp/project","base":"main","production":true}"#;
+    let json =
+        r#"{"root":"/tmp/project","base":"main","production":true,"production_health":true}"#;
     let params: AuditParams = serde_json::from_str(json).unwrap();
     assert_eq!(params.root.as_deref(), Some("/tmp/project"));
     assert_eq!(params.base.as_deref(), Some("main"));
     assert_eq!(params.production, Some(true));
+    assert_eq!(params.production_health, Some(true));
 }
 
 #[test]
@@ -567,6 +746,9 @@ fn audit_params_minimal() {
     assert!(params.root.is_none());
     assert!(params.base.is_none());
     assert!(params.production.is_none());
+    assert!(params.production_dead_code.is_none());
+    assert!(params.production_health.is_none());
+    assert!(params.production_dupes.is_none());
     assert!(params.workspace.is_none());
     assert!(params.no_cache.is_none());
     assert!(params.threads.is_none());
@@ -579,21 +761,32 @@ fn audit_params_with_all_fields() {
         "config": ".fallowrc.json",
         "base": "develop",
         "production": true,
+        "production_dead_code": true,
+        "production_health": true,
+        "production_dupes": true,
         "workspace": "@app/core",
         "no_cache": true,
-        "threads": 8
+        "threads": 8,
+        "coverage": "coverage/coverage-final.json",
+        "coverage_root": "/ci/build"
     }"#;
     let params: AuditParams = serde_json::from_str(json).unwrap();
     assert_eq!(params.root.as_deref(), Some("/project"));
     assert_eq!(params.config.as_deref(), Some(".fallowrc.json"));
     assert_eq!(params.base.as_deref(), Some("develop"));
     assert_eq!(params.production, Some(true));
+    assert_eq!(params.production_dead_code, Some(true));
+    assert_eq!(params.production_health, Some(true));
+    assert_eq!(params.production_dupes, Some(true));
     assert_eq!(params.workspace.as_deref(), Some("@app/core"));
     assert_eq!(params.no_cache, Some(true));
     assert_eq!(params.threads, Some(8));
+    assert_eq!(
+        params.coverage.as_deref(),
+        Some("coverage/coverage-final.json")
+    );
+    assert_eq!(params.coverage_root.as_deref(), Some("/ci/build"));
 }
-
-// ── ListBoundariesParams ────────────────────────────────────────
 
 #[test]
 fn list_boundaries_params_minimal() {
@@ -619,7 +812,39 @@ fn list_boundaries_params_full() {
     assert_eq!(params.threads, Some(4));
 }
 
-// ── FindDupesParams: changed_since deserialization ───────────────
+#[test]
+fn impact_params_minimal() {
+    let params: ImpactParams = serde_json::from_str("{}").unwrap();
+    assert!(params.root.is_none());
+}
+
+#[test]
+fn impact_params_with_root() {
+    let params: ImpactParams = serde_json::from_str(r#"{"root": "/project"}"#).unwrap();
+    assert_eq!(params.root.as_deref(), Some("/project"));
+}
+
+#[test]
+fn impact_params_ignores_unknown_fields() {
+    let json = r#"{"root": "/app", "config": ".fallowrc.json", "no_cache": true}"#;
+    let params: ImpactParams = serde_json::from_str(json).unwrap();
+    assert_eq!(params.root.as_deref(), Some("/app"));
+}
+
+#[test]
+fn impact_all_params_minimal() {
+    let params: ImpactAllParams = serde_json::from_str("{}").unwrap();
+    assert!(params.sort.is_none());
+    assert!(params.limit.is_none());
+}
+
+#[test]
+fn impact_all_params_with_sort_and_limit() {
+    let json = r#"{"sort": "contained", "limit": 3}"#;
+    let params: ImpactAllParams = serde_json::from_str(json).unwrap();
+    assert_eq!(params.sort.as_deref(), Some("contained"));
+    assert_eq!(params.limit, Some(3));
+}
 
 #[test]
 fn find_dupes_params_changed_since_deserialize() {
@@ -634,8 +859,6 @@ fn find_dupes_params_changed_since_missing_is_none() {
     assert!(params.changed_since.is_none());
 }
 
-// ── AnalyzeParams: boundary_violations deserialization ───────────
-
 #[test]
 fn analyze_params_boundary_violations_true_deserialize() {
     let json = r#"{"boundary_violations": true}"#;
@@ -648,8 +871,6 @@ fn analyze_params_boundary_violations_missing_is_none() {
     let params: AnalyzeParams = serde_json::from_str("{}").unwrap();
     assert!(params.boundary_violations.is_none());
 }
-
-// ── ProjectInfoParams: section flags deserialization ─────────────
 
 #[test]
 fn project_info_params_section_flags_deserialize() {

@@ -1,11 +1,14 @@
 name: Real-World Benchmarks
 
 on:
-  # Temporarily disabled to conserve CI minutes; run locally or via workflow_dispatch.
-  # schedule:
-  #   # Run daily at 07:00 UTC (after conformance at 06:00)
-  #   - cron: '0 7 * * *'
+  schedule:
+    # Run daily at 07:00 UTC (after conformance at 06:00)
+    - cron: '0 7 * * *'
   workflow_dispatch:
+
+concurrency:
+  group: bench-real-world-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions: {}
 
@@ -20,17 +23,17 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - uses: ./.github/actions/setup-rust
         with:
           cache-key: bench-real-world
 
-      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
         with:
           node-version: '22'
 
-      - uses: pnpm/action-setup@08c4be7e2e672a47d11bd04269e27e5f3e8529cb # v4
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v4
         with:
           version: 9
 
@@ -45,7 +48,7 @@ jobs:
             --clone-dir /tmp/fallow-bench-ci \
             --runs 3 \
             > bench-real-world.json \
-            2>bench-real-world-stderr.txt
+            2> >(tee bench-real-world-stderr.txt >&2)
         continue-on-error: true
 
       - name: Store benchmark result
@@ -64,20 +67,26 @@ jobs:
         if: always()
         run: |
           if [[ ! -f bench-real-world.json ]] || ! python3 -c "import json; json.load(open('bench-real-world.json'))" 2>/dev/null; then
-            echo "## Real-World Benchmarks" >> "$GITHUB_STEP_SUMMARY"
-            echo "" >> "$GITHUB_STEP_SUMMARY"
-            echo "Benchmark suite did not produce a valid report. Check the logs." >> "$GITHUB_STEP_SUMMARY"
+            {
+              echo "## Real-World Benchmarks"
+              echo ""
+              echo "Benchmark suite did not produce a valid report. Check the logs."
+            } >> "$GITHUB_STEP_SUMMARY"
             if [[ -f bench-real-world-stderr.txt ]]; then
-              echo "" >> "$GITHUB_STEP_SUMMARY"
-              echo '```' >> "$GITHUB_STEP_SUMMARY"
-              tail -30 bench-real-world-stderr.txt >> "$GITHUB_STEP_SUMMARY"
-              echo '```' >> "$GITHUB_STEP_SUMMARY"
+              {
+                echo ""
+                echo '```'
+                tail -30 bench-real-world-stderr.txt
+                echo '```'
+              } >> "$GITHUB_STEP_SUMMARY"
             fi
             exit 0
           fi
 
-          echo "## Real-World Benchmarks" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "## Real-World Benchmarks"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
           python3 -c "
           import json
           with open('bench-real-world.json') as f:
@@ -101,7 +110,7 @@ jobs:
               warm_str = f'{warm}ms' if warm < 1000 else f'{warm/1000:.2f}s'
               speedup = f'{cold/warm:.1f}x' if warm > 0 else '-'
               print(f'| {proj} | {cold_str} | {warm_str} | {speedup} |')
-          " >> "\$GITHUB_STEP_SUMMARY"
+          " >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload report
         if: always()

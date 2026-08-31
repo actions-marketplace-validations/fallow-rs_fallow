@@ -1,0 +1,344 @@
+//! Detection of unused Angular component/directive outputs: an `@Output()` /
+//! signal `output()` declared output EMITTED nowhere inside its own component
+//! (no `this.<output>.emit(...)`).
+//!
+//! Single-file dead-output direction, the Angular analogue of the Vue
+//! `unused-component-emit` rule. The harvest lives on
+//! `ModuleInfo.angular_outputs` (set during extraction; a `model()` is recorded
+//! as an input only, so its framework-driven `update:` emit never appears here).
+//! This detector reads the harvest, applies the `@angular/core` dep gate and the
+//! whole-component extends-abstain, and emits one finding per genuinely-unused
+//! output.
+//!
+//! Usage is detected by over-crediting (every ambiguous shape credits toward
+//! "used", so only false negatives can result, never false positives). An output
+//! `bar` is USED if ANY hold:
+//! - a `member_access` with `object == "this.bar" && member == "emit"` (the
+//!   `this.bar.emit(...)` call site; reading `.emit` without calling is a
+//!   negligible shape treated as a call);
+//! - a `member_access` with `object == "this" && member == bar` (the output read
+//!   as a value, e.g. forwarded to a function that may emit it). Over-credit;
+//! - a typed Angular template member fact for `bar`, with older cached
+//!   member accesses accepted only as a conservative parse-cache fallback, which
+//!   credits a template-handler emit such as `(click)="bar.emit(...)"` (Angular
+//!   templates emit outputs directly off the bare name, with no `this.` prefix);
+//! - the same template member evidence in the linked external `templateUrl`
+//!   `.html` module, reached via the `SideEffect` import edge.
+//!
+//! Whole-component ABSTAIN (skip ALL outputs for the component) when the
+//! component class declares an `extends` heritage clause: a base class in another
+//! file may emit `this.bar`, invisible to the per-module scan. Same conservative
+//! `super_class`-present signal as the input detector.
+
+use rustc_hash::{FxHashMap, FxHashSet};
+
+use fallow_types::extract::{ModuleInfo, SemanticFactView};
+
+use crate::discover::FileId;
+use crate::graph::{ModuleGraph, ModuleNode};
+use crate::results::UnusedComponentOutput;
+
+use super::predicates::component_name_for;
+use super::{LineOffsetsMap, byte_offset_to_line_col};
+
+/// Find Angular component/directive outputs emitted nowhere in their own
+/// component. Returns empty unless the project declares `@angular/core`.
+#[must_use]
+pub fn find_unused_component_outputs(
+    graph: &ModuleGraph,
+    modules: &[ModuleInfo],
+    declared_deps: &FxHashSet<String>,
+    line_offsets_by_file: &LineOffsetsMap<'_>,
+) -> Vec<UnusedComponentOutput> {
+    if !declared_deps.contains("@angular/core") {
+        return Vec::new();
+    }
+
+    let modules_by_id: FxHashMap<FileId, &ModuleInfo> =
+        modules.iter().map(|m| (m.file_id, m)).collect();
+
+    let mut findings = Vec::new();
+    for node in &graph.modules {
+        if !node.is_reachable() {
+            continue;
+        }
+        let Some(module) = modules_by_id.get(&node.file_id) else {
+            continue;
+        };
+        collect_module_unused_component_outputs(
+            node,
+            module,
+            graph,
+            &modules_by_id,
+            line_offsets_by_file,
+            &mut findings,
+        );
+    }
+
+    findings.sort_by(|a, b| {
+        a.path
+            .cmp(&b.path)
+            .then(a.line.cmp(&b.line))
+            .then(a.output_name.cmp(&b.output_name))
+    });
+    findings
+}
+
+fn collect_module_unused_component_outputs(
+    node: &ModuleNode,
+    module: &ModuleInfo,
+    graph: &ModuleGraph,
+    modules_by_id: &FxHashMap<FileId, &ModuleInfo>,
+    line_offsets_by_file: &LineOffsetsMap<'_>,
+    findings: &mut Vec<UnusedComponentOutput>,
+) {
+    if module.angular_outputs.is_empty() || component_abstains_outputs(module) {
+        return;
+    }
+
+    // Linked external `templateUrl` module(s): a `(click)="bar.emit()"`
+    // handler in the `.html` file emits the output too.
+    let external_templates = external_template_modules(graph, modules_by_id, node.file_id);
+    let template_emitted = template_emitted_outputs(module, &external_templates);
+
+    let component_name = component_name_for(&node.path);
+    for output in &module.angular_outputs {
+        if output_is_emitted(module, &output.name)
+            || template_emitted.contains(output.name.as_str())
+            || super::unused_component_input::is_js_reserved_word(&output.name)
+        {
+            continue;
+        }
+        let (line, col) =
+            byte_offset_to_line_col(line_offsets_by_file, node.file_id, output.span_start);
+        findings.push(UnusedComponentOutput {
+            path: node.path.clone(),
+            component_name: component_name.clone(),
+            output_name: output.name.clone(),
+            line,
+            col,
+        });
+    }
+}
+
+fn component_abstains_outputs(module: &ModuleInfo) -> bool {
+    // A base class in another file may emit the output through `this.bar.emit()`.
+    if component_has_extends(module) {
+        return true;
+    }
+
+    // `{ ...this }` forwards every output opaquely into a behavior pattern.
+    super::unused_component_input::component_spreads_this(module)
+}
+
+/// Whether the output `name` is emitted (or forwarded) somewhere in its own
+/// component. Over-credits: `this.<name>.emit(...)` is the canonical emit, and a
+/// bare `this.<name>` value read credits too (it may be forwarded to a function
+/// that emits it).
+fn output_is_emitted(component: &ModuleInfo, name: &str) -> bool {
+    let emit_object = format!("this.{name}");
+    SemanticFactView::new(&component.semantic_facts, &component.member_accesses)
+        .ordinary_member_accesses()
+        .any(|access| {
+            (access.object == emit_object && access.member == "emit")
+                || (access.object == "this" && access.member == name)
+        })
+}
+
+/// Build the set of output names emitted through a template handler. An Angular
+/// template emits an output off the bare name (`(click)="bar.emit(...)"`), which
+/// extraction records as typed Angular template member evidence for `bar`.
+/// Legacy semantic member accesses are accepted for older parse-cache payloads.
+/// This covers the component's own inline template plus
+/// every linked external `templateUrl` module. Over-credits by design.
+fn template_emitted_outputs<'a>(
+    component: &'a ModuleInfo,
+    external_templates: &[&'a ModuleInfo],
+) -> FxHashSet<&'a str> {
+    let mut emitted: FxHashSet<&str> = FxHashSet::default();
+    super::unused_component_input::insert_angular_template_members(component, &mut emitted);
+    for template in external_templates {
+        super::unused_component_input::insert_angular_template_members(template, &mut emitted);
+    }
+    emitted
+}
+
+/// The `.ts` modules reached from `from` by a `SideEffect`-shaped edge that hold
+/// an external Angular `templateUrl`. Mirrors the input detector's helper: the
+/// component sets `has_angular_component_template_url`, and the external `.html`
+/// file is reached via a `SideEffect` import edge whose target carries template
+/// member evidence.
+fn external_template_modules<'a>(
+    graph: &ModuleGraph,
+    modules_by_id: &FxHashMap<FileId, &'a ModuleInfo>,
+    from: FileId,
+) -> Vec<&'a ModuleInfo> {
+    let Some(component) = modules_by_id.get(&from) else {
+        return Vec::new();
+    };
+    if !component.has_angular_component_template_url {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for target in graph.edges_for(from) {
+        let Some(target_module) = modules_by_id.get(&target) else {
+            continue;
+        };
+        if SemanticFactView::new(
+            &target_module.semantic_facts,
+            &target_module.member_accesses,
+        )
+        .has_angular_template_members()
+        {
+            out.push(*target_module);
+        }
+    }
+    out
+}
+
+/// Whether the component declares an `extends` heritage clause anywhere in its
+/// module. Conservative: any exported class with a `super_class`, or any
+/// `class_heritage` entry with a `super_class`, abstains the whole component.
+fn component_has_extends(module: &ModuleInfo) -> bool {
+    module.exports.iter().any(|e| e.super_class.is_some())
+        || module
+            .class_heritage
+            .iter()
+            .any(|h| h.super_class.is_some())
+}
+
+#[cfg(test)]
+mod tests {
+    use fallow_types::extract::{
+        AngularOutputMember, AngularTemplateMemberAccessFact, ClassHeritageInfo, MemberAccess,
+        SemanticFact,
+    };
+    use rustc_hash::FxHashSet;
+
+    use super::*;
+    use crate::analyze::test_support::empty_module;
+
+    fn output(name: &str, span: u32) -> AngularOutputMember {
+        AngularOutputMember {
+            name: name.to_string(),
+            span_start: span,
+        }
+    }
+
+    fn access(object: &str, member: &str) -> MemberAccess {
+        MemberAccess {
+            object: object.to_string(),
+            member: member.to_string(),
+        }
+    }
+
+    fn tpl_fact(member: &str) -> SemanticFact {
+        SemanticFact::AngularTemplateMemberAccess(AngularTemplateMemberAccessFact {
+            member: member.to_string(),
+        })
+    }
+
+    #[test]
+    fn unemitted_output_is_not_emitted() {
+        let component = ModuleInfo {
+            angular_outputs: vec![output("changed", 10)],
+            ..empty_module()
+        };
+        assert!(
+            !output_is_emitted(&component, "changed"),
+            "an output emitted nowhere is reported"
+        );
+    }
+
+    #[test]
+    fn emitted_output_is_credited() {
+        let component = ModuleInfo {
+            angular_outputs: vec![output("changed", 10)],
+            member_accesses: vec![access("this.changed", "emit")].into(),
+            ..empty_module()
+        };
+        assert!(
+            output_is_emitted(&component, "changed"),
+            "a `this.changed.emit(...)` call credits the output"
+        );
+    }
+
+    #[test]
+    fn inline_template_emit_credits_output() {
+        let component = ModuleInfo {
+            angular_outputs: vec![output("changed", 10)],
+            semantic_facts: vec![tpl_fact("changed")].into(),
+            ..empty_module()
+        };
+        let emitted = template_emitted_outputs(&component, &[]);
+        assert!(
+            emitted.contains("changed"),
+            "an inline-template handler emit must credit the output"
+        );
+        assert!(
+            !output_is_emitted(&component, "changed"),
+            "template evidence is not a `this.changed.emit` script call"
+        );
+    }
+
+    #[test]
+    fn typed_template_fact_credits_output() {
+        let component = ModuleInfo {
+            angular_outputs: vec![output("changed", 10)],
+            semantic_facts: vec![tpl_fact("changed")].into(),
+            ..empty_module()
+        };
+        let emitted = template_emitted_outputs(&component, &[]);
+        assert!(
+            emitted.contains("changed"),
+            "a typed Angular template fact credits the output"
+        );
+    }
+
+    #[test]
+    fn forwarded_output_value_read_is_credited() {
+        let component = ModuleInfo {
+            angular_outputs: vec![output("changed", 10)],
+            member_accesses: vec![access("this", "changed")].into(),
+            ..empty_module()
+        };
+        assert!(
+            output_is_emitted(&component, "changed"),
+            "a `this.changed` value read (forwarded) over-credits the output"
+        );
+    }
+
+    #[test]
+    fn extends_abstain_holds() {
+        let component = ModuleInfo {
+            angular_outputs: vec![output("changed", 10)],
+            class_heritage: vec![ClassHeritageInfo {
+                export_name: "Foo".to_string(),
+                super_class: Some("Base".to_string()),
+                implements: Vec::new(),
+                type_parameters: Vec::new(),
+                instance_bindings: Vec::new(),
+                super_class_type_args: Vec::new(),
+                generic_instance_bindings: Vec::new(),
+            }],
+            ..empty_module()
+        };
+        assert!(
+            component_has_extends(&component),
+            "an `extends` clause abstains the whole component"
+        );
+    }
+
+    #[test]
+    fn dep_gate_returns_empty_without_angular_core() {
+        let graph = ModuleGraph::build(&[], &[], &[]);
+        let modules = Vec::new();
+        let declared: FxHashSet<String> = std::iter::once("react".to_string()).collect();
+        let offsets = LineOffsetsMap::default();
+        let findings = find_unused_component_outputs(&graph, &modules, &declared, &offsets);
+        assert!(
+            findings.is_empty(),
+            "no `@angular/core` dependency means no findings"
+        );
+    }
+}

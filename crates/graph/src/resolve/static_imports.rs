@@ -26,7 +26,7 @@ pub(super) fn resolve_static_imports(
         .iter()
         .map(|imp| ResolvedImport {
             info: imp.clone(),
-            target: resolve_specifier(ctx, file_path, &imp.source),
+            target: resolve_specifier(ctx, file_path, &imp.source, imp.from_style),
         })
         .collect()
 }

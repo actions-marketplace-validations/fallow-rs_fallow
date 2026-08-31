@@ -7,4 +7,4 @@
 | **Duplication mode** | Choose strictness: `strict`, `mild`, `weak`, or `semantic` |
 | **Duplication threshold** | Minimum lines for a block to count as duplicate (default: 5) |
 
-For project-wide config, create a `.fallowrc.json` in your project root with entry points, ignore patterns, and rule severity.
+For project-wide config, create a `.fallowrc.json` (or `.fallowrc.jsonc` for editor-detected JSONC syntax highlighting) in your project root with entry points, ignore patterns, and rule severity.

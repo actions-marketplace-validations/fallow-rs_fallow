@@ -1,0 +1,14 @@
+# Every text file checks out with LF bytes on every platform. The repository
+# contains no intentionally-CRLF files (verified: zero CRLF blobs, no
+# .bat/.cmd/.ps1), while three surfaces byte-compare checked-out files against
+# LF-writing generators or content-derived hashes: contract surfaces
+# (scripts/generate-all.mjs --check and the staged subgenerator tests, run on
+# Windows in release.yml), copy-through generator INPUTS (crates/napi/types/),
+# and test fixtures (clone fingerprints, snapshot assertions). Enumerating
+# those surfaces missed inputs twice (v3.4.0 failed on the committed side
+# being CRLF, v3.4.1 on a generator input being CRLF); the repo-wide default
+# closes the class. Binary files are auto-detected and unaffected.
+* text=auto eol=lf
+
+# Kept for emphasis: fixture bytes feed content-derived hashes.
+tests/fixtures/** text eol=lf

@@ -1,0 +1,58 @@
+[package]
+name = "fallow-benchmarks"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+publish = false
+description = "CodSpeed benchmark suites for fallow"
+
+[[bench]]
+name = "programmatic_commands"
+harness = false
+
+[[bench]]
+name = "programmatic_stable"
+harness = false
+
+[[bench]]
+name = "representative_sources"
+harness = false
+
+[[bench]]
+name = "component_config"
+harness = false
+
+[[bench]]
+name = "component_engine"
+harness = false
+
+[[bench]]
+name = "component_graph"
+harness = false
+
+[[bench]]
+name = "component_output"
+harness = false
+
+[dev-dependencies]
+criterion = { workspace = true }
+fallow-api = { workspace = true }
+fallow-cli = { version = "3.21.0", path = "../cli" }
+fallow-config = { workspace = true }
+fallow-engine = { workspace = true }
+fallow-extract = { workspace = true }
+fallow-graph = { workspace = true }
+fallow-output = { workspace = true }
+fallow-types = { workspace = true }
+globset = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+
+[features]
+codspeed = []
+
+[lints]
+workspace = true

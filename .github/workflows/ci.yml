@@ -5,8 +5,9 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  merge_group:
 
-# Deny all permissions by default — grant per-job as needed
+# Deny all permissions by default, grant per-job as needed
 permissions: {}
 
 concurrency:
@@ -26,31 +27,145 @@ jobs:
       pull-requests: read
     outputs:
       rust: ${{ steps.filter.outputs.rust }}
+      windows-rust: ${{ steps.filter.outputs.windows-rust }}
+      windows-type-aware: ${{ steps.filter.outputs.windows-type-aware }}
       vscode: ${{ steps.filter.outputs.vscode }}
       zed: ${{ steps.filter.outputs.zed }}
+      npm: ${{ steps.filter.outputs.npm }}
       actions: ${{ steps.filter.outputs.actions }}
+      docker: ${{ steps.filter.outputs.docker }}
       miri: ${{ steps.filter.outputs.miri }}
       ci-scripts: ${{ steps.filter.outputs.ci-scripts }}
+      npm-package: ${{ steps.filter.outputs.npm-package }}
+      self-analyze: ${{ steps.filter.outputs.self-analyze }}
+      skills: ${{ steps.filter.outputs.skills }}
+      action-current: ${{ steps.filter.outputs.action-current }}
+      viz: ${{ steps.filter.outputs.viz }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d # v4.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         id: filter
         with:
           filters: |
+            # The `rust` filter gates the `check` job, which runs two drift
+            # gates:
+            #   - `cargo test/clippy --features schema-emit` for the
+            #     Rust-source -> docs/output-schema.json chain (output schema)
+            #   - `cargo test --workspace --lib --bins --tests --examples`
+            #     for the FallowConfig -> schema.json chain (config-input
+            #     schema, #440), via a `#[cfg(test)] mod config_schema_drift`
+            #     test in `crates/cli/src/init.rs`.
+            # JsonSchema-deriving structs are spread across multiple crates;
+            # keeping the filter at `crates/**` (rather than a narrower
+            # per-crate list) ensures edits to ANY of the following subtrees
+            # trigger the gate:
+            #   - crates/types/src/                       (analysis and base payload types)
+            #   - crates/output/src/                      (health, action, and envelope wire shapes)
+            #   - crates/api/src/                         (programmatic and attribution wrappers)
+            #   - crates/cli/src/bin/schema_emit.rs       (derived definition registry and schema assembly)
+            #   - crates/config/src/config/              (FallowConfig + RulesConfig + presets, source of schema.json)
+            # Both `docs/output-schema.json` and `schema.json` are included so
+            # PR edits that ONLY touch a committed schema (without a matching
+            # Rust change) still trigger the drift gate on the PR rather than
+            # slipping through to a push-time failure on main. Refs #416, #440.
+            # Generated npm and editor contract files are included for the same
+            # reason: the Ubuntu check job runs the full `generate:contracts:check`
+            # bundle now, covering output schema, capability metadata, TS
+            # contracts, NAPI types, and agent docs in one place.
             rust:
               - 'crates/**'
               - 'tests/**'
+              - 'docs/output-schema.json'
+              - 'schema.json'
+              - 'plugin-schema.json'
+              - 'rule-pack-schema.json'
+              - 'npm/fallow/schema.json'
+              - 'npm/fallow/capabilities.json'
+              - 'npm/fallow/issue-registry.json'
+              - 'npm/fallow/types/output-contract.d.ts'
+              - 'npm/fallow/skills/fallow/**'
+              - 'editors/vscode/src/generated/output-contract.d.ts'
+              - 'editors/vscode/src/generated/lsp-initialization-options.d.ts'
+              - 'editors/vscode/src/generated/issue-types.ts'
+              - 'editors/vscode/package.json'
+              - 'tools/type-aware-sidecar/src/generated-protocol.mjs'
+              - 'scripts/generate-all.mjs'
+              - 'scripts/generation-transaction.mjs'
+              - 'scripts/contract-surfaces.mjs'
+              - 'scripts/generate-agent-docs.mjs'
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'deny.toml'
               - '.clippy.toml'
               - 'rust-toolchain.toml'
+            windows-rust:
+              - 'crates/core/src/discover/walk.rs'
+              - 'crates/core/src/plugins/manifest_entries.rs'
+              - 'crates/core/tests/integration_test.rs'
+              - 'crates/core/tests/integration_test/symlink_root_containment.rs'
+              - 'crates/engine/src/changed_files.rs'
+              - 'crates/engine/src/churn.rs'
+              - 'crates/engine/src/repo_refs.rs'
+              - 'crates/engine/Cargo.toml'
+              - 'crates/cli/src/signal/**'
+              - 'crates/cli/src/type_aware.rs'
+              - 'crates/cli/Cargo.toml'
+              - 'crates/lsp/**'
+              - 'crates/mcp/src/tools/code_mode_subprocess.rs'
+              - 'crates/mcp/src/tools/mod.rs'
+              - 'crates/mcp/src/tools/process_tree.rs'
+              - 'crates/mcp/Cargo.toml'
+              - 'crates/config/**'
+              - 'crates/types/**'
+              - '.github/actions/setup-rust/**'
+              - '.github/workflows/ci.yml'
+              - 'scripts/workflow-policy.test.mjs'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - '.clippy.toml'
+              - 'rust-toolchain.toml'
+            windows-type-aware:
+              - 'npm/fallow/scripts/**'
+              - 'npm/fallow/package.json'
+              - 'npm/fallow/bin/**'
+              - 'tools/type-aware-sidecar/**'
+              - 'editors/vscode/package.json'
+              - 'editors/vscode/pnpm-lock.yaml'
+              - 'editors/vscode/pnpm-workspace.yaml'
+              - 'editors/vscode/.vscodeignore'
+              - 'editors/vscode/scripts/package-type-aware.mjs'
+              - 'editors/vscode/scripts/verify-packaged-type-aware.mjs'
+              - 'editors/vscode/src/typeAwareCompanion.ts'
+              - 'editors/vscode/test/integration/fixtures/real-workspace/**'
+              - 'editors/vscode/test/integration/real/**'
+              - 'crates/api/src/type_aware/transport/**'
+              - '.github/workflows/ci.yml'
+              - '.github/workflows/release-validation.yml'
+              - 'scripts/repository-policy.test.mjs'
+              - 'scripts/type-aware-windows-candidate-smoke.mjs'
+              - 'scripts/workflow-policy.test.mjs'
             vscode:
               - 'editors/vscode/**'
+              - 'crates/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'rust-toolchain.toml'
+              - '.github/workflows/ci.yml'
+              - '.github/workflows/release.yml'
+              - '.github/workflows/release-validation.yml'
             zed:
               - 'editors/zed/**'
+            npm:
+              - 'npm/**'
             actions:
               - '.github/**'
+            docker:
+              - 'Dockerfile'
+              - 'Dockerfile.dev'
+              - '.dockerignore'
+              - 'examples/docker/**'
+              - '.github/dependabot.yml'
+              - '.github/workflows/ci.yml'
             miri:
               - 'crates/graph/**'
               - 'crates/extract/**'
@@ -59,38 +174,167 @@ jobs:
             ci-scripts:
               - 'ci/**'
               - 'action/**'
+            npm-package:
+              - 'npm/fallow/**'
+              - 'schema.json'
+              - '.github/scripts/**'
+              - '.github/workflows/ci.yml'
+            self-analyze:
+              - '.github/workflows/ci.yml'
+              - 'editors/vscode/**'
+              - 'npm/fallow/**'
+            # `skills` gates the public skill contract: the public plugin must
+            # match the source under npm/fallow/skills after its one declared
+            # frontmatter transform.
+            skills:
+              - 'npm/fallow/skills/**'
+              - 'scripts/vendor-skills.mjs'
+              - '.github/workflows/ci.yml'
+            action-current:
+              - 'action/**'
+              - 'action.yml'
+              - 'crates/**'
+              - 'tests/fixtures/basic-project/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'rust-toolchain.toml'
+              - '.github/actions/setup-rust/**'
+              - '.github/workflows/ci.yml'
+              - 'scripts/workflow-policy.test.mjs'
+            viz:
+              - 'viz-frontend/**'
+              - 'crates/cli/viz-assets/**'
+
+  docker:
+    name: Docker
+    needs: changes
+    if: needs.changes.outputs.docker == 'true' || github.event_name == 'push' || github.event_name == 'merge_group'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Build image
+        run: docker build -t fallow:ci .
+      - name: Run version
+        # Asserts the image reports the version pinned in the Dockerfile's own
+        # ARG default, not just that the binary runs. This is what makes this
+        # required check a real end-to-end proof for the release's Docker pin
+        # commit (fallow-release skill step 13): the new pins download,
+        # checksum-verify, and report the just-released version instead of
+        # merely not crashing.
+        shell: bash
+        run: |
+          set -euo pipefail
+          PINNED_VERSION="$(grep -m1 '^ARG FALLOW_VERSION=' Dockerfile | cut -d '=' -f2)"
+          OUTPUT="$(docker run --rm fallow:ci --version)"
+          echo "${OUTPUT}"
+          echo "${OUTPUT}" | grep -qF "${PINNED_VERSION}"
+      - name: Check exit code propagation
+        shell: bash
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp -d)"
+          mkdir -p "$tmp/dirty/src" "$tmp/clean/src"
+          printf '%s\n' '{"name":"dirty","type":"module","main":"src/index.ts","dependencies":{},"devDependencies":{}}' > "$tmp/dirty/package.json"
+          printf '%s\n' '{"name":"clean","type":"module","main":"src/index.ts","dependencies":{},"devDependencies":{}}' > "$tmp/clean/package.json"
+          printf '%s\n' 'export const entry = 1;' > "$tmp/dirty/src/index.ts"
+          printf '%s\n' 'export const unused = 1;' > "$tmp/dirty/src/unused.ts"
+          printf '%s\n' 'export const entry = 1;' > "$tmp/clean/src/index.ts"
+
+          set +e
+          docker run --rm -v "$tmp/dirty:/workspace" --user "$(id -u):$(id -g)" fallow:ci dead-code --format json --quiet > "$tmp/dirty.json"
+          dirty_code="$?"
+          docker run --rm -v "$tmp/clean:/workspace" --user "$(id -u):$(id -g)" fallow:ci dead-code --format json --quiet > "$tmp/clean.json"
+          clean_code="$?"
+          set -e
+
+          test "$dirty_code" -eq 1
+          test "$clean_code" -eq 0
+      - name: Check Compose example
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker tag fallow:ci fallow:local
+          tmp="$(mktemp -d)"
+          mkdir -p "$tmp/dirty/src" "$tmp/clean/src"
+          printf '%s\n' '{"name":"dirty","type":"module","main":"src/index.ts","dependencies":{},"devDependencies":{}}' > "$tmp/dirty/package.json"
+          printf '%s\n' '{"name":"clean","type":"module","main":"src/index.ts","dependencies":{},"devDependencies":{}}' > "$tmp/clean/package.json"
+          printf '%s\n' 'export const entry = 1;' > "$tmp/dirty/src/index.ts"
+          printf '%s\n' 'export const unused = 1;' > "$tmp/dirty/src/unused.ts"
+          printf '%s\n' 'export const entry = 1;' > "$tmp/clean/src/index.ts"
+          cp examples/docker/compose.yaml "$tmp/dirty/compose.yaml"
+          cp examples/docker/compose.yaml "$tmp/clean/compose.yaml"
+
+          env "UID=$(id -u)" "GID=$(id -g)" docker compose -f "$tmp/dirty/compose.yaml" run --rm fallow --version
+          set +e
+          env "UID=$(id -u)" "GID=$(id -g)" docker compose -f "$tmp/dirty/compose.yaml" run --rm fallow dead-code --format json --quiet > "$tmp/dirty-compose.json"
+          dirty_code="$?"
+          env "UID=$(id -u)" "GID=$(id -g)" docker compose -f "$tmp/clean/compose.yaml" run --rm fallow dead-code --format json --quiet > "$tmp/clean-compose.json"
+          clean_code="$?"
+          set -e
+
+          test "$dirty_code" -eq 1
+          test "$clean_code" -eq 0
 
   check:
-    name: Check (${{ matrix.os }})
+    name: Check
     needs: changes
-    if: needs.changes.outputs.rust == 'true' || github.event_name == 'push'
-    runs-on: ${{ matrix.os }}
+    if: needs.changes.outputs.rust == 'true' || github.event_name == 'push' || github.event_name == 'merge_group'
+    runs-on: ubuntu-latest
+    # A cold Rust cache can leave the NAPI release build finishing just after
+    # the previous 20-minute limit on merged commits.
     timeout-minutes: 30
     permissions:
       contents: read
-    strategy:
-      fail-fast: false
-      matrix:
-        # Temporarily reduced to ubuntu-only to conserve CI minutes (macOS is 10x multiplier).
-        # Run macos + windows locally before release.
-        os: [ubuntu-latest]
 
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - uses: ./.github/actions/setup-rust
         with:
           components: clippy, rustfmt
 
-      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+        with:
+          version: 10.33.0
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: '22'
 
-      - name: Run tests
-        run: cargo test --workspace --all-targets
+      - name: Install type-aware sidecar dependencies
+        run: npm ci --prefix tools/type-aware-sidecar --no-audit --no-fund --ignore-scripts
 
-      - name: Run production-coverage integration tests (feature-gated stub sidecar)
-        run: cargo test -p fallow-cli --features test-sidecar-key --test production_coverage_tests
+      - name: Run tests
+        # Benchmark targets exceed this job's timeout and are covered by the
+        # dedicated benchmark workflows.
+        run: cargo test --workspace --lib --bins --tests --examples
+
+      - name: Run coverage producer conformance
+        # Rides this job rather than a job of its own: the `rust` filter above
+        # already covers crates/** and tests/**, `cargo test --bins` has already
+        # produced target/debug/fallow, and setup-node is already present. The
+        # harness reads committed producer maps, so it installs nothing and
+        # touches no network. It writes only to a temporary directory, which
+        # the `git diff --exit-code` step at the end of this job depends on.
+        run: npm run check:coverage-producers
+
+      - name: Run runtime-coverage integration tests (feature-gated stub sidecar)
+        run: cargo test -p fallow-cli --features test-sidecar-key --test runtime_coverage_tests
+
+      - name: Run schema drift gate (feature-gated schema-emit binary)
+        run: cargo test -p fallow-cli --features schema-emit --bin fallow-schema-emit
+
+      - name: Install contract bundle dependencies
+        run: cd editors/vscode && pnpm install --frozen-lockfile --ignore-scripts
+
+      - name: Run staged subgenerator integration tests
+        run: node --test scripts/subgenerator-staging.test.mjs
+
+      - name: Run contract bundle drift gate
+        run: CI=true npm run generate:contracts:check
 
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
@@ -98,14 +342,17 @@ jobs:
       - name: Clippy (test-sidecar-key feature)
         run: cargo clippy -p fallow-cli --features test-sidecar-key --all-targets -- -D warnings
 
+      - name: Clippy (schema-emit feature)
+        run: cargo clippy -p fallow-cli --features schema-emit --bin fallow-schema-emit --tests -- -D warnings
+
       - name: Format
         run: cargo fmt --all -- --check
 
       - name: Install NAPI package dependencies
-        run: cd crates/napi && npm ci --omit=optional
+        run: cd crates/napi && npm ci --omit=optional --ignore-scripts
 
       - name: Build NAPI package
-        run: cd crates/napi && npm run build:debug
+        run: cd crates/napi && npx napi build --platform --profile napi-release --no-js && npm run publish:prepare
 
       - name: Run NAPI smoke test
         run: cd crates/napi && npm test
@@ -113,16 +360,115 @@ jobs:
       - name: Check for uncommitted changes
         run: git diff --exit-code
 
+  windows-rust:
+    name: Windows path and subprocess handling
+    needs: changes
+    if: needs.changes.outputs.windows-rust == 'true'
+    runs-on: windows-latest
+    # The suite plus the platform clippy pass takes around 14 minutes of real
+    # work on a warm cache, so a 15-minute budget cancels the job during
+    # cache-save cleanup even though every step succeeded.
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+        with:
+          components: clippy
+          cache-key: pr-windows-rust
+      - name: Test changed-file path handling
+        run: cargo test -p fallow-engine changed_files::tests
+      - name: Test churn path handling
+        run: cargo test -p fallow-engine churn::tests
+      - name: Test repository reference handling
+        run: cargo test -p fallow-engine repo_refs::tests
+      - name: Test source and manifest symlink containment
+        run: cargo test -p fallow-core symlink
+      - name: Test LSP diagnostic URI handling
+        run: cargo test -p fallow-lsp windows_initialization_publishes_uri_safe_diagnostics
+      - name: Test MCP subprocess cleanup
+        run: cargo test -p fallow-mcp completed_success_cleans_descendant_process_tree
+      - name: Test CLI subprocess cleanup
+        run: cargo test -p fallow-cli windows_job_object_terminates_descendants_without_taskkill_lookup
+      - name: Test config and workspace diagnostic path handling
+        run: cargo test -p fallow-config -p fallow-types --lib
+      - name: Clippy platform-specific paths
+        run: cargo clippy -p fallow-cli -p fallow-core -p fallow-engine -p fallow-lsp -p fallow-mcp --all-targets -- -D warnings
+
+  windows-type-aware:
+    name: Windows type-aware npm and transport
+    needs: changes
+    if: needs.changes.outputs.windows-type-aware == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: pr-windows-type-aware
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+      - name: Test Windows npm launcher
+        run: npm --prefix npm/fallow test
+      - name: Test Windows child-process wiring
+        run: node --test tools/type-aware-sidecar/test/windows-child-process.test.mjs
+      - name: Test Rust type-aware transport
+        run: cargo test -p fallow-api type_aware::transport
+      - name: Build current CLI binary
+        run: cargo build -p fallow-cli --bin fallow
+      - name: Run installed npm candidate against pinned Preact
+        env:
+          FALLOW_CANDIDATE_BIN: ${{ github.workspace }}\target\debug\fallow.exe
+        run: node scripts/type-aware-windows-candidate-smoke.mjs
+      - name: Check for uncommitted changes
+        run: git diff --exit-code
+
+  skills-vendor:
+    name: Public skills contract
+    needs: changes
+    if: needs.changes.outputs.skills == 'true' || github.event_name == 'push' || github.event_name == 'merge_group'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The released product contract lives in this repository. The companion
+      # skills repo packages it for agent hosts and may add host interface
+      # files plus the declared plugin frontmatter transform.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: fallow-rs/fallow-skills
+          path: .fallow-skills-src
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+      - name: Check public skill matches the Fallow source contract
+        env:
+          FALLOW_SKILLS_DIR: ${{ github.workspace }}/.fallow-skills-src
+        run: node scripts/vendor-skills.mjs --check
+
   doc:
     name: Documentation
     needs: changes
-    if: needs.changes.outputs.rust == 'true' || github.event_name == 'push'
+    if: needs.changes.outputs.rust == 'true' || github.event_name == 'push' || github.event_name == 'merge_group'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: ./.github/actions/setup-rust
       - name: Check documentation
         env:
@@ -136,48 +482,465 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: crate-ci/typos@cf5f1c29a8ac336af8568821ec41919923b05a83 # v1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: crate-ci/typos@8a48f81b6c64dcfea44b3633223084c4be58ac5f # v1
+      - name: Hidden unicode
+        run: python3 scripts/scan-hidden-unicode.py --mode committed
+      - name: Hidden-unicode scanner self-test
+        run: bash scripts/test-scan-hidden-unicode.sh
 
-  vscode:
-    name: VS Code Extension
+  js-lint:
+    name: JS Lint and Format
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check out public documentation contract
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: fallow-rs/docs
+          path: .companion/fallow-docs
+          persist-credentials: false
+      - name: Check out public skill contract
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: fallow-rs/fallow-skills
+          path: .companion/fallow-skills
+          persist-credentials: false
+      - name: Documentation discoverability
+        uses: Hedde/trigger_tree@54a559c561dac35cfc993307b8087fe453a5bc6c # v1.29.1
+        with:
+          min-score: "100"
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+      - run: npm ci --no-audit --no-fund --ignore-scripts
+      - name: oxlint
+        run: npm run lint:js
+      - name: oxfmt --check
+        run: npm run fmt:js:check
+      - name: Narrator comment guard
+        run: node scripts/check-comment-quality.mjs --all
+      - name: Script tests
+        run: node --test scripts/*.test.mjs
+      - name: Install type-aware sidecar dependencies
+        run: npm ci --prefix tools/type-aware-sidecar --no-audit --no-fund --ignore-scripts
+      - name: Type-aware sidecar tests
+        run: node --test tools/type-aware-sidecar/test/*.test.mjs
+      - name: Type-aware sidecar package check
+        working-directory: tools/type-aware-sidecar
+        run: npm pack --dry-run --json
+      - name: Knowledge architecture
+        run: npm run check:knowledge-architecture
+      - name: Cross-repository telemetry documentation parity
+        env:
+          FALLOW_DOCS_DIR: ${{ github.workspace }}/.companion/fallow-docs
+          FALLOW_SKILLS_DIR: ${{ github.workspace }}/.companion/fallow-skills
+        run: python3 scripts/check_telemetry_doc_sync.py
+      - name: Audit schema documentation parity
+        env:
+          FALLOW_DOCS_DIR: ${{ github.workspace }}/.companion/fallow-docs
+        run: node scripts/check-audit-schema-doc-sync.mjs
+      - name: Agent adapter drift
+        run: npm run check:agent-adapters
+
+  npm-package:
+    name: npm Package
     needs: changes
-    if: needs.changes.outputs.vscode == 'true' || github.event_name == 'push'
+    if: needs.changes.outputs.npm-package == 'true' || github.event_name == 'push' || github.event_name == 'merge_group'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+
+      - name: Install locked repository tools
+        run: npm ci --no-audit --no-fund --ignore-scripts
+
+      - name: Validate bundled Agent Skill
+        run: npx --no-install intent validate npm/fallow/skills
+
+      - name: Check npm package contents
+        run: |
+          cp schema.json npm/fallow/schema.json
+          # Document the cp invariant: npm/fallow/schema.json is the root
+          # schema.json verbatim. A future refactor that drops or moves the
+          # cp will fail loud here instead of silently shipping a stale
+          # schema to npm consumers. Refs #440.
+          diff schema.json npm/fallow/schema.json
+          npm pack --dry-run --json ./npm/fallow > /tmp/fallow-pack.json
+          node <<'NODE'
+          const fs = require('fs');
+          const [pack] = JSON.parse(fs.readFileSync('/tmp/fallow-pack.json', 'utf8'));
+          const files = new Set(pack.files.map((file) => file.path));
+          const required = [
+            'package.json',
+            'README.md',
+            'skills/fallow/SKILL.md',
+            'skills/fallow/references/cli-reference.md',
+            'skills/fallow/references/gotchas.md',
+            'skills/fallow/references/patterns.md',
+            'skills/fallow/references/similar-code.md',
+            'schema.json',
+            'capabilities.json',
+            'issue-registry.json',
+          ];
+          const missing = required.filter((file) => !files.has(file));
+          if (missing.length > 0) {
+            throw new Error(`npm package is missing expected files: ${missing.join(', ')}`);
+          }
+          NODE
+
+      - name: Test release packaging gate
+        run: node --test .github/scripts/verify-pack-contents.test.mjs .github/scripts/update-dockerfile-pins.test.mjs
+
+      - name: Run npm wrapper unit tests
+        run: npm --prefix npm/fallow test
+
+      - name: Smoke that no postinstall runs on install
+        # Phase 2 of RFC 868 will block postinstall hooks by default. fallow
+        # must not regress to depending on postinstall. Pack the candidate
+        # tarball and install with --ignore-scripts; confirm the bin wrappers
+        # land and the postinstall file is gone.
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/fallow-tarball
+          npm pack ./npm/fallow --pack-destination /tmp/fallow-tarball > /tmp/fallow-pack.log
+          shopt -s nullglob
+          tarballs=(/tmp/fallow-tarball/fallow-*.tgz)
+          if [ ${#tarballs[@]} -eq 0 ]; then
+            echo "::error::npm pack produced no tarball"
+            exit 1
+          fi
+          TARBALL="${tarballs[0]}"
+          mkdir -p /tmp/fallow-smoke && cd /tmp/fallow-smoke
+          printf '%s' '{"name":"fallow-smoke","version":"0.0.0","private":true}' > package.json
+          # Skip the optional platform-binary fetch: the smoke checks install
+          # layout, not binary exec. Avoids unnecessary network traffic and
+          # registry rate-limit risk on busy CI windows.
+          npm install --ignore-scripts --omit=optional "$TARBALL" 2>&1 | tee /tmp/fallow-install.log
+          # Match only npm's lifecycle-script announcement for fallow itself
+          # (`> fallow@<version> postinstall`), not the substring "postinstall"
+          # in transitive-dep announcements.
+          if grep -qE "^> fallow@[0-9].*(postinstall|preinstall|install)" /tmp/fallow-install.log; then
+            echo "::error::npm install ran an install lifecycle script for fallow; the package must be zero-script after RFC 868 prep"
+            exit 1
+          fi
+          test -x node_modules/fallow/bin/fallow
+          test -x node_modules/fallow/bin/fallow-lsp
+          test -x node_modules/fallow/bin/fallow-mcp
+          test -x node_modules/.bin/fallow-lsp
+          test -x node_modules/.bin/fallow-mcp
+          PLATFORM_DIR=node_modules/@fallow-cli/linux-x64-gnu
+          mkdir -p "$PLATFORM_DIR"
+          printf '%s' '{"name":"@fallow-cli/linux-x64-gnu","version":"3.5.0"}' > "$PLATFORM_DIR/package.json"
+          cat > "$PLATFORM_DIR/fallow" <<'NODE'
+          #!/usr/bin/env node
+          require('node:fs').writeFileSync(process.env.FALLOW_TEST_ARGS, JSON.stringify(process.argv.slice(2)));
+          NODE
+          chmod +x "$PLATFORM_DIR/fallow"
+          FALLOW_SKIP_BINARY_VERIFY=1 FALLOW_TEST_ARGS=/tmp/fallow-lsp-args.json node_modules/.bin/fallow-lsp --stdio
+          FALLOW_SKIP_BINARY_VERIFY=1 FALLOW_TEST_ARGS=/tmp/fallow-mcp-args.json node_modules/.bin/fallow-mcp --transport stdio
+          node - <<'NODE'
+          const fs = require('node:fs');
+          const assert = require('node:assert/strict');
+          assert.deepEqual(JSON.parse(fs.readFileSync('/tmp/fallow-lsp-args.json', 'utf8')), ['lsp-server', '--stdio']);
+          assert.deepEqual(JSON.parse(fs.readFileSync('/tmp/fallow-mcp-args.json', 'utf8')), ['mcp-server', '--transport', 'stdio']);
+          NODE
+          if [ -f node_modules/fallow/scripts/postinstall.js ]; then
+            echo "::error::postinstall.js still ships in the npm tarball; remove from npm/fallow/scripts/"
+            exit 1
+          fi
+          test -f node_modules/fallow/scripts/lazy-verify.js
+          test -f node_modules/fallow/scripts/sentinel-path.js
+          test -f node_modules/fallow/scripts/run-binary.js
+
+  action-current:
+    name: Action with current binary
+    needs: changes
+    if: needs.changes.outputs.action-current == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: pnpm/action-setup@08c4be7e2e672a47d11bd04269e27e5f3e8529cb # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          version: 10.33.0
-      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+      - name: Build current fallow binary
+        run: cargo build --bin fallow
+      - name: Put current fallow binary first on PATH
+        run: printf '%s\n' "${GITHUB_WORKSPACE}/target/debug" >> "$GITHUB_PATH"
+      - name: Run Action shell tests with current binary
+        env:
+          FALLOW_BIN: ${{ github.workspace }}/target/debug/fallow
+        run: bash action/tests/run.sh
+      - name: Run checked-in Action JSON smoke
+        id: current_action
+        uses: ./
+        env:
+          FALLOW_BIN: ${{ github.workspace }}/target/debug/fallow
+          FALLOW_SKIP_BINARY_VERIFY: "1"
+        with:
+          command: dead-code
+          root: tests/fixtures/basic-project
+          format: json
+          annotations: false
+          fail-on-issues: false
+          auto-changed-since: false
+      - name: Verify current-binary JSON contract
+        env:
+          RESULTS_PATH: ${{ steps.current_action.outputs.results }}
+        run: |
+          test -f "$RESULTS_PATH"
+          jq empty "$RESULTS_PATH"
+          jq -e '.total_issues >= 0 and (.unused_files | type == "array")' "$RESULTS_PATH"
+
+  fallow-self-analyze:
+    name: Fallow Self Analysis
+    needs: changes
+    if: needs.changes.outputs.self-analyze == 'true' || github.event_name == 'push' || github.event_name == 'merge_group'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 2
+      - uses: ./.github/actions/setup-rust
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+        with:
+          version: 11.10.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: '22'
           cache: pnpm
           cache-dependency-path: editors/vscode/pnpm-lock.yaml
-      - run: cd editors/vscode && pnpm install --frozen-lockfile
-      - run: cd editors/vscode && pnpm audit --prod
-      - run: cd editors/vscode && pnpm lint
-      - run: cd editors/vscode && pnpm build
-      - run: cd editors/vscode && pnpm test:unit
-      - run: cd editors/vscode && pnpm package
+      - name: Install VS Code extension dependencies
+        run: cd editors/vscode && pnpm install --frozen-lockfile --ignore-scripts
+      - name: Build fallow binary
+        run: cargo build --bin fallow
+      - name: Dead-code dogfood VS Code extension
+        run: ./target/debug/fallow dead-code --root editors/vscode --format json --quiet
+      - name: Health dogfood VS Code extension
+        run: ./target/debug/fallow health --root editors/vscode --format json --quiet --score --targets --top 10 --report-only
+      - name: Duplication dogfood VS Code extension
+        run: ./target/debug/fallow dupes --root editors/vscode --format json --quiet --top 10
+      - name: Dead-code dogfood npm wrapper package
+        run: ./target/debug/fallow dead-code --root npm/fallow --format json --quiet
+      - name: Health dogfood npm wrapper package
+        run: ./target/debug/fallow health --root npm/fallow --format json --quiet --score --targets --top 10 --report-only
+      - name: Duplication dogfood npm wrapper package
+        run: ./target/debug/fallow dupes --root npm/fallow --format json --quiet --top 10
+      - name: Audit dogfood smoke
+        run: |
+          base=HEAD
+          if git rev-parse --verify HEAD~1 >/dev/null 2>&1; then
+            base=HEAD~1
+          fi
+          set +e
+          ./target/debug/fallow audit --base "$base" --format json --quiet > /tmp/fallow-self-audit.json
+          code=$?
+          set -e
+          test -s /tmp/fallow-self-audit.json
+          if [ "$code" -gt 1 ]; then
+            exit "$code"
+          fi
 
-  zed:
-    name: Zed Extension (${{ matrix.os }})
+  vscode:
+    name: VS Code Extension
     needs: changes
-    if: needs.changes.outputs.zed == 'true' || github.event_name == 'push'
+    if: needs.changes.outputs.vscode == 'true' || github.event_name == 'push' || github.event_name == 'merge_group'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+        with:
+          version: 11.10.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+          cache: pnpm
+          cache-dependency-path: editors/vscode/pnpm-lock.yaml
+      - name: Cache VS Code test download
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v5
+        with:
+          path: /tmp/fallow-vscode-test-cache
+          key: vscode-test-${{ runner.os }}-${{ runner.arch }}-vscode-1.96.0
+      - run: cd editors/vscode && pnpm install --frozen-lockfile --ignore-scripts
+      - run: cd editors/vscode && pnpm audit --prod
+      - name: Verify generated extension contracts
+        run: cd editors/vscode && pnpm run check:contracts
+      - run: cd editors/vscode && pnpm lint
+      - name: Build current multicall binary
+        run: cargo build -p fallow-multicall --bin fallow-multicall
+      - name: Run VS Code extension-host integration tests
+        run: cd editors/vscode && xvfb-run -a pnpm test:integration
+      - name: Run VS Code real CLI and LSP contract smoke
+        env:
+          FALLOW_BIN: ${{ github.workspace }}/target/debug/fallow-multicall
+        run: xvfb-run -a pnpm --dir editors/vscode run test:integration:real
+      - run: cd editors/vscode && pnpm test:unit
+
+  vscode-package-targets:
+    name: Package VS Code target artifacts
+    needs: changes
+    if: needs.changes.outputs.vscode == 'true' || github.event_name == 'push' || github.event_name == 'merge_group'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+        with:
+          version: 11.10.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+          cache: pnpm
+          cache-dependency-path: editors/vscode/pnpm-lock.yaml
+      - name: Install VS Code dependencies
+        run: cd editors/vscode && pnpm install --frozen-lockfile --ignore-scripts
+      - name: Test target VSIX packaging contracts
+        run: pnpm --dir editors/vscode test:packaging
+      - name: Package target VSIX artifacts
+        run: pnpm --dir editors/vscode package:variants -- --output-dir "$RUNNER_TEMP/fallow-vscode-targets"
+      - name: Upload target VSIX artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: fallow-vscode-targets
+          path: ${{ runner.temp }}/fallow-vscode-targets
+
+  vscode-target-host:
+    name: VS Code target host (${{ matrix.target }})
+    needs: [changes, vscode-package-targets]
+    if: needs.changes.outputs.vscode == 'true' || github.event_name == 'push' || github.event_name == 'merge_group'
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
+    timeout-minutes: 35
     permissions:
       contents: read
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          - os: ubuntu-latest
+            target: linux-x64
+            cli: target/debug/fallow
+            lsp: target/debug/fallow-lsp
+          - os: windows-latest
+            target: win32-x64
+            cli: target/debug/fallow.exe
+            lsp: target/debug/fallow-lsp.exe
+          - os: macos-15-intel
+            target: darwin-x64
+            cli: target/debug/fallow
+            lsp: target/debug/fallow-lsp
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: vscode-target-${{ matrix.target }}
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+        with:
+          version: 11.10.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+          cache: pnpm
+          cache-dependency-path: editors/vscode/pnpm-lock.yaml
+      - name: Cache VS Code test download
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v5
+        with:
+          path: ${{ runner.temp }}/fallow-vscode-test-cache
+          key: vscode-target-${{ matrix.target }}-vscode-1.96.0
+      - name: Install VS Code dependencies
+        run: cd editors/vscode && pnpm install --frozen-lockfile --ignore-scripts
+      - name: Build current CLI and LSP binaries
+        run: cargo build -p fallow-cli --bin fallow -p fallow-lsp --bin fallow-lsp
+      - name: Download Ubuntu-built target VSIX artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: fallow-vscode-targets
+          path: ${{ runner.temp }}/fallow-vscode-targets
+      - name: Extract and verify the exact target VSIX on Unix
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          FALLOW_VSIX_TARGET: ${{ matrix.target }}
+        run: |
+          version="$(node -p "require('./editors/vscode/package.json').version")"
+          vsix="$RUNNER_TEMP/fallow-vscode-targets/fallow-vscode-$version-$FALLOW_VSIX_TARGET.vsix"
+          test -f "$vsix"
+          destination="$RUNNER_TEMP/fallow-vscode-$FALLOW_VSIX_TARGET"
+          unzip -q "$vsix" -d "$destination"
+          pnpm --dir editors/vscode verify:vsix "$destination/extension" "$vsix" --target "$FALLOW_VSIX_TARGET"
+          echo "FALLOW_EXTENSION_PATH=$(realpath "$destination/extension")" >> "$GITHUB_ENV"
+      - name: Extract and verify the exact target VSIX on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          FALLOW_VSIX_TARGET: ${{ matrix.target }}
+        run: |
+          $version = (Get-Content editors/vscode/package.json | ConvertFrom-Json).version
+          $vsix = Join-Path $env:RUNNER_TEMP "fallow-vscode-targets/fallow-vscode-$version-$env:FALLOW_VSIX_TARGET.vsix"
+          if (-not (Test-Path -PathType Leaf $vsix)) { throw "Expected target VSIX was not downloaded: $vsix" }
+          $archive = Join-Path $env:RUNNER_TEMP "fallow-vscode-$env:FALLOW_VSIX_TARGET.zip"
+          $destination = Join-Path $env:RUNNER_TEMP "fallow-vscode-$env:FALLOW_VSIX_TARGET"
+          Copy-Item $vsix $archive
+          Expand-Archive -Path $archive -DestinationPath $destination
+          pnpm --dir editors/vscode verify:vsix "$destination/extension" $vsix --target $env:FALLOW_VSIX_TARGET
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $extensionPath = (Resolve-Path "$destination/extension").Path
+          "FALLOW_EXTENSION_PATH=$extensionPath" >> $env:GITHUB_ENV
+      - name: Run exact target VSIX host smoke on Linux
+        if: runner.os == 'Linux'
+        env:
+          FALLOW_BIN: ${{ github.workspace }}/${{ matrix.cli }}
+          FALLOW_LSP_BIN: ${{ github.workspace }}/${{ matrix.lsp }}
+          FALLOW_VSCODE_TEST_CACHE_PATH: ${{ runner.temp }}/fallow-vscode-test-cache
+        run: xvfb-run -a pnpm --dir editors/vscode run test:integration:real
+      - name: Run exact target VSIX host smoke
+        if: runner.os != 'Linux'
+        env:
+          FALLOW_BIN: ${{ github.workspace }}/${{ matrix.cli }}
+          FALLOW_LSP_BIN: ${{ github.workspace }}/${{ matrix.lsp }}
+          FALLOW_VSCODE_TEST_CACHE_PATH: ${{ runner.temp }}/fallow-vscode-test-cache
+        run: pnpm --dir editors/vscode run test:integration:real
+
+  zed:
+    name: Zed Extension
+    needs: changes
+    if: needs.changes.outputs.zed == 'true' || github.event_name == 'push' || github.event_name == 'merge_group'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: ./.github/actions/setup-rust
         with:
           components: rustfmt
@@ -192,13 +955,13 @@ jobs:
   test-gitlab-ci:
     name: Test GitLab CI scripts
     needs: changes
-    if: needs.changes.outputs.ci-scripts == 'true' || github.event_name == 'push'
+    if: needs.changes.outputs.ci-scripts == 'true' || github.event_name == 'push' || github.event_name == 'merge_group'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Run GitLab CI jq unit tests
         run: bash ci/tests/run.sh
@@ -206,111 +969,181 @@ jobs:
   audit:
     name: Security Audit
     needs: changes
-    if: needs.changes.outputs.rust == 'true' || github.event_name == 'push'
+    if: needs.changes.outputs.rust == 'true' || github.event_name == 'push' || github.event_name == 'merge_group'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: taiki-e/install-action@9b29ffac42f36c4efe76140737435c61cfb92383 # cargo-audit
-      - run: cargo audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: taiki-e/install-action@6cd13508893c0e7eab5f273c2575d3859bd7229a # v2.86.6
+        with:
+          tool: cargo-audit
+      # RUSTSEC-2026-0097: `rand` 0.9.2 unsoundness with a custom logger via
+      # `rand::rng()`. Reaches the tree only through the `proptest` dev-dependency
+      # (test-only, never shipped in a fallow binary) and fallow does not use the
+      # affected pattern; no patched `rand` release exists. cargo-deny (the primary
+      # advisory gate, deny.toml) already treats this informational/unsound advisory
+      # as non-blocking. Remove once a fixed `rand` ships or proptest drops it.
+      - run: cargo audit --ignore RUSTSEC-2026-0097
 
   deny:
     name: Cargo Deny
     needs: changes
-    if: needs.changes.outputs.rust == 'true' || github.event_name == 'push'
+    if: needs.changes.outputs.rust == 'true' || github.event_name == 'push' || github.event_name == 'merge_group'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: EmbarkStudios/cargo-deny-action@91bf2b620e09e18d6eb78b92e7861937469acedb # v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
 
   shear:
     name: Unused Dependencies
     needs: changes
-    if: needs.changes.outputs.rust == 'true' || github.event_name == 'push'
+    if: needs.changes.outputs.rust == 'true' || github.event_name == 'push' || github.event_name == 'merge_group'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: taiki-e/install-action@b9da40722b5dc25d162879fdf6a098f2d71926cc # cargo-shear
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: taiki-e/install-action@6cd13508893c0e7eab5f273c2575d3859bd7229a # v2.86.6
+        with:
+          tool: cargo-shear
       - run: cargo shear
 
   zizmor:
     name: Actions Security
     needs: changes
-    if: needs.changes.outputs.actions == 'true' || github.event_name == 'push'
+    if: needs.changes.outputs.actions == 'true' || github.event_name == 'push' || github.event_name == 'merge_group'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: astral-sh/setup-uv@cec208311dfd045dd5311c1add060b2062131d57 # v8.0.0
-      - run: uvx zizmor --config .github/zizmor.yml --min-confidence medium --format plain .
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          enable-cache: false
+      # Scope to repo's own workflows + composite action. tests/fixtures/ contains
+      # intentionally lax CI YAML used as fallow analysis fixtures, not real workflows.
+      # Pin zizmor so a new release adding/strengthening an audit cannot redden
+      # CI on main with no fallow change (v1.26.1 added the adhoc-packages audit,
+      # suppressed for ci.yml/release.yml in .github/zizmor.yml). Bump deliberately.
+      - run: uvx zizmor@1.26.1 --config .github/zizmor.yml --min-confidence medium --format plain .github/ action.yml
 
   msrv:
     name: MSRV (1.92)
     needs: changes
-    # Temporarily disabled to conserve CI minutes; run `cargo +1.92.0 check --workspace` locally.
-    if: false && (needs.changes.outputs.rust == 'true' || github.event_name == 'push')
+    if: needs.changes.outputs.rust == 'true' || github.event_name == 'push' || github.event_name == 'merge_group'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
       contents: read
+    env:
+      RUSTUP_TOOLCHAIN: 1.92.0
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: ./.github/actions/setup-rust
         with:
           toolchain: '1.92.0'
           cache-key: msrv
+      - name: Verify published crate MSRV metadata
+        run: |
+          cargo metadata --no-deps --format-version 1 | jq -e --arg msrv "1.92" '
+            [.packages[]
+              | select((.publish | type) == "null" or (.publish | length) > 0)
+              | .rust_version]
+            | length > 0 and all(. == $msrv)
+          '
       - name: Check compilation
         run: cargo check --workspace
 
   miri:
     name: Miri
     needs: changes
-    # Temporarily disabled to conserve CI minutes; run `cargo +nightly miri test` locally.
-    if: false && (needs.changes.outputs.miri == 'true' || github.event_name == 'push')
+    # PR-only and path-filtered to crates/{graph,extract,types,config}: catches contributor PRs
+    # that add tempdir / fs-IO tests without inheriting #[cfg_attr(miri, ignore)] from sibling
+    # tests. Does not run on push events (the .githooks/pre-push hook covers that locally for
+    # maintainers who opt in via `git config core.hooksPath .githooks`).
+    if: (needs.changes.outputs.miri == 'true' && github.event_name == 'pull_request') || github.event_name == 'merge_group'
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # 60, not 45: the fallow-extract step shares this budget with types+graph and
+    # the React/JSX structural-extraction additions (larger ModuleInfo + per-file
+    # JSX harvesting) grew the extract suite's interpreter runtime past the old
+    # 45-min ceiling. cargo test passes fast; this is Miri-interpreter cost only.
+    timeout-minutes: 60
     permissions:
       contents: read
     env:
       MIRI_TOOLCHAIN: nightly-2026-03-20
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Miri toolchain
         run: |
           rustup toolchain install "$MIRI_TOOLCHAIN" --component miri
           cargo +"$MIRI_TOOLCHAIN" miri setup
 
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
         with:
           key: miri
 
       - name: fallow-types
-        run: cargo +"$MIRI_TOOLCHAIN" miri test -p fallow-types --lib --tests
+        run: cargo +"$MIRI_TOOLCHAIN" miri test -p fallow-types --lib --tests -- --skip proptests
 
       - name: fallow-graph
         run: cargo +"$MIRI_TOOLCHAIN" miri test -p fallow-graph --lib --tests -- --skip proptests
 
-      # Only suppress, css, and visitor/helpers run under Miri (pure data logic).
-      # Parser-heavy modules (visitor::tests, sfc_template, html, template_usage)
-      # have no unsafe code and are too slow under Miri interpretation.
+      # Only suppress, CSS helpers, and visitor helpers run under Miri (pure data logic).
+      # Parser-heavy modules have no unsafe code and are too slow under Miri interpretation.
+      #
+      # Tree Borrows for this crate only: the css analytics path parses via
+      # lightningcss (alpha), whose @layer string handling reconstructs a &str
+      # from raw parts in a way Miri's Stacked Borrows flags as a benign
+      # (still-experimental-rules) violation. Tree Borrows models the same
+      # aliasing safety but accepts lightningcss's reconstructed-pointer pattern.
+      # types/graph stay on Stacked Borrows (default).
       - name: fallow-extract
-        run: cargo +"$MIRI_TOOLCHAIN" miri test -p fallow-extract --lib --tests -- --skip cache --skip visitor::tests --skip sfc_template --skip html --skip template_usage
+        env:
+          MIRIFLAGS: -Zmiri-tree-borrows
+        run: |
+          cargo +"$MIRI_TOOLCHAIN" miri test -p fallow-extract --lib --tests css:: -- --skip sfc_css::
+          cargo +"$MIRI_TOOLCHAIN" miri test -p fallow-extract --lib --tests css_classes::
+          cargo +"$MIRI_TOOLCHAIN" miri test -p fallow-extract --lib --tests css_metrics::
+          cargo +"$MIRI_TOOLCHAIN" miri test -p fallow-extract --lib --tests suppress::
+          cargo +"$MIRI_TOOLCHAIN" miri test -p fallow-extract --lib --tests visitor::helpers::
+
+  viz-frontend:
+    name: Viz frontend
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.viz == 'true'
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+      - run: npm ci
+        working-directory: viz-frontend
+      - run: npm run lint
+        working-directory: viz-frontend
+      - run: npm run test
+        working-directory: viz-frontend
+      - run: npm run build
+        working-directory: viz-frontend
+      - name: Bundle drift
+        run: git diff --exit-code crates/cli/viz-assets
 
   ci-ok:
     name: CI
     if: always()
-    needs: [check, doc, typos, vscode, test-gitlab-ci, audit, deny, shear, zizmor, msrv, miri]
+    needs: [check, windows-rust, windows-type-aware, doc, typos, js-lint, npm-package, action-current, fallow-self-analyze, vscode, vscode-package-targets, vscode-target-host, zed, test-gitlab-ci, audit, deny, shear, zizmor, msrv, miri, skills-vendor, viz-frontend]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions: {}

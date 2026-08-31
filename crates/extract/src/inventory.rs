@@ -15,15 +15,24 @@
 //! starts at 0 and increments in pre-order AST traversal each time a function
 //! is entered without a resolvable explicit name. Name resolution precedence:
 //!
-//! 1. Parent-provided `pending_name` (from `MethodDefinition`,
-//!    `VariableDeclarator`), same pattern as the internal complexity visitor.
+//! 1. Parent-provided `pending_name`: from a `MethodDefinition` /
+//!    `VariableDeclarator` binding, OR from the callee of the call / `new`
+//!    expression a function is passed to as an argument (`arr.map(cb)` ->
+//!    "map", `foo(cb)` -> "foo", `new Promise(cb)` -> "Promise"). The callee
+//!    case matches `oxc-coverage-instrument`'s opt-in `name_callback_arguments`
+//!    (which the Fallow runtime beacon enables), so a callback's static name
+//!    lines up with its runtime-instrumented name instead of both sides drifting
+//!    to different anonymous placeholders.
 //! 2. The function's own `id` (named `function foo() {}`, named function
 //!    expression `const x = function named() {}`).
 //! 3. `(anonymous_N)` with the current counter value; counter then increments.
+//!    Only genuinely unnamed functions reach this: an immediately-invoked
+//!    function expression, an arrow returned from another function, or a
+//!    computed non-string-key call.
 //!
 //! Counter scope is per-file. Reference implementation:
-//! `oxc-coverage-instrument/src/transform.rs` (`fn_counter` field; lines 201
-//! and 612 at the time of writing).
+//! `oxc-coverage-instrument/src/transform.rs` (`resolve_function_name` +
+//! `callback_argument_name`).
 
 use std::path::Path;
 
@@ -34,35 +43,78 @@ use oxc_ast_visit::{Visit, walk};
 use oxc_parser::Parser;
 use oxc_semantic::ScopeFlags;
 use oxc_span::{SourceType, Span};
+use rustc_hash::FxHashMap;
 
-/// A single static-inventory entry: `(name, line)` for one function.
+/// A single static-inventory entry for one function.
 ///
 /// `name` is beacon-compatible (see the module docs for the naming rule).
-/// `line` is 1-based, matching the AST span start.
+/// `line` is 1-based, matching the AST span start. The `start_column` /
+/// `end_line` / `end_column` fields carry the function-node span in the
+/// 1-indexed UTF-16 convention the cross-surface `FunctionIdentity` join key
+/// expects (see `fallow_cov_protocol::FunctionIdentity::start_column`). They
+/// are descriptive metadata: the join hash is `(file, name, line)` only, so
+/// column fidelity never affects the join, only display / same-line
+/// disambiguation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InventoryEntry {
     /// Beacon-compatible function name.
     pub name: String,
-    /// 1-based source line of the function declaration.
+    /// 1-based source line of the function declaration (node `span.start`).
     pub line: u32,
+    /// 1-indexed UTF-16 column of the function node start.
+    pub start_column: u32,
+    /// 1-based source line where the function node ends.
+    pub end_line: u32,
+    /// 1-indexed UTF-16 column of the function node end.
+    pub end_column: u32,
+    /// Content digest of the function's full-span source slice
+    /// (`&source[span.start..span.end]`): first 8 bytes of SHA-256 as 16
+    /// lowercase hex characters, via `fallow_cov_protocol::source_hash_for`.
+    /// The slice is the canonical body bytes (signature line + body + closing
+    /// brace, no whitespace normalization), identical for `Function` and
+    /// `ArrowFunctionExpression`. Stable across line moves, so a
+    /// moved-but-unedited function keeps the same hash.
+    pub source_hash: String,
+}
+
+/// Rolling state for [`InventoryVisitor::line_col_utf16`]: the last resolved
+/// offset's line index, clamped byte position, and 0-based UTF-16 column.
+/// `line_idx` starts at `usize::MAX` so the first query never matches.
+struct ColCache {
+    line_idx: usize,
+    byte_end: usize,
+    utf16_units: usize,
 }
 
 /// Visitor that collects [`InventoryEntry`] values in file traversal order.
 struct InventoryVisitor<'a> {
+    source: &'a str,
     line_offsets: &'a [u32],
     entries: Vec<InventoryEntry>,
+    col_cache: ColCache,
     /// Parent-provided name override (method key, variable binding, etc.).
     pending_name: Option<String>,
+    /// Callee name for a function passed as a call / `new` argument. Ranks BELOW
+    /// the function's own `id` (a named function expression keeps its id), so it
+    /// is a separate slot from `pending_name` (which ranks above the id).
+    pending_callee_name: Option<String>,
     /// File-scoped monotonic counter for unnamed functions.
     anonymous_counter: u32,
 }
 
 impl<'a> InventoryVisitor<'a> {
-    const fn new(line_offsets: &'a [u32]) -> Self {
+    const fn new(source: &'a str, line_offsets: &'a [u32]) -> Self {
         Self {
+            source,
             line_offsets,
             entries: Vec::new(),
+            col_cache: ColCache {
+                line_idx: usize::MAX,
+                byte_end: 0,
+                utf16_units: 0,
+            },
             pending_name: None,
+            pending_callee_name: None,
             anonymous_counter: 0,
         }
     }
@@ -74,8 +126,9 @@ impl<'a> InventoryVisitor<'a> {
     /// `add_function` advances the counter unconditionally on every
     /// instrumented function (named or not). We collapse both into one call.
     ///
-    /// Name precedence: parent `pending_name` (method key / variable binding)
-    /// → function's own `id` → counter.
+    /// Name precedence, matching the instrumenter's `resolve_function_name`:
+    /// parent `pending_name` (method key / variable binding) → function's own
+    /// `id` → call/`new` callee (`pending_callee_name`) → counter.
     fn resolve_name(&mut self, explicit: Option<&str>) -> String {
         let n = self.anonymous_counter;
         self.anonymous_counter += 1;
@@ -85,23 +138,91 @@ impl<'a> InventoryVisitor<'a> {
         if let Some(name) = explicit {
             return name.to_owned();
         }
+        if let Some(callee) = self.pending_callee_name.take() {
+            return callee;
+        }
         format!("(anonymous_{n})")
     }
 
     fn record(&mut self, name: String, span: Span) {
-        let (line, _col) =
-            fallow_types::extract::byte_offset_to_line_col(self.line_offsets, span.start);
-        self.entries.push(InventoryEntry { name, line });
+        let (line, start_column) = self.line_col_utf16(span.start);
+        let (end_line, end_column) = self.line_col_utf16(span.end);
+        let source_hash = self
+            .source
+            .get(span.start as usize..span.end as usize)
+            .map_or_else(
+                || fallow_cov_protocol::source_hash_for(b""),
+                |slice| fallow_cov_protocol::source_hash_for(slice.as_bytes()),
+            );
+        self.entries.push(InventoryEntry {
+            name,
+            line,
+            start_column,
+            end_line,
+            end_column,
+            source_hash,
+        });
+    }
+
+    /// Map a UTF-8 byte offset to `(1-based line, 1-indexed UTF-16 column)`.
+    ///
+    /// The line comes from the precomputed offset table; the column counts
+    /// UTF-16 code units from the line start to `byte_offset`, matching the
+    /// `FunctionIdentity` column convention (Istanbul / V8 / oxc all normalize
+    /// to 1-indexed UTF-16). A byte offset that does not fall on a char
+    /// boundary (it always should for an AST span) clamps to the nearest
+    /// boundary at or before it rather than panicking.
+    ///
+    /// Successive queries on the same line are answered incrementally from
+    /// [`ColCache`]: pre-order traversal emits nearby offsets, so counting
+    /// only the gap to the previous offset keeps the walk linear on
+    /// single-line (minified / generated) files instead of re-encoding the
+    /// full line prefix for every function.
+    fn line_col_utf16(&mut self, byte_offset: u32) -> (u32, u32) {
+        let line_idx = match self.line_offsets.binary_search(&byte_offset) {
+            Ok(idx) => idx,
+            Err(idx) => idx.saturating_sub(1),
+        };
+        let line = line_idx as u32 + 1;
+        let line_start = self.line_offsets[line_idx] as usize;
+        let mut end = byte_offset as usize;
+        while end > line_start && !self.source.is_char_boundary(end) {
+            end -= 1;
+        }
+        // Both `end` and the cached position are char boundaries at or after
+        // `line_start` on the same line, so the gap slice is always valid and
+        // a backward gap never exceeds the cached column.
+        let from_cache = if self.col_cache.line_idx == line_idx {
+            if end >= self.col_cache.byte_end {
+                self.utf16_len(self.col_cache.byte_end, end)
+                    .map(|gap| self.col_cache.utf16_units + gap)
+            } else {
+                self.utf16_len(end, self.col_cache.byte_end)
+                    .map(|gap| self.col_cache.utf16_units - gap)
+            }
+        } else {
+            None
+        };
+        let col_utf16 = from_cache.unwrap_or_else(|| self.utf16_len(line_start, end).unwrap_or(0));
+        self.col_cache = ColCache {
+            line_idx,
+            byte_end: end,
+            utf16_units: col_utf16,
+        };
+        (line, col_utf16 as u32 + 1)
+    }
+
+    /// UTF-16 code-unit count of `source[start..end]`, `None` when the range
+    /// is not sliceable.
+    fn utf16_len(&self, start: usize, end: usize) -> Option<usize> {
+        self.source
+            .get(start..end)
+            .map(|slice| slice.encode_utf16().count())
     }
 }
 
 impl<'ast> Visit<'ast> for InventoryVisitor<'_> {
     fn visit_function(&mut self, func: &Function<'ast>, flags: ScopeFlags) {
-        // Bodyless functions (TypeScript overload signatures, `abstract`
-        // class methods, `declare function ...`) are not instrumented at
-        // runtime. The instrumenter only calls `add_function` when a body
-        // exists, so neither recording an entry nor advancing the counter
-        // for these signatures keeps our naming in lockstep.
         if func.body.is_none() {
             walk::walk_function(self, func, flags);
             return;
@@ -141,16 +262,76 @@ impl<'ast> Visit<'ast> for InventoryVisitor<'_> {
     }
 
     fn visit_object_property(&mut self, prop: &ObjectProperty<'ast>) {
-        // Object-literal methods (`{ run() {} }`) and arrow properties
-        // (`{ run: () => 1 }`) intentionally do NOT inherit the outer
-        // variable binding's name. Clear any pending_name leaked from an
-        // ancestor (e.g., `const obj = { run() {} }`) so the inner function
-        // falls through to the anonymous counter, matching the e2e
-        // verification against `oxc-coverage-instrument`.
         self.pending_name = None;
         walk::walk_object_property(self, prop);
         self.pending_name = None;
     }
+
+    /// Name each function-valued argument from the callee (`arr.map(cb)` ->
+    /// "map", `foo(cb)` -> "foo"), matching `oxc-coverage-instrument`'s
+    /// `name_callback_arguments`. The callee subtree is visited FIRST with no
+    /// inherited name, so a chained call (`a.b().c(cb)`) never leaks `b` onto
+    /// `c`'s callback; the callee's own name is then applied afresh to each
+    /// argument. A binding name from a parent (declarator / method) is already
+    /// consumed by its direct function child before the body's calls, so it
+    /// never collides here. Type arguments are skipped (types hold no function
+    /// to inventory).
+    fn visit_call_expression(&mut self, call: &CallExpression<'ast>) {
+        self.visit_expression(&call.callee);
+        let name = callee_name(&call.callee);
+        for argument in &call.arguments {
+            self.pending_callee_name.clone_from(&name);
+            self.visit_argument(argument);
+        }
+        self.pending_callee_name = None;
+    }
+
+    fn visit_new_expression(&mut self, new_expr: &NewExpression<'ast>) {
+        self.visit_expression(&new_expr.callee);
+        let name = callee_name(&new_expr.callee);
+        for argument in &new_expr.arguments {
+            self.pending_callee_name.clone_from(&name);
+            self.visit_argument(argument);
+        }
+        self.pending_callee_name = None;
+    }
+}
+
+/// Extract a display name from a call / `new` callee, matching
+/// `oxc-coverage-instrument`'s `callee_name`: a bare identifier keeps its name,
+/// a member access uses the (last) property, and a computed access uses a
+/// string-literal key. Anything else (a computed non-string index, a call
+/// result, a parenthesized expression) yields no name.
+fn callee_name(callee: &Expression<'_>) -> Option<String> {
+    match callee {
+        Expression::Identifier(ident) => Some(ident.name.to_string()),
+        Expression::StaticMemberExpression(member) => Some(member.property.name.to_string()),
+        Expression::ComputedMemberExpression(member) => match &member.expression {
+            Expression::StringLiteral(lit) => Some(lit.value.to_string()),
+            _ => None,
+        },
+        // A parenthesized callee (`(foo)(cb)`, `(a.b)(cb)`) unwraps to its inner
+        // callee, matching the instrumenter. oxc keeps paren nodes by default
+        // (`preserve_parens`), so both sides see this node.
+        Expression::ParenthesizedExpression(paren) => callee_name(&paren.expression),
+        _ => None,
+    }
+}
+
+/// Per-function static complexity collected alongside the inventory walk.
+///
+/// Keyed to an [`InventoryEntry`] by its `source_hash`, which both this and the
+/// inventory walk derive from the identical full-span byte slice over the same
+/// parsed program (see [`InventoryEntry::source_hash`]). The hash is stable
+/// across line moves, so the pairing survives reformatting that shifts line
+/// numbers. `cyclomatic` and `cognitive` are descriptive context for downstream
+/// importance weighting, never thresholds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InventoryComplexity {
+    /// `McCabe` cyclomatic complexity (1 + decision points).
+    pub cyclomatic: u16,
+    /// `SonarSource` cognitive complexity (structural + nesting penalty).
+    pub cognitive: u16,
 }
 
 /// Parse `source` at `path` and return every function as an [`InventoryEntry`].
@@ -164,34 +345,75 @@ impl<'ast> Visit<'ast> for InventoryVisitor<'_> {
 /// results.
 #[must_use]
 pub fn walk_source(path: &Path, source: &str) -> Vec<InventoryEntry> {
+    walk_source_with_complexity(path, source).0
+}
+
+/// Parse `source` at `path` once and return every function as an
+/// [`InventoryEntry`] together with a `source_hash -> InventoryComplexity` map.
+///
+/// Both the inventory entries and the complexity map come from the SAME parse
+/// (including the JSX fallback retry), so the per-function `source_hash` values
+/// line up exactly and a caller can enrich each entry's metrics by a hash
+/// lookup. Functions whose span slice could not be sliced share the empty-input
+/// hash and simply don't pair; that degrades to "no metrics", never a panic.
+///
+/// Errors are swallowed, matching [`walk_source`]: the returned data covers
+/// whatever could be parsed.
+#[must_use]
+pub fn walk_source_with_complexity(
+    path: &Path,
+    source: &str,
+) -> (Vec<InventoryEntry>, FxHashMap<String, InventoryComplexity>) {
     let source_type = SourceType::from_path(path).unwrap_or_default();
-    let allocator = Allocator::default();
-    let parser_return = Parser::new(&allocator, source, source_type).parse();
-
     let line_offsets = fallow_types::extract::compute_line_offsets(source);
-    let mut visitor = InventoryVisitor::new(&line_offsets);
-    visitor.visit_program(&parser_return.program);
 
-    // If the initial parse found nothing, retry with JSX/TSX source type
-    // (matches parse.rs fallback for `.js` files that actually contain JSX).
-    // Keep this independent of file length: tiny components such as
-    // `const A = () => <div />;` are common and still need inventory entries.
-    if visitor.entries.is_empty() && !source_type.is_jsx() {
+    let primary = walk_one_parse(source, source_type, &line_offsets);
+    if primary.0.is_empty() && !source_type.is_jsx() {
         let jsx_type = if source_type.is_typescript() {
             SourceType::tsx()
         } else {
             SourceType::jsx()
         };
-        let allocator2 = Allocator::default();
-        let retry_return = Parser::new(&allocator2, source, jsx_type).parse();
-        let mut retry_visitor = InventoryVisitor::new(&line_offsets);
-        retry_visitor.visit_program(&retry_return.program);
-        if !retry_visitor.entries.is_empty() {
-            return retry_visitor.entries;
+        let retry = walk_one_parse(source, jsx_type, &line_offsets);
+        if !retry.0.is_empty() {
+            return retry;
         }
     }
 
-    visitor.entries
+    primary
+}
+
+/// Run both the inventory and complexity visitors over a single parse of
+/// `source` under `source_type`, pairing them by `source_hash`.
+fn walk_one_parse(
+    source: &str,
+    source_type: SourceType,
+    line_offsets: &[u32],
+) -> (Vec<InventoryEntry>, FxHashMap<String, InventoryComplexity>) {
+    let allocator = Allocator::default();
+    let parser_return = Parser::new(&allocator, source, source_type).parse();
+
+    let mut visitor = InventoryVisitor::new(source, line_offsets);
+    visitor.visit_program(&parser_return.program);
+
+    let complexity =
+        crate::complexity::compute_complexity(&parser_return.program, source, line_offsets);
+    let metrics: FxHashMap<String, InventoryComplexity> = complexity
+        .into_iter()
+        .filter_map(|fc| {
+            fc.source_hash.map(|hash| {
+                (
+                    hash,
+                    InventoryComplexity {
+                        cyclomatic: fc.cyclomatic,
+                        cognitive: fc.cognitive,
+                    },
+                )
+            })
+        })
+        .collect();
+
+    (visitor.entries, metrics)
 }
 
 #[cfg(all(test, not(miri)))]
@@ -220,9 +442,6 @@ mod tests {
 
     #[test]
     fn const_function_expression_captures_binding_name_not_fn_id() {
-        // When both are present, oxc-coverage-instrument prefers the
-        // parent-provided pending_name (the `const` binding). Our walker
-        // matches that precedence.
         let entries = walk("const outer = function inner() { return 1; };");
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "outer");
@@ -242,14 +461,16 @@ mod tests {
     }
 
     #[test]
-    fn anonymous_arrow_passed_as_argument_uses_counter() {
+    fn callback_argument_takes_the_callee_name() {
+        // An arrow passed as a call argument now takes the callee name (matches
+        // the instrumenter's name_callback_arguments), not the anonymous counter.
         let entries = walk("setTimeout(() => { console.log('hi'); }, 10);");
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].name, "(anonymous_0)");
+        assert_eq!(entries[0].name, "setTimeout");
     }
 
     #[test]
-    fn multiple_anonymous_functions_increment_counter_in_source_order() {
+    fn member_callee_names_each_callback_in_source_order() {
         let entries = walk(
             r"
             [1, 2, 3].map(() => 1);
@@ -257,14 +478,14 @@ mod tests {
             ",
         );
         let names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
-        assert_eq!(names, vec!["(anonymous_0)", "(anonymous_1)"]);
+        assert_eq!(names, vec!["map", "filter"]);
     }
 
     #[test]
     fn named_function_still_advances_counter_matching_instrumenter() {
-        // Oracle: `oxc-coverage-instrument` advances its `fn_counter` on
-        // every function with a body (named or anonymous). The anonymous
-        // arrow below is the second emitted function, so its slot is `1`.
+        // The counter still advances on every function (named or callee-named),
+        // matching the instrumenter, so a later genuinely-anonymous function
+        // gets the right N. Here the callback is callee-named "map".
         let entries = walk(
             r"
             function named() { return 1; }
@@ -272,14 +493,87 @@ mod tests {
             ",
         );
         let names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
-        assert_eq!(names, vec!["named", "(anonymous_1)"]);
+        assert_eq!(names, vec!["named", "map"]);
+    }
+
+    #[test]
+    fn plain_identifier_callee_names_the_callback() {
+        let entries = walk("useMemo(() => compute());");
+        assert_eq!(entries[0].name, "useMemo");
+    }
+
+    #[test]
+    fn new_expression_callee_names_the_callback() {
+        let entries = walk("new Promise((resolve) => resolve(1));");
+        assert_eq!(entries[0].name, "Promise");
+    }
+
+    #[test]
+    fn callback_after_a_string_argument_is_named_from_the_callee() {
+        // The event/route-handler shape: the function is a later argument, after
+        // a string. It is named from the callee, not the string.
+        let entries = walk(r#"el.addEventListener("click", () => handle());"#);
+        assert_eq!(entries[0].name, "addEventListener");
+    }
+
+    #[test]
+    fn computed_string_key_callee_is_named() {
+        let entries = walk(r#"obj["handler"](() => run());"#);
+        assert_eq!(entries[0].name, "handler");
+    }
+
+    #[test]
+    fn chained_call_does_not_leak_the_earlier_callee_onto_the_later_callback() {
+        // `.then`'s callback must be "then" and `.catch`'s must be "catch": the
+        // callee subtree (`p.then(cb).catch`) is visited before the outer
+        // arguments, so the earlier callee never leaks onto the later callback.
+        let entries = walk("p.then(() => a).catch(() => b);");
+        let names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["then", "catch"]);
+    }
+
+    #[test]
+    fn nested_callbacks_each_take_their_own_callee() {
+        let entries = walk("outer(() => inner(() => 1));");
+        let names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["outer", "inner"]);
+    }
+
+    #[test]
+    fn binding_name_wins_over_callee() {
+        // A declarator binding is consumed on function entry, before the body's
+        // calls, so a bound arrow keeps its name even when its body is a call.
+        let entries = walk("const handler = () => run();");
+        assert_eq!(entries[0].name, "handler");
+    }
+
+    #[test]
+    fn named_function_expression_argument_keeps_its_own_id() {
+        let entries = walk("run(function inner() { return 1; });");
+        assert_eq!(entries[0].name, "inner");
+    }
+
+    #[test]
+    fn iife_callee_stays_anonymous() {
+        // The function is the callee, not an argument, so it is not a callback.
+        let entries = walk("(function () { return 1; })();");
+        assert_eq!(entries[0].name, "(anonymous_0)");
+    }
+
+    #[test]
+    fn computed_non_string_callee_stays_anonymous() {
+        let entries = walk("handlers[index](() => run());");
+        assert_eq!(entries[0].name, "(anonymous_0)");
+    }
+
+    #[test]
+    fn parenthesized_callee_unwraps_to_the_inner_name() {
+        assert_eq!(walk("(foo)(() => run());")[0].name, "foo");
+        assert_eq!(walk("(a.b)(() => run());")[0].name, "b");
     }
 
     #[test]
     fn anonymous_after_named_chain_uses_next_counter_value() {
-        // Regression for the "counter only advances on anonymous" bug caught
-        // in rust-reviewer BLOCK. Each named function MUST still bump the
-        // counter so a trailing anonymous gets the right index.
         let entries = walk(
             r"
             function a() {}
@@ -289,18 +583,11 @@ mod tests {
             ",
         );
         let names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
-        // `a`, `b`, `c`, and the binding `d` consume counter slots 0-3.
-        // There is no free-floating anonymous here; all four are resolved
-        // by name. If a truly anonymous arrow appeared, it would be slot 4.
         assert_eq!(names, vec!["a", "b", "c", "d"]);
     }
 
     #[test]
     fn typescript_overload_signatures_dont_emit_or_advance_counter() {
-        // Overload signatures have no body, are not runtime-instrumented,
-        // and therefore must not consume a counter slot. The trailing
-        // anonymous arrow is the second bodyful function, so it must be
-        // `(anonymous_1)` (slot 0 goes to the `foo` implementation).
         let entries = walk(
             r"
             function foo(): number;
@@ -310,7 +597,7 @@ mod tests {
             ",
         );
         let names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
-        assert_eq!(names, vec!["foo", "(anonymous_1)"]);
+        assert_eq!(names, vec!["foo", "map"]);
     }
 
     #[test]
@@ -336,9 +623,6 @@ mod tests {
             }",
         );
         let names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
-        // `outer` is slot 0 (uses its own name); the nested anonymous is
-        // slot 1. The counter advances on every bodyful function, so the
-        // anonymous sees counter value 1 at resolution time.
         assert_eq!(names, vec!["outer", "(anonymous_1)"]);
     }
 
@@ -374,5 +658,131 @@ mod tests {
         );
         let names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, vec!["(anonymous_0)"]);
+    }
+
+    #[test]
+    fn records_one_indexed_utf16_columns() {
+        let entries = walk("function foo() { return 1; }");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].start_column, 1);
+        assert_eq!(entries[0].end_line, 1);
+        assert!(entries[0].end_column > entries[0].start_column);
+    }
+
+    #[test]
+    fn utf16_column_counts_code_units_not_bytes() {
+        let entries = walk("const e = \"\u{1F600}\"; const f = () => 1;");
+        let f = entries.iter().find(|e| e.name == "f").expect("f present");
+        let byte_prefix_len = "const e = \"\u{1F600}\"; const f = ".len() as u32;
+        assert!(f.start_column < byte_prefix_len + 1);
+    }
+
+    #[test]
+    fn utf16_columns_stay_exact_across_a_long_single_line() {
+        // Minified shape: many functions with non-ASCII content on one line.
+        // Columns must match a naive full-prefix UTF-16 count even though the
+        // walker resolves them incrementally, including the backward offset
+        // jump from `outer`'s end to `inner`'s start and the reset to line 2.
+        use std::fmt::Write as _;
+        let mut src = String::new();
+        for i in 0..40 {
+            let _ = write!(src, "function f{i}() {{ return \"\u{1F600}\"; }} ");
+        }
+        src.push_str("function outer() { const inner = () => \"\u{1F600}\"; return inner; }");
+        src.push_str("\nconst tail = () => 1;");
+        let entries = walk(&src);
+        let col = |byte: usize| src[..byte].encode_utf16().count() as u32 + 1;
+
+        for i in [0_usize, 17, 39] {
+            let body = format!("function f{i}() {{ return \"\u{1F600}\"; }}");
+            let start = src.find(&body).expect("function text present");
+            let entry = entries
+                .iter()
+                .find(|e| e.name == format!("f{i}"))
+                .expect("entry present");
+            assert_eq!(entry.line, 1);
+            assert_eq!(entry.start_column, col(start));
+            assert_eq!(entry.end_line, 1);
+            assert_eq!(entry.end_column, col(start + body.len()));
+        }
+
+        let inner_start = src
+            .find("() => \"\u{1F600}\"")
+            .expect("inner arrow present");
+        let inner = entries
+            .iter()
+            .find(|e| e.name == "inner")
+            .expect("inner present");
+        assert_eq!(inner.line, 1);
+        assert_eq!(inner.start_column, col(inner_start));
+
+        let tail = entries
+            .iter()
+            .find(|e| e.name == "tail")
+            .expect("tail present");
+        let line2_start = src.find('\n').expect("newline present") + 1;
+        let tail_start = src.rfind("() => 1").expect("tail arrow present");
+        assert_eq!(tail.line, 2);
+        assert_eq!(
+            tail.start_column,
+            src[line2_start..tail_start].encode_utf16().count() as u32 + 1
+        );
+    }
+
+    #[test]
+    fn same_line_distinct_named_functions_have_distinct_positions() {
+        let entries = walk("function a() {} function b() {}");
+        let a = entries.iter().find(|e| e.name == "a").expect("a present");
+        let b = entries.iter().find(|e| e.name == "b").expect("b present");
+        assert_eq!(a.line, b.line, "both on line 1");
+        assert_ne!(
+            a.start_column, b.start_column,
+            "same-line functions are column-disambiguated"
+        );
+    }
+
+    #[test]
+    fn same_line_anonymous_functions_stay_distinct_via_counter() {
+        let entries = walk("const xs = [() => 1, () => 2];");
+        let names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["(anonymous_0)", "(anonymous_1)"]);
+        assert_eq!(entries[0].line, entries[1].line, "both on line 1");
+        assert_ne!(
+            entries[0].name, entries[1].name,
+            "counter keeps them distinct"
+        );
+    }
+
+    #[test]
+    fn source_hash_is_the_content_digest_of_the_function_span() {
+        let src = "function foo() { return 1; }";
+        let entries = walk(src);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].source_hash,
+            fallow_cov_protocol::source_hash_for(src.as_bytes())
+        );
+        assert_eq!(entries[0].source_hash.len(), 16);
+        assert!(
+            entries[0]
+                .source_hash
+                .chars()
+                .all(|c| c.is_ascii_hexdigit())
+        );
+    }
+
+    #[test]
+    fn source_hash_survives_line_moves_and_tracks_body_edits() {
+        let original = walk("function foo() { return 1; }");
+        let moved = walk("\n\nfunction foo() { return 1; }");
+        assert_eq!(
+            original[0].source_hash, moved[0].source_hash,
+            "a moved-but-unedited function must keep its source_hash"
+        );
+        let edited = walk("function foo() { return 2; }");
+        assert_ne!(
+            original[0].source_hash, edited[0].source_hash,
+            "an edited body must change the source_hash"
+        );
     }
 }

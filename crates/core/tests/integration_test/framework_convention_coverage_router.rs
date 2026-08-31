@@ -3,11 +3,62 @@ use super::framework_convention_coverage_common::{
     collect_unused_exports, collect_unused_files, has_unused_export,
 };
 
+fn collect_unresolved_imports(
+    root: &std::path::Path,
+    results: &fallow_core::results::AnalysisResults,
+) -> Vec<(String, String)> {
+    results
+        .unresolved_imports
+        .iter()
+        .map(|import| {
+            (
+                import
+                    .import
+                    .path
+                    .strip_prefix(root)
+                    .unwrap_or(&import.import.path)
+                    .to_string_lossy()
+                    .replace('\\', "/"),
+                import.import.specifier.clone(),
+            )
+        })
+        .collect()
+}
+
+fn assert_bundle_boundary_modules_are_traversed(
+    root: &std::path::Path,
+    results: &fallow_core::results::AnalysisResults,
+) {
+    let unresolved = collect_unresolved_imports(root, results);
+
+    for specifier in ["../.client/analytics", "../.server/db"] {
+        assert!(
+            !unresolved
+                .iter()
+                .any(|(path, spec)| path == "app/routes/_index.tsx" && spec == specifier),
+            "{specifier} should resolve through .client/.server discovery, found: {unresolved:?}"
+        );
+    }
+
+    let unused_dep_names: Vec<&str> = results
+        .unused_dependencies
+        .iter()
+        .map(|dep| dep.dep.package_name.as_str())
+        .collect();
+    for dep in ["@prisma/client", "browser-analytics"] {
+        assert!(
+            !unused_dep_names.contains(&dep),
+            "{dep} is imported from .client/.server code and should be marked used: {unused_dep_names:?}"
+        );
+    }
+}
+
 #[test]
 fn react_router_route_config_root_and_route_exports_are_covered() {
     let root = fixture_path("react-router-conventions");
     let config = create_config(root.clone());
     let results = fallow_core::analyze(&config).expect("analysis should succeed");
+    assert_bundle_boundary_modules_are_traversed(&root, &results);
 
     let unused_files = collect_unused_files(&root, &results);
     assert!(
@@ -45,10 +96,32 @@ fn react_router_route_config_root_and_route_exports_are_covered() {
 }
 
 #[test]
+fn react_router_generated_route_type_imports_are_not_unresolved() {
+    let root = fixture_path("react-router-conventions");
+    let config = create_config(root.clone());
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+    let unresolved = collect_unresolved_imports(&root, &results);
+
+    assert!(
+        !unresolved
+            .iter()
+            .any(|(path, spec)| path == "app/root.tsx" && spec == "./+types/root"),
+        "React Router generated type import should not be unresolved, found: {unresolved:?}"
+    );
+    assert!(
+        unresolved
+            .iter()
+            .any(|(path, spec)| path == "app/root.tsx" && spec == "./+types/runtime"),
+        "runtime imports under ./+types/ should still be reported, found: {unresolved:?}"
+    );
+}
+
+#[test]
 fn remix_root_and_client_data_exports_are_covered() {
     let root = fixture_path("remix-conventions");
     let config = create_config(root.clone());
     let results = fallow_core::analyze(&config).expect("analysis should succeed");
+    assert_bundle_boundary_modules_are_traversed(&root, &results);
 
     let unused_exports = collect_unused_exports(&root, &results);
     for (path, export) in [
@@ -77,6 +150,21 @@ fn remix_root_and_client_data_exports_are_covered() {
             "{path}:{export} should still be reported as unused, found: {unused_exports:?}"
         );
     }
+}
+
+#[test]
+fn remix_generated_route_type_imports_are_not_unresolved() {
+    let root = fixture_path("remix-conventions");
+    let config = create_config(root.clone());
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+    let unresolved = collect_unresolved_imports(&root, &results);
+
+    assert!(
+        !unresolved
+            .iter()
+            .any(|(path, spec)| path == "app/root.tsx" && spec == "./+types/root"),
+        "Remix generated type import should not be unresolved, found: {unresolved:?}"
+    );
 }
 
 #[test]

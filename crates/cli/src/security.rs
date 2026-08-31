@@ -1,0 +1,4717 @@
+//! `fallow security` command: opt-in local security-candidate surface.
+//!
+//! Ships the graph-structural `client-server-leak` rule plus the data-driven
+//! `tainted-sink` catalogue (one `TaintedSink` kind covering every CWE category
+//! in `security_matchers.toml`). Findings are CANDIDATES for downstream agent
+//! verification, NOT verified vulnerabilities.
+//! This command is the ONLY surface for security findings: they never appear
+//! under bare `fallow` or the `audit` gate. There is no `confidence` or
+//! `signal_strength` field; structural traces and reachability context are the
+//! only honest signals.
+
+use crate::report::sink::outln;
+use colored::Colorize;
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+use std::time::Instant;
+
+use fallow_config::{OutputFormat, ProductionAnalysis, Severity};
+use fallow_engine::dead_code::{derive_security_severity, security_catalogue_title};
+pub use fallow_output::{
+    SecurityBlindSpotFile, SecurityBlindSpotGroup, SecurityBlindSpotsOutput,
+    SecurityBlindSpotsSchemaVersion, SecurityBlindSpotsSummary, SecurityGateVerdict,
+    SecuritySchemaVersion, SecuritySurvivor, SecuritySurvivorsOutput,
+    SecuritySurvivorsSchemaVersion, SecuritySurvivorsSummary, SecurityUnresolvedCalleeDiagnostics,
+    SecurityUnresolvedCalleeReasonCount, SecurityUnresolvedCalleeSample,
+    SecurityUnresolvedCalleeTopFile, SecurityVerifierVerdict, SecurityVerifierVerdictStatus,
+};
+use fallow_types::discover::DiscoveredFile;
+use fallow_types::envelope::{ElapsedMs, ToolVersion};
+use fallow_types::extract::ModuleInfo;
+use fallow_types::results::{
+    AnalysisResults, SecurityAttackSurfaceEntry, SecurityDeadCodeKind, SecurityFinding,
+    SecurityFindingKind, SecurityRuntimeContext, SecurityRuntimeState, SecuritySeverity,
+    SecurityUnresolvedCalleeDiagnostic, TaintConfidence, TraceHop, TraceHopRole,
+};
+use rustc_hash::FxHashSet;
+use xxhash_rust::xxh3::xxh3_64;
+
+use crate::base_worktree::{BaseWorktree, git_rev_parse};
+use crate::error::emit_error;
+use crate::exit_codes::SECURITY_GATE_EXIT_CODE;
+use crate::health::HealthOptions;
+use crate::load_config_for_analysis;
+use fallow_output::{
+    RuntimeCoverageFinding, RuntimeCoverageHotPath, RuntimeCoverageReport, RuntimeCoverageVerdict,
+};
+
+pub use fallow_api::SecurityGateMode;
+
+const UNRESOLVED_CALLEE_SAMPLE_LIMIT: usize = 25;
+const UNRESOLVED_CALLEE_TOP_FILES_LIMIT: usize = 10;
+
+/// CLI parser mode for `fallow security --gate <mode>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum SecurityGateArg {
+    /// Fail when the change introduces a new security-sink candidate on a
+    /// changed line.
+    New,
+    /// Fail when a candidate becomes runtime-reachable from an entry point in
+    /// head but the matching candidate was not runtime-reachable in base.
+    NewlyReachable,
+}
+
+impl SecurityGateArg {
+    #[must_use]
+    pub const fn into_mode(self) -> SecurityGateMode {
+        match self {
+            Self::New => SecurityGateMode::New,
+            Self::NewlyReachable => SecurityGateMode::NewlyReachable,
+        }
+    }
+}
+
+pub type SecurityGate = fallow_output::SecurityGate<SecurityGateMode>;
+
+pub type SecurityOutputConfig = fallow_output::SecurityOutputConfig<Severity>;
+
+pub type SecurityOutputRulesConfig = fallow_output::SecurityOutputRulesConfig<Severity>;
+
+pub type SecurityRuleSeverityConfig = fallow_output::SecurityRuleSeverityConfig<Severity>;
+
+pub type SecurityOutput = fallow_output::SecurityOutput<SecurityOutputConfig, SecurityGate>;
+
+/// Options for `fallow security`, mirroring the global CLI flags it honors.
+pub struct SecurityOptions<'a> {
+    /// Project root.
+    pub root: &'a Path,
+    /// Explicit config path (global `--config`).
+    pub config_path: &'a Option<PathBuf>,
+    /// Output format.
+    pub output: OutputFormat,
+    /// Presentation style for JSON output.
+    pub json_style: crate::json_style::JsonStyle,
+    /// Disable the extraction cache.
+    pub no_cache: bool,
+    /// Resolved thread-pool size.
+    pub threads: usize,
+    /// Suppress progress output.
+    pub quiet: bool,
+    pub allow_remote_extends: bool,
+    /// Exit with code 1 when candidates are found.
+    pub fail_on_issues: bool,
+    /// Write SARIF to a sidecar file in addition to the primary output.
+    pub sarif_file: Option<&'a Path>,
+    /// Show a compact human summary instead of per-finding detail.
+    pub summary: bool,
+    /// `--changed-since <ref>`: scope findings to files changed since the ref.
+    pub changed_since: Option<&'a str>,
+    /// Apply the shared `--diff-file` / `--diff-stdin` line filter.
+    pub use_shared_diff_index: bool,
+    /// `--workspace <patterns...>`: scope findings to selected workspace roots.
+    pub workspace: Option<&'a [String]>,
+    /// `--changed-workspaces <ref>`: scope to workspaces with changed files.
+    pub changed_workspaces: Option<&'a str>,
+    /// `--file <PATH>`: scope findings to selected files or trace hops.
+    pub file: &'a [PathBuf],
+    /// `--surface`: include the top-level attack-surface inventory in JSON.
+    pub surface: bool,
+    /// `--gate <mode>`: opt-in regression gate. `new` requires a diff source and
+    /// reports candidates introduced in changed lines. `newly-reachable`
+    /// requires `--changed-since <ref>` and reports candidates newly reachable
+    /// from runtime entry points.
+    pub gate: Option<SecurityGateMode>,
+    /// Paid local runtime-coverage sidecar input.
+    pub runtime_coverage: Option<&'a Path>,
+    /// Threshold for hot-path classification when `--runtime-coverage` is set.
+    pub min_invocations_hot: u64,
+    /// Include security-specific `_meta` in JSON output.
+    pub explain: bool,
+}
+
+/// Options for `fallow security survivors`.
+pub struct SecuritySurvivorsOptions<'a> {
+    /// Output format.
+    pub output: OutputFormat,
+    /// Presentation style for JSON output.
+    pub json_style: crate::json_style::JsonStyle,
+    /// Raw `fallow security --format json` candidate file.
+    pub candidates: &'a Path,
+    /// Verifier verdict JSON file.
+    pub verdicts: &'a Path,
+    /// Exit with code 2 when any candidate lacks a matching verdict.
+    pub require_verdict_for_each_candidate: bool,
+}
+
+/// Run `fallow security survivors`.
+pub fn run_survivors(opts: &SecuritySurvivorsOptions<'_>) -> ExitCode {
+    let started = Instant::now();
+    if let Err(code) = validate_derived_security_output(opts.output, "survivors") {
+        return code;
+    }
+    let output = match build_survivors_output(opts, started) {
+        Ok(output) => output,
+        Err(message) => return emit_error(&message, 2, opts.output),
+    };
+    // Note find-state for telemetry before any exit (issue #1650): the survivors
+    // subcommand emits a `security` workflow event, and without this the
+    // process-global findings-present accumulator stays unset (-> null). The
+    // retained, non-dismissed candidates (survivors + needs-human-review) are
+    // what this run surfaced as actionable; an all-dismissed run is clean.
+    crate::telemetry::note_result_count(
+        output.summary.survivors + output.summary.needs_human_review,
+    );
+    if opts.require_verdict_for_each_candidate && output.summary.unverdicted > 0 {
+        return emit_error(
+            &format!(
+                "Verifier verdict file is missing verdicts for {} candidate{}.",
+                output.summary.unverdicted,
+                crate::report::plural(output.summary.unverdicted)
+            ),
+            2,
+            opts.output,
+        );
+    }
+    outln!(
+        "{}",
+        render_survivors_output(opts.output, opts.json_style, &output)
+    );
+    ExitCode::SUCCESS
+}
+
+/// Run `fallow security blind-spots`.
+pub fn run_blind_spots(opts: &SecurityOptions<'_>) -> ExitCode {
+    let started = Instant::now();
+    if let Err(code) = validate_derived_security_output(opts.output, "blind-spots") {
+        return code;
+    }
+    let (security_output, _) = match build_security_command_output(opts, started) {
+        Ok(output) => output,
+        Err(code) => return code,
+    };
+    let output = build_blind_spots_output(&security_output);
+    // Note find-state for telemetry before exit (issue #1650): the blind-spots
+    // subcommand emits a `security` workflow event; without this the
+    // findings-present accumulator stays unset (-> null). Its findings are the
+    // unresolved callee sites it surfaces; zero blind spots is a clean run.
+    crate::telemetry::note_result_count(output.summary.unresolved_callee_sites);
+    outln!(
+        "{}",
+        render_blind_spots_output(opts.output, opts.json_style, &output)
+    );
+    ExitCode::SUCCESS
+}
+
+/// Run `fallow security`. Always exits 0 unless the user explicitly raised the
+/// `security-client-server-leak` rule to `error` AND findings exist (the rule
+/// defaults to `off` and the command forces it to `warn`, so the common case is
+/// advisory). Unsupported output formats exit 2.
+pub fn run(opts: &SecurityOptions<'_>) -> ExitCode {
+    let started = Instant::now();
+    let (output, effective_severities) = match build_security_command_output(opts, started) {
+        Ok(output) => output,
+        Err(code) => return code,
+    };
+    crate::telemetry::note_result_count(output.security_findings.len());
+
+    if let Err(code) = maybe_write_security_sarif(opts, &output) {
+        return code;
+    }
+
+    let rendered = render_security_output(opts, &output);
+    // The annotation stream is legitimately empty on a clean run; other
+    // formats always render at least a headline.
+    if !rendered.is_empty() || !matches!(opts.output, OutputFormat::GithubAnnotations) {
+        outln!("{rendered}");
+    }
+    security_exit_code(opts, &output, effective_severities)
+}
+
+/// Benchmark hook for the production security analysis and JSON rendering
+/// pipeline. This is not a supported API.
+#[doc(hidden)]
+pub fn benchmark_security_json(root: &Path, threads: usize) -> Result<(usize, usize), ExitCode> {
+    let config_path = None;
+    let files: &[PathBuf] = &[];
+    let opts = SecurityOptions {
+        root,
+        config_path: &config_path,
+        output: OutputFormat::Json,
+        json_style: crate::json_style::JsonStyle::Compact,
+        no_cache: true,
+        threads,
+        quiet: true,
+        allow_remote_extends: false,
+        fail_on_issues: false,
+        sarif_file: None,
+        summary: false,
+        changed_since: None,
+        use_shared_diff_index: true,
+        workspace: None,
+        changed_workspaces: None,
+        file: files,
+        surface: false,
+        gate: None,
+        runtime_coverage: None,
+        min_invocations_hot: crate::DEFAULT_MIN_INVOCATIONS_HOT,
+        explain: false,
+    };
+    let (output, _) = build_security_command_output(&opts, Instant::now())?;
+    let finding_count = output.security_findings.len();
+    let rendered = render_security_output(&opts, &output);
+    Ok((finding_count, rendered.len()))
+}
+
+/// Self-contained candidate and verdict files for the survivors benchmark.
+/// This is not a supported API.
+#[doc(hidden)]
+pub struct SecuritySurvivorsBenchmarkCorpus {
+    _temp_dir: tempfile::TempDir,
+    candidates: PathBuf,
+    verdicts: PathBuf,
+}
+
+/// Build the security candidates and explicit verifier inputs outside the
+/// timed survivors benchmark. This is not a supported API.
+#[doc(hidden)]
+pub fn create_security_survivors_benchmark_corpus(
+    root: &Path,
+    threads: usize,
+) -> Result<SecuritySurvivorsBenchmarkCorpus, ExitCode> {
+    let config_path = None;
+    let files: &[PathBuf] = &[];
+    let opts = SecurityOptions {
+        root,
+        config_path: &config_path,
+        output: OutputFormat::Json,
+        json_style: crate::json_style::JsonStyle::Compact,
+        no_cache: true,
+        threads,
+        quiet: true,
+        allow_remote_extends: false,
+        fail_on_issues: false,
+        sarif_file: None,
+        summary: false,
+        changed_since: None,
+        use_shared_diff_index: true,
+        workspace: None,
+        changed_workspaces: None,
+        file: files,
+        surface: false,
+        gate: None,
+        runtime_coverage: None,
+        min_invocations_hot: crate::DEFAULT_MIN_INVOCATIONS_HOT,
+        explain: false,
+    };
+    let (output, _) = build_security_command_output(&opts, Instant::now())?;
+    write_security_survivors_benchmark_corpus(&output)
+        .map_err(|message| emit_error(&message, 2, OutputFormat::Json))
+}
+
+fn write_security_survivors_benchmark_corpus(
+    output: &SecurityOutput,
+) -> Result<SecuritySurvivorsBenchmarkCorpus, String> {
+    let temp_dir = tempfile::tempdir()
+        .map_err(|err| format!("Failed to create survivors benchmark corpus: {err}"))?;
+    let candidates = temp_dir.path().join("candidates.json");
+    let verdicts = temp_dir.path().join("verdicts.json");
+    let candidate_json = render_json_with_style(output, crate::json_style::JsonStyle::Compact);
+    std::fs::write(&candidates, candidate_json)
+        .map_err(|err| format!("Failed to write survivors benchmark candidates: {err}"))?;
+
+    let verdicts_json: Vec<_> = output
+        .security_findings
+        .iter()
+        .enumerate()
+        .map(|(index, finding)| SecurityVerifierVerdict {
+            schema_version: "fallow-security-verdict/v1".to_owned(),
+            finding_id: finding.finding_id.clone(),
+            verdict: match index % 3 {
+                0 => SecurityVerifierVerdictStatus::Survivor,
+                1 => SecurityVerifierVerdictStatus::Dismissed,
+                _ => SecurityVerifierVerdictStatus::NeedsHumanReview,
+            },
+            reason: Some(format!("benchmark-verdict-{index}")),
+            rationale: Some("stable benchmark verifier rationale".to_owned()),
+            confidence: Some("high".to_owned()),
+            impact: Some("benchmark impact".to_owned()),
+            fix_direction: Some("benchmark fix direction".to_owned()),
+        })
+        .collect();
+    let verdicts_json = serde_json::to_vec(&serde_json::json!({
+        "schema_version": "fallow-security-verdicts/v1",
+        "verdicts": verdicts_json,
+    }))
+    .map_err(|err| format!("Failed to serialize survivors benchmark verdicts: {err}"))?;
+    std::fs::write(&verdicts, verdicts_json)
+        .map_err(|err| format!("Failed to write survivors benchmark verdicts: {err}"))?;
+
+    Ok(SecuritySurvivorsBenchmarkCorpus {
+        _temp_dir: temp_dir,
+        candidates,
+        verdicts,
+    })
+}
+
+/// Benchmark the production candidate/verdict loaders, join, and compact JSON
+/// serializer against a self-contained corpus. This is not a supported API.
+#[doc(hidden)]
+pub fn benchmark_security_survivors_json(
+    corpus: &SecuritySurvivorsBenchmarkCorpus,
+) -> Result<(usize, usize, usize, usize, usize), String> {
+    let opts = SecuritySurvivorsOptions {
+        output: OutputFormat::Json,
+        json_style: crate::json_style::JsonStyle::Compact,
+        candidates: &corpus.candidates,
+        verdicts: &corpus.verdicts,
+        require_verdict_for_each_candidate: true,
+    };
+    let output = build_survivors_output(&opts, Instant::now())?;
+    let rendered = render_survivors_output(opts.output, opts.json_style, &output);
+    Ok((
+        output.summary.survivors,
+        output.summary.dismissed,
+        output.summary.needs_human_review,
+        output.summary.unverdicted,
+        rendered.len(),
+    ))
+}
+
+/// Production blind-spots output retained for benchmark contract assertions.
+/// This is not a supported API.
+#[doc(hidden)]
+pub struct SecurityBlindSpotsBenchmarkResult {
+    /// Derived production output before compact serialization.
+    pub output: SecurityBlindSpotsOutput,
+    /// Compact serialized output size.
+    pub rendered_bytes: usize,
+}
+
+/// Benchmark unresolved-callee normalization, blind-spot grouping, and compact
+/// JSON serialization without reading the project root. This is not a
+/// supported API.
+#[doc(hidden)]
+pub fn benchmark_security_blind_spots_json(
+    root: &Path,
+    diagnostics: &[SecurityUnresolvedCalleeDiagnostic],
+) -> SecurityBlindSpotsBenchmarkResult {
+    let normalized = unresolved_callee_diagnostics(diagnostics, root);
+    let output = SecurityOutput {
+        schema_version: SecuritySchemaVersion::V8,
+        version: ToolVersion(env!("CARGO_PKG_VERSION").to_owned()),
+        elapsed_ms: ElapsedMs(0),
+        config: SecurityOutputConfig {
+            rules: SecurityOutputRulesConfig {
+                security_client_server_leak: SecurityRuleSeverityConfig {
+                    configured: Severity::Off,
+                    effective: Severity::Warn,
+                },
+                security_sink: SecurityRuleSeverityConfig {
+                    configured: Severity::Off,
+                    effective: Severity::Warn,
+                },
+            },
+            categories_include: None,
+            categories_exclude: None,
+        },
+        meta: None,
+        gate: None,
+        workspace_diagnostics: Vec::new(),
+        security_findings: Vec::new(),
+        attack_surface: None,
+        unresolved_edge_files: 0,
+        unresolved_callee_sites: diagnostics.len(),
+        unresolved_callee_diagnostics: normalized,
+    };
+    let output = build_blind_spots_output(&output);
+    let rendered = render_blind_spots_output(
+        OutputFormat::Json,
+        crate::json_style::JsonStyle::Compact,
+        &output,
+    );
+    SecurityBlindSpotsBenchmarkResult {
+        output,
+        rendered_bytes: rendered.len(),
+    }
+}
+
+fn build_security_command_output(
+    opts: &SecurityOptions<'_>,
+    started: Instant,
+) -> Result<(SecurityOutput, SecurityRuleSeverities), ExitCode> {
+    validate_security_output(opts.output)?;
+
+    let mut config = load_config_for_analysis(
+        opts.root,
+        opts.config_path,
+        crate::ConfigLoadOptions {
+            output: opts.output,
+            no_cache: opts.no_cache,
+            threads: opts.threads,
+            production_override: None,
+            quiet: opts.quiet,
+            allow_remote_extends: opts.allow_remote_extends,
+        },
+        ProductionAnalysis::DeadCode,
+    )?;
+
+    let configured_severities = security_rule_severities(&config);
+    force_security_rules(&mut config);
+    let effective_severities = security_rule_severities(&config);
+
+    let mut analysis = analyze_security_candidates(opts, &config)?;
+
+    apply_security_scopes(opts, &mut analysis)?;
+
+    let gate_mode = apply_security_gate(opts, &config, &mut analysis.results)?;
+
+    let unresolved_edge_files = analysis.results.security_unresolved_edge_files;
+    let unresolved_callee_sites = analysis.results.security_unresolved_callee_sites;
+    let unresolved_callee_diagnostics = unresolved_callee_diagnostics(
+        &analysis.results.security_unresolved_callee_diagnostics,
+        &config.root,
+    );
+    let runtime_report = security_runtime_report(opts, &mut analysis)?;
+    let PreparedSecurityFindings {
+        findings,
+        attack_surface,
+    } = prepare_security_findings(
+        &mut analysis,
+        runtime_report.as_ref(),
+        &config.root,
+        opts.surface,
+    );
+    let workspace_diagnostics = analysis
+        .workspace_diagnostics
+        .into_iter()
+        .map(|diagnostic| diagnostic.into_root_relative(&config.root))
+        .collect();
+
+    let output = build_security_output(SecurityOutputInput {
+        opts,
+        started,
+        config: &config,
+        configured_severities,
+        effective_severities,
+        gate_mode,
+        findings,
+        attack_surface,
+        unresolved_edge_files,
+        unresolved_callee_sites,
+        unresolved_callee_diagnostics,
+        workspace_diagnostics,
+    });
+    Ok((output, effective_severities))
+}
+
+#[derive(Clone, Copy)]
+struct SecurityRuleSeverities {
+    leak: Severity,
+    sink: Severity,
+}
+
+struct SecurityOutputInput<'a, 'b> {
+    opts: &'a SecurityOptions<'b>,
+    started: Instant,
+    config: &'a fallow_config::ResolvedConfig,
+    configured_severities: SecurityRuleSeverities,
+    effective_severities: SecurityRuleSeverities,
+    gate_mode: Option<SecurityGateMode>,
+    findings: Vec<SecurityFinding>,
+    attack_surface: Option<Vec<SecurityAttackSurfaceEntry>>,
+    unresolved_edge_files: usize,
+    unresolved_callee_sites: usize,
+    unresolved_callee_diagnostics: Option<SecurityUnresolvedCalleeDiagnostics>,
+    workspace_diagnostics: Vec<fallow_config::WorkspaceDiagnostic>,
+}
+
+fn validate_security_output(output: OutputFormat) -> Result<(), ExitCode> {
+    if matches!(
+        output,
+        OutputFormat::Human
+            | OutputFormat::Json
+            | OutputFormat::Sarif
+            | OutputFormat::GithubAnnotations
+            | OutputFormat::GithubSummary
+    ) {
+        Ok(())
+    } else {
+        Err(emit_error(
+            "fallow security supports --format human, json, sarif, github-annotations, or github-summary only.",
+            2,
+            output,
+        ))
+    }
+}
+
+fn validate_derived_security_output(
+    output: OutputFormat,
+    subcommand: &'static str,
+) -> Result<(), ExitCode> {
+    if matches!(output, OutputFormat::Human | OutputFormat::Json) {
+        Ok(())
+    } else {
+        Err(emit_error(
+            &format!("fallow security {subcommand} supports --format human or json only."),
+            2,
+            output,
+        ))
+    }
+}
+
+fn build_survivors_output(
+    opts: &SecuritySurvivorsOptions<'_>,
+    started: Instant,
+) -> Result<SecuritySurvivorsOutput, String> {
+    let CandidateInput {
+        candidates,
+        workspace_diagnostics,
+    } = load_candidate_map(opts.candidates)?;
+    let verdicts = load_verdicts(opts.verdicts)?;
+    let mut seen = BTreeSet::new();
+    let mut survivors = BTreeMap::new();
+    let mut needs_human_review = BTreeMap::new();
+    let mut dismissed = 0;
+
+    for verdict in &verdicts {
+        validate_verdict(verdict)?;
+        if !seen.insert(verdict.finding_id.clone()) {
+            return Err(format!(
+                "Verifier verdict file has duplicate verdict for finding_id `{}`.",
+                verdict.finding_id
+            ));
+        }
+        let Some(candidate) = candidates.get(&verdict.finding_id) else {
+            return Err(format!(
+                "Verifier verdict references unknown finding_id `{}`.",
+                verdict.finding_id
+            ));
+        };
+        match verdict.verdict {
+            SecurityVerifierVerdictStatus::Survivor => {
+                survivors.insert(
+                    verdict.finding_id.clone(),
+                    survivor_from_verdict(verdict, candidate),
+                );
+            }
+            SecurityVerifierVerdictStatus::Dismissed => dismissed += 1,
+            SecurityVerifierVerdictStatus::NeedsHumanReview => {
+                needs_human_review.insert(
+                    verdict.finding_id.clone(),
+                    survivor_from_verdict(verdict, candidate),
+                );
+            }
+        }
+    }
+
+    let unverdicted = candidates.len().saturating_sub(seen.len());
+
+    Ok(SecuritySurvivorsOutput {
+        schema_version: SecuritySurvivorsSchemaVersion::V2,
+        version: ToolVersion(env!("CARGO_PKG_VERSION").to_string()),
+        elapsed_ms: ElapsedMs(started.elapsed().as_millis() as u64),
+        workspace_diagnostics,
+        summary: SecuritySurvivorsSummary {
+            candidates: candidates.len(),
+            verdicts: verdicts.len(),
+            survivors: survivors.len(),
+            dismissed,
+            needs_human_review: needs_human_review.len(),
+            unverdicted,
+        },
+        survivors,
+        needs_human_review,
+    })
+}
+
+struct CandidateInput {
+    candidates: BTreeMap<String, SecurityFinding>,
+    workspace_diagnostics: Vec<fallow_config::WorkspaceDiagnostic>,
+}
+
+fn load_candidate_map(path: &Path) -> Result<CandidateInput, String> {
+    let value = load_json_file(path, "candidate")?;
+    let workspace_diagnostics = value
+        .get("workspace_diagnostics")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|err| {
+            format!(
+                "Candidate file {} contains malformed workspace diagnostics: {err}",
+                path.display()
+            )
+        })?
+        .unwrap_or_default();
+    let Some(findings) = value
+        .get("security_findings")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return Err(format!(
+            "Candidate file {} must be raw `fallow security --format json` output with a security_findings array.",
+            path.display()
+        ));
+    };
+    let mut candidates = BTreeMap::new();
+    for finding in findings {
+        let finding: SecurityFinding = serde_json::from_value(finding.clone()).map_err(|err| {
+            format!(
+                "Candidate file {} contains a malformed security finding: {err}",
+                path.display()
+            )
+        })?;
+        if finding.finding_id.is_empty() {
+            return Err(format!(
+                "Candidate file {} contains a security finding with an empty finding_id.",
+                path.display()
+            ));
+        }
+        if candidates
+            .insert(finding.finding_id.clone(), finding.clone())
+            .is_some()
+        {
+            return Err(format!(
+                "Candidate file {} contains duplicate finding_id `{}`.",
+                path.display(),
+                finding.finding_id
+            ));
+        }
+    }
+    Ok(CandidateInput {
+        candidates,
+        workspace_diagnostics,
+    })
+}
+
+fn load_verdicts(path: &Path) -> Result<Vec<SecurityVerifierVerdict>, String> {
+    let value = load_json_file(path, "verdict")?;
+    let verdicts_value = if let Some(items) = value.get("verdicts") {
+        if value
+            .get("schema_version")
+            .and_then(serde_json::Value::as_str)
+            != Some("fallow-security-verdicts/v1")
+        {
+            return Err(format!(
+                "Verifier verdict file {} must use schema_version `fallow-security-verdicts/v1`.",
+                path.display()
+            ));
+        }
+        if !items.is_array() {
+            return Err(format!(
+                "Verifier verdict file {} must contain a verdicts array.",
+                path.display()
+            ));
+        }
+        items.clone()
+    } else {
+        value
+    };
+    serde_json::from_value::<Vec<SecurityVerifierVerdict>>(verdicts_value).map_err(|err| {
+        format!(
+            "Failed to parse verifier verdict file {}: {err}",
+            path.display()
+        )
+    })
+}
+
+fn load_json_file(path: &Path, label: &str) -> Result<serde_json::Value, String> {
+    let src = std::fs::read_to_string(path)
+        .map_err(|err| format!("Failed to read {label} file {}: {err}", path.display()))?;
+    serde_json::from_str(&src)
+        .map_err(|err| format!("Failed to parse {label} file {}: {err}", path.display()))
+}
+
+fn validate_verdict(verdict: &SecurityVerifierVerdict) -> Result<(), String> {
+    if verdict.schema_version != "fallow-security-verdict/v1" {
+        return Err(format!(
+            "Verifier verdict for finding_id `{}` must use schema_version `fallow-security-verdict/v1`.",
+            verdict.finding_id
+        ));
+    }
+    if verdict.finding_id.is_empty() {
+        return Err("Verifier verdict contains an empty finding_id.".to_owned());
+    }
+    Ok(())
+}
+
+fn survivor_from_verdict(
+    verdict: &SecurityVerifierVerdict,
+    candidate: &SecurityFinding,
+) -> SecuritySurvivor {
+    SecuritySurvivor {
+        finding_id: verdict.finding_id.clone(),
+        verdict: verdict.verdict,
+        reason: verdict.reason.clone(),
+        rationale: verdict.rationale.clone(),
+        confidence: verdict.confidence.clone(),
+        impact: verdict.impact.clone(),
+        fix_direction: verdict.fix_direction.clone(),
+        candidate: candidate.clone(),
+    }
+}
+
+fn security_rule_severities(config: &fallow_config::ResolvedConfig) -> SecurityRuleSeverities {
+    SecurityRuleSeverities {
+        leak: config.rules.security_client_server_leak,
+        sink: config.rules.security_sink,
+    }
+}
+
+fn build_security_output(input: SecurityOutputInput<'_, '_>) -> SecurityOutput {
+    SecurityOutput {
+        schema_version: SecuritySchemaVersion::V8,
+        version: ToolVersion(env!("CARGO_PKG_VERSION").to_string()),
+        elapsed_ms: ElapsedMs(input.started.elapsed().as_millis() as u64),
+        config: security_output_config(
+            input.config,
+            input.configured_severities.leak,
+            input.effective_severities.leak,
+            input.configured_severities.sink,
+            input.effective_severities.sink,
+        ),
+        meta: input.opts.explain.then(crate::explain::security_meta),
+        gate: input
+            .gate_mode
+            .map(|mode| security_gate_output(mode, input.findings.len())),
+        workspace_diagnostics: input.workspace_diagnostics,
+        security_findings: input.findings,
+        attack_surface: input.attack_surface,
+        unresolved_edge_files: input.unresolved_edge_files,
+        unresolved_callee_sites: input.unresolved_callee_sites,
+        unresolved_callee_diagnostics: input.unresolved_callee_diagnostics,
+    }
+}
+
+fn security_gate_output(mode: SecurityGateMode, finding_count: usize) -> SecurityGate {
+    // In gate mode the displayed set is the strict "new" set, so its length is
+    // the new-candidate count. The gate block is emitted unconditionally when a
+    // gate ran so consumers can distinguish pass from "gate did not run".
+    SecurityGate {
+        mode,
+        verdict: if finding_count > 0 {
+            SecurityGateVerdict::Fail
+        } else {
+            SecurityGateVerdict::Pass
+        },
+        new_count: finding_count,
+    }
+}
+
+fn maybe_write_security_sarif(
+    opts: &SecurityOptions<'_>,
+    output: &SecurityOutput,
+) -> Result<(), ExitCode> {
+    if let Some(path) = opts.sarif_file
+        && let Err(message) = write_sarif_file(output, path)
+    {
+        return Err(emit_error(&message, 2, opts.output));
+    }
+    Ok(())
+}
+
+fn render_security_output(opts: &SecurityOptions<'_>, output: &SecurityOutput) -> String {
+    match opts.output {
+        OutputFormat::Json if opts.summary => {
+            render_json_summary_with_style(output, opts.json_style)
+        }
+        OutputFormat::Json => render_json_with_style(output, opts.json_style),
+        OutputFormat::Sarif => render_sarif(output),
+        OutputFormat::GithubAnnotations | OutputFormat::GithubSummary => {
+            render_security_github(opts, output)
+        }
+        _ if opts.summary => render_human_summary(output),
+        _ => render_human(output),
+    }
+}
+
+/// Render security candidates in a GitHub-native format from the same JSON
+/// envelope `--format json` serializes. Annotations are a net-new surface at
+/// `::notice` level (the bundled action's jq layer has no security
+/// annotations); the summary ports `summary-security.jq`.
+fn render_security_github(opts: &SecurityOptions<'_>, output: &SecurityOutput) -> String {
+    let Ok(envelope) = fallow_output::serialize_security_json_output(
+        output.clone(),
+        crate::output_runtime::current_root_envelope_mode(),
+        crate::output_runtime::telemetry_analysis_run_id().as_deref(),
+    ) else {
+        return String::new();
+    };
+    let options = crate::report::github::resolve_render_options(opts.root);
+    if matches!(opts.output, OutputFormat::GithubSummary) {
+        let links = crate::report::github_summary::LinkContext::from_env(&options.rebase);
+        crate::report::github_summary::render_summary(
+            crate::report::github_annotations::EnvelopeKind::Security,
+            &envelope,
+            &links,
+        )
+    } else {
+        crate::report::github_annotations::render_annotations(
+            crate::report::github_annotations::EnvelopeKind::Security,
+            &envelope,
+            &options,
+        )
+    }
+}
+
+fn security_exit_code(
+    opts: &SecurityOptions<'_>,
+    output: &SecurityOutput,
+    effective_severities: SecurityRuleSeverities,
+) -> ExitCode {
+    if let Some(gate) = &output.gate {
+        if gate.verdict == SecurityGateVerdict::Fail {
+            ExitCode::from(SECURITY_GATE_EXIT_CODE)
+        } else {
+            ExitCode::SUCCESS
+        }
+    } else if security_advisory_failed(opts, output, effective_severities) {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+fn security_advisory_failed(
+    opts: &SecurityOptions<'_>,
+    output: &SecurityOutput,
+    effective_severities: SecurityRuleSeverities,
+) -> bool {
+    (opts.fail_on_issues
+        || effective_severities.leak == Severity::Error
+        || effective_severities.sink == Severity::Error)
+        && !output.security_findings.is_empty()
+}
+
+struct PreparedSecurityFindings {
+    findings: Vec<SecurityFinding>,
+    attack_surface: Option<Vec<SecurityAttackSurfaceEntry>>,
+}
+
+fn prepare_security_findings(
+    analysis: &mut SecurityAnalysisState,
+    runtime_report: Option<&RuntimeCoverageReport>,
+    root: &Path,
+    include_surface: bool,
+) -> PreparedSecurityFindings {
+    let mut findings: Vec<SecurityFinding> =
+        std::mem::take(&mut analysis.results.security_findings)
+            .into_iter()
+            .map(|f| relativize_finding(f, root))
+            .collect();
+    if let (Some(report), Some(modules), Some(files)) = (
+        runtime_report,
+        analysis.modules.as_ref(),
+        analysis.files.as_ref(),
+    ) {
+        apply_runtime_context(&mut findings, modules, files, root, report);
+    }
+    apply_security_severity(&mut findings);
+    sort_by_security_severity(&mut findings);
+    for finding in &mut findings {
+        finding.finding_id = security_finding_id(finding);
+    }
+    let (findings, attack_surface) = prepare_findings(findings, root, include_surface);
+    PreparedSecurityFindings {
+        findings,
+        attack_surface,
+    }
+}
+
+fn force_security_rules(config: &mut fallow_config::ResolvedConfig) {
+    // Respect explicit user severities; force the rules on when they are the
+    // default off so this dedicated command actually surfaces candidates.
+    if config.rules.security_client_server_leak == Severity::Off {
+        config.rules.security_client_server_leak = Severity::Warn;
+    }
+    if config.rules.security_sink == Severity::Off {
+        config.rules.security_sink = Severity::Warn;
+    }
+}
+
+fn security_output_config(
+    config: &fallow_config::ResolvedConfig,
+    configured_severity: Severity,
+    effective_severity: Severity,
+    configured_sink_severity: Severity,
+    effective_sink_severity: Severity,
+) -> SecurityOutputConfig {
+    let categories = config.security.categories.as_ref();
+    SecurityOutputConfig {
+        rules: SecurityOutputRulesConfig {
+            security_client_server_leak: SecurityRuleSeverityConfig {
+                configured: configured_severity,
+                effective: effective_severity,
+            },
+            security_sink: SecurityRuleSeverityConfig {
+                configured: configured_sink_severity,
+                effective: effective_sink_severity,
+            },
+        },
+        categories_include: categories.and_then(|categories| categories.include.clone()),
+        categories_exclude: categories.and_then(|categories| categories.exclude.clone()),
+    }
+}
+
+fn apply_changed_scope(opts: &SecurityOptions<'_>, results: &mut AnalysisResults) {
+    if let Some(git_ref) = opts.changed_since
+        && let Some(changed) = fallow_engine::changed_files::get_changed_files(opts.root, git_ref)
+    {
+        fallow_engine::changed_files::filter_results_by_changed_files(results, &changed);
+    }
+    if opts.use_shared_diff_index
+        && let Some(diff_index) = crate::report::ci::diff_filter::shared_diff_index()
+    {
+        crate::check::filtering::filter_results_by_diff(results, diff_index, opts.root);
+    }
+}
+
+fn apply_security_scopes(
+    opts: &SecurityOptions<'_>,
+    analysis: &mut SecurityAnalysisState,
+) -> Result<(), ExitCode> {
+    let ws_roots = crate::check::filtering::resolve_workspace_scope(
+        opts.root,
+        opts.workspace,
+        opts.changed_workspaces,
+        opts.output,
+    )?;
+    if let Some(ref roots) = ws_roots {
+        crate::check::filtering::filter_to_workspaces(&mut analysis.results, roots);
+    }
+
+    if !matches!(opts.gate, Some(SecurityGateMode::NewlyReachable)) {
+        apply_changed_scope(opts, &mut analysis.results);
+    }
+    filter_to_files(&mut analysis.results, opts.root, opts.file, opts.quiet);
+
+    Ok(())
+}
+
+fn apply_security_gate(
+    opts: &SecurityOptions<'_>,
+    config: &fallow_config::ResolvedConfig,
+    results: &mut AnalysisResults,
+) -> Result<Option<SecurityGateMode>, ExitCode> {
+    let Some(mode) = opts.gate else {
+        return Ok(None);
+    };
+
+    if matches!(mode, SecurityGateMode::NewlyReachable) {
+        retain_gate_newly_reachable(opts, config, results)?;
+        return Ok(Some(mode));
+    }
+
+    // Security gate (issue #886): narrow to the STRICT "new in changed lines"
+    // predicate and drive a dedicated exit code. The gate requires a diff
+    // source; a diff it cannot compute is a LOUD error (exit 2), never a green
+    // gate (a silent miss defeats a security gate).
+    let mut owned_gate_diff: Option<crate::report::ci::diff_filter::DiffIndex> = None;
+    let gate_diff: &crate::report::ci::diff_filter::DiffIndex =
+        if let Some(shared) = crate::report::ci::diff_filter::shared_diff_index() {
+            shared
+        } else if let Some(git_ref) = opts.changed_since {
+            match fallow_engine::changed_files::try_get_changed_diff(opts.root, git_ref) {
+                Ok(text) => owned_gate_diff
+                    .insert(crate::report::ci::diff_filter::DiffIndex::from_unified_diff(&text)),
+                Err(err) => {
+                    return Err(emit_error(
+                        &format!(
+                            "fallow security --gate could not compute the diff for '{git_ref}': {}",
+                            err.describe()
+                        ),
+                        2,
+                        opts.output,
+                    ));
+                }
+            }
+        } else {
+            return Err(emit_error(
+                "fallow security --gate requires a diff source: --changed-since <ref>, \
+                     --diff-file <path>, or --diff-stdin.",
+                2,
+                opts.output,
+            ));
+        };
+    crate::check::filtering::retain_gate_new(results, gate_diff, opts.root);
+    Ok(Some(mode))
+}
+
+const SECURITY_BASE_SNAPSHOT_CACHE_VERSION: u8 = 1;
+const MAX_SECURITY_BASE_SNAPSHOT_CACHE_SIZE: usize = 8 * 1024 * 1024;
+
+#[derive(Debug, Clone)]
+struct SecurityKeySnapshot {
+    reachable: FxHashSet<String>,
+}
+
+struct SecurityBaseSnapshotCacheKey {
+    hash: u64,
+    base_sha: String,
+}
+
+#[derive(bitcode::Encode, bitcode::Decode)]
+struct CachedSecurityKeySnapshot {
+    version: u8,
+    cli_version: String,
+    key_hash: u64,
+    base_sha: String,
+    reachable: Vec<String>,
+}
+
+fn retain_gate_newly_reachable(
+    opts: &SecurityOptions<'_>,
+    config: &fallow_config::ResolvedConfig,
+    results: &mut AnalysisResults,
+) -> Result<(), ExitCode> {
+    let Some(base_ref) = opts.changed_since else {
+        return Err(emit_error(
+            "fallow security --gate newly-reachable requires --changed-since <ref>; \
+             --diff-file and --diff-stdin do not identify a base tree.",
+            2,
+            opts.output,
+        ));
+    };
+    let Some(base_sha) = git_rev_parse(opts.root, base_ref) else {
+        return Err(emit_error(
+            &format!(
+                "fallow security --gate newly-reachable could not resolve base ref '{base_ref}'."
+            ),
+            2,
+            opts.output,
+        ));
+    };
+    let cache_key = security_base_snapshot_cache_key(opts, config, &base_sha)?;
+    let base = if let Some(snapshot) = load_cached_security_base_snapshot(config, &cache_key) {
+        snapshot
+    } else {
+        let snapshot = compute_base_security_snapshot(opts, config, base_ref, &base_sha)?;
+        save_cached_security_base_snapshot(config, &cache_key, &snapshot);
+        snapshot
+    };
+    results.security_findings.retain(|finding| {
+        security_reachability_key(finding, opts.root)
+            .is_some_and(|key| !base.reachable.contains(&key))
+    });
+    Ok(())
+}
+
+fn compute_base_security_snapshot(
+    opts: &SecurityOptions<'_>,
+    config: &fallow_config::ResolvedConfig,
+    base_ref: &str,
+    base_sha: &str,
+) -> Result<SecurityKeySnapshot, ExitCode> {
+    let Some(worktree) = BaseWorktree::create(opts.root, base_ref, Some(base_sha)) else {
+        return Err(emit_error(
+            &format!("could not create a temporary worktree for base ref '{base_ref}'"),
+            2,
+            opts.output,
+        ));
+    };
+    let base_root = base_analysis_root(opts.root, worktree.path());
+    let current_config_path = opts
+        .config_path
+        .clone()
+        .or_else(|| fallow_config::FallowConfig::find_config_path(opts.root));
+    let mut base_config = load_config_for_analysis(
+        &base_root,
+        &current_config_path,
+        crate::ConfigLoadOptions {
+            output: opts.output,
+            no_cache: opts.no_cache,
+            threads: opts.threads,
+            production_override: None,
+            quiet: true,
+            allow_remote_extends: opts.allow_remote_extends,
+        },
+        ProductionAnalysis::DeadCode,
+    )?;
+    base_config.cache_dir =
+        remap_cache_dir_for_base_worktree(opts.root, &base_root, &config.cache_dir);
+    force_security_rules(&mut base_config);
+    let mut base_analysis = analyze_security_candidates(
+        &base_snapshot_security_options(opts, &base_root, &current_config_path),
+        &base_config,
+    )?;
+    scope_base_snapshot_to_workspaces(opts, &base_root, &mut base_analysis.results)?;
+    Ok(SecurityKeySnapshot {
+        reachable: security_reachable_keys(&base_analysis.results.security_findings, &base_root),
+    })
+}
+
+/// Build the quiet, non-gating `SecurityOptions` used to re-analyze the base
+/// worktree for the `--gate newly-reachable` snapshot.
+#[expect(
+    clippy::ref_option,
+    reason = "config_path mirrors the SecurityOptions.config_path field which is &Option<PathBuf>"
+)]
+fn base_snapshot_security_options<'a>(
+    opts: &SecurityOptions<'a>,
+    base_root: &'a Path,
+    config_path: &'a Option<PathBuf>,
+) -> SecurityOptions<'a> {
+    SecurityOptions {
+        root: base_root,
+        config_path,
+        output: opts.output,
+        json_style: opts.json_style,
+        no_cache: opts.no_cache,
+        threads: opts.threads,
+        quiet: true,
+        allow_remote_extends: opts.allow_remote_extends,
+        fail_on_issues: false,
+        sarif_file: None,
+        summary: false,
+        changed_since: None,
+        use_shared_diff_index: false,
+        workspace: opts.workspace,
+        changed_workspaces: None,
+        file: &[],
+        surface: false,
+        gate: None,
+        runtime_coverage: None,
+        min_invocations_hot: opts.min_invocations_hot,
+        explain: false,
+    }
+}
+
+/// Apply the run's `--workspace` scope to the base-snapshot results so the
+/// reachable-key set matches the head scope it is diffed against.
+fn scope_base_snapshot_to_workspaces(
+    opts: &SecurityOptions<'_>,
+    base_root: &Path,
+    results: &mut AnalysisResults,
+) -> Result<(), ExitCode> {
+    if let Some(ref roots) = crate::check::filtering::resolve_workspace_scope(
+        base_root,
+        opts.workspace,
+        None,
+        opts.output,
+    )? {
+        crate::check::filtering::filter_to_workspaces(results, roots);
+    }
+    Ok(())
+}
+
+fn security_reachable_keys(findings: &[SecurityFinding], root: &Path) -> FxHashSet<String> {
+    findings
+        .iter()
+        .filter_map(|finding| security_reachability_key(finding, root))
+        .collect()
+}
+
+fn security_reachability_key(finding: &SecurityFinding, root: &Path) -> Option<String> {
+    if !finding
+        .reachability
+        .as_ref()
+        .is_some_and(|reachability| reachability.reachable_from_entry)
+    {
+        return None;
+    }
+    let category = finding.category.as_deref().unwrap_or("none");
+    Some(format!(
+        "security-reach:{}:{}:{}",
+        relative_key(&finding.path, root),
+        security_kind_key(finding.kind),
+        category,
+    ))
+}
+
+fn security_kind_key(kind: SecurityFindingKind) -> &'static str {
+    match kind {
+        SecurityFindingKind::ClientServerLeak => "client-server-leak",
+        SecurityFindingKind::TaintedSink => "tainted-sink",
+    }
+}
+
+fn security_base_snapshot_cache_key(
+    opts: &SecurityOptions<'_>,
+    config: &fallow_config::ResolvedConfig,
+    base_sha: &str,
+) -> Result<SecurityBaseSnapshotCacheKey, ExitCode> {
+    let payload = serde_json::json!({
+        "cache_version": SECURITY_BASE_SNAPSHOT_CACHE_VERSION,
+        "cli_version": env!("CARGO_PKG_VERSION"),
+        "base_sha": base_sha,
+        "config_hash": format!("{:016x}", config.cache_config_hash),
+        "security_client_server_leak": format!("{:?}", config.rules.security_client_server_leak),
+        "security_sink": format!("{:?}", config.rules.security_sink),
+        "workspace": opts.workspace,
+        "changed_workspaces": opts.changed_workspaces,
+    });
+    let bytes = serde_json::to_vec(&payload).map_err(|err| {
+        emit_error(
+            &format!("failed to build security gate cache key: {err}"),
+            2,
+            opts.output,
+        )
+    })?;
+    Ok(SecurityBaseSnapshotCacheKey {
+        hash: xxh3_64(&bytes),
+        base_sha: base_sha.to_owned(),
+    })
+}
+
+fn security_base_snapshot_cache_dir(config: &fallow_config::ResolvedConfig) -> PathBuf {
+    config.cache_dir.join("cache").join(format!(
+        "security-base-v{SECURITY_BASE_SNAPSHOT_CACHE_VERSION}"
+    ))
+}
+
+fn security_base_snapshot_cache_file(
+    config: &fallow_config::ResolvedConfig,
+    key: &SecurityBaseSnapshotCacheKey,
+) -> PathBuf {
+    security_base_snapshot_cache_dir(config).join(format!("{:016x}.bin", key.hash))
+}
+
+fn ensure_security_base_snapshot_cache_dir(dir: &Path) -> Result<(), std::io::Error> {
+    std::fs::create_dir_all(dir)?;
+    let gitignore = dir.join(".gitignore");
+    if std::fs::read_to_string(&gitignore).ok().as_deref() != Some("*\n") {
+        std::fs::write(gitignore, "*\n")?;
+    }
+    Ok(())
+}
+
+fn load_cached_security_base_snapshot(
+    config: &fallow_config::ResolvedConfig,
+    key: &SecurityBaseSnapshotCacheKey,
+) -> Option<SecurityKeySnapshot> {
+    if config.no_cache {
+        return None;
+    }
+    let path = security_base_snapshot_cache_file(config, key);
+    let data = std::fs::read(path).ok()?;
+    if data.len() > MAX_SECURITY_BASE_SNAPSHOT_CACHE_SIZE {
+        return None;
+    }
+    let cached: CachedSecurityKeySnapshot = bitcode::decode(&data).ok()?;
+    if cached.version != SECURITY_BASE_SNAPSHOT_CACHE_VERSION
+        || cached.cli_version != env!("CARGO_PKG_VERSION")
+        || cached.key_hash != key.hash
+        || cached.base_sha != key.base_sha
+    {
+        return None;
+    }
+    Some(SecurityKeySnapshot {
+        reachable: cached.reachable.into_iter().collect(),
+    })
+}
+
+fn save_cached_security_base_snapshot(
+    config: &fallow_config::ResolvedConfig,
+    key: &SecurityBaseSnapshotCacheKey,
+    snapshot: &SecurityKeySnapshot,
+) {
+    if config.no_cache {
+        return;
+    }
+    let dir = security_base_snapshot_cache_dir(config);
+    if ensure_security_base_snapshot_cache_dir(&dir).is_err() {
+        return;
+    }
+    let mut reachable = snapshot.reachable.iter().cloned().collect::<Vec<_>>();
+    reachable.sort_unstable();
+    let data = bitcode::encode(&CachedSecurityKeySnapshot {
+        version: SECURITY_BASE_SNAPSHOT_CACHE_VERSION,
+        cli_version: env!("CARGO_PKG_VERSION").to_owned(),
+        key_hash: key.hash,
+        base_sha: key.base_sha.clone(),
+        reachable,
+    });
+    let Ok(mut tmp) = tempfile::NamedTempFile::new_in(&dir) else {
+        return;
+    };
+    if tmp.write_all(&data).is_err() {
+        return;
+    }
+    let _ = tmp.persist(security_base_snapshot_cache_file(config, key));
+}
+
+fn base_analysis_root(current_root: &Path, base_worktree_root: &Path) -> PathBuf {
+    if current_root.is_absolute()
+        && let Some(git_root) = crate::base_worktree::git_toplevel(current_root)
+        && let Ok(relative) = current_root.strip_prefix(git_root)
+    {
+        return base_worktree_root.join(relative);
+    }
+    base_worktree_root.to_path_buf()
+}
+
+fn remap_cache_dir_for_base_worktree(
+    current_root: &Path,
+    base_worktree_root: &Path,
+    cache_dir: &Path,
+) -> PathBuf {
+    if cache_dir.is_absolute()
+        && let Ok(relative) = cache_dir.strip_prefix(current_root)
+    {
+        return base_worktree_root.join(relative);
+    }
+    cache_dir.to_path_buf()
+}
+
+struct SecurityAnalysisState {
+    results: AnalysisResults,
+    workspace_diagnostics: Vec<fallow_config::WorkspaceDiagnostic>,
+    modules: Option<Vec<ModuleInfo>>,
+    files: Option<Vec<DiscoveredFile>>,
+    analysis_output: Option<fallow_engine::dead_code::DeadCodeAnalysisArtifacts>,
+}
+
+fn analyze_security_candidates(
+    opts: &SecurityOptions<'_>,
+    config: &fallow_config::ResolvedConfig,
+) -> Result<SecurityAnalysisState, ExitCode> {
+    let session = fallow_engine::session::AnalysisSession::from_resolved_config(config.clone())
+        .map_err(|err| emit_error(&format!("Analysis error: {err}"), 2, opts.output))?;
+
+    if opts.runtime_coverage.is_none() {
+        return session
+            .analyze_dead_code_with_artifacts(false, false)
+            .map(|output| SecurityAnalysisState {
+                results: output.results,
+                workspace_diagnostics: session.current_workspace_diagnostics(),
+                modules: None,
+                files: None,
+                analysis_output: None,
+            })
+            .map_err(|err| emit_error(&format!("Analysis error: {err}"), 2, opts.output));
+    }
+
+    session
+        .analyze_dead_code_with_artifacts(true, true)
+        .map(|mut output| {
+            let modules = output.modules.take();
+            let files = output.files.take();
+            let results = output.results.clone();
+            SecurityAnalysisState {
+                results,
+                workspace_diagnostics: session.current_workspace_diagnostics(),
+                modules,
+                files,
+                analysis_output: Some(output),
+            }
+        })
+        .map_err(|err| emit_error(&format!("Analysis error: {err}"), 2, opts.output))
+}
+
+fn security_runtime_report(
+    opts: &SecurityOptions<'_>,
+    analysis: &mut SecurityAnalysisState,
+) -> Result<Option<RuntimeCoverageReport>, ExitCode> {
+    let Some(path) = opts.runtime_coverage else {
+        return Ok(None);
+    };
+    let (Some(modules), Some(files), Some(analysis_output)) = (
+        analysis.modules.as_ref(),
+        analysis.files.as_ref(),
+        analysis.analysis_output.take(),
+    ) else {
+        return Ok(None);
+    };
+    analyze_security_runtime(opts, path, modules.clone(), files.clone(), analysis_output)
+}
+
+fn analyze_security_runtime(
+    opts: &SecurityOptions<'_>,
+    path: &Path,
+    modules: Vec<ModuleInfo>,
+    files: Vec<DiscoveredFile>,
+    analysis_output: fallow_engine::dead_code::DeadCodeAnalysisArtifacts,
+) -> Result<Option<RuntimeCoverageReport>, ExitCode> {
+    let runtime_coverage = crate::health::coverage::prepare_options(
+        path,
+        opts.min_invocations_hot,
+        None,
+        None,
+        opts.output,
+    )?;
+    let result = crate::health::execute_health_with_shared_parse(
+        &security_runtime_health_options(opts, runtime_coverage),
+        fallow_engine::health::HealthSharedParseData {
+            files,
+            modules,
+            dead_code_results: None,
+            workspaces: Vec::new(),
+            analysis_output: Some(analysis_output),
+        },
+    )?;
+    Ok(result.report.runtime_coverage)
+}
+
+/// Build the production-forced `HealthOptions` used to compute runtime coverage
+/// context for security findings (complexity/hotspot/ownership all disabled).
+fn security_runtime_health_options<'a>(
+    opts: &SecurityOptions<'a>,
+    runtime_coverage: fallow_engine::health::RuntimeCoverageOptions,
+) -> HealthOptions<'a> {
+    HealthOptions {
+        root: opts.root,
+        config_path: opts.config_path,
+        output: opts.output,
+        no_cache: opts.no_cache,
+        threads: opts.threads,
+        quiet: opts.quiet,
+        thresholds: fallow_engine::health::HealthThresholdOverrides::default(),
+        top: None,
+        sort: fallow_engine::health::HealthSort::Cyclomatic,
+        production: true,
+        production_override: Some(true),
+        allow_remote_extends: opts.allow_remote_extends,
+        changed_since: opts.changed_since,
+        diff_index: None,
+        use_shared_diff_index: opts.use_shared_diff_index,
+        workspace: opts.workspace,
+        changed_workspaces: opts.changed_workspaces,
+        baseline: None,
+        save_baseline: None,
+        baseline_mode: fallow_engine::baseline::HealthBaselineMode::default(),
+        baseline_mode_explicit: false,
+        complexity: false,
+        file_scores: false,
+        coverage_gaps: false,
+        config_activates_coverage_gaps: false,
+        hotspots: false,
+        ownership: false,
+        ownership_emails: None,
+        targets: false,
+        css: false,
+        css_deep: false,
+        force_full: false,
+        score_only_output: false,
+        enforce_coverage_gap_gate: false,
+        effort: None,
+        score: false,
+        gates: fallow_engine::health::HealthGateOptions::default(),
+        since: None,
+        min_commits: None,
+        explain: false,
+        summary: false,
+        save_snapshot: None,
+        trend: false,
+        coverage_inputs: fallow_engine::health::HealthCoverageInputs::default(),
+        performance: false,
+        runtime_coverage: Some(runtime_coverage),
+        churn_file: None,
+        analysis_identity: fallow_types::semantic::SemanticAnalysisIdentity::default(),
+        complexity_breakdown: false,
+        group_by: None,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct RuntimeFunctionKey {
+    path: String,
+    function: String,
+    line: u32,
+}
+
+#[derive(Debug, Clone)]
+struct FunctionSpan {
+    key: RuntimeFunctionKey,
+    end_line: u32,
+}
+
+fn apply_runtime_context(
+    findings: &mut Vec<SecurityFinding>,
+    modules: &[ModuleInfo],
+    files: &[fallow_types::discover::DiscoveredFile],
+    root: &Path,
+    report: &RuntimeCoverageReport,
+) {
+    let spans = function_spans(modules, files, root);
+    let runtime = SecurityRuntimeIndex::new(report);
+    let mut indexed = findings.drain(..).enumerate().collect::<Vec<_>>();
+    for (_, finding) in &mut indexed {
+        if !matches!(finding.kind, SecurityFindingKind::TaintedSink) {
+            continue;
+        }
+        finding.runtime = runtime_context_for_finding(finding, &spans, &runtime);
+    }
+    indexed.sort_by(|(left_index, left), (right_index, right)| {
+        runtime_rank(left)
+            .cmp(&runtime_rank(right))
+            .then_with(|| left_index.cmp(right_index))
+    });
+    findings.extend(indexed.into_iter().map(|(_, finding)| finding));
+}
+
+fn function_spans(
+    modules: &[ModuleInfo],
+    files: &[fallow_types::discover::DiscoveredFile],
+    root: &Path,
+) -> Vec<FunctionSpan> {
+    let paths_by_id = files
+        .iter()
+        .map(|file| (file.id, &file.path))
+        .collect::<rustc_hash::FxHashMap<_, _>>();
+    let mut spans = Vec::new();
+    for module in modules {
+        let Some(path) = paths_by_id.get(&module.file_id) else {
+            continue;
+        };
+        let path = relative_key(path, root);
+        for function in &module.complexity {
+            spans.push(FunctionSpan {
+                key: RuntimeFunctionKey {
+                    path: path.clone(),
+                    function: function.name.clone(),
+                    line: function.line,
+                },
+                end_line: function.line.saturating_add(function.line_count),
+            });
+        }
+    }
+    spans
+}
+
+struct SecurityRuntimeIndex {
+    hot_paths: Vec<(RuntimeFunctionKey, u32, SecurityRuntimeContext)>,
+    findings: rustc_hash::FxHashMap<RuntimeFunctionKey, SecurityRuntimeContext>,
+}
+
+impl SecurityRuntimeIndex {
+    fn new(report: &RuntimeCoverageReport) -> Self {
+        let hot_paths = report
+            .hot_paths
+            .iter()
+            .map(|hot| {
+                (
+                    runtime_hot_key(hot),
+                    hot.end_line.max(hot.line),
+                    SecurityRuntimeContext {
+                        state: SecurityRuntimeState::RuntimeHot,
+                        function: hot.function.clone(),
+                        line: hot.line,
+                        invocations: Some(hot.invocations),
+                        stable_id: hot.stable_id.clone(),
+                        evidence: Some(format!(
+                            "production hot path observed with {} invocation{}",
+                            hot.invocations,
+                            crate::report::plural(hot.invocations as usize)
+                        )),
+                    },
+                )
+            })
+            .collect();
+        let findings = report
+            .findings
+            .iter()
+            .map(runtime_finding_context)
+            .collect();
+        Self {
+            hot_paths,
+            findings,
+        }
+    }
+}
+
+fn runtime_context_for_finding(
+    finding: &SecurityFinding,
+    spans: &[FunctionSpan],
+    runtime: &SecurityRuntimeIndex,
+) -> Option<SecurityRuntimeContext> {
+    let path = path_key(&finding.path);
+    let span = spans
+        .iter()
+        .filter(|span| {
+            span.key.path == path && span.key.line <= finding.line && finding.line <= span.end_line
+        })
+        .min_by_key(|span| span.end_line.saturating_sub(span.key.line))?;
+    if let Some((_, _, context)) = runtime.hot_paths.iter().find(|(key, end_line, _)| {
+        key == &span.key && key.line <= finding.line && finding.line <= *end_line
+    }) {
+        return Some(context.clone());
+    }
+    runtime.findings.get(&span.key).cloned().or_else(|| {
+        Some(SecurityRuntimeContext {
+            state: SecurityRuntimeState::RuntimeUnknown,
+            function: span.key.function.clone(),
+            line: span.key.line,
+            invocations: None,
+            stable_id: None,
+            evidence: Some("runtime coverage carried no matching function evidence".to_owned()),
+        })
+    })
+}
+
+fn runtime_rank(finding: &SecurityFinding) -> u8 {
+    match finding.runtime.as_ref().map(|runtime| runtime.state) {
+        Some(SecurityRuntimeState::RuntimeHot) => 0,
+        Some(SecurityRuntimeState::LowTraffic) => 1,
+        None | Some(SecurityRuntimeState::RuntimeUnknown) => 2,
+        Some(SecurityRuntimeState::CoverageUnavailable) => 3,
+        Some(SecurityRuntimeState::RuntimeCold) => 4,
+        Some(SecurityRuntimeState::NeverExecuted) => 5,
+    }
+}
+
+fn apply_security_severity(findings: &mut [SecurityFinding]) {
+    for finding in findings {
+        finding.severity = derive_security_severity(finding);
+    }
+}
+
+fn sort_by_security_severity(findings: &mut [SecurityFinding]) {
+    findings.sort_by(compare_security_priority);
+}
+
+fn compare_security_priority(left: &SecurityFinding, right: &SecurityFinding) -> Ordering {
+    security_severity_rank(left.severity)
+        .cmp(&security_severity_rank(right.severity))
+        .then_with(|| runtime_rank(left).cmp(&runtime_rank(right)))
+        .then_with(|| {
+            right
+                .reachability
+                .as_ref()
+                .is_some_and(|reach| reach.reachable_from_entry)
+                .cmp(
+                    &left
+                        .reachability
+                        .as_ref()
+                        .is_some_and(|reach| reach.reachable_from_entry),
+                )
+        })
+        .then_with(|| taint_rank(left).cmp(&taint_rank(right)))
+        .then_with(|| security_blast_radius(right).cmp(&security_blast_radius(left)))
+        .then_with(|| security_crosses_boundary(right).cmp(&security_crosses_boundary(left)))
+        .then_with(|| left.dead_code.is_some().cmp(&right.dead_code.is_some()))
+        .then_with(|| left.path.cmp(&right.path))
+        .then_with(|| left.line.cmp(&right.line))
+        .then_with(|| left.col.cmp(&right.col))
+        .then_with(|| left.category.cmp(&right.category))
+}
+
+fn taint_rank(finding: &SecurityFinding) -> u8 {
+    match finding
+        .reachability
+        .as_ref()
+        .and_then(|reach| reach.taint_confidence)
+    {
+        Some(TaintConfidence::ArgLevel) => 0,
+        Some(TaintConfidence::ModuleLevel) => 1,
+        None if finding.source_backed => 0,
+        None if finding
+            .reachability
+            .as_ref()
+            .is_some_and(|reach| reach.reachable_from_untrusted_source) =>
+        {
+            1
+        }
+        None => 2,
+    }
+}
+
+fn security_blast_radius(finding: &SecurityFinding) -> u32 {
+    finding
+        .reachability
+        .as_ref()
+        .map_or(0, |reach| reach.blast_radius)
+}
+
+fn security_crosses_boundary(finding: &SecurityFinding) -> bool {
+    finding
+        .reachability
+        .as_ref()
+        .is_some_and(|reach| reach.crosses_boundary)
+}
+
+const fn security_severity_rank(severity: SecuritySeverity) -> u8 {
+    match severity {
+        SecuritySeverity::High => 0,
+        SecuritySeverity::Medium => 1,
+        SecuritySeverity::Low => 2,
+    }
+}
+
+fn runtime_hot_key(hot: &RuntimeCoverageHotPath) -> RuntimeFunctionKey {
+    RuntimeFunctionKey {
+        path: path_key(&hot.path),
+        function: hot.function.clone(),
+        line: hot.line,
+    }
+}
+
+fn runtime_finding_context(
+    finding: &RuntimeCoverageFinding,
+) -> (RuntimeFunctionKey, SecurityRuntimeContext) {
+    let state = match finding.verdict {
+        RuntimeCoverageVerdict::SafeToDelete => SecurityRuntimeState::NeverExecuted,
+        RuntimeCoverageVerdict::ReviewRequired if finding.invocations.unwrap_or(0) == 0 => {
+            SecurityRuntimeState::RuntimeCold
+        }
+        RuntimeCoverageVerdict::LowTraffic => SecurityRuntimeState::LowTraffic,
+        RuntimeCoverageVerdict::CoverageUnavailable | RuntimeCoverageVerdict::Unknown => {
+            SecurityRuntimeState::CoverageUnavailable
+        }
+        RuntimeCoverageVerdict::ReviewRequired | RuntimeCoverageVerdict::Active => {
+            SecurityRuntimeState::RuntimeUnknown
+        }
+    };
+    (
+        RuntimeFunctionKey {
+            path: path_key(&finding.path),
+            function: finding.function.clone(),
+            line: finding.line,
+        },
+        SecurityRuntimeContext {
+            state,
+            function: finding.function.clone(),
+            line: finding.line,
+            invocations: finding.invocations,
+            stable_id: finding.stable_id.clone(),
+            evidence: Some(format!("runtime coverage verdict: {}", finding.verdict)),
+        },
+    )
+}
+
+fn relative_key(path: &Path, root: &Path) -> String {
+    path_key(path.strip_prefix(root).unwrap_or(path))
+}
+
+fn path_key(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+fn unresolved_callee_diagnostics(
+    diagnostics: &[SecurityUnresolvedCalleeDiagnostic],
+    root: &Path,
+) -> Option<SecurityUnresolvedCalleeDiagnostics> {
+    if diagnostics.is_empty() {
+        return None;
+    }
+
+    let mut sorted = diagnostics.to_vec();
+    sorted.sort_by(|a, b| {
+        a.path
+            .cmp(&b.path)
+            .then(a.line.cmp(&b.line))
+            .then(a.col.cmp(&b.col))
+            .then(a.reason.cmp(&b.reason))
+            .then(a.expression_kind.cmp(&b.expression_kind))
+    });
+
+    let sampled = sorted
+        .iter()
+        .take(UNRESOLVED_CALLEE_SAMPLE_LIMIT)
+        .map(|diagnostic| SecurityUnresolvedCalleeSample {
+            path: relative_key(&diagnostic.path, root),
+            line: diagnostic.line,
+            col: diagnostic.col,
+            reason: diagnostic.reason,
+            expression_kind: diagnostic.expression_kind,
+        })
+        .collect();
+
+    let mut by_file: BTreeMap<String, usize> = BTreeMap::new();
+    let mut by_reason: BTreeMap<fallow_types::extract::SkippedSecurityCalleeReason, usize> =
+        BTreeMap::new();
+    for diagnostic in &sorted {
+        *by_file
+            .entry(relative_key(&diagnostic.path, root))
+            .or_insert(0) += 1;
+        *by_reason.entry(diagnostic.reason).or_insert(0) += 1;
+    }
+
+    let mut top_files: Vec<_> = by_file
+        .into_iter()
+        .map(|(path, count)| SecurityUnresolvedCalleeTopFile { path, count })
+        .collect();
+    top_files.sort_by(|a, b| b.count.cmp(&a.count).then(a.path.cmp(&b.path)));
+    top_files.truncate(UNRESOLVED_CALLEE_TOP_FILES_LIMIT);
+
+    let mut by_reason: Vec<_> = by_reason
+        .into_iter()
+        .map(|(reason, count)| SecurityUnresolvedCalleeReasonCount { reason, count })
+        .collect();
+    by_reason.sort_by(|a, b| b.count.cmp(&a.count).then(a.reason.cmp(&b.reason)));
+
+    Some(SecurityUnresolvedCalleeDiagnostics {
+        sampled,
+        top_files,
+        by_reason,
+        sample_limit: UNRESOLVED_CALLEE_SAMPLE_LIMIT,
+        top_files_limit: UNRESOLVED_CALLEE_TOP_FILES_LIMIT,
+    })
+}
+
+fn filter_to_files(results: &mut AnalysisResults, root: &Path, files: &[PathBuf], quiet: bool) {
+    if files.is_empty() {
+        return;
+    }
+
+    let resolved_files: Vec<PathBuf> = files
+        .iter()
+        .map(|path| {
+            if crate::path_util::is_absolute_path_any_platform(path) {
+                path.clone()
+            } else {
+                root.join(path)
+            }
+        })
+        .collect();
+
+    if !quiet {
+        for (original, resolved) in files.iter().zip(&resolved_files) {
+            if !resolved.exists() {
+                eprintln!(
+                    "Warning: --file '{}' (resolved to '{}') was not found in the project",
+                    original.display(),
+                    resolved.display()
+                );
+            }
+        }
+    }
+
+    let file_set: rustc_hash::FxHashSet<PathBuf> = resolved_files.into_iter().collect();
+    fallow_engine::changed_files::filter_results_by_changed_files(results, &file_set);
+}
+
+fn prepare_findings(
+    findings: Vec<SecurityFinding>,
+    root: &Path,
+    include_surface: bool,
+) -> (
+    Vec<SecurityFinding>,
+    Option<Vec<SecurityAttackSurfaceEntry>>,
+) {
+    let mut findings: Vec<SecurityFinding> = findings
+        .into_iter()
+        .map(|f| {
+            let mut f = relativize_finding(f, root);
+            f.finding_id = security_finding_id(&f);
+            f
+        })
+        .collect();
+    let attack_surface = include_surface.then(|| {
+        findings
+            .iter()
+            .filter_map(|finding| finding.attack_surface.clone())
+            .collect()
+    });
+    for finding in &mut findings {
+        finding.attack_surface = None;
+    }
+    (findings, attack_surface)
+}
+
+/// Rewrite a finding's anchor + every trace hop path to be project-root-relative
+/// (forward-slash normalization happens at serialize time via `serde_path`).
+fn relativize_finding(mut finding: SecurityFinding, root: &Path) -> SecurityFinding {
+    finding.path = relativize(&finding.path, root);
+    for hop in &mut finding.trace {
+        hop.path = relativize(&hop.path, root);
+    }
+    if let Some(reachability) = &mut finding.reachability {
+        for hop in &mut reachability.untrusted_source_trace {
+            hop.path = relativize(&hop.path, root);
+        }
+    }
+    finding.candidate.sink.path = relativize(&finding.candidate.sink.path, root);
+    if let Some(flow) = &mut finding.taint_flow {
+        flow.source.path = relativize(&flow.source.path, root);
+        flow.sink.path = relativize(&flow.sink.path, root);
+    }
+    if let Some(surface) = &mut finding.attack_surface {
+        surface.source.path = relativize(&surface.source.path, root);
+        surface.sink.path = relativize(&surface.sink.path, root);
+        for hop in &mut surface.path {
+            hop.path = relativize(&hop.path, root);
+        }
+        for control in &mut surface.defensive_boundary.controls {
+            control.path = relativize(&control.path, root);
+        }
+    }
+    finding
+}
+
+fn relativize(path: &Path, root: &Path) -> PathBuf {
+    path.strip_prefix(root)
+        .map_or_else(|_| path.to_path_buf(), Path::to_path_buf)
+}
+
+/// JSON: the `SecurityOutput` envelope, pretty-printed.
+#[must_use]
+#[cfg(test)]
+pub fn render_json(output: &SecurityOutput) -> String {
+    render_json_with_style(output, crate::json_style::JsonStyle::Compact)
+}
+
+fn render_json_with_style(
+    output: &SecurityOutput,
+    json_style: crate::json_style::JsonStyle,
+) -> String {
+    let Ok(value) = fallow_output::serialize_security_json_output(
+        output.clone(),
+        crate::output_runtime::current_root_envelope_mode(),
+        crate::output_runtime::telemetry_analysis_run_id().as_deref(),
+    ) else {
+        return "{\"error\":\"failed to serialize security output\"}".to_owned();
+    };
+    json_style
+        .serialize(&value)
+        .unwrap_or_else(|_| "{\"error\":\"failed to serialize security output\"}".to_owned())
+}
+
+/// JSON summary: compact aggregate payload without per-finding arrays.
+#[must_use]
+#[cfg(test)]
+pub fn render_json_summary(output: &SecurityOutput) -> String {
+    render_json_summary_with_style(output, crate::json_style::JsonStyle::Compact)
+}
+
+fn render_json_summary_with_style(
+    output: &SecurityOutput,
+    json_style: crate::json_style::JsonStyle,
+) -> String {
+    let Ok(value) = fallow_output::serialize_security_summary_json_output(
+        output,
+        crate::output_runtime::current_root_envelope_mode(),
+        None,
+    ) else {
+        return "{\"error\":\"failed to serialize security summary output\"}".to_owned();
+    };
+    json_style.serialize(&value).unwrap_or_else(|_| {
+        "{\"error\":\"failed to serialize security summary output\"}".to_owned()
+    })
+}
+
+fn render_survivors_output(
+    output_format: OutputFormat,
+    json_style: crate::json_style::JsonStyle,
+    output: &SecuritySurvivorsOutput,
+) -> String {
+    match output_format {
+        OutputFormat::Json => render_survivors_json_with_style(output, json_style),
+        _ => render_survivors_human(output),
+    }
+}
+
+#[must_use]
+#[cfg(test)]
+pub fn render_survivors_json(output: &SecuritySurvivorsOutput) -> String {
+    render_survivors_json_with_style(output, crate::json_style::JsonStyle::Compact)
+}
+
+fn render_survivors_json_with_style(
+    output: &SecuritySurvivorsOutput,
+    json_style: crate::json_style::JsonStyle,
+) -> String {
+    let Ok(value) = fallow_output::serialize_security_survivors_json_output(
+        output.clone(),
+        crate::output_runtime::current_root_envelope_mode(),
+    ) else {
+        return "{\"error\":\"failed to serialize security survivors output\"}".to_owned();
+    };
+    json_style.serialize(&value).unwrap_or_else(|_| {
+        "{\"error\":\"failed to serialize security survivors output\"}".to_owned()
+    })
+}
+
+#[must_use]
+fn render_survivors_human(output: &SecuritySurvivorsOutput) -> String {
+    use crate::report::plural;
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "Security survivors: {} verifier-retained candidate{}.",
+        output.summary.survivors,
+        plural(output.summary.survivors)
+    );
+    let _ = writeln!(
+        out,
+        "Verdicts: {}/{} candidates covered, {} dismissed.",
+        output.summary.verdicts, output.summary.candidates, output.summary.dismissed
+    );
+    if output.summary.needs_human_review > 0 {
+        let _ = writeln!(
+            out,
+            "Needs human review: {} candidate{}.",
+            output.summary.needs_human_review,
+            plural(output.summary.needs_human_review)
+        );
+    }
+    if output.summary.unverdicted > 0 {
+        let _ = writeln!(
+            out,
+            "Unreviewed candidates: {} candidate{}.",
+            output.summary.unverdicted,
+            plural(output.summary.unverdicted)
+        );
+    }
+    out.push_str(
+        "Retained and human-review rows are verifier dispositions, not vulnerabilities proven by fallow.\n",
+    );
+    if output.summary.unverdicted > 0 {
+        out.push_str("Unreviewed candidates have no verifier disposition yet.\n");
+    }
+
+    if output.survivors.is_empty() && output.needs_human_review.is_empty() {
+        if output.summary.unverdicted > 0 {
+            out.push_str("\nNo retained or human-review details to show yet.\n");
+        } else {
+            out.push_str("\nNo retained candidate details to show.\n");
+        }
+        return out;
+    }
+
+    push_survivor_group(&mut out, "Survivors", &output.survivors);
+    push_survivor_group(&mut out, "Needs human review", &output.needs_human_review);
+    out
+}
+
+fn push_survivor_group(
+    out: &mut String,
+    title: &str,
+    survivors: &BTreeMap<String, SecuritySurvivor>,
+) {
+    use std::fmt::Write as _;
+
+    if survivors.is_empty() {
+        return;
+    }
+    let _ = writeln!(out, "\n{title}:");
+    for survivor in survivors.values() {
+        let path = survivor.candidate.path.to_string_lossy().replace('\\', "/");
+        let line = survivor.candidate.line;
+        let category = survivor
+            .candidate
+            .category
+            .as_deref()
+            .unwrap_or_else(|| security_kind_key(survivor.candidate.kind));
+        let _ = writeln!(
+            out,
+            "- {}:{} ({}) [{}]",
+            path, line, category, survivor.finding_id
+        );
+        if let Some(reason) = survivor.reason.as_ref().or(survivor.rationale.as_ref()) {
+            let _ = writeln!(out, "  reason: {reason}");
+        }
+        if let Some(impact) = &survivor.impact {
+            let _ = writeln!(out, "  impact: {impact}");
+        }
+        if let Some(fix_direction) = &survivor.fix_direction {
+            let _ = writeln!(out, "  fix direction: {fix_direction}");
+        }
+        out.push_str("  Next: review the original candidate evidence before editing code.\n");
+    }
+}
+
+fn build_blind_spots_output(output: &SecurityOutput) -> SecurityBlindSpotsOutput {
+    let diagnostics = output.unresolved_callee_diagnostics.as_ref();
+    let groups = diagnostics
+        .map(group_blind_spot_samples)
+        .unwrap_or_default();
+    let sampled_callee_sites = diagnostics.map_or(0, |diagnostics| diagnostics.sampled.len());
+    let unresolved_callee_sites =
+        diagnostics.map_or(output.unresolved_callee_sites, |diagnostics| {
+            diagnostics
+                .by_reason
+                .iter()
+                .map(|reason| reason.count)
+                .sum()
+        });
+
+    SecurityBlindSpotsOutput {
+        schema_version: SecurityBlindSpotsSchemaVersion::V1,
+        version: output.version.clone(),
+        elapsed_ms: output.elapsed_ms,
+        workspace_diagnostics: output.workspace_diagnostics.clone(),
+        summary: SecurityBlindSpotsSummary {
+            unresolved_edge_files: output.unresolved_edge_files,
+            unresolved_callee_sites,
+            sampled_callee_sites,
+        },
+        groups,
+    }
+}
+
+fn group_blind_spot_samples(
+    diagnostics: &SecurityUnresolvedCalleeDiagnostics,
+) -> Vec<SecurityBlindSpotGroup> {
+    let mut groups: BTreeMap<
+        (
+            fallow_types::extract::SkippedSecurityCalleeReason,
+            fallow_types::extract::SkippedSecurityCalleeExpressionKind,
+        ),
+        BTreeMap<String, usize>,
+    > = BTreeMap::new();
+
+    for sample in &diagnostics.sampled {
+        let files = groups
+            .entry((sample.reason, sample.expression_kind))
+            .or_default();
+        *files.entry(sample.path.clone()).or_insert(0) += 1;
+    }
+
+    let mut groups: Vec<SecurityBlindSpotGroup> = groups
+        .into_iter()
+        .map(|((reason, expression_kind), files)| {
+            let sampled_count = files.values().sum();
+            let mut files: Vec<SecurityBlindSpotFile> = files
+                .into_iter()
+                .map(|(path, sampled_count)| SecurityBlindSpotFile {
+                    path,
+                    sampled_count,
+                })
+                .collect();
+            files.sort_by(|a, b| {
+                b.sampled_count
+                    .cmp(&a.sampled_count)
+                    .then_with(|| a.path.cmp(&b.path))
+            });
+            SecurityBlindSpotGroup {
+                reason,
+                expression_kind,
+                sampled_count,
+                files,
+                suggestion: blind_spot_suggestion(reason).to_owned(),
+            }
+        })
+        .collect();
+
+    groups.sort_by(|a, b| {
+        b.sampled_count
+            .cmp(&a.sampled_count)
+            .then_with(|| {
+                unresolved_callee_reason_label(a.reason)
+                    .cmp(unresolved_callee_reason_label(b.reason))
+            })
+            .then_with(|| {
+                unresolved_callee_expression_label(a.expression_kind)
+                    .cmp(unresolved_callee_expression_label(b.expression_kind))
+            })
+    });
+    groups
+}
+
+fn render_blind_spots_output(
+    output_format: OutputFormat,
+    json_style: crate::json_style::JsonStyle,
+    output: &SecurityBlindSpotsOutput,
+) -> String {
+    match output_format {
+        OutputFormat::Json => render_blind_spots_json_with_style(output, json_style),
+        _ => render_blind_spots_human(output),
+    }
+}
+
+#[must_use]
+#[cfg(test)]
+pub fn render_blind_spots_json(output: &SecurityBlindSpotsOutput) -> String {
+    render_blind_spots_json_with_style(output, crate::json_style::JsonStyle::Compact)
+}
+
+fn render_blind_spots_json_with_style(
+    output: &SecurityBlindSpotsOutput,
+    json_style: crate::json_style::JsonStyle,
+) -> String {
+    let Ok(value) = fallow_output::serialize_security_blind_spots_json_output(
+        output.clone(),
+        crate::output_runtime::current_root_envelope_mode(),
+    ) else {
+        return "{\"error\":\"failed to serialize security blind-spots output\"}".to_owned();
+    };
+    json_style.serialize(&value).unwrap_or_else(|_| {
+        "{\"error\":\"failed to serialize security blind-spots output\"}".to_owned()
+    })
+}
+
+#[must_use]
+fn render_blind_spots_human(output: &SecurityBlindSpotsOutput) -> String {
+    use crate::report::plural;
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    let callee_count = output.summary.unresolved_callee_sites;
+    let edge_count = output.summary.unresolved_edge_files;
+    if callee_count == 0 && edge_count == 0 {
+        out.push_str("Security blind spots: no unresolved security edges or callees found.\n");
+        return out;
+    }
+
+    let _ = writeln!(
+        out,
+        "Security blind spots: {callee_count} unresolved callee{} and {edge_count} unresolved client import edge{}.",
+        plural(callee_count),
+        plural(edge_count)
+    );
+    out.push_str("A non-zero blind-spot count means fallow may have missed security candidates behind dynamic code shapes.\n");
+
+    for group in &output.groups {
+        let reason = unresolved_callee_reason_label(group.reason);
+        let expression = unresolved_callee_expression_label(group.expression_kind);
+        let _ = writeln!(
+            out,
+            "\n{} Blind spot: {reason} / {expression}, {} sampled site{}.",
+            "[I]".blue().bold(),
+            group.sampled_count,
+            plural(group.sampled_count)
+        );
+        for file in group.files.iter().take(3) {
+            let _ = writeln!(out, "  {} ({})", file.path, file.sampled_count);
+        }
+        let _ = writeln!(out, "  Next: {}", group.suggestion);
+    }
+
+    out
+}
+
+fn unresolved_callee_expression_label(
+    expression_kind: fallow_types::extract::SkippedSecurityCalleeExpressionKind,
+) -> &'static str {
+    match expression_kind {
+        fallow_types::extract::SkippedSecurityCalleeExpressionKind::ComputedMemberExpression => {
+            "computed-member"
+        }
+        fallow_types::extract::SkippedSecurityCalleeExpressionKind::Identifier => "identifier",
+        fallow_types::extract::SkippedSecurityCalleeExpressionKind::StaticMemberExpression => {
+            "member-expression"
+        }
+        fallow_types::extract::SkippedSecurityCalleeExpressionKind::Other => "other",
+    }
+}
+
+fn blind_spot_suggestion(
+    reason: fallow_types::extract::SkippedSecurityCalleeReason,
+) -> &'static str {
+    match reason {
+        fallow_types::extract::SkippedSecurityCalleeReason::ComputedMember => {
+            "inspect computed property names or convert hot sinks to explicit calls."
+        }
+        fallow_types::extract::SkippedSecurityCalleeReason::DynamicDispatch => {
+            "inspect dynamic dispatch targets and add a narrow wrapper or catalogue shape if the sink is real."
+        }
+        fallow_types::extract::SkippedSecurityCalleeReason::UnsupportedAssignmentObject => {
+            "inspect assignment targets and simplify the object shape if security sink calls are hidden there."
+        }
+    }
+}
+
+fn write_sarif_file(output: &SecurityOutput, path: &Path) -> Result<(), String> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent).map_err(|err| {
+            format!(
+                "Failed to create directory for SARIF file {}: {err}",
+                path.display()
+            )
+        })?;
+    }
+    std::fs::write(path, render_sarif(output))
+        .map_err(|err| format!("Failed to write SARIF file {}: {err}", path.display()))
+}
+
+/// One-line gate verdict header. Leads with the ACTION ("REVIEW REQUIRED") and
+/// immediately qualifies with the candidate framing, so a human never reads the
+/// gate as "fallow confirmed a vulnerability". The wire `verdict` token stays
+/// `fail`; only this human prose says "REVIEW REQUIRED".
+fn gate_human_header(gate: &SecurityGate) -> String {
+    use crate::report::plural;
+    let checked = match gate.mode {
+        SecurityGateMode::New => "in changed lines",
+        SecurityGateMode::NewlyReachable => "newly reachable from entry points",
+    };
+    match gate.verdict {
+        SecurityGateVerdict::Fail => format!(
+            "Gate: REVIEW REQUIRED, {} new security item{} {checked}. fallow has not confirmed a vulnerability.",
+            gate.new_count,
+            plural(gate.new_count),
+        ),
+        SecurityGateVerdict::Pass => {
+            format!("Gate: PASS, no new security items {checked}.")
+        }
+    }
+}
+
+fn unresolved_callee_human_hint(output: &SecurityOutput) -> Option<String> {
+    let diagnostics = output.unresolved_callee_diagnostics.as_ref()?;
+    let top_reason = diagnostics.by_reason.first()?;
+    let top_file = diagnostics.top_files.first()?;
+    Some(format!(
+        "Most unresolved callees: {} in {}.",
+        unresolved_callee_reason_label(top_reason.reason),
+        top_file.path
+    ))
+}
+
+fn unresolved_callee_reason_label(
+    reason: fallow_types::extract::SkippedSecurityCalleeReason,
+) -> &'static str {
+    match reason {
+        fallow_types::extract::SkippedSecurityCalleeReason::ComputedMember => "computed-member",
+        fallow_types::extract::SkippedSecurityCalleeReason::DynamicDispatch => "dynamic-dispatch",
+        fallow_types::extract::SkippedSecurityCalleeReason::UnsupportedAssignmentObject => {
+            "unsupported-assignment-object"
+        }
+    }
+}
+
+#[must_use]
+fn render_human_summary(output: &SecurityOutput) -> String {
+    use crate::report::plural;
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    if let Some(gate) = &output.gate {
+        out.push_str(&gate_human_header(gate));
+        out.push('\n');
+    }
+    let count = output.security_findings.len();
+    if count == 0 {
+        out.push_str("Security review: no items to check in the scanned code.\n");
+    } else {
+        let _ = writeln!(
+            out,
+            "Security review: {count} item{} to check. These are unverified security candidates, not confirmed vulnerabilities.",
+            plural(count),
+        );
+        out.push_str(
+            "Next: check whether the listed code can run with unsafe input, secrets, or settings, and whether anything blocks the risk.\n",
+        );
+    }
+    if output.unresolved_edge_files > 0 {
+        let n = output.unresolved_edge_files;
+        let verb = if n == 1 { "uses" } else { "use" };
+        let _ = writeln!(
+            out,
+            "Blind spot: {n} client file{} {verb} dynamic imports that fallow could not follow.",
+            plural(n)
+        );
+    }
+    if output.unresolved_callee_sites > 0 {
+        let n = output.unresolved_callee_sites;
+        let verb = if n == 1 { "uses" } else { "use" };
+        let _ = writeln!(
+            out,
+            "Blind spot: {n} call site{} {verb} code patterns that fallow could not resolve.",
+            plural(n)
+        );
+        if let Some(hint) = unresolved_callee_human_hint(output) {
+            let _ = writeln!(out, "{hint}");
+        }
+    }
+    out
+}
+
+/// Human output. Frames findings as candidates and states the next human action
+/// per finding; surfaces the unresolved-edge blind spot as a counted line.
+#[must_use]
+#[expect(
+    clippy::format_push_string,
+    reason = "small report renderer; readability over avoiding the extra allocation"
+)]
+pub fn render_human(output: &SecurityOutput) -> String {
+    use crate::report::plural;
+
+    let mut out = String::new();
+    push_human_gate(&mut out, output);
+    let count = output.security_findings.len();
+    out.push_str(&format!("Security review: {count} item{}", plural(count)));
+    if count == 0 {
+        out.push_str(" to check in the scanned code.\n");
+    } else {
+        out.push_str(" to check.\n");
+        out.push_str(
+            "These are unverified security candidates, not confirmed vulnerabilities. Check whether the listed code can run with unsafe input, secrets, or settings, and whether anything blocks the risk.\n",
+        );
+    }
+    out.push('\n');
+
+    if output.security_findings.is_empty() {
+        out.push_str("No security details to show.\n");
+    } else {
+        push_human_findings(&mut out, &output.security_findings);
+    }
+
+    push_human_blind_spots(&mut out, output);
+
+    out.push_str(&format!(
+        "\nResult: {count} security item{} to check.",
+        plural(count),
+    ));
+    if count > 0 {
+        out.push_str(" Review the listed evidence and trace before changing code.");
+    }
+    out.push('\n');
+    out
+}
+
+fn push_human_gate(out: &mut String, output: &SecurityOutput) {
+    if let Some(gate) = &output.gate {
+        out.push_str(&gate_human_header(gate));
+        out.push_str("\n\n");
+    }
+}
+
+fn push_human_findings(out: &mut String, findings: &[SecurityFinding]) {
+    for finding in findings {
+        push_human_finding(out, finding);
+    }
+}
+
+fn push_human_finding(out: &mut String, finding: &SecurityFinding) {
+    use std::fmt::Write as _;
+
+    push_human_finding_header(out, finding);
+    let _ = writeln!(out, "    evidence: {}", finding.evidence);
+    if let Some(hint) = dead_code_hint(finding) {
+        let _ = writeln!(out, "    dead-code: {hint}");
+    }
+    if let Some(runtime) = finding.runtime.as_ref() {
+        let _ = writeln!(out, "    runtime: {}", runtime_hint_text(runtime));
+    }
+    push_human_reachability(out, finding);
+    push_human_import_trace(out, finding);
+    push_human_next_step(out, finding);
+    out.push('\n');
+}
+
+fn push_human_finding_header(out: &mut String, finding: &SecurityFinding) {
+    use colored::Colorize;
+    use std::fmt::Write as _;
+
+    let kind = security_finding_label(finding);
+    let (glyph, label) = human_severity_marker(finding.severity);
+    let _ = writeln!(
+        out,
+        "{} {label} {kind}  {}:{}",
+        glyph,
+        finding.path.to_string_lossy().replace('\\', "/").bold(),
+        finding.line,
+    );
+}
+
+fn push_human_reachability(out: &mut String, finding: &SecurityFinding) {
+    use std::fmt::Write as _;
+
+    let Some(reach) = finding.reachability.as_ref() else {
+        return;
+    };
+    let entry = if reach.reachable_from_entry {
+        "reachable from a runtime entry point"
+    } else {
+        "not reached from any runtime entry point"
+    };
+    let boundary = if reach.crosses_boundary {
+        "; crosses an architecture boundary"
+    } else {
+        ""
+    };
+    let _ = writeln!(
+        out,
+        "    code path: {entry} (blast radius {}){boundary}",
+        reach.blast_radius,
+    );
+    if reach.reachable_from_untrusted_source {
+        push_human_untrusted_trace(out, finding);
+    }
+}
+
+fn push_human_untrusted_trace(out: &mut String, finding: &SecurityFinding) {
+    use std::fmt::Write as _;
+
+    let Some(reach) = finding.reachability.as_ref() else {
+        return;
+    };
+    let hops = reach.untrusted_source_hop_count.unwrap_or(0);
+    let _ = writeln!(
+        out,
+        "    input path: this module is reachable from a module that receives \
+         untrusted input via {hops} import hop{}",
+        crate::report::plural(hops as usize),
+    );
+    if !reach.untrusted_source_trace.is_empty() {
+        out.push_str("    input import trace:\n");
+        for hop in &reach.untrusted_source_trace {
+            let _ = writeln!(
+                out,
+                "      {}:{} ({})",
+                hop.path.to_string_lossy().replace('\\', "/"),
+                hop.line,
+                hop_role_label(hop.role),
+            );
+        }
+    }
+}
+
+fn push_human_import_trace(out: &mut String, finding: &SecurityFinding) {
+    use std::fmt::Write as _;
+
+    if finding.trace.is_empty() {
+        return;
+    }
+    out.push_str("    import trace:\n");
+    for hop in &finding.trace {
+        let _ = writeln!(
+            out,
+            "      {}:{} ({})",
+            hop.path.to_string_lossy().replace('\\', "/"),
+            hop.line,
+            hop_role_label(hop.role),
+        );
+    }
+}
+
+fn push_human_next_step(out: &mut String, finding: &SecurityFinding) {
+    if is_server_only_leak(finding) {
+        out.push_str(
+            "    Next: check whether this server-only code is meant to run on the client. \
+             If it is pulled in only through next/dynamic(..., { ssr: false }), type-only, \
+             or removed at build time, mark it as a false positive. If the sink is a \
+             \"use server\" Server Action module, decide by export shape: only a \
+             non-action export (a top-level const, a re-export, or a default value) \
+             carries the server-only import into the client bundle; if every export is \
+             an async action, mark it as a false positive.\n",
+        );
+    } else if matches!(finding.kind, SecurityFindingKind::ClientServerLeak) {
+        out.push_str(
+            "    Next: check whether this import can ship a secret to the browser. If \
+             it is type-only, server-only, or removed at build time, mark it as a false \
+             positive.\n",
+        );
+    } else if finding.dead_code.is_some() {
+        out.push_str(
+            "    Next: first verify the dead-code finding. If the code is safe to \
+             remove, delete it. Otherwise check and harden the risky call.\n",
+        );
+    } else {
+        out.push_str(
+            "    Next: check whether unsafe input, secrets, or settings can reach this \
+             risky call without a safe guard. If not, mark it as a false positive.\n",
+        );
+    }
+}
+
+fn push_human_blind_spots(out: &mut String, output: &SecurityOutput) {
+    use crate::report::plural;
+    use std::fmt::Write as _;
+
+    if output.unresolved_edge_files > 0 {
+        let n = output.unresolved_edge_files;
+        let verb = if n == 1 { "uses" } else { "use" };
+        let _ = writeln!(
+            out,
+            "{} Blind spot: {n} client file{} {verb} dynamic imports that fallow could not \
+             follow. Code behind those imports may be missing from this report.",
+            "[I]".blue().bold(),
+            plural(n),
+        );
+    }
+
+    if output.unresolved_callee_sites > 0 {
+        let n = output.unresolved_callee_sites;
+        let verb = if n == 1 { "uses" } else { "use" };
+        let _ = writeln!(
+            out,
+            "{} Blind spot: {n} call site{} {verb} code patterns that fallow could not resolve, \
+             such as dynamic dispatch, computed members, or aliased bindings.",
+            "[I]".blue().bold(),
+            plural(n),
+        );
+        if let Some(hint) = unresolved_callee_human_hint(output) {
+            let _ = writeln!(out, "    {hint}");
+        }
+    }
+}
+
+/// Render the human-facing label for a finding. The secret-leak
+/// `ClientServerLeak` keeps its bespoke kebab kind; the server-only variant uses
+/// its own kebab label so a reader tells the two apart; `TaintedSink` uses the
+/// catalogue title plus the CWE number carried on the finding.
+fn security_finding_label(finding: &SecurityFinding) -> String {
+    match finding.kind {
+        SecurityFindingKind::ClientServerLeak if is_server_only_leak(finding) => {
+            "server-only-import".to_string()
+        }
+        SecurityFindingKind::ClientServerLeak => "client-server-leak".to_string(),
+        SecurityFindingKind::TaintedSink => {
+            let title = finding
+                .category
+                .as_deref()
+                .and_then(security_catalogue_title)
+                .or(finding.category.as_deref())
+                .unwrap_or("tainted-sink");
+            match finding.cwe {
+                Some(cwe) => format!("{title} (CWE-{cwe})"),
+                None => title.to_string(),
+            }
+        }
+    }
+}
+
+fn human_severity_marker(severity: SecuritySeverity) -> (colored::ColoredString, &'static str) {
+    use colored::Colorize;
+    match severity {
+        SecuritySeverity::High => ("[H]".red().bold(), "high"),
+        SecuritySeverity::Medium => ("[M]".yellow().bold(), "medium"),
+        SecuritySeverity::Low => ("[L]".blue().bold(), "low"),
+    }
+}
+
+fn dead_code_hint(finding: &SecurityFinding) -> Option<String> {
+    let context = finding.dead_code.as_ref()?;
+    match context.kind {
+        SecurityDeadCodeKind::UnusedFile => Some(
+            "also reported as unused-file; delete this file instead of hardening the sink"
+                .to_string(),
+        ),
+        SecurityDeadCodeKind::UnusedExport => Some(format!(
+            "also reported as unused-export{}; remove the export instead of hardening the sink",
+            context
+                .export_name
+                .as_ref()
+                .map_or(String::new(), |name| format!(" `{name}`"))
+        )),
+    }
+}
+
+const fn hop_role_label(role: TraceHopRole) -> &'static str {
+    match role {
+        TraceHopRole::ClientBoundary => "client boundary",
+        TraceHopRole::UntrustedSource => "untrusted source",
+        TraceHopRole::ModuleSource => "source module",
+        TraceHopRole::Intermediate => "intermediate",
+        TraceHopRole::SecretSource => "secret source",
+        TraceHopRole::Sink => "sink site",
+    }
+}
+
+fn source_reachability_hint(finding: &SecurityFinding) -> Option<&'static str> {
+    finding
+        .reachability
+        .as_ref()
+        .filter(|reach| reach.reachable_from_untrusted_source)
+        .map(|_| {
+            "Module-level context: the sink module is reachable from an untrusted-source module; fallow does not prove value flow."
+        })
+}
+
+fn runtime_hint_text(runtime: &SecurityRuntimeContext) -> String {
+    use std::fmt::Write as _;
+
+    let mut text = format!(
+        "{} in {}:{}",
+        runtime_state_label(runtime.state),
+        runtime.function,
+        runtime.line
+    );
+    if let Some(invocations) = runtime.invocations {
+        let _ = write!(
+            text,
+            " ({} invocation{})",
+            invocations,
+            crate::report::plural(invocations as usize)
+        );
+    }
+    if let Some(evidence) = runtime.evidence.as_deref() {
+        text.push_str("; ");
+        text.push_str(evidence);
+    }
+    text
+}
+
+const fn runtime_state_label(state: SecurityRuntimeState) -> &'static str {
+    match state {
+        SecurityRuntimeState::RuntimeHot => "runtime-hot",
+        SecurityRuntimeState::RuntimeCold => "runtime-cold",
+        SecurityRuntimeState::NeverExecuted => "never-executed",
+        SecurityRuntimeState::LowTraffic => "low-traffic",
+        SecurityRuntimeState::CoverageUnavailable => "coverage-unavailable",
+        SecurityRuntimeState::RuntimeUnknown => "runtime-unknown",
+    }
+}
+
+/// The `category` string distinguishing the server-only-import sink from the
+/// secret-leak sink (both `ClientServerLeak` kind). Matches the constant in
+/// `crates/core/src/analyze/security/mod.rs`.
+const SERVER_ONLY_CATEGORY: &str = "server-only-import";
+
+/// Whether a `ClientServerLeak` finding is the server-only-import variant rather
+/// than the original secret-leak variant. Keys on `category` because both share
+/// the `ClientServerLeak` kind and the same rule.
+fn is_server_only_leak(finding: &SecurityFinding) -> bool {
+    matches!(finding.kind, SecurityFindingKind::ClientServerLeak)
+        && finding.category.as_deref() == Some(SERVER_ONLY_CATEGORY)
+}
+
+/// The SARIF ruleId for a finding. The secret-leak `client-server-leak` keeps its
+/// bespoke id; the server-only variant gets `security/server-only-import` so the
+/// GitHub Security tab tells "reaches server-only code" apart from "reads a
+/// secret"; each `TaintedSink` category gets `security/<category>` so candidates
+/// group and label per CWE class.
+fn sarif_rule_id(finding: &SecurityFinding) -> String {
+    match finding.kind {
+        SecurityFindingKind::ClientServerLeak if is_server_only_leak(finding) => {
+            "security/server-only-import".to_owned()
+        }
+        SecurityFindingKind::ClientServerLeak => "security/client-server-leak".to_owned(),
+        SecurityFindingKind::TaintedSink => {
+            format!(
+                "security/{}",
+                finding.category.as_deref().unwrap_or("tainted-sink")
+            )
+        }
+    }
+}
+
+fn security_help_text(title: &str) -> String {
+    format!(
+        "Verify this unverified {title} candidate before acting. Review the source, sink, \
+         SARIF code flow, and any runtime or dead-code context. fallow does not prove \
+         exploitability, attacker control, or missing sanitization."
+    )
+}
+
+fn security_help_markdown(title: &str) -> String {
+    format!(
+        "Verify this unverified **{title}** candidate before acting.\n\n\
+         1. Review the source and sink in the SARIF code flow.\n\
+         2. Confirm whether attacker-controlled data can reach the sink unsanitized.\n\
+         3. Use runtime and dead-code context only as triage signals."
+    )
+}
+
+fn cwe_taxon_id(cwe: u32) -> String {
+    format!("CWE-{cwe}")
+}
+
+fn cwe_taxon(cwe: u32) -> serde_json::Value {
+    let id = cwe_taxon_id(cwe);
+    serde_json::json!({
+        "id": id,
+        "name": id,
+        "shortDescription": { "text": format!("Common Weakness Enumeration {id}") },
+        "fullDescription": { "text": format!("MITRE Common Weakness Enumeration {id}") },
+        "helpUri": format!("https://cwe.mitre.org/data/definitions/{cwe}.html")
+    })
+}
+
+fn cwe_relationship(cwe: u32, taxon_index: usize) -> serde_json::Value {
+    serde_json::json!({
+        "target": {
+            "id": cwe_taxon_id(cwe),
+            "index": taxon_index,
+            "toolComponent": {
+                "name": "CWE",
+                "index": 0
+            }
+        },
+        "kinds": ["superset"]
+    })
+}
+
+fn collect_cwes(findings: &[SecurityFinding]) -> Vec<u32> {
+    let mut cwes: Vec<u32> = findings.iter().filter_map(|finding| finding.cwe).collect();
+    cwes.sort_unstable();
+    cwes.dedup();
+    cwes
+}
+
+fn cwe_index(cwes: &[u32], cwe: u32) -> Option<usize> {
+    cwes.iter().position(|existing| *existing == cwe)
+}
+
+fn cwe_taxonomy(cwes: &[u32]) -> Option<serde_json::Value> {
+    if cwes.is_empty() {
+        return None;
+    }
+    let taxa = cwes.iter().map(|cwe| cwe_taxon(*cwe)).collect::<Vec<_>>();
+    Some(serde_json::json!({
+        "name": "CWE",
+        "fullName": "Common Weakness Enumeration",
+        "organization": "MITRE",
+        "informationUri": "https://cwe.mitre.org/",
+        "taxa": taxa
+    }))
+}
+
+/// Build the SARIF rule definition for a ruleId, deriving per-category metadata
+/// (catalogue title + CWE tag and relationship) for `TaintedSink` findings so
+/// CWE grouping survives in SARIF-aware consumers.
+fn sarif_rule_def(
+    rule_id: &str,
+    finding: &SecurityFinding,
+    cwe_taxon_index: Option<usize>,
+) -> serde_json::Value {
+    match finding.kind {
+        SecurityFindingKind::ClientServerLeak if is_server_only_leak(finding) => {
+            sarif_rule_def_server_only_leak(rule_id)
+        }
+        SecurityFindingKind::ClientServerLeak => sarif_rule_def_secret_leak(rule_id),
+        SecurityFindingKind::TaintedSink => {
+            sarif_rule_def_tainted_sink(rule_id, finding, cwe_taxon_index)
+        }
+    }
+}
+
+/// SARIF rule definition for the server-only-import flavor of `ClientServerLeak`.
+fn sarif_rule_def_server_only_leak(rule_id: &str) -> serde_json::Value {
+    let title = "Client imports server-only code";
+    serde_json::json!({
+        "id": rule_id,
+        "name": title,
+        "shortDescription": { "text": "Client imports server-only code candidate (unverified)" },
+        "fullDescription": { "text":
+            "Unverified candidate, requires verification: a \"use client\" file \
+             transitively imports a server-only module (one importing server-only \
+             code such as server-only, next/headers, \
+             next/server, or node:fs / node:child_process). fallow does not prove this \
+             code runs on the client; a module pulled in only through \
+             next/dynamic(..., { ssr: false }) is a false positive. For a \"use server\" \
+             Server Action module the deciding question is export shape: only a \
+             non-action export (a top-level const, a re-export, or a default value) \
+             carries the server-only import into the client bundle; a module whose \
+             exports are all async actions is a false positive." },
+        "help": {
+            "text": security_help_text(title),
+            "markdown": security_help_markdown(title)
+        },
+        "helpUri": "https://github.com/fallow-rs/fallow",
+        "defaultConfiguration": { "level": "note" }
+    })
+}
+
+/// SARIF rule definition for the secret-leak flavor of `ClientServerLeak`.
+fn sarif_rule_def_secret_leak(rule_id: &str) -> serde_json::Value {
+    let title = "Client-server secret leak";
+    serde_json::json!({
+        "id": rule_id,
+        "name": title,
+        "shortDescription": { "text": "Client-server secret leak candidate (unverified)" },
+        "fullDescription": { "text":
+            "Unverified candidate, requires verification: a \"use client\" file \
+             transitively imports a module that reads a non-public process.env \
+             secret. fallow does not prove the secret reaches client-bundled code." },
+        "help": {
+            "text": security_help_text(title),
+            "markdown": security_help_markdown(title)
+        },
+        "helpUri": "https://github.com/fallow-rs/fallow",
+        "defaultConfiguration": { "level": "note" }
+    })
+}
+
+/// SARIF rule definition for `TaintedSink` findings, attaching CWE tags and the
+/// CWE taxonomy relationship when the finding carries a CWE id.
+fn sarif_rule_def_tainted_sink(
+    rule_id: &str,
+    finding: &SecurityFinding,
+    cwe_taxon_index: Option<usize>,
+) -> serde_json::Value {
+    let title = finding
+        .category
+        .as_deref()
+        .and_then(security_catalogue_title)
+        .or(finding.category.as_deref())
+        .unwrap_or("tainted-sink");
+    let mut rule = serde_json::json!({
+        "id": rule_id,
+        "name": title,
+        "shortDescription": { "text": format!("{title} candidate (unverified)") },
+        "fullDescription": { "text": format!(
+            "Unverified candidate, requires verification: {title}. fallow flags a \
+             syntactic sink reached by a non-literal argument; it does not prove the \
+             value is attacker-controlled or reaches the sink unsanitized."
+        ) },
+        "help": {
+            "text": security_help_text(title),
+            "markdown": security_help_markdown(title)
+        },
+        "helpUri": "https://github.com/fallow-rs/fallow",
+        "defaultConfiguration": { "level": "note" }
+    });
+    if let Some(cwe) = finding.cwe {
+        rule["properties"] = serde_json::json!({
+            "tags": [format!("external/cwe/cwe-{cwe}")]
+        });
+        if let Some(taxon_index) = cwe_taxon_index {
+            rule["relationships"] = serde_json::json!([cwe_relationship(cwe, taxon_index)]);
+        }
+    }
+    rule
+}
+
+fn hop_role_token(role: TraceHopRole) -> &'static str {
+    match role {
+        TraceHopRole::ClientBoundary => "client-boundary",
+        TraceHopRole::UntrustedSource => "untrusted-source",
+        TraceHopRole::ModuleSource => "module-source",
+        TraceHopRole::Intermediate => "intermediate",
+        TraceHopRole::SecretSource => "secret-source",
+        TraceHopRole::Sink => "sink",
+    }
+}
+
+fn sarif_thread_flow_location(hop: &TraceHop) -> serde_json::Value {
+    let role = hop_role_token(hop.role);
+    serde_json::json!({
+        "location": sarif_location(&hop.path, hop.line, hop.col),
+        "kinds": [role],
+        "properties": { "fallowTraceRole": role }
+    })
+}
+
+fn primary_code_flow_hops(finding: &SecurityFinding) -> &[TraceHop] {
+    if let Some(reachability) = finding.reachability.as_ref()
+        && !reachability.untrusted_source_trace.is_empty()
+    {
+        return &reachability.untrusted_source_trace;
+    }
+    &finding.trace
+}
+
+fn sarif_code_flows(finding: &SecurityFinding) -> Option<serde_json::Value> {
+    let hops = primary_code_flow_hops(finding);
+    if hops.is_empty() {
+        return None;
+    }
+    let locations = hops
+        .iter()
+        .map(sarif_thread_flow_location)
+        .collect::<Vec<_>>();
+    Some(serde_json::json!([
+        {
+            "threadFlows": [
+                { "locations": locations }
+            ]
+        }
+    ]))
+}
+
+fn push_related_location(related: &mut Vec<serde_json::Value>, hop: &TraceHop) {
+    let location = sarif_location(&hop.path, hop.line, hop.col);
+    if !related.iter().any(|existing| existing == &location) {
+        related.push(location);
+    }
+}
+
+fn sarif_related_locations(finding: &SecurityFinding) -> Vec<serde_json::Value> {
+    let mut related = Vec::new();
+    for hop in &finding.trace {
+        push_related_location(&mut related, hop);
+    }
+    if let Some(reachability) = finding.reachability.as_ref() {
+        for hop in &reachability.untrusted_source_trace {
+            push_related_location(&mut related, hop);
+        }
+    }
+    related
+}
+
+const fn sarif_level(severity: SecuritySeverity) -> &'static str {
+    match severity {
+        SecuritySeverity::High | SecuritySeverity::Medium => "warning",
+        SecuritySeverity::Low => "note",
+    }
+}
+
+/// Build the SARIF `result` object for a single finding, composing the
+/// candidate-framed message, related locations, fingerprint, and code flows.
+fn sarif_result_for_finding(finding: &SecurityFinding) -> serde_json::Value {
+    let rule_id = sarif_rule_id(finding);
+    let mut message = dead_code_hint(finding).map_or_else(
+        || finding.evidence.clone(),
+        |hint| format!("{} Dead-code cross-link: {hint}.", finding.evidence),
+    );
+    if let Some(hint) = source_reachability_hint(finding) {
+        message.push(' ');
+        message.push_str(hint);
+    }
+    if let Some(runtime) = finding.runtime.as_ref() {
+        message.push_str(" Runtime context: ");
+        message.push_str(&runtime_hint_text(runtime));
+        message.push('.');
+    }
+    let related = sarif_related_locations(finding);
+    // Stable dedup key for GHAS: rule + anchor path + line. Without
+    // partialFingerprints, every run re-opens previously triaged alerts.
+    // Same helper as the JSON `finding_id` field so the two never drift
+    // (issue #900).
+    let mut result = serde_json::json!({
+        "ruleId": rule_id,
+        "level": sarif_level(finding.severity),
+        "message": { "text": message },
+        "locations": [sarif_location(&finding.path, finding.line, finding.col)],
+        "relatedLocations": related,
+        "partialFingerprints": { "fallowSecurity/v1": security_finding_id(finding) },
+    });
+    if let Some(code_flows) = sarif_code_flows(finding) {
+        result["codeFlows"] = code_flows;
+    }
+    result
+}
+
+/// Collect one SARIF rule definition per distinct ruleId present in `findings`,
+/// in first-seen order, attaching the CWE taxonomy index when available.
+fn sarif_rule_defs(findings: &[SecurityFinding], cwes: &[u32]) -> Vec<serde_json::Value> {
+    let mut seen: Vec<String> = Vec::new();
+    let mut rules: Vec<serde_json::Value> = Vec::new();
+    for finding in findings {
+        let rule_id = sarif_rule_id(finding);
+        if seen.iter().any(|s| s == &rule_id) {
+            continue;
+        }
+        seen.push(rule_id.clone());
+        let cwe_taxon_index = finding.cwe.and_then(|cwe| cwe_index(cwes, cwe));
+        rules.push(sarif_rule_def(&rule_id, finding, cwe_taxon_index));
+    }
+    rules
+}
+
+/// SARIF output. Maps the candidate's verification-priority tier to SARIF
+/// `level` while keeping the message text candidate-framed. Each finding's ruleId is
+/// per-category (`security/<category>` for tainted-sink, `security/client-server-leak`
+/// for the graph rule); the `rules` array carries one definition per distinct
+/// ruleId present, with the CWE tag for tainted-sink categories. Detector trace
+/// hops and source-reachability hops become `relatedLocations` of the result.
+#[must_use]
+fn render_sarif(output: &SecurityOutput) -> String {
+    let gate = output
+        .gate
+        .as_ref()
+        .and_then(|gate| serde_json::to_value(gate).ok());
+    let sarif = build_security_sarif(&output.security_findings, gate.as_ref());
+    serde_json::to_string_pretty(&sarif)
+        .unwrap_or_else(|_| "{\"error\":\"failed to serialize sarif\"}".to_owned())
+}
+
+/// Build the native security SARIF document from typed findings.
+///
+/// Both the direct security command and `fallow report --from` use this
+/// function so CWE taxonomy, traces, fingerprints, and gate metadata cannot
+/// drift between analyze-once and direct rendering.
+#[must_use]
+pub fn build_security_sarif(
+    security_findings: &[SecurityFinding],
+    gate: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let cwes = collect_cwes(security_findings);
+    let results: Vec<serde_json::Value> = security_findings
+        .iter()
+        .map(sarif_result_for_finding)
+        .collect();
+    let rules = sarif_rule_defs(security_findings, &cwes);
+
+    let mut run = serde_json::json!({
+        "tool": { "driver": {
+            "name": "fallow",
+            "version": env!("CARGO_PKG_VERSION"),
+            "informationUri": "https://github.com/fallow-rs/fallow",
+            "rules": rules,
+        }},
+        "results": results,
+    });
+    if let Some(taxonomy) = cwe_taxonomy(&cwes) {
+        run["taxonomies"] = serde_json::json!([taxonomy]);
+        run["tool"]["driver"]["supportedTaxonomies"] = serde_json::json!([
+            { "name": "CWE", "index": 0 }
+        ]);
+    }
+    // Gate verdict rides as a RUN-level property, never on result severity.
+    // Result levels come from candidate review-priority severity and deliberately
+    // avoid `error`, so GHAS does not frame candidates as confirmed problems.
+    if let Some(gate) = gate {
+        run["properties"] = serde_json::json!({ "fallowGate": gate });
+    }
+
+    serde_json::json!({
+        "version": "2.1.0",
+        "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+        "runs": [run],
+    })
+}
+
+/// Small FNV-1a hex digest for SARIF `partialFingerprints` dedup stability.
+fn fnv_hex(input: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in input.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
+/// Stable per-finding correlation id: FNV-1a hex of `rule:path:line`. The single
+/// source of truth for BOTH the JSON `finding_id` field and the SARIF
+/// `partialFingerprints` value, so an agent can join the two and they never
+/// drift. Computed on the project-relative path, so it must run after the
+/// finding is relativized (issue #900).
+fn security_finding_id(finding: &SecurityFinding) -> String {
+    let fp = format!(
+        "{}:{}:{}",
+        sarif_rule_id(finding),
+        finding.path.to_string_lossy().replace('\\', "/"),
+        finding.line,
+    );
+    fnv_hex(&fp)
+}
+
+fn sarif_location(path: &Path, line: u32, col: u32) -> serde_json::Value {
+    serde_json::json!({
+        "physicalLocation": {
+            "artifactLocation": { "uri": path.to_string_lossy().replace('\\', "/") },
+            "region": { "startLine": line.max(1), "startColumn": col.saturating_add(1) }
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fallow_types::results::{
+        SecurityCandidate, SecurityCandidateBoundary, SecurityCandidateSink,
+        SecurityDeadCodeContext, SecurityDeadCodeKind, SecurityFinding, SecurityFindingKind,
+        TraceHop, TraceHopRole,
+    };
+    use fallow_types::results::{
+        SecurityReachability, SecurityTaintFlow, TaintEndpoint, TaintPath,
+    };
+
+    /// Build a finding anchored under `root` with a three-hop client -> secret trace.
+    fn sample_finding(root: &Path) -> SecurityFinding {
+        SecurityFinding {
+            kind: SecurityFindingKind::ClientServerLeak,
+            path: root.join("src/app.tsx"),
+            line: 12,
+            col: 3,
+            evidence: "reaches process.env.SECRET_KEY".to_owned(),
+            source_backed: false,
+            source_read: None,
+            severity: SecuritySeverity::High,
+            trace: vec![
+                TraceHop {
+                    path: root.join("src/app.tsx"),
+                    line: 12,
+                    col: 3,
+                    role: TraceHopRole::ClientBoundary,
+                },
+                TraceHop {
+                    path: root.join("src/lib/util.ts"),
+                    line: 4,
+                    col: 0,
+                    role: TraceHopRole::Intermediate,
+                },
+                TraceHop {
+                    path: root.join("src/lib/secret.ts"),
+                    line: 8,
+                    col: 2,
+                    role: TraceHopRole::SecretSource,
+                },
+            ],
+            actions: vec![],
+            category: None,
+            cwe: None,
+            dead_code: None,
+            reachability: None,
+            finding_id: String::new(),
+            candidate: SecurityCandidate {
+                source_kind: None,
+                sink: SecurityCandidateSink {
+                    path: root.join("src/app.tsx"),
+                    line: 12,
+                    col: 3,
+                    category: None,
+                    cwe: None,
+                    callee: None,
+                    url_shape: None,
+                },
+                boundary: SecurityCandidateBoundary {
+                    client_server: true,
+                    cross_module: false,
+                    architecture_zone: None,
+                },
+                network: None,
+            },
+            taint_flow: None,
+            runtime: None,
+            attack_surface: None,
+        }
+    }
+
+    fn output_with(findings: Vec<SecurityFinding>, unresolved_edge_files: usize) -> SecurityOutput {
+        SecurityOutput {
+            schema_version: SecuritySchemaVersion::V8,
+            version: ToolVersion("test".to_string()),
+            elapsed_ms: ElapsedMs(0),
+            config: test_output_config(),
+            meta: None,
+            gate: None,
+            workspace_diagnostics: Vec::new(),
+            security_findings: findings,
+            attack_surface: None,
+            unresolved_edge_files,
+            unresolved_callee_sites: 0,
+            unresolved_callee_diagnostics: None,
+        }
+    }
+
+    fn output_with_gate(verdict: SecurityGateVerdict, new_count: usize) -> SecurityOutput {
+        SecurityOutput {
+            schema_version: SecuritySchemaVersion::V8,
+            version: ToolVersion("test".to_string()),
+            elapsed_ms: ElapsedMs(0),
+            config: test_output_config(),
+            meta: None,
+            gate: Some(SecurityGate {
+                mode: SecurityGateMode::New,
+                verdict,
+                new_count,
+            }),
+            workspace_diagnostics: Vec::new(),
+            security_findings: vec![],
+            attack_surface: None,
+            unresolved_edge_files: 0,
+            unresolved_callee_sites: 0,
+            unresolved_callee_diagnostics: None,
+        }
+    }
+
+    fn survivor_candidate_json(
+        finding_id: &str,
+        path: &str,
+        line: u32,
+        kind: SecurityFindingKind,
+        category: Option<&str>,
+    ) -> serde_json::Value {
+        let root = Path::new("/proj/root");
+        let mut finding = relativize_finding(sample_finding(root), root);
+        finding.finding_id = finding_id.to_owned();
+        finding.path = PathBuf::from(path);
+        finding.line = line;
+        finding.kind = kind;
+        finding.category = category.map(str::to_owned);
+        finding.candidate.sink.path = PathBuf::from(path);
+        finding.candidate.sink.line = line;
+        finding.candidate.sink.category = category.map(str::to_owned);
+        serde_json::to_value(finding).expect("security finding serializes")
+    }
+
+    fn sample_unresolved_callee_diagnostics(root: &Path) -> SecurityUnresolvedCalleeDiagnostics {
+        unresolved_callee_diagnostics(
+            &[
+                SecurityUnresolvedCalleeDiagnostic {
+                    path: root.join("src/z.ts"),
+                    line: 9,
+                    col: 4,
+                    reason: fallow_types::extract::SkippedSecurityCalleeReason::ComputedMember,
+                    expression_kind:
+                        fallow_types::extract::SkippedSecurityCalleeExpressionKind::ComputedMemberExpression,
+                },
+                SecurityUnresolvedCalleeDiagnostic {
+                    path: root.join("src/a.ts"),
+                    line: 3,
+                    col: 2,
+                    reason: fallow_types::extract::SkippedSecurityCalleeReason::DynamicDispatch,
+                    expression_kind: fallow_types::extract::SkippedSecurityCalleeExpressionKind::Other,
+                },
+                SecurityUnresolvedCalleeDiagnostic {
+                    path: root.join("src/a.ts"),
+                    line: 4,
+                    col: 2,
+                    reason: fallow_types::extract::SkippedSecurityCalleeReason::DynamicDispatch,
+                    expression_kind: fallow_types::extract::SkippedSecurityCalleeExpressionKind::Other,
+                },
+            ],
+            root,
+        )
+        .expect("diagnostics summarized")
+    }
+
+    fn test_output_config() -> SecurityOutputConfig {
+        SecurityOutputConfig {
+            rules: SecurityOutputRulesConfig {
+                security_client_server_leak: SecurityRuleSeverityConfig {
+                    configured: Severity::Off,
+                    effective: Severity::Warn,
+                },
+                security_sink: SecurityRuleSeverityConfig {
+                    configured: Severity::Off,
+                    effective: Severity::Warn,
+                },
+            },
+            categories_include: None,
+            categories_exclude: None,
+        }
+    }
+
+    #[test]
+    fn survivors_benchmark_uses_only_its_explicit_corpus_files() {
+        let root = Path::new("/removed/security-benchmark-project");
+        let findings = ["sec-a", "sec-b", "sec-c"]
+            .into_iter()
+            .map(|finding_id| {
+                let mut finding = sample_finding(root);
+                finding.finding_id = finding_id.to_owned();
+                finding
+            })
+            .collect();
+        let corpus = write_security_survivors_benchmark_corpus(&output_with(findings, 0))
+            .expect("self-contained survivors corpus");
+
+        let result = benchmark_security_survivors_json(&corpus)
+            .expect("benchmark should only read the explicit corpus files");
+        assert_eq!(result.0, 1);
+        assert_eq!(result.1, 1);
+        assert_eq!(result.2, 1);
+        assert_eq!(result.3, 0);
+        assert!(result.4 > 0);
+    }
+
+    #[test]
+    fn blind_spots_benchmark_normalizes_without_project_io() {
+        let root = Path::new("/removed/security-benchmark-project");
+        let diagnostics: Vec<_> = (0..64)
+            .rev()
+            .map(|index| SecurityUnresolvedCalleeDiagnostic {
+                path: root.join(format!("src/module{}.ts", index % 8)),
+                line: index + 1,
+                col: index % 4,
+                reason: if index % 2 == 0 {
+                    fallow_types::extract::SkippedSecurityCalleeReason::ComputedMember
+                } else {
+                    fallow_types::extract::SkippedSecurityCalleeReason::DynamicDispatch
+                },
+                expression_kind: if index % 2 == 0 {
+                    fallow_types::extract::SkippedSecurityCalleeExpressionKind::ComputedMemberExpression
+                } else {
+                    fallow_types::extract::SkippedSecurityCalleeExpressionKind::Other
+                },
+            })
+            .collect();
+
+        let result = benchmark_security_blind_spots_json(root, &diagnostics);
+        assert_eq!(
+            result.output.summary.unresolved_callee_sites,
+            diagnostics.len()
+        );
+        assert_eq!(
+            result.output.summary.sampled_callee_sites,
+            UNRESOLVED_CALLEE_SAMPLE_LIMIT
+        );
+        assert_eq!(result.output.groups.len(), 2);
+        assert!(result.rendered_bytes > 0);
+    }
+
+    #[test]
+    fn survivors_json_keeps_survivors_and_review_candidates_by_finding_id() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let candidates = dir.path().join("candidates.json");
+        let verdicts = dir.path().join("verdicts.json");
+        std::fs::write(
+            &candidates,
+            serde_json::json!({
+                "kind": "security",
+                "workspace_diagnostics": [{
+                    "kind": "undeclared-workspace",
+                    "path": "packages/orphan",
+                    "message": "Workspace is not declared."
+                }],
+                "security_findings": [
+                    survivor_candidate_json("sec-a", "src/a.ts", 10, SecurityFindingKind::TaintedSink, Some("ssrf")),
+                    survivor_candidate_json("sec-b", "src/b.ts", 11, SecurityFindingKind::TaintedSink, Some("redos-regex")),
+                    survivor_candidate_json("sec-c", "src/c.ts", 12, SecurityFindingKind::ClientServerLeak, None)
+                ]
+            })
+            .to_string(),
+        )
+        .expect("write candidates");
+        std::fs::write(
+            &verdicts,
+            serde_json::json!({
+                "schema_version": "fallow-security-verdicts/v1",
+                "verdicts": [
+                    { "schema_version": "fallow-security-verdict/v1", "finding_id": "sec-b", "verdict": "dismissed" },
+                    { "schema_version": "fallow-security-verdict/v1", "finding_id": "sec-a", "verdict": "survivor", "rationale": "input controls URL" },
+                    { "schema_version": "fallow-security-verdict/v1", "finding_id": "sec-c", "verdict": "needs-human-review" }
+                ]
+            })
+            .to_string(),
+        )
+        .expect("write verdicts");
+
+        let output = build_survivors_output(
+            &SecuritySurvivorsOptions {
+                output: OutputFormat::Json,
+                json_style: crate::json_style::JsonStyle::Compact,
+                candidates: &candidates,
+                verdicts: &verdicts,
+                require_verdict_for_each_candidate: false,
+            },
+            Instant::now(),
+        )
+        .expect("survivors output");
+        let rendered: serde_json::Value =
+            serde_json::from_str(&render_survivors_json(&output)).expect("json");
+
+        assert_eq!(rendered["kind"], "security-survivors");
+        assert_eq!(
+            rendered["workspace_diagnostics"][0]["path"],
+            "packages/orphan"
+        );
+        assert!(rendered["survivors"]["sec-a"].is_object());
+        assert!(rendered["survivors"]["sec-b"].is_null());
+        assert!(rendered["needs_human_review"]["sec-c"].is_object());
+        assert_eq!(rendered["summary"]["dismissed"], 1);
+    }
+
+    #[test]
+    fn survivors_reject_duplicate_verdicts_and_unknown_candidates() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let candidates = dir.path().join("candidates.json");
+        let verdicts = dir.path().join("verdicts.json");
+        std::fs::write(
+            &candidates,
+            serde_json::json!({
+                "security_findings": [
+                    survivor_candidate_json("sec-a", "src/a.ts", 1, SecurityFindingKind::TaintedSink, Some("ssrf"))
+                ]
+            })
+            .to_string(),
+        )
+        .expect("write candidates");
+        std::fs::write(
+            &verdicts,
+            r#"[
+                {"schema_version":"fallow-security-verdict/v1","finding_id":"sec-a","verdict":"survivor"},
+                {"schema_version":"fallow-security-verdict/v1","finding_id":"sec-a","verdict":"dismissed"}
+            ]"#,
+        )
+        .expect("write duplicate verdicts");
+        let duplicate = build_survivors_output(
+            &SecuritySurvivorsOptions {
+                output: OutputFormat::Json,
+                json_style: crate::json_style::JsonStyle::Compact,
+                candidates: &candidates,
+                verdicts: &verdicts,
+                require_verdict_for_each_candidate: false,
+            },
+            Instant::now(),
+        )
+        .expect_err("duplicate verdict should fail");
+        assert!(duplicate.contains("duplicate verdict"));
+
+        std::fs::write(
+            &verdicts,
+            r#"[{"schema_version":"fallow-security-verdict/v1","finding_id":"sec-missing","verdict":"survivor"}]"#,
+        )
+        .expect("write missing verdict");
+        let missing = build_survivors_output(
+            &SecuritySurvivorsOptions {
+                output: OutputFormat::Json,
+                json_style: crate::json_style::JsonStyle::Compact,
+                candidates: &candidates,
+                verdicts: &verdicts,
+                require_verdict_for_each_candidate: false,
+            },
+            Instant::now(),
+        )
+        .expect_err("missing candidate should fail");
+        assert!(missing.contains("unknown finding_id"));
+    }
+
+    #[test]
+    fn survivors_reject_malformed_schema_versions_and_unknown_verdicts() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let candidates = dir.path().join("candidates.json");
+        let verdicts = dir.path().join("verdicts.json");
+        std::fs::write(
+            &candidates,
+            serde_json::json!({
+                "security_findings": [
+                    survivor_candidate_json("sec-a", "src/a.ts", 1, SecurityFindingKind::TaintedSink, Some("ssrf"))
+                ]
+            })
+            .to_string(),
+        )
+        .expect("write candidates");
+        std::fs::write(
+            &verdicts,
+            r#"[{"schema_version":"wrong","finding_id":"sec-a","verdict":"survivor"}]"#,
+        )
+        .expect("write bad schema");
+        let bad_schema = build_survivors_output(
+            &SecuritySurvivorsOptions {
+                output: OutputFormat::Json,
+                json_style: crate::json_style::JsonStyle::Compact,
+                candidates: &candidates,
+                verdicts: &verdicts,
+                require_verdict_for_each_candidate: false,
+            },
+            Instant::now(),
+        )
+        .expect_err("bad schema should fail");
+        assert!(bad_schema.contains("schema_version"));
+
+        std::fs::write(
+            &verdicts,
+            r#"[{"schema_version":"fallow-security-verdict/v1","finding_id":"sec-a","verdict":"maybe"}]"#,
+        )
+        .expect("write unknown verdict");
+        let unknown = build_survivors_output(
+            &SecuritySurvivorsOptions {
+                output: OutputFormat::Json,
+                json_style: crate::json_style::JsonStyle::Compact,
+                candidates: &candidates,
+                verdicts: &verdicts,
+                require_verdict_for_each_candidate: false,
+            },
+            Instant::now(),
+        )
+        .expect_err("unknown verdict should fail");
+        assert!(unknown.contains("Failed to parse verifier verdict file"));
+    }
+
+    #[test]
+    fn blind_spots_group_existing_diagnostics_with_suggestions() {
+        let root = Path::new("/proj/root");
+        let mut output = output_with(vec![], 2);
+        output.unresolved_callee_sites = 99;
+        output.unresolved_callee_diagnostics = Some(sample_unresolved_callee_diagnostics(root));
+
+        let blind_spots = build_blind_spots_output(&output);
+        let rendered: serde_json::Value =
+            serde_json::from_str(&render_blind_spots_json(&blind_spots)).expect("json");
+
+        assert_eq!(rendered["kind"], "security-blind-spots");
+        assert_eq!(rendered["summary"]["unresolved_edge_files"], 2);
+        assert_eq!(rendered["summary"]["unresolved_callee_sites"], 3);
+        assert_eq!(rendered["groups"][0]["reason"], "dynamic-dispatch");
+        assert_eq!(rendered["groups"][0]["expression_kind"], "other");
+        assert_eq!(rendered["groups"][0]["files"][0]["path"], "src/a.ts");
+        assert!(rendered["groups"][0]["suggestion"].is_string());
+    }
+
+    #[test]
+    fn blind_spots_human_preserves_non_clean_bill_framing() {
+        let root = Path::new("/proj/root");
+        let mut output = output_with(vec![], 0);
+        output.unresolved_callee_sites = 3;
+        output.unresolved_callee_diagnostics = Some(sample_unresolved_callee_diagnostics(root));
+
+        let out = render_blind_spots_human(&build_blind_spots_output(&output));
+
+        assert!(out.contains("may have missed security candidates"));
+        assert!(out.contains("dynamic-dispatch / other"));
+        assert!(out.contains("Next: inspect dynamic dispatch targets"));
+    }
+
+    fn tainted_with_runtime(root: &Path, state: Option<SecurityRuntimeState>) -> SecurityFinding {
+        let mut finding = sample_finding(root);
+        finding.kind = SecurityFindingKind::TaintedSink;
+        finding.category = Some("dangerous-html".to_owned());
+        finding.cwe = Some(79);
+        finding.runtime = state.map(|state| SecurityRuntimeContext {
+            state,
+            function: "render".to_owned(),
+            line: 10,
+            invocations: Some(123),
+            stable_id: Some("fallow:fn:test".to_owned()),
+            evidence: Some("production runtime evidence".to_owned()),
+        });
+        finding
+    }
+
+    #[test]
+    fn runtime_rank_promotes_hot_and_demotes_never_executed() {
+        let root = Path::new("/proj/root");
+        let mut findings = [
+            tainted_with_runtime(root, Some(SecurityRuntimeState::NeverExecuted)),
+            tainted_with_runtime(root, None),
+            tainted_with_runtime(root, Some(SecurityRuntimeState::RuntimeHot)),
+            tainted_with_runtime(root, Some(SecurityRuntimeState::CoverageUnavailable)),
+        ];
+
+        findings.sort_by_key(runtime_rank);
+
+        assert_eq!(
+            findings
+                .iter()
+                .map(|finding| finding.runtime.as_ref().map(|runtime| runtime.state))
+                .collect::<Vec<_>>(),
+            vec![
+                Some(SecurityRuntimeState::RuntimeHot),
+                None,
+                Some(SecurityRuntimeState::CoverageUnavailable),
+                Some(SecurityRuntimeState::NeverExecuted),
+            ]
+        );
+    }
+
+    #[test]
+    fn severity_sort_orders_tiers_then_location() {
+        let root = Path::new("/proj/root");
+        let mut high = sample_finding(root);
+        high.path = root.join("z.ts");
+        high.severity = SecuritySeverity::High;
+        let mut low = sample_finding(root);
+        low.path = root.join("a.ts");
+        low.severity = SecuritySeverity::Low;
+        let mut medium_a = sample_finding(root);
+        medium_a.path = root.join("a.ts");
+        medium_a.severity = SecuritySeverity::Medium;
+        medium_a.reachability = Some(fallow_types::results::SecurityReachability {
+            reachable_from_entry: false,
+            reachable_from_untrusted_source: true,
+            taint_confidence: Some(TaintConfidence::ModuleLevel),
+            untrusted_source_hop_count: Some(1),
+            untrusted_source_trace: vec![],
+            blast_radius: 10,
+            crosses_boundary: false,
+        });
+        let mut medium_b = sample_finding(root);
+        medium_b.path = root.join("b.ts");
+        medium_b.severity = SecuritySeverity::Medium;
+        medium_b.source_backed = true;
+        medium_b.reachability = Some(fallow_types::results::SecurityReachability {
+            reachable_from_entry: false,
+            reachable_from_untrusted_source: true,
+            taint_confidence: Some(TaintConfidence::ArgLevel),
+            untrusted_source_hop_count: Some(0),
+            untrusted_source_trace: vec![],
+            blast_radius: 1,
+            crosses_boundary: false,
+        });
+        let mut findings = vec![low, medium_b, high, medium_a];
+
+        sort_by_security_severity(&mut findings);
+
+        assert_eq!(
+            findings
+                .iter()
+                .map(|finding| (finding.severity, finding.path.file_name().unwrap()))
+                .collect::<Vec<_>>(),
+            vec![
+                (SecuritySeverity::High, std::ffi::OsStr::new("z.ts")),
+                (SecuritySeverity::Medium, std::ffi::OsStr::new("b.ts")),
+                (SecuritySeverity::Medium, std::ffi::OsStr::new("a.ts")),
+                (SecuritySeverity::Low, std::ffi::OsStr::new("a.ts")),
+            ]
+        );
+    }
+
+    #[test]
+    fn human_render_includes_runtime_context_line() {
+        let root = Path::new("/proj/root");
+        let finding = relativize_finding(
+            tainted_with_runtime(root, Some(SecurityRuntimeState::RuntimeHot)),
+            root,
+        );
+        let out = render_human(&output_with(vec![finding], 0));
+
+        assert!(
+            out.contains("runtime: runtime-hot in render:10"),
+            "got: {out}"
+        );
+        assert!(out.contains("production runtime evidence"), "got: {out}");
+    }
+
+    #[test]
+    fn sarif_render_includes_runtime_context_in_message() {
+        let root = Path::new("/proj/root");
+        let finding = relativize_finding(
+            tainted_with_runtime(root, Some(SecurityRuntimeState::RuntimeHot)),
+            root,
+        );
+        let rendered = render_sarif(&output_with(vec![finding], 0));
+        let sarif: serde_json::Value = serde_json::from_str(&rendered).expect("valid SARIF JSON");
+        let message = sarif["runs"][0]["results"][0]["message"]["text"]
+            .as_str()
+            .expect("message text");
+
+        assert!(message.contains("Runtime context"), "got: {message}");
+        assert!(
+            message.contains("runtime-hot in render:10"),
+            "got: {message}"
+        );
+    }
+
+    #[test]
+    fn gate_human_header_fail_says_review_required_not_fail() {
+        let gate = SecurityGate {
+            mode: SecurityGateMode::New,
+            verdict: SecurityGateVerdict::Fail,
+            new_count: 2,
+        };
+        let header = gate_human_header(&gate);
+        assert!(header.contains("REVIEW REQUIRED"));
+        assert!(header.contains("2 new security items"));
+        assert!(header.contains("not confirmed a vulnerability"));
+        assert!(!header.to_uppercase().contains("GATE: FAIL"));
+    }
+
+    #[test]
+    fn gate_human_header_fail_singular_for_one_candidate() {
+        // The gate makes new_count == 1 the common case (one PR adds one sink).
+        let gate = SecurityGate {
+            mode: SecurityGateMode::New,
+            verdict: SecurityGateVerdict::Fail,
+            new_count: 1,
+        };
+        let header = gate_human_header(&gate);
+        assert!(header.contains("1 new security item in changed lines"));
+        assert!(!header.contains("1 new security candidates"));
+    }
+
+    #[test]
+    fn gate_human_header_pass() {
+        let gate = SecurityGate {
+            mode: SecurityGateMode::New,
+            verdict: SecurityGateVerdict::Pass,
+            new_count: 0,
+        };
+        assert!(gate_human_header(&gate).contains("Gate: PASS"));
+    }
+
+    #[test]
+    fn gate_json_block_is_snake_case_and_present_on_pass() {
+        let json = render_json(&output_with_gate(SecurityGateVerdict::Pass, 0));
+        let value: serde_json::Value =
+            serde_json::from_str(&json).expect("security JSON must parse");
+        assert_eq!(value["gate"]["mode"], "new");
+        assert_eq!(value["gate"]["verdict"], "pass");
+        assert_eq!(value["gate"]["new_count"], 0);
+    }
+
+    #[test]
+    fn reachability_key_includes_path_kind_and_category() {
+        let root = Path::new("/proj/root");
+        let mut leak = sample_finding(root);
+        leak.reachability = Some(SecurityReachability {
+            reachable_from_entry: true,
+            reachable_from_untrusted_source: false,
+            taint_confidence: None,
+            untrusted_source_hop_count: None,
+            untrusted_source_trace: vec![],
+            blast_radius: 0,
+            crosses_boundary: false,
+        });
+        let mut sink = leak.clone();
+        sink.kind = SecurityFindingKind::TaintedSink;
+        sink.category = Some("dangerous-html".to_owned());
+
+        assert_eq!(
+            security_reachability_key(&leak, root).as_deref(),
+            Some("security-reach:src/app.tsx:client-server-leak:none")
+        );
+        assert_eq!(
+            security_reachability_key(&sink, root).as_deref(),
+            Some("security-reach:src/app.tsx:tainted-sink:dangerous-html")
+        );
+    }
+
+    #[test]
+    fn reachability_key_ignores_unreachable_findings() {
+        let root = Path::new("/proj/root");
+        let finding = sample_finding(root);
+
+        assert!(security_reachability_key(&finding, root).is_none());
+    }
+
+    #[test]
+    fn gate_absent_from_json_when_no_gate_ran() {
+        let json = render_json(&output_with(vec![], 0));
+        assert!(!json.contains("\"gate\""));
+    }
+
+    #[test]
+    fn gate_sarif_is_a_run_property_not_result_severity() {
+        let sarif = render_sarif(&output_with_gate(SecurityGateVerdict::Fail, 1));
+        assert!(sarif.contains("fallowGate"));
+        // The gate verdict is a run property and creates no result severity.
+        assert!(!sarif.contains("\"level\": \"error\""));
+        assert!(!sarif.contains("\"level\": \"warning\""));
+    }
+
+    fn add_untrusted_source_reachability(finding: &mut SecurityFinding, root: &Path) {
+        finding.reachability = Some(SecurityReachability {
+            reachable_from_entry: true,
+            reachable_from_untrusted_source: true,
+            // Cross-module reachability is module-level (issue #1093).
+            taint_confidence: Some(TaintConfidence::ModuleLevel),
+            untrusted_source_hop_count: Some(1),
+            untrusted_source_trace: vec![
+                TraceHop {
+                    path: root.join("src/routes/api.ts"),
+                    line: 3,
+                    col: 0,
+                    role: TraceHopRole::ModuleSource,
+                },
+                TraceHop {
+                    path: root.join("src/lib/sink.ts"),
+                    line: 9,
+                    col: 2,
+                    role: TraceHopRole::Sink,
+                },
+            ],
+            blast_radius: 2,
+            crosses_boundary: false,
+        });
+    }
+
+    fn add_taint_flow(finding: &mut SecurityFinding, root: &Path) {
+        finding.taint_flow = Some(SecurityTaintFlow {
+            source: TaintEndpoint {
+                path: root.join("src/routes/api.ts"),
+                line: 3,
+                col: 0,
+            },
+            sink: TaintEndpoint {
+                path: root.join("src/lib/sink.ts"),
+                line: 9,
+                col: 2,
+            },
+            path: TaintPath {
+                intra_module: false,
+                cross_module_hops: 1,
+            },
+        });
+    }
+
+    #[test]
+    fn relativize_strips_root_prefix() {
+        let root = Path::new("/proj/root");
+        let abs = root.join("src/app.tsx");
+        let rel = relativize(&abs, root);
+        assert_eq!(rel.to_string_lossy().replace('\\', "/"), "src/app.tsx");
+    }
+
+    #[test]
+    fn relativize_keeps_path_when_outside_root() {
+        let root = Path::new("/proj/root");
+        let outside = Path::new("/elsewhere/file.ts");
+        // Not under root: the original path is returned unchanged.
+        assert_eq!(relativize(outside, root), outside.to_path_buf());
+    }
+
+    #[test]
+    fn relativize_finding_relativizes_anchor_and_every_hop() {
+        let root = Path::new("/proj/root");
+        let finding = relativize_finding(sample_finding(root), root);
+        assert_eq!(
+            finding.path.to_string_lossy().replace('\\', "/"),
+            "src/app.tsx"
+        );
+        let hop_paths: Vec<String> = finding
+            .trace
+            .iter()
+            .map(|h| h.path.to_string_lossy().replace('\\', "/"))
+            .collect();
+        assert_eq!(
+            hop_paths,
+            vec!["src/app.tsx", "src/lib/util.ts", "src/lib/secret.ts"]
+        );
+    }
+
+    #[test]
+    fn relativize_finding_relativizes_untrusted_source_trace() {
+        let root = Path::new("/proj/root");
+        let mut finding = sample_finding(root);
+        add_untrusted_source_reachability(&mut finding, root);
+        let finding = relativize_finding(finding, root);
+        let reach = finding.reachability.as_ref().expect("reachability");
+        let hop_paths: Vec<String> = reach
+            .untrusted_source_trace
+            .iter()
+            .map(|h| h.path.to_string_lossy().replace('\\', "/"))
+            .collect();
+        assert_eq!(hop_paths, vec!["src/routes/api.ts", "src/lib/sink.ts"]);
+    }
+
+    #[test]
+    fn fnv_hex_is_deterministic_and_16_hex_digits() {
+        let a = fnv_hex("security/client-server-leak:src/app.tsx:12");
+        let b = fnv_hex("security/client-server-leak:src/app.tsx:12");
+        assert_eq!(a, b, "same input must hash identically");
+        assert_eq!(a.len(), 16);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+        // Distinct input yields a distinct digest (anchor line differs).
+        assert_ne!(a, fnv_hex("security/client-server-leak:src/app.tsx:13"));
+    }
+
+    #[test]
+    fn hop_role_labels_cover_every_role() {
+        assert_eq!(
+            hop_role_label(TraceHopRole::ClientBoundary),
+            "client boundary"
+        );
+        assert_eq!(
+            hop_role_label(TraceHopRole::UntrustedSource),
+            "untrusted source"
+        );
+        assert_eq!(hop_role_label(TraceHopRole::ModuleSource), "source module");
+        assert_eq!(hop_role_label(TraceHopRole::Intermediate), "intermediate");
+        assert_eq!(hop_role_label(TraceHopRole::SecretSource), "secret source");
+        assert_eq!(hop_role_label(TraceHopRole::Sink), "sink site");
+    }
+
+    #[test]
+    fn sarif_location_clamps_line_and_offsets_column() {
+        // A zero line clamps to 1; the 0-based column becomes 1-based.
+        let loc = sarif_location(Path::new("a\\b.ts"), 0, 0);
+        let region = &loc["physicalLocation"]["region"];
+        assert_eq!(region["startLine"], 1);
+        assert_eq!(region["startColumn"], 1);
+        // Backslash separators normalize to forward slashes in the URI.
+        assert_eq!(loc["physicalLocation"]["artifactLocation"]["uri"], "a/b.ts");
+    }
+
+    #[test]
+    fn human_summary_reports_zero_without_edge_line() {
+        let out = render_human_summary(&output_with(vec![], 0));
+        assert!(
+            out.contains("Security review: no items to check in the scanned code."),
+            "got: {out}"
+        );
+        assert!(!out.contains("Blind spot"));
+    }
+
+    #[test]
+    fn human_summary_pluralizes_and_surfaces_unresolved_edges() {
+        let root = Path::new("/proj/root");
+        let out = render_human_summary(&output_with(vec![sample_finding(root)], 2));
+        assert!(
+            out.contains("Security review: 1 item to check."),
+            "got: {out}"
+        );
+        assert!(out.contains("not confirmed vulnerabilities"));
+        assert!(out.contains("unsafe input, secrets, or settings"));
+        assert!(out.contains("Blind spot: 2 client files use dynamic imports"));
+    }
+
+    #[test]
+    fn human_render_empty_states_no_candidates() {
+        colored::control::set_override(false);
+        let out = render_human(&output_with(vec![], 0));
+        assert!(out.contains("Security review: 0 items to check"));
+        assert!(out.contains("No security details to show."));
+        assert!(out.contains("Result: 0 security items to check."));
+    }
+
+    #[test]
+    fn human_render_shows_finding_trace_and_next_action() {
+        colored::control::set_override(false);
+        let root = Path::new("/proj/root");
+        let finding = relativize_finding(sample_finding(root), root);
+        let out = render_human(&output_with(vec![finding], 0));
+        assert!(out.contains("[H] high client-server-leak"));
+        assert!(out.contains("client-server-leak"));
+        assert!(out.contains("src/app.tsx:12"));
+        assert!(out.contains("evidence: reaches process.env.SECRET_KEY"));
+        assert!(out.contains("import trace:"));
+        assert!(out.contains("src/lib/secret.ts:8 (secret source)"));
+        assert!(out.contains("src/app.tsx:12 (client boundary)"));
+        assert!(out.contains("Next: check whether this import can ship a secret to the browser"));
+        assert!(out.contains("Result: 1 security item to check."));
+    }
+
+    #[test]
+    fn human_render_shows_dead_code_hint_and_delete_next_step() {
+        colored::control::set_override(false);
+        let root = Path::new("/proj/root");
+        let mut finding = relativize_finding(sample_finding(root), root);
+        finding.kind = SecurityFindingKind::TaintedSink;
+        finding.dead_code = Some(SecurityDeadCodeContext {
+            kind: SecurityDeadCodeKind::UnusedFile,
+            export_name: None,
+            line: None,
+            guidance: "delete instead of harden".to_string(),
+        });
+        let out = render_human(&output_with(vec![finding], 0));
+        assert!(
+            out.contains("dead-code: also reported as unused-file"),
+            "got: {out}"
+        );
+        assert!(
+            out.contains("If the code is safe to remove, delete it"),
+            "got: {out}"
+        );
+    }
+
+    #[test]
+    fn human_render_shows_untrusted_source_path_as_module_context() {
+        colored::control::set_override(false);
+        let root = Path::new("/proj/root");
+        let mut finding = sample_finding(root);
+        finding.kind = SecurityFindingKind::TaintedSink;
+        finding.category = Some("command-injection".to_string());
+        add_untrusted_source_reachability(&mut finding, root);
+        let finding = relativize_finding(finding, root);
+
+        let out = render_human(&output_with(vec![finding], 0));
+
+        assert!(
+            out.contains("reachable from a module that receives untrusted input via 1 import hop"),
+            "got: {out}"
+        );
+        assert!(out.contains("input import trace:"), "got: {out}");
+        assert!(
+            out.contains("src/routes/api.ts:3 (source module)"),
+            "got: {out}"
+        );
+    }
+
+    #[test]
+    fn human_render_surfaces_unresolved_edge_blind_spot() {
+        colored::control::set_override(false);
+        let out = render_human(&output_with(vec![], 3));
+        assert!(out.contains("Blind spot: 3 client files use dynamic imports"));
+        assert!(out.contains("Code behind those imports may be missing from this report."));
+    }
+
+    #[test]
+    fn human_render_blind_spots_use_singular_verbs() {
+        colored::control::set_override(false);
+        let mut output = output_with(vec![], 1);
+        output.unresolved_callee_sites = 1;
+
+        let out = render_human(&output);
+
+        assert!(out.contains("Blind spot: 1 client file uses dynamic imports"));
+        assert!(out.contains("Blind spot: 1 call site uses code patterns"));
+    }
+
+    #[test]
+    fn human_render_mentions_top_unresolved_callee_reason_and_file() {
+        colored::control::set_override(false);
+        let root = Path::new("/proj/root");
+        let mut output = output_with(vec![], 0);
+        output.unresolved_callee_sites = 3;
+        output.unresolved_callee_diagnostics = Some(sample_unresolved_callee_diagnostics(root));
+
+        let out = render_human(&output);
+
+        assert!(
+            out.contains("Most unresolved callees: dynamic-dispatch in src/a.ts."),
+            "got: {out}"
+        );
+    }
+
+    #[test]
+    fn json_render_carries_schema_version_and_findings() {
+        let root = Path::new("/proj/root");
+        let finding = relativize_finding(sample_finding(root), root);
+        let rendered = render_json(&output_with(vec![finding], 1));
+        let value: serde_json::Value = serde_json::from_str(&rendered).expect("valid JSON");
+        assert_eq!(value["schema_version"], "8");
+        assert_eq!(value["version"], "test");
+        assert_eq!(value["elapsed_ms"], 0);
+        assert_eq!(
+            value["config"]["rules"]["security_client_server_leak"]["configured"],
+            "off"
+        );
+        assert_eq!(
+            value["config"]["rules"]["security_client_server_leak"]["effective"],
+            "warn"
+        );
+        assert!(value["config"]["categories_include"].is_null());
+        assert!(value["config"]["categories_exclude"].is_null());
+        assert_eq!(value["unresolved_edge_files"], 1);
+        let findings = value["security_findings"].as_array().expect("array");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0]["kind"], "client-server-leak");
+        assert_eq!(findings[0]["path"], "src/app.tsx");
+        assert_eq!(findings[0]["severity"], "high");
+    }
+
+    #[test]
+    fn json_render_carries_bounded_unresolved_callee_diagnostics() {
+        let root = Path::new("/proj/root");
+        let mut output = output_with(vec![], 0);
+        output.unresolved_callee_sites = 3;
+        output.unresolved_callee_diagnostics = Some(sample_unresolved_callee_diagnostics(root));
+
+        let rendered = render_json(&output);
+        let value: serde_json::Value = serde_json::from_str(&rendered).expect("valid JSON");
+        let diagnostics = &value["unresolved_callee_diagnostics"];
+
+        assert_eq!(diagnostics["sample_limit"], 25);
+        assert_eq!(diagnostics["top_files_limit"], 10);
+        assert_eq!(diagnostics["sampled"][0]["path"], "src/a.ts");
+        assert_eq!(diagnostics["sampled"][0]["reason"], "dynamic-dispatch");
+        assert_eq!(diagnostics["sampled"][0]["expression_kind"], "other");
+        assert_eq!(diagnostics["top_files"][0]["path"], "src/a.ts");
+        assert_eq!(diagnostics["top_files"][0]["count"], 2);
+        assert_eq!(diagnostics["by_reason"][0]["reason"], "dynamic-dispatch");
+        assert_eq!(diagnostics["by_reason"][0]["count"], 2);
+    }
+
+    #[test]
+    fn json_summary_omits_finding_arrays_and_counts_security_findings() {
+        let root = Path::new("/proj/root");
+        let mut leak = relativize_finding(sample_finding(root), root);
+        leak.severity = SecuritySeverity::High;
+
+        let mut sink = relativize_finding(sample_finding(root), root);
+        sink.kind = SecurityFindingKind::TaintedSink;
+        sink.category = Some("dangerous-html".to_string());
+        sink.severity = SecuritySeverity::Medium;
+        sink.source_backed = true;
+        sink.reachability = Some(SecurityReachability {
+            reachable_from_entry: true,
+            reachable_from_untrusted_source: true,
+            taint_confidence: Some(TaintConfidence::ArgLevel),
+            untrusted_source_hop_count: Some(0),
+            untrusted_source_trace: vec![],
+            blast_radius: 3,
+            crosses_boundary: true,
+        });
+        sink.runtime = Some(SecurityRuntimeContext {
+            state: SecurityRuntimeState::RuntimeHot,
+            function: "render".to_owned(),
+            line: 10,
+            invocations: Some(120),
+            stable_id: Some("src/app.tsx::render:10".to_owned()),
+            evidence: Some("production hot path observed".to_owned()),
+        });
+
+        let mut output = output_with(vec![leak, sink], 2);
+        output.elapsed_ms = ElapsedMs(17);
+        output.unresolved_callee_sites = 3;
+
+        let rendered = render_json_summary(&output);
+        let value: serde_json::Value = serde_json::from_str(&rendered).expect("valid JSON");
+
+        assert_eq!(value["kind"], "security");
+        assert_eq!(value["schema_version"], "8");
+        assert_eq!(value["version"], "test");
+        assert_eq!(value["elapsed_ms"], 17);
+        assert!(value.get("config").is_some());
+        assert!(value.get("security_findings").is_none());
+        assert!(value.get("attack_surface").is_none());
+        assert!(value.get("_meta").is_none());
+        assert_eq!(value["summary"]["security_findings"], 2);
+        assert_eq!(value["summary"]["by_severity"]["high"], 1);
+        assert_eq!(value["summary"]["by_severity"]["medium"], 1);
+        assert_eq!(value["summary"]["by_severity"]["low"], 0);
+        assert_eq!(value["summary"]["by_category"]["client-server-leak"], 1);
+        assert_eq!(value["summary"]["by_category"]["dangerous-html"], 1);
+        assert_eq!(value["summary"]["by_reachability"]["entry_reachable"], 1);
+        assert_eq!(
+            value["summary"]["by_reachability"]["untrusted_source_reachable"],
+            1
+        );
+        assert_eq!(value["summary"]["by_reachability"]["arg_level"], 1);
+        assert_eq!(value["summary"]["by_reachability"]["module_level"], 0);
+        assert_eq!(value["summary"]["by_reachability"]["crosses_boundary"], 1);
+        assert_eq!(value["summary"]["by_reachability"]["source_backed"], 1);
+        assert_eq!(value["summary"]["by_runtime_state"]["runtime_hot"], 1);
+        assert_eq!(value["summary"]["by_runtime_state"]["runtime_cold"], 0);
+        assert_eq!(value["summary"]["by_runtime_state"]["never_executed"], 0);
+        assert_eq!(value["summary"]["by_runtime_state"]["low_traffic"], 0);
+        assert_eq!(
+            value["summary"]["by_runtime_state"]["coverage_unavailable"],
+            0
+        );
+        assert_eq!(value["summary"]["by_runtime_state"]["runtime_unknown"], 0);
+        assert_eq!(value["summary"]["by_runtime_state"]["not_collected"], 1);
+        assert_eq!(value["summary"]["unresolved_edge_files"], 2);
+        assert_eq!(value["summary"]["unresolved_callee_sites"], 3);
+        assert_eq!(value["summary"]["attack_surface_entries"], 0);
+    }
+
+    #[test]
+    fn json_summary_carries_security_meta_when_explain_requested() {
+        let root = Path::new("/proj/root");
+        let mut output = output_with(vec![relativize_finding(sample_finding(root), root)], 0);
+        output.meta = Some(crate::explain::security_meta());
+
+        let rendered = render_json_summary(&output);
+        let value: serde_json::Value = serde_json::from_str(&rendered).expect("valid JSON");
+
+        assert!(value.get("security_findings").is_none());
+        assert!(value["_meta"]["field_definitions"]["security_findings[]"].is_string());
+        assert!(value["_meta"]["field_definitions"]["summary.by_reachability"].is_string());
+        assert!(value["_meta"]["field_definitions"]["summary.by_runtime_state"].is_string());
+        assert!(value["_meta"]["field_definitions"]["unresolved_callee_sites"].is_string());
+    }
+
+    #[test]
+    fn json_summary_preserves_gate_block() {
+        let output = output_with_gate(SecurityGateVerdict::Fail, 1);
+        let rendered = render_json_summary(&output);
+        let value: serde_json::Value = serde_json::from_str(&rendered).expect("valid JSON");
+
+        assert_eq!(value["kind"], "security");
+        assert_eq!(value["gate"]["mode"], "new");
+        assert_eq!(value["gate"]["verdict"], "fail");
+        assert_eq!(value["gate"]["new_count"], 1);
+        assert_eq!(value["summary"]["security_findings"], 0);
+    }
+
+    #[test]
+    fn json_render_carries_security_meta_when_explain_requested() {
+        let mut output = output_with(vec![], 0);
+        output.meta = Some(crate::explain::security_meta());
+
+        let rendered = render_json(&output);
+        let value: serde_json::Value = serde_json::from_str(&rendered).expect("valid JSON");
+
+        assert_eq!(
+            value["_meta"]["field_definitions"]["security_findings[]"],
+            "Unverified security candidates for downstream human or agent verification."
+        );
+        assert!(value["_meta"]["rules"]["security/tainted-sink"].is_object());
+    }
+
+    #[test]
+    fn json_render_carries_candidate_record_and_omits_impact() {
+        // Issue #900: every finding carries a 3-slot candidate record; there is
+        // NO `impact` key on the wire (agent-owned, documented in the schema). A
+        // client-server-leak has no source kind and no taint flow.
+        let root = Path::new("/proj/root");
+        let finding = relativize_finding(sample_finding(root), root);
+        let rendered = render_json(&output_with(vec![finding], 0));
+        let value: serde_json::Value = serde_json::from_str(&rendered).expect("valid JSON");
+        let finding = &value["security_findings"][0];
+
+        let candidate = &finding["candidate"];
+        assert!(candidate.is_object(), "candidate record present");
+        assert!(candidate["sink"].is_object(), "sink slot present");
+        assert_eq!(candidate["boundary"]["client_server"], true);
+        assert!(
+            candidate.get("impact").is_none(),
+            "impact must NOT be a wire field"
+        );
+        assert!(
+            candidate.get("source_kind").is_none(),
+            "client-server-leak has no source kind"
+        );
+        assert!(
+            finding.get("taint_flow").is_none(),
+            "no untrusted-source flow on a client-server-leak"
+        );
+        assert!(
+            finding.get("finding_id").is_some(),
+            "finding_id is on the wire"
+        );
+    }
+
+    #[test]
+    fn finding_id_is_stable_and_matches_sarif_fingerprint() {
+        // Issue #900: one helper computes both the JSON finding_id and the SARIF
+        // partialFingerprint, so an agent can join the two and they never drift.
+        let root = Path::new("/proj/root");
+        let finding = relativize_finding(sample_finding(root), root);
+        let id = security_finding_id(&finding);
+        assert!(!id.is_empty());
+        assert_eq!(
+            id,
+            security_finding_id(&finding),
+            "deterministic across calls"
+        );
+
+        let sarif: serde_json::Value =
+            serde_json::from_str(&render_sarif(&output_with(vec![finding], 0)))
+                .expect("valid SARIF");
+        assert_eq!(
+            sarif["runs"][0]["results"][0]["partialFingerprints"]["fallowSecurity/v1"],
+            serde_json::Value::String(id)
+        );
+    }
+
+    #[test]
+    fn json_render_carries_dead_code_context() {
+        let root = Path::new("/proj/root");
+        let mut finding = relativize_finding(sample_finding(root), root);
+        finding.kind = SecurityFindingKind::TaintedSink;
+        finding.dead_code = Some(SecurityDeadCodeContext {
+            kind: SecurityDeadCodeKind::UnusedExport,
+            export_name: Some("handler".to_string()),
+            line: Some(12),
+            guidance: "remove export instead of harden".to_string(),
+        });
+        let rendered = render_json(&output_with(vec![finding], 0));
+        let value: serde_json::Value = serde_json::from_str(&rendered).expect("valid JSON");
+        let context = &value["security_findings"][0]["dead_code"];
+        assert_eq!(context["kind"], "unused-export");
+        assert_eq!(context["export_name"], "handler");
+        assert_eq!(context["line"], 12);
+    }
+
+    #[test]
+    fn sarif_render_emits_warning_level_with_fingerprint_and_related_locations() {
+        let root = Path::new("/proj/root");
+        let finding = relativize_finding(sample_finding(root), root);
+        let rendered = render_sarif(&output_with(vec![finding], 0));
+        let sarif: serde_json::Value = serde_json::from_str(&rendered).expect("valid SARIF JSON");
+        assert_eq!(sarif["version"], "2.1.0");
+        let run = &sarif["runs"][0];
+        assert_eq!(run["tool"]["driver"]["name"], "fallow");
+        let result = &run["results"][0];
+        // Candidate framing: a high-priority finding is warning, never error.
+        assert_eq!(result["level"], "warning");
+        assert_eq!(result["ruleId"], "security/client-server-leak");
+        assert_eq!(result["message"]["text"], "reaches process.env.SECRET_KEY");
+        // Trace hops surface as relatedLocations and codeFlows.
+        assert_eq!(result["relatedLocations"].as_array().unwrap().len(), 3);
+        let flow_locations = result["codeFlows"][0]["threadFlows"][0]["locations"]
+            .as_array()
+            .expect("thread flow locations");
+        assert_eq!(flow_locations.len(), 3);
+        assert_eq!(
+            flow_locations[0]["location"]["physicalLocation"]["artifactLocation"]["uri"],
+            "src/app.tsx"
+        );
+        assert_eq!(
+            flow_locations[2]["location"]["physicalLocation"]["artifactLocation"]["uri"],
+            "src/lib/secret.ts"
+        );
+        assert_eq!(
+            flow_locations[2]["kinds"][0],
+            serde_json::json!("secret-source")
+        );
+        // Stable dedup fingerprint present for GHAS.
+        assert!(result["partialFingerprints"]["fallowSecurity/v1"].is_string());
+
+        let rules = run["tool"]["driver"]["rules"].as_array().unwrap();
+        assert_eq!(rules[0]["name"], "Client-server secret leak");
+        assert!(rules[0]["help"]["text"].is_string());
+        assert!(rules[0].get("relationships").is_none());
+        assert!(run.get("taxonomies").is_none());
+    }
+
+    #[test]
+    fn sarif_render_keeps_low_severity_as_note() {
+        let root = Path::new("/proj/root");
+        let mut finding = sample_finding(root);
+        finding.severity = SecuritySeverity::Low;
+        let rendered = render_sarif(&output_with(vec![relativize_finding(finding, root)], 0));
+        let sarif: serde_json::Value = serde_json::from_str(&rendered).expect("valid SARIF JSON");
+
+        assert_eq!(sarif["runs"][0]["results"][0]["level"], "note");
+    }
+
+    #[test]
+    fn sarif_render_includes_dead_code_hint_in_message() {
+        let root = Path::new("/proj/root");
+        let mut finding = relativize_finding(sample_finding(root), root);
+        finding.kind = SecurityFindingKind::TaintedSink;
+        finding.dead_code = Some(SecurityDeadCodeContext {
+            kind: SecurityDeadCodeKind::UnusedFile,
+            export_name: None,
+            line: None,
+            guidance: "delete instead of harden".to_string(),
+        });
+        let rendered = render_sarif(&output_with(vec![finding], 0));
+        let sarif: serde_json::Value = serde_json::from_str(&rendered).expect("valid SARIF JSON");
+        let message = sarif["runs"][0]["results"][0]["message"]["text"]
+            .as_str()
+            .expect("message text");
+        assert!(message.contains("Dead-code cross-link"), "got: {message}");
+        assert!(
+            message.contains("delete this file instead of hardening"),
+            "got: {message}"
+        );
+    }
+
+    #[test]
+    fn sarif_render_includes_untrusted_source_context_and_related_locations() {
+        let root = Path::new("/proj/root");
+        let mut finding = sample_finding(root);
+        finding.kind = SecurityFindingKind::TaintedSink;
+        finding.category = Some("command-injection".to_string());
+        add_untrusted_source_reachability(&mut finding, root);
+        add_taint_flow(&mut finding, root);
+        finding.trace.push(TraceHop {
+            path: root.join("src/lib/sink.ts"),
+            line: 9,
+            col: 2,
+            role: TraceHopRole::Sink,
+        });
+        let rendered = render_sarif(&output_with(vec![relativize_finding(finding, root)], 0));
+        let sarif: serde_json::Value = serde_json::from_str(&rendered).expect("valid SARIF JSON");
+        let result = &sarif["runs"][0]["results"][0];
+        let message = result["message"]["text"].as_str().expect("message text");
+        assert!(message.contains("Module-level context"), "got: {message}");
+        assert!(
+            message.contains("does not prove value flow"),
+            "got: {message}"
+        );
+        // The sink appears in both trace families, but SARIF relatedLocations requires unique items.
+        assert_eq!(result["relatedLocations"].as_array().unwrap().len(), 5);
+        let flow_locations = result["codeFlows"][0]["threadFlows"][0]["locations"]
+            .as_array()
+            .expect("thread flow locations");
+        assert_eq!(flow_locations.len(), 2);
+        assert_eq!(
+            flow_locations[0]["location"]["physicalLocation"]["artifactLocation"]["uri"],
+            "src/routes/api.ts"
+        );
+        assert_eq!(
+            flow_locations[1]["location"]["physicalLocation"]["artifactLocation"]["uri"],
+            "src/lib/sink.ts"
+        );
+    }
+
+    #[test]
+    fn sarif_tainted_sink_uses_per_category_rule_id_and_cwe_metadata() {
+        let root = Path::new("/proj/root");
+        let mut finding = sample_finding(root);
+        finding.kind = SecurityFindingKind::TaintedSink;
+        finding.category = Some("dangerous-html".to_owned());
+        finding.cwe = Some(79);
+        let rendered = render_sarif(&output_with(vec![relativize_finding(finding, root)], 0));
+        let sarif: serde_json::Value = serde_json::from_str(&rendered).expect("valid SARIF JSON");
+        let run = &sarif["runs"][0];
+        // The finding is grouped under its own per-category rule, not collapsed
+        // into client-server-leak, and stays candidate-framed.
+        let result = &run["results"][0];
+        assert_eq!(result["level"], "warning");
+        assert_eq!(result["ruleId"], "security/dangerous-html");
+        // Exactly one rule definition, carrying compatible tags plus SARIF-native CWE taxonomy.
+        let rules = run["tool"]["driver"]["rules"].as_array().unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0]["id"], "security/dangerous-html");
+        assert_eq!(rules[0]["name"], "Dangerous HTML sink");
+        assert!(
+            rules[0]["help"]["text"]
+                .as_str()
+                .expect("help text")
+                .contains("Verify this unverified")
+        );
+        assert!(
+            rules[0]["help"]["markdown"]
+                .as_str()
+                .expect("help markdown")
+                .contains("**Dangerous HTML sink**")
+        );
+        let tags = rules[0]["properties"]["tags"].as_array().unwrap();
+        assert!(tags.iter().any(|t| t == "external/cwe/cwe-79"));
+        let relationship = &rules[0]["relationships"][0];
+        assert_eq!(relationship["target"]["id"], "CWE-79");
+        assert_eq!(relationship["target"]["index"], 0);
+        assert_eq!(relationship["target"]["toolComponent"]["name"], "CWE");
+        assert_eq!(relationship["kinds"][0], "superset");
+
+        let taxonomy = &run["taxonomies"][0];
+        assert_eq!(taxonomy["name"], "CWE");
+        assert_eq!(taxonomy["taxa"][0]["id"], "CWE-79");
+        assert_eq!(
+            run["tool"]["driver"]["supportedTaxonomies"][0]["name"],
+            "CWE"
+        );
+    }
+
+    #[test]
+    fn write_sarif_file_creates_parent_dir_and_writes_valid_sarif() {
+        let root = Path::new("/proj/root");
+        let finding = relativize_finding(sample_finding(root), root);
+        let output = output_with(vec![finding], 0);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("nested/out.sarif");
+        write_sarif_file(&output, &path).expect("write succeeds and creates parent dir");
+        let written = std::fs::read_to_string(&path).expect("file exists");
+        let sarif: serde_json::Value = serde_json::from_str(&written).expect("valid SARIF JSON");
+        assert_eq!(sarif["version"], "2.1.0");
+    }
+
+    /// No explicit `--config`; static so the `&'a Option<PathBuf>` field borrows it.
+    const NO_CONFIG: Option<PathBuf> = None;
+
+    fn leak_fixture_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/security-client-server-leak")
+    }
+
+    fn source_reachability_fixture_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/security-source-reachability-885")
+    }
+
+    fn run_opts(root: &Path, output: OutputFormat, fail_on_issues: bool) -> SecurityOptions<'_> {
+        SecurityOptions {
+            root,
+            config_path: &NO_CONFIG,
+            output,
+            json_style: crate::json_style::JsonStyle::Compact,
+            no_cache: true,
+            threads: 1,
+            quiet: true,
+            allow_remote_extends: false,
+            fail_on_issues,
+            sarif_file: None,
+            summary: false,
+            changed_since: None,
+            use_shared_diff_index: false,
+            workspace: None,
+            changed_workspaces: None,
+            file: &[],
+            surface: false,
+            gate: None,
+            runtime_coverage: None,
+            min_invocations_hot: 100,
+            explain: false,
+        }
+    }
+
+    #[test]
+    fn source_reachability_fixture_marks_cross_module_sink() {
+        let root = source_reachability_fixture_root();
+        let mut config = load_config_for_analysis(
+            &root,
+            &NO_CONFIG,
+            crate::ConfigLoadOptions {
+                output: OutputFormat::Json,
+                no_cache: true,
+                threads: 1,
+                production_override: None,
+                quiet: true,
+                allow_remote_extends: false,
+            },
+            ProductionAnalysis::DeadCode,
+        )
+        .expect("fixture config loads");
+        config.rules.security_sink = Severity::Warn;
+
+        let analysis = fallow_engine::session::AnalysisSession::from_resolved_config(config)
+            .expect("fixture session")
+            .analyze_dead_code_with_artifacts(false, false)
+            .expect("fixture analyzes");
+        let finding = analysis
+            .results
+            .security_findings
+            .iter()
+            .find(|finding| finding.path.ends_with("src/runner.ts"))
+            .expect("runner sink finding");
+        let reach = finding.reachability.as_ref().expect("reachability");
+
+        assert!(reach.reachable_from_untrusted_source);
+        assert_eq!(reach.untrusted_source_hop_count, Some(1));
+        // Cross-module reachability is module-level: the structured discriminator
+        // says so, and the source node is honestly labeled `ModuleSource`, never
+        // `UntrustedSource` (which is reserved for an arg-level same-module read).
+        assert_eq!(reach.taint_confidence, Some(TaintConfidence::ModuleLevel));
+        assert_eq!(
+            reach
+                .untrusted_source_trace
+                .iter()
+                .map(|hop| hop.role)
+                .collect::<Vec<_>>(),
+            vec![TraceHopRole::ModuleSource, TraceHopRole::Sink]
+        );
+        assert!(
+            reach.untrusted_source_trace[0]
+                .path
+                .ends_with("src/route.ts")
+        );
+
+        // Issue #900: the candidate boundary slot records the cross-module hop,
+        // and the taint-flow triple re-projects the reachability endpoints + a
+        // compact path (not a duplicate hop array).
+        assert!(
+            finding.candidate.boundary.cross_module,
+            "a sink reached across a module hop crosses a module boundary"
+        );
+        let flow = finding.taint_flow.as_ref().expect("taint_flow present");
+        assert!(!flow.path.intra_module);
+        assert_eq!(flow.path.cross_module_hops, 1);
+        assert!(flow.source.path.ends_with("src/route.ts"));
+        assert!(flow.sink.path.ends_with("src/runner.ts"));
+    }
+
+    #[test]
+    fn file_scope_keeps_security_finding_when_anchor_matches() {
+        let root = Path::new("/proj/root");
+        let mut results = AnalysisResults::default();
+        results.security_findings.push(sample_finding(root));
+
+        filter_to_files(&mut results, root, &[PathBuf::from("src/app.tsx")], true);
+
+        assert_eq!(results.security_findings.len(), 1);
+    }
+
+    #[test]
+    fn file_scope_keeps_security_finding_when_trace_hop_matches() {
+        let root = Path::new("/proj/root");
+        let mut results = AnalysisResults::default();
+        results.security_findings.push(sample_finding(root));
+
+        filter_to_files(
+            &mut results,
+            root,
+            &[PathBuf::from("src/lib/secret.ts")],
+            true,
+        );
+
+        assert_eq!(results.security_findings.len(), 1);
+    }
+
+    #[test]
+    fn file_scope_drops_unrelated_security_finding() {
+        let root = Path::new("/proj/root");
+        let mut results = AnalysisResults::default();
+        results.security_findings.push(sample_finding(root));
+
+        filter_to_files(&mut results, root, &[PathBuf::from("src/other.ts")], true);
+
+        assert!(results.security_findings.is_empty());
+    }
+
+    #[test]
+    fn run_is_advisory_and_exits_zero_even_with_candidates() {
+        // The rule defaults to off; the command forces it to warn, so findings on
+        // the fixture are surfaced but the exit stays 0 (advisory) by default.
+        let root = leak_fixture_root();
+        let code = run(&run_opts(&root, OutputFormat::Json, false));
+        assert_eq!(code, ExitCode::SUCCESS);
+    }
+
+    #[test]
+    fn run_with_fail_on_issues_exits_one_when_candidates_found() {
+        // The fixture has real leak candidates, so --fail-on-issues raises exit 1.
+        let root = leak_fixture_root();
+        let code = run(&run_opts(&root, OutputFormat::Human, true));
+        assert_eq!(code, ExitCode::from(1));
+    }
+
+    #[test]
+    fn run_rejects_unsupported_output_format() {
+        // Only human / json / sarif are supported; compact exits 2 before analysis.
+        let root = leak_fixture_root();
+        let code = run(&run_opts(&root, OutputFormat::Compact, false));
+        assert_eq!(code, ExitCode::from(2));
+    }
+
+    #[test]
+    fn run_summary_mode_dispatches_compact_human_renderer() {
+        let root = leak_fixture_root();
+        let opts = SecurityOptions {
+            summary: true,
+            ..run_opts(&root, OutputFormat::Human, false)
+        };
+        assert_eq!(run(&opts), ExitCode::SUCCESS);
+    }
+
+    #[test]
+    fn run_sarif_format_dispatches_sarif_renderer() {
+        let root = leak_fixture_root();
+        assert_eq!(
+            run(&run_opts(&root, OutputFormat::Sarif, false)),
+            ExitCode::SUCCESS
+        );
+    }
+
+    #[test]
+    fn run_writes_sarif_sidecar_file_when_requested() {
+        let root = leak_fixture_root();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sidecar = dir.path().join("security.sarif");
+        let opts = SecurityOptions {
+            sarif_file: Some(&sidecar),
+            ..run_opts(&root, OutputFormat::Human, false)
+        };
+        assert_eq!(run(&opts), ExitCode::SUCCESS);
+        let written = std::fs::read_to_string(&sidecar).expect("sidecar SARIF written");
+        let sarif: serde_json::Value = serde_json::from_str(&written).expect("valid SARIF JSON");
+        assert_eq!(sarif["version"], "2.1.0");
+    }
+}

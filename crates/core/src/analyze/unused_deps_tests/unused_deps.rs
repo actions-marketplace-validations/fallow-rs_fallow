@@ -1,7 +1,5 @@
 use super::helpers::*;
 
-// ---- find_unused_dependencies integration tests ----
-
 #[test]
 fn unused_dep_flagged_when_never_imported() {
     let (graph, _) = build_graph_with_npm_imports(&[("react", false)]);
@@ -32,7 +30,6 @@ fn known_tooling_dev_deps_not_flagged_as_unused() {
     let (unused, unused_dev, _) = find_unused_dependencies(&graph, &pkg, &config, None, &[]);
 
     assert!(unused.is_empty());
-    // "jest" and "vitest" are known tooling deps, so they should NOT be flagged
     assert!(
         !unused_dev.iter().any(|d| d.package_name == "jest"),
         "jest is a known tooling dep and should be filtered"
@@ -73,7 +70,6 @@ fn unused_optional_dep_flagged_when_never_imported() {
 
 #[test]
 fn implicit_deps_not_flagged_as_unused() {
-    // react-dom, @types/node, etc. are implicit and should be filtered
     let (graph, _) = build_graph_with_npm_imports(&[]);
     let pkg = make_pkg(&["react-dom", "@types/node"], &[], &[]);
     let config = test_config(PathBuf::from("/project"));
@@ -91,7 +87,7 @@ fn implicit_deps_not_flagged_as_unused() {
 }
 
 #[test]
-fn workspace_package_names_not_flagged() {
+fn unused_workspace_package_names_are_flagged() {
     let (graph, _) = build_graph_with_npm_imports(&[]);
     let pkg = make_pkg(&["@myorg/shared"], &[], &[]);
     let config = test_config(PathBuf::from("/project"));
@@ -105,8 +101,8 @@ fn workspace_package_names_not_flagged() {
     let (unused, _, _) = find_unused_dependencies(&graph, &pkg, &config, None, &workspaces);
 
     assert!(
-        !unused.iter().any(|d| d.package_name == "@myorg/shared"),
-        "workspace packages should not be flagged as unused"
+        unused.iter().any(|d| d.package_name == "@myorg/shared"),
+        "declared workspace package dependency should be flagged when unused"
     );
 }
 
@@ -117,6 +113,7 @@ fn ignore_dependencies_config_filters_deps() {
 
     let config = FallowConfig {
         ignore_dependencies: vec!["my-internal-pkg".to_string()],
+        ignore_unresolved_imports: vec![],
         ..Default::default()
     }
     .resolve(
@@ -125,6 +122,7 @@ fn ignore_dependencies_config_filters_deps() {
         1,
         true,
         true,
+        None,
     );
 
     let (unused, _, _) = find_unused_dependencies(&graph, &pkg, &config, None, &[]);
@@ -195,6 +193,111 @@ fn script_used_packages_not_flagged() {
 }
 
 #[test]
+fn peer_dependency_of_used_package_not_flagged() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("node_modules/react-dom")).expect("create react-dom dir");
+    std::fs::write(
+        root.join("node_modules/react-dom/package.json"),
+        r#"{"name":"react-dom","peerDependencies":{"react":"^18.0.0"}}"#,
+    )
+    .expect("write react-dom package");
+
+    let (graph, _) = build_graph_with_npm_imports(&[("react-dom", false)]);
+    let pkg = make_pkg(&["react", "react-dom"], &[], &[]);
+    let config = test_config(root.to_path_buf());
+
+    let (unused, _, _) = find_unused_dependencies(&graph, &pkg, &config, None, &[]);
+
+    assert!(
+        !unused.iter().any(|d| d.package_name == "react"),
+        "react is a peer dependency of used react-dom and should not be flagged: {unused:?}"
+    );
+}
+
+#[test]
+fn peer_dependency_of_parent_installed_package_not_flagged() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let root = tmp.path().join("monorepo/packages/app");
+    let parent = tmp.path().join("monorepo");
+    std::fs::create_dir_all(parent.join("node_modules/react-dom"))
+        .expect("create parent react-dom dir");
+    std::fs::write(
+        parent.join("node_modules/react-dom/package.json"),
+        r#"{"name":"react-dom","peerDependencies":{"react":"^18.0.0"}}"#,
+    )
+    .expect("write parent react-dom package");
+
+    let (graph, _) = build_graph_with_npm_imports(&[("react-dom", false)]);
+    let pkg = make_pkg(&["react", "react-dom"], &[], &[]);
+    let config = test_config(root);
+
+    let (unused, _, _) = find_unused_dependencies(&graph, &pkg, &config, None, &[]);
+
+    assert!(
+        !unused.iter().any(|d| d.package_name == "react"),
+        "react is a peer dependency of hoisted react-dom and should not be flagged: {unused:?}"
+    );
+}
+
+#[test]
+fn recursive_peer_dependencies_of_used_package_not_flagged() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("node_modules/plugin-a")).expect("create plugin-a dir");
+    std::fs::create_dir_all(root.join("node_modules/plugin-b")).expect("create plugin-b dir");
+    std::fs::write(
+        root.join("node_modules/plugin-a/package.json"),
+        r#"{"name":"plugin-a","peerDependencies":{"plugin-b":"^1.0.0"}}"#,
+    )
+    .expect("write plugin-a package");
+    std::fs::write(
+        root.join("node_modules/plugin-b/package.json"),
+        r#"{"name":"plugin-b","peerDependencies":{"react":"^18.0.0"}}"#,
+    )
+    .expect("write plugin-b package");
+
+    let (graph, _) = build_graph_with_npm_imports(&[("plugin-a", false)]);
+    let pkg = make_pkg(&["plugin-a", "plugin-b", "react"], &[], &[]);
+    let config = test_config(root.to_path_buf());
+
+    let (unused, _, _) = find_unused_dependencies(&graph, &pkg, &config, None, &[]);
+    let unused_names: Vec<&str> = unused.iter().map(|dep| dep.package_name.as_str()).collect();
+
+    assert!(
+        !unused_names.contains(&"plugin-b") && !unused_names.contains(&"react"),
+        "recursive peer deps should be credited from used plugin-a, got: {unused_names:?}"
+    );
+}
+
+#[test]
+fn optional_peer_dependency_of_used_package_is_still_flagged_when_unused() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("node_modules/plugin-a")).expect("create plugin-a dir");
+    std::fs::write(
+        root.join("node_modules/plugin-a/package.json"),
+        r#"{
+  "name": "plugin-a",
+  "peerDependencies": {"optional-peer": "^1.0.0"},
+  "peerDependenciesMeta": {"optional-peer": {"optional": true}}
+}"#,
+    )
+    .expect("write plugin-a package");
+
+    let (graph, _) = build_graph_with_npm_imports(&[("plugin-a", false)]);
+    let pkg = make_pkg(&["plugin-a", "optional-peer"], &[], &[]);
+    let config = test_config(root.to_path_buf());
+
+    let (unused, _, _) = find_unused_dependencies(&graph, &pkg, &config, None, &[]);
+
+    assert!(
+        unused.iter().any(|d| d.package_name == "optional-peer"),
+        "optional peer dependencies are not required by the used package and should still be reported: {unused:?}"
+    );
+}
+
+#[test]
 fn unused_dep_location_is_correct() {
     let (graph, _) = build_graph_with_npm_imports(&[]);
     let pkg = make_pkg(&["unused-dep"], &["unused-dev"], &["unused-opt"]);
@@ -215,12 +318,8 @@ fn unused_dep_location_is_correct() {
     );
 }
 
-// ---- Scoped package / subpath import edge cases ----
-
 #[test]
 fn scoped_package_subpath_import_recognized_as_used() {
-    // import { Button } from '@chakra-ui/react/button'
-    // should recognize '@chakra-ui/react' as the package name
     let (graph, _resolved_modules) = build_graph_with_npm_imports(&[("@chakra-ui/react", false)]);
     let pkg = make_pkg(&["@chakra-ui/react"], &[], &[]);
     let config = test_config(PathBuf::from("/project"));
@@ -235,7 +334,6 @@ fn scoped_package_subpath_import_recognized_as_used() {
 
 #[test]
 fn optional_dep_in_peer_deps_also_counts() {
-    // An optional dep that is also used should not be flagged
     let (graph, _) = build_graph_with_npm_imports(&[("sharp", false)]);
     let pkg = make_pkg(&[], &[], &["sharp"]);
     let config = test_config(PathBuf::from("/project"));
@@ -247,8 +345,6 @@ fn optional_dep_in_peer_deps_also_counts() {
         "optional dep that is imported should not be flagged as unused"
     );
 }
-
-// ---- Empty / edge case scenarios ----
 
 #[test]
 fn no_deps_produces_no_unused() {
@@ -307,7 +403,6 @@ fn unlisted_dep_has_import_sites() {
 
 #[test]
 fn path_alias_imports_not_reported_as_unlisted() {
-    // @/components and ~/utils are path aliases, not npm packages
     let files = vec![DiscoveredFile {
         id: FileId(0),
         path: PathBuf::from("/project/src/index.ts"),
@@ -320,7 +415,7 @@ fn path_alias_imports_not_reported_as_unlisted() {
     let resolved_modules = vec![ResolvedModule {
         file_id: FileId(0),
         path: PathBuf::from("/project/src/index.ts"),
-        exports: vec![],
+        exports: vec![].into(),
         re_exports: vec![],
         resolved_imports: vec![
             ResolvedImport {
@@ -329,6 +424,8 @@ fn path_alias_imports_not_reported_as_unlisted() {
                     imported_name: ImportedName::Named("Button".to_string()),
                     local_name: "Button".to_string(),
                     is_type_only: false,
+                    is_type_only_star: false,
+                    from_style: false,
                     span: oxc_span::Span::new(0, 30),
                     source_span: oxc_span::Span::default(),
                 },
@@ -340,6 +437,8 @@ fn path_alias_imports_not_reported_as_unlisted() {
                     imported_name: ImportedName::Named("helper".to_string()),
                     local_name: "helper".to_string(),
                     is_type_only: false,
+                    is_type_only_star: false,
+                    from_style: false,
                     span: oxc_span::Span::new(35, 60),
                     source_span: oxc_span::Span::default(),
                 },
@@ -348,12 +447,18 @@ fn path_alias_imports_not_reported_as_unlisted() {
         ],
         resolved_dynamic_imports: vec![],
         resolved_dynamic_patterns: vec![],
-        member_accesses: vec![],
-        whole_object_uses: vec![],
+        member_accesses: vec![].into(),
+        semantic_facts: std::sync::Arc::default(),
+        whole_object_uses: std::sync::Arc::default(),
         has_cjs_exports: false,
+        has_angular_component_template_url: false,
         unused_import_bindings: FxHashSet::default(),
         type_referenced_import_bindings: vec![],
         value_referenced_import_bindings: vec![],
+        namespace_object_aliases: vec![],
+        exported_factory_returns: std::sync::Arc::default(),
+        exported_factory_return_object_shapes: std::sync::Arc::default(),
+        type_member_types: std::sync::Arc::default(),
     }];
     let graph = ModuleGraph::build(&resolved_modules, &entry_points, &files);
     let pkg = make_pkg(&[], &[], &[]);
@@ -381,7 +486,7 @@ fn multiple_unresolved_imports_collected() {
     let resolved_modules = vec![ResolvedModule {
         file_id: FileId(0),
         path: PathBuf::from("/project/src/index.ts"),
-        exports: vec![],
+        exports: vec![].into(),
         re_exports: vec![],
         resolved_imports: vec![
             ResolvedImport {
@@ -390,6 +495,8 @@ fn multiple_unresolved_imports_collected() {
                     imported_name: ImportedName::Named("a".to_string()),
                     local_name: "a".to_string(),
                     is_type_only: false,
+                    is_type_only_star: false,
+                    from_style: false,
                     span: oxc_span::Span::new(0, 20),
                     source_span: oxc_span::Span::default(),
                 },
@@ -401,6 +508,8 @@ fn multiple_unresolved_imports_collected() {
                     imported_name: ImportedName::Named("b".to_string()),
                     local_name: "b".to_string(),
                     is_type_only: false,
+                    is_type_only_star: false,
+                    from_style: false,
                     span: oxc_span::Span::new(25, 45),
                     source_span: oxc_span::Span::default(),
                 },
@@ -409,12 +518,18 @@ fn multiple_unresolved_imports_collected() {
         ],
         resolved_dynamic_imports: vec![],
         resolved_dynamic_patterns: vec![],
-        member_accesses: vec![],
-        whole_object_uses: vec![],
+        member_accesses: vec![].into(),
+        semantic_facts: std::sync::Arc::default(),
+        whole_object_uses: std::sync::Arc::default(),
         has_cjs_exports: false,
+        has_angular_component_template_url: false,
         unused_import_bindings: FxHashSet::default(),
         type_referenced_import_bindings: vec![],
         value_referenced_import_bindings: vec![],
+        namespace_object_aliases: vec![],
+        exported_factory_returns: std::sync::Arc::default(),
+        exported_factory_return_object_shapes: std::sync::Arc::default(),
+        type_member_types: std::sync::Arc::default(),
     }];
 
     let config = test_config(PathBuf::from("/project"));
@@ -427,6 +542,7 @@ fn multiple_unresolved_imports_collected() {
         &suppressions,
         &[],
         &[],
+        &[],
         &line_offsets,
     );
 
@@ -435,11 +551,8 @@ fn multiple_unresolved_imports_collected() {
     assert!(unresolved.iter().any(|u| u.specifier == "./missing-b"));
 }
 
-// ---- Additional coverage: all deps used scenario ----
-
 #[test]
 fn all_deps_used_produces_no_unused() {
-    // Every dependency listed is also imported — nothing should be flagged
     let (graph, _) =
         build_graph_with_npm_imports(&[("react", false), ("lodash", false), ("axios", false)]);
     let pkg = make_pkg(&["react", "lodash", "axios"], &[], &[]);
@@ -456,12 +569,8 @@ fn all_deps_used_produces_no_unused() {
     assert!(unused_optional.is_empty());
 }
 
-// ---- Additional coverage: workspace-scoped dependency usage ----
-
 #[test]
 fn workspace_dep_used_within_workspace_not_flagged() {
-    // A workspace declares "react" as a dep AND a file within that workspace imports "react".
-    // This dep should NOT be flagged as unused for the workspace.
     let ws_root = PathBuf::from("/project/packages/web");
     let files = vec![DiscoveredFile {
         id: FileId(0),
@@ -475,7 +584,7 @@ fn workspace_dep_used_within_workspace_not_flagged() {
     let resolved_modules = vec![ResolvedModule {
         file_id: FileId(0),
         path: ws_root.join("src/index.ts"),
-        exports: vec![],
+        exports: vec![].into(),
         re_exports: vec![],
         resolved_imports: vec![ResolvedImport {
             info: ImportInfo {
@@ -483,6 +592,8 @@ fn workspace_dep_used_within_workspace_not_flagged() {
                 imported_name: ImportedName::Named("useState".to_string()),
                 local_name: "useState".to_string(),
                 is_type_only: false,
+                is_type_only_star: false,
+                from_style: false,
                 span: oxc_span::Span::new(0, 20),
                 source_span: oxc_span::Span::default(),
             },
@@ -490,31 +601,31 @@ fn workspace_dep_used_within_workspace_not_flagged() {
         }],
         resolved_dynamic_imports: vec![],
         resolved_dynamic_patterns: vec![],
-        member_accesses: vec![],
-        whole_object_uses: vec![],
+        member_accesses: vec![].into(),
+        semantic_facts: std::sync::Arc::default(),
+        whole_object_uses: std::sync::Arc::default(),
         has_cjs_exports: false,
+        has_angular_component_template_url: false,
         unused_import_bindings: FxHashSet::default(),
         type_referenced_import_bindings: vec![],
         value_referenced_import_bindings: vec![],
+        namespace_object_aliases: vec![],
+        exported_factory_returns: std::sync::Arc::default(),
+        exported_factory_return_object_shapes: std::sync::Arc::default(),
+        type_member_types: std::sync::Arc::default(),
     }];
     let graph = ModuleGraph::build(&resolved_modules, &entry_points, &files);
 
-    // Root package.json does NOT list "react" — it's only in the workspace
     let root_pkg = make_pkg(&[], &[], &[]);
     let config = test_config(PathBuf::from("/project"));
 
-    // The workspace package.json would list "react", but since we can't write to disk,
-    // we verify that the root analysis does not flag "react" because it IS used somewhere.
     let (unused, _, _) = find_unused_dependencies(&graph, &root_pkg, &config, None, &[]);
 
-    // "react" is not in root package.json, so it won't appear in unused root deps at all
     assert!(
         !unused.iter().any(|d| d.package_name == "react"),
         "react should not be in root unused since it's not in root deps"
     );
 }
-
-// ---- Additional coverage: unused deps with plugin tooling for dev deps ----
 
 #[test]
 fn plugin_tooling_dev_deps_not_flagged() {

@@ -4,20 +4,126 @@
 set +e -o pipefail
 
 # Run fallow analysis with CLI argument construction (deduped)
-# Required env: INPUT_COMMAND, INPUT_ROOT, INPUT_CONFIG, INPUT_FORMAT, INPUT_PRODUCTION,
-#   INPUT_CHANGED_SINCE, INPUT_AUTO_CHANGED_SINCE, PR_BASE_SHA, EVENT_NAME,
-#   INPUT_BASELINE, INPUT_SAVE_BASELINE, INPUT_FAIL_ON_REGRESSION,
-#   INPUT_TOLERANCE, INPUT_REGRESSION_BASELINE, INPUT_SAVE_REGRESSION_BASELINE,
-#   INPUT_ARGS, INPUT_DUPES_MODE,
-#   INPUT_MIN_TOKENS, INPUT_MIN_LINES, INPUT_THRESHOLD, INPUT_SKIP_LOCAL,
-#   INPUT_CROSS_LANGUAGE, INPUT_DRY_RUN, INPUT_WORKSPACE, INPUT_CHANGED_WORKSPACES,
-#   INPUT_MAX_CYCLOMATIC,
-#   INPUT_MAX_COGNITIVE, INPUT_TOP, INPUT_SORT, INPUT_FILE_SCORES, INPUT_HOTSPOTS,
-#   INPUT_TARGETS, INPUT_COMPLEXITY, INPUT_SINCE, INPUT_MIN_COMMITS,
-#   INPUT_PRODUCTION_COVERAGE, INPUT_COVERAGE_ROOT, INPUT_MIN_INVOCATIONS_HOT,
-#   INPUT_MIN_OBSERVATION_VOLUME, INPUT_LOW_TRAFFIC_THRESHOLD,
-#   INPUT_SCORE, INPUT_SAVE_SNAPSHOT, INPUT_TREND, INPUT_ISSUE_TYPES, INPUT_NO_CACHE, INPUT_THREADS,
-#   INPUT_ONLY, INPUT_SKIP
+# Env contract: provided by the composite action. action.yml is the
+#   authoritative input surface; each INPUT_* variable maps 1:1 to an action
+#   input, plus workflow-context variables (PR_BASE_SHA, EVENT_NAME) wired in
+#   this script's step env block.
+
+artifact_path() {
+  local filename=$1
+  if [ "$ARTIFACTS_DIR" = "." ]; then
+    printf '%s\n' "$filename"
+  else
+    printf '%s/%s\n' "$ARTIFACTS_DIR" "$filename"
+  fi
+}
+
+is_dead_code_baseline_command() {
+  [ -n "${INPUT_BASELINE:-}" ] || return 1
+  case "${INPUT_COMMAND:-}" in
+    ""|dead-code|check) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+normalize_changed_path() {
+  local path=$1
+  local root="${INPUT_ROOT:-.}"
+
+  path="${path#./}"
+  root="${root#./}"
+
+  if [ "$root" != "." ] && [[ "$path" == "$root/"* ]]; then
+    path="${path#"$root/"}"
+  fi
+
+  printf '%s\n' "$path"
+}
+
+repo_relative_root() {
+  local root="${INPUT_ROOT:-.}"
+  root="${root#./}"
+
+  if [ "$root" = "." ]; then
+    printf '.\n'
+    return 0
+  fi
+
+  if [[ "$root" != /* ]]; then
+    printf '%s\n' "${root%/}"
+    return 0
+  fi
+
+  local workspace="${GITHUB_WORKSPACE:-}"
+  local abs_root
+  local abs_workspace
+  [ -n "$workspace" ] || return 1
+  abs_root=$(cd "$root" 2>/dev/null && pwd -P) || return 1
+  abs_workspace=$(cd "$workspace" 2>/dev/null && pwd -P) || return 1
+
+  if [ "$abs_root" = "$abs_workspace" ]; then
+    printf '.\n'
+  elif [[ "$abs_root" == "$abs_workspace/"* ]]; then
+    printf '%s\n' "${abs_root#"$abs_workspace/"}"
+  else
+    return 1
+  fi
+}
+
+normalize_config_path() {
+  local path=$1
+  local root="${INPUT_ROOT:-.}"
+
+  path="${path#./}"
+  root="${root#./}"
+
+  if [[ "$path" = /* ]]; then
+    local abs_root
+    abs_root=$(cd "${INPUT_ROOT:-.}" 2>/dev/null && pwd -P)
+    if [ -n "$abs_root" ] && [[ "$path" == "$abs_root/"* ]]; then
+      path="${path#"$abs_root/"}"
+    fi
+  elif [ "$root" != "." ] && [[ "$path" == "$root/"* ]]; then
+    path="${path#"$root/"}"
+  fi
+
+  printf '%s\n' "$path"
+}
+
+find_changed_fallow_config() {
+  local changed_files_json=$1
+  local explicit_config=""
+  local matched=""
+  local root_prefix=""
+
+  if [ -n "${INPUT_CONFIG:-}" ]; then
+    explicit_config=$(normalize_config_path "$INPUT_CONFIG")
+  fi
+  if [ -n "${INPUT_ROOT:-}" ] && [ "$INPUT_ROOT" != "." ]; then
+    root_prefix="${INPUT_ROOT#./}/"
+  fi
+
+  matched=$(printf '%s' "$changed_files_json" | jq -r \
+    --arg explicit "$explicit_config" --arg root "$root_prefix" '
+    .[]
+    | sub("^\\./"; "")
+    | if ($root != "" and startswith($root)) then ltrimstr($root) else . end
+    | select(
+        . == ".fallowrc.json"
+        or . == ".fallowrc.jsonc"
+        or . == "fallow.toml"
+        or . == ".fallow.toml"
+        or ($explicit != "" and . == $explicit)
+      )
+  ' | head -1)
+
+  if [ -n "$matched" ]; then
+    printf '%s\n' "$matched"
+    return 0
+  fi
+
+  return 1
+}
 
 # --- Shared argument building functions ---
 # Uses global ARGS array (avoids bash nameref compatibility issues)
@@ -30,6 +136,11 @@ build_common_args() {
 
   [ -n "${INPUT_CONFIG:-}" ] && ARGS+=(--config "$INPUT_CONFIG")
   [ "${INPUT_PRODUCTION:-}" = "true" ] && ARGS+=(--production)
+  if [ -z "$INPUT_COMMAND" ]; then
+    [ "${INPUT_PRODUCTION_DEAD_CODE:-}" = "true" ] && ARGS+=(--production-dead-code)
+    [ "${INPUT_PRODUCTION_HEALTH:-}" = "true" ] && ARGS+=(--production-health)
+    [ "${INPUT_PRODUCTION_DUPES:-}" = "true" ] && ARGS+=(--production-dupes)
+  fi
   [ -n "${INPUT_CHANGED_SINCE:-}" ] && ARGS+=(--changed-since "$INPUT_CHANGED_SINCE")
   [ -n "${INPUT_BASELINE:-}" ] && ARGS+=(--baseline "$INPUT_BASELINE")
   [ -n "${INPUT_SAVE_BASELINE:-}" ] && ARGS+=(--save-baseline "$INPUT_SAVE_BASELINE")
@@ -37,6 +148,23 @@ build_common_args() {
   [ -n "${INPUT_CHANGED_WORKSPACES:-}" ] && ARGS+=(--changed-workspaces "$INPUT_CHANGED_WORKSPACES")
   [ "${INPUT_NO_CACHE:-}" = "true" ] && ARGS+=(--no-cache)
   [ -n "${INPUT_THREADS:-}" ] && ARGS+=(--threads "$INPUT_THREADS")
+  if [ "${INPUT_TYPE_AWARE:-}" = "true" ]; then
+    ARGS+=(--type-aware)
+    if [ -n "${INPUT_TYPE_AWARE_PROJECTS:-}" ]; then
+      IFS=',' read -ra TYPE_AWARE_PROJECTS <<< "$INPUT_TYPE_AWARE_PROJECTS"
+      for project in "${TYPE_AWARE_PROJECTS[@]}"; do
+        [ -n "$project" ] && ARGS+=(--type-aware-project "$project")
+      done
+    fi
+    [ -n "${INPUT_TYPE_AWARE_REQUIRE:-}" ] && \
+      ARGS+=(--type-aware-require "$INPUT_TYPE_AWARE_REQUIRE")
+  elif [ "${INPUT_TYPE_AWARE:-}" = "false" ] && [ "${HAS_NO_TYPE_AWARE:-false}" = "true" ]; then
+    # Explicit opt-out overrides a config-enabled typeAware, keeping the run
+    # syntactic even though the sidecar was not provisioned (#2107). The
+    # 'auto' default adds no flag: the project config drives the analysis.
+    # Gated on binary support so older CLIs keep their previous behavior.
+    ARGS+=(--no-type-aware)
+  fi
 
   if [ -z "$INPUT_COMMAND" ]; then
     [ -n "${INPUT_ONLY:-}" ] && ARGS+=(--only "$INPUT_ONLY")
@@ -50,7 +178,7 @@ build_command_args() {
   case "$INPUT_COMMAND" in
     dead-code|check)
       if [ "${INPUT_FORMAT:-}" = "sarif" ] && [ "${HAS_SARIF_FILE:-false}" = "true" ]; then
-        ARGS+=(--sarif-file fallow-results.sarif)
+        ARGS+=(--sarif-file "$SARIF_FILE")
       fi
       if [ -n "${INPUT_ISSUE_TYPES:-}" ]; then
         IFS=',' read -ra TYPES <<< "$INPUT_ISSUE_TYPES"
@@ -79,7 +207,8 @@ build_command_args() {
       [ -n "${INPUT_MAX_CYCLOMATIC:-}" ] && ARGS+=(--max-cyclomatic "$INPUT_MAX_CYCLOMATIC")
       [ -n "${INPUT_MAX_COGNITIVE:-}" ] && ARGS+=(--max-cognitive "$INPUT_MAX_COGNITIVE")
       [ -n "${INPUT_MAX_CRAP:-}" ] && ARGS+=(--max-crap "$INPUT_MAX_CRAP")
-      [ -n "${INPUT_PRODUCTION_COVERAGE:-}" ] && ARGS+=(--production-coverage "$INPUT_PRODUCTION_COVERAGE")
+      [ -n "${INPUT_COVERAGE:-}" ] && ARGS+=(--coverage "$INPUT_COVERAGE")
+      [ -n "${INPUT_PRODUCTION_COVERAGE:-}" ] && ARGS+=(--runtime-coverage "$INPUT_PRODUCTION_COVERAGE")
       [ -n "${INPUT_COVERAGE_ROOT:-}" ] && ARGS+=(--coverage-root "$INPUT_COVERAGE_ROOT")
       [ -n "${INPUT_MIN_INVOCATIONS_HOT:-}" ] && ARGS+=(--min-invocations-hot "$INPUT_MIN_INVOCATIONS_HOT")
       [ -n "${INPUT_MIN_OBSERVATION_VOLUME:-}" ] && ARGS+=(--min-observation-volume "$INPUT_MIN_OBSERVATION_VOLUME")
@@ -103,6 +232,22 @@ build_command_args() {
       fi
       [ "${INPUT_TREND:-}" = "true" ] && ARGS+=(--trend)
       ;;
+    audit)
+      [ "${INPUT_PRODUCTION_DEAD_CODE:-}" = "true" ] && ARGS+=(--production-dead-code)
+      [ "${INPUT_PRODUCTION_HEALTH:-}" = "true" ] && ARGS+=(--production-health)
+      [ "${INPUT_PRODUCTION_DUPES:-}" = "true" ] && ARGS+=(--production-dupes)
+      [ -n "${INPUT_DEAD_CODE_BASELINE:-}" ] && ARGS+=(--dead-code-baseline "$INPUT_DEAD_CODE_BASELINE")
+      [ -n "${INPUT_HEALTH_BASELINE:-}" ] && ARGS+=(--health-baseline "$INPUT_HEALTH_BASELINE")
+      [ -n "${INPUT_DUPES_BASELINE:-}" ] && ARGS+=(--dupes-baseline "$INPUT_DUPES_BASELINE")
+      [ -n "${INPUT_MAX_CRAP:-}" ] && ARGS+=(--max-crap "$INPUT_MAX_CRAP")
+      [ -n "${INPUT_COVERAGE:-}" ] && ARGS+=(--coverage "$INPUT_COVERAGE")
+      [ -n "${INPUT_COVERAGE_ROOT:-}" ] && ARGS+=(--coverage-root "$INPUT_COVERAGE_ROOT")
+      [ -n "${INPUT_GATE:-}" ] && ARGS+=(--gate "$INPUT_GATE")
+      [ "${INPUT_INCLUDE_ENTRY_EXPORTS:-}" = "true" ] && ARGS+=(--include-entry-exports)
+      ;;
+    security)
+      [ -n "${INPUT_SECURITY_GATE:-}" ] && ARGS+=(--gate "$INPUT_SECURITY_GATE")
+      ;;
     fix)
       if [ "${INPUT_DRY_RUN:-}" = "true" ]; then
         ARGS+=(--dry-run)
@@ -112,7 +257,7 @@ build_command_args() {
       ;;
     "")
       if [ "${INPUT_FORMAT:-}" = "sarif" ] && [ "${HAS_SARIF_FILE:-false}" = "true" ]; then
-        ARGS+=(--sarif-file fallow-results.sarif)
+        ARGS+=(--sarif-file "$SARIF_FILE")
       fi
       [ "${INPUT_SCORE:-}" = "true" ] && ARGS+=(--score)
       [ "${INPUT_TREND:-}" = "true" ] && ARGS+=(--trend)
@@ -127,16 +272,61 @@ build_command_args() {
       [ -n "${INPUT_TOLERANCE:-}" ] && [ "${INPUT_TOLERANCE:-}" != "0" ] && ARGS+=(--tolerance "$INPUT_TOLERANCE")
       [ -n "${INPUT_REGRESSION_BASELINE:-}" ] && ARGS+=(--regression-baseline "$INPUT_REGRESSION_BASELINE")
       [ -n "${INPUT_SAVE_REGRESSION_BASELINE:-}" ] && ARGS+=(--save-regression-baseline "$INPUT_SAVE_REGRESSION_BASELINE")
+      [ -n "${INPUT_COVERAGE:-}" ] && ARGS+=(--coverage "$INPUT_COVERAGE")
+      [ -n "${INPUT_COVERAGE_ROOT:-}" ] && ARGS+=(--coverage-root "$INPUT_COVERAGE_ROOT")
       ;;
   esac
 }
 
 # --- Validation ---
 
+contains_ascii_control() {
+  local LC_ALL=C
+  local value=$1
+  [[ "$value" =~ [[:cntrl:]] ]]
+}
+
+validate_action_scalars() {
+  local changed_since="${INPUT_CHANGED_SINCE:-}"
+  local diff_file="${FALLOW_DIFF_FILE:-}"
+
+  if [ -z "$changed_since" ] && [ "${INPUT_AUTO_CHANGED_SINCE:-}" = "true" ] && \
+     { [ "${EVENT_NAME:-}" = "pull_request" ] || [ "${EVENT_NAME:-}" = "pull_request_target" ]; }; then
+    changed_since="${PR_BASE_SHA:-}"
+  fi
+
+  if [[ "$changed_since" = -* ]]; then
+    printf '%s\n' "::error::changed-since must not begin with '-'"
+    exit 2
+  fi
+  if contains_ascii_control "$changed_since"; then
+    printf '%s\n' "::error::changed-since must not contain ASCII control characters"
+    exit 2
+  fi
+  if contains_ascii_control "$diff_file"; then
+    printf '%s\n' "::error::diff-file must not contain ASCII control characters"
+    exit 2
+  fi
+}
+
+validate_action_scalars
+
 case "$INPUT_COMMAND" in
-  ""|dead-code|check|dupes|health|fix) ;;
-  *) echo "::error::Invalid command: ${INPUT_COMMAND}. Must be dead-code, dupes, health, fix, or empty (runs all)."; exit 2 ;;
+  ""|dead-code|check|dupes|health|audit|security|fix) ;;
+  *) echo "::error::Invalid command: ${INPUT_COMMAND}. Must be dead-code, dupes, health, audit, security, fix, or empty (runs all)."; exit 2 ;;
 esac
+
+if [ "$INPUT_COMMAND" = "audit" ] && { [ -n "${INPUT_BASELINE:-}" ] || [ -n "${INPUT_SAVE_BASELINE:-}" ]; }; then
+  echo "::error::The audit command does not support the generic baseline/save-baseline inputs. Use dead-code-baseline, health-baseline, or dupes-baseline instead."
+  exit 2
+fi
+
+if [ -n "${INPUT_GATE:-}" ] && [ "$INPUT_GATE" != "new-only" ] && [ "$INPUT_GATE" != "all" ]; then
+  echo "::error::gate must be 'new-only' or 'all', got: ${INPUT_GATE}"; exit 2
+fi
+if [ -n "${INPUT_SECURITY_GATE:-}" ] && [ "$INPUT_SECURITY_GATE" != "new" ] && [ "$INPUT_SECURITY_GATE" != "newly-reachable" ]; then
+  echo "::error::security-gate must be 'new' or 'newly-reachable', got: ${INPUT_SECURITY_GATE}"; exit 2
+fi
 
 for name_val in "min-tokens:${INPUT_MIN_TOKENS:-}" "min-lines:${INPUT_MIN_LINES:-}" \
                "max-cyclomatic:${INPUT_MAX_CYCLOMATIC:-}" "max-cognitive:${INPUT_MAX_COGNITIVE:-}" \
@@ -159,6 +349,42 @@ if [ -n "${INPUT_LOW_TRAFFIC_THRESHOLD:-}" ] && ! [[ "$INPUT_LOW_TRAFFIC_THRESHO
   echo "::error::low-traffic-threshold must be a non-negative number, got: ${INPUT_LOW_TRAFFIC_THRESHOLD}"; exit 2
 fi
 
+# --- Resolve artifact paths ---
+
+ARTIFACTS_DIR="${INPUT_ARTIFACTS_DIR:-.}"
+if [ -z "$ARTIFACTS_DIR" ]; then
+  ARTIFACTS_DIR="."
+fi
+if [[ "$ARTIFACTS_DIR" = /* ]] || [[ "$ARTIFACTS_DIR" = -* ]] || \
+   [[ "$ARTIFACTS_DIR" == *$'\n'* ]] || [[ "$ARTIFACTS_DIR" == *$'\r'* ]] || \
+   [[ "$ARTIFACTS_DIR" =~ (^|/)\.\.(/|$) ]]; then
+  echo "::error::artifacts-dir must be a relative path inside the workspace, got: ${ARTIFACTS_DIR}"
+  exit 2
+fi
+if ! mkdir -p "$ARTIFACTS_DIR"; then
+  echo "::error::Failed to create artifacts-dir: ${ARTIFACTS_DIR}"
+  exit 2
+fi
+
+RESULTS_FILE=$(artifact_path fallow-results.json)
+RESULTS_RAW_FILE=$(artifact_path fallow-results-raw.json)
+SCOPED_RESULTS_FILE=$(artifact_path fallow-results-scoped.json)
+SARIF_FILE=$(artifact_path fallow-results.sarif)
+STDERR_FILE=$(artifact_path fallow-stderr.log)
+ANALYSIS_ARGS_FILE=$(artifact_path fallow-analysis-args.sh)
+CHANGED_FILES_FILE=$(artifact_path fallow-changed-files.json)
+AUTO_DIFF_FILE="$PWD/$(artifact_path fallow-pr.diff)"
+
+if [ -n "${GITHUB_ENV:-}" ]; then
+  printf '%s\n' \
+    "FALLOW_RESULTS_FILE=${RESULTS_FILE}" \
+    "FALLOW_SCOPED_RESULTS_FILE=${SCOPED_RESULTS_FILE}" \
+    "FALLOW_ANALYSIS_ARGS_FILE=${ANALYSIS_ARGS_FILE}" \
+    "FALLOW_CHANGED_FILES_FILE=${CHANGED_FILES_FILE}" \
+    "FALLOW_SARIF_FILE=${SARIF_FILE}" \
+    "FALLOW_ARTIFACTS_DIR=${ARTIFACTS_DIR}" >> "$GITHUB_ENV"
+fi
+
 # --- Check for --sarif-file support ---
 
 HAS_SARIF_FILE=false
@@ -171,17 +397,46 @@ if { [ "$INPUT_COMMAND" = "dead-code" ] || [ "$INPUT_COMMAND" = "check" ] || [ -
   rm -f "$HELP_TMP"
 fi
 
+# --- Check for native `fallow report` support ---
+# `fallow report --from <results.json> --format github-annotations|github-summary`
+# lets the annotate / summary steps re-render the saved envelope instead of the
+# bundled jq. One probe covers both formats (they shipped together). The
+# annotate / summary steps run in separate step processes, so the result flows
+# through $GITHUB_ENV like the other analyze outputs above; unset on older
+# binaries keeps those steps on the jq fallback.
+
+HAS_NATIVE_REPORT=false
+if fallow report --help > /dev/null 2>&1; then
+  HAS_NATIVE_REPORT=true
+fi
+
+# --- Check for --no-type-aware support ---
+# Only probed for the explicit `type-aware: false` opt-out; the flag is global
+# on supporting CLIs, so any subcommand help lists it.
+
+HAS_NO_TYPE_AWARE=false
+if [ "${INPUT_TYPE_AWARE:-}" = "false" ]; then
+  if fallow dead-code --help 2>/dev/null | /usr/bin/grep -q -- '--no-type-aware'; then
+    HAS_NO_TYPE_AWARE=true
+  fi
+fi
+if [ -n "${GITHUB_ENV:-}" ]; then
+  printf '%s\n' "HAS_NATIVE_REPORT=${HAS_NATIVE_REPORT}" >> "$GITHUB_ENV"
+fi
+
 # --- Auto-detect changed-since in PR context ---
+
+AUTO_CHANGED_SINCE=false
+USER_DIFF_FILE=false
+[ -n "${FALLOW_DIFF_FILE:-}" ] && USER_DIFF_FILE=true
 
 if [ -z "${INPUT_CHANGED_SINCE:-}" ] && [ "${INPUT_AUTO_CHANGED_SINCE:-}" = "true" ] && \
    { [ "${EVENT_NAME:-}" = "pull_request" ] || [ "${EVENT_NAME:-}" = "pull_request_target" ]; } && \
    [ -n "${PR_BASE_SHA:-}" ]; then
   INPUT_CHANGED_SINCE="$PR_BASE_SHA"
+  AUTO_CHANGED_SINCE=true
   echo "::notice::Auto-scoping analysis to files changed since PR base (${PR_BASE_SHA:0:7})"
 fi
-
-# Propagate the effective changed-since value so downstream steps can filter
-echo "changed_since=${INPUT_CHANGED_SINCE:-}" >> "$GITHUB_OUTPUT"
 
 # --- Pre-compute changed files list for downstream filtering ---
 # Downstream scripts (comment, summary, annotations, review) need the list of
@@ -189,38 +444,160 @@ echo "changed_since=${INPUT_CHANGED_SINCE:-}" >> "$GITHUB_OUTPUT"
 # actions/checkout depth), git diff against the base SHA fails. We compute the
 # list here once — trying git first, then the GitHub API — and save it for reuse.
 
+# Initialize the API-failure marker unconditionally so downstream gates always
+# see a definitive value (false), regardless of whether changed-since was
+# requested. Without this, `if:` conditions using
+# `outputs.changed_files_unavailable == 'false'` as a positive signal see an
+# absent field instead of false when changed-since is not set.
+if [ -n "${GITHUB_OUTPUT:-}" ]; then
+  printf '%s\n' "changed_files_unavailable=false" >> "$GITHUB_OUTPUT"
+fi
+
+_CHANGED_JSON=""
+
 if [ -n "${INPUT_CHANGED_SINCE:-}" ]; then
   _ROOT="${INPUT_ROOT:-.}"
-  _CHANGED=""
+  _CHANGED_JSON=""
 
   # Try three-dot diff (precise: changes since merge-base, needs full history)
-  _CHANGED=$(cd "$_ROOT" && git diff --name-only --relative "${INPUT_CHANGED_SINCE}...HEAD" -- . 2>/dev/null || true)
+  _CHANGED_JSON=$(cd "$_ROOT" && git diff --name-only -z --relative "${INPUT_CHANGED_SINCE}...HEAD" -- . 2>/dev/null | jq -Rs 'split("\u0000") | map(select(length > 0))' || true)
 
   # Shallow clone fallback: fetch the base commit and try two-dot diff
-  if [ -z "$_CHANGED" ]; then
+  if ! printf '%s' "$_CHANGED_JSON" | jq -e 'length > 0' >/dev/null 2>&1; then
     if ! git cat-file -e "${INPUT_CHANGED_SINCE}^{commit}" 2>/dev/null; then
       git fetch --depth=1 origin "$INPUT_CHANGED_SINCE" 2>/dev/null || true
     fi
-    _CHANGED=$(cd "$_ROOT" && git diff --name-only --relative "${INPUT_CHANGED_SINCE}" HEAD -- . 2>/dev/null || true)
+    _CHANGED_JSON=$(cd "$_ROOT" && git diff --name-only -z --relative "${INPUT_CHANGED_SINCE}" HEAD -- . 2>/dev/null | jq -Rs 'split("\u0000") | map(select(length > 0))' || true)
   fi
 
-  # Last resort: GitHub API (works regardless of clone depth)
-  if [ -z "$_CHANGED" ] && [ -n "${GH_TOKEN:-}" ] && [ -n "${PR_NUMBER:-}" ] && [ -n "${GH_REPO:-}" ]; then
-    _API_FILES=$(gh api --paginate "repos/${GH_REPO}/pulls/${PR_NUMBER}/files" --jq '.[].filename' 2>/dev/null || true)
-    if [ -n "$_API_FILES" ]; then
-      if [ "$_ROOT" != "." ]; then
-        # Strip root prefix — API returns repo-root-relative paths, fallow JSON uses root-relative
-        _CHANGED=$(echo "$_API_FILES" | sed -n "s|^${_ROOT}/||p")
-      else
-        _CHANGED="$_API_FILES"
+  # Last resort: GitHub API (works regardless of clone depth).
+  # Distinguish API failure (rate limit, 5xx, expired token, missing
+  # permissions) from "no PR context" (no GH_TOKEN / PR_NUMBER / GH_REPO).
+  # On API failure, set `changed_files_unavailable=true` so downstream
+  # workflow steps can gate on the degraded state rather than silently
+  # running unscoped analysis. The existing shallow-clone warning below
+  # keeps its framing for the no-API-credentials case.
+  if ! printf '%s' "$_CHANGED_JSON" | jq -e 'length > 0' >/dev/null 2>&1 \
+      && [ -n "${GH_TOKEN:-}" ] && [ -n "${PR_NUMBER:-}" ] && [ -n "${GH_REPO:-}" ]; then
+    _API_TMP=$(mktemp)
+    _API_ERR=$(mktemp)
+    trap 'rm -f "$_API_TMP" "$_API_ERR"' EXIT
+    if gh api --paginate "repos/${GH_REPO}/pulls/${PR_NUMBER}/files" --jq '.[].filename | @json' \
+         > "$_API_TMP" 2> "$_API_ERR"; then
+      _CHANGED_JSON=$(jq -s '.' "$_API_TMP")
+      if printf '%s' "$_CHANGED_JSON" | jq -e 'length > 0' >/dev/null 2>&1; then
+        _API_ROOT=$(repo_relative_root || true)
+        if [ -z "$_API_ROOT" ]; then
+          echo "::warning::fallow: absolute root is outside GITHUB_WORKSPACE; GitHub API paths cannot be scoped safely." >&2
+          [ -n "${GITHUB_OUTPUT:-}" ] && printf '%s\n' "changed_files_unavailable=true" >> "$GITHUB_OUTPUT"
+          _CHANGED_JSON='[]'
+        elif [ "$_API_ROOT" != "." ]; then
+          # Strip root prefix; API returns repo-root-relative paths, fallow JSON uses root-relative.
+          _CHANGED_JSON=$(printf '%s' "$_CHANGED_JSON" | jq -c --arg prefix "${_API_ROOT%/}/" \
+            'map(select(startswith($prefix)) | ltrimstr($prefix))')
+        fi
       fi
+    else
+      _STDERR_HEAD=$(head -3 "$_API_ERR" | tr '\n' ' ')
+      echo "::warning::fallow: GitHub API call to list PR files failed; analysis will run against the full codebase, not just files changed in this PR. stderr: ${_STDERR_HEAD} Re-run the job to retry. If persistent, check 'gh auth status' and repo permissions." >&2
+      [ -n "${GITHUB_OUTPUT:-}" ] && printf '%s\n' "changed_files_unavailable=true" >> "$GITHUB_OUTPUT"
     fi
   fi
 
-  if [ -n "$_CHANGED" ]; then
-    echo "$_CHANGED" | jq -R -s 'split("\n") | map(select(length > 0))' > fallow-changed-files.json
+  if printf '%s' "$_CHANGED_JSON" | jq -e 'length > 0' >/dev/null 2>&1; then
+    printf '%s\n' "$_CHANGED_JSON" > "$CHANGED_FILES_FILE"
   else
     echo "::warning::Could not determine changed files for --changed-since scoping. Use fetch-depth: 0 in actions/checkout for best results."
+  fi
+fi
+
+if is_dead_code_baseline_command \
+    && printf '%s' "$_CHANGED_JSON" | jq -e 'length > 0' >/dev/null 2>&1; then
+  CONFIG_SCOPE_TRIGGER=$(find_changed_fallow_config "$_CHANGED_JSON" || true)
+  if [ -n "$CONFIG_SCOPE_TRIGGER" ]; then
+    if [ "$AUTO_CHANGED_SINCE" = "true" ]; then
+      if [ "$USER_DIFF_FILE" = "true" ]; then
+        echo "::warning::fallow: '${CONFIG_SCOPE_TRIGGER}' changed, so auto changed-since scoping is disabled for dead-code baseline comparison. The explicit diff file remains active and may still hide baseline drift until an unscoped run." >&2
+      else
+        echo "::warning::fallow: dead-code baseline comparison is running unscoped because '${CONFIG_SCOPE_TRIGGER}' changed. Fallow config can change baseline membership; downstream PR filtering is disabled for this run." >&2
+      fi
+      INPUT_CHANGED_SINCE=""
+      rm -f "$CHANGED_FILES_FILE" "$AUTO_DIFF_FILE"
+    else
+      echo "::warning::fallow: '${CONFIG_SCOPE_TRIGGER}' changed while dead-code baseline comparison is explicitly scoped. Fallow config can change baseline membership, so baseline drift may stay hidden until an unscoped run." >&2
+    fi
+  fi
+fi
+
+# Propagate the effective changed-since value after config safety logic so
+# downstream steps do not reapply stale PR scope.
+if [ -n "${GITHUB_OUTPUT:-}" ]; then
+  printf '%s\n' "changed_since=${INPUT_CHANGED_SINCE:-}" >> "$GITHUB_OUTPUT"
+fi
+
+# --- Pre-compute unified diff for line-level hot-path scoping ---
+# `fallow audit` and `fallow health` consume a unified diff to do
+# line-overlap matching against runtime hot paths so the
+# `hot-path-touched` verdict only fires when an added line falls inside
+# a hot function's body, not merely when the file was touched. Mirrors
+# the changed-files cascade above (three-dot diff, shallow-clone fetch
+# fallback, GitHub API last resort) so behavior is consistent across
+# checkout depths.
+#
+# Skip when the user already supplied `inputs.diff-file` (FALLOW_DIFF_FILE
+# is non-empty in that case): respect their choice. Skip when there is no
+# changed-since, since there is nothing to scope against.
+#
+# Export via $GITHUB_ENV so the comment / review render steps later in
+# the composite action reuse the same diff file we wrote here, instead
+# of re-running `gh pr diff` and double-paying the API quota.
+
+# When the user supplied --diff-file via the action input, the env block
+# already set FALLOW_DIFF_FILE on this step. Propagate it to subsequent
+# composite steps via $GITHUB_ENV so the comment / review steps don't
+# need to declare their own FALLOW_DIFF_FILE env (which would override
+# the analyze-step propagation otherwise). User-supplied path wins.
+if [ -n "${FALLOW_DIFF_FILE:-}" ] && [ -n "${GITHUB_ENV:-}" ]; then
+  printf '%s\n' "FALLOW_DIFF_FILE=${FALLOW_DIFF_FILE}" >> "$GITHUB_ENV"
+fi
+
+if [ -n "${INPUT_CHANGED_SINCE:-}" ] && [ -z "${FALLOW_DIFF_FILE:-}" ]; then
+  _ROOT="${INPUT_ROOT:-.}"
+  _DIFF_PATH="$AUTO_DIFF_FILE"
+
+  # Three-dot diff (precise: changes since merge-base, needs full history).
+  if (cd "$_ROOT" && git diff --unified=0 --relative "${INPUT_CHANGED_SINCE}...HEAD" -- .) > "$_DIFF_PATH" 2>/dev/null; then
+    :
+  fi
+
+  # Shallow-clone fallback: fetch the base commit, retry two-dot diff.
+  if [ ! -s "$_DIFF_PATH" ]; then
+    if ! git cat-file -e "${INPUT_CHANGED_SINCE}^{commit}" 2>/dev/null; then
+      git fetch --depth=1 origin "$INPUT_CHANGED_SINCE" 2>/dev/null || true
+    fi
+    (cd "$_ROOT" && git diff --unified=0 --relative "${INPUT_CHANGED_SINCE}" HEAD -- .) > "$_DIFF_PATH" 2>/dev/null || true
+  fi
+
+  # Last resort: GitHub API. `gh pr diff` returns the same unified-diff
+  # format git produces, so the downstream DiffIndex parser is identical.
+  if [ ! -s "$_DIFF_PATH" ] && [ -n "${GH_TOKEN:-}" ] && [ -n "${PR_NUMBER:-}" ] && [ -n "${GH_REPO:-}" ]; then
+    gh pr diff "$PR_NUMBER" --repo "$GH_REPO" > "$_DIFF_PATH" 2>/dev/null || true
+  fi
+
+  if [ -s "$_DIFF_PATH" ]; then
+    export FALLOW_DIFF_FILE="$_DIFF_PATH"
+    # Propagate to the comment / review render steps (separate composite
+    # steps see only $GITHUB_ENV, not exported shell variables).
+    if [ -n "${GITHUB_ENV:-}" ]; then
+      printf '%s\n' "FALLOW_DIFF_FILE=${_DIFF_PATH}" >> "$GITHUB_ENV"
+    fi
+  else
+    rm -f "$_DIFF_PATH"
+    # Soft-degrade: line-level filtering disabled, the runtime-coverage
+    # filter falls back to file-level via `--changed-since`. Emit a
+    # machine-greppable warning so dashboards can alert on it without
+    # parsing free-form text.
+    echo "::warning::fallow: warning [shallow-clone]: could not produce unified diff for line-level hot-path scoping. Use fetch-depth: 0 in actions/checkout for line-precision."
   fi
 fi
 
@@ -236,50 +613,180 @@ if [ -n "${INPUT_ARGS:-}" ]; then
   read -ra EXTRA_ARGS <<< "$INPUT_ARGS"
 fi
 
+# Path prefixes affect only repository-facing presentation formats. Pull them
+# out of the analysis invocation (whose primary format is JSON) and propagate
+# the explicit override to later composite-action steps via GITHUB_ENV.
+FALLOW_RENDER_PATH_PREFIX_SET=0
+FALLOW_RENDER_PATH_PREFIX=""
+FILTERED_EXTRA_ARGS=()
+for ((i = 0; i < ${#EXTRA_ARGS[@]}; i++)); do
+  arg="${EXTRA_ARGS[$i]}"
+  case "$arg" in
+    --report-path-prefix|--annotations-path-prefix)
+      if [ $((i + 1)) -ge "${#EXTRA_ARGS[@]}" ]; then
+        echo "::error::${arg} requires a prefix value"
+        exit 2
+      fi
+      i=$((i + 1))
+      FALLOW_RENDER_PATH_PREFIX="${EXTRA_ARGS[$i]}"
+      FALLOW_RENDER_PATH_PREFIX_SET=1
+      ;;
+    --report-path-prefix=*|--annotations-path-prefix=*)
+      FALLOW_RENDER_PATH_PREFIX="${arg#*=}"
+      FALLOW_RENDER_PATH_PREFIX_SET=1
+      ;;
+    *) FILTERED_EXTRA_ARGS+=("$arg") ;;
+  esac
+done
+EXTRA_ARGS=()
+if [ "${#FILTERED_EXTRA_ARGS[@]}" -gt 0 ]; then
+  EXTRA_ARGS=("${FILTERED_EXTRA_ARGS[@]}")
+fi
+if [ -n "${GITHUB_ENV:-}" ]; then
+  # Preserve exact argv for pinned-CLI compatibility as inert runner-owned
+  # data. Later steps parse this JSON instead of executing a workspace file.
+  ANALYSIS_ARGS_JSON=$(jq -cn --args '$ARGS.positional' -- "${ARGS[@]}" "${EXTRA_ARGS[@]}")
+  printf '%s\n' \
+    "FALLOW_RENDER_PATH_PREFIX_SET=${FALLOW_RENDER_PATH_PREFIX_SET}" \
+    "FALLOW_RENDER_PATH_PREFIX=${FALLOW_RENDER_PATH_PREFIX}" \
+    "FALLOW_ANALYSIS_ARGS_JSON=${ANALYSIS_ARGS_JSON}" >> "$GITHUB_ENV"
+fi
+
 # Run analysis — no --fail-on-issues so subsequent steps always run.
 # Bare invocations may emit an error JSON (e.g., health on a non-git repo)
 # followed by the actual combined results. Use jq -s 'last' to extract only
 # the final JSON object so downstream parsing sees a single valid result.
-if ! fallow "${ARGS[@]}" "${EXTRA_ARGS[@]}" > fallow-results-raw.json 2> fallow-stderr.log; then
-  if [ ! -s fallow-results-raw.json ] || ! jq -e '.' fallow-results-raw.json > /dev/null 2>&1; then
+{
+  printf 'FALLOW_ANALYSIS_ARGS=('
+  printf '%q ' "${ARGS[@]}" "${EXTRA_ARGS[@]}"
+  printf ')\n'
+} > "$ANALYSIS_ARGS_FILE"
+
+if ! fallow "${ARGS[@]}" "${EXTRA_ARGS[@]}" > "$RESULTS_RAW_FILE" 2> "$STDERR_FILE"; then
+  if [ ! -s "$RESULTS_RAW_FILE" ] || ! jq -e '.' "$RESULTS_RAW_FILE" > /dev/null 2>&1; then
     echo "::error::Fallow failed to run"
-    [ -s fallow-stderr.log ] && cat fallow-stderr.log
-    [ -s fallow-results-raw.json ] && cat fallow-results-raw.json
+    [ -s "$STDERR_FILE" ] && cat "$STDERR_FILE"
+    [ -s "$RESULTS_RAW_FILE" ] && cat "$RESULTS_RAW_FILE"
     exit 2
   fi
 fi
-jq -s 'last' fallow-results-raw.json > fallow-results.json
-rm -f fallow-results-raw.json
+jq -s 'last' "$RESULTS_RAW_FILE" > "$RESULTS_FILE"
+rm -f "$RESULTS_RAW_FILE"
+if jq -e '.error == true' "$RESULTS_FILE" > /dev/null 2>&1; then
+  MESSAGE=$(jq -r '.message // "Fallow failed"' "$RESULTS_FILE")
+  EXIT_CODE=$(jq -r '.exit_code // 2' "$RESULTS_FILE")
+  echo "::error::${MESSAGE}"
+  exit "$EXIT_CODE"
+fi
 
-# --- Fallback SARIF generation ---
+# A findings exit code can still carry a valid JSON envelope, so the analysis
+# command above cannot rely on its exit status alone. Record the effective
+# semantic completeness gate now, then fail only after artifacts and outputs
+# have been published for downstream action steps.
+TYPE_AWARE_COMPLETENESS_FAILED=false
+if ! jq -e --arg requested "${INPUT_TYPE_AWARE_REQUIRE:-}" '
+    (
+      ._meta.type_aware
+      // ._meta.check.type_aware
+      // .check._meta.type_aware
+      // .dead_code._meta.type_aware
+      // null
+    ) as $type_aware
+    | (($type_aware.required_completeness // $requested) != "complete")
+      or (
+        ($type_aware != null)
+        and
+        ($type_aware.identity.completeness == "complete")
+        and ([ $type_aware.queries[]? | select(.status != "complete") ] | length == 0)
+      )
+  ' "$RESULTS_FILE" > /dev/null 2>&1; then
+  TYPE_AWARE_COMPLETENESS_FAILED=true
+fi
 
-if [ "${INPUT_FORMAT:-}" = "sarif" ] && [ "$INPUT_COMMAND" != "fix" ] && \
-   { [ ! -f fallow-results.sarif ] || ! jq -e '.' fallow-results.sarif > /dev/null 2>&1; }; then
-  ARGS=()
-  build_common_args sarif
-  build_command_args false  # omit --top for SARIF
+# --- Analyze-once SARIF generation ---
 
-  if ! fallow "${ARGS[@]}" "${EXTRA_ARGS[@]}" > fallow-results.sarif 2>/dev/null; then
-    echo "::warning::SARIF generation failed"
+valid_sarif() {
+  [ -s "$1" ] && jq -e '
+    .version == "2.1.0"
+    and (.runs | type == "array")
+    and all(.runs[]?; ((.results // []) | type == "array"))
+  ' "$1" > /dev/null 2>&1
+}
+
+if { [ "${INPUT_FORMAT:-}" = "sarif" ] || [ "${INPUT_SARIF:-}" = "true" ]; } && \
+   [ "$INPUT_COMMAND" != "fix" ] && \
+   ! valid_sarif "$SARIF_FILE"; then
+  # Render the saved JSON envelope instead of running semantic analysis again.
+  # A valid SARIF run with zero results is required to clear stale alerts.
+  if [ "$HAS_NATIVE_REPORT" = "true" ]; then
+    REPORT_ARGS=(report --from "$RESULTS_FILE" --root "$INPUT_ROOT" --quiet --format sarif)
+    [ -n "${INPUT_CONFIG:-}" ] && REPORT_ARGS+=(--config "$INPUT_CONFIG")
+    fallow "${REPORT_ARGS[@]}" > "$SARIF_FILE" 2>/dev/null || true
   fi
+  if ! valid_sarif "$SARIF_FILE"; then
+    # Compatibility path for pinned binaries that either lack `report` or
+    # support `report` without saved-envelope SARIF rendering.
+    SARIF_ARGS=()
+    skip_next=false
+    for ((index = 0; index < ${#ARGS[@]}; index++)); do
+      arg=${ARGS[$index]}
+      if [ "$skip_next" = "true" ]; then
+        skip_next=false
+        continue
+      fi
+      if [ "$arg" = "--sarif-file" ]; then
+        skip_next=true
+        continue
+      fi
+      SARIF_ARGS+=("$arg")
+      if [ "$arg" = "--format" ]; then
+        index=$((index + 1))
+        SARIF_ARGS+=("sarif")
+      fi
+    done
+    fallow "${SARIF_ARGS[@]}" "${EXTRA_ARGS[@]}" > "$SARIF_FILE" 2>/dev/null || true
+  fi
+  if ! valid_sarif "$SARIF_FILE"; then
+    echo "::warning::SARIF generation failed"
+    rm -f "$SARIF_FILE"
+  fi
+fi
+
+# Never expose a malformed renderer artifact to the upload step.
+if [ -f "$SARIF_FILE" ] && ! valid_sarif "$SARIF_FILE"; then
+  rm -f "$SARIF_FILE"
 fi
 
 # --- Surface warnings from stderr ---
 
-if [ -s fallow-stderr.log ]; then
+if [ -s "$STDERR_FILE" ]; then
   while IFS= read -r line; do
     echo "::debug::${line}"
-  done < fallow-stderr.log
+  done < "$STDERR_FILE"
 fi
 
-# --- Extract issue count ---
+# --- Extract verdict / gate (audit only) and issue count ---
+# Audit's verdict (pass/warn/fail) is the load-bearing severity-aware signal:
+# warn means "warn-tier issues only, do not fail CI". Threshold step gates on
+# verdict for audit; raw issue counts only gate non-audit commands.
+
+VERDICT=""
+GATE=""
+if [ "$INPUT_COMMAND" = "audit" ]; then
+  VERDICT=$(jq -r '.verdict // ""' "$RESULTS_FILE")
+  GATE=$(jq -r '.attribution.gate // ""' "$RESULTS_FILE")
+elif [ "$INPUT_COMMAND" = "security" ]; then
+  GATE=$(jq -r '.gate.mode // ""' "$RESULTS_FILE")
+fi
 
 case "$INPUT_COMMAND" in
-  dead-code|check) ISSUES=$(jq -r '.total_issues' fallow-results.json) ;;
-  dupes)           ISSUES=$(jq -r '.stats.clone_groups' fallow-results.json) ;;
-  health)          ISSUES=$(jq -r '((.summary.functions_above_threshold // 0) + ((.production_coverage.findings // []) | map(select(.verdict == "safe_to_delete" or .verdict == "review_required" or .verdict == "low_traffic")) | length))' fallow-results.json) ;;
-  fix)             ISSUES=$(jq -r '(.fixes | length)' fallow-results.json) ;;
-  "")              ISSUES=$(jq -r '((.check.total_issues // 0) + (.dupes.stats.clone_groups // 0) + (.health.summary.functions_above_threshold // 0) + ((.health.production_coverage.findings // []) | map(select(.verdict == "safe_to_delete" or .verdict == "review_required" or .verdict == "low_traffic")) | length))' fallow-results.json) ;;
+  dead-code|check) ISSUES=$(jq -r '.total_issues' "$RESULTS_FILE") ;;
+  dupes)           ISSUES=$(jq -r '.stats.clone_groups' "$RESULTS_FILE") ;;
+  health)          ISSUES=$(jq -r '((.summary.functions_above_threshold // 0) + ((.runtime_coverage.findings // []) | map(select(.verdict == "safe_to_delete" or .verdict == "review_required" or .verdict == "low_traffic")) | length))' "$RESULTS_FILE") ;;
+  audit)           ISSUES=$(jq -r 'if (.attribution.gate // "new-only") == "all" then ((.summary.dead_code_issues // 0) + (.summary.complexity_findings // 0) + (.summary.duplication_clone_groups // 0) + ((.complexity.styling_findings // []) | length)) else ((.attribution.dead_code_introduced // 0) + (.attribution.complexity_introduced // 0) + (.attribution.duplication_introduced // 0) + (.attribution.styling_introduced // 0)) end' "$RESULTS_FILE") ;;
+  security)        ISSUES=$(jq -r 'if .gate then (.gate.new_count // 0) else (.summary.security_findings // ((.security_findings // []) | length)) end' "$RESULTS_FILE") ;;
+  fix)             ISSUES=$(jq -r '(.fixes | length)' "$RESULTS_FILE") ;;
+  "")              ISSUES=$(jq -r '((.check.total_issues // 0) + ((.dupes.clone_groups // []) | length) + (.health.summary.functions_above_threshold // 0) + ((.health.runtime_coverage.findings // []) | map(select(.verdict == "safe_to_delete" or .verdict == "review_required" or .verdict == "low_traffic")) | length))' "$RESULTS_FILE") ;;
 esac
 
 if ! [[ "$ISSUES" =~ ^[0-9]+$ ]]; then
@@ -287,20 +794,31 @@ if ! [[ "$ISSUES" =~ ^[0-9]+$ ]]; then
   exit 2
 fi
 
-echo "issues=${ISSUES}" >> "$GITHUB_OUTPUT"
-echo "results=fallow-results.json" >> "$GITHUB_OUTPUT"
-echo "command=${INPUT_COMMAND}" >> "$GITHUB_OUTPUT"
-
-if [ -f fallow-results.sarif ]; then
-  echo "sarif=fallow-results.sarif" >> "$GITHUB_OUTPUT"
-fi
+{
+  printf '%s\n' \
+    "issues=${ISSUES}" \
+    "results=${RESULTS_FILE}" \
+    "command=${INPUT_COMMAND}" \
+    "verdict=${VERDICT}" \
+    "gate=${GATE}"
+  if [ -f "$SARIF_FILE" ]; then
+    printf '%s\n' "sarif=${SARIF_FILE}"
+  fi
+} >> "$GITHUB_OUTPUT"
 
 if [ "$ISSUES" -gt 0 ]; then
   case "$INPUT_COMMAND" in
     dead-code|check) echo "::warning::Fallow found ${ISSUES} unused code issues" ;;
     dupes)           echo "::warning::Fallow found ${ISSUES} clone groups" ;;
     health)          echo "::warning::Fallow found ${ISSUES} high complexity functions" ;;
+    audit)           echo "::warning::Fallow audit found ${ISSUES} introduced issues in changed files" ;;
+    security)        echo "::warning::Fallow found ${ISSUES} security candidates" ;;
     fix)             echo "::warning::Fallow proposed ${ISSUES} fixes" ;;
     "")              echo "::warning::Fallow found ${ISSUES} issues" ;;
   esac
+fi
+
+if [ "$TYPE_AWARE_COMPLETENESS_FAILED" = "true" ]; then
+  echo "::error::Type-aware completeness gate failed because semantic analysis was unavailable or partial."
+  exit 1
 fi

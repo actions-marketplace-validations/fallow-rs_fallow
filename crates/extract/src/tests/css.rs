@@ -32,6 +32,22 @@ fn extracts_css_import_quoted() {
 }
 
 #[test]
+fn css_import_spans_point_at_source_specifier() {
+    let source = "\n\n@import \"./reset.css\";\n";
+    let info = parse_css(source, "styles.css");
+    let import = &info.imports[0];
+    let (line, _col) = fallow_types::extract::byte_offset_to_line_col(
+        &info.line_offsets,
+        import.source_span.start,
+    );
+    assert_eq!(line, 3);
+    assert_eq!(
+        &source[import.source_span.start as usize..import.source_span.end as usize],
+        "./reset.css"
+    );
+}
+
+#[test]
 fn extracts_css_import_single_quoted() {
     let info = parse_css("@import './variables.css';", "styles.css");
     assert_eq!(info.imports.len(), 1);
@@ -83,6 +99,16 @@ fn extracts_css_import_tailwind_package() {
 }
 
 #[test]
+fn extracts_css_package_subpath_import_as_bare() {
+    let info = parse_css(
+        r#"@import "tailwindcss/theme.css" layer(theme);"#,
+        "styles.css",
+    );
+    assert_eq!(info.imports.len(), 1);
+    assert_eq!(info.imports[0].source, "tailwindcss/theme.css");
+}
+
+#[test]
 fn scss_import_without_dot_slash_normalized() {
     let info = parse_css("@import 'app.scss';", "index.scss");
     assert_eq!(info.imports.len(), 1);
@@ -91,10 +117,6 @@ fn scss_import_without_dot_slash_normalized() {
 
 #[test]
 fn scss_import_bare_extensionless_normalized_to_relative() {
-    // In SCSS, extensionless imports are partial references (local files),
-    // not npm packages. They get ./ prepended so the resolver can try
-    // the SCSS partial (_filename) convention. Actual npm packages will
-    // fall through the partial fallback to npm classification in the resolver.
     let info = parse_css(r#"@import "some-package";"#, "styles.scss");
     assert_eq!(info.imports.len(), 1);
     assert_eq!(info.imports[0].source, "./some-package");
@@ -102,7 +124,6 @@ fn scss_import_bare_extensionless_normalized_to_relative() {
 
 #[test]
 fn scss_builtin_module_stays_bare() {
-    // SCSS built-in modules (sass:math, sass:color) should stay bare
     let info = parse_css(r#"@use "sass:math";"#, "styles.scss");
     assert_eq!(info.imports.len(), 1);
     assert_eq!(info.imports[0].source, "sass:math");
@@ -138,6 +159,40 @@ fn css_tailwind_directive_creates_dependency() {
         info.imports.iter().any(|i| i.source == "tailwindcss"),
         "should create synthetic tailwindcss import"
     );
+}
+
+#[test]
+fn css_plugin_directive_creates_plugin_dependency() {
+    let info = parse_css(
+        r#"
+@import "tailwindcss";
+@plugin "@tailwindcss/typography";
+@plugin "daisyui" {
+    themes: light --default;
+}
+"#,
+        "styles.css",
+    );
+
+    let sources: Vec<&str> = info.imports.iter().map(|i| i.source.as_str()).collect();
+    assert!(sources.contains(&"tailwindcss"));
+    assert!(sources.contains(&"@tailwindcss/typography"));
+    assert!(sources.contains(&"daisyui"));
+}
+
+#[test]
+fn css_plugin_directive_tracks_relative_plugin_file() {
+    let info = parse_css(r#"@plugin "./tailwind-plugin.js";"#, "styles.css");
+    assert_eq!(info.imports.len(), 1);
+    assert_eq!(info.imports[0].source, "./tailwind-plugin.js");
+    assert_eq!(info.imports[0].imported_name, ImportedName::Default);
+}
+
+#[test]
+fn scss_plugin_directive_keeps_package_specifier_bare() {
+    let info = parse_css(r#"@plugin "daisyui";"#, "styles.scss");
+    assert_eq!(info.imports.len(), 1);
+    assert_eq!(info.imports[0].source, "daisyui");
 }
 
 #[test]
@@ -289,6 +344,21 @@ fn css_commented_tailwind_not_extracted() {
 }
 
 #[test]
+fn css_commented_plugin_not_extracted() {
+    let info = parse_css(
+        r#"
+/* @plugin "daisyui"; */
+.btn { color: red; }
+"#,
+        "styles.css",
+    );
+    assert!(
+        !info.imports.iter().any(|i| i.source == "daisyui"),
+        "commented-out @plugin should NOT create an import"
+    );
+}
+
+#[test]
 fn scss_line_comment_not_extracted() {
     let info = parse_css(
         r#"
@@ -341,8 +411,6 @@ fn css_mixed_comments_and_real_directives() {
     assert!(info.imports.iter().any(|i| i.source == "./real-import.css"));
     assert!(info.imports.iter().any(|i| i.source == "tailwindcss"));
 }
-
-// -- CSS Module extraction --
 
 #[test]
 fn css_module_extracts_class_names_as_exports() {
@@ -480,4 +548,29 @@ fn css_module_ignores_classes_in_strings_and_urls() {
         !named.contains(&"png".to_string()),
         "File extensions inside url() should be ignored"
     );
+}
+
+#[test]
+fn issue_540_nested_cascade_layers_do_not_export_sub_names() {
+    let info = parse_css_module(
+        "@layer foo;
+@layer foo.bar, foo.baz;
+
+@layer foo.bar {
+  .root { color: red; }
+}
+
+@layer foo.baz {
+  .pressed { color: blue; }
+}",
+    );
+    let named: Vec<String> = info
+        .exports
+        .iter()
+        .filter_map(|e| match &e.name {
+            ExportName::Named(n) => Some(n.clone()),
+            ExportName::Default => None,
+        })
+        .collect();
+    assert_eq!(named, vec!["root", "pressed"], "phantom exports leaked");
 }

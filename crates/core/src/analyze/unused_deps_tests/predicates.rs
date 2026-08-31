@@ -1,4 +1,13 @@
-// ---- is_builtin_module tests (via predicates, used in find_unlisted_dependencies) ----
+#[test]
+fn production_exclude_globset_is_reused_without_changing_matches() {
+    let first = super::super::production_exclude_globset().expect("static patterns compile");
+    let second = super::super::production_exclude_globset().expect("cached patterns remain valid");
+
+    assert!(std::ptr::eq(first, second));
+    assert!(first.is_match("src/app.test.ts"));
+    assert!(first.is_match("vitest.config.ts"));
+    assert!(!first.is_match("src/app.ts"));
+}
 
 #[test]
 fn builtin_module_subpaths() {
@@ -27,14 +36,29 @@ fn builtin_module_cloudflare_workers() {
 }
 
 #[test]
+fn builtin_module_bun() {
+    assert!(super::super::super::predicates::is_builtin_module("bun"));
+    assert!(super::super::super::predicates::is_builtin_module(
+        "bun:sqlite"
+    ));
+    assert!(!super::super::super::predicates::is_builtin_module(
+        "bun-types"
+    ));
+    assert!(!super::super::super::predicates::is_builtin_module(
+        "@types/bun"
+    ));
+    assert!(!super::super::super::predicates::is_builtin_module(
+        "bunyan"
+    ));
+}
+
+#[test]
 fn builtin_module_deno_std() {
     assert!(super::super::super::predicates::is_builtin_module("std"));
     assert!(super::super::super::predicates::is_builtin_module(
         "std/path"
     ));
 }
-
-// ---- is_implicit_dependency tests (used in find_unused_dependencies) ----
 
 #[test]
 fn implicit_dep_react_dom() {
@@ -72,11 +96,8 @@ fn implicit_dep_websocket_addons() {
     ));
 }
 
-// ---- is_path_alias tests (used in find_unlisted_dependencies) ----
-
 #[test]
 fn path_alias_not_reported_as_unlisted() {
-    // These should be detected as path aliases and skipped
     assert!(super::super::super::predicates::is_path_alias(
         "@/components/Foo"
     ));

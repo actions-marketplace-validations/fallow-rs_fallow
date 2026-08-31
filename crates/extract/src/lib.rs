@@ -5,21 +5,46 @@
 //! HTML asset reference extraction, and incremental caching of parse results.
 
 #![warn(missing_docs)]
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        reason = "tests use unwrap and expect to keep fixture setup concise"
+    )
+)]
 
 mod asset_url;
 pub mod astro;
 pub mod cache;
 pub(crate) mod complexity;
 pub mod css;
+pub mod css_classes;
+pub mod css_in_js;
+pub mod css_metrics;
 pub mod flags;
-pub mod html;
+pub mod glimmer;
+pub(crate) mod graphql;
+pub(crate) mod html;
+pub(crate) mod iconify;
 pub mod inventory;
 pub mod mdx;
+mod module_info;
 mod parse;
 pub mod sfc;
+pub mod sfc_css;
+mod sfc_props;
 mod sfc_template;
+pub mod similar_code;
+mod source_map;
 pub mod suppress;
+/// Tailwind CSS arbitrary-value detection.
+pub mod tailwind;
+pub(crate) mod template_complexity;
+mod template_expression_scan;
 mod template_usage;
+/// Visitor utilities for AST extraction.
 pub mod visitor;
 
 use std::path::Path;
@@ -29,23 +54,90 @@ use rayon::prelude::*;
 use cache::CacheStore;
 use fallow_types::discover::{DiscoveredFile, FileId};
 
-// Re-export all extract types from fallow-types
 pub use fallow_types::extract::{
-    ClassHeritageInfo, DynamicImportInfo, DynamicImportPattern, ExportInfo, ExportName, ImportInfo,
-    ImportedName, MemberAccess, MemberInfo, MemberKind, ModuleInfo, ParseResult, ReExportInfo,
-    RequireCallInfo, VisibilityTag, compute_line_offsets,
+    AngularComponentFieldArrayTypeFact, AngularTemplateMemberAccessFact, AngularThisSpreadFact,
+    ClassHeritageInfo, ClassThisMemberAccessFact, ClassThisWholeObjectUseFact,
+    ComputedEnumKeyUseFact, DefaultImportWholeObjectUseFact, DynamicCustomElementRenderFact,
+    DynamicImportInfo, DynamicImportPattern, ExportInfo, ExportName, FactoryCallMemberAccessFact,
+    FactoryFnMemberAccessFact, FactoryFnWholeObjectFact, FactoryReturnExport,
+    FactoryReturnObjectPropertyAccessFact, FactoryReturnObjectShapeExport,
+    FluentChainMemberAccessFact, FluentChainNewMemberAccessFact, ImportInfo, ImportedName,
+    InstanceExportBindingFact, LocalTypeDeclaration, MemberAccess, MemberInfo, MemberKind,
+    ModuleInfo, ModuleLoadMechanism, ParseResult, PlaywrightFixtureAliasFact,
+    PlaywrightFixtureDefinitionFact, PlaywrightFixtureTypeFact, PlaywrightFixtureUseFact,
+    PublicSignatureTypeReference, ReExportInfo, RequireCallInfo, RequiredTypeMemberFact,
+    SemanticFact, SourceReadFailure, StringEnumMemberValueFact, TypeAliasSurfaceTargetFact,
+    TypeMemberTypeEntry, TypedPropertyMemberAccessFact, VisibilityTag, VitestModuleMockAction,
+    VitestModuleMockOperationFact, compute_line_offsets,
 };
 
-// Re-export extraction functions for internal use and fuzzing
-pub use astro::extract_astro_frontmatter;
-pub use css::extract_css_module_exports;
-pub use mdx::extract_mdx_statements;
-pub use sfc::{extract_sfc_scripts, is_sfc_file};
-pub use sfc_template::angular::ANGULAR_TPL_SENTINEL;
+pub use astro::{
+    extract_astro_frontmatter, extract_astro_style_regions, extract_astro_template_regions,
+};
+pub use css::{
+    ThemeScan, ThemeTokenDef, extract_apply_tokens, extract_apply_tokens_located,
+    extract_css_module_exports, extract_css_var_reads_located, scan_theme_blocks,
+};
+pub use css_classes::{
+    MarkupClassScan, MarkupClassToken, is_edit_distance_one, is_typo_edit, scan_markup_class_tokens,
+};
+pub use css_in_js::{
+    ConsumerQuery, CssInJsObjectSheets, CssInJsToken, CssInJsTokenDef, CssInJsTokenOrigin,
+    TokenConsumerHit, css_in_js_consumer_scan, css_in_js_object_sheets, css_in_js_theme_consumers,
+    css_in_js_theme_token_defs, css_in_js_token_consumers, css_in_js_token_defs,
+    css_in_js_virtual_stylesheet, panda_style_value_consumers, panda_token_call_consumers,
+};
+pub use css_metrics::{compute_css_analytics, parse_css_color_rgb};
+pub use glimmer::{is_glimmer_file, strip_glimmer_templates};
+pub use mdx::{extract_mdx_statements, extract_mdx_statements_mapped};
+pub use sfc::{
+    SourceRegion, extract_sfc_scripts, extract_sfc_styles, extract_sfc_template_regions,
+    is_sfc_file,
+};
+pub use sfc_css::{
+    scoped_unused_classes, sfc_preprocessor_virtual_stylesheet, sfc_virtual_stylesheet,
+};
+pub use similar_code::extract_similar_code_functions;
+pub use source_map::ExtractionResult;
+pub use tailwind::{TailwindArbitraryUse, scan_tailwind_arbitrary_values};
 
-use parse::parse_source_to_module;
+#[expect(
+    clippy::expect_used,
+    reason = "static regex patterns are hard-coded analyzer invariants covered by extraction tests"
+)]
+fn static_regex(pattern: &str) -> regex::Regex {
+    regex::Regex::new(pattern).expect("static regex pattern should compile")
+}
 
-/// Parse all files in parallel, extracting imports and exports.
+pub use parse::parse_source_to_module;
+
+/// Leading UTF-8 byte order mark codepoint.
+///
+/// Windows editors (Notepad, older VS settings, some IDE plugins) emit a UTF-8
+/// BOM at the start of source files. fallow's contract is "UTF-8 with or
+/// without BOM; line offsets are computed against the post-BOM view; the BOM,
+/// if present on input, is preserved on output by `fallow fix`."
+const BOM_CHAR: char = '\u{FEFF}';
+// Small, cache-hot inputs are faster on one thread than through Rayon setup.
+// Larger file sets still use parallel parsing where parse work dominates.
+const PARALLEL_PARSE_FILE_THRESHOLD: usize = 32;
+
+/// Strip the leading UTF-8 BOM if present.
+///
+/// Called at every file-read entry point in this crate so the rest of the
+/// pipeline (content hash, `compute_line_offsets`, oxc parser, downstream
+/// analyses) sees a consistent post-BOM view. Mirrors the
+/// `fallow_config` layer (`config_writer.rs::BOM`) so config-shaped sources
+/// and source-code-shaped sources are processed symmetrically. See issue #475.
+#[must_use]
+fn strip_bom(source: &str) -> &str {
+    source.strip_prefix(BOM_CHAR).unwrap_or(source)
+}
+
+/// Parse all files, extracting imports and exports.
+///
+/// Small file sets use a sequential fast path to avoid parallel scheduling
+/// overhead; larger file sets use parallel extraction.
 /// Uses the cache to skip reparsing files whose content hasn't changed.
 ///
 /// When `need_complexity` is true, per-function cyclomatic/cognitive complexity
@@ -56,19 +148,36 @@ pub fn parse_all_files(
     cache: Option<&CacheStore>,
     need_complexity: bool,
 ) -> ParseResult {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    let cache_hits = AtomicUsize::new(0);
-    let cache_misses = AtomicUsize::new(0);
+    let results: Vec<ParseFileResult> = if files.len() <= PARALLEL_PARSE_FILE_THRESHOLD {
+        files
+            .iter()
+            .map(|file| parse_single_file_cached(file, cache, need_complexity))
+            .collect()
+    } else {
+        files
+            .par_iter()
+            .map(|file| parse_single_file_cached(file, cache, need_complexity))
+            .collect()
+    };
 
-    let modules: Vec<ModuleInfo> = files
-        .par_iter()
-        .filter_map(|file| {
-            parse_single_file_cached(file, cache, &cache_hits, &cache_misses, need_complexity)
-        })
-        .collect();
+    let mut modules = Vec::with_capacity(results.len());
+    let mut read_failures = Vec::new();
+    let mut hits = 0usize;
+    let mut misses = 0usize;
+    let mut parse_cpu_nanos = 0u64;
 
-    let hits = cache_hits.load(Ordering::Relaxed);
-    let misses = cache_misses.load(Ordering::Relaxed);
+    for result in results {
+        hits += result.cache_hits;
+        misses += result.cache_misses;
+        parse_cpu_nanos = parse_cpu_nanos.saturating_add(result.parse_cpu_nanos);
+        if let Some(module) = result.module {
+            modules.push(module);
+        }
+        if let Some(failure) = result.read_failure {
+            read_failures.push(failure);
+        }
+    }
+
     if hits > 0 || misses > 0 {
         tracing::info!(
             cache_hits = hits,
@@ -79,88 +188,132 @@ pub fn parse_all_files(
 
     ParseResult {
         modules,
+        read_failures,
         cache_hits: hits,
         cache_misses: misses,
+        parse_cpu_ms: parse_cpu_nanos as f64 / 1_000_000.0,
     }
 }
 
-/// Extract mtime (seconds since epoch) from file metadata.
-/// Returns 0 if mtime cannot be determined (pre-epoch, unsupported OS, etc.).
-fn mtime_secs(metadata: &std::fs::Metadata) -> u64 {
-    metadata
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
-        .map_or(0, |d| d.as_secs())
+struct ParseFileResult {
+    module: Option<ModuleInfo>,
+    read_failure: Option<SourceReadFailure>,
+    cache_hits: usize,
+    cache_misses: usize,
+    parse_cpu_nanos: u64,
+}
+
+impl ParseFileResult {
+    fn cache_hit(module: ModuleInfo) -> Self {
+        Self {
+            module: Some(module),
+            read_failure: None,
+            cache_hits: 1,
+            cache_misses: 0,
+            parse_cpu_nanos: 0,
+        }
+    }
+
+    fn cache_miss(module: ModuleInfo, parse_cpu_nanos: u64) -> Self {
+        Self {
+            module: Some(module),
+            read_failure: None,
+            cache_hits: 0,
+            cache_misses: 1,
+            parse_cpu_nanos,
+        }
+    }
+
+    fn read_failure(file: &DiscoveredFile, error: &std::io::Error) -> Self {
+        Self {
+            module: None,
+            read_failure: Some(SourceReadFailure {
+                file_id: file.id,
+                path: file.path.clone(),
+                error: error.to_string(),
+            }),
+            cache_hits: 0,
+            cache_misses: 0,
+            parse_cpu_nanos: 0,
+        }
+    }
 }
 
 /// Parse a single file, consulting the cache first.
 ///
 /// Cache validation strategy (fast path -> slow path):
-/// 1. `stat()` the file to get mtime + size (single syscall, no file read)
-/// 2. If mtime+size match the cached entry -> cache hit, return immediately
-/// 3. If mtime+size differ -> read file, compute content hash
-/// 4. If content hash matches cached entry -> cache hit (file was `touch`ed but unchanged)
-/// 5. Otherwise -> cache miss, full parse
+/// 1. Open the file so unreadable sources cannot use stale cached analysis
+/// 2. Read mtime + size from the open handle
+/// 3. If mtime+size match the cached entry -> cache hit, return immediately
+/// 4. If mtime+size differ -> read file, compute content hash
+/// 5. If content hash matches cached entry -> cache hit (file was `touch`ed but unchanged)
+/// 6. Otherwise -> cache miss, full parse
 fn parse_single_file_cached(
     file: &DiscoveredFile,
     cache: Option<&CacheStore>,
-    cache_hits: &std::sync::atomic::AtomicUsize,
-    cache_misses: &std::sync::atomic::AtomicUsize,
     need_complexity: bool,
-) -> Option<ModuleInfo> {
-    use std::sync::atomic::Ordering;
+) -> ParseFileResult {
+    let cached_by_path = cache.and_then(|store| store.get_by_path_only(&file.path));
 
-    // Fast path: check mtime+size before reading file content.
-    // A single stat() syscall is ~100x cheaper than read()+hash().
-    if let Some(store) = cache
-        && let Ok(metadata) = std::fs::metadata(&file.path)
+    if let Some(cached) = cached_by_path
+        && cached.file_size == file.size_bytes
     {
-        let mt = mtime_secs(&metadata);
-        let sz = metadata.len();
-        if let Some(cached) = store.get_by_metadata(&file.path, mt, sz) {
-            // When complexity is requested but the cached entry lacks it
-            // (populated by a prior `check` run), skip the cache and re-parse.
-            if !need_complexity || !cached.complexity.is_empty() {
-                cache_hits.fetch_add(1, Ordering::Relaxed);
-                return Some(cache::cached_to_module(cached, file.id));
+        let source_file = match std::fs::File::open(&file.path) {
+            Ok(source_file) => source_file,
+            Err(error) => return ParseFileResult::read_failure(file, &error),
+        };
+        if let Ok(metadata) = source_file.metadata()
+            && metadata.len() == cached.file_size
+        {
+            let fingerprint =
+                fallow_types::source_fingerprint::SourceFingerprint::from_metadata(&metadata);
+            if cached.source_fingerprint() == fingerprint
+                && fingerprint.has_known_mtime()
+                && (!need_complexity || !cached.complexity.is_empty())
+            {
+                return ParseFileResult::cache_hit(cache::cached_to_module_opts(
+                    cached,
+                    file.id,
+                    need_complexity,
+                ));
             }
         }
     }
 
-    // Slow path: read file content and compute content hash.
-    let source = std::fs::read_to_string(&file.path).ok()?;
+    let raw = match std::fs::read_to_string(&file.path) {
+        Ok(raw) => raw,
+        Err(error) => return ParseFileResult::read_failure(file, &error),
+    };
+    let source = strip_bom(&raw);
     let content_hash = xxhash_rust::xxh3::xxh3_64(source.as_bytes());
 
-    // Check cache by content hash (handles touch/save-without-change)
-    if let Some(store) = cache
-        && let Some(cached) = store.get(&file.path, content_hash)
+    if let Some(cached) = cached_by_path
+        && cached.content_hash == content_hash
         && (!need_complexity || !cached.complexity.is_empty())
     {
-        cache_hits.fetch_add(1, Ordering::Relaxed);
-        return Some(cache::cached_to_module(cached, file.id));
+        return ParseFileResult::cache_hit(cache::cached_to_module_opts(
+            cached,
+            file.id,
+            need_complexity,
+        ));
     }
-    cache_misses.fetch_add(1, Ordering::Relaxed);
 
-    // Cache miss, do a full parse
-    Some(parse_source_to_module(
-        file.id,
-        &file.path,
-        &source,
-        content_hash,
-        need_complexity,
-    ))
+    let parse_start = std::time::Instant::now();
+    let module = parse_source_to_module(file.id, &file.path, source, content_hash, need_complexity);
+    let parse_cpu_nanos = u64::try_from(parse_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    ParseFileResult::cache_miss(module, parse_cpu_nanos)
 }
 
 /// Parse a single file and extract module information (without complexity).
 #[must_use]
 pub fn parse_single_file(file: &DiscoveredFile) -> Option<ModuleInfo> {
-    let source = std::fs::read_to_string(&file.path).ok()?;
+    let raw = std::fs::read_to_string(&file.path).ok()?;
+    let source = strip_bom(&raw);
     let content_hash = xxhash_rust::xxh3::xxh3_64(source.as_bytes());
     Some(parse_source_to_module(
         file.id,
         &file.path,
-        &source,
+        source,
         content_hash,
         false,
     ))
@@ -169,11 +322,10 @@ pub fn parse_single_file(file: &DiscoveredFile) -> Option<ModuleInfo> {
 /// Parse from in-memory content (for LSP, includes complexity).
 #[must_use]
 pub fn parse_from_content(file_id: FileId, path: &Path, content: &str) -> ModuleInfo {
+    let content = strip_bom(content);
     let content_hash = xxhash_rust::xxh3::xxh3_64(content.as_bytes());
     parse_source_to_module(file_id, path, content, content_hash, true)
 }
 
-// Parser integration tests invoke Oxc under Miri which is ~1000x slower.
-// Unit tests in individual modules (visitor, suppress, sfc, css, etc.) still run.
 #[cfg(all(test, not(miri)))]
 mod tests;

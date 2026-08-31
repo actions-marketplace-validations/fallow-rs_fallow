@@ -11,11 +11,8 @@ use super::{Plugin, PluginResult};
 const ENABLERS: &[&str] = &["gatsby"];
 
 const ENTRY_PATTERNS: &[&str] = &[
-    // Filesystem routing
     "src/pages/**/*.{ts,tsx,js,jsx}",
-    // Templates (used by createPage in gatsby-node)
     "src/templates/**/*.{ts,tsx,js,jsx}",
-    // API routes (Gatsby 4+)
     "src/api/**/*.{ts,js}",
 ];
 
@@ -35,7 +32,6 @@ const ALWAYS_USED: &[&str] = &[
 
 const TOOLING_DEPENDENCIES: &[&str] = &["gatsby", "gatsby-cli"];
 
-// Gatsby page exports
 const PAGE_EXPORTS: &[&str] = &["default", "Head", "query", "config", "getServerData"];
 const FUNCTION_EXPORTS: &[&str] = &["default", "config"];
 
@@ -54,22 +50,18 @@ define_plugin! {
     resolve_config(config_path, source, _root) {
         let mut result = PluginResult::default();
 
-        // Extract import sources as referenced dependencies
         let imports = config_parser::extract_imports(source, config_path);
         for imp in &imports {
             let dep = crate::resolve::extract_package_name(imp);
             result.referenced_dependencies.push(dep);
         }
 
-        // Extract plugins array -- plugins can be strings or { resolve: "plugin-name" } objects
-        // Simple string plugins
         let plugins = config_parser::extract_config_shallow_strings(source, config_path, "plugins");
         for plugin in &plugins {
             let dep = crate::resolve::extract_package_name(plugin);
             result.referenced_dependencies.push(dep);
         }
 
-        // require() calls in plugins array
         let require_deps =
             config_parser::extract_config_require_strings(source, config_path, "plugins");
         for dep in &require_deps {
@@ -78,8 +70,6 @@ define_plugin! {
                 .push(crate::resolve::extract_package_name(dep));
         }
 
-        // Extract "resolve" property values from plugin objects
-        // e.g., plugins: [{ resolve: "gatsby-plugin-image", options: {} }]
         extract_gatsby_plugin_resolves(source, config_path, &mut result);
 
         result
@@ -103,7 +93,6 @@ fn extract_gatsby_plugin_resolves(source: &str, path: &Path, result: &mut Plugin
         return;
     };
 
-    // Find the plugins property
     let Some(plugins_prop) = obj.properties.iter().find_map(|prop| {
         if let ObjectPropertyKind::ObjectProperty(p) = prop {
             let is_match = match &p.key {
@@ -126,7 +115,6 @@ fn extract_gatsby_plugin_resolves(source: &str, path: &Path, result: &mut Plugin
 
     for el in &arr.elements {
         if let Some(Expression::ObjectExpression(plugin_obj)) = el.as_expression() {
-            // Look for { resolve: "plugin-name" }
             for prop in &plugin_obj.properties {
                 if let ObjectPropertyKind::ObjectProperty(p) = prop {
                     let is_resolve = match &p.key {
@@ -284,7 +272,6 @@ mod tests {
             source,
             std::path::Path::new("/project"),
         );
-        // String plugins extracted via extract_config_shallow_strings
         assert!(
             result
                 .referenced_dependencies
@@ -337,7 +324,6 @@ mod tests {
         );
         let deps = &result.referenced_dependencies;
         assert!(deps.contains(&"gatsby-plugin-manifest".to_string()));
-        // "options" property value should not appear as a dependency
         assert!(!deps.iter().any(|d| d.contains("My App")));
     }
 
@@ -392,12 +378,9 @@ mod tests {
             std::path::Path::new("/project"),
         );
         let deps = &result.referenced_dependencies;
-        // Import-level dependency
         assert!(deps.contains(&"sharp".to_string()));
-        // String plugins
         assert!(deps.contains(&"gatsby-plugin-image".to_string()));
         assert!(deps.contains(&"gatsby-transformer-sharp".to_string()));
-        // Object plugins via resolve
         assert!(deps.contains(&"gatsby-source-filesystem".to_string()));
         assert!(deps.contains(&"gatsby-plugin-manifest".to_string()));
     }

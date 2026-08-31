@@ -1,8 +1,23 @@
+import { countCheckIssues } from "./analysis-utils.js";
+import { escapeMarkdownText, normalizeInlineText } from "./markdown-utils.js";
+import type { FallowCheckResult, FallowDupesResult } from "./types.js";
+
+/** Whether the LSP server applied or dropped a requested changed-since scope. */
+export type ChangedSinceScopeState = "applied" | "dropped";
+
+/** Structured changed-since status reported by the LSP server. */
+export interface ChangedSinceScopeStatus {
+  readonly requestedRef: string;
+  readonly state: ChangedSinceScopeState;
+  readonly reason?: string;
+}
+
 export interface AnalysisCompleteParams {
   totalIssues: number;
   unusedFiles: number;
   unusedExports: number;
   unusedTypes: number;
+  privateTypeLeaks: number;
   unusedDependencies: number;
   unusedDevDependencies: number;
   unusedOptionalDependencies: number;
@@ -12,14 +27,60 @@ export interface AnalysisCompleteParams {
   unlistedDependencies: number;
   duplicateExports: number;
   typeOnlyDependencies: number;
+  testOnlyDependencies: number;
+  devDependenciesInProduction: number;
   circularDependencies: number;
+  reExportCycles: number;
+  boundaryViolations: number;
+  staleSuppressions: number;
+  unusedCatalogEntries: number;
+  unresolvedCatalogReferences: number;
+  unusedDependencyOverrides: number;
+  misconfiguredDependencyOverrides: number;
   duplicationPercentage: number;
   cloneGroups: number;
+  changedSinceScope?: ChangedSinceScopeStatus;
 }
 
-type SeverityKey =
-  | "statusBarItem.errorBackground"
-  | "statusBarItem.warningBackground";
+/**
+ * Convert CLI analysis results into the same shape the LSP notification
+ * delivers, so the status bar text and tooltip can be built from a single
+ * source of truth regardless of whether LSP or CLI produced the data.
+ */
+export const buildParamsFromCli = (
+  check: FallowCheckResult | null,
+  dupes: FallowDupesResult | null,
+): AnalysisCompleteParams => ({
+  totalIssues: countCheckIssues(check),
+  unusedFiles: check?.unused_files.length ?? 0,
+  unusedExports: check?.unused_exports.length ?? 0,
+  unusedTypes: check?.unused_types.length ?? 0,
+  privateTypeLeaks: check?.private_type_leaks?.length ?? 0,
+  unusedDependencies: check?.unused_dependencies.length ?? 0,
+  unusedDevDependencies: check?.unused_dev_dependencies.length ?? 0,
+  unusedOptionalDependencies: check?.unused_optional_dependencies?.length ?? 0,
+  unusedEnumMembers: check?.unused_enum_members.length ?? 0,
+  unusedClassMembers: check?.unused_class_members.length ?? 0,
+  unresolvedImports: check?.unresolved_imports.length ?? 0,
+  unlistedDependencies: check?.unlisted_dependencies.length ?? 0,
+  duplicateExports: check?.duplicate_exports.length ?? 0,
+  typeOnlyDependencies: check?.type_only_dependencies?.length ?? 0,
+  testOnlyDependencies: check?.test_only_dependencies?.length ?? 0,
+  devDependenciesInProduction: check?.dev_dependencies_in_production?.length ?? 0,
+  circularDependencies: check?.circular_dependencies?.length ?? 0,
+  reExportCycles: check?.re_export_cycles?.length ?? 0,
+  boundaryViolations:
+    (check?.boundary_violations?.length ?? 0) +
+    (check?.boundary_coverage_violations?.length ?? 0) +
+    (check?.boundary_call_violations?.length ?? 0),
+  staleSuppressions: check?.stale_suppressions?.length ?? 0,
+  unusedCatalogEntries: check?.unused_catalog_entries?.length ?? 0,
+  unresolvedCatalogReferences: check?.unresolved_catalog_references?.length ?? 0,
+  unusedDependencyOverrides: check?.unused_dependency_overrides?.length ?? 0,
+  misconfiguredDependencyOverrides: check?.misconfigured_dependency_overrides?.length ?? 0,
+  duplicationPercentage: dupes?.stats.duplication_percentage ?? 0,
+  cloneGroups: dupes?.stats.clone_groups ?? 0,
+});
 
 interface BreakdownLine {
   readonly count: keyof AnalysisCompleteParams;
@@ -36,6 +97,11 @@ const BREAKDOWN_LINES: ReadonlyArray<BreakdownLine> = [
   { count: "unusedFiles", icon: "$(warning)", label: "unused files" },
   { count: "unusedExports", icon: "$(warning)", label: "unused exports" },
   { count: "unusedTypes", icon: "$(info)", label: "unused types" },
+  {
+    count: "privateTypeLeaks",
+    icon: "$(warning)",
+    label: "private type leaks",
+  },
   {
     count: "unusedDependencies",
     icon: "$(warning)",
@@ -77,44 +143,122 @@ const BREAKDOWN_LINES: ReadonlyArray<BreakdownLine> = [
     label: "type-only dependencies",
   },
   {
+    count: "testOnlyDependencies",
+    icon: "$(info)",
+    label: "test-only dependencies",
+  },
+  {
+    count: "devDependenciesInProduction",
+    icon: "$(warning)",
+    label: "dev dependencies used in production",
+  },
+  {
     count: "circularDependencies",
     icon: "$(warning)",
     label: "circular dependencies",
   },
+  {
+    count: "reExportCycles",
+    icon: "$(warning)",
+    label: "re-export cycles",
+  },
+  {
+    count: "boundaryViolations",
+    icon: "$(warning)",
+    label: "boundary violations",
+  },
+  {
+    count: "staleSuppressions",
+    icon: "$(info)",
+    label: "stale suppressions",
+  },
+  {
+    count: "unusedCatalogEntries",
+    icon: "$(warning)",
+    label: "unused catalog entries",
+  },
+  {
+    count: "unresolvedCatalogReferences",
+    icon: "$(error)",
+    label: "unresolved catalog references",
+  },
+  {
+    count: "unusedDependencyOverrides",
+    icon: "$(warning)",
+    label: "unused dependency overrides",
+  },
+  {
+    count: "misconfiguredDependencyOverrides",
+    icon: "$(error)",
+    label: "misconfigured dependency overrides",
+  },
 ];
 
-export const getDuplicationPercentage = (
-  duplicationPercentage: number
-): number => (Number.isFinite(duplicationPercentage) ? duplicationPercentage : 0);
+export const getDuplicationPercentage = (duplicationPercentage: number): number =>
+  Number.isFinite(duplicationPercentage) ? duplicationPercentage : 0;
 
-export const buildStatusBarPartsFromLsp = (
-  params: AnalysisCompleteParams
-): string[] => [
+export const buildStatusBarPartsFromLsp = (params: AnalysisCompleteParams): string[] => [
   `${params.totalIssues} issues`,
   `${getDuplicationPercentage(params.duplicationPercentage).toFixed(1)}% duplication`,
 ];
 
-export const getStatusBarSeverityKey = (
-  params: AnalysisCompleteParams
-): SeverityKey | null => {
-  if (params.unresolvedImports > 0) {
-    return "statusBarItem.errorBackground";
-  }
+export const formatChangedSinceRefForStatusBar = (ref: string): string => {
+  const normalized = normalizeInlineText(ref);
+  return normalized.length > 48 ? `${normalized.slice(0, 45).trimEnd()}...` : normalized;
+};
 
-  if (params.totalIssues > 0) {
-    return "statusBarItem.warningBackground";
+/**
+ * Resolve the visible status bar text for a given base label, appending
+ * the persistent `changedSince` suffix when that filter is active.
+ *
+ * Single source of truth across the four status bar states (idle,
+ * analyzing, error, post-analysis). Earlier the post-analysis path was
+ * the only state that showed `(since <ref>)`, which made the filter feel
+ * intermittent and forced users to hover the tooltip to verify it was
+ * still active. The panel review for issue #190 flagged this as the
+ * visible signal that should match the `changedSince` filter applied to
+ * LSP diagnostics.
+ *
+ * Pure: takes the resolved ref so it can be unit-tested without a vscode
+ * mock. Callers in `statusBar.ts` pass `getChangedSince()` or `null`.
+ */
+export const renderStatusBarText = (
+  base: string,
+  changedSince: string | null,
+  scope?: ChangedSinceScopeStatus,
+): string => {
+  const requestedRef = scope?.requestedRef || changedSince;
+  if (!requestedRef) {
+    return base;
   }
-
-  return null;
+  const formattedRef = formatChangedSinceRefForStatusBar(requestedRef);
+  if (scope?.state === "dropped") {
+    return `${base} (since ${formattedRef}: scope dropped)`;
+  }
+  return `${base} (since ${formattedRef})`;
 };
 
 export const buildStatusBarTooltipMarkdown = (
-  params: AnalysisCompleteParams
+  params: AnalysisCompleteParams,
+  changedSinceRef: string | null = null,
 ): string => {
   const lines: string[] = ["**Fallow** - Analysis Results\n"];
-  const duplicationPercentage = getDuplicationPercentage(
-    params.duplicationPercentage
-  );
+  const duplicationPercentage = getDuplicationPercentage(params.duplicationPercentage);
+
+  const scope = params.changedSinceScope;
+  if (scope?.state === "dropped") {
+    lines.push(
+      `$(warning) Scope since ${escapeMarkdownText(scope.requestedRef)} was dropped; results are full-scope.`,
+    );
+    if (scope.reason) {
+      lines.push(`Reason: ${escapeMarkdownText(scope.reason)}`);
+    }
+  } else {
+    const appliedRef = scope?.requestedRef || changedSinceRef;
+    if (appliedRef) {
+      lines.push(`$(git-branch) Scoped to changes since ${escapeMarkdownText(appliedRef)}`);
+    }
+  }
 
   for (const line of BREAKDOWN_LINES) {
     const count = params[line.count];
@@ -125,7 +269,7 @@ export const buildStatusBarTooltipMarkdown = (
 
   if (params.cloneGroups > 0) {
     lines.push(
-      `$(copy) ${params.cloneGroups} clone groups (${duplicationPercentage.toFixed(1)}% duplication)`
+      `$(copy) ${params.cloneGroups} clone groups (${duplicationPercentage.toFixed(1)}% duplication)`,
     );
   }
 
@@ -135,7 +279,7 @@ export const buildStatusBarTooltipMarkdown = (
 
   lines.push("\n---\n");
   lines.push(
-    "[$(play) Run Analysis](command:fallow.analyze) · [$(wrench) Auto-Fix](command:fallow.fix) · [$(output) Output](command:fallow.showOutput)"
+    "[$(play) Run Analysis](command:fallow.analyze) · [$(wrench) Auto-Fix](command:fallow.fix) · [$(output) Output](command:fallow.showOutput)",
   );
 
   return lines.join("\n\n");

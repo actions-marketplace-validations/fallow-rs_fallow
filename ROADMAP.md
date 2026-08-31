@@ -1,8 +1,8 @@
 # Fallow Roadmap
 
-> Last updated: 2026-04-23
+> This roadmap covers planned work and is reviewed periodically. For shipped capabilities, see the [releases](https://github.com/fallow-rs/fallow/releases) and [documentation](https://docs.fallow.tools).
 
-This roadmap tracks planned work on Fallow. For shipped capabilities, see the [documentation](https://docs.fallow.tools) and [GitHub releases](https://github.com/fallow-rs/fallow/releases).
+This roadmap tracks planned work on Fallow: what is queued, what is being scoped, and where the project is headed.
 
 ---
 
@@ -10,17 +10,9 @@ This roadmap tracks planned work on Fallow. For shipped capabilities, see the [d
 
 Concrete work scoped to the next one or two minor releases.
 
-### Hot-path change review
-
-Production coverage ships the data; the review workflow on top of it does not yet exist. `HotPathChangesNeeded` will correlate a PR's changed lines against the hot functions captured by the sidecar and flag diffs that touch runtime-critical code. Paid, runtime-backed.
-
 ### Richer MCP responses
 
-Agents already query fallow via MCP, but the responses lack context agents need to make confident removal decisions: re-export chains, who imports this symbol, recent churn, duplicate siblings. Expand existing tool responses before adding new tools.
-
-### Pre-commit hook install
-
-`fallow check --changed` is fast enough to run on staged files. Ship a `fallow hooks install` command that wires it into husky, lefthook, or native `core.hooksPath`, scoped to unused exports and unresolved imports for sub-second feedback.
+The `inspect_target` tool already combines re-export chains, importers, duplicate siblings, and optional recent churn into one evidence bundle. The remaining work is to bring the same decision-ready context to broader MCP analysis flows where agents currently have to follow up with a separate inspection call.
 
 ### Coverage sidecar ergonomics
 
@@ -29,6 +21,10 @@ The coverage setup state machine works end to end, but the install handoff still
 ### Post-fix formatter integration
 
 `fallow fix` leaves Prettier, dprint, or Biome to clean up whitespace after removals. Invoke the project's configured formatter automatically when running in-place.
+
+### Per-package `changedSince` overrides
+
+Monorepos with packages on different release cadences want different baseline refs per package (e.g. `packages/web` tracks `main`, `packages/legacy` tracks `release/2024.10`). Today `fallow.changedSince` is workspace-wide. Extending this to per-package overrides requires config-schema work (a new `[overrides]` block keyed on workspace root, or `package.json` field), resolution semantics (which baseline wins for a file in package A imported from package B), and matching status-bar logic.
 
 ---
 
@@ -40,13 +36,14 @@ Broader bets, still being scoped.
 
 Safe removals (unused exports, enum members, dependencies) are already auto-fixable. The open question is the judgment calls: deleting files, consolidating duplicates, restructuring modules. The bet: structured MCP output plus the right review workflow lets an agent propose those changes, a human approves the PR, and fallow verifies nothing regressed.
 
-### Codebase health grade
+### Health score calibration and adoption
 
-One letter (A-F) per project, derived from dead code ratio, duplication, complexity density, and dependency hygiene. Visible as a badge, tracked in vital signs snapshots, trended over time. Managers understand it, developers trust it, agents optimize for it. The risk is that a single grade collapses signal the existing health score already surfaces more precisely; scoping needs to show it adds value over the current score.
-
-### Visualization
-
-`fallow viz`: a self-contained interactive HTML report. Treemap with dead code highlighted, dependency graph, cycle visualization, duplication heatmaps. No server, opens in any browser. Scoping depends on which view actually unblocks a user workflow rather than just looking good in screenshots.
+Shipped today: `fallow health` provides a 0-100 score, an A-F letter grade,
+badge output, saved vital-sign snapshots, and trend comparisons. Planned work
+focuses on calibrating the formula against a broad real-world corpus, explaining
+how its multiple signals contribute to each result, and helping teams adopt
+baselines and thresholds that fit their project context. This direction improves
+confidence and multi-signal explainability rather than adding another grade.
 
 ---
 
@@ -57,7 +54,7 @@ Continuous work across releases.
 - **Incremental analysis** -- finer-grained caching for faster watch mode and CI on large monorepos
 - **Plugin ecosystem** -- more framework coverage, better external plugin authoring, community-contributed plugins
 - **Health intelligence** -- structured fix suggestions, HTML report cards, richer regression diffing
-- **Agent integration** -- Claude Code hooks, Cursor integration, agent skill packages, expanded MCP coverage
+- **Agent integration** -- Cursor integration, expanded MCP coverage, new editor surfaces beyond VS Code and Zed
 
 ---
 
@@ -65,7 +62,10 @@ Continuous work across releases.
 
 Acknowledged gaps. Fixes land opportunistically.
 
-- **Syntactic analysis only** -- no TypeScript type information. Projects using `isolatedModules: true` (the modern default) are well-served; legacy tsc-only patterns may produce false positives.
+- **Syntactic by default** -- the fast Rust-native path does not require
+  TypeScript. The optional `--type-aware` companion adds bounded checker
+  evidence for exact symbol use, API leaks, targeted tests, and public type
+  coupling. It does not replace compiler diagnostics or general typed linting.
 - **Config parsing ceiling** -- AST-based extraction handles static configs. Computed values and conditionals are out of reach without JS eval.
 - **Svelte export false negatives** -- props (`export let`) can't be distinguished from utility exports without Svelte compiler semantics.
 - **NestJS/DI class members** -- abstract methods consumed via DI are not tracked. Use `unused_class_members = "off"` for DI-heavy projects.

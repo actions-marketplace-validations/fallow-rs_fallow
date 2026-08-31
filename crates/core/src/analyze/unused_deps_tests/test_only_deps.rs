@@ -1,7 +1,5 @@
 use super::helpers::*;
 
-// ---- find_test_only_dependencies tests ----
-
 /// A dependency imported only from a root-level test file should be flagged.
 #[test]
 fn test_only_dep_from_root_test_file() {
@@ -19,7 +17,7 @@ fn test_only_dep_from_root_test_file() {
     let resolved_modules = vec![ResolvedModule {
         file_id: FileId(0),
         path: PathBuf::from("/project/src/app.test.ts"),
-        exports: vec![],
+        exports: vec![].into(),
         re_exports: vec![],
         resolved_imports: vec![ResolvedImport {
             info: ImportInfo {
@@ -27,6 +25,8 @@ fn test_only_dep_from_root_test_file() {
                 imported_name: ImportedName::Named("describe".to_string()),
                 local_name: "describe".to_string(),
                 is_type_only: false,
+                is_type_only_star: false,
+                from_style: false,
                 span: oxc_span::Span::new(0, 20),
                 source_span: oxc_span::Span::default(),
             },
@@ -34,12 +34,18 @@ fn test_only_dep_from_root_test_file() {
         }],
         resolved_dynamic_imports: vec![],
         resolved_dynamic_patterns: vec![],
-        member_accesses: vec![],
-        whole_object_uses: vec![],
+        member_accesses: vec![].into(),
+        semantic_facts: std::sync::Arc::default(),
+        whole_object_uses: std::sync::Arc::default(),
         has_cjs_exports: false,
+        has_angular_component_template_url: false,
         unused_import_bindings: FxHashSet::default(),
         type_referenced_import_bindings: vec![],
         value_referenced_import_bindings: vec![],
+        namespace_object_aliases: vec![],
+        exported_factory_returns: std::sync::Arc::default(),
+        exported_factory_return_object_shapes: std::sync::Arc::default(),
+        type_member_types: std::sync::Arc::default(),
     }];
 
     let graph = ModuleGraph::build(&resolved_modules, &entry_points, &files);
@@ -71,7 +77,7 @@ fn test_only_dep_from_root_config_file() {
     let resolved_modules = vec![ResolvedModule {
         file_id: FileId(0),
         path: PathBuf::from("/project/vitest.config.ts"),
-        exports: vec![],
+        exports: vec![].into(),
         re_exports: vec![],
         resolved_imports: vec![ResolvedImport {
             info: ImportInfo {
@@ -79,6 +85,8 @@ fn test_only_dep_from_root_config_file() {
                 imported_name: ImportedName::Named("defineConfig".to_string()),
                 local_name: "defineConfig".to_string(),
                 is_type_only: false,
+                is_type_only_star: false,
+                from_style: false,
                 span: oxc_span::Span::new(0, 20),
                 source_span: oxc_span::Span::default(),
             },
@@ -86,12 +94,18 @@ fn test_only_dep_from_root_config_file() {
         }],
         resolved_dynamic_imports: vec![],
         resolved_dynamic_patterns: vec![],
-        member_accesses: vec![],
-        whole_object_uses: vec![],
+        member_accesses: vec![].into(),
+        semantic_facts: std::sync::Arc::default(),
+        whole_object_uses: std::sync::Arc::default(),
         has_cjs_exports: false,
+        has_angular_component_template_url: false,
         unused_import_bindings: FxHashSet::default(),
         type_referenced_import_bindings: vec![],
         value_referenced_import_bindings: vec![],
+        namespace_object_aliases: vec![],
+        exported_factory_returns: std::sync::Arc::default(),
+        exported_factory_return_object_shapes: std::sync::Arc::default(),
+        type_member_types: std::sync::Arc::default(),
     }];
 
     let graph = ModuleGraph::build(&resolved_modules, &entry_points, &files);
@@ -125,7 +139,7 @@ fn test_only_dep_from_workspace_config_file() {
     let resolved_modules = vec![ResolvedModule {
         file_id: FileId(0),
         path: PathBuf::from("/project/packages/foo/vitest.config.ts"),
-        exports: vec![],
+        exports: vec![].into(),
         re_exports: vec![],
         resolved_imports: vec![ResolvedImport {
             info: ImportInfo {
@@ -133,6 +147,8 @@ fn test_only_dep_from_workspace_config_file() {
                 imported_name: ImportedName::Named("defineConfig".to_string()),
                 local_name: "defineConfig".to_string(),
                 is_type_only: false,
+                is_type_only_star: false,
+                from_style: false,
                 span: oxc_span::Span::new(0, 20),
                 source_span: oxc_span::Span::default(),
             },
@@ -140,12 +156,18 @@ fn test_only_dep_from_workspace_config_file() {
         }],
         resolved_dynamic_imports: vec![],
         resolved_dynamic_patterns: vec![],
-        member_accesses: vec![],
-        whole_object_uses: vec![],
+        member_accesses: vec![].into(),
+        semantic_facts: std::sync::Arc::default(),
+        whole_object_uses: std::sync::Arc::default(),
         has_cjs_exports: false,
+        has_angular_component_template_url: false,
         unused_import_bindings: FxHashSet::default(),
         type_referenced_import_bindings: vec![],
         value_referenced_import_bindings: vec![],
+        namespace_object_aliases: vec![],
+        exported_factory_returns: std::sync::Arc::default(),
+        exported_factory_return_object_shapes: std::sync::Arc::default(),
+        type_member_types: std::sync::Arc::default(),
     }];
 
     let graph = ModuleGraph::build(&resolved_modules, &entry_points, &files);
@@ -178,7 +200,7 @@ fn not_test_only_when_imported_from_app_config() {
     let resolved_modules = vec![ResolvedModule {
         file_id: FileId(0),
         path: PathBuf::from("/project/src/app/app.config.ts"),
-        exports: vec![],
+        exports: vec![].into(),
         re_exports: vec![],
         resolved_imports: vec![ResolvedImport {
             info: ImportInfo {
@@ -186,6 +208,8 @@ fn not_test_only_when_imported_from_app_config() {
                 imported_name: ImportedName::Named("provideRouter".to_string()),
                 local_name: "provideRouter".to_string(),
                 is_type_only: false,
+                is_type_only_star: false,
+                from_style: false,
                 span: oxc_span::Span::new(0, 20),
                 source_span: oxc_span::Span::default(),
             },
@@ -193,12 +217,18 @@ fn not_test_only_when_imported_from_app_config() {
         }],
         resolved_dynamic_imports: vec![],
         resolved_dynamic_patterns: vec![],
-        member_accesses: vec![],
-        whole_object_uses: vec![],
+        member_accesses: vec![].into(),
+        semantic_facts: std::sync::Arc::default(),
+        whole_object_uses: std::sync::Arc::default(),
         has_cjs_exports: false,
+        has_angular_component_template_url: false,
         unused_import_bindings: FxHashSet::default(),
         type_referenced_import_bindings: vec![],
         value_referenced_import_bindings: vec![],
+        namespace_object_aliases: vec![],
+        exported_factory_returns: std::sync::Arc::default(),
+        exported_factory_return_object_shapes: std::sync::Arc::default(),
+        type_member_types: std::sync::Arc::default(),
     }];
 
     let graph = ModuleGraph::build(&resolved_modules, &entry_points, &files);
@@ -244,7 +274,7 @@ fn not_test_only_when_also_imported_from_source() {
         ResolvedModule {
             file_id: FileId(0),
             path: PathBuf::from("/project/packages/foo/vitest.config.ts"),
-            exports: vec![],
+            exports: vec![].into(),
             re_exports: vec![],
             resolved_imports: vec![ResolvedImport {
                 info: ImportInfo {
@@ -252,6 +282,8 @@ fn not_test_only_when_also_imported_from_source() {
                     imported_name: ImportedName::Named("configure".to_string()),
                     local_name: "configure".to_string(),
                     is_type_only: false,
+                    is_type_only_star: false,
+                    from_style: false,
                     span: oxc_span::Span::new(0, 20),
                     source_span: oxc_span::Span::default(),
                 },
@@ -259,17 +291,23 @@ fn not_test_only_when_also_imported_from_source() {
             }],
             resolved_dynamic_imports: vec![],
             resolved_dynamic_patterns: vec![],
-            member_accesses: vec![],
-            whole_object_uses: vec![],
+            member_accesses: vec![].into(),
+            semantic_facts: std::sync::Arc::default(),
+            whole_object_uses: std::sync::Arc::default(),
             has_cjs_exports: false,
+            has_angular_component_template_url: false,
             unused_import_bindings: FxHashSet::default(),
             type_referenced_import_bindings: vec![],
             value_referenced_import_bindings: vec![],
+            namespace_object_aliases: vec![],
+            exported_factory_returns: std::sync::Arc::default(),
+            exported_factory_return_object_shapes: std::sync::Arc::default(),
+            type_member_types: std::sync::Arc::default(),
         },
         ResolvedModule {
             file_id: FileId(1),
             path: PathBuf::from("/project/src/app.ts"),
-            exports: vec![],
+            exports: vec![].into(),
             re_exports: vec![],
             resolved_imports: vec![ResolvedImport {
                 info: ImportInfo {
@@ -277,6 +315,8 @@ fn not_test_only_when_also_imported_from_source() {
                     imported_name: ImportedName::Named("doSomething".to_string()),
                     local_name: "doSomething".to_string(),
                     is_type_only: false,
+                    is_type_only_star: false,
+                    from_style: false,
                     span: oxc_span::Span::new(0, 20),
                     source_span: oxc_span::Span::default(),
                 },
@@ -284,12 +324,18 @@ fn not_test_only_when_also_imported_from_source() {
             }],
             resolved_dynamic_imports: vec![],
             resolved_dynamic_patterns: vec![],
-            member_accesses: vec![],
-            whole_object_uses: vec![],
+            member_accesses: vec![].into(),
+            semantic_facts: std::sync::Arc::default(),
+            whole_object_uses: std::sync::Arc::default(),
             has_cjs_exports: false,
+            has_angular_component_template_url: false,
             unused_import_bindings: FxHashSet::default(),
             type_referenced_import_bindings: vec![],
             value_referenced_import_bindings: vec![],
+            namespace_object_aliases: vec![],
+            exported_factory_returns: std::sync::Arc::default(),
+            exported_factory_return_object_shapes: std::sync::Arc::default(),
+            type_member_types: std::sync::Arc::default(),
         },
     ];
 
@@ -322,7 +368,7 @@ fn test_only_dep_from_workspace_jest_config() {
     let resolved_modules = vec![ResolvedModule {
         file_id: FileId(0),
         path: PathBuf::from("/project/packages/api/jest.config.ts"),
-        exports: vec![],
+        exports: vec![].into(),
         re_exports: vec![],
         resolved_imports: vec![ResolvedImport {
             info: ImportInfo {
@@ -330,6 +376,8 @@ fn test_only_dep_from_workspace_jest_config() {
                 imported_name: ImportedName::Named("pathsToModuleNameMapper".to_string()),
                 local_name: "pathsToModuleNameMapper".to_string(),
                 is_type_only: false,
+                is_type_only_star: false,
+                from_style: false,
                 span: oxc_span::Span::new(0, 20),
                 source_span: oxc_span::Span::default(),
             },
@@ -337,12 +385,18 @@ fn test_only_dep_from_workspace_jest_config() {
         }],
         resolved_dynamic_imports: vec![],
         resolved_dynamic_patterns: vec![],
-        member_accesses: vec![],
-        whole_object_uses: vec![],
+        member_accesses: vec![].into(),
+        semantic_facts: std::sync::Arc::default(),
+        whole_object_uses: std::sync::Arc::default(),
         has_cjs_exports: false,
+        has_angular_component_template_url: false,
         unused_import_bindings: FxHashSet::default(),
         type_referenced_import_bindings: vec![],
         value_referenced_import_bindings: vec![],
+        namespace_object_aliases: vec![],
+        exported_factory_returns: std::sync::Arc::default(),
+        exported_factory_return_object_shapes: std::sync::Arc::default(),
+        type_member_types: std::sync::Arc::default(),
     }];
 
     let graph = ModuleGraph::build(&resolved_modules, &entry_points, &files);

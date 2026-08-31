@@ -1,23 +1,8 @@
-use rmcp::ServiceExt;
-use rmcp::transport::stdio;
-use tracing_subscriber::EnvFilter;
+use std::process::ExitCode;
 
-mod params;
-mod server;
-mod tools;
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // MCP servers must never write non-protocol data to stdout.
-    // All logging goes to stderr.
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_env_filter(EnvFilter::from_default_env())
-        .with_ansi(false)
-        .init();
-
-    let server = server::FallowMcp::new();
-    let service = server.serve(stdio()).await?;
-    service.waiting().await?;
-    Ok(())
+/// Thin delegator to the MCP server library entry. The full server lives in
+/// `fallow_mcp::run_stdio_server` so the multicall `fallow mcp-server`
+/// subcommand can reuse the exact same runtime and stdio wiring.
+fn main() -> ExitCode {
+    fallow_mcp::run_stdio_server()
 }

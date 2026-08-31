@@ -2,9 +2,10 @@
 ///
 /// Generates self-contained SVG badges with embedded Verdana 11px character
 /// width data for accurate text measurement. No external dependencies required.
+use crate::report::sink::outln;
 use std::process::ExitCode;
 
-use crate::health_types::HealthReport;
+use fallow_output::HealthReport;
 
 /// Escape a string for safe interpolation in XML attributes and element content.
 fn xml_escape(s: &str) -> String {
@@ -125,7 +126,6 @@ fn text_width(s: &str) -> u32 {
     }
     let raw: f64 = s.chars().map(char_width).sum();
     let floored = raw as u32;
-    // Round up to nearest odd number.
     if floored.is_multiple_of(2) {
         floored + 1
     } else {
@@ -157,7 +157,6 @@ fn render_badge(label: &str, message: &str, color: &str) -> String {
     let total_width = left_width + right_width;
     let height: u32 = 20;
 
-    // Text positions in 10x coordinate space (SVG uses transform="scale(.1)").
     let label_margin: u32 = 1;
     let label_x = 10 * (label_margin + label_w / 2 + horiz_padding);
     let label_text_len = 10 * label_w;
@@ -166,18 +165,14 @@ fn render_badge(label: &str, message: &str, color: &str) -> String {
     let msg_x = 10 * (msg_margin + message_w / 2 + horiz_padding);
     let msg_text_len = 10 * message_w;
 
-    // Escape all text content for safe XML interpolation.
     let label = xml_escape(label);
     let message = xml_escape(message);
     let accessible = format!("{label}: {message}");
 
-    // Unique IDs to avoid collisions when multiple badges are inlined on one page.
     let suffix = svg_id_suffix(&label, &message);
     let grad_id = format!("s-{suffix}");
     let clip_id = format!("r-{suffix}");
 
-    // Colors extracted as variables to avoid Rust 2021 prefix-literal conflicts
-    // with `#` inside raw string format arguments.
     let label_bg = "#555";
     let white = "#fff";
     let shadow = "#010101";
@@ -226,7 +221,7 @@ pub fn print_health_badge(report: &HealthReport) -> ExitCode {
     let color = grade_color(score.grade);
     let svg = render_badge("fallow", &message, color);
 
-    println!("{svg}");
+    outln!("{svg}");
     ExitCode::SUCCESS
 }
 
@@ -275,7 +270,6 @@ mod tests {
     fn render_badge_unique_ids() {
         let a = render_badge("fallow", "A (90)", "#4c1");
         let b = render_badge("fallow", "B (76)", "#97ca00");
-        // Extract gradient ID from each badge.
         let extract_id = |svg: &str| -> String {
             let start = svg.find("id=\"s-").unwrap() + 4;
             let end = svg[start..].find('"').unwrap() + start;
@@ -289,7 +283,6 @@ mod tests {
         let short = render_badge("a", "b", "#4c1");
         let long = render_badge("fallow health", "100 A", "#4c1");
 
-        // Extract width from the opening svg tag.
         let extract_width = |svg: &str| -> u32 {
             let start = svg.find("width=\"").unwrap() + 7;
             let end = svg[start..].find('"').unwrap() + start;
@@ -300,7 +293,7 @@ mod tests {
     }
 
     fn empty_report() -> HealthReport {
-        use crate::health_types::HealthSummary;
+        use fallow_output::HealthSummary;
 
         HealthReport {
             summary: HealthSummary {
@@ -320,10 +313,11 @@ mod tests {
 
     #[test]
     fn print_health_badge_with_score() {
-        use crate::health_types::{HealthScore, HealthScorePenalties};
+        use fallow_output::{HEALTH_SCORE_FORMULA_VERSION, HealthScore, HealthScorePenalties};
 
         let mut report = empty_report();
         report.health_score = Some(HealthScore {
+            formula_version: HEALTH_SCORE_FORMULA_VERSION,
             score: 87.3,
             grade: "A",
             penalties: HealthScorePenalties {
@@ -338,6 +332,7 @@ mod tests {
                 unit_size: None,
                 coupling: None,
                 duplication: None,
+                prop_drilling: None,
             },
         });
         let code = print_health_badge(&report);

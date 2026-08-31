@@ -2,6 +2,7 @@
 name = "fallow-graph"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
@@ -35,10 +36,17 @@ fixedbitset = { workspace = true }
 # Hashing
 rustc-hash = { workspace = true }
 
+# Concurrent caches shared across rayon workers
+dashmap = { workspace = true }
+
+# Persisted graph cache (serde derives on the graph types + postcard store)
+serde = { workspace = true }
+postcard = { workspace = true }
+
 # Logging
 tracing = { workspace = true }
 serde_json = { workspace = true }
-json_comments = { workspace = true }
+jsonc-parser = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

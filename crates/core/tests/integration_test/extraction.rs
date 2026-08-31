@@ -177,7 +177,6 @@ export default class App {}
 ";
     let info = parse_from_content(FileId(0), Path::new("test.ts"), content);
 
-    // VALUE, helper, Config, Logger, Level, default = 6 exports
     assert_eq!(
         info.exports.len(),
         6,
@@ -188,7 +187,6 @@ export default class App {}
             .collect::<Vec<_>>()
     );
 
-    // Level enum should have 4 members
     let level_export = info
         .exports
         .iter()

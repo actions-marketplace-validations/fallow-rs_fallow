@@ -1,0 +1,69 @@
+[package]
+name = "fallow-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Typed analysis engine facade for fallow consumers"
+readme = "../../README.md"
+
+[lib]
+doctest = false
+
+[dependencies]
+fallow-config = { workspace = true }
+fallow-core = { workspace = true }
+fallow-extract = { workspace = true }
+fallow-graph = { workspace = true }
+fallow-output = { workspace = true }
+fallow-security = { workspace = true }
+fallow-types = { workspace = true }
+bitcode = { workspace = true }
+colored = { workspace = true }
+dunce = { workspace = true }
+globset = { workspace = true }
+oxc_allocator = { workspace = true }
+oxc_ast = { workspace = true }
+oxc_ast_visit = { workspace = true }
+oxc_parser = { workspace = true }
+oxc_span = { workspace = true }
+oxc_syntax = { workspace = true }
+oxc_coverage_instrument = { workspace = true }
+rayon = { workspace = true }
+rustc-hash = { workspace = true }
+sha2 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+xxhash-rust = { workspace = true }
+
+[features]
+codspeed = []
+schema = ["fallow-output/schema", "fallow-types/schema"]
+
+[dev-dependencies]
+criterion = { workspace = true }
+proptest = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "dupes_detect"
+harness = false
+
+[[bench]]
+name = "dupes_pipeline"
+harness = false
+
+[[bench]]
+name = "similar_code"
+harness = false

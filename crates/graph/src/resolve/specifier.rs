@@ -1,23 +1,28 @@
 //! Main resolution engine: creates the oxc_resolver instance and resolves individual specifiers.
 
-use std::fs::File;
-use std::io::BufReader;
+use std::ffi::OsString;
+use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use json_comments::StripComments;
+use globset::{Glob, GlobSetBuilder};
 use oxc_resolver::{Resolution, ResolveError, ResolveOptions, Resolver};
 use serde_json::Value;
 
 use super::fallbacks::{
-    extract_package_name_from_node_modules_path, try_path_alias_fallback,
-    try_pnpm_workspace_fallback, try_scss_include_path_fallback, try_scss_node_modules_fallback,
-    try_scss_partial_fallback, try_source_fallback, try_workspace_package_fallback,
+    extract_package_name_from_node_modules_path, lookup_internal_file_id, nearest_package_manifest,
+    normalize_path_lexically, try_css_extension_fallback, try_package_imports_fallback,
+    try_path_alias_fallback, try_pnpm_workspace_fallback,
+    try_relative_package_root_source_fallback, try_scss_include_path_fallback,
+    try_scss_node_modules_fallback, try_scss_partial_fallback, try_source_fallback,
+    try_workspace_package_fallback,
 };
 use super::path_info::{
     extract_package_name, is_bare_specifier, is_path_alias, is_valid_package_name,
+    normalize_npm_specifier,
 };
 use super::react_native::{build_condition_names, build_extensions};
-use super::types::{ResolveContext, ResolveResult};
+use super::types::{DenoImportMapEntry, ResolveContext, ResolveResult};
 
 /// Create an `oxc_resolver` instance with standard configuration.
 ///
@@ -27,46 +32,112 @@ use super::types::{ResolveContext, ResolveResult};
 /// `extra_conditions` are prepended to the resolver's `condition_names`
 /// list, giving them priority over baseline conditions during package.json
 /// `exports` / `imports` matching.
-pub(super) fn create_resolver(active_plugins: &[String], extra_conditions: &[String]) -> Resolver {
+pub(super) fn create_resolver(
+    root: &Path,
+    active_plugins: &[String],
+    extra_conditions: &[String],
+) -> Resolver {
+    Resolver::new(build_resolve_options(
+        root,
+        active_plugins,
+        extra_conditions,
+    ))
+}
+
+/// Build the [`ResolveOptions`] behind [`create_resolver`].
+///
+/// Exposed so a second resolver with different conditions can be derived from
+/// an existing one through `Resolver::clone_with_options`, sharing its
+/// filesystem cache and, on Yarn Plug'n'Play projects, the parsed manifest.
+pub(super) fn build_resolve_options(
+    root: &Path,
+    active_plugins: &[String],
+    extra_conditions: &[String],
+) -> ResolveOptions {
     let mut options = ResolveOptions {
         extensions: build_extensions(active_plugins),
-        // Support TypeScript's node16/nodenext module resolution where .ts files
-        // are imported with .js extensions (e.g., `import './api.js'` for `api.ts`).
         extension_alias: vec![
             (
                 ".js".into(),
-                vec![".ts".into(), ".tsx".into(), ".js".into()],
+                vec![
+                    ".ts".into(),
+                    ".tsx".into(),
+                    ".gts".into(),
+                    ".js".into(),
+                    ".gjs".into(),
+                    // Last so declaration-only modules resolve (TypeScript maps
+                    // .js to .d.ts too) without shadowing runtime files.
+                    ".d.ts".into(),
+                ],
             ),
+            (".ts".into(), vec![".gts".into(), ".ts".into()]),
             (".jsx".into(), vec![".tsx".into(), ".jsx".into()]),
-            (".mjs".into(), vec![".mts".into(), ".mjs".into()]),
-            (".cjs".into(), vec![".cts".into(), ".cjs".into()]),
+            (
+                ".mjs".into(),
+                vec![".mts".into(), ".mjs".into(), ".d.mts".into()],
+            ),
+            (
+                ".cjs".into(),
+                vec![".cts".into(), ".cjs".into(), ".d.cts".into()],
+            ),
         ],
         condition_names: build_condition_names(active_plugins, extra_conditions),
         main_fields: vec!["module".into(), "main".into()],
         ..Default::default()
     };
 
-    // Always use auto-discovery mode so oxc_resolver finds the nearest tsconfig.json
-    // for each file. This is critical for monorepos where workspace packages have
-    // their own tsconfig with path aliases (e.g., `~/*` → `./src/*`). Manual mode
-    // with a root tsconfig only uses that single tsconfig's paths for ALL files,
-    // missing workspace-specific aliases. Auto mode walks up from each file to find
-    // the nearest tsconfig.json and follows `extends` chains, so workspace tsconfigs
-    // that extend a root tsconfig still inherit root-level paths.
     options.tsconfig = Some(oxc_resolver::TsconfigDiscovery::Auto);
 
-    Resolver::new(options)
+    // oxc locates the PnP manifest by walking up from `cwd`, falling back to
+    // the process working directory. fallow never chdirs, so a run started
+    // outside the project (`fallow /path/to/repo`, an editor's language
+    // server) would otherwise miss the manifest and silently stay on the slow
+    // path. Anchor discovery to the manifest directory itself. Canonical,
+    // because the pnp crate diffs issuer paths against that directory and the
+    // issuers fallow feeds it are canonical.
+    let manifest_dir = find_yarn_pnp_manifest_dir(root);
+    options.yarn_pnp = manifest_dir.is_some();
+    options.cwd = manifest_dir.map(|dir| dunce::canonicalize(&dir).unwrap_or(dir));
+
+    options
+}
+
+/// The Yarn Plug'n'Play manifest.
+///
+/// Yarn 2 wrote `.pnp.js`, and installs with `pnpEnableInlining: false` split
+/// the runtime state into `.pnp.data.json`. The pnp crate behind oxc_resolver
+/// only opens `.pnp.cjs` and only parses an inlined payload, so those layouts
+/// are deliberately not probed: enabling PnP for them would fail every bare
+/// specifier instead of merely leaving them on the slower fallback path.
+const YARN_PNP_MANIFEST: &str = ".pnp.cjs";
+
+/// Find the directory holding the Yarn Plug'n'Play manifest that governs `root`.
+///
+/// PnP resolution is enabled per project rather than always-on. A PnP project
+/// has no populated `node_modules`, so without this every bare specifier misses
+/// and falls through to the much slower tsconfig fallback; conversely, turning
+/// it on for a non-PnP project would make the resolver consult a manifest that
+/// is not there.
+///
+/// Yarn writes the manifest only at the workspace root, so `root` and its
+/// ancestors are probed: analyzing one package of a PnP monorepo (`--root
+/// packages/app`, an editor workspace folder) still finds it. A directory
+/// named like the manifest is not an install, hence `is_file`.
+fn find_yarn_pnp_manifest_dir(root: &Path) -> Option<PathBuf> {
+    root.ancestors()
+        .find(|dir| dir.join(YARN_PNP_MANIFEST).is_file())
+        .map(Path::to_path_buf)
 }
 
 /// Return `true` for errors raised while loading a tsconfig file (as opposed to
 /// errors about the specifier itself). When `resolve_file` fails with one of these,
-/// a broken sibling tsconfig is poisoning resolution for the current file — retrying
+/// a broken sibling tsconfig is poisoning resolution for the current file, retrying
 /// via `resolve(dir, specifier)` bypasses `TsconfigDiscovery::Auto` and restores
 /// resolution for everything that does not need path aliases (relative, absolute,
 /// bare package specifiers).
 ///
 /// `IOError` and `Json` are included because a malformed or unreadable tsconfig
-/// surfaces as one of these — the variants are shared with package.json parsing,
+/// surfaces as one of these. The variants are shared with package.json parsing,
 /// but a retry is still safe: if the error really came from the specifier's own
 /// resolution, `resolve()` will fail the same way and we fall through to the
 /// existing error handling.
@@ -82,8 +153,13 @@ const fn is_tsconfig_error(err: &ResolveError) -> bool {
 }
 
 enum ResolveFileAttempt {
-    Resolved(Resolution),
-    Failed { used_tsconfig_fallback: bool },
+    Resolved {
+        resolution: Resolution,
+        used_tsconfig_fallback: bool,
+    },
+    Failed {
+        used_tsconfig_fallback: bool,
+    },
 }
 
 /// Try `resolve_file` first (honors per-file tsconfig discovery); on a
@@ -95,13 +171,28 @@ fn resolve_file_with_tsconfig_fallback(
     from_file: &Path,
     specifier: &str,
 ) -> ResolveFileAttempt {
-    match ctx.resolver.resolve_file(from_file, specifier) {
-        Ok(resolution) => ResolveFileAttempt::Resolved(resolution),
+    resolve_file_with_resolver_and_tsconfig_fallback(ctx, ctx.resolver, from_file, specifier)
+}
+
+fn resolve_file_with_resolver_and_tsconfig_fallback(
+    ctx: &ResolveContext<'_>,
+    resolver: &Resolver,
+    from_file: &Path,
+    specifier: &str,
+) -> ResolveFileAttempt {
+    match resolver.resolve_file(from_file, specifier) {
+        Ok(resolution) => ResolveFileAttempt::Resolved {
+            resolution,
+            used_tsconfig_fallback: false,
+        },
         Err(err) if is_tsconfig_error(&err) => {
             warn_once_tsconfig(ctx, &err);
             let dir = from_file.parent().unwrap_or(from_file);
-            match ctx.resolver.resolve(dir, specifier) {
-                Ok(resolution) => ResolveFileAttempt::Resolved(resolution),
+            match resolver.resolve(dir, specifier) {
+                Ok(resolution) => ResolveFileAttempt::Resolved {
+                    resolution,
+                    used_tsconfig_fallback: true,
+                },
                 Err(_) => ResolveFileAttempt::Failed {
                     used_tsconfig_fallback: true,
                 },
@@ -120,19 +211,90 @@ fn warn_once_tsconfig(ctx: &ResolveContext<'_>, err: &ResolveError) {
     let message = err.to_string();
     let should_warn = {
         let Ok(mut seen) = ctx.tsconfig_warned.lock() else {
-            // Mutex poisoned by a panic on another thread — stay silent rather
-            // than poisoning this thread's resolution with another panic.
             return;
         };
         seen.insert(message.clone())
     };
     if should_warn {
         tracing::warn!(
-            "Broken tsconfig chain: {message}. Falling back to resolver-less resolution for \
-             affected files. Relative and bare imports still work, but tsconfig path aliases \
-             (e.g., `@/...`) will not. Fix the extends/references chain to restore alias support."
+            "tsconfig chain not fully loaded: {message}. Falling back to resolver-less \
+             resolution for the affected files. Relative imports, bare imports, and path \
+             aliases declared in a discovered root or workspace tsconfig still resolve (fallow \
+             applies those project-wide), so this is usually harmless and is common when \
+             analyzing before dependencies are installed. Only aliases declared solely in the \
+             unreadable inherited config are affected: if imports look misreported, install \
+             dependencies so the referenced config resolves, or fix the extends/references \
+             chain."
         );
     }
+}
+
+fn try_root_relative_specifier(
+    ctx: &ResolveContext<'_>,
+    from_file: &Path,
+    specifier: &str,
+) -> Option<ResolveResult> {
+    if !specifier.starts_with('/') || !is_root_relative_importer(from_file) {
+        return None;
+    }
+
+    let relative = format!(".{specifier}");
+    let source_dir = from_file.parent().unwrap_or(ctx.root);
+    if let Some(result) = resolve_root_relative_from_dir(ctx, source_dir, &relative) {
+        return Some(result);
+    }
+    if source_dir != ctx.root
+        && let Some(result) = resolve_root_relative_from_dir(ctx, ctx.root, &relative)
+    {
+        return Some(result);
+    }
+    if let Some(result) = try_html_public_root_relative_asset(ctx, from_file, specifier) {
+        return Some(result);
+    }
+    Some(ResolveResult::Unresolvable(specifier.to_string()))
+}
+
+fn is_root_relative_importer(from_file: &Path) -> bool {
+    from_file.extension().is_some_and(|extension| {
+        matches!(
+            extension.to_str(),
+            Some(
+                "html"
+                    | "jsx"
+                    | "tsx"
+                    | "js"
+                    | "ts"
+                    | "mjs"
+                    | "cjs"
+                    | "mts"
+                    | "cts"
+                    | "gts"
+                    | "gjs"
+            )
+        )
+    })
+}
+
+fn resolve_root_relative_from_dir(
+    ctx: &ResolveContext<'_>,
+    source_dir: &Path,
+    relative: &str,
+) -> Option<ResolveResult> {
+    let resolved = ctx.resolver.resolve(source_dir, relative).ok()?;
+    let resolved_path = resolved.path();
+    if let Some(&file_id) = ctx.raw_path_to_id.get(resolved_path) {
+        return Some(ResolveResult::InternalModule(file_id));
+    }
+    let canonical = ctx.canonicalize_cache.get(resolved_path)?;
+    if let Some(&file_id) = ctx.path_to_id.get(canonical.as_path()) {
+        return Some(ResolveResult::InternalModule(file_id));
+    }
+    if let Some(fallback) = ctx.canonical_fallback
+        && let Some(file_id) = fallback.get(&canonical)
+    {
+        return Some(ResolveResult::InternalModule(file_id));
+    }
+    None
 }
 
 fn nearest_tsconfig_path(root: &Path, from_file: &Path) -> Option<PathBuf> {
@@ -152,80 +314,888 @@ fn nearest_tsconfig_path(root: &Path, from_file: &Path) -> Option<PathBuf> {
     }
 }
 
-fn path_alias_pattern_matches(pattern: &str, specifier: &str) -> bool {
-    match pattern.split_once('*') {
-        Some((prefix, suffix)) if !prefix.is_empty() || !suffix.is_empty() => {
-            specifier.starts_with(prefix)
-                && specifier.ends_with(suffix)
-                && specifier.len() >= prefix.len() + suffix.len()
+fn local_tsconfig_chain(ctx: &ResolveContext<'_>, from_file: &Path) -> Arc<[PathBuf]> {
+    if let Some(chain) = ctx.tsconfig_cache.chain(from_file) {
+        return chain;
+    }
+    let chain: Arc<[PathBuf]> = local_tsconfig_chain_uncached(ctx, from_file).into();
+    ctx.tsconfig_cache
+        .store_chain(from_file, Arc::clone(&chain));
+    chain
+}
+
+fn local_tsconfig_chain_uncached(ctx: &ResolveContext<'_>, from_file: &Path) -> Vec<PathBuf> {
+    let root = ctx.root;
+    let Some(first) = nearest_tsconfig_path(root, from_file) else {
+        return Vec::new();
+    };
+    let mut chain = Vec::new();
+    let mut seen = rustc_hash::FxHashSet::default();
+    collect_local_tsconfig_chain(ctx, from_file, &first, &mut chain, &mut seen);
+    chain
+}
+
+fn collect_local_tsconfig_chain(
+    ctx: &ResolveContext<'_>,
+    from_file: &Path,
+    tsconfig_path: &Path,
+    chain: &mut Vec<PathBuf>,
+    seen: &mut rustc_hash::FxHashSet<PathBuf>,
+) {
+    if !seen.insert(tsconfig_path.to_path_buf()) {
+        return;
+    }
+    let Some(json) = read_tsconfig_json_cached(ctx, tsconfig_path) else {
+        return;
+    };
+    chain.push(tsconfig_path.to_path_buf());
+
+    let root = ctx.root;
+    let tsconfig_dir = tsconfig_path.parent().unwrap_or(root);
+    for reference in referenced_tsconfig_paths(tsconfig_dir, &json) {
+        if reference.is_file() && tsconfig_applies_to_file(ctx, &reference, from_file) {
+            collect_local_tsconfig_chain(ctx, from_file, &reference, chain, seen);
         }
-        Some(_) => false,
-        None => specifier == pattern,
+    }
+
+    for extends in tsconfig_extends_values(&json) {
+        let next = resolve_tsconfig_extends_path(tsconfig_dir, extends);
+        if next.is_file() {
+            collect_local_tsconfig_chain(ctx, from_file, &next, chain, seen);
+        }
     }
 }
 
-fn matches_nearest_tsconfig_path_alias(root: &Path, from_file: &Path, specifier: &str) -> bool {
-    let Some(tsconfig_path) = nearest_tsconfig_path(root, from_file) else {
+fn referenced_tsconfig_paths(base_dir: &Path, json: &Value) -> Vec<PathBuf> {
+    json.get("references")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|reference| reference.get("path").and_then(Value::as_str))
+        .map(|path| resolve_tsconfig_reference_path(base_dir, path))
+        .collect()
+}
+
+fn resolve_tsconfig_reference_path(base_dir: &Path, reference: &str) -> PathBuf {
+    let path = base_dir.join(reference);
+    if path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext == "json" || ext == "jsonc")
+    {
+        return path;
+    }
+    if path.is_dir() {
+        return path.join("tsconfig.json");
+    }
+    let mut with_json = OsString::from(path.as_os_str());
+    with_json.push(".json");
+    let with_json = PathBuf::from(with_json);
+    if with_json.is_file() {
+        with_json
+    } else {
+        path.join("tsconfig.json")
+    }
+}
+
+fn tsconfig_extends_values(json: &Value) -> Vec<&str> {
+    match json.get("extends") {
+        Some(Value::String(extends)) => vec![extends.as_str()],
+        Some(Value::Array(values)) => values.iter().filter_map(Value::as_str).collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn tsconfig_applies_to_file(
+    ctx: &ResolveContext<'_>,
+    tsconfig_path: &Path,
+    from_file: &Path,
+) -> bool {
+    let root = ctx.root;
+    let Some(json) = read_tsconfig_json_cached(ctx, tsconfig_path) else {
         return false;
     };
-    let Ok(file) = File::open(tsconfig_path) else {
+    // `references` paths are joined verbatim, so the directory can carry `./`
+    // and `..` segments. Normalize once: the `include`/`exclude` globs are
+    // built from this string and a literal `./` or `..` never matches a
+    // normalized file path.
+    let tsconfig_dir = normalize_path_lexically(tsconfig_path.parent().unwrap_or(root));
+    let tsconfig_dir = tsconfig_dir.as_path();
+    if let Some(files) = json.get("files").and_then(Value::as_array) {
+        return files
+            .iter()
+            .filter_map(Value::as_str)
+            .map(|file| resolve_tsconfig_relative_path(tsconfig_dir, file))
+            .any(|file| same_path(&file, from_file));
+    }
+
+    let include_matches = match json.get("include").and_then(Value::as_array) {
+        Some(include) => glob_values_match(tsconfig_dir, include, from_file),
+        None => from_file.starts_with(tsconfig_dir),
+    };
+    if !include_matches {
+        return false;
+    }
+
+    !json
+        .get("exclude")
+        .and_then(Value::as_array)
+        .is_some_and(|exclude| glob_values_match(tsconfig_dir, exclude, from_file))
+}
+
+fn glob_values_match(base_dir: &Path, values: &[Value], path: &Path) -> bool {
+    let mut builder = GlobSetBuilder::new();
+    let mut has_patterns = false;
+    for value in values.iter().filter_map(Value::as_str) {
+        let mut pattern = resolve_tsconfig_relative_path(base_dir, value);
+        if !has_glob_meta(value) && pattern.is_dir() {
+            pattern = pattern.join("**/*");
+        }
+        let Some(pattern) = pattern.to_str() else {
+            continue;
+        };
+        let Ok(glob) = Glob::new(pattern) else {
+            continue;
+        };
+        builder.add(glob);
+        has_patterns = true;
+    }
+    has_patterns && builder.build().is_ok_and(|set| set.is_match(path))
+}
+
+fn has_glob_meta(value: &str) -> bool {
+    value
+        .bytes()
+        .any(|byte| matches!(byte, b'*' | b'?' | b'[' | b']' | b'{'))
+}
+
+fn resolve_tsconfig_relative_path(base_dir: &Path, path: &str) -> PathBuf {
+    let path = Path::new(path);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base_dir.join(path)
+    }
+}
+
+fn same_path(left: &Path, right: &Path) -> bool {
+    left == right
+        || dunce::canonicalize(left)
+            .ok()
+            .zip(dunce::canonicalize(right).ok())
+            .is_some_and(|(left, right)| left == right)
+}
+
+fn is_storybook_preview_html(from_file: &Path) -> bool {
+    matches!(
+        from_file.file_name().and_then(|name| name.to_str()),
+        Some("preview-head.html" | "preview-body.html")
+    ) && from_file
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        == Some(".storybook")
+}
+
+/// Return `true` when `specifier` matches the plugin alias `prefix` at a
+/// path-segment boundary.
+///
+/// Mirrors `alias_match_remainder` in `fallbacks.rs`: a prefix that already
+/// ends with `/` matches any continuation. For bare prefixes (e.g. `@` or
+/// `~`) the match is only admitted when the specifier equals the prefix
+/// exactly or the remainder after stripping the prefix starts with `/`, so
+/// `prefix = "@"` does NOT match `@radix-ui/react-checkbox`.
+fn specifier_matches_alias_prefix(specifier: &str, prefix: &str) -> bool {
+    let Some(remainder) = specifier.strip_prefix(prefix) else {
         return false;
     };
-    let reader = StripComments::new(BufReader::new(file));
-    let Ok(json) = serde_json::from_reader::<_, Value>(reader) else {
-        return false;
+    remainder.is_empty() || prefix.ends_with('/') || remainder.starts_with('/')
+}
+
+fn strip_url_suffix(specifier: &str) -> &str {
+    specifier
+        .find(['?', '#'])
+        .map_or(specifier, |idx| &specifier[..idx])
+}
+
+fn storybook_static_url_path(specifier: &str) -> Option<String> {
+    let lookup = strip_url_suffix(specifier);
+    if lookup.starts_with("../") {
+        return None;
+    }
+    if lookup.starts_with('/') {
+        return Some(lookup.to_string());
+    }
+    lookup
+        .strip_prefix("./")
+        .map(|rest| format!("/{rest}"))
+        .or_else(|| (!lookup.starts_with('.')).then(|| format!("/{lookup}")))
+}
+
+fn static_dir_relative_path<'a>(url_path: &'a str, mount: &str) -> Option<&'a str> {
+    if mount == "/" {
+        return url_path.strip_prefix('/');
+    }
+    if url_path == mount {
+        return Some("");
+    }
+    url_path
+        .strip_prefix(mount)
+        .and_then(|rest| rest.strip_prefix('/'))
+}
+
+fn is_safe_static_dir_relative_path(relative: &str) -> bool {
+    !Path::new(relative).components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_)
+        )
+    })
+}
+
+fn resolve_filesystem_path(ctx: &ResolveContext<'_>, path: &Path) -> Option<ResolveResult> {
+    if let Some(&file_id) = ctx.raw_path_to_id.get(path) {
+        return Some(ResolveResult::InternalModule(file_id));
+    }
+    let canonical = ctx.canonicalize_cache.get(path)?;
+    if let Some(&file_id) = ctx.path_to_id.get(canonical.as_path()) {
+        return Some(ResolveResult::InternalModule(file_id));
+    }
+    if let Some(fallback) = ctx.canonical_fallback
+        && let Some(file_id) = fallback.get(&canonical)
+    {
+        return Some(ResolveResult::InternalModule(file_id));
+    }
+    path.exists()
+        .then_some(ResolveResult::ExternalFile(canonical))
+}
+
+fn try_storybook_static_dir_mapping(
+    ctx: &ResolveContext<'_>,
+    from_file: &Path,
+    specifier: &str,
+) -> Option<ResolveResult> {
+    if ctx.static_dir_mappings.is_empty() || !is_storybook_preview_html(from_file) {
+        return None;
+    }
+    let url_path = storybook_static_url_path(specifier)?;
+    ctx.static_dir_mappings
+        .iter()
+        .filter_map(|(from_dir, mount)| {
+            let relative = static_dir_relative_path(&url_path, mount)?;
+            if !is_safe_static_dir_relative_path(relative) {
+                return None;
+            }
+            Some((mount.len(), from_dir.join(relative)))
+        })
+        .max_by_key(|(mount_len, _)| *mount_len)
+        .and_then(|(_, path)| resolve_filesystem_path(ctx, &path))
+}
+
+fn try_html_public_root_relative_asset(
+    ctx: &ResolveContext<'_>,
+    from_file: &Path,
+    specifier: &str,
+) -> Option<ResolveResult> {
+    if from_file.extension().and_then(|ext| ext.to_str()) != Some("html") {
+        return None;
+    }
+
+    let relative = strip_url_suffix(specifier).strip_prefix('/')?;
+    if !is_safe_static_dir_relative_path(relative) {
+        return None;
+    }
+
+    resolve_filesystem_path(ctx, &ctx.root.join("public").join(relative))
+}
+
+fn resolve_tsconfig_extends_path(base_dir: &Path, extends: &str) -> PathBuf {
+    let path = if is_relative_tsconfig_extends(extends) || Path::new(extends).is_absolute() {
+        base_dir.join(extends)
+    } else if let Some(package_path) = resolve_package_tsconfig_extends(base_dir, extends) {
+        package_path
+    } else {
+        base_dir.join(extends)
     };
-    let Some(paths) = json
-        .get("compilerOptions")
-        .and_then(|compiler_options| compiler_options.get("paths"))
-        .and_then(Value::as_object)
-    else {
+    if path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext == "json" || ext == "jsonc")
+    {
+        path
+    } else {
+        let mut with_json = OsString::from(path.as_os_str());
+        with_json.push(".json");
+        PathBuf::from(with_json)
+    }
+}
+
+fn is_relative_tsconfig_extends(extends: &str) -> bool {
+    extends.starts_with("./") || extends.starts_with("../")
+}
+
+fn resolve_package_tsconfig_extends(base_dir: &Path, extends: &str) -> Option<PathBuf> {
+    for ancestor in base_dir.ancestors() {
+        let candidate = ancestor.join("node_modules").join(extends);
+        let candidate = resolve_tsconfig_extends_candidate(candidate);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn resolve_tsconfig_extends_candidate(path: PathBuf) -> PathBuf {
+    if path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext == "json" || ext == "jsonc")
+    {
+        return path;
+    }
+    if path.is_dir() {
+        return path.join("tsconfig.json");
+    }
+    let mut with_json = OsString::from(path.as_os_str());
+    with_json.push(".json");
+    let with_json = PathBuf::from(with_json);
+    if with_json.is_file() { with_json } else { path }
+}
+
+fn read_tsconfig_json(path: &Path) -> Option<Value> {
+    read_json_file(path)
+}
+
+fn read_tsconfig_json_cached(ctx: &ResolveContext<'_>, path: &Path) -> Option<Arc<Value>> {
+    ctx.tsconfig_cache.json(path, read_tsconfig_json)
+}
+
+fn read_json_file(path: &Path) -> Option<Value> {
+    let content = fs::read_to_string(path).ok()?;
+    if let Ok(json) = serde_json::from_str::<Value>(&content) {
+        return Some(json);
+    }
+    jsonc_parser::parse_to_serde_value::<Value>(&content, &jsonc_parse_options()).ok()
+}
+
+fn jsonc_parse_options() -> jsonc_parser::ParseOptions {
+    jsonc_parser::ParseOptions {
+        allow_comments: true,
+        allow_loose_object_property_names: false,
+        allow_trailing_commas: true,
+        allow_missing_commas: false,
+        allow_single_quoted_strings: false,
+        allow_hexadecimal_numbers: false,
+        allow_unary_plus_numbers: false,
+    }
+}
+
+fn path_alias_pattern_matches(pattern: &str, specifier: &str) -> bool {
+    if pattern == "*" {
         return false;
+    }
+    path_alias_capture(pattern, specifier).is_some()
+}
+
+fn path_alias_capture<'a>(pattern: &str, specifier: &'a str) -> Option<&'a str> {
+    match pattern.split_once('*') {
+        Some((prefix, suffix)) if !prefix.is_empty() || !suffix.is_empty() => {
+            if specifier.starts_with(prefix)
+                && specifier.ends_with(suffix)
+                && specifier.len() >= prefix.len() + suffix.len()
+            {
+                Some(&specifier[prefix.len()..specifier.len() - suffix.len()])
+            } else {
+                None
+            }
+        }
+        Some(_) => Some(specifier),
+        None => (specifier == pattern).then_some(""),
+    }
+}
+
+fn matches_nearest_tsconfig_path_alias(
+    ctx: &ResolveContext<'_>,
+    from_file: &Path,
+    specifier: &str,
+) -> bool {
+    for tsconfig_path in local_tsconfig_chain(ctx, from_file).iter() {
+        let Some(paths) = read_tsconfig_json_cached(ctx, tsconfig_path).and_then(|json| {
+            json.get("compilerOptions")
+                .and_then(|compiler_options| compiler_options.get("paths"))
+                .and_then(Value::as_object)
+                .cloned()
+        }) else {
+            continue;
+        };
+        return paths
+            .keys()
+            .any(|pattern| path_alias_pattern_matches(pattern, specifier));
+    }
+    false
+}
+
+fn try_nearest_tsconfig_path_alias(
+    ctx: &ResolveContext<'_>,
+    from_file: &Path,
+    specifier: &str,
+    from_style: bool,
+) -> Option<ResolveResult> {
+    let style_context = from_style
+        || from_file
+            .extension()
+            .is_some_and(|extension| extension == "scss" || extension == "sass");
+    let chain = local_tsconfig_chain(ctx, from_file);
+    for tsconfig_path in chain.iter() {
+        let Some(json) = read_tsconfig_json_cached(ctx, tsconfig_path) else {
+            continue;
+        };
+        let has_paths = json
+            .get("compilerOptions")
+            .and_then(|compiler_options| compiler_options.get("paths"))
+            .is_some();
+        if let Some(result) =
+            try_tsconfig_paths_from_config(ctx, tsconfig_path, &json, specifier, style_context)
+        {
+            return Some(result);
+        }
+        if has_paths {
+            return None;
+        }
+    }
+    for tsconfig_path in chain.iter() {
+        let Some(json) = read_tsconfig_json_cached(ctx, tsconfig_path) else {
+            continue;
+        };
+        let has_base_url = json
+            .get("compilerOptions")
+            .and_then(|compiler_options| compiler_options.get("baseUrl"))
+            .is_some();
+        if let Some(result) =
+            try_tsconfig_base_url_from_config(ctx, tsconfig_path, &json, specifier, style_context)
+        {
+            return Some(result);
+        }
+        if has_base_url {
+            return None;
+        }
+    }
+    None
+}
+
+fn try_tsconfig_paths_from_config(
+    ctx: &ResolveContext<'_>,
+    tsconfig_path: &Path,
+    json: &Value,
+    specifier: &str,
+    style_context: bool,
+) -> Option<ResolveResult> {
+    let compiler_options = json.get("compilerOptions")?;
+    let paths = compiler_options.get("paths")?.as_object()?;
+    let tsconfig_dir = tsconfig_path.parent().unwrap_or(ctx.root);
+    let base_dir = compiler_options
+        .get("baseUrl")
+        .and_then(Value::as_str)
+        .map_or_else(
+            || tsconfig_dir.to_path_buf(),
+            |base_url| {
+                let base_url = Path::new(base_url);
+                if base_url.is_absolute() {
+                    base_url.to_path_buf()
+                } else {
+                    tsconfig_dir.join(base_url)
+                }
+            },
+        );
+
+    let mut matches: Vec<_> = paths
+        .iter()
+        .filter_map(|(pattern, targets)| {
+            path_alias_capture(pattern, specifier)
+                .map(|capture| (pattern.as_str(), capture, targets))
+        })
+        .collect();
+    matches.sort_by_key(|(pattern, _, _)| std::cmp::Reverse(path_alias_specificity(pattern)));
+
+    for (_, capture, targets) in matches {
+        let Some(targets) = targets.as_array() else {
+            continue;
+        };
+        for target in targets.iter().filter_map(Value::as_str) {
+            let target = if target.contains('*') {
+                target.replacen('*', capture, 1)
+            } else {
+                target.to_string()
+            };
+            let target_path = Path::new(&target);
+            let absolute = if target_path.is_absolute() {
+                target_path.to_path_buf()
+            } else {
+                base_dir.join(target_path)
+            };
+            if let Some(result) = try_tsconfig_alias_target(ctx, &absolute, style_context) {
+                return Some(result);
+            }
+        }
+    }
+    None
+}
+
+fn path_alias_specificity(pattern: &str) -> usize {
+    match pattern.split_once('*') {
+        Some((prefix, suffix)) => prefix.len() + suffix.len(),
+        None => usize::MAX,
+    }
+}
+
+fn try_tsconfig_base_url_from_config(
+    ctx: &ResolveContext<'_>,
+    tsconfig_path: &Path,
+    json: &Value,
+    specifier: &str,
+    style_context: bool,
+) -> Option<ResolveResult> {
+    if specifier.starts_with('.') || Path::new(specifier).is_absolute() {
+        return None;
+    }
+    let compiler_options = json.get("compilerOptions")?;
+    let base_url = compiler_options.get("baseUrl")?.as_str()?;
+    let tsconfig_dir = tsconfig_path.parent().unwrap_or(ctx.root);
+    let base_url = Path::new(base_url);
+    let base_dir = if base_url.is_absolute() {
+        base_url.to_path_buf()
+    } else {
+        tsconfig_dir.join(base_url)
     };
-    paths
-        .keys()
-        .any(|pattern| path_alias_pattern_matches(pattern, specifier))
+    try_tsconfig_alias_target(ctx, &base_dir.join(specifier), style_context)
+}
+
+fn try_tsconfig_alias_target(
+    ctx: &ResolveContext<'_>,
+    target: &Path,
+    style_context: bool,
+) -> Option<ResolveResult> {
+    if let Some(result) = resolve_tsconfig_alias_candidate(ctx, target) {
+        return Some(result);
+    }
+
+    if let Some(result) = try_tsconfig_alias_extension_alias(ctx, target) {
+        return Some(result);
+    }
+
+    if style_context && let Some(result) = try_tsconfig_alias_sass_target(ctx, target) {
+        return Some(result);
+    }
+
+    if let Some(result) = try_tsconfig_alias_directory(ctx, target, style_context) {
+        return Some(result);
+    }
+
+    if should_probe_extensions(ctx, target) {
+        for ext in ctx.extensions {
+            if let Some(result) =
+                resolve_tsconfig_alias_candidate(ctx, &with_appended_extension(target, ext))
+            {
+                return Some(result);
+            }
+        }
+    }
+
+    if target.extension().is_none() {
+        for ext in ctx.extensions {
+            let index = target.join(format!("index{ext}"));
+            if let Some(result) = resolve_tsconfig_alias_candidate(ctx, &index) {
+                return Some(result);
+            }
+        }
+    }
+
+    None
+}
+
+/// Probe Sass's extension, partial, and directory-index conventions against an
+/// already-expanded tsconfig alias target.
+///
+/// This must only be called for stylesheet edges. JavaScript and TypeScript
+/// imports may use the same alias text, but `_name.scss` is not a valid module
+/// candidate in those contexts.
+fn try_tsconfig_alias_sass_target(
+    ctx: &ResolveContext<'_>,
+    target: &Path,
+) -> Option<ResolveResult> {
+    let style_extension = target
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| matches!(extension, "css" | "scss" | "sass"));
+
+    let filename = target.file_name()?.to_str()?;
+    let partial =
+        (!filename.starts_with('_')).then(|| target.with_file_name(format!("_{filename}")));
+
+    if style_extension {
+        if let Some(partial) = partial
+            && let Some(result) = resolve_tsconfig_alias_candidate(ctx, &partial)
+        {
+            return Some(result);
+        }
+        return None;
+    }
+
+    // Match the established Sass fallback order: exhaust direct, partial, and
+    // directory-index candidates for one extension before trying the next.
+    for extension in [".scss", ".sass"] {
+        if let Some(result) =
+            resolve_tsconfig_alias_candidate(ctx, &with_appended_extension(target, extension))
+        {
+            return Some(result);
+        }
+        if let Some(partial) = &partial
+            && let Some(result) =
+                resolve_tsconfig_alias_candidate(ctx, &with_appended_extension(partial, extension))
+        {
+            return Some(result);
+        }
+        for index in ["_index", "index"] {
+            if let Some(result) = resolve_tsconfig_alias_candidate(
+                ctx,
+                &with_appended_extension(&target.join(index), extension),
+            ) {
+                return Some(result);
+            }
+        }
+    }
+
+    for candidate in [
+        with_appended_extension(target, ".css"),
+        target.join("index.css"),
+    ] {
+        if let Some(result) = resolve_tsconfig_alias_candidate(ctx, &candidate) {
+            return Some(result);
+        }
+    }
+
+    None
+}
+
+fn should_probe_extensions(ctx: &ResolveContext<'_>, target: &Path) -> bool {
+    target
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_none_or(|ext| {
+            !ctx.extensions
+                .iter()
+                .any(|known| known.trim_start_matches('.') == ext)
+        })
+}
+
+fn with_appended_extension(path: &Path, extension: &str) -> PathBuf {
+    let mut value = OsString::from(path.as_os_str());
+    value.push(extension);
+    PathBuf::from(value)
+}
+
+fn try_tsconfig_alias_directory(
+    ctx: &ResolveContext<'_>,
+    target: &Path,
+    style_context: bool,
+) -> Option<ResolveResult> {
+    if !target.is_dir() {
+        return None;
+    }
+    if let Some(package_json) = read_json_file(&target.join("package.json")) {
+        for field in ["module", "main"] {
+            if let Some(entry) = package_json.get(field).and_then(Value::as_str)
+                && let Some(result) =
+                    try_tsconfig_alias_target(ctx, &target.join(entry), style_context)
+            {
+                return Some(result);
+            }
+        }
+    }
+    let parent = target.parent()?;
+    let name = target.file_name()?.to_str()?;
+    let resolved = ctx.resolver.resolve(parent, name).ok()?;
+    resolve_tsconfig_alias_candidate(ctx, resolved.path())
+}
+
+fn try_tsconfig_alias_extension_alias(
+    ctx: &ResolveContext<'_>,
+    target: &Path,
+) -> Option<ResolveResult> {
+    let import_ext = target.extension().and_then(|ext| ext.to_str())?;
+    if !matches!(import_ext, "js" | "jsx" | "mjs" | "cjs") {
+        return None;
+    }
+    for ext in ctx
+        .extensions
+        .iter()
+        .filter(|ext| extension_alias_matches(import_ext, ext))
+    {
+        if let Some(result) =
+            resolve_tsconfig_alias_candidate(ctx, &with_exact_extension(target, ext))
+        {
+            return Some(result);
+        }
+    }
+    None
+}
+
+fn extension_alias_matches(import_ext: &str, candidate_ext: &str) -> bool {
+    let candidate_ext = candidate_ext.trim_start_matches('.');
+    let aliases: &[&str] = match import_ext {
+        "js" => &["ts", "tsx", "js"],
+        "jsx" => &["tsx", "jsx"],
+        "mjs" => &["mts", "mjs"],
+        "cjs" => &["cts", "cjs"],
+        _ => return false,
+    };
+    aliases
+        .iter()
+        .any(|alias| candidate_ext == *alias || candidate_ext.ends_with(&format!(".{alias}")))
+}
+
+fn with_exact_extension(path: &Path, extension: &str) -> PathBuf {
+    let Some(file_stem) = path.file_stem() else {
+        return path.to_path_buf();
+    };
+    let mut file_name = OsString::from(file_stem);
+    file_name.push(extension);
+    path.with_file_name(file_name)
+}
+
+fn resolve_tsconfig_alias_candidate(
+    ctx: &ResolveContext<'_>,
+    candidate: &Path,
+) -> Option<ResolveResult> {
+    if let Some(&file_id) = ctx.raw_path_to_id.get(candidate) {
+        return Some(ResolveResult::InternalModule(file_id));
+    }
+    if let Some(canonical) = ctx.canonicalize_cache.get(candidate) {
+        if let Some(&file_id) = ctx.path_to_id.get(canonical.as_path()) {
+            return Some(ResolveResult::InternalModule(file_id));
+        }
+        if let Some(fallback) = ctx.canonical_fallback
+            && let Some(file_id) = fallback.get(&canonical)
+        {
+            return Some(ResolveResult::InternalModule(file_id));
+        }
+        if let Some(file_id) = try_source_fallback(&canonical, ctx.path_to_id) {
+            return Some(ResolveResult::InternalModule(file_id));
+        }
+        if let Some(file_id) =
+            try_pnpm_workspace_fallback(&canonical, ctx.path_to_id, ctx.workspace_roots)
+        {
+            return Some(ResolveResult::InternalModule(file_id));
+        }
+    }
+    None
 }
 
 /// Try the SCSS-specific resolution fallbacks in order: local partial,
 /// framework-supplied include paths, and `node_modules/`.
 ///
-/// Only applies to `.scss` / `.sass` importers. Returns `None` when the
-/// importer is not an SCSS file or when none of the fallbacks produce a hit,
-/// so the outer error path continues to the generic alias / bare / workspace
-/// fallbacks.
+/// Applies when the importer is a `.scss` / `.sass` file OR the import
+/// originated from an SFC `<style lang="scss">` block (`from_style = true`).
+/// SFC importers carry the `.vue` / `.svelte` extension at the file system
+/// level but still emit SCSS-shape specifiers from style blocks; the
+/// `from_style` flag is the authoritative signal that the import is a
+/// CSS-context reference rather than a JS-context import from the same file.
+/// Returns `None` when none of the fallbacks produce a hit, so the outer error
+/// path continues to the generic alias / bare / workspace fallbacks.
 fn try_scss_fallbacks(
     ctx: &ResolveContext<'_>,
     from_file: &Path,
     specifier: &str,
+    from_style: bool,
 ) -> Option<ResolveResult> {
-    if !from_file
+    let is_scss_importer = from_file
         .extension()
-        .is_some_and(|e| e == "scss" || e == "sass")
-    {
+        .is_some_and(|e| e == "scss" || e == "sass");
+    if !is_scss_importer && !from_style {
         return None;
     }
-    // 1. Local partial convention: `@use 'variables'` → `_variables.scss`.
+    if let Some(result) = try_css_extension_fallback(ctx, from_file, specifier) {
+        return Some(result);
+    }
     if let Some(result) = try_scss_partial_fallback(ctx, from_file, specifier) {
         return Some(result);
     }
-    // 2. Framework-supplied SCSS include paths (Angular's
-    //    `stylePreprocessorOptions.includePaths`, Nx equivalent). See #103.
-    if let Some(result) = try_scss_include_path_fallback(ctx, from_file, specifier) {
+    if let Some(result) = try_scss_include_path_fallback(ctx, from_file, specifier, from_style) {
         return Some(result);
     }
-    // 3. `node_modules/` search (Sass's own resolution algorithm):
-    //    `@import 'bootstrap/scss/functions'` →
-    //    `node_modules/bootstrap/scss/_functions.scss`. Returns
-    //    `ResolveResult::NpmPackage` so unused-/unlisted-dependency detection
-    //    stays accurate. See #125.
-    try_scss_node_modules_fallback(ctx, from_file, specifier)
+    try_scss_node_modules_fallback(ctx, from_file, specifier, from_style)
 }
 
 fn is_style_file(path: &Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
         .is_some_and(|ext| matches!(ext, "css" | "scss" | "sass"))
+}
+
+/// Return `true` when the path's extension is a JS/TS-family runtime extension.
+///
+/// Used to reject standard-resolver hits when the importer is a stylesheet:
+/// Sass's resolution algorithm only ever considers `.css` / `.scss` / `.sass`
+/// files, so a sibling `.tsx` / `.ts` / `.js` cannot legally satisfy a Sass
+/// `@use` / `@import`. The resolver's extension list mixes JS/TS and CSS,
+/// so without this guard `@use 'Widget'` from a `.scss` importer would
+/// resolve to a sibling `Widget.tsx` whenever both files exist. See #245.
+fn is_js_ts_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| {
+            matches!(
+                ext,
+                "ts" | "tsx" | "mts" | "cts" | "gts" | "js" | "jsx" | "mjs" | "cjs" | "gjs"
+            )
+        })
+}
+
+fn is_plain_css_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext == "css")
+}
+
+fn is_bare_style_subpath(specifier: &str) -> bool {
+    is_bare_specifier(specifier)
+        && specifier.contains('/')
+        && Path::new(specifier)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| {
+                ext.eq_ignore_ascii_case("css")
+                    || ext.eq_ignore_ascii_case("scss")
+                    || ext.eq_ignore_ascii_case("sass")
+                    || ext.eq_ignore_ascii_case("less")
+            })
+}
+
+fn is_bare_style_package_reference(specifier: &str) -> bool {
+    if !is_bare_specifier(specifier) {
+        return false;
+    }
+
+    is_bare_style_subpath(specifier) || extract_package_name(specifier) == specifier
+}
+
+fn try_css_relative_subpath_fallback(
+    ctx: &ResolveContext<'_>,
+    from_file: &Path,
+    specifier: &str,
+    from_style: bool,
+) -> Option<ResolveResult> {
+    if !is_plain_css_file(from_file) || !is_bare_style_subpath(specifier) {
+        return None;
+    }
+
+    let relative = format!("./{specifier}");
+    match resolve_specifier(ctx, from_file, &relative, from_style) {
+        ResolveResult::Unresolvable(_) => None,
+        result => Some(result),
+    }
 }
 
 fn is_node_modules_path(path: &Path) -> bool {
@@ -239,6 +1209,7 @@ fn should_preserve_node_modules_style_file(
     specifier: &str,
     from_file: &Path,
     resolved_path: &Path,
+    from_style: bool,
 ) -> bool {
     if !is_style_file(resolved_path) || !is_node_modules_path(resolved_path) {
         return false;
@@ -250,267 +1221,744 @@ fn should_preserve_node_modules_style_file(
         return true;
     }
 
+    if is_bare_specifier(specifier) && (from_style || is_style_file(from_file)) {
+        return true;
+    }
+
     is_node_modules_path(from_file) && (specifier.starts_with('.') || specifier.starts_with('/'))
 }
 
+fn try_style_condition_package_resolution(
+    ctx: &ResolveContext<'_>,
+    from_file: &Path,
+    specifier: &str,
+    from_style: bool,
+) -> Option<ResolveResult> {
+    if !is_bare_style_package_reference(specifier) || (!from_style && !is_style_file(from_file)) {
+        return None;
+    }
+
+    let ResolveFileAttempt::Resolved {
+        resolution: resolved,
+        ..
+    } = resolve_file_with_resolver_and_tsconfig_fallback(
+        ctx,
+        ctx.style_resolver,
+        from_file,
+        specifier,
+    )
+    else {
+        return None;
+    };
+    let resolved_path = resolved.path();
+    if !is_style_file(resolved_path) {
+        return None;
+    }
+
+    if let Some(&file_id) = ctx.raw_path_to_id.get(resolved_path) {
+        return Some(ResolveResult::InternalModule(file_id));
+    }
+
+    if should_preserve_node_modules_style_file(specifier, from_file, resolved_path, from_style) {
+        return Some(ResolveResult::ExternalFile(resolved_path.to_path_buf()));
+    }
+
+    if let Some(pkg_name) = package_usage_name_for_resolved_package(specifier, resolved_path)
+        && !ctx.workspace_roots.contains_key(pkg_name.as_str())
+    {
+        return Some(ResolveResult::NpmPackage(pkg_name));
+    }
+
+    if let Some(canonical) = ctx.canonicalize_cache.get(resolved_path) {
+        return Some(resolve_style_canonical_path(
+            ctx, from_file, specifier, from_style, canonical,
+        ));
+    }
+
+    package_usage_name_for_resolved_package(specifier, resolved_path)
+        .map(ResolveResult::NpmPackage)
+        .or_else(|| Some(ResolveResult::ExternalFile(resolved_path.to_path_buf())))
+}
+
+/// Classify the canonicalized style-resolver target: internal module via the
+/// id maps and fallbacks, preserved external `node_modules` style file, npm
+/// package, or external file.
+fn resolve_style_canonical_path(
+    ctx: &ResolveContext<'_>,
+    from_file: &Path,
+    specifier: &str,
+    from_style: bool,
+    canonical: PathBuf,
+) -> ResolveResult {
+    if let Some(&file_id) = ctx.path_to_id.get(canonical.as_path()) {
+        return ResolveResult::InternalModule(file_id);
+    }
+    if let Some(fallback) = ctx.canonical_fallback
+        && let Some(file_id) = fallback.get(&canonical)
+    {
+        return ResolveResult::InternalModule(file_id);
+    }
+    if let Some(file_id) = try_source_fallback(&canonical, ctx.path_to_id) {
+        return ResolveResult::InternalModule(file_id);
+    }
+    if let Some(file_id) =
+        try_pnpm_workspace_fallback(&canonical, ctx.path_to_id, ctx.workspace_roots)
+    {
+        return ResolveResult::InternalModule(file_id);
+    }
+    if should_preserve_node_modules_style_file(specifier, from_file, &canonical, from_style) {
+        return ResolveResult::ExternalFile(canonical);
+    }
+    if let Some(pkg_name) = package_usage_name_for_resolved_package(specifier, &canonical)
+        && !ctx.workspace_roots.contains_key(pkg_name.as_str())
+    {
+        return ResolveResult::NpmPackage(pkg_name);
+    }
+    if is_inside_project_root(ctx, &canonical)
+        && matches_nearest_tsconfig_path_alias(ctx, from_file, specifier)
+    {
+        return ResolveResult::ExternalFile(canonical);
+    }
+    if let Some(pkg_name) = package_usage_name_for_external_bare_specifier(specifier) {
+        return ResolveResult::NpmPackage(pkg_name);
+    }
+    ResolveResult::ExternalFile(canonical)
+}
+
+/// Whether `path` lives under the analyzed project root.
+///
+/// Containment is tested against both the configured root and its canonicalized
+/// form: the resolver returns realpaths (`ResolveOptions::symlinks` defaults to
+/// true) while the configured root may itself be reached through a symlink, as
+/// it is under `/tmp` on macOS.
+///
+/// This separates the two cases that reach the bare-specifier classification
+/// tail with no `node_modules` segment in the resolved path. A path-alias target
+/// inside the root is a project file the alias points at, which stays a concrete
+/// `ExternalFile` when `ignorePatterns` kept it out of the file index. A target
+/// outside the root is a workspace package reached through its install symlink,
+/// which must keep npm-package accounting so the declared dependency is credited
+/// (see `package_usage_name_for_external_bare_specifier`).
+fn is_inside_project_root(ctx: &ResolveContext<'_>, path: &Path) -> bool {
+    if path.starts_with(ctx.root) {
+        return true;
+    }
+    ctx.canonicalize_cache
+        .get(ctx.root)
+        .is_some_and(|canonical_root| path.starts_with(canonical_root))
+}
+
+/// Package-usage key for an import that resolved into `node_modules`.
+///
+/// pnpm can install a package under a declared name (e.g. `unstorage`) symlinked
+/// to a `.pnpm` store whose inner package has a different "source" name (e.g.
+/// `unstorage-nightly`). For a plain bare specifier we credit the declared import
+/// name so `unused-dependency` / `unlisted-dependency` accounting matches what the
+/// user wrote in `package.json`, not the on-disk source package. Path aliases that
+/// happen to be bare (Node.js `#imports`, `~/`, `@/`, PascalCase scopes) are
+/// excluded: they can map to an external package whose real name is only recoverable
+/// from the resolved path, so they keep the resolved-package name. Returns `None`
+/// when the path is not inside a `node_modules` directory.
+pub(super) fn package_usage_name_for_resolved_package(
+    specifier: &str,
+    resolved_path: &Path,
+) -> Option<String> {
+    let resolved_package = extract_package_name_from_node_modules_path(resolved_path)?;
+    if is_bare_specifier(specifier) && !is_path_alias(specifier) {
+        Some(extract_package_name(specifier))
+    } else {
+        Some(resolved_package)
+    }
+}
+
+/// Package-usage key for a valid bare package specifier whose resolved file
+/// canonicalized outside the analyzed root before a `node_modules` segment could
+/// be observed. This preserves dependency accounting for pnpm workspace symlinks
+/// when users analyze a workspace package directly.
+pub(super) fn package_usage_name_for_external_bare_specifier(specifier: &str) -> Option<String> {
+    if !is_bare_specifier(specifier) || is_path_alias(specifier) {
+        return None;
+    }
+    if specifier.starts_with('@') && specifier.split('/').nth(1).is_none_or(str::is_empty) {
+        return None;
+    }
+
+    let package_name = extract_package_name(specifier);
+    is_valid_package_name(&package_name).then_some(package_name)
+}
+
+struct ResolvedPathContext<'ctx, 'resolve> {
+    ctx: &'resolve ResolveContext<'ctx>,
+    from_file: &'resolve Path,
+    specifier: &'resolve str,
+    from_style: bool,
+}
+
+impl ResolvedPathContext<'_, '_> {
+    fn resolve(&self, resolved_path: &Path) -> ResolveResult {
+        if let Some(&file_id) = self.ctx.raw_path_to_id.get(resolved_path) {
+            return ResolveResult::InternalModule(file_id);
+        }
+        if let Some(result) = self.bare_package_result(resolved_path) {
+            return result;
+        }
+
+        match self.ctx.canonicalize_cache.get(resolved_path) {
+            Some(canonical) => self.resolve_canonical_path(canonical),
+            None => self.resolve_uncanonicalized_path(resolved_path),
+        }
+    }
+
+    fn bare_package_result(&self, resolved_path: &Path) -> Option<ResolveResult> {
+        if !is_bare_specifier(self.specifier)
+            || resolved_path
+                .as_os_str()
+                .as_encoded_bytes()
+                .windows(7)
+                .any(|window| window == b"/.pnpm/" || window == b"\\.pnpm\\")
+        {
+            return None;
+        }
+        let pkg_name = package_usage_name_for_resolved_package(self.specifier, resolved_path)?;
+        if self.ctx.workspace_roots.contains_key(pkg_name.as_str()) {
+            return None;
+        }
+        Some(self.package_result_or_preserved_file(pkg_name, resolved_path))
+    }
+
+    fn resolve_canonical_path(&self, canonical: PathBuf) -> ResolveResult {
+        if let Some(&file_id) = self.ctx.path_to_id.get(canonical.as_path()) {
+            ResolveResult::InternalModule(file_id)
+        } else if let Some(fallback) = self.ctx.canonical_fallback
+            && let Some(file_id) = fallback.get(&canonical)
+        {
+            ResolveResult::InternalModule(file_id)
+        } else if let Some(file_id) = try_source_fallback(&canonical, self.ctx.path_to_id) {
+            ResolveResult::InternalModule(file_id)
+        } else if let Some(file_id) =
+            try_pnpm_workspace_fallback(&canonical, self.ctx.path_to_id, self.ctx.workspace_roots)
+        {
+            ResolveResult::InternalModule(file_id)
+        } else if let Some(result) = self.package_or_external_result(&canonical) {
+            result
+        } else {
+            ResolveResult::ExternalFile(canonical)
+        }
+    }
+
+    fn resolve_uncanonicalized_path(&self, resolved_path: &Path) -> ResolveResult {
+        if let Some(file_id) = try_source_fallback(resolved_path, self.ctx.path_to_id) {
+            ResolveResult::InternalModule(file_id)
+        } else if let Some(file_id) = try_pnpm_workspace_fallback(
+            resolved_path,
+            self.ctx.path_to_id,
+            self.ctx.workspace_roots,
+        ) {
+            ResolveResult::InternalModule(file_id)
+        } else if let Some(result) = self.package_or_external_result(resolved_path) {
+            result
+        } else {
+            ResolveResult::ExternalFile(resolved_path.to_path_buf())
+        }
+    }
+
+    fn package_or_external_result(&self, path: &Path) -> Option<ResolveResult> {
+        if let Some(pkg_name) = package_usage_name_for_resolved_package(self.specifier, path) {
+            if self.ctx.workspace_roots.contains_key(pkg_name.as_str())
+                && let Some(result) = try_workspace_package_fallback(self.ctx, self.specifier)
+            {
+                return Some(result);
+            }
+            return Some(self.package_result_or_preserved_file(pkg_name, path));
+        }
+
+        // A resolved path alias target can be absent from the project file index when
+        // ignorePatterns excluded it. Keep the concrete target instead of reclassifying
+        // the alias's bare-looking specifier as an npm package.
+        if is_inside_project_root(self.ctx, path)
+            && matches_nearest_tsconfig_path_alias(self.ctx, self.from_file, self.specifier)
+        {
+            return Some(ResolveResult::ExternalFile(path.to_path_buf()));
+        }
+
+        package_usage_name_for_external_bare_specifier(self.specifier)
+            .map(ResolveResult::NpmPackage)
+    }
+
+    fn package_result_or_preserved_file(&self, pkg_name: String, path: &Path) -> ResolveResult {
+        if should_preserve_node_modules_style_file(
+            self.specifier,
+            self.from_file,
+            path,
+            self.from_style,
+        ) {
+            ResolveResult::ExternalFile(path.to_path_buf())
+        } else {
+            ResolveResult::NpmPackage(pkg_name)
+        }
+    }
+}
+
+/// Outcome of normalizing a specifier's scheme prefix.
+enum SpecifierNormalization {
+    /// The specifier is an external scheme (`jsr:`, URL, `data:`, empty `npm:`).
+    External(ResolveResult),
+    /// The specifier is resolvable; carries the scheme-stripped form.
+    Resolvable(String),
+}
+
+/// Strip `jsr:` / `npm:` / URL / `data:` schemes, short-circuiting to an
+/// external result when the scheme is not internally resolvable.
+fn normalize_resolve_specifier(specifier: &str) -> SpecifierNormalization {
+    if specifier.starts_with("jsr:") {
+        return SpecifierNormalization::External(ResolveResult::ExternalFile(PathBuf::from(
+            specifier,
+        )));
+    }
+    let resolvable = if let Some(rest) = specifier.strip_prefix("npm:") {
+        let normalized = normalize_npm_specifier(rest);
+        if normalized.is_empty() {
+            return SpecifierNormalization::External(ResolveResult::ExternalFile(PathBuf::from(
+                specifier,
+            )));
+        }
+        normalized
+    } else {
+        specifier.to_string()
+    };
+
+    if resolvable.contains("://") || resolvable.starts_with("data:") {
+        return SpecifierNormalization::External(ResolveResult::ExternalFile(PathBuf::from(
+            resolvable,
+        )));
+    }
+    SpecifierNormalization::Resolvable(resolvable)
+}
+
 /// Resolve a single import specifier to a target.
-#[expect(
-    clippy::too_many_lines,
-    reason = "central import resolver keeps fallback order visible; style-preservation logic is \
-              intentionally local to the resolution decision tree"
-)]
+///
+/// `from_style` is `true` for imports extracted from CSS contexts (currently
+/// SFC `<style lang="scss">` blocks and `<style src>` references). It enables
+/// SCSS partial / include-path / node_modules fallbacks for SFC importers
+/// without applying them to JS-context imports from the same file.
 pub(super) fn resolve_specifier(
     ctx: &ResolveContext<'_>,
     from_file: &Path,
     specifier: &str,
+    from_style: bool,
 ) -> ResolveResult {
-    // URL imports (https://, http://, data:) are valid but can't be resolved locally
-    if specifier.contains("://") || specifier.starts_with("data:") {
-        return ResolveResult::ExternalFile(PathBuf::from(specifier));
+    // Deno import maps rewrite matching specifiers within the nearest package
+    // scope. Mapped targets may be external schemes or config-relative paths.
+    let mapped = if ctx.has_deno_import_maps {
+        nearest_package_manifest(ctx.package_manifests, from_file)
+            .and_then(|manifest| apply_import_map(&manifest.deno_import_map, specifier))
+    } else {
+        None
+    };
+    let after_import_map = mapped
+        .as_ref()
+        .map_or(specifier, |(mapped, _base)| mapped.as_str());
+
+    let normalized;
+    let specifier = match normalize_resolve_specifier(after_import_map) {
+        SpecifierNormalization::External(result) => return result,
+        SpecifierNormalization::Resolvable(spec) => {
+            normalized = spec;
+            normalized.as_str()
+        }
+    };
+
+    if let Some((_mapped, base)) = mapped
+        && (specifier.starts_with("./") || specifier.starts_with("../"))
+    {
+        return try_import_map_relative(ctx, base, specifier)
+            .unwrap_or_else(|| ResolveResult::Unresolvable(specifier.to_string()));
     }
 
-    // Root-relative paths (`/src/main.tsx`, `/static/style.css`) are a web
-    // convention meaning "relative to the project/workspace root". Vite,
-    // Parcel, and other dev servers resolve them this way. In monorepos, each
-    // workspace member has its own Vite root, so `site/index.html` referencing
-    // `/src/main.tsx` should resolve to `site/src/main.tsx`, not
-    // `<monorepo-root>/src/main.tsx`. Use the source file's parent directory as
-    // the base, which is correct for both workspace members and single projects.
-    //
-    // Applied to web-facing source files: HTML, JSX/TSX, and plain JS/TS. The
-    // JSX/TSX case covers SSR frameworks like Hono where JSX templates emit
-    // `<link href="/static/style.css" />`: these paths cannot be AST-resolved
-    // and have the same web-root semantics as HTML. See issue #105 (till's
-    // comment). Applied unconditionally to JS/TS too because the JSX visitor
-    // emits `ImportInfo` with the raw attribute value, and the file extension
-    // after JSX retry may not reflect the original source (`.js` files with
-    // JSX still parse as JSX and get their asset refs recorded here).
-    if specifier.starts_with('/')
-        && from_file.extension().is_some_and(|e| {
-            matches!(
-                e.to_str(),
-                Some("html" | "jsx" | "tsx" | "js" | "ts" | "mjs" | "cjs" | "mts" | "cts")
+    if let Some(result) = try_pre_file_resolution_fallbacks(ctx, from_file, specifier, from_style) {
+        return result;
+    }
+
+    let flags = FailedSpecifierFlags::new(ctx, specifier);
+    resolve_file_or_failed(ctx, from_file, specifier, from_style, flags)
+}
+
+/// Apply exact or longest slash-prefix matching across an effective import map.
+fn apply_import_map<'a>(
+    import_map: &'a [DenoImportMapEntry],
+    specifier: &str,
+) -> Option<(String, &'a Path)> {
+    if let Some(entry) = import_map.iter().find(|entry| entry.key == specifier) {
+        return Some((entry.target.clone(), &entry.declaring_dir));
+    }
+
+    import_map
+        .iter()
+        .filter(|entry| entry.key.ends_with('/') && specifier.starts_with(&entry.key))
+        .max_by_key(|entry| entry.key.len())
+        .map(|entry| {
+            (
+                format!("{}{}", entry.target, &specifier[entry.key.len()..]),
+                entry.declaring_dir.as_path(),
             )
         })
-    {
-        let relative = format!(".{specifier}");
-        let source_dir = from_file.parent().unwrap_or(ctx.root);
-        if let Ok(resolved) = ctx.resolver.resolve(source_dir, &relative) {
-            let resolved_path = resolved.path();
-            if let Some(&file_id) = ctx.raw_path_to_id.get(resolved_path) {
-                return ResolveResult::InternalModule(file_id);
-            }
-            if let Ok(canonical) = dunce::canonicalize(resolved_path) {
-                if let Some(&file_id) = ctx.path_to_id.get(canonical.as_path()) {
-                    return ResolveResult::InternalModule(file_id);
-                }
-                if let Some(fallback) = ctx.canonical_fallback
-                    && let Some(file_id) = fallback.get(&canonical)
-                {
-                    return ResolveResult::InternalModule(file_id);
-                }
-            }
-        }
-        // Fall back to project root for non-workspace setups where the source
-        // file may be in a subdirectory (e.g., `public/index.html` referencing
-        // `/src/main.tsx`, or a Hono JSX layout in `src/` referencing `/static/style.css`).
-        if source_dir != ctx.root
-            && let Ok(resolved) = ctx.resolver.resolve(ctx.root, &relative)
-        {
-            let resolved_path = resolved.path();
-            if let Some(&file_id) = ctx.raw_path_to_id.get(resolved_path) {
-                return ResolveResult::InternalModule(file_id);
-            }
-            if let Ok(canonical) = dunce::canonicalize(resolved_path) {
-                if let Some(&file_id) = ctx.path_to_id.get(canonical.as_path()) {
-                    return ResolveResult::InternalModule(file_id);
-                }
-                if let Some(fallback) = ctx.canonical_fallback
-                    && let Some(file_id) = fallback.get(&canonical)
-                {
-                    return ResolveResult::InternalModule(file_id);
-                }
-            }
+}
+
+/// Resolve a relative import-map target from its declaring config directory.
+fn try_import_map_relative(
+    ctx: &ResolveContext<'_>,
+    declaring_dir: &Path,
+    relative: &str,
+) -> Option<ResolveResult> {
+    let config_file = declaring_dir.join("__fallow_import_map_resolve__");
+    let resolved = ctx.resolver.resolve_file(&config_file, relative).ok()?;
+    lookup_internal_file_id(ctx, resolved.path()).map(ResolveResult::InternalModule)
+}
+
+fn try_pre_file_resolution_fallbacks(
+    ctx: &ResolveContext<'_>,
+    from_file: &Path,
+    specifier: &str,
+    from_style: bool,
+) -> Option<ResolveResult> {
+    if let Some(result) = try_storybook_static_dir_mapping(ctx, from_file, specifier) {
+        return Some(result);
+    }
+
+    if let Some(result) = try_root_relative_specifier(ctx, from_file, specifier) {
+        return Some(result);
+    }
+
+    if from_style && let Some(result) = try_scss_fallbacks(ctx, from_file, specifier, true) {
+        return Some(result);
+    }
+
+    try_style_condition_package_resolution(ctx, from_file, specifier, from_style)
+}
+
+fn resolve_file_or_failed(
+    ctx: &ResolveContext<'_>,
+    from_file: &Path,
+    specifier: &str,
+    from_style: bool,
+    flags: FailedSpecifierFlags,
+) -> ResolveResult {
+    match resolve_file_with_tsconfig_fallback(ctx, from_file, specifier) {
+        ResolveFileAttempt::Resolved {
+            resolution: resolved,
+            used_tsconfig_fallback,
+        } => resolve_resolved_specifier(
+            ctx,
+            from_file,
+            specifier,
+            from_style,
+            resolved.path(),
+            FailedSpecifierFlags {
+                used_tsconfig_fallback,
+                ..flags
+            },
+        ),
+        ResolveFileAttempt::Failed {
+            used_tsconfig_fallback,
+        } => resolve_failed_specifier(
+            ctx,
+            from_file,
+            specifier,
+            from_style,
+            FailedSpecifierFlags {
+                used_tsconfig_fallback,
+                ..flags
+            },
+        ),
+    }
+}
+
+/// Map a successfully resolved file to a `ResolveResult`, applying the
+/// SCSS-importer JS/TS rejection and tsconfig-fallback alias retries before
+/// classifying the resolved path.
+fn resolve_resolved_specifier(
+    ctx: &ResolveContext<'_>,
+    from_file: &Path,
+    specifier: &str,
+    from_style: bool,
+    resolved_path: &Path,
+    flags: FailedSpecifierFlags,
+) -> ResolveResult {
+    let is_scss_importer = from_file
+        .extension()
+        .is_some_and(|e| e == "scss" || e == "sass");
+    if is_scss_importer && is_js_ts_extension(resolved_path) {
+        if let Some(result) = try_scss_fallbacks(ctx, from_file, specifier, from_style) {
+            return result;
         }
         return ResolveResult::Unresolvable(specifier.to_string());
     }
-
-    // Bare specifier classification (used for fallback logic below).
-    let is_bare = is_bare_specifier(specifier);
-    let is_alias = is_path_alias(specifier);
-    let matches_plugin_alias = ctx
-        .path_aliases
-        .iter()
-        .any(|(prefix, _)| specifier.starts_with(prefix));
-
-    // Use resolve_file instead of resolve so that TsconfigDiscovery::Auto works.
-    // oxc_resolver's resolve() ignores Auto tsconfig discovery — only resolve_file()
-    // walks up from the importing file to find the nearest tsconfig.json and apply
-    // its path aliases (e.g., @/ → src/).
-    //
-    // If resolve_file returns a tsconfig-related error (e.g., a solution-style
-    // tsconfig.json references a sibling with a broken `extends` chain), retry with
-    // the directory-only `resolve()` form so a broken sibling config does not poison
-    // resolution for files covered by a healthy sibling. See issue #97.
-    match resolve_file_with_tsconfig_fallback(ctx, from_file, specifier) {
-        ResolveFileAttempt::Resolved(resolved) => {
-            let resolved_path = resolved.path();
-            // Try raw path lookup first (avoids canonicalize syscall in most cases)
-            if let Some(&file_id) = ctx.raw_path_to_id.get(resolved_path) {
-                return ResolveResult::InternalModule(file_id);
-            }
-
-            // Fast path for bare specifiers resolving to node_modules: if the resolved
-            // path is in node_modules (but not pnpm's .pnpm virtual store) and the
-            // package is not a workspace package, skip the expensive canonicalize()
-            // syscall and go directly to NpmPackage. Workspace packages need the full
-            // fallback chain (source fallback, pnpm fallback) to map dist→src.
-            // Note: the byte pattern check handles Unix and Windows separators separately.
-            // Paths with mixed separators fall through to canonicalize() (perf-only cost).
-            if is_bare
-                && !resolved_path
-                    .as_os_str()
-                    .as_encoded_bytes()
-                    .windows(7)
-                    .any(|w| w == b"/.pnpm/" || w == b"\\.pnpm\\")
-                && let Some(pkg_name) = extract_package_name_from_node_modules_path(resolved_path)
-                && !ctx.workspace_roots.contains_key(pkg_name.as_str())
-            {
-                return if should_preserve_node_modules_style_file(
-                    specifier,
-                    from_file,
-                    resolved_path,
-                ) {
-                    ResolveResult::ExternalFile(resolved_path.to_path_buf())
-                } else {
-                    ResolveResult::NpmPackage(pkg_name)
-                };
-            }
-
-            // Fall back to canonical path lookup
-            match dunce::canonicalize(resolved_path) {
-                Ok(canonical) => {
-                    if let Some(&file_id) = ctx.path_to_id.get(canonical.as_path()) {
-                        ResolveResult::InternalModule(file_id)
-                    } else if let Some(fallback) = ctx.canonical_fallback
-                        && let Some(file_id) = fallback.get(&canonical)
-                    {
-                        // Intra-project symlink: raw path differs from canonical path.
-                        // The lazy fallback resolves this without upfront bulk canonicalize.
-                        ResolveResult::InternalModule(file_id)
-                    } else if let Some(file_id) = try_source_fallback(&canonical, ctx.path_to_id) {
-                        // Exports map resolved to a built output (e.g., dist/utils.js)
-                        // but the source file (e.g., src/utils.ts) is what we track.
-                        ResolveResult::InternalModule(file_id)
-                    } else if let Some(file_id) =
-                        try_pnpm_workspace_fallback(&canonical, ctx.path_to_id, ctx.workspace_roots)
-                    {
-                        ResolveResult::InternalModule(file_id)
-                    } else if let Some(pkg_name) =
-                        extract_package_name_from_node_modules_path(&canonical)
-                    {
-                        // Workspace package resolved through a node_modules symlink to
-                        // a built output (e.g. dist/esm/button/index.js) that has no
-                        // src/ mirror. Retry against the workspace root's source tree.
-                        // See issue #106.
-                        if ctx.workspace_roots.contains_key(pkg_name.as_str())
-                            && let Some(result) = try_workspace_package_fallback(ctx, specifier)
-                        {
-                            return result;
-                        }
-                        if should_preserve_node_modules_style_file(specifier, from_file, &canonical)
-                        {
-                            ResolveResult::ExternalFile(canonical)
-                        } else {
-                            ResolveResult::NpmPackage(pkg_name)
-                        }
-                    } else {
-                        ResolveResult::ExternalFile(canonical)
-                    }
-                }
-                Err(_) => {
-                    // Path doesn't exist on disk — try source fallback on the raw path
-                    if let Some(file_id) = try_source_fallback(resolved_path, ctx.path_to_id) {
-                        ResolveResult::InternalModule(file_id)
-                    } else if let Some(file_id) = try_pnpm_workspace_fallback(
-                        resolved_path,
-                        ctx.path_to_id,
-                        ctx.workspace_roots,
-                    ) {
-                        ResolveResult::InternalModule(file_id)
-                    } else if let Some(pkg_name) =
-                        extract_package_name_from_node_modules_path(resolved_path)
-                    {
-                        if ctx.workspace_roots.contains_key(pkg_name.as_str())
-                            && let Some(result) = try_workspace_package_fallback(ctx, specifier)
-                        {
-                            return result;
-                        }
-                        if should_preserve_node_modules_style_file(
-                            specifier,
-                            from_file,
-                            resolved_path,
-                        ) {
-                            ResolveResult::ExternalFile(resolved_path.to_path_buf())
-                        } else {
-                            ResolveResult::NpmPackage(pkg_name)
-                        }
-                    } else {
-                        ResolveResult::ExternalFile(resolved_path.to_path_buf())
-                    }
-                }
-            }
+    if flags.used_tsconfig_fallback {
+        if let Some(result) = try_tsconfig_root_dirs(ctx, from_file, specifier) {
+            return result;
         }
-        ResolveFileAttempt::Failed {
-            used_tsconfig_fallback,
-        } => {
-            if let Some(result) = try_scss_fallbacks(ctx, from_file, specifier) {
-                return result;
-            }
-
-            if used_tsconfig_fallback
-                && matches_nearest_tsconfig_path_alias(ctx.root, from_file, specifier)
-            {
-                // The tsconfig chain was broken, so alias-aware resolution is unavailable.
-                // Keep these imports unresolved instead of misclassifying them as npm packages.
-                return ResolveResult::Unresolvable(specifier.to_string());
-            }
-
-            if is_alias || matches_plugin_alias {
-                // Try plugin-provided path aliases before giving up.
-                // This covers both built-in alias shapes (`~/`, `@/`, `#foo`) and
-                // custom prefixes discovered from framework config files such as
-                // `@shared/*` or `$utils/*`.
-                // Path aliases that fail resolution are unresolvable, not npm packages.
-                // Classifying them as NpmPackage would cause false "unlisted dependency" reports.
-                try_path_alias_fallback(ctx, specifier)
-                    .unwrap_or_else(|| ResolveResult::Unresolvable(specifier.to_string()))
-            } else if is_bare && is_valid_package_name(specifier) {
-                // Workspace package fallback: self-referencing and cross-workspace
-                // imports without node_modules symlinks. Resolves `@org/pkg/sub`
-                // against the workspace root's source tree. See issue #106.
-                if let Some(result) = try_workspace_package_fallback(ctx, specifier) {
-                    return result;
-                }
-                let pkg_name = extract_package_name(specifier);
-                ResolveResult::NpmPackage(pkg_name)
-            } else {
-                ResolveResult::Unresolvable(specifier.to_string())
-            }
+        if (flags.is_bare || flags.is_alias || flags.matches_plugin_alias)
+            && let Some(result) =
+                try_nearest_tsconfig_path_alias(ctx, from_file, specifier, from_style)
+        {
+            return result;
+        }
+        if matches_nearest_tsconfig_path_alias(ctx, from_file, specifier) {
+            return ResolveResult::Unresolvable(specifier.to_string());
         }
     }
+    ResolvedPathContext {
+        ctx,
+        from_file,
+        specifier,
+        from_style,
+    }
+    .resolve(resolved_path)
+}
+
+#[derive(Clone, Copy)]
+struct FailedSpecifierFlags {
+    used_tsconfig_fallback: bool,
+    is_bare: bool,
+    is_alias: bool,
+    matches_plugin_alias: bool,
+}
+
+impl FailedSpecifierFlags {
+    fn new(ctx: &ResolveContext<'_>, specifier: &str) -> Self {
+        Self {
+            used_tsconfig_fallback: false,
+            is_bare: is_bare_specifier(specifier),
+            is_alias: is_path_alias(specifier),
+            matches_plugin_alias: ctx
+                .path_aliases
+                .iter()
+                .any(|(prefix, _)| specifier_matches_alias_prefix(specifier, prefix)),
+        }
+    }
+}
+
+fn resolve_failed_specifier(
+    ctx: &ResolveContext<'_>,
+    from_file: &Path,
+    specifier: &str,
+    from_style: bool,
+    flags: FailedSpecifierFlags,
+) -> ResolveResult {
+    if let Some(result) = try_failed_primary_fallbacks(
+        ctx,
+        from_file,
+        specifier,
+        from_style,
+        flags.used_tsconfig_fallback,
+        flags.is_bare || flags.is_alias || flags.matches_plugin_alias,
+    ) {
+        return result;
+    }
+
+    let matches_tsconfig_path_alias =
+        matches_nearest_tsconfig_path_alias(ctx, from_file, specifier);
+
+    if let Some(result) = try_failed_package_fallbacks(ctx, from_file, specifier) {
+        return result;
+    }
+
+    if flags.is_alias || flags.matches_plugin_alias {
+        return resolve_failed_alias_specifier(
+            ctx,
+            specifier,
+            flags.is_bare,
+            matches_tsconfig_path_alias,
+        );
+    }
+    resolve_failed_regular_specifier(
+        ctx,
+        from_file,
+        specifier,
+        from_style,
+        flags.is_bare,
+        matches_tsconfig_path_alias,
+    )
+}
+
+fn resolve_failed_regular_specifier(
+    ctx: &ResolveContext<'_>,
+    from_file: &Path,
+    specifier: &str,
+    from_style: bool,
+    is_bare: bool,
+    matches_tsconfig_path_alias: bool,
+) -> ResolveResult {
+    if let Some(result) = try_css_relative_subpath_fallback(ctx, from_file, specifier, from_style) {
+        return result;
+    }
+    if is_plain_css_file(from_file) && is_bare_style_subpath(specifier) {
+        return ResolveResult::Unresolvable(specifier.to_string());
+    }
+    if is_bare && is_valid_package_name(specifier) {
+        return resolve_failed_bare_package_specifier(ctx, specifier, matches_tsconfig_path_alias);
+    }
+    ResolveResult::Unresolvable(specifier.to_string())
+}
+
+fn try_failed_primary_fallbacks(
+    ctx: &ResolveContext<'_>,
+    from_file: &Path,
+    specifier: &str,
+    from_style: bool,
+    used_tsconfig_fallback: bool,
+    can_try_nearest_alias: bool,
+) -> Option<ResolveResult> {
+    if let Some(result) = try_scss_fallbacks(ctx, from_file, specifier, from_style) {
+        return Some(result);
+    }
+
+    if used_tsconfig_fallback
+        && let Some(result) = try_tsconfig_root_dirs(ctx, from_file, specifier)
+    {
+        return Some(result);
+    }
+
+    if (used_tsconfig_fallback || can_try_nearest_alias)
+        && let Some(result) = try_nearest_tsconfig_path_alias(ctx, from_file, specifier, from_style)
+    {
+        return Some(result);
+    }
+
+    None
+}
+
+fn try_failed_package_fallbacks(
+    ctx: &ResolveContext<'_>,
+    from_file: &Path,
+    specifier: &str,
+) -> Option<ResolveResult> {
+    if let Some(result) = try_package_imports_fallback(ctx, from_file, specifier) {
+        return Some(result);
+    }
+    try_relative_package_root_source_fallback(ctx, from_file, specifier)
+}
+
+fn resolve_failed_alias_specifier(
+    ctx: &ResolveContext<'_>,
+    specifier: &str,
+    is_bare: bool,
+    matches_tsconfig_path_alias: bool,
+) -> ResolveResult {
+    if let Some(result) = try_path_alias_fallback(ctx, specifier) {
+        return result;
+    }
+    if is_bare
+        && is_valid_package_name(specifier)
+        && let Some(result) = try_workspace_package_fallback(ctx, specifier)
+    {
+        return result;
+    }
+    if matches_tsconfig_path_alias {
+        return ResolveResult::Unresolvable(specifier.to_string());
+    }
+    ResolveResult::Unresolvable(specifier.to_string())
+}
+
+fn resolve_failed_bare_package_specifier(
+    ctx: &ResolveContext<'_>,
+    specifier: &str,
+    matches_tsconfig_path_alias: bool,
+) -> ResolveResult {
+    if let Some(result) = try_workspace_package_fallback(ctx, specifier) {
+        return result;
+    }
+    if matches_tsconfig_path_alias {
+        return ResolveResult::Unresolvable(specifier.to_string());
+    }
+    let pkg_name = extract_package_name(specifier);
+    if ctx.workspace_roots.contains_key(pkg_name.as_str())
+        || ctx
+            .package_manifests
+            .iter()
+            .any(|manifest| manifest.name.as_deref() == Some(pkg_name.as_str()))
+    {
+        ResolveResult::Unresolvable(specifier.to_string())
+    } else {
+        ResolveResult::NpmPackage(pkg_name)
+    }
+}
+
+fn try_tsconfig_root_dirs(
+    ctx: &ResolveContext<'_>,
+    from_file: &Path,
+    specifier: &str,
+) -> Option<ResolveResult> {
+    if !specifier.starts_with('.') {
+        return None;
+    }
+    for tsconfig_path in local_tsconfig_chain(ctx, from_file).iter() {
+        let Some(json) = read_tsconfig_json_cached(ctx, tsconfig_path) else {
+            continue;
+        };
+        let Some(compiler_options) = json.get("compilerOptions") else {
+            continue;
+        };
+        let has_root_dirs = compiler_options.get("rootDirs").is_some();
+        let Some(root_dirs) = compiler_options.get("rootDirs").and_then(Value::as_array) else {
+            continue;
+        };
+        let tsconfig_dir = tsconfig_path.parent().unwrap_or(ctx.root);
+        let roots: Vec<PathBuf> = root_dirs
+            .iter()
+            .filter_map(Value::as_str)
+            .map(|root_dir| {
+                let root_dir = Path::new(root_dir);
+                if root_dir.is_absolute() {
+                    root_dir.to_path_buf()
+                } else {
+                    tsconfig_dir.join(root_dir)
+                }
+            })
+            .collect();
+        let from_dir = from_file.parent().unwrap_or(from_file);
+        for root in &roots {
+            let Ok(relative_dir) = from_dir.strip_prefix(root) else {
+                continue;
+            };
+            for candidate_root in &roots {
+                let candidate = candidate_root.join(relative_dir).join(specifier);
+                if let Some(result) = try_tsconfig_alias_target(ctx, &candidate, false) {
+                    return Some(result);
+                }
+            }
+        }
+        if has_root_dirs {
+            return None;
+        }
+    }
+    None
 }
 
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use oxc_resolver::{JSONError, ResolveError};
+    use rustc_hash::{FxHashMap, FxHashSet};
     use tempfile::tempdir;
 
+    use crate::resolve::react_native;
+    use crate::resolve::types::{CanonicalizeCache, ResolveContext, TsconfigCache};
+
     use super::{
-        is_tsconfig_error, matches_nearest_tsconfig_path_alias, path_alias_pattern_matches,
+        SpecifierNormalization, extension_alias_matches, glob_values_match, has_glob_meta,
+        is_bare_style_package_reference, is_bare_style_subpath, is_js_ts_extension,
+        is_node_modules_path, is_plain_css_file, is_relative_tsconfig_extends,
+        is_safe_static_dir_relative_path, is_storybook_preview_html, is_style_file,
+        is_tsconfig_error, matches_nearest_tsconfig_path_alias, normalize_resolve_specifier,
+        package_usage_name_for_external_bare_specifier, package_usage_name_for_resolved_package,
+        path_alias_capture, path_alias_pattern_matches, path_alias_specificity,
+        resolve_tsconfig_extends_candidate, resolve_tsconfig_extends_path,
+        resolve_tsconfig_reference_path, should_preserve_node_modules_style_file,
+        specifier_matches_alias_prefix, static_dir_relative_path, storybook_static_url_path,
+        strip_url_suffix, tsconfig_extends_values, with_appended_extension, with_exact_extension,
     };
 
     #[test]
@@ -527,25 +1975,14 @@ mod tests {
         )));
     }
 
-    // `TsconfigCircularExtend(CircularPathBufs)` is part of the matched set but
-    // cannot be directly unit-tested: `CircularPathBufs` is not re-exported from
-    // `oxc_resolver::lib`, so external crates cannot construct the variant. The
-    // `matches!` arm is structural, so adding the variant to `is_tsconfig_error`
-    // is guaranteed by the compiler to return `true` regardless of payload.
-
     #[test]
     fn io_error_is_tsconfig_error() {
-        // An IO error (permission denied while reading a tsconfig) must trigger
-        // the fallback. The variant is shared with non-tsconfig IO failures, but
-        // the retry via `resolve()` is safe in either case.
         let io_err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
         assert!(is_tsconfig_error(&ResolveError::from(io_err)));
     }
 
     #[test]
     fn json_error_is_tsconfig_error() {
-        // Malformed tsconfig JSON surfaces as ResolveError::Json. Same variant
-        // covers malformed package.json; retry via `resolve()` is safe there too.
         assert!(is_tsconfig_error(&ResolveError::Json(JSONError {
             path: PathBuf::from("/project/tsconfig.json"),
             message: "unexpected token".to_string(),
@@ -556,8 +1993,6 @@ mod tests {
 
     #[test]
     fn module_not_found_is_not_tsconfig_error() {
-        // Regular "module not found" must NOT trigger the fallback —
-        // the tsconfig loaded fine, the specifier just doesn't exist.
         assert!(!is_tsconfig_error(&ResolveError::NotFound(
             "./missing-module".to_string()
         )));
@@ -584,8 +2019,86 @@ mod tests {
     }
 
     #[test]
+    fn wildcard_tsconfig_path_alias_capture_matches_middle() {
+        assert_eq!(
+            path_alias_capture("@/*", "@/components/Button"),
+            Some("components/Button")
+        );
+        assert_eq!(
+            path_alias_capture("@app/*/test", "@app/foo/bar/test"),
+            Some("foo/bar")
+        );
+        assert_eq!(path_alias_capture("@/*", "@"), None);
+    }
+
+    #[test]
     fn wildcard_only_tsconfig_path_alias_pattern_does_not_match_everything() {
         assert!(!path_alias_pattern_matches("*", "@gen/foo"));
+    }
+
+    #[test]
+    fn wildcard_only_tsconfig_path_alias_capture_can_resolve_targets() {
+        assert_eq!(path_alias_capture("*", "shared"), Some("shared"));
+    }
+
+    #[test]
+    fn static_dir_relative_path_safety_rejects_escape_paths() {
+        assert!(is_safe_static_dir_relative_path("js/app.js"));
+        assert!(is_safe_static_dir_relative_path("style/index.css"));
+        assert!(!is_safe_static_dir_relative_path("../secret.js"));
+        assert!(!is_safe_static_dir_relative_path("/absolute.js"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn static_dir_relative_path_safety_rejects_windows_prefix() {
+        assert!(!is_safe_static_dir_relative_path("C:/secret.js"));
+    }
+
+    #[cfg_attr(miri, ignore = "tempdir is blocked by Miri isolation")]
+    #[test]
+    fn bare_directory_tsconfig_include_matches_nested_files() {
+        let temp = tempdir().expect("temp dir");
+        let root = temp.path();
+        fs::create_dir_all(root.join("src/features")).expect("src dir");
+        let source = root.join("src/features/button.ts");
+        fs::write(&source, "export const button = true;\n").expect("source");
+
+        assert!(glob_values_match(
+            root,
+            &[serde_json::json!("src")],
+            &source
+        ));
+    }
+
+    #[cfg_attr(miri, ignore = "tempdir is blocked by Miri isolation")]
+    #[test]
+    fn bare_directory_tsconfig_include_does_not_match_sibling_files() {
+        let temp = tempdir().expect("temp dir");
+        let root = temp.path();
+        fs::create_dir_all(root.join("src")).expect("src dir");
+        fs::create_dir_all(root.join("test")).expect("test dir");
+        let source = root.join("test/button.ts");
+        fs::write(&source, "export const button = true;\n").expect("source");
+
+        assert!(!glob_values_match(
+            root,
+            &[serde_json::json!("src")],
+            &source
+        ));
+    }
+
+    #[test]
+    fn tsconfig_extends_resolution_preserves_explicit_extension() {
+        let base = Path::new("/repo/apps/mobile");
+        assert_eq!(
+            resolve_tsconfig_extends_path(base, "../../tsconfig.base.jsonc"),
+            PathBuf::from("/repo/apps/mobile/../../tsconfig.base.jsonc")
+        );
+        assert_eq!(
+            resolve_tsconfig_extends_path(base, "../../tsconfig.base"),
+            PathBuf::from("/repo/apps/mobile/../../tsconfig.base.json")
+        );
     }
 
     #[cfg_attr(miri, ignore = "tempdir is blocked by Miri isolation")]
@@ -610,15 +2123,1248 @@ mod tests {
         )
         .unwrap();
 
+        let resolver = super::create_resolver(&project_root, &[], &[]);
+        let style_resolver = super::create_resolver(&project_root, &[], &["style".to_string()]);
+        let extensions = react_native::build_extensions(&[]);
+        let path_to_id = FxHashMap::default();
+        let raw_path_to_id = FxHashMap::default();
+        let workspace_roots = FxHashMap::default();
+        let package_manifests = Vec::new();
+        let condition_names = react_native::build_condition_names(&[], &[]);
+        let tsconfig_warned = std::sync::Mutex::new(FxHashSet::default());
+        let tsconfig_cache = TsconfigCache::default();
+        let canonicalize_cache = CanonicalizeCache::default();
+        let ctx = ResolveContext {
+            resolver: &resolver,
+            style_resolver: &style_resolver,
+            extensions: &extensions,
+            path_to_id: &path_to_id,
+            raw_path_to_id: &raw_path_to_id,
+            workspace_roots: &workspace_roots,
+            package_manifests: &package_manifests,
+            has_deno_import_maps: false,
+            condition_names: &condition_names,
+            path_aliases: &[],
+            scss_include_paths: &[],
+            static_dir_mappings: &[],
+            root: &project_root,
+            canonical_fallback: None,
+            tsconfig_warned: &tsconfig_warned,
+            tsconfig_cache: &tsconfig_cache,
+            canonicalize_cache: &canonicalize_cache,
+        };
+
         assert!(matches_nearest_tsconfig_path_alias(
-            &project_root,
+            &ctx,
             &source_file,
             "@gen/foo"
         ));
         assert!(!matches_nearest_tsconfig_path_alias(
-            &project_root,
+            &ctx,
             &source_file,
             "@other/foo"
         ));
+    }
+
+    // ---- normalize_resolve_specifier (lines 1285-1308) ----
+
+    #[test]
+    fn jsr_scheme_is_external() {
+        let result = normalize_resolve_specifier("jsr:@std/path");
+        assert!(
+            matches!(result, SpecifierNormalization::External(_)),
+            "jsr: scheme must short-circuit to External"
+        );
+    }
+
+    #[test]
+    fn npm_scheme_with_version_strips_to_bare_package() {
+        let result = normalize_resolve_specifier("npm:preact@10/hooks");
+        let SpecifierNormalization::Resolvable(s) = result else {
+            panic!("npm: with version should be Resolvable");
+        };
+        assert_eq!(s, "preact/hooks");
+    }
+
+    #[test]
+    fn npm_scheme_scoped_package_with_version_strips_version() {
+        let result = normalize_resolve_specifier("npm:@supabase/supabase-js@2");
+        let SpecifierNormalization::Resolvable(s) = result else {
+            panic!("npm: scoped should be Resolvable");
+        };
+        assert_eq!(s, "@supabase/supabase-js");
+    }
+
+    #[test]
+    fn npm_scheme_empty_body_is_external() {
+        let result = normalize_resolve_specifier("npm:");
+        assert!(
+            matches!(result, SpecifierNormalization::External(_)),
+            "bare npm: with no body must be External"
+        );
+    }
+
+    #[test]
+    fn https_url_is_external() {
+        let result = normalize_resolve_specifier("https://deno.land/std/path.ts");
+        assert!(
+            matches!(result, SpecifierNormalization::External(_)),
+            "https:// URL must be External"
+        );
+    }
+
+    #[test]
+    fn data_uri_is_external() {
+        let result = normalize_resolve_specifier("data:text/javascript,export default 42;");
+        assert!(
+            matches!(result, SpecifierNormalization::External(_)),
+            "data: URI must be External"
+        );
+    }
+
+    #[test]
+    fn plain_bare_specifier_is_resolvable() {
+        let result = normalize_resolve_specifier("react");
+        let SpecifierNormalization::Resolvable(s) = result else {
+            panic!("plain bare specifier must be Resolvable");
+        };
+        assert_eq!(s, "react");
+    }
+
+    // ---- specifier_matches_alias_prefix (lines 412-417) ----
+
+    #[test]
+    fn alias_prefix_bare_at_sign_does_not_match_scoped_package() {
+        assert!(
+            !specifier_matches_alias_prefix("@radix-ui/react-checkbox", "@"),
+            "bare '@' must NOT match scoped packages"
+        );
+    }
+
+    #[test]
+    fn alias_prefix_bare_at_sign_matches_exact() {
+        assert!(
+            specifier_matches_alias_prefix("@", "@"),
+            "bare '@' must match exactly '@'"
+        );
+    }
+
+    #[test]
+    fn alias_prefix_with_trailing_slash_matches_any_continuation() {
+        assert!(
+            specifier_matches_alias_prefix("@/components/Button", "@/"),
+            "'@/' prefix matches any continuation"
+        );
+    }
+
+    #[test]
+    fn alias_prefix_tilde_matches_tilde_slash_continuation() {
+        assert!(
+            specifier_matches_alias_prefix("~/utils", "~"),
+            "'~' prefix matches '~/utils' (slash continuation)"
+        );
+    }
+
+    #[test]
+    fn alias_prefix_tilde_does_not_match_tilde_name() {
+        assert!(
+            !specifier_matches_alias_prefix("~utils", "~"),
+            "'~' prefix must NOT match '~utils' (no slash)"
+        );
+    }
+
+    // ---- strip_url_suffix (lines 419-423) ----
+
+    #[test]
+    fn strip_url_suffix_removes_query_string() {
+        assert_eq!(strip_url_suffix("./style.css?inline"), "./style.css");
+    }
+
+    #[test]
+    fn strip_url_suffix_removes_hash_fragment() {
+        assert_eq!(strip_url_suffix("./page.html#section"), "./page.html");
+    }
+
+    #[test]
+    fn strip_url_suffix_passes_through_plain_specifier() {
+        assert_eq!(strip_url_suffix("react"), "react");
+    }
+
+    // ---- storybook_static_url_path (lines 425-437) ----
+
+    #[test]
+    fn storybook_static_url_path_root_relative_returns_unchanged() {
+        assert_eq!(
+            storybook_static_url_path("/js/app.js"),
+            Some("/js/app.js".to_string())
+        );
+    }
+
+    #[test]
+    fn storybook_static_url_path_dot_slash_prepends_root() {
+        assert_eq!(
+            storybook_static_url_path("./icons/logo.svg"),
+            Some("/icons/logo.svg".to_string())
+        );
+    }
+
+    #[test]
+    fn storybook_static_url_path_bare_prepends_root() {
+        assert_eq!(
+            storybook_static_url_path("fonts/inter.woff2"),
+            Some("/fonts/inter.woff2".to_string())
+        );
+    }
+
+    #[test]
+    fn storybook_static_url_path_parent_relative_returns_none() {
+        assert_eq!(storybook_static_url_path("../escape.js"), None);
+    }
+
+    #[test]
+    fn storybook_static_url_path_strips_query_before_prefix() {
+        assert_eq!(
+            storybook_static_url_path("/js/app.js?v=1"),
+            Some("/js/app.js".to_string())
+        );
+    }
+
+    // ---- static_dir_relative_path (lines 439-449) ----
+
+    #[test]
+    fn static_dir_relative_path_root_mount_strips_leading_slash() {
+        assert_eq!(
+            static_dir_relative_path("/icons/logo.svg", "/"),
+            Some("icons/logo.svg")
+        );
+    }
+
+    #[test]
+    fn static_dir_relative_path_exact_mount_returns_empty() {
+        assert_eq!(static_dir_relative_path("/assets", "/assets"), Some(""));
+    }
+
+    #[test]
+    fn static_dir_relative_path_subdirectory_strips_mount_and_slash() {
+        assert_eq!(
+            static_dir_relative_path("/assets/logo.png", "/assets"),
+            Some("logo.png")
+        );
+    }
+
+    #[test]
+    fn static_dir_relative_path_non_matching_mount_returns_none() {
+        assert_eq!(static_dir_relative_path("/other/file.js", "/assets"), None);
+    }
+
+    // ---- is_node_modules_path (lines 1011-1016) ----
+
+    #[test]
+    fn is_node_modules_path_detects_node_modules_segment() {
+        let p = PathBuf::from("/project/node_modules/react/index.js");
+        assert!(is_node_modules_path(&p));
+    }
+
+    #[test]
+    fn is_node_modules_path_rejects_project_src() {
+        let p = PathBuf::from("/project/src/index.ts");
+        assert!(!is_node_modules_path(&p));
+    }
+
+    #[test]
+    fn is_node_modules_path_detects_nested_node_modules() {
+        let p = PathBuf::from("/project/packages/ui/node_modules/.pnpm/lodash/index.js");
+        assert!(is_node_modules_path(&p));
+    }
+
+    // ---- is_style_file / is_js_ts_extension / is_plain_css_file ----
+
+    #[test]
+    fn is_style_file_recognizes_css_scss_sass() {
+        assert!(is_style_file(Path::new("style.css")));
+        assert!(is_style_file(Path::new("theme.scss")));
+        assert!(is_style_file(Path::new("mixin.sass")));
+        assert!(!is_style_file(Path::new("index.ts")));
+    }
+
+    #[test]
+    fn is_js_ts_extension_recognizes_ts_family() {
+        assert!(is_js_ts_extension(Path::new("file.ts")));
+        assert!(is_js_ts_extension(Path::new("component.tsx")));
+        assert!(is_js_ts_extension(Path::new("module.mts")));
+        assert!(is_js_ts_extension(Path::new("module.cts")));
+        assert!(!is_js_ts_extension(Path::new("style.css")));
+        assert!(!is_js_ts_extension(Path::new("file.scss")));
+    }
+
+    #[test]
+    fn is_plain_css_file_matches_only_css_extension() {
+        assert!(is_plain_css_file(Path::new("main.css")));
+        assert!(!is_plain_css_file(Path::new("main.scss")));
+        assert!(!is_plain_css_file(Path::new("main.ts")));
+    }
+
+    // ---- is_bare_style_subpath / is_bare_style_package_reference ----
+
+    #[test]
+    fn is_bare_style_subpath_matches_package_with_css_subpath() {
+        assert!(is_bare_style_subpath(
+            "bootstrap/dist/css/bootstrap.min.css"
+        ));
+        assert!(is_bare_style_subpath("@fontsource/roboto/400.css"));
+    }
+
+    #[test]
+    fn is_bare_style_subpath_rejects_bare_package_root() {
+        assert!(!is_bare_style_subpath("bootstrap"));
+    }
+
+    #[test]
+    fn is_bare_style_subpath_rejects_relative_path() {
+        assert!(!is_bare_style_subpath("./local.css"));
+    }
+
+    #[test]
+    fn is_bare_style_package_reference_accepts_bare_root() {
+        assert!(is_bare_style_package_reference("bootstrap"));
+    }
+
+    #[test]
+    fn is_bare_style_package_reference_rejects_relative_specifier() {
+        assert!(!is_bare_style_package_reference("./styles.css"));
+    }
+
+    // ---- should_preserve_node_modules_style_file (lines 1018-1039) ----
+
+    #[test]
+    fn should_preserve_preserves_bare_subpath_css_from_node_modules() {
+        let specifier = "bootstrap/dist/css/bootstrap.min.css";
+        let from_file = Path::new("/project/src/main.css");
+        let resolved = Path::new("/project/node_modules/bootstrap/dist/css/bootstrap.min.css");
+        assert!(should_preserve_node_modules_style_file(
+            specifier, from_file, resolved, false
+        ));
+    }
+
+    #[test]
+    fn should_preserve_preserves_bare_root_css_from_style_importer() {
+        let specifier = "animate.css";
+        let from_file = Path::new("/project/src/main.scss");
+        let resolved = Path::new("/project/node_modules/animate.css/animate.min.css");
+        assert!(should_preserve_node_modules_style_file(
+            specifier, from_file, resolved, false
+        ));
+    }
+
+    #[test]
+    fn should_preserve_does_not_preserve_non_style_file() {
+        let specifier = "react";
+        let from_file = Path::new("/project/src/index.ts");
+        let resolved = Path::new("/project/node_modules/react/index.js");
+        assert!(!should_preserve_node_modules_style_file(
+            specifier, from_file, resolved, false
+        ));
+    }
+
+    // ---- package_usage_name_for_resolved_package (lines 1144-1153) ----
+
+    #[test]
+    fn package_usage_name_bare_specifier_uses_import_name() {
+        let specifier = "lodash";
+        let resolved = Path::new("/project/node_modules/lodash/index.js");
+        let name = package_usage_name_for_resolved_package(specifier, resolved);
+        assert_eq!(name, Some("lodash".to_string()));
+    }
+
+    #[test]
+    fn package_usage_name_scoped_bare_specifier_uses_import_name() {
+        let specifier = "@babel/core";
+        let resolved = Path::new("/project/node_modules/@babel/core/lib/index.js");
+        let name = package_usage_name_for_resolved_package(specifier, resolved);
+        assert_eq!(name, Some("@babel/core".to_string()));
+    }
+
+    #[test]
+    fn package_usage_name_non_node_modules_path_returns_none() {
+        let specifier = "./local";
+        let resolved = Path::new("/project/src/local.ts");
+        let name = package_usage_name_for_resolved_package(specifier, resolved);
+        assert_eq!(name, None);
+    }
+
+    // ---- package_usage_name_for_external_bare_specifier (lines 1160-1169) ----
+
+    #[test]
+    fn external_bare_specifier_valid_package_returns_name() {
+        let result = package_usage_name_for_external_bare_specifier("react");
+        assert_eq!(result, Some("react".to_string()));
+    }
+
+    #[test]
+    fn external_bare_specifier_scoped_package_returns_scoped_name() {
+        let result = package_usage_name_for_external_bare_specifier("@babel/core");
+        assert_eq!(result, Some("@babel/core".to_string()));
+    }
+
+    #[test]
+    fn external_bare_specifier_relative_path_returns_none() {
+        let result = package_usage_name_for_external_bare_specifier("./local");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn external_bare_specifier_path_alias_returns_none() {
+        let result = package_usage_name_for_external_bare_specifier("@/components");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn external_bare_specifier_bare_at_sign_only_returns_none() {
+        let result = package_usage_name_for_external_bare_specifier("@");
+        assert_eq!(result, None);
+    }
+
+    // ---- has_glob_meta (lines 370-374) ----
+
+    #[test]
+    fn has_glob_meta_detects_star_wildcard() {
+        assert!(has_glob_meta("src/**/*.ts"));
+    }
+
+    #[test]
+    fn has_glob_meta_detects_question_mark() {
+        assert!(has_glob_meta("src/?.ts"));
+    }
+
+    #[test]
+    fn has_glob_meta_detects_bracket_group() {
+        assert!(has_glob_meta("src/[abc].ts"));
+    }
+
+    #[test]
+    fn has_glob_meta_detects_brace_group() {
+        assert!(has_glob_meta("src/{a,b}.ts"));
+    }
+
+    #[test]
+    fn has_glob_meta_plain_path_returns_false() {
+        assert!(!has_glob_meta("src/components"));
+    }
+
+    // ---- path_alias_specificity (lines 734-738) ----
+
+    #[test]
+    fn path_alias_specificity_exact_pattern_is_max() {
+        assert_eq!(path_alias_specificity("$lib"), usize::MAX);
+    }
+
+    #[test]
+    fn path_alias_specificity_wildcard_pattern_counts_prefix_and_suffix_length() {
+        assert_eq!(path_alias_specificity("@app/*"), "@app/".len());
+    }
+
+    #[test]
+    fn path_alias_specificity_longer_prefix_is_more_specific_than_shorter() {
+        assert!(path_alias_specificity("@app/foo/*") > path_alias_specificity("@app/*"));
+    }
+
+    // ---- extension_alias_matches (lines 855-867) ----
+
+    #[test]
+    fn extension_alias_matches_js_to_ts() {
+        assert!(extension_alias_matches("js", ".ts"));
+        assert!(extension_alias_matches("js", ".tsx"));
+        assert!(extension_alias_matches("js", ".js"));
+    }
+
+    #[test]
+    fn extension_alias_matches_jsx_to_tsx() {
+        assert!(extension_alias_matches("jsx", ".tsx"));
+        assert!(extension_alias_matches("jsx", ".jsx"));
+        assert!(!extension_alias_matches("jsx", ".ts"));
+    }
+
+    #[test]
+    fn extension_alias_matches_mjs_to_mts() {
+        assert!(extension_alias_matches("mjs", ".mts"));
+        assert!(extension_alias_matches("mjs", ".mjs"));
+        assert!(!extension_alias_matches("mjs", ".ts"));
+    }
+
+    #[test]
+    fn extension_alias_matches_cjs_to_cts() {
+        assert!(extension_alias_matches("cjs", ".cts"));
+        assert!(extension_alias_matches("cjs", ".cjs"));
+        assert!(!extension_alias_matches("cjs", ".js"));
+    }
+
+    #[test]
+    fn extension_alias_matches_unknown_import_ext_returns_false() {
+        assert!(!extension_alias_matches("ts", ".js"));
+    }
+
+    // ---- with_appended_extension / with_exact_extension (lines 808-876) ----
+
+    #[test]
+    fn with_appended_extension_appends_to_extensionless_path() {
+        let path = Path::new("/project/src/Button");
+        let result = with_appended_extension(path, ".ts");
+        assert_eq!(
+            result.to_string_lossy().replace('\\', "/"),
+            "/project/src/Button.ts"
+        );
+    }
+
+    #[test]
+    fn with_exact_extension_replaces_existing_extension() {
+        let path = Path::new("/project/src/Button.js");
+        let result = with_exact_extension(path, ".ts");
+        assert_eq!(
+            result.to_string_lossy().replace('\\', "/"),
+            "/project/src/Button.ts"
+        );
+    }
+
+    // ---- resolve_tsconfig_reference_path (lines 293-313) ----
+
+    #[cfg_attr(miri, ignore = "tempdir is blocked by Miri isolation")]
+    #[test]
+    fn resolve_tsconfig_reference_path_directory_appends_tsconfig_json() {
+        let temp = tempdir().unwrap();
+        let base = temp.path();
+        fs::create_dir_all(base.join("packages/ui")).unwrap();
+        let result = resolve_tsconfig_reference_path(base, "packages/ui");
+        assert_eq!(
+            result.to_string_lossy().replace('\\', "/"),
+            base.join("packages/ui/tsconfig.json")
+                .to_string_lossy()
+                .replace('\\', "/")
+        );
+    }
+
+    #[test]
+    fn resolve_tsconfig_reference_path_explicit_json_preserved() {
+        let base = Path::new("/project");
+        let result = resolve_tsconfig_reference_path(base, "tsconfig.lib.json");
+        assert_eq!(
+            result.to_string_lossy().replace('\\', "/"),
+            "/project/tsconfig.lib.json"
+        );
+    }
+
+    #[cfg_attr(miri, ignore = "tempdir is blocked by Miri isolation")]
+    #[test]
+    fn resolve_tsconfig_reference_path_extensionless_existing_file_appends_json() {
+        let temp = tempdir().unwrap();
+        let base = temp.path();
+        fs::write(base.join("tsconfig.lib.json"), "{}").unwrap();
+        let result = resolve_tsconfig_reference_path(base, "tsconfig.lib");
+        assert_eq!(
+            result.to_string_lossy().replace('\\', "/"),
+            base.join("tsconfig.lib.json")
+                .to_string_lossy()
+                .replace('\\', "/")
+        );
+    }
+
+    #[cfg_attr(miri, ignore = "filesystem metadata is blocked by Miri isolation")]
+    #[test]
+    fn resolve_tsconfig_reference_path_extensionless_nonexistent_falls_back_to_tsconfig_json() {
+        let base = Path::new("/project");
+        let result = resolve_tsconfig_reference_path(base, "tsconfig.lib");
+        assert_eq!(
+            result.to_string_lossy().replace('\\', "/"),
+            "/project/tsconfig.lib/tsconfig.json"
+        );
+    }
+
+    // ---- tsconfig_extends_values (lines 315-320) ----
+
+    #[test]
+    fn tsconfig_extends_values_single_string() {
+        let json = serde_json::json!({ "extends": "../../tsconfig.base.json" });
+        let values = tsconfig_extends_values(&json);
+        assert_eq!(values, vec!["../../tsconfig.base.json"]);
+    }
+
+    #[test]
+    fn tsconfig_extends_values_array_form() {
+        let json = serde_json::json!({
+            "extends": ["../../tsconfig.base.json", "@tsconfig/node18/tsconfig.json"]
+        });
+        let values = tsconfig_extends_values(&json);
+        assert_eq!(
+            values,
+            vec!["../../tsconfig.base.json", "@tsconfig/node18/tsconfig.json"]
+        );
+    }
+
+    #[test]
+    fn tsconfig_extends_values_missing_extends_returns_empty() {
+        let json = serde_json::json!({ "compilerOptions": {} });
+        let values = tsconfig_extends_values(&json);
+        assert!(values.is_empty());
+    }
+
+    // ---- is_relative_tsconfig_extends (lines 539-541) ----
+
+    #[test]
+    fn is_relative_tsconfig_extends_dot_slash_is_relative() {
+        assert!(is_relative_tsconfig_extends("./tsconfig.base.json"));
+    }
+
+    #[test]
+    fn is_relative_tsconfig_extends_double_dot_slash_is_relative() {
+        assert!(is_relative_tsconfig_extends("../../tsconfig.base.json"));
+    }
+
+    #[test]
+    fn is_relative_tsconfig_extends_package_name_is_not_relative() {
+        assert!(!is_relative_tsconfig_extends(
+            "@tsconfig/node18/tsconfig.json"
+        ));
+    }
+
+    // ---- resolve_tsconfig_extends_candidate (lines 554-568) ----
+
+    #[test]
+    fn resolve_tsconfig_extends_candidate_with_json_ext_unchanged() {
+        let path = PathBuf::from("/project/tsconfig.base.json");
+        let result = resolve_tsconfig_extends_candidate(path.clone());
+        assert_eq!(
+            result.to_string_lossy().replace('\\', "/"),
+            path.to_string_lossy().replace('\\', "/")
+        );
+    }
+
+    #[cfg_attr(miri, ignore = "tempdir is blocked by Miri isolation")]
+    #[test]
+    fn resolve_tsconfig_extends_candidate_extensionless_with_existing_json_file_appends_json() {
+        let temp = tempdir().unwrap();
+        let base = temp.path();
+        fs::write(base.join("tsconfig.base.json"), "{}").unwrap();
+        let path = base.join("tsconfig.base");
+        let result = resolve_tsconfig_extends_candidate(path);
+        assert_eq!(
+            result.to_string_lossy().replace('\\', "/"),
+            base.join("tsconfig.base.json")
+                .to_string_lossy()
+                .replace('\\', "/")
+        );
+    }
+
+    #[cfg_attr(miri, ignore = "filesystem metadata is blocked by Miri isolation")]
+    #[test]
+    fn resolve_tsconfig_extends_candidate_extensionless_nonexistent_returns_original_path() {
+        let path = PathBuf::from("/project/tsconfig.base");
+        let result = resolve_tsconfig_extends_candidate(path.clone());
+        assert_eq!(
+            result.to_string_lossy().replace('\\', "/"),
+            path.to_string_lossy().replace('\\', "/")
+        );
+    }
+
+    // ---- is_storybook_preview_html (lines 393-401) ----
+
+    #[test]
+    fn is_storybook_preview_html_matches_preview_head_html() {
+        let path = Path::new("/project/.storybook/preview-head.html");
+        assert!(is_storybook_preview_html(path));
+    }
+
+    #[test]
+    fn is_storybook_preview_html_matches_preview_body_html() {
+        let path = Path::new("/project/.storybook/preview-body.html");
+        assert!(is_storybook_preview_html(path));
+    }
+
+    #[test]
+    fn is_storybook_preview_html_rejects_non_storybook_dir() {
+        let path = Path::new("/project/src/preview-head.html");
+        assert!(!is_storybook_preview_html(path));
+    }
+
+    #[test]
+    fn is_storybook_preview_html_rejects_other_filenames() {
+        let path = Path::new("/project/.storybook/manager-head.html");
+        assert!(!is_storybook_preview_html(path));
+    }
+
+    // ---- tsconfig_extends_values array with non-string entries (line 318) ----
+
+    #[test]
+    fn tsconfig_extends_values_array_filters_out_non_string_entries() {
+        let json = serde_json::json!({ "extends": ["valid.json", 42, null] });
+        let values = tsconfig_extends_values(&json);
+        assert_eq!(values, vec!["valid.json"]);
+    }
+
+    // ---- path_alias_capture: exact match returns empty capture (line 615) ----
+
+    #[test]
+    fn path_alias_capture_exact_pattern_returns_empty_capture() {
+        assert_eq!(path_alias_capture("$lib", "$lib"), Some(""));
+        assert_eq!(path_alias_capture("$lib", "$lib/utils"), None);
+    }
+
+    // ---- path_alias_pattern_matches: bare wildcard (lines 596-599) ----
+
+    #[test]
+    fn wildcard_only_pattern_does_not_match_via_pattern_matches() {
+        assert!(!path_alias_pattern_matches("*", "anything"));
+    }
+
+    // ---- package_usage_name_for_resolved_package with path alias specifier ----
+
+    #[test]
+    fn package_usage_name_path_alias_specifier_uses_resolved_package() {
+        let specifier = "@/utils";
+        let resolved = Path::new("/project/node_modules/some-pkg/utils/index.js");
+        let name = package_usage_name_for_resolved_package(specifier, resolved);
+        assert_eq!(name, Some("some-pkg".to_string()));
+    }
+
+    // ---- static_dir_relative_path: mount without trailing slash subdir (line 447) ----
+
+    #[test]
+    fn static_dir_relative_path_prefix_collision_does_not_match() {
+        assert_eq!(
+            static_dir_relative_path("/assetsExtra/file.js", "/assets"),
+            None
+        );
+    }
+
+    // ---- glob_values_match: invalid glob is skipped (line 362) ----
+
+    #[test]
+    fn glob_values_match_invalid_glob_pattern_is_skipped() {
+        let base = Path::new("/project");
+        let source = Path::new("/project/src/index.ts");
+        let result = glob_values_match(base, &[serde_json::json!("[invalid")], source);
+        assert!(
+            !result,
+            "an invalid glob pattern must not accidentally match"
+        );
+    }
+
+    // ---- glob_values_match: no patterns at all returns false ----
+
+    #[test]
+    fn glob_values_match_empty_values_returns_false() {
+        let base = Path::new("/project");
+        let source = Path::new("/project/src/index.ts");
+        assert!(!glob_values_match(base, &[], source));
+    }
+
+    // ---- should_preserve: from_style flag enables preservation for bare package from scss importer ----
+
+    #[test]
+    fn should_preserve_from_style_flag_enables_preservation() {
+        let specifier = "normalize.css";
+        let from_file = Path::new("/project/src/App.vue");
+        let resolved = Path::new("/project/node_modules/normalize.css/normalize.css");
+        assert!(should_preserve_node_modules_style_file(
+            specifier, from_file, resolved, true
+        ));
+    }
+
+    // ---- normalize_resolve_specifier: http:// URL is external ----
+
+    #[test]
+    fn http_url_is_external() {
+        let result = normalize_resolve_specifier("http://cdn.example.com/lib.js");
+        assert!(
+            matches!(result, SpecifierNormalization::External(_)),
+            "http:// URL must be External"
+        );
+    }
+
+    // ---- normalize_resolve_specifier: npm: with subpath (lines 1291-1301) ----
+
+    #[test]
+    fn npm_scheme_plain_package_is_resolvable() {
+        let result = normalize_resolve_specifier("npm:react");
+        let SpecifierNormalization::Resolvable(s) = result else {
+            panic!("npm:react should be Resolvable");
+        };
+        assert_eq!(s, "react");
+    }
+
+    // ---- resolve_tsconfig_extends_path: relative path resolution (lines 519-536) ----
+
+    #[test]
+    fn resolve_tsconfig_extends_path_relative_dot_slash_preserves_dot_slash() {
+        let base = Path::new("/project");
+        let result = resolve_tsconfig_extends_path(base, "./tsconfig.base.json");
+        assert!(
+            result
+                .to_string_lossy()
+                .replace('\\', "/")
+                .contains("tsconfig.base.json"),
+            "relative dot-slash path must resolve to the base.json file"
+        );
+    }
+
+    #[test]
+    fn resolve_tsconfig_extends_path_adds_json_extension_for_extensionless_relative() {
+        let base = Path::new("/project");
+        let result = resolve_tsconfig_extends_path(base, "../shared/tsconfig.base");
+        assert!(
+            result.to_string_lossy().ends_with(".json"),
+            "extensionless extends must get .json appended"
+        );
+    }
+
+    // ---- is_bare_style_subpath edge cases: scss extension ----
+
+    #[test]
+    fn is_bare_style_subpath_scss_extension_matches() {
+        assert!(is_bare_style_subpath("bootstrap/scss/bootstrap.scss"));
+    }
+
+    #[test]
+    fn is_bare_style_subpath_sass_extension_matches() {
+        assert!(is_bare_style_subpath("bulma/sass/helpers/index.sass"));
+    }
+
+    #[test]
+    fn is_bare_style_subpath_less_extension_matches() {
+        assert!(is_bare_style_subpath("antd/lib/style/index.less"));
+    }
+
+    // ---- has_glob_meta: closing brace or bracket alone ----
+
+    #[test]
+    fn has_glob_meta_closing_bracket_detected() {
+        assert!(has_glob_meta("src/[a-z]"));
+    }
+
+    // ---- path_alias_specificity: wildcard-only pattern ----
+
+    #[test]
+    fn path_alias_specificity_pure_wildcard_has_zero_specificity() {
+        assert_eq!(path_alias_specificity("*"), 0);
+    }
+
+    // ---- with_exact_extension: path without extension ----
+
+    #[test]
+    fn with_exact_extension_path_without_extension_does_not_add_double_ext() {
+        let path = Path::new("/project/src/Button");
+        let result = with_exact_extension(path, ".ts");
+        assert_eq!(
+            result.to_string_lossy().replace('\\', "/"),
+            "/project/src/Button.ts"
+        );
+    }
+
+    // ---- tsconfig_applies_to_file ----
+
+    /// Build a `ResolveContext` rooted at `root` with empty lookup tables and
+    /// hand it to `f`. Enough for helpers that only read tsconfigs from disk.
+    fn with_ctx_at_root<F: FnOnce(&ResolveContext<'_>)>(root: &Path, f: F) {
+        let resolver = super::create_resolver(root, &[], &[]);
+        let style_resolver = super::create_resolver(root, &[], &["style".to_string()]);
+        let extensions = react_native::build_extensions(&[]);
+        let path_to_id = FxHashMap::default();
+        let raw_path_to_id = FxHashMap::default();
+        let workspace_roots = FxHashMap::default();
+        let package_manifests = Vec::new();
+        let condition_names = react_native::build_condition_names(&[], &[]);
+        let tsconfig_warned = std::sync::Mutex::new(FxHashSet::default());
+        let tsconfig_cache = TsconfigCache::default();
+        let canonicalize_cache = CanonicalizeCache::default();
+        let ctx = ResolveContext {
+            resolver: &resolver,
+            style_resolver: &style_resolver,
+            extensions: &extensions,
+            path_to_id: &path_to_id,
+            raw_path_to_id: &raw_path_to_id,
+            workspace_roots: &workspace_roots,
+            package_manifests: &package_manifests,
+            has_deno_import_maps: false,
+            condition_names: &condition_names,
+            path_aliases: &[],
+            scss_include_paths: &[],
+            static_dir_mappings: &[],
+            root,
+            canonical_fallback: None,
+            tsconfig_warned: &tsconfig_warned,
+            tsconfig_cache: &tsconfig_cache,
+            canonicalize_cache: &canonicalize_cache,
+        };
+        f(&ctx);
+    }
+
+    fn write_two_sibling_packages_without_includes(root: &Path) {
+        for package in ["app", "lib"] {
+            let src = root.join("packages").join(package).join("src");
+            fs::create_dir_all(&src).unwrap();
+            fs::write(src.join("index.ts"), "export {};").unwrap();
+            fs::write(
+                root.join("packages").join(package).join("tsconfig.json"),
+                r#"{"compilerOptions":{}}"#,
+            )
+            .unwrap();
+        }
+    }
+
+    /// The regression this guards: a tsconfig with neither `files` nor
+    /// `include` used to match every file in the repo, so an unrelated sibling
+    /// project claimed ownership of it.
+    #[test]
+    #[cfg_attr(miri, ignore = "tempdir is blocked by Miri isolation")]
+    fn tsconfig_without_includes_does_not_apply_to_a_sibling_package() {
+        let temp = tempdir().unwrap();
+        let root = temp.path();
+        write_two_sibling_packages_without_includes(root);
+
+        with_ctx_at_root(root, |ctx| {
+            assert!(!super::tsconfig_applies_to_file(
+                ctx,
+                &root.join("packages/lib/tsconfig.json"),
+                &root.join("packages/app/src/index.ts"),
+            ));
+        });
+    }
+
+    // ---- find_yarn_pnp_manifest_dir ----
+
+    #[test]
+    #[cfg_attr(miri, ignore = "tempdir is blocked by Miri isolation")]
+    fn yarn_pnp_manifest_dir_is_the_root_holding_pnp_cjs() {
+        let temp = tempdir().unwrap();
+        fs::write(temp.path().join(".pnp.cjs"), "").unwrap();
+        assert_eq!(
+            super::find_yarn_pnp_manifest_dir(temp.path()).as_deref(),
+            Some(temp.path())
+        );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "tempdir is blocked by Miri isolation")]
+    fn yarn_pnp_manifest_dir_is_none_without_manifest() {
+        let temp = tempdir().unwrap();
+        fs::write(temp.path().join("package.json"), "{}").unwrap();
+        assert_eq!(super::find_yarn_pnp_manifest_dir(temp.path()), None);
+    }
+
+    /// Only `.pnp.cjs` is loadable by the resolver's PnP backend. The Yarn 2
+    /// loader name, the split data file, and the ESM loader shim must not
+    /// switch PnP on.
+    #[test]
+    #[cfg_attr(miri, ignore = "tempdir is blocked by Miri isolation")]
+    fn yarn_pnp_manifest_dir_ignores_other_pnp_filenames() {
+        for name in [".pnp.js", ".pnp.mjs", ".pnp.data.json", ".pnp.loader.mjs"] {
+            let temp = tempdir().unwrap();
+            fs::write(temp.path().join(name), "").unwrap();
+            assert_eq!(
+                super::find_yarn_pnp_manifest_dir(temp.path()),
+                None,
+                "{name} must not enable PnP"
+            );
+        }
+    }
+
+    /// A directory sharing the manifest's name is not an install; `is_file`
+    /// rather than `exists` is what keeps this from being a false positive.
+    #[test]
+    #[cfg_attr(miri, ignore = "tempdir is blocked by Miri isolation")]
+    fn yarn_pnp_manifest_dir_ignores_directory_named_like_manifest() {
+        let temp = tempdir().unwrap();
+        fs::create_dir(temp.path().join(".pnp.cjs")).unwrap();
+        assert_eq!(super::find_yarn_pnp_manifest_dir(temp.path()), None);
+    }
+
+    /// Yarn writes the manifest only at the workspace root, so a nested
+    /// package root inherits it from the ancestor that holds it.
+    #[test]
+    #[cfg_attr(miri, ignore = "tempdir is blocked by Miri isolation")]
+    fn yarn_pnp_manifest_dir_inherits_from_ancestor() {
+        let temp = tempdir().unwrap();
+        fs::write(temp.path().join(".pnp.cjs"), "").unwrap();
+        let nested = temp.path().join("packages/app");
+        fs::create_dir_all(&nested).unwrap();
+        assert_eq!(
+            super::find_yarn_pnp_manifest_dir(&nested).as_deref(),
+            Some(temp.path())
+        );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "tempdir is blocked by Miri isolation")]
+    fn build_resolve_options_anchors_pnp_cwd_to_the_manifest_directory() {
+        let temp = tempdir().unwrap();
+        fs::write(temp.path().join(".pnp.cjs"), "").unwrap();
+        let nested = temp.path().join("packages/app");
+        fs::create_dir_all(&nested).unwrap();
+
+        let options = super::build_resolve_options(&nested, &[], &[]);
+        assert!(options.yarn_pnp);
+        assert_eq!(
+            options.cwd.as_deref(),
+            Some(dunce::canonicalize(temp.path()).unwrap().as_path())
+        );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "tempdir is blocked by Miri isolation")]
+    fn build_resolve_options_leaves_pnp_off_without_manifest() {
+        let temp = tempdir().unwrap();
+        fs::write(temp.path().join("package.json"), "{}").unwrap();
+
+        let options = super::build_resolve_options(temp.path(), &[], &[]);
+        assert!(!options.yarn_pnp);
+        assert_eq!(options.cwd, None);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "tempdir is blocked by Miri isolation")]
+    fn create_resolver_accepts_a_yarn_pnp_project_root() {
+        let temp = tempdir().unwrap();
+        fs::write(temp.path().join(".pnp.cjs"), "").unwrap();
+        let _resolver = super::create_resolver(temp.path(), &[], &[]);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "tempdir is blocked by Miri isolation")]
+    fn tsconfig_without_includes_applies_to_files_in_its_own_directory() {
+        let temp = tempdir().unwrap();
+        let root = temp.path();
+        write_two_sibling_packages_without_includes(root);
+
+        with_ctx_at_root(root, |ctx| {
+            assert!(super::tsconfig_applies_to_file(
+                ctx,
+                &root.join("packages/app/tsconfig.json"),
+                &root.join("packages/app/src/index.ts"),
+            ));
+        });
+    }
+
+    /// `references` targets are joined onto the referencing directory verbatim,
+    /// so the tsconfig's own directory routinely arrives with `..` segments.
+    #[test]
+    #[cfg_attr(miri, ignore = "tempdir is blocked by Miri isolation")]
+    fn tsconfig_without_includes_applies_through_parent_dir_segments() {
+        let temp = tempdir().unwrap();
+        let root = temp.path();
+        write_two_sibling_packages_without_includes(root);
+
+        with_ctx_at_root(root, |ctx| {
+            assert!(super::tsconfig_applies_to_file(
+                ctx,
+                &root.join("packages/app/../lib/tsconfig.json"),
+                &root.join("packages/lib/src/index.ts"),
+            ));
+        });
+    }
+
+    /// A directory prefix must not match on a partial path component.
+    #[test]
+    #[cfg_attr(miri, ignore = "tempdir is blocked by Miri isolation")]
+    fn tsconfig_without_includes_does_not_apply_to_similarly_named_sibling() {
+        let temp = tempdir().unwrap();
+        let root = temp.path();
+        let src = root.join("packages/app-extra/src");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("index.ts"), "export {};").unwrap();
+        let app = root.join("packages/app");
+        fs::create_dir_all(&app).unwrap();
+        fs::write(app.join("tsconfig.json"), r#"{"compilerOptions":{}}"#).unwrap();
+
+        with_ctx_at_root(root, |ctx| {
+            assert!(!super::tsconfig_applies_to_file(
+                ctx,
+                &app.join("tsconfig.json"),
+                &src.join("index.ts"),
+            ));
+        });
+    }
+
+    /// An explicit `include` still wins over the directory default.
+    #[test]
+    #[cfg_attr(miri, ignore = "tempdir is blocked by Miri isolation")]
+    fn explicit_include_still_narrows_within_the_tsconfig_directory() {
+        let temp = tempdir().unwrap();
+        let root = temp.path();
+        let package = root.join("packages/app");
+        fs::create_dir_all(package.join("src")).unwrap();
+        fs::create_dir_all(package.join("tools")).unwrap();
+        fs::write(package.join("src/index.ts"), "export {};").unwrap();
+        fs::write(package.join("tools/build.ts"), "export {};").unwrap();
+        fs::write(
+            package.join("tsconfig.json"),
+            r#"{"include":["src/**/*"],"compilerOptions":{}}"#,
+        )
+        .unwrap();
+
+        with_ctx_at_root(root, |ctx| {
+            let tsconfig = package.join("tsconfig.json");
+            assert!(super::tsconfig_applies_to_file(
+                ctx,
+                &tsconfig,
+                &package.join("src/index.ts")
+            ));
+            assert!(!super::tsconfig_applies_to_file(
+                ctx,
+                &tsconfig,
+                &package.join("tools/build.ts")
+            ));
+        });
+    }
+
+    /// `exclude` is still applied when the directory default stands in for a
+    /// missing `include`.
+    #[test]
+    #[cfg_attr(miri, ignore = "tempdir is blocked by Miri isolation")]
+    fn exclude_is_honoured_without_include() {
+        let temp = tempdir().unwrap();
+        let root = temp.path();
+        let package = root.join("packages/app");
+        fs::create_dir_all(package.join("src/generated")).unwrap();
+        fs::write(package.join("src/index.ts"), "export {};").unwrap();
+        fs::write(package.join("src/generated/schema.ts"), "export {};").unwrap();
+        fs::write(
+            package.join("tsconfig.json"),
+            r#"{"exclude":["src/generated"],"compilerOptions":{}}"#,
+        )
+        .unwrap();
+
+        with_ctx_at_root(root, |ctx| {
+            let tsconfig = package.join("tsconfig.json");
+            assert!(super::tsconfig_applies_to_file(
+                ctx,
+                &tsconfig,
+                &package.join("src/index.ts")
+            ));
+            assert!(!super::tsconfig_applies_to_file(
+                ctx,
+                &tsconfig,
+                &package.join("src/generated/schema.ts")
+            ));
+        });
+    }
+
+    /// `files` without `include` keeps its files-only semantics: a sibling in
+    /// the same directory does not fall back to the directory default.
+    #[test]
+    #[cfg_attr(miri, ignore = "tempdir is blocked by Miri isolation")]
+    fn files_without_include_stays_files_only() {
+        let temp = tempdir().unwrap();
+        let root = temp.path();
+        let package = root.join("packages/app");
+        fs::create_dir_all(package.join("src")).unwrap();
+        fs::write(package.join("src/entry.ts"), "export {};").unwrap();
+        fs::write(package.join("src/other.ts"), "export {};").unwrap();
+        fs::write(
+            package.join("tsconfig.json"),
+            r#"{"files":["src/entry.ts"],"compilerOptions":{}}"#,
+        )
+        .unwrap();
+
+        with_ctx_at_root(root, |ctx| {
+            let tsconfig = package.join("tsconfig.json");
+            assert!(super::tsconfig_applies_to_file(
+                ctx,
+                &tsconfig,
+                &package.join("src/entry.ts")
+            ));
+            assert!(!super::tsconfig_applies_to_file(
+                ctx,
+                &tsconfig,
+                &package.join("src/other.ts")
+            ));
+        });
+    }
+
+    fn write_two_sibling_packages_with_lib_include(root: &Path) {
+        for package in ["app", "lib"] {
+            let src = root.join("packages").join(package).join("src");
+            fs::create_dir_all(&src).unwrap();
+        }
+        fs::write(root.join("packages/lib/src/x.ts"), "export {};").unwrap();
+        fs::write(root.join("packages/app/src/y.ts"), "export {};").unwrap();
+        fs::write(
+            root.join("packages/lib/tsconfig.json"),
+            r#"{"include":["src"],"compilerOptions":{}}"#,
+        )
+        .unwrap();
+    }
+
+    /// A referenced config that does have `include` must match when reached
+    /// through the verbatim `references` spelling. Both `./packages/lib` and
+    /// `../lib` keep their `.` and `..` segments in the joined path, and the
+    /// include globs are built from that path.
+    #[test]
+    #[cfg_attr(miri, ignore = "tempdir is blocked by Miri isolation")]
+    fn referenced_include_matches_through_dot_and_parent_dir_spellings() {
+        let temp = tempdir().unwrap();
+        let root = temp.path();
+        write_two_sibling_packages_with_lib_include(root);
+        let lib_x = root.join("packages/lib/src/x.ts");
+        let app_y = root.join("packages/app/src/y.ts");
+
+        with_ctx_at_root(root, |ctx| {
+            let via_dot = resolve_tsconfig_reference_path(root, "./packages/lib");
+            let via_parent = resolve_tsconfig_reference_path(&root.join("packages/app"), "../lib");
+            for reference in [via_dot, via_parent] {
+                assert!(reference.is_file(), "{}", reference.display());
+                assert!(
+                    super::tsconfig_applies_to_file(ctx, &reference, &lib_x),
+                    "{} should apply to packages/lib/src/x.ts",
+                    reference.display()
+                );
+                assert!(
+                    !super::tsconfig_applies_to_file(ctx, &reference, &app_y),
+                    "{} should not apply to packages/app/src/y.ts",
+                    reference.display()
+                );
+            }
+        });
+    }
+
+    /// End to end through the `references` walk: the lib config lands in the
+    /// chain for its own source file and stays out of the chain for a sibling
+    /// package's file.
+    #[test]
+    #[cfg_attr(miri, ignore = "tempdir is blocked by Miri isolation")]
+    fn references_walk_scopes_referenced_include_to_its_directory() {
+        let temp = tempdir().unwrap();
+        let root = temp.path();
+        write_two_sibling_packages_with_lib_include(root);
+        fs::write(
+            root.join("tsconfig.json"),
+            r#"{"files":[],"references":[{"path":"./packages/lib"}]}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("packages/app/tsconfig.json"),
+            r#"{"references":[{"path":"../lib"}],"compilerOptions":{}}"#,
+        )
+        .unwrap();
+        let lib_tsconfig = root.join("packages/lib/tsconfig.json");
+
+        with_ctx_at_root(root, |ctx| {
+            let chain_for = |from_file: &Path, first: &Path| {
+                let mut chain = Vec::new();
+                let mut seen = FxHashSet::default();
+                super::collect_local_tsconfig_chain(ctx, from_file, first, &mut chain, &mut seen);
+                chain
+                    .into_iter()
+                    .map(|path| super::normalize_path_lexically(&path))
+                    .collect::<Vec<_>>()
+            };
+
+            let root_config = root.join("tsconfig.json");
+            let app_config = root.join("packages/app/tsconfig.json");
+            let lib_x = root.join("packages/lib/src/x.ts");
+            let app_y = root.join("packages/app/src/y.ts");
+
+            assert!(chain_for(&lib_x, &root_config).contains(&lib_tsconfig));
+            assert!(chain_for(&lib_x, &app_config).contains(&lib_tsconfig));
+            assert!(!chain_for(&app_y, &root_config).contains(&lib_tsconfig));
+            assert!(!chain_for(&app_y, &app_config).contains(&lib_tsconfig));
+        });
     }
 }

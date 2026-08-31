@@ -2,8 +2,9 @@ use std::{fs, path::Path};
 
 use super::common::{create_config, fixture_path};
 use super::framework_convention_coverage_common::{
-    collect_unused_exports, collect_unused_files, has_unused_export,
+    collect_unused_exports, collect_unused_files, has_unused_export, normalize_path,
 };
+use fallow_core::results::AnalysisResults;
 use tempfile::tempdir;
 
 fn write_project_file(root: &Path, relative_path: &str, source: &str) {
@@ -12,6 +13,25 @@ fn write_project_file(root: &Path, relative_path: &str, source: &str) {
         fs::create_dir_all(parent).expect("create parent directories");
     }
     fs::write(path, source).expect("write test file");
+}
+
+fn duplicate_export_locations(
+    root: &Path,
+    results: &AnalysisResults,
+    export_name: &str,
+) -> Vec<String> {
+    results
+        .duplicate_exports
+        .iter()
+        .filter(|duplicate| duplicate.export.export_name == export_name)
+        .flat_map(|duplicate| {
+            duplicate
+                .export
+                .locations
+                .iter()
+                .map(|location| normalize_path(root, &location.path))
+        })
+        .collect()
 }
 
 #[test]
@@ -126,6 +146,12 @@ fn tanstack_router_custom_route_dir_and_lazy_exports_are_covered() {
             "{path}:{export} should still be reported as unused, found: {unused_exports:?}"
         );
     }
+
+    let duplicate_route_locations = duplicate_export_locations(&root, &results, "Route");
+    assert!(
+        duplicate_route_locations.is_empty(),
+        "TanStack route files should not report duplicate Route exports, found: {duplicate_route_locations:?}"
+    );
 }
 
 #[test]
@@ -165,6 +191,899 @@ fn tanstack_router_prefix_and_ignore_patterns_stay_strict() {
     assert!(
         has_unused_export(&unused_exports, "src/routes/route-posts.lazy.tsx", "loader"),
         "lazy routes should not inherit non-lazy exports, found: {unused_exports:?}"
+    );
+
+    let duplicate_route_locations = duplicate_export_locations(&root, &results, "Route");
+    assert!(
+        duplicate_route_locations.is_empty(),
+        "configured TanStack route files should not report duplicate Route exports, found: {duplicate_route_locations:?}"
+    );
+}
+
+#[test]
+fn tanstack_start_custom_route_file_ignore_prefix_keeps_dash_routes_live() {
+    let root = fixture_path("tanstack-router-custom-ignore-prefix");
+    let config = create_config(root.clone());
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+
+    // With routeFileIgnorePrefix overridden to "__excluded__" via the vite
+    // tanstackStart({ router: { ... } }) call, the default "-" prefix is no
+    // longer ignored, so src/routes/-/me.tsx is a live route. Nothing reachable
+    // only through it should be flagged unused.
+    let unused_files = collect_unused_files(&root, &results);
+    for path in [
+        "src/routes/-/me.tsx",
+        "src/components/Me.tsx",
+        "src/services/profile.ts",
+    ] {
+        assert!(
+            !unused_files.iter().any(|unused| unused == path),
+            "{path} should be live once routeFileIgnorePrefix is overridden, unused files: {unused_files:?}"
+        );
+    }
+    // The configured ignore prefix still excludes its own files.
+    assert!(
+        unused_files
+            .iter()
+            .any(|unused| unused == "src/routes/__excluded__scratch.tsx"),
+        "the configured __excluded__ prefix should still be ignored, unused files: {unused_files:?}"
+    );
+
+    let unused_exports = collect_unused_exports(&root, &results);
+    for (path, export) in [
+        ("src/routes/-/me.tsx", "Route"),
+        ("src/routes/-/me.tsx", "loader"),
+        ("src/routes/-/me.tsx", "component"),
+    ] {
+        assert!(
+            !has_unused_export(&unused_exports, path, export),
+            "{path}:{export} should be framework-used on a live dash route, found: {unused_exports:?}"
+        );
+    }
+    // Ordinary helpers on a live route file are still reported.
+    assert!(
+        has_unused_export(&unused_exports, "src/routes/-/me.tsx", "unusedMeHelper"),
+        "ordinary helpers on a live route file should still be reported, found: {unused_exports:?}"
+    );
+}
+
+#[test]
+fn tanstack_router_vite_legacy_alias_honors_custom_ignore_prefix() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+
+    write_project_file(
+        root,
+        "package.json",
+        r#"{
+  "dependencies": {
+    "@tanstack/react-router": "1.0.0",
+    "@tanstack/router-plugin": "1.0.0",
+    "vite": "1.0.0"
+  }
+}"#,
+    );
+    // Legacy TanStackRouterVite alias takes flat options (no `router` nesting).
+    write_project_file(
+        root,
+        "vite.config.ts",
+        r#"import { defineConfig } from "vite";
+import { TanStackRouterVite } from "@tanstack/router-plugin/vite";
+
+export default defineConfig({
+  plugins: [
+    TanStackRouterVite({
+      routeFileIgnorePrefix: "__excluded__"
+    })
+  ]
+});
+"#,
+    );
+    write_project_file(
+        root,
+        "src/routeTree.gen.ts",
+        r#"import { Route as dashRoute } from "./routes/-/me";
+
+export const routeTree = [dashRoute];
+"#,
+    );
+    write_project_file(root, "src/routes/-/me.tsx", "export const Route = {};\n");
+    write_project_file(
+        root,
+        "src/routes/__excluded__scratch.tsx",
+        "export const Route = {};\n",
+    );
+
+    let config = create_config(root.to_path_buf());
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+    let unused_files = collect_unused_files(root, &results);
+    assert!(
+        !unused_files
+            .iter()
+            .any(|path| path == "src/routes/-/me.tsx"),
+        "dash-prefixed route should stay live under the legacy alias override, unused files: {unused_files:?}"
+    );
+    assert!(
+        unused_files
+            .iter()
+            .any(|path| path == "src/routes/__excluded__scratch.tsx"),
+        "the configured __excluded__ prefix should be ignored under the legacy alias, unused files: {unused_files:?}"
+    );
+}
+
+#[test]
+fn tanstack_router_default_ignore_prefix_still_ignores_dash_files() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+
+    write_project_file(
+        root,
+        "package.json",
+        r#"{
+  "dependencies": {
+    "@tanstack/react-router": "1.0.0"
+  }
+}"#,
+    );
+    write_project_file(root, "src/routes/index.tsx", "export const Route = {};\n");
+    write_project_file(root, "src/routes/-helper.tsx", "export const Route = {};\n");
+
+    let config = create_config(root.to_path_buf());
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+    let unused_files = collect_unused_files(root, &results);
+    assert!(
+        unused_files
+            .iter()
+            .any(|path| path == "src/routes/-helper.tsx"),
+        "with no override the default \"-\" prefix must stay ignored, unused files: {unused_files:?}"
+    );
+}
+
+#[test]
+fn tanstack_router_generated_tree_route_exports_are_not_duplicate_exports() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+
+    write_project_file(
+        root,
+        "package.json",
+        r#"{
+  "name": "tanstack-generated-tree-routes",
+  "main": "src/renderer/src/router.ts",
+  "dependencies": {
+    "@tanstack/react-router": "1.0.0"
+  }
+}"#,
+    );
+    write_project_file(
+        root,
+        "src/renderer/src/router.ts",
+        r#"import { routeTree } from "./routeTree.gen";
+
+export const router = routeTree;
+"#,
+    );
+    write_project_file(
+        root,
+        "src/renderer/src/routeTree.gen.ts",
+        r#"import { Route as rootRouteImport } from "./routes/__root";
+import { Route as homeRouteImport } from "./routes/home";
+
+export const routeTree = [rootRouteImport, homeRouteImport];
+"#,
+    );
+    write_project_file(
+        root,
+        "src/renderer/src/routes/__root.tsx",
+        r#"import { createRootRoute } from "@tanstack/react-router";
+
+export const Route = createRootRoute()({});
+"#,
+    );
+    write_project_file(
+        root,
+        "src/renderer/src/routes/home.tsx",
+        r#"import { createFileRoute } from "@tanstack/react-router";
+
+export const Route = createFileRoute("/")({});
+"#,
+    );
+
+    let config = create_config(root.to_path_buf());
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+    let duplicate_route_locations = duplicate_export_locations(root, &results, "Route");
+
+    assert!(
+        duplicate_route_locations.is_empty(),
+        "Route exports referenced by TanStack generated route trees should not be duplicate exports, found: {duplicate_route_locations:?}"
+    );
+}
+
+#[test]
+fn tanstack_router_generated_route_tree_import_without_file_is_not_unresolved() {
+    let root = fixture_path("tanstack-router-generated-route-tree-import");
+    let config = create_config(root);
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+    let unresolved_specifiers: Vec<&str> = results
+        .unresolved_imports
+        .iter()
+        .map(|import| import.import.specifier.as_str())
+        .collect();
+
+    assert!(
+        !unresolved_specifiers.contains(&"./routeTree.gen"),
+        "TanStack Router generated route tree imports should not be unresolved, found: {unresolved_specifiers:?}"
+    );
+    assert!(
+        unresolved_specifiers.contains(&"./missing-control"),
+        "ordinary missing relative imports should still be unresolved, found: {unresolved_specifiers:?}"
+    );
+}
+
+#[test]
+fn route_tree_generated_import_stays_unresolved_without_tanstack_router_plugin() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+
+    write_project_file(
+        root,
+        "package.json",
+        r#"{
+  "name": "route-tree-without-tanstack",
+  "main": "src/router.ts"
+}"#,
+    );
+    write_project_file(root, "src/router.ts", "import './routeTree.gen';\n");
+
+    let config = create_config(root.to_path_buf());
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+    let unresolved_specifiers: Vec<&str> = results
+        .unresolved_imports
+        .iter()
+        .map(|import| import.import.specifier.as_str())
+        .collect();
+
+    assert!(
+        unresolved_specifiers.contains(&"./routeTree.gen"),
+        "routeTree.gen should only be suppressed by the active TanStack Router plugin, found: {unresolved_specifiers:?}"
+    );
+}
+
+#[test]
+fn tanstack_start_virtual_modules_are_not_unlisted() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+
+    write_project_file(
+        root,
+        "package.json",
+        r#"{
+  "name": "tanstack-start-virtual-modules",
+  "main": "src/router-manifest.ts",
+  "dependencies": {
+    "@tanstack/react-start": "1.0.0"
+  }
+}"#,
+    );
+    write_project_file(
+        root,
+        "src/router-manifest.ts",
+        r#"import manifestModule from "tanstack-start-manifest:v";
+
+export async function loadManifest() {
+  const { tsrStartManifest } = await import("tanstack-start-manifest:v");
+  const mod = await import("tanstack-start-injected-head-scripts:v");
+  return [manifestModule, tsrStartManifest, mod];
+}
+"#,
+    );
+
+    let config = create_config(root.to_path_buf());
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+    let unlisted_names: Vec<&str> = results
+        .unlisted_dependencies
+        .iter()
+        .map(|dep| dep.dep.package_name.as_str())
+        .collect();
+    let unresolved_specifiers: Vec<&str> = results
+        .unresolved_imports
+        .iter()
+        .map(|import| import.import.specifier.as_str())
+        .collect();
+
+    for specifier in [
+        "tanstack-start-manifest:v",
+        "tanstack-start-injected-head-scripts:v",
+    ] {
+        assert!(
+            !unlisted_names.contains(&specifier),
+            "{specifier} should be treated as a TanStack Start virtual module, unlisted dependencies: {unlisted_names:?}"
+        );
+        assert!(
+            !unresolved_specifiers.contains(&specifier),
+            "{specifier} should be treated as a TanStack Start virtual module, unresolved imports: {unresolved_specifiers:?}"
+        );
+    }
+}
+
+#[test]
+fn tanstack_start_virtual_modules_stay_unlisted_without_plugin() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+
+    write_project_file(
+        root,
+        "package.json",
+        r#"{
+  "name": "tanstack-start-virtual-modules-without-plugin",
+  "main": "src/router-manifest.ts"
+}"#,
+    );
+    write_project_file(
+        root,
+        "src/router-manifest.ts",
+        r#"export async function loadManifest() {
+  const { tsrStartManifest } = await import("tanstack-start-manifest:v");
+  const mod = await import("tanstack-start-injected-head-scripts:v");
+  return [tsrStartManifest, mod];
+}
+"#,
+    );
+
+    let config = create_config(root.to_path_buf());
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+    let unlisted_names: Vec<&str> = results
+        .unlisted_dependencies
+        .iter()
+        .map(|dep| dep.dep.package_name.as_str())
+        .collect();
+
+    for specifier in [
+        "tanstack-start-manifest:v",
+        "tanstack-start-injected-head-scripts:v",
+    ] {
+        assert!(
+            unlisted_names.contains(&specifier),
+            "{specifier} should only be suppressed by the active TanStack plugin, unlisted dependencies: {unlisted_names:?}"
+        );
+    }
+}
+
+#[test]
+fn tanstack_router_inline_virtual_route_config_is_covered() {
+    let root = fixture_path("tanstack-router-virtual-routes");
+    let config = create_config(root.clone());
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+
+    let unused_files = collect_unused_files(&root, &results);
+    for path in [
+        "src/routeTree.gen.ts",
+        "src/virtual-routes/root.tsx",
+        "src/virtual-routes/home.tsx",
+        "src/virtual-routes/admin/dashboard.tsx",
+        "src/virtual-routes/layouts/shell.tsx",
+        "src/virtual-routes/settings.tsx",
+    ] {
+        assert!(
+            !unused_files.iter().any(|unused| unused == path),
+            "{path} should be reachable through inline virtualRouteConfig, unused files: {unused_files:?}"
+        );
+    }
+    assert!(
+        unused_files
+            .iter()
+            .any(|unused| unused == "src/virtual-routes/orphan.tsx"),
+        "virtualRouteConfig should not keep unlisted route files alive, unused files: {unused_files:?}"
+    );
+
+    let unused_exports = collect_unused_exports(&root, &results);
+    for (path, export) in [
+        ("src/virtual-routes/root.tsx", "Route"),
+        ("src/virtual-routes/home.tsx", "Route"),
+        ("src/virtual-routes/home.tsx", "loader"),
+        ("src/virtual-routes/admin/dashboard.tsx", "ServerRoute"),
+        ("src/virtual-routes/layouts/shell.tsx", "beforeLoad"),
+    ] {
+        assert!(
+            !has_unused_export(&unused_exports, path, export),
+            "{path}:{export} should be framework-used through virtualRouteConfig, found: {unused_exports:?}"
+        );
+    }
+    assert!(
+        has_unused_export(
+            &unused_exports,
+            "src/virtual-routes/home.tsx",
+            "unusedHomeHelper"
+        ),
+        "ordinary helpers in virtual route files should still be reported, found: {unused_exports:?}"
+    );
+
+    let duplicate_route_locations = duplicate_export_locations(&root, &results, "Route");
+    assert!(
+        duplicate_route_locations.is_empty(),
+        "virtual TanStack route files should not report duplicate Route exports, found: {duplicate_route_locations:?}"
+    );
+}
+
+#[test]
+fn tanstack_router_non_route_duplicate_route_exports_are_still_reported() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+
+    write_project_file(
+        root,
+        "package.json",
+        r#"{
+  "name": "tanstack-non-route-duplicates",
+  "main": "src/main.ts",
+  "dependencies": {
+    "@tanstack/react-router": "1.0.0"
+  }
+}"#,
+    );
+    write_project_file(
+        root,
+        "src/main.ts",
+        r#"import { Route as RouteA } from "./features/a";
+import { Route as RouteB } from "./features/b";
+
+export const routes = [RouteA, RouteB];
+"#,
+    );
+    write_project_file(root, "src/features/a.ts", "export const Route = 'a';\n");
+    write_project_file(root, "src/features/b.ts", "export const Route = 'b';\n");
+
+    let config = create_config(root.to_path_buf());
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+    let duplicate_route_locations = duplicate_export_locations(root, &results, "Route");
+
+    assert!(
+        duplicate_route_locations
+            .iter()
+            .any(|path| path == "src/features/a.ts")
+            && duplicate_route_locations
+                .iter()
+                .any(|path| path == "src/features/b.ts"),
+        "non-route duplicate Route exports should still be reported, found: {duplicate_route_locations:?}"
+    );
+}
+
+#[test]
+fn tanstack_router_virtual_route_config_file_is_covered() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+
+    write_project_file(
+        root,
+        "package.json",
+        r#"{
+  "dependencies": {
+    "@tanstack/react-start": "1.0.0",
+    "@tanstack/virtual-file-routes": "1.0.0"
+  }
+}"#,
+    );
+    write_project_file(
+        root,
+        "tsr.config.json",
+        r#"{
+  "virtualRouteConfig": "./routes.ts",
+  "generatedRouteTree": "./routeTree.gen.ts"
+}"#,
+    );
+    write_project_file(
+        root,
+        "routes.ts",
+        r#"import { index, layout, physical, rootRoute, route } from "@tanstack/virtual-file-routes";
+
+export const routes = rootRoute("root.tsx", [
+  index("home.tsx"),
+  route("/admin", "admin/dashboard.tsx"),
+  layout("shell", "layouts/shell.tsx", [
+    route("/settings", "settings.tsx")
+  ]),
+  physical("physical")
+]);
+"#,
+    );
+    write_project_file(root, "routeTree.gen.ts", "export const routeTree = {};\n");
+    write_project_file(root, "root.tsx", "export const Route = {};\n");
+    write_project_file(root, "home.tsx", "export const Route = {};\n");
+    write_project_file(
+        root,
+        "admin/dashboard.tsx",
+        "export const ServerRoute = {};\nexport const unusedDashboardHelper = 1;\n",
+    );
+    write_project_file(
+        root,
+        "layouts/shell.tsx",
+        "export function beforeLoad() {}\n",
+    );
+    write_project_file(root, "settings.tsx", "export const Route = {};\n");
+    write_project_file(root, "physical/index.tsx", "export const Route = {};\n");
+    write_project_file(root, "physical/-helper.tsx", "export const Route = {};\n");
+    write_project_file(root, "src/routes/orphan.tsx", "export const Route = {};\n");
+
+    let config = create_config(root.to_path_buf());
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+    let unused_files = collect_unused_files(root, &results);
+    for path in [
+        "routes.ts",
+        "routeTree.gen.ts",
+        "root.tsx",
+        "home.tsx",
+        "admin/dashboard.tsx",
+        "layouts/shell.tsx",
+        "settings.tsx",
+        "physical/index.tsx",
+    ] {
+        assert!(
+            !unused_files.iter().any(|unused| unused == path),
+            "{path} should be reachable through virtual route config file, unused files: {unused_files:?}"
+        );
+    }
+    for path in ["physical/-helper.tsx", "src/routes/orphan.tsx"] {
+        assert!(
+            unused_files.iter().any(|unused| unused == path),
+            "{path} should not be treated as a configured virtual route, unused files: {unused_files:?}"
+        );
+    }
+
+    let unused_exports = collect_unused_exports(root, &results);
+    assert!(
+        !has_unused_export(&unused_exports, "admin/dashboard.tsx", "ServerRoute"),
+        "Start ServerRoute export should be framework-used, found: {unused_exports:?}"
+    );
+    assert!(
+        has_unused_export(
+            &unused_exports,
+            "admin/dashboard.tsx",
+            "unusedDashboardHelper"
+        ),
+        "non-framework exports should still be reported, found: {unused_exports:?}"
+    );
+}
+
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "test fixture; linear setup/assert, length is not a maintainability concern"
+)]
+fn tanstack_router_vite_plugin_inline_virtual_routes_are_covered() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+
+    write_project_file(
+        root,
+        "package.json",
+        r#"{
+  "dependencies": {
+    "@tanstack/react-start": "1.0.0",
+    "@tanstack/router-plugin": "1.0.0",
+    "@tanstack/virtual-file-routes": "1.0.0",
+    "vite": "1.0.0"
+  }
+}"#,
+    );
+    write_project_file(
+        root,
+        "vite.config.ts",
+        r#"import { defineConfig } from "vite";
+import { tanstackRouter } from "@tanstack/router-plugin/vite";
+import { index, layout, physical, rootRoute, route } from "@tanstack/virtual-file-routes";
+
+const routes = rootRoute("root.tsx", [
+  index("home.tsx"),
+  route("/admin", "admin/dashboard.tsx"),
+  layout("shell", "layouts/shell.tsx", [
+    route("/settings", "settings.tsx")
+  ]),
+  physical("physical")
+]);
+
+export default defineConfig({
+  plugins: [
+    tanstackRouter({
+      target: "react",
+      routesDirectory: "./src/virtual-routes",
+      generatedRouteTree: "./src/routeTree.gen.ts",
+      virtualRouteConfig: routes
+    })
+  ]
+});
+"#,
+    );
+    write_project_file(
+        root,
+        "src/routeTree.gen.ts",
+        "export const routeTree = {};\n",
+    );
+    write_project_file(
+        root,
+        "src/virtual-routes/root.tsx",
+        "export const Route = {};\n",
+    );
+    write_project_file(
+        root,
+        "src/virtual-routes/home.tsx",
+        "export const Route = {};\nexport function loader() {}\nexport const unusedHomeHelper = 1;\n",
+    );
+    write_project_file(
+        root,
+        "src/virtual-routes/admin/dashboard.tsx",
+        "export const ServerRoute = {};\n",
+    );
+    write_project_file(
+        root,
+        "src/virtual-routes/layouts/shell.tsx",
+        "export function beforeLoad() {}\n",
+    );
+    write_project_file(
+        root,
+        "src/virtual-routes/settings.tsx",
+        "export const Route = {};\n",
+    );
+    write_project_file(
+        root,
+        "src/virtual-routes/physical/index.tsx",
+        "export const Route = {};\n",
+    );
+    write_project_file(
+        root,
+        "src/virtual-routes/physical/-helper.tsx",
+        "export const Route = {};\n",
+    );
+    write_project_file(
+        root,
+        "src/virtual-routes/orphan.tsx",
+        "export const Route = {};\n",
+    );
+    write_project_file(root, "src/routes/legacy.tsx", "export const Route = {};\n");
+
+    let config = create_config(root.to_path_buf());
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+    let unused_files = collect_unused_files(root, &results);
+    for path in [
+        "src/routeTree.gen.ts",
+        "src/virtual-routes/root.tsx",
+        "src/virtual-routes/home.tsx",
+        "src/virtual-routes/admin/dashboard.tsx",
+        "src/virtual-routes/layouts/shell.tsx",
+        "src/virtual-routes/settings.tsx",
+        "src/virtual-routes/physical/index.tsx",
+    ] {
+        assert!(
+            !unused_files.iter().any(|unused| unused == path),
+            "{path} should be reachable through vite tanstackRouter virtualRouteConfig, unused files: {unused_files:?}"
+        );
+    }
+    for path in [
+        "src/virtual-routes/physical/-helper.tsx",
+        "src/virtual-routes/orphan.tsx",
+        "src/routes/legacy.tsx",
+    ] {
+        assert!(
+            unused_files.iter().any(|unused| unused == path),
+            "{path} should not be treated as a configured virtual route, unused files: {unused_files:?}"
+        );
+    }
+
+    let unused_exports = collect_unused_exports(root, &results);
+    for (path, export) in [
+        ("src/virtual-routes/home.tsx", "loader"),
+        ("src/virtual-routes/admin/dashboard.tsx", "ServerRoute"),
+        ("src/virtual-routes/layouts/shell.tsx", "beforeLoad"),
+    ] {
+        assert!(
+            !has_unused_export(&unused_exports, path, export),
+            "{path}:{export} should be framework-used through vite tanstackRouter config, found: {unused_exports:?}"
+        );
+    }
+    assert!(
+        has_unused_export(
+            &unused_exports,
+            "src/virtual-routes/home.tsx",
+            "unusedHomeHelper"
+        ),
+        "ordinary helpers in virtual route files should still be reported, found: {unused_exports:?}"
+    );
+}
+
+#[test]
+fn tanstack_router_webpack_plugin_virtual_route_file_is_covered() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+
+    write_project_file(
+        root,
+        "package.json",
+        r#"{
+  "dependencies": {
+    "@tanstack/react-router": "1.0.0",
+    "@tanstack/router-plugin": "1.0.0",
+    "@tanstack/virtual-file-routes": "1.0.0",
+    "webpack": "1.0.0"
+  }
+}"#,
+    );
+    write_project_file(
+        root,
+        "webpack.config.ts",
+        r#"import { tanstackRouter } from "@tanstack/router-plugin/webpack";
+
+export default {
+  plugins: [
+    tanstackRouter({
+      target: "react",
+      routesDirectory: "./app/pages",
+      generatedRouteTree: "./app/routeTree.gen.ts",
+      virtualRouteConfig: "./routes.ts"
+    })
+  ]
+};
+"#,
+    );
+    write_project_file(
+        root,
+        "routes.ts",
+        r#"import { index, rootRoute, route } from "@tanstack/virtual-file-routes";
+
+export const routes = rootRoute("root.tsx", [
+  index("home.tsx"),
+  route("/admin", "admin/dashboard.tsx")
+]);
+"#,
+    );
+    write_project_file(
+        root,
+        "app/routeTree.gen.ts",
+        "export const routeTree = {};\n",
+    );
+    write_project_file(root, "root.tsx", "export const Route = {};\n");
+    write_project_file(root, "home.tsx", "export const Route = {};\n");
+    write_project_file(
+        root,
+        "admin/dashboard.tsx",
+        "export const ServerRoute = {};\nexport const unusedDashboardHelper = 1;\n",
+    );
+    write_project_file(root, "app/pages/legacy.tsx", "export const Route = {};\n");
+
+    let config = create_config(root.to_path_buf());
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+    let unused_files = collect_unused_files(root, &results);
+    for path in [
+        "webpack.config.ts",
+        "routes.ts",
+        "app/routeTree.gen.ts",
+        "root.tsx",
+        "home.tsx",
+        "admin/dashboard.tsx",
+    ] {
+        assert!(
+            !unused_files.iter().any(|unused| unused == path),
+            "{path} should be reachable through webpack tanstackRouter virtualRouteConfig, unused files: {unused_files:?}"
+        );
+    }
+    assert!(
+        unused_files
+            .iter()
+            .any(|unused| unused == "app/pages/legacy.tsx"),
+        "virtualRouteConfig should replace the default route directory walk, unused files: {unused_files:?}"
+    );
+
+    let unused_exports = collect_unused_exports(root, &results);
+    assert!(
+        !has_unused_export(&unused_exports, "admin/dashboard.tsx", "ServerRoute"),
+        "ServerRoute export should be framework-used through webpack tanstackRouter config, found: {unused_exports:?}"
+    );
+    assert!(
+        has_unused_export(
+            &unused_exports,
+            "admin/dashboard.tsx",
+            "unusedDashboardHelper"
+        ),
+        "non-framework exports should still be reported, found: {unused_exports:?}"
+    );
+}
+
+#[test]
+fn tanstack_router_plain_vite_config_does_not_shadow_tsr_config() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+
+    write_project_file(
+        root,
+        "package.json",
+        r#"{
+  "dependencies": {
+    "@tanstack/react-router": "1.0.0",
+    "vite": "1.0.0"
+  }
+}"#,
+    );
+    write_project_file(
+        root,
+        "vite.config.ts",
+        r#"import { defineConfig } from "vite";
+
+export default defineConfig({});
+"#,
+    );
+    write_project_file(
+        root,
+        "tsr.config.json",
+        r#"{
+  "routesDirectory": "./app/pages"
+}"#,
+    );
+    write_project_file(root, "app/pages/index.tsx", "export const Route = {};\n");
+    write_project_file(root, "src/routes/legacy.tsx", "export const Route = {};\n");
+
+    let config = create_config(root.to_path_buf());
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+    let unused_files = collect_unused_files(root, &results);
+    assert!(
+        !unused_files
+            .iter()
+            .any(|path| path == "app/pages/index.tsx"),
+        "tsr.config.json should keep custom route directory live even when a plain vite config is present, unused files: {unused_files:?}"
+    );
+    assert!(
+        unused_files
+            .iter()
+            .any(|path| path == "src/routes/legacy.tsx"),
+        "default src/routes should not stay alive after tsr.config.json moves routesDirectory, unused files: {unused_files:?}"
+    );
+}
+
+#[test]
+fn tanstack_router_webpack_cjs_config_is_covered() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+
+    write_project_file(
+        root,
+        "package.json",
+        r#"{
+  "dependencies": {
+    "@tanstack/react-router": "1.0.0",
+    "@tanstack/router-plugin": "1.0.0",
+    "webpack": "1.0.0"
+  }
+}"#,
+    );
+    write_project_file(
+        root,
+        "webpack.config.cjs",
+        r#"const { tanstackRouter } = require("@tanstack/router-plugin/webpack");
+
+module.exports = {
+  plugins: [
+    tanstackRouter({
+      target: "react",
+      routesDirectory: "./app/pages"
+    })
+  ]
+};
+"#,
+    );
+    write_project_file(root, "app/pages/index.tsx", "export const Route = {};\n");
+    write_project_file(root, "src/routes/legacy.tsx", "export const Route = {};\n");
+
+    let config = create_config(root.to_path_buf());
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+    let unused_files = collect_unused_files(root, &results);
+    assert!(
+        !unused_files
+            .iter()
+            .any(|path| path == "app/pages/index.tsx"),
+        "CommonJS webpack tanstackRouter config should keep custom route directory live, unused files: {unused_files:?}"
+    );
+    assert!(
+        unused_files
+            .iter()
+            .any(|path| path == "src/routes/legacy.tsx"),
+        "default src/routes should not stay alive after webpack config moves routesDirectory, unused files: {unused_files:?}"
     );
 }
 
@@ -227,7 +1146,7 @@ fn tanstack_router_custom_route_dir_replaces_default_used_export_rules() {
 }
 
 #[test]
-fn tanstack_router_invalid_ignore_pattern_only_drops_the_bad_filter() {
+fn tanstack_router_invalid_ignore_pattern_returns_config_error() {
     let temp = tempdir().expect("create temp dir");
     let root = temp.path();
 
@@ -250,18 +1169,20 @@ fn tanstack_router_invalid_ignore_pattern_only_drops_the_bad_filter() {
     write_project_file(root, "src/routes/index.tsx", "export const Route = {};\n");
 
     let config = create_config(root.to_path_buf());
-    let results = fallow_core::analyze(&config).expect("analysis should succeed");
-    let unused_files = collect_unused_files(root, &results);
+    let err = fallow_core::analyze(&config).expect_err("analysis should fail");
+    assert_eq!(err.code(), Some("E004"));
+    let rendered = err.to_string();
     assert!(
-        !unused_files
-            .iter()
-            .any(|path| path == "src/routes/index.tsx"),
-        "invalid ignore patterns should not disable route discovery, unused files: {unused_files:?}"
+        rendered.contains("invalid plugin regex configuration"),
+        "error: {rendered}"
     );
-
-    let unused_exports = collect_unused_exports(root, &results);
+    assert!(rendered.contains("tanstack-router"), "error: {rendered}");
     assert!(
-        !has_unused_export(&unused_exports, "src/routes/index.tsx", "Route"),
-        "invalid ignore patterns should not disable framework-used export rules, found: {unused_exports:?}"
+        rendered.contains("entry_patterns[].exclude_segment_regexes"),
+        "error: {rendered}"
+    );
+    assert!(
+        rendered.contains("used_exports[].path.exclude_segment_regexes"),
+        "error: {rendered}"
     );
 }

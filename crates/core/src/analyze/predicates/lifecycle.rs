@@ -14,7 +14,6 @@ pub(in crate::analyze) fn is_angular_lifecycle_method(name: &str) -> bool {
             | "ngAfterViewInit"
             | "ngAfterViewChecked"
             | "ngAcceptInputType"
-            // Angular guard/resolver/interceptor methods
             | "canActivate"
             | "canDeactivate"
             | "canActivateChild"
@@ -22,7 +21,6 @@ pub(in crate::analyze) fn is_angular_lifecycle_method(name: &str) -> bool {
             | "resolve"
             | "intercept"
             | "transform"
-            // Angular form-related methods
             | "validate"
             | "registerOnChange"
             | "registerOnTouched"
@@ -58,7 +56,6 @@ pub(in crate::analyze) fn is_react_lifecycle_method(name: &str) -> bool {
 mod tests {
     use super::*;
 
-    // React lifecycle method tests (Issue 1)
     #[test]
     fn react_lifecycle_standard_methods() {
         assert!(is_react_lifecycle_method("render"));
@@ -108,7 +105,6 @@ mod tests {
         assert!(!is_react_lifecycle_method("customMethod"));
     }
 
-    // is_angular_lifecycle_method tests
     #[test]
     fn angular_lifecycle_core_hooks() {
         assert!(is_angular_lifecycle_method("ngOnInit"));
@@ -156,10 +152,6 @@ mod tests {
         assert!(!is_angular_lifecycle_method("handleSubmit"));
         assert!(!is_angular_lifecycle_method("render"));
     }
-
-    // ---------------------------------------------------------------
-    // Angular lifecycle methods — exhaustive and negative edge cases
-    // ---------------------------------------------------------------
 
     /// Verify every Angular lifecycle hook is recognized.
     #[test]
@@ -243,10 +235,6 @@ mod tests {
         assert!(!is_angular_lifecycle_method("canactivate"));
         assert!(!is_angular_lifecycle_method("CANACTIVATE"));
     }
-
-    // ---------------------------------------------------------------
-    // React lifecycle methods — exhaustive and negative edge cases
-    // ---------------------------------------------------------------
 
     /// Verify every React lifecycle method is recognized (complete list).
     #[test]
@@ -332,10 +320,6 @@ mod tests {
         }
     }
 
-    // ---------------------------------------------------------------
-    // Angular lifecycle additional methods
-    // ---------------------------------------------------------------
-
     #[test]
     fn angular_guard_methods() {
         assert!(is_angular_lifecycle_method("canActivate"));
@@ -362,10 +346,6 @@ mod tests {
         assert!(!is_angular_lifecycle_method("constructor"));
         assert!(!is_angular_lifecycle_method("ngOnSomethingCustom"));
     }
-
-    // ---------------------------------------------------------------
-    // React lifecycle additional methods
-    // ---------------------------------------------------------------
 
     #[test]
     fn react_unsafe_lifecycle_methods() {

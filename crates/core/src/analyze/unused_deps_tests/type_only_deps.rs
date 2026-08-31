@@ -1,7 +1,5 @@
 use super::helpers::*;
 
-// ---- find_type_only_dependencies tests ----
-
 #[test]
 fn type_only_dep_detected_when_all_imports_are_type_only() {
     let (graph, _) = build_graph_with_npm_imports(&[("zod", true)]);
@@ -18,7 +16,6 @@ fn type_only_dep_detected_when_all_imports_are_type_only() {
 
 #[test]
 fn type_only_dep_not_detected_when_runtime_import_exists() {
-    // One runtime import + one type-only import => not type-only
     let files = vec![
         DiscoveredFile {
             id: FileId(0),
@@ -47,7 +44,7 @@ fn type_only_dep_not_detected_when_runtime_import_exists() {
         ResolvedModule {
             file_id: FileId(0),
             path: PathBuf::from("/project/src/index.ts"),
-            exports: vec![],
+            exports: vec![].into(),
             re_exports: vec![],
             resolved_imports: vec![ResolvedImport {
                 info: ImportInfo {
@@ -55,6 +52,8 @@ fn type_only_dep_not_detected_when_runtime_import_exists() {
                     imported_name: ImportedName::Named("z".to_string()),
                     local_name: "z".to_string(),
                     is_type_only: true,
+                    is_type_only_star: false,
+                    from_style: false,
                     span: oxc_span::Span::new(0, 20),
                     source_span: oxc_span::Span::default(),
                 },
@@ -62,17 +61,23 @@ fn type_only_dep_not_detected_when_runtime_import_exists() {
             }],
             resolved_dynamic_imports: vec![],
             resolved_dynamic_patterns: vec![],
-            member_accesses: vec![],
-            whole_object_uses: vec![],
+            member_accesses: vec![].into(),
+            semantic_facts: std::sync::Arc::default(),
+            whole_object_uses: std::sync::Arc::default(),
             has_cjs_exports: false,
+            has_angular_component_template_url: false,
             unused_import_bindings: FxHashSet::default(),
             type_referenced_import_bindings: vec![],
             value_referenced_import_bindings: vec![],
+            namespace_object_aliases: vec![],
+            exported_factory_returns: std::sync::Arc::default(),
+            exported_factory_return_object_shapes: std::sync::Arc::default(),
+            type_member_types: std::sync::Arc::default(),
         },
         ResolvedModule {
             file_id: FileId(1),
             path: PathBuf::from("/project/src/other.ts"),
-            exports: vec![],
+            exports: vec![].into(),
             re_exports: vec![],
             resolved_imports: vec![ResolvedImport {
                 info: ImportInfo {
@@ -80,6 +85,8 @@ fn type_only_dep_not_detected_when_runtime_import_exists() {
                     imported_name: ImportedName::Named("z".to_string()),
                     local_name: "z".to_string(),
                     is_type_only: false, // runtime import
+                    is_type_only_star: false,
+                    from_style: false,
                     span: oxc_span::Span::new(0, 20),
                     source_span: oxc_span::Span::default(),
                 },
@@ -87,12 +94,18 @@ fn type_only_dep_not_detected_when_runtime_import_exists() {
             }],
             resolved_dynamic_imports: vec![],
             resolved_dynamic_patterns: vec![],
-            member_accesses: vec![],
-            whole_object_uses: vec![],
+            member_accesses: vec![].into(),
+            semantic_facts: std::sync::Arc::default(),
+            whole_object_uses: std::sync::Arc::default(),
             has_cjs_exports: false,
+            has_angular_component_template_url: false,
             unused_import_bindings: FxHashSet::default(),
             type_referenced_import_bindings: vec![],
             value_referenced_import_bindings: vec![],
+            namespace_object_aliases: vec![],
+            exported_factory_returns: std::sync::Arc::default(),
+            exported_factory_return_object_shapes: std::sync::Arc::default(),
+            type_member_types: std::sync::Arc::default(),
         },
     ];
 
@@ -110,7 +123,6 @@ fn type_only_dep_not_detected_when_runtime_import_exists() {
 
 #[test]
 fn type_only_dep_not_detected_when_unused() {
-    // Dep is not imported at all => caught by unused_dependencies, not type_only
     let (graph, _) = build_graph_with_npm_imports(&[]);
     let pkg = make_pkg(&["zod"], &[], &[]);
     let config = test_config(PathBuf::from("/project"));
@@ -150,6 +162,7 @@ fn type_only_dep_skips_ignored_deps() {
 
     let config = FallowConfig {
         ignore_dependencies: vec!["zod".to_string()],
+        ignore_unresolved_imports: vec![],
         ..Default::default()
     }
     .resolve(
@@ -158,6 +171,7 @@ fn type_only_dep_skips_ignored_deps() {
         1,
         true,
         true,
+        None,
     );
 
     let type_only = find_type_only_dependencies(&graph, &pkg, &config, &[]);
@@ -168,12 +182,8 @@ fn type_only_dep_skips_ignored_deps() {
     );
 }
 
-// ---- Additional coverage: find_type_only_dependencies only checks production deps ----
-
 #[test]
 fn type_only_dep_ignores_dev_dependencies() {
-    // A dev dependency that is only type-imported should NOT appear in type_only results,
-    // because find_type_only_dependencies only checks production dependencies.
     let (graph, _) = build_graph_with_npm_imports(&[("@types/lodash", true)]);
     let pkg = make_pkg(&[], &["@types/lodash"], &[]);
     let config = test_config(PathBuf::from("/project"));

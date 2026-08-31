@@ -1,190 +1,153 @@
-export interface IssueTypeConfig {
-  readonly "unused-files": boolean;
-  readonly "unused-exports": boolean;
-  readonly "unused-types": boolean;
-  readonly "unused-dependencies": boolean;
-  readonly "unused-dev-dependencies": boolean;
-  readonly "unused-enum-members": boolean;
-  readonly "unused-class-members": boolean;
-  readonly "unresolved-imports": boolean;
-  readonly "unlisted-dependencies": boolean;
-  readonly "duplicate-exports": boolean;
-  readonly "type-only-dependencies": boolean;
-  readonly "circular-dependencies": boolean;
-}
+/**
+ * Public type surface for the extension. Re-exports schema-derived types from
+ * `./generated/output-contract.js` plus hand-written types from `./settings`,
+ * `./labels`, and `./fix-types`.
+ *
+ * Schema-derived contract types are generated from `docs/output-schema.json`
+ * by `scripts/codegen-contracts.mjs`. Edit the schema (and the upstream Rust
+ * struct), regenerate, commit. See the banner of
+ * `src/generated/output-contract.d.ts` for the full recipe.
+ *
+ * The `Fallow*Result` aliases below preserve the historical names used by
+ * existing consumers. New code should prefer the schema-derived names
+ * (`CheckOutput`, `DupesOutput`, `CombinedOutput`).
+ */
 
-export type DuplicationMode = "strict" | "mild" | "weak" | "semantic";
+// Bare-name backwards-compat aliases (`UnusedExport`, `CloneGroup`, ...) and
+// per-alias rationale live in the generated `output-contract.d.ts` under the
+// `// Backwards-compat aliases` section. They are sourced from the same
+// `export type { ... }` block below so the published `fallow/types` subpath
+// Legacy output aliases remain supported throughout v3. Removing them requires
+// an explicit deprecation period and a future major release. Policy:
+// `docs/backwards-compatibility.md`.
+export type {
+  AddToConfigAction,
+  AttributedCloneGroup,
+  AttributedCloneGroupFinding,
+  AuditGate,
+  AuditOutput,
+  AuditVerdict,
+  BoundaryViolation,
+  BoundaryViolationFinding,
+  CheckOutput,
+  CheckSummary,
+  CircularDependency,
+  CircularDependencyFinding,
+  CloneFamily,
+  CloneFamilyAction,
+  CloneFamilyFinding,
+  CloneGroup,
+  CloneGroupAction,
+  CloneGroupFinding,
+  CloneInstance,
+  CombinedOutput,
+  ComplexityContribution,
+  ComplexityContributionKind,
+  CoverageAnalyzeOutput,
+  RuntimeCoverageReport,
+  RuntimeCoverageHotPath,
+  RuntimeCoverageFinding,
+  RuntimeCoverageVerdict,
+  RuntimeCoverageConfidence,
+  RuntimeCoverageWatermark,
+  DuplicateExport,
+  DuplicateExportFinding,
+  DuplicateLocation,
+  DupesOutput,
+  DupesReportPayload,
+  DuplicationReport,
+  DuplicationStats,
+  EmptyCatalogGroup,
+  EmptyCatalogGroupFinding,
+  EntryPoints,
+  FindingSeverity,
+  FixAction as SuggestionFixAction,
+  FallowOutput,
+  HealthFinding,
+  HealthOutput,
+  HealthReport,
+  HealthScore,
+  HealthScorePenalties,
+  HotspotFinding,
+  ImportSite,
+  IssueAction,
+  MisconfiguredDependencyOverride,
+  MisconfiguredDependencyOverrideFinding,
+  PrivateTypeLeak,
+  PrivateTypeLeakFinding,
+  RefactoringSuggestion,
+  RefactoringTargetFinding,
+  SecurityFinding,
+  SecurityFindingKind,
+  SecurityOutput,
+  SecurityReachability,
+  StaleSuppression,
+  SuppressFileAction,
+  SuppressLineAction,
+  TestOnlyDependency,
+  TestOnlyDependencyFinding,
+  TraceHop,
+  TraceHopRole,
+  TypeOnlyDependency,
+  TypeOnlyDependencyFinding,
+  UnlistedDependency,
+  UnlistedDependencyFinding,
+  UnresolvedCatalogReference,
+  UnresolvedCatalogReferenceFinding,
+  UnresolvedImport,
+  UnresolvedImportFinding,
+  UnusedCatalogEntry,
+  UnusedCatalogEntryFinding,
+  UnusedClassMemberFinding,
+  UnusedDependency,
+  UnusedDependencyFinding,
+  UnusedDependencyOverride,
+  UnusedDependencyOverrideFinding,
+  UnusedDevDependencyFinding,
+  UnusedEnumMemberFinding,
+  UnusedExport,
+  UnusedExportFinding,
+  UnusedFile,
+  UnusedFileFinding,
+  UnusedMember,
+  UnusedOptionalDependencyFinding,
+  UnusedTypeFinding,
+  WorkspaceInfo,
+  WorkspacesOutput,
+} from "./generated/output-contract.js";
 
-export type TraceLevel = "off" | "messages" | "verbose";
+import type { FallowOutput } from "./generated/output-contract.js";
 
-export interface FallowCheckResult {
-  readonly unused_files: ReadonlyArray<UnusedFile>;
-  readonly unused_exports: ReadonlyArray<UnusedExport>;
-  readonly unused_types: ReadonlyArray<UnusedExport>;
-  readonly unused_dependencies: ReadonlyArray<UnusedDependency>;
-  readonly unused_dev_dependencies: ReadonlyArray<UnusedDependency>;
-  readonly unused_enum_members: ReadonlyArray<UnusedMember>;
-  readonly unused_class_members: ReadonlyArray<UnusedMember>;
-  readonly unresolved_imports: ReadonlyArray<UnresolvedImport>;
-  readonly unlisted_dependencies: ReadonlyArray<UnlistedDependency>;
-  readonly duplicate_exports: ReadonlyArray<DuplicateExport>;
-  readonly type_only_dependencies?: ReadonlyArray<TypeOnlyDependency>;
-  readonly circular_dependencies?: ReadonlyArray<CircularDependency>;
-}
+export type { CheckOutput as FallowCheckResult } from "./generated/output-contract.js";
+export type FallowInspectResult = Extract<FallowOutput, { kind: "inspect_target" }>;
+// The VS Code extension reads dupes only via the combined invocation
+// (`fallow --format json`), where `combined.dupes` is the typed
+// `DupesReportPayload` body (introduced in #409), NOT the full
+// `DupesOutput` envelope with schema_version / version / elapsed_ms.
+// Aliasing `FallowDupesResult` to `DupesReportPayload` keeps every
+// downstream consumer's existing usage (clone_groups, clone_families,
+// stats, mirrored_directories) honest; the inner `clone_groups[]` and
+// `clone_families[]` items are now `CloneGroupFinding` /
+// `CloneFamilyFinding` (each carrying typed actions[]). If a future VS
+// Code feature calls `fallow dupes` standalone, switch its return type
+// to the full `DupesOutput` instead.
+export type { DupesReportPayload as FallowDupesResult } from "./generated/output-contract.js";
+export type { CombinedOutput as FallowCombinedResult } from "./generated/output-contract.js";
 
-interface UnusedFile {
-  readonly path: string;
-}
-
-interface UnusedExport {
-  readonly path: string;
-  readonly export_name: string;
-  readonly line: number;
-  readonly col: number;
-}
-
-interface UnusedDependency {
-  readonly package_name: string;
-  readonly path: string;
-}
-
-interface UnusedMember {
-  readonly path: string;
-  readonly parent_name: string;
-  readonly member_name: string;
-  readonly line: number;
-  readonly col: number;
-}
-
-interface UnresolvedImport {
-  readonly path: string;
-  readonly specifier: string;
-  readonly line: number;
-  readonly col: number;
-}
-
-interface UnlistedDependency {
-  readonly package_name: string;
-  readonly path: string;
-}
-
-interface DuplicateLocation {
-  readonly path: string;
-  readonly line: number;
-  readonly col: number;
-}
-
-interface DuplicateExport {
-  readonly export_name: string;
-  readonly locations: ReadonlyArray<DuplicateLocation>;
-}
-
-interface TypeOnlyDependency {
-  readonly package_name: string;
-  readonly path: string;
-}
-
-interface CircularDependency {
-  readonly files: ReadonlyArray<string>;
-  readonly length: number;
-}
-
-export interface FallowDupesResult {
-  readonly clone_groups: ReadonlyArray<CloneGroup>;
-  readonly clone_families: ReadonlyArray<CloneFamily>;
-  readonly stats: DupesStats;
-}
-
-export interface FallowCombinedResult {
-  readonly schema_version?: number;
-  readonly version?: string;
-  readonly elapsed_ms?: number;
-  readonly check?: FallowCheckResult;
-  readonly dupes?: FallowDupesResult;
-}
-
-export interface CloneGroup {
-  readonly instances: ReadonlyArray<CloneInstance>;
-  readonly token_count: number;
-  readonly line_count: number;
-}
-
-interface CloneInstance {
-  readonly file: string;
-  readonly start_line: number;
-  readonly end_line: number;
-  readonly start_col: number;
-  readonly end_col: number;
-  readonly fragment: string;
-}
-
-interface CloneFamily {
-  readonly files: ReadonlyArray<string>;
-  readonly groups: ReadonlyArray<CloneGroup>;
-  readonly total_duplicated_lines: number;
-  readonly total_duplicated_tokens: number;
-  readonly suggestions: ReadonlyArray<RefactoringSuggestion>;
-}
-
-interface RefactoringSuggestion {
-  readonly kind: "ExtractFunction" | "ExtractModule";
-  readonly description: string;
-  readonly estimated_savings: number;
-}
-
-interface DupesStats {
-  readonly total_files: number;
-  readonly files_with_clones: number;
-  readonly total_lines: number;
-  readonly duplicated_lines: number;
-  readonly total_tokens: number;
-  readonly duplicated_tokens: number;
-  readonly clone_groups: number;
-  readonly clone_instances: number;
-  readonly duplication_percentage: number;
-}
-
-export interface FallowFixResult {
-  readonly dry_run: boolean;
-  readonly fixes: ReadonlyArray<FixAction>;
-  readonly total_fixed: number;
-}
-
-export interface FixAction {
-  readonly type: string;
-  readonly path?: string;
-  readonly line?: number;
-  readonly name?: string;
-  readonly package?: string;
-  readonly location?: string;
-  readonly file?: string;
-}
-
-export type IssueCategory =
-  | "unused-files"
-  | "unused-exports"
-  | "unused-types"
-  | "unused-dependencies"
-  | "unused-dev-dependencies"
-  | "unused-enum-members"
-  | "unused-class-members"
-  | "unresolved-imports"
-  | "unlisted-dependencies"
-  | "duplicate-exports"
-  | "type-only-dependencies"
-  | "circular-dependencies";
-
-export const ISSUE_CATEGORY_LABELS: Record<IssueCategory, string> = {
-  "unused-files": "Unused Files",
-  "unused-exports": "Unused Exports",
-  "unused-types": "Unused Types",
-  "unused-dependencies": "Unused Dependencies",
-  "unused-dev-dependencies": "Unused Dev Dependencies",
-  "unused-enum-members": "Unused Enum Members",
-  "unused-class-members": "Unused Class Members",
-  "unresolved-imports": "Unresolved Imports",
-  "unlisted-dependencies": "Unlisted Dependencies",
-  "duplicate-exports": "Duplicate Exports",
-  "type-only-dependencies": "Type-Only Dependencies",
-  "circular-dependencies": "Circular Dependencies",
-};
+export type {
+  DiagnosticSeveritySetting,
+  DuplicationMode,
+  IssueTypeConfig,
+  TraceLevel,
+} from "./settings.js";
+export type { IssueCategory } from "./labels.js";
+export { ISSUE_CATEGORY_LABELS } from "./labels.js";
+export type { FallowFixResult, FixAction } from "./fix-types.js";
+export type {
+  LicenseActionResult,
+  LicenseErrorJson,
+  LicenseKind,
+  LicenseParseResult,
+  LicenseState,
+  LicenseStatusJson,
+} from "./license-types.js";

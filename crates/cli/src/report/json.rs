@@ -1,44 +1,48 @@
+use crate::report::sink::outln;
 use std::path::Path;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use fallow_core::duplicates::DuplicationReport;
-use fallow_core::results::AnalysisResults;
+use fallow_api::{
+    CheckJsonExtraOutputs, CheckJsonOutputInput, CheckJsonPayloadInput, DupesReportPayload,
+    DuplicationGrouping, DuplicationJsonOutputInput, GroupedCheckJsonOutputInput,
+    GroupedDuplicationJsonOutputInput,
+};
+use fallow_types::duplicates::DuplicationReport;
+#[cfg(test)]
+use fallow_types::envelope::{ElapsedMs, SchemaVersion, ToolVersion};
+use fallow_types::results::AnalysisResults;
 
-use super::{emit_json, normalize_uri};
-use crate::explain;
+#[cfg(test)]
+use fallow_output::strip_root_prefix;
+use fallow_types::envelope::{
+    BaselineCategoryDelta, BaselineDeltas, BaselineMatch, RegressionResult, RegressionStatus,
+    RegressionToleranceKind,
+};
+
+use super::emit_report_json;
 use crate::report::grouping::{OwnershipResolver, ResultGroup};
+use fallow_config::WorkspaceDiagnostic;
+use fallow_output::GroupByMode;
 
-pub(super) fn print_json(
-    results: &AnalysisResults,
-    root: &Path,
-    elapsed: Duration,
-    explain: bool,
-    regression: Option<&crate::regression::RegressionOutcome>,
-    baseline_matched: Option<(usize, usize)>,
-) -> ExitCode {
-    match build_json(results, root, elapsed) {
-        Ok(mut output) => {
-            if let Some(outcome) = regression
-                && let serde_json::Value::Object(ref mut map) = output
-            {
-                map.insert("regression".to_string(), outcome.to_json());
-            }
-            if let Some((entries, matched)) = baseline_matched
-                && let serde_json::Value::Object(ref mut map) = output
-            {
-                map.insert(
-                    "baseline".to_string(),
-                    serde_json::json!({
-                        "entries": entries,
-                        "matched": matched,
-                    }),
-                );
-            }
-            if explain {
-                insert_meta(&mut output, explain::check_meta());
-            }
-            emit_json(&output, "JSON")
+pub(super) struct PrintJsonInput<'a> {
+    pub(super) results: &'a AnalysisResults,
+    pub(super) root: &'a Path,
+    pub(super) elapsed: Duration,
+    pub(super) explain: bool,
+    pub(super) type_aware: Option<&'a fallow_types::envelope::TypeAwareMeta>,
+    pub(super) regression: Option<&'a crate::regression::RegressionOutcome>,
+    pub(super) baseline_matched: Option<(usize, usize)>,
+    pub(super) config_fixable: bool,
+    pub(super) workspace_diagnostics: &'a [WorkspaceDiagnostic],
+    pub(super) json_style: crate::json_style::JsonStyle,
+}
+
+pub(super) fn print_json(input: &PrintJsonInput<'_>) -> ExitCode {
+    match render_json(input) {
+        Ok(output) => {
+            outln!("{output}");
+            ExitCode::SUCCESS
         }
         Err(e) => {
             eprintln!("Error: failed to serialize results: {e}");
@@ -47,1004 +51,734 @@ pub(super) fn print_json(
     }
 }
 
-/// Render grouped analysis results as a single JSON document.
-///
-/// Produces an envelope with `grouped_by` and `total_issues` at the top level,
-/// then a `groups` array where each element contains the group `key`,
-/// `total_issues`, and all the normal result fields with paths relativized.
+pub(super) fn render_json(input: &PrintJsonInput<'_>) -> Result<String, serde_json::Error> {
+    let output = api_check_json_document_with_config_fixable_meta_and_extras(
+        input.results,
+        input.root,
+        input.elapsed,
+        input.config_fixable,
+        check_output_meta(input.explain, input.type_aware),
+        check_json_extras(input.regression, None, input.baseline_matched),
+        input.workspace_diagnostics,
+    )?;
+    input.json_style.serialize(&output)
+}
+
 #[must_use]
-pub(super) fn print_grouped_json(
-    groups: &[ResultGroup],
-    original: &AnalysisResults,
-    root: &Path,
-    elapsed: Duration,
-    explain: bool,
-    resolver: &OwnershipResolver,
-) -> ExitCode {
-    let root_prefix = format!("{}/", root.display());
-
-    let group_values: Vec<serde_json::Value> = groups
-        .iter()
-        .filter_map(|group| {
-            let mut value = serde_json::to_value(&group.results).ok()?;
-            strip_root_prefix(&mut value, &root_prefix);
-            inject_actions(&mut value);
-
-            if let serde_json::Value::Object(ref mut map) = value {
-                // Insert key, owners (section mode), and total_issues at the
-                // front by rebuilding the map.
-                let mut ordered = serde_json::Map::new();
-                ordered.insert("key".to_string(), serde_json::json!(group.key));
-                if let Some(ref owners) = group.owners {
-                    ordered.insert("owners".to_string(), serde_json::json!(owners));
-                }
-                ordered.insert(
-                    "total_issues".to_string(),
-                    serde_json::json!(group.results.total_issues()),
-                );
-                for (k, v) in map.iter() {
-                    ordered.insert(k.clone(), v.clone());
-                }
-                Some(serde_json::Value::Object(ordered))
-            } else {
-                Some(value)
-            }
-        })
-        .collect();
-
-    let mut output = serde_json::json!({
-        "schema_version": SCHEMA_VERSION,
-        "version": env!("CARGO_PKG_VERSION"),
-        "elapsed_ms": elapsed.as_millis() as u64,
-        "grouped_by": resolver.mode_label(),
-        "total_issues": original.total_issues(),
-        "groups": group_values,
-    });
-
-    if explain {
-        insert_meta(&mut output, explain::check_meta());
-    }
-
-    emit_json(&output, "JSON")
+pub(super) struct PrintGroupedJsonInput<'a> {
+    pub(super) groups: &'a [ResultGroup],
+    pub(super) original: &'a AnalysisResults,
+    pub(super) root: &'a Path,
+    pub(super) elapsed: Duration,
+    pub(super) explain: bool,
+    pub(super) type_aware: Option<&'a fallow_types::envelope::TypeAwareMeta>,
+    pub(super) resolver: &'a OwnershipResolver,
+    pub(super) config_fixable: bool,
+    pub(super) workspace_diagnostics: &'a [WorkspaceDiagnostic],
+    pub(super) json_style: crate::json_style::JsonStyle,
 }
 
-/// JSON output schema version as an integer (independent of tool version).
-///
-/// Bump this when the structure of the JSON output changes in a
-/// backwards-incompatible way (removing/renaming fields, changing types).
-/// Adding new fields is always backwards-compatible and does not require a bump.
-const SCHEMA_VERSION: u32 = 4;
-
-/// Build a JSON envelope with standard metadata fields at the top.
-///
-/// Creates a JSON object with `schema_version`, `version`, and `elapsed_ms`,
-/// then merges all fields from `report_value` into the envelope.
-/// Fields from `report_value` appear after the metadata header.
-fn build_json_envelope(report_value: serde_json::Value, elapsed: Duration) -> serde_json::Value {
-    let mut map = serde_json::Map::new();
-    map.insert(
-        "schema_version".to_string(),
-        serde_json::json!(SCHEMA_VERSION),
-    );
-    map.insert(
-        "version".to_string(),
-        serde_json::json!(env!("CARGO_PKG_VERSION")),
-    );
-    map.insert(
-        "elapsed_ms".to_string(),
-        serde_json::json!(elapsed.as_millis()),
-    );
-    if let serde_json::Value::Object(report_map) = report_value {
-        for (key, value) in report_map {
-            map.insert(key, value);
+pub(super) fn print_grouped_json(input: &PrintGroupedJsonInput<'_>) -> ExitCode {
+    let output = match fallow_api::serialize_grouped_check_json(GroupedCheckJsonOutputInput {
+        groups: input.groups,
+        original: input.original,
+        root: input.root,
+        elapsed: input.elapsed,
+        grouped_by: group_by_mode_from_label(input.resolver.mode_label()),
+        config_fixable: input.config_fixable,
+        meta: check_output_meta(input.explain, input.type_aware),
+        workspace_diagnostics: input.workspace_diagnostics.to_vec(),
+        next_steps: crate::report::suggestions::build_dead_code_next_steps(
+            input.original,
+            input.root,
+            crate::report::suggestions::setup_pointer_applicable(input.root),
+            crate::report::suggestions::due_impact_digest(input.root),
+        ),
+        envelope_mode: crate::output_runtime::current_root_envelope_mode(),
+        telemetry_analysis_run_id: crate::output_runtime::telemetry_analysis_run_id().as_deref(),
+    }) {
+        Ok(value) => value,
+        Err(e) => {
+            eprintln!("Error: failed to serialize grouped results: {e}");
+            return ExitCode::from(2);
         }
-    }
-    serde_json::Value::Object(map)
+    };
+
+    emit_report_json(&output, "JSON", input.json_style)
 }
 
-/// Build the JSON output value for analysis results.
-///
-/// Metadata fields (`schema_version`, `version`, `elapsed_ms`, `total_issues`)
-/// appear first in the output for readability. Paths are made relative to `root`.
-///
-/// # Errors
-///
-/// Returns an error if the results cannot be serialized to JSON.
-pub fn build_json(
+fn check_output_meta(
+    explain: bool,
+    type_aware: Option<&fallow_types::envelope::TypeAwareMeta>,
+) -> Option<fallow_types::envelope::Meta> {
+    if !explain && type_aware.is_none() {
+        return None;
+    }
+
+    let mut meta = if explain {
+        fallow_output::check_meta()
+    } else {
+        fallow_types::envelope::Meta::default()
+    };
+    if explain && type_aware.is_some() {
+        add_type_aware_explanations(&mut meta);
+    }
+    meta.type_aware = type_aware.cloned();
+    Some(meta)
+}
+
+fn add_type_aware_explanations(meta: &mut fallow_types::envelope::Meta) {
+    add_type_aware_field_definitions(meta);
+    add_type_aware_metric_definitions(meta);
+}
+
+fn add_type_aware_field_definitions(meta: &mut fallow_types::envelope::Meta) {
+    meta.field_definitions.extend([
+        (
+            "type_aware.executed".to_owned(),
+            "Whether the semantic companion executed at least one query.".to_owned(),
+        ),
+        (
+            "type_aware.protocol_version".to_owned(),
+            "Version of Fallow's backend-neutral type-aware sidecar protocol.".to_owned(),
+        ),
+        (
+            "type_aware.backend".to_owned(),
+            "Semantic backend capability identifier.".to_owned(),
+        ),
+        (
+            "type_aware.sidecar_version".to_owned(),
+            "Version of the sidecar package that executed the query; omitted when no semantic query was needed.".to_owned(),
+        ),
+        (
+            "type_aware.backend_version".to_owned(),
+            "Compiler or semantic engine version that executed the query; omitted when no semantic query was needed.".to_owned(),
+        ),
+        (
+            "type_aware.selected_tsconfigs".to_owned(),
+            "Sorted project configs selected for candidate files. The <inferred> marker denotes a TypeScript inferred project.".to_owned(),
+        ),
+        (
+            "type_aware.warnings".to_owned(),
+            "Bounded semantic warnings. Affected candidates remain findings.".to_owned(),
+        ),
+        (
+            "type_aware.projects".to_owned(),
+            "Per-project status, selection source, diagnostic count, and candidate outcomes.".to_owned(),
+        ),
+        (
+            "type_aware.candidate_decisions".to_owned(),
+            "Per-candidate Fallow decision with bounded checker evidence, contract relations, owning projects, and guarded-edit eligibility.".to_owned(),
+        ),
+        (
+            "type_aware.phase_timings_ms".to_owned(),
+            "Semantic project setup, diagnostics, and batched symbol-scan durations in milliseconds.".to_owned(),
+        ),
+        (
+            "type_aware.abstention_reasons".to_owned(),
+            "Stable reason-code counts for candidates retained without semantic scanning.".to_owned(),
+        ),
+    ]);
+}
+
+fn add_type_aware_metric_definitions(meta: &mut fallow_types::envelope::Meta) {
+    meta.metrics.extend([
+        (
+            "type_aware.protocol_version".to_owned(),
+            type_aware_metric(
+                "Type-aware Protocol Version",
+                "Version of Fallow's backend-neutral semantic sidecar protocol.",
+                "[1, infinity)",
+                "must match the protocol version supported by this Fallow build",
+            ),
+        ),
+        (
+            "type_aware.candidate_count".to_owned(),
+            type_aware_metric(
+                "Type-aware Candidate Count",
+                "Dead-code candidates sent to the semantic sidecar after normal Fallow filtering, including class members, exports, and types.",
+                "[0, infinity)",
+                "context only",
+            ),
+        ),
+        (
+            "type_aware.confirmed_used_count".to_owned(),
+            type_aware_metric(
+                "Type-aware Confirmed Used Count",
+                "Candidates whose exact declaration has a checker-resolved static reference, including imports, re-exports, type references, and property or element access, and was removed from the findings.",
+                "[0, candidate_count]",
+                "higher means semantic analysis removed more syntactic false positives",
+            ),
+        ),
+        (
+            "type_aware.contract_preserved_count".to_owned(),
+            type_aware_metric(
+                "Type-aware Contract Preserved Count",
+                "Candidates removed from findings because their declarations satisfy an interface, abstract member, or override contract.",
+                "[0, candidate_count]",
+                "higher means semantic contract evidence removed more syntactic false positives",
+            ),
+        ),
+        (
+            "type_aware.no_static_references_count".to_owned(),
+            type_aware_metric(
+                "Type-aware No Static References Count",
+                "Candidates retained after complete analysis found no checker-resolved static references.",
+                "[0, candidate_count]",
+                "these remain findings; only an eligible class method can receive a guarded fix",
+            ),
+        ),
+        (
+            "type_aware.fix_eligible_count".to_owned(),
+            type_aware_metric(
+                "Type-aware Fix Eligible Count",
+                "Class-method candidates whose complete closed-world evidence and declaration guard permit a guarded fix.",
+                "[0, type_aware.no_static_references_count]",
+                "higher means more retained findings can be removed safely by fallow fix",
+            ),
+        ),
+        (
+            "type_aware.unresolved_count".to_owned(),
+            type_aware_metric(
+                "Type-aware Unresolved Count",
+                "Candidates not positively confirmed as used and therefore retained as findings.",
+                "[0, candidate_count]",
+                "lower means more candidates were resolved exactly",
+            ),
+        ),
+        (
+            "type_aware.abstained_count".to_owned(),
+            type_aware_metric(
+                "Type-aware Abstained Count",
+                "Candidates retained without semantic scanning because project selection or compiler state was unsafe.",
+                "[0, candidate_count]",
+                "zero means every candidate was assigned to a structurally safe TypeScript project",
+            ),
+        ),
+        (
+            "type_aware.warning_count".to_owned(),
+            type_aware_metric(
+                "Type-aware Warning Count",
+                "Bounded semantic warnings returned by the sidecar.",
+                "[0, 20]",
+                "zero means the selected projects produced no semantic warnings",
+            ),
+        ),
+        (
+            "type_aware.elapsed_ms".to_owned(),
+            type_aware_metric(
+                "Type-aware Elapsed Time",
+                "Semantic pass duration reported by the sidecar in milliseconds.",
+                "[0, infinity)",
+                "lower is faster",
+            ),
+        ),
+    ]);
+    add_type_aware_phase_metric_definitions(meta);
+    add_type_aware_project_metric_definitions(meta);
+    add_type_aware_abstention_metric_definitions(meta);
+}
+
+fn add_type_aware_phase_metric_definitions(meta: &mut fallow_types::envelope::Meta) {
+    meta.metrics.extend([
+        (
+            "type_aware.phase_timings_ms.project_setup".to_owned(),
+            type_aware_metric(
+                "Type-aware Project Setup Time",
+                "Milliseconds spent constructing TypeScript projects and selecting snapshots.",
+                "[0, elapsed_ms]",
+                "lower is faster",
+            ),
+        ),
+        (
+            "type_aware.phase_timings_ms.diagnostics".to_owned(),
+            type_aware_metric(
+                "Type-aware Diagnostics Time",
+                "Milliseconds spent collecting structural diagnostics before scanning.",
+                "[0, elapsed_ms]",
+                "lower is faster",
+            ),
+        ),
+        (
+            "type_aware.phase_timings_ms.symbol_scan".to_owned(),
+            type_aware_metric(
+                "Type-aware Symbol Scan Time",
+                "Milliseconds spent on batched symbol lookup and exact declaration matching.",
+                "[0, elapsed_ms]",
+                "lower is faster",
+            ),
+        ),
+    ]);
+}
+
+fn add_type_aware_project_metric_definitions(meta: &mut fallow_types::envelope::Meta) {
+    meta.metrics.extend([
+        (
+            "type_aware.projects[].candidate_count".to_owned(),
+            type_aware_metric(
+                "Project Candidate Count",
+                "Candidates assigned to one selected TypeScript project.",
+                "[0, type_aware.candidate_count]",
+                "context only",
+            ),
+        ),
+        (
+            "type_aware.projects[].confirmed_used_count".to_owned(),
+            type_aware_metric(
+                "Project Confirmed Used Count",
+                "Project candidates confirmed as used and removed from findings.",
+                "[0, project candidate_count]",
+                "higher means the project supplied more exact semantic proof",
+            ),
+        ),
+        (
+            "type_aware.projects[].contract_preserved_count".to_owned(),
+            type_aware_metric(
+                "Project Contract Preserved Count",
+                "Project candidates removed because they satisfy an inherited or implemented contract.",
+                "[0, project candidate_count]",
+                "higher means this project supplied more exact contract evidence",
+            ),
+        ),
+        (
+            "type_aware.projects[].no_static_references_count".to_owned(),
+            type_aware_metric(
+                "Project No Static References Count",
+                "Project candidates retained after complete analysis found no static references.",
+                "[0, project candidate_count]",
+                "these remain findings unless a guarded class-member fix is eligible",
+            ),
+        ),
+        (
+            "type_aware.projects[].fix_eligible_count".to_owned(),
+            type_aware_metric(
+                "Project Fix Eligible Count",
+                "Project class-method candidates eligible for a guarded semantic fix.",
+                "[0, project no_static_references_count]",
+                "higher means more retained findings have complete deletion evidence",
+            ),
+        ),
+        (
+            "type_aware.projects[].unresolved_count".to_owned(),
+            type_aware_metric(
+                "Project Unresolved Count",
+                "Project candidates scanned without an exact confirmed use.",
+                "[0, project candidate_count]",
+                "these candidates remain findings",
+            ),
+        ),
+        (
+            "type_aware.projects[].abstained_count".to_owned(),
+            type_aware_metric(
+                "Project Abstained Count",
+                "Project candidates retained without scanning because the project was unsafe.",
+                "[0, project candidate_count]",
+                "zero means this project was refined",
+            ),
+        ),
+        (
+            "type_aware.projects[].blocking_diagnostic_count".to_owned(),
+            type_aware_metric(
+                "Project Blocking Diagnostic Count",
+                "Structural diagnostics that prevented exact semantic scanning for the project.",
+                "[0, infinity)",
+                "nonzero means the project abstained",
+            ),
+        ),
+        (
+            "type_aware.projects[].source_file_count".to_owned(),
+            type_aware_metric(
+                "Project Source File Count",
+                "Source files loaded into the TypeScript program for this project.",
+                "[1, infinity)",
+                "context for project cost and scope",
+            ),
+        ),
+    ]);
+}
+
+fn add_type_aware_abstention_metric_definitions(meta: &mut fallow_types::envelope::Meta) {
+    meta.metrics.extend([
+        (
+            "type_aware.abstention_reasons.no_project".to_owned(),
+            type_aware_metric(
+                "No-project Abstention Count",
+                "Candidates not contained by a selected TypeScript project.",
+                "[0, type_aware.abstained_count]",
+                "lower means project selection covered more candidates",
+            ),
+        ),
+        (
+            "type_aware.abstention_reasons.ambiguous_project".to_owned(),
+            type_aware_metric(
+                "Ambiguous-project Abstention Count",
+                "Candidates contained by multiple explicit TypeScript projects.",
+                "[0, type_aware.abstained_count]",
+                "zero means explicit project selection was unambiguous",
+            ),
+        ),
+        (
+            "type_aware.abstention_reasons.blocking_diagnostics".to_owned(),
+            type_aware_metric(
+                "Blocking-diagnostics Abstention Count",
+                "Candidates retained because structural TypeScript diagnostics blocked scanning.",
+                "[0, type_aware.abstained_count]",
+                "lower means more candidate projects were structurally safe",
+            ),
+        ),
+        (
+            "type_aware.abstention_reasons.svelte_virtual_module_exports".to_owned(),
+            type_aware_metric(
+                "Svelte Virtual-module Export Abstention Count",
+                "Candidates retained because TypeScript-Go could not resolve named Svelte virtual-module exports.",
+                "[0, type_aware.unresolved_count]",
+                "zero means no candidate depended on unavailable Svelte virtual-module exports",
+            ),
+        ),
+        (
+            "type_aware.abstention_reasons.unknown_symbol".to_owned(),
+            type_aware_metric(
+                "Unknown-symbol Abstention Count",
+                "Candidates whose exact declaration identity could not be resolved.",
+                "[0, type_aware.abstained_count]",
+                "lower means syntactic and semantic declaration identities agree more often",
+            ),
+        ),
+        (
+            "type_aware.abstention_reasons.unsupported_syntax".to_owned(),
+            type_aware_metric(
+                "Unsupported-syntax Abstention Count",
+                "Candidates using declaration syntax unsupported by the semantic backend.",
+                "[0, type_aware.abstained_count]",
+                "lower means the semantic backend covers more candidate syntax",
+            ),
+        ),
+        (
+            "type_aware.abstention_reasons.capacity".to_owned(),
+            type_aware_metric(
+                "Capacity Abstention Count",
+                "Candidates retained because the bounded semantic request reached capacity.",
+                "[0, type_aware.abstained_count]",
+                "zero means every requested candidate fit in the semantic batch",
+            ),
+        ),
+    ]);
+}
+
+fn type_aware_metric(
+    name: &str,
+    description: &str,
+    range: &str,
+    interpretation: &str,
+) -> fallow_types::envelope::MetaMetric {
+    fallow_types::envelope::MetaMetric {
+        name: Some(name.to_owned()),
+        description: Some(description.to_owned()),
+        range: Some(range.to_owned()),
+        interpretation: Some(interpretation.to_owned()),
+    }
+}
+
+#[cfg(test)]
+fn api_check_json_document(
     results: &AnalysisResults,
     root: &Path,
     elapsed: Duration,
 ) -> Result<serde_json::Value, serde_json::Error> {
-    let results_value = serde_json::to_value(results)?;
-
-    let mut map = serde_json::Map::new();
-    map.insert(
-        "schema_version".to_string(),
-        serde_json::json!(SCHEMA_VERSION),
-    );
-    map.insert(
-        "version".to_string(),
-        serde_json::json!(env!("CARGO_PKG_VERSION")),
-    );
-    map.insert(
-        "elapsed_ms".to_string(),
-        serde_json::json!(elapsed.as_millis()),
-    );
-    map.insert(
-        "total_issues".to_string(),
-        serde_json::json!(results.total_issues()),
-    );
-
-    // Entry-point detection summary (metadata, not serialized via serde)
-    if let Some(ref ep) = results.entry_point_summary {
-        let sources: serde_json::Map<String, serde_json::Value> = ep
-            .by_source
-            .iter()
-            .map(|(k, v)| (k.replace(' ', "_"), serde_json::json!(v)))
-            .collect();
-        map.insert(
-            "entry_points".to_string(),
-            serde_json::json!({
-                "total": ep.total,
-                "sources": sources,
-            }),
-        );
-    }
-
-    // Per-category summary counts for CI dashboard consumption
-    let summary = serde_json::json!({
-        "total_issues": results.total_issues(),
-        "unused_files": results.unused_files.len(),
-        "unused_exports": results.unused_exports.len(),
-        "unused_types": results.unused_types.len(),
-        "unused_dependencies": results.unused_dependencies.len()
-            + results.unused_dev_dependencies.len()
-            + results.unused_optional_dependencies.len(),
-        "unused_enum_members": results.unused_enum_members.len(),
-        "unused_class_members": results.unused_class_members.len(),
-        "unresolved_imports": results.unresolved_imports.len(),
-        "unlisted_dependencies": results.unlisted_dependencies.len(),
-        "duplicate_exports": results.duplicate_exports.len(),
-        "type_only_dependencies": results.type_only_dependencies.len(),
-        "test_only_dependencies": results.test_only_dependencies.len(),
-        "circular_dependencies": results.circular_dependencies.len(),
-        "boundary_violations": results.boundary_violations.len(),
-        "stale_suppressions": results.stale_suppressions.len(),
-    });
-    map.insert("summary".to_string(), summary);
-
-    if let serde_json::Value::Object(results_map) = results_value {
-        for (key, value) in results_map {
-            map.insert(key, value);
-        }
-    }
-
-    let mut output = serde_json::Value::Object(map);
-    let root_prefix = format!("{}/", root.display());
-    // strip_root_prefix must run before inject_actions so that injected
-    // action fields (static strings and package names) are not processed
-    // by the path stripper.
-    strip_root_prefix(&mut output, &root_prefix);
-    inject_actions(&mut output);
-    Ok(output)
+    api_check_json_document_with_config_fixable(
+        results,
+        root,
+        elapsed,
+        crate::fix::is_config_fixable(root, None),
+    )
 }
 
-/// Recursively strip the root prefix from all string values in the JSON tree.
-///
-/// This converts absolute paths (e.g., `/home/runner/work/repo/repo/src/utils.ts`)
-/// to relative paths (`src/utils.ts`) for all output fields.
-pub fn strip_root_prefix(value: &mut serde_json::Value, prefix: &str) {
-    match value {
-        serde_json::Value::String(s) => {
-            if let Some(rest) = s.strip_prefix(prefix) {
-                *s = rest.to_string();
-            } else {
-                let normalized = normalize_uri(s);
-                let normalized_prefix = normalize_uri(prefix);
-                if let Some(rest) = normalized.strip_prefix(&normalized_prefix) {
-                    *s = rest.to_string();
-                }
-            }
-        }
-        serde_json::Value::Array(arr) => {
-            for item in arr {
-                strip_root_prefix(item, prefix);
-            }
-        }
-        serde_json::Value::Object(map) => {
-            for (_, v) in map.iter_mut() {
-                strip_root_prefix(v, prefix);
-            }
-        }
-        _ => {}
-    }
+#[cfg(test)]
+fn api_check_json_document_with_config_fixable(
+    results: &AnalysisResults,
+    root: &Path,
+    elapsed: Duration,
+    config_fixable: bool,
+) -> Result<serde_json::Value, serde_json::Error> {
+    api_check_json_document_with_config_fixable_and_meta(
+        results,
+        root,
+        elapsed,
+        config_fixable,
+        None,
+    )
 }
 
-// ── Fix action injection ────────────────────────────────────────
-
-/// Suppress mechanism for an issue type.
-enum SuppressKind {
-    /// `// fallow-ignore-next-line <type>` on the line before.
-    InlineComment,
-    /// `// fallow-ignore-file <type>` at the top of the file.
-    FileComment,
-    /// Add to `ignoreDependencies` in fallow config.
-    ConfigIgnoreDep,
+#[cfg(test)]
+fn api_check_json_document_with_config_fixable_and_meta(
+    results: &AnalysisResults,
+    root: &Path,
+    elapsed: Duration,
+    config_fixable: bool,
+    meta: Option<fallow_types::envelope::Meta>,
+) -> Result<serde_json::Value, serde_json::Error> {
+    api_check_json_document_with_config_fixable_meta_and_extras(
+        results,
+        root,
+        elapsed,
+        config_fixable,
+        meta,
+        CheckJsonExtraOutputs::default(),
+        &[],
+    )
 }
 
-/// Specification for actions to inject per issue type.
-struct ActionSpec {
-    fix_type: &'static str,
-    auto_fixable: bool,
-    description: &'static str,
-    note: Option<&'static str>,
-    suppress: SuppressKind,
-    issue_kind: &'static str,
-}
-
-/// Map an issue array key to its action specification.
-fn actions_for_issue_type(key: &str) -> Option<ActionSpec> {
-    match key {
-        "unused_files" => Some(ActionSpec {
-            fix_type: "delete-file",
-            auto_fixable: false,
-            description: "Delete this file",
-            note: Some(
-                "File deletion may remove runtime functionality not visible to static analysis",
-            ),
-            suppress: SuppressKind::FileComment,
-            issue_kind: "unused-file",
-        }),
-        "unused_exports" => Some(ActionSpec {
-            fix_type: "remove-export",
-            auto_fixable: true,
-            description: "Remove the `export` keyword from the declaration",
-            note: None,
-            suppress: SuppressKind::InlineComment,
-            issue_kind: "unused-export",
-        }),
-        "unused_types" => Some(ActionSpec {
-            fix_type: "remove-export",
-            auto_fixable: true,
-            description: "Remove the `export` (or `export type`) keyword from the type declaration",
-            note: None,
-            suppress: SuppressKind::InlineComment,
-            issue_kind: "unused-type",
-        }),
-        "unused_dependencies" => Some(ActionSpec {
-            fix_type: "remove-dependency",
-            auto_fixable: true,
-            description: "Remove from dependencies in package.json",
-            note: None,
-            suppress: SuppressKind::ConfigIgnoreDep,
-            issue_kind: "unused-dependency",
-        }),
-        "unused_dev_dependencies" => Some(ActionSpec {
-            fix_type: "remove-dependency",
-            auto_fixable: true,
-            description: "Remove from devDependencies in package.json",
-            note: None,
-            suppress: SuppressKind::ConfigIgnoreDep,
-            issue_kind: "unused-dev-dependency",
-        }),
-        "unused_optional_dependencies" => Some(ActionSpec {
-            fix_type: "remove-dependency",
-            auto_fixable: true,
-            description: "Remove from optionalDependencies in package.json",
-            note: None,
-            suppress: SuppressKind::ConfigIgnoreDep,
-            // No IssueKind variant exists for optional deps — uses config suppress only.
-            issue_kind: "unused-dependency",
-        }),
-        "unused_enum_members" => Some(ActionSpec {
-            fix_type: "remove-enum-member",
-            auto_fixable: true,
-            description: "Remove this enum member",
-            note: None,
-            suppress: SuppressKind::InlineComment,
-            issue_kind: "unused-enum-member",
-        }),
-        "unused_class_members" => Some(ActionSpec {
-            fix_type: "remove-class-member",
-            auto_fixable: false,
-            description: "Remove this class member",
-            note: Some("Class member may be used via dependency injection or decorators"),
-            suppress: SuppressKind::InlineComment,
-            issue_kind: "unused-class-member",
-        }),
-        "unresolved_imports" => Some(ActionSpec {
-            fix_type: "resolve-import",
-            auto_fixable: false,
-            description: "Fix the import specifier or install the missing module",
-            note: Some("Verify the module path and check tsconfig paths configuration"),
-            suppress: SuppressKind::InlineComment,
-            issue_kind: "unresolved-import",
-        }),
-        "unlisted_dependencies" => Some(ActionSpec {
-            fix_type: "install-dependency",
-            auto_fixable: false,
-            description: "Add this package to dependencies in package.json",
-            note: Some("Verify this package should be a direct dependency before adding"),
-            suppress: SuppressKind::ConfigIgnoreDep,
-            issue_kind: "unlisted-dependency",
-        }),
-        "duplicate_exports" => Some(ActionSpec {
-            fix_type: "remove-duplicate",
-            auto_fixable: false,
-            description: "Keep one canonical export location and remove the others",
-            note: Some("Review all locations to determine which should be the canonical export"),
-            suppress: SuppressKind::InlineComment,
-            issue_kind: "duplicate-export",
-        }),
-        "type_only_dependencies" => Some(ActionSpec {
-            fix_type: "move-to-dev",
-            auto_fixable: false,
-            description: "Move to devDependencies (only type imports are used)",
-            note: Some(
-                "Type imports are erased at runtime so this dependency is not needed in production",
-            ),
-            suppress: SuppressKind::ConfigIgnoreDep,
-            issue_kind: "type-only-dependency",
-        }),
-        "test_only_dependencies" => Some(ActionSpec {
-            fix_type: "move-to-dev",
-            auto_fixable: false,
-            description: "Move to devDependencies (only test files import this)",
-            note: Some(
-                "Only test files import this package so it does not need to be a production dependency",
-            ),
-            suppress: SuppressKind::ConfigIgnoreDep,
-            issue_kind: "test-only-dependency",
-        }),
-        "circular_dependencies" => Some(ActionSpec {
-            fix_type: "refactor-cycle",
-            auto_fixable: false,
-            description: "Extract shared logic into a separate module to break the cycle",
-            note: Some(
-                "Circular imports can cause initialization issues and make code harder to reason about",
-            ),
-            suppress: SuppressKind::InlineComment,
-            issue_kind: "circular-dependency",
-        }),
-        "boundary_violations" => Some(ActionSpec {
-            fix_type: "refactor-boundary",
-            auto_fixable: false,
-            description: "Move the import through an allowed zone or restructure the dependency",
-            note: Some(
-                "This import crosses an architecture boundary that is not permitted by the configured rules",
-            ),
-            suppress: SuppressKind::InlineComment,
-            issue_kind: "boundary-violation",
-        }),
-        _ => None,
-    }
-}
-
-/// Build the `actions` array for a single issue item.
-fn build_actions(
-    item: &serde_json::Value,
-    issue_key: &str,
-    spec: &ActionSpec,
-) -> serde_json::Value {
-    let mut actions = Vec::with_capacity(2);
-
-    // Primary fix action
-    let mut fix_action = serde_json::json!({
-        "type": spec.fix_type,
-        "auto_fixable": spec.auto_fixable,
-        "description": spec.description,
-    });
-    if let Some(note) = spec.note {
-        fix_action["note"] = serde_json::json!(note);
-    }
-    // Warn about re-exports that may be part of the public API surface.
-    if (issue_key == "unused_exports" || issue_key == "unused_types")
-        && item
-            .get("is_re_export")
-            .and_then(serde_json::Value::as_bool)
-            == Some(true)
-    {
-        fix_action["note"] = serde_json::json!(
-            "This finding originates from a re-export; verify it is not part of your public API before removing"
-        );
-    }
-    actions.push(fix_action);
-
-    // Suppress action — every action carries `auto_fixable` for uniform filtering.
-    match spec.suppress {
-        SuppressKind::InlineComment => {
-            let mut suppress = serde_json::json!({
-                "type": "suppress-line",
-                "auto_fixable": false,
-                "description": "Suppress with an inline comment above the line",
-                "comment": format!("// fallow-ignore-next-line {}", spec.issue_kind),
-            });
-            // duplicate_exports has N locations, not one — flag multi-location scope.
-            if issue_key == "duplicate_exports" {
-                suppress["scope"] = serde_json::json!("per-location");
-            }
-            actions.push(suppress);
-        }
-        SuppressKind::FileComment => {
-            actions.push(serde_json::json!({
-                "type": "suppress-file",
-                "auto_fixable": false,
-                "description": "Suppress with a file-level comment at the top of the file",
-                "comment": format!("// fallow-ignore-file {}", spec.issue_kind),
-            }));
-        }
-        SuppressKind::ConfigIgnoreDep => {
-            // Extract the package name from the item for a concrete suggestion.
-            let pkg = item
-                .get("package_name")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("package-name");
-            actions.push(serde_json::json!({
-                "type": "add-to-config",
-                "auto_fixable": false,
-                "description": format!("Add \"{pkg}\" to ignoreDependencies in fallow config"),
-                "config_key": "ignoreDependencies",
-                "value": pkg,
-            }));
-        }
-    }
-
-    serde_json::Value::Array(actions)
-}
-
-/// Inject `actions` arrays into every issue item in the JSON output.
-///
-/// Walks each known issue-type array and appends an `actions` field
-/// to every item, providing machine-actionable fix and suppress hints.
-fn inject_actions(output: &mut serde_json::Value) {
-    let Some(map) = output.as_object_mut() else {
-        return;
-    };
-
-    for (key, value) in map.iter_mut() {
-        let Some(spec) = actions_for_issue_type(key) else {
-            continue;
-        };
-        let Some(arr) = value.as_array_mut() else {
-            continue;
-        };
-        for item in arr {
-            let actions = build_actions(item, key, &spec);
-            if let serde_json::Value::Object(obj) = item {
-                obj.insert("actions".to_string(), actions);
-            }
-        }
-    }
-}
-
-// ── Health action injection ─────────────────────────────────────
-
-/// Build a JSON representation of baseline deltas for the combined JSON envelope.
-///
-/// Accepts a total delta and an iterator of per-category entries to avoid
-/// coupling the report module (compiled in both lib and bin) to the
-/// binary-only `baseline` module.
-pub fn build_baseline_deltas_json<'a>(
-    total_delta: i64,
-    per_category: impl Iterator<Item = (&'a str, usize, usize, i64)>,
-) -> serde_json::Value {
-    let mut per_cat = serde_json::Map::new();
-    for (cat, current, baseline, delta) in per_category {
-        per_cat.insert(
-            cat.to_string(),
-            serde_json::json!({
-                "current": current,
-                "baseline": baseline,
-                "delta": delta,
-            }),
-        );
-    }
-    serde_json::json!({
-        "total_delta": total_delta,
-        "per_category": per_cat
+#[expect(
+    clippy::too_many_arguments,
+    reason = "check output keeps envelope metadata and run-owned diagnostics explicit"
+)]
+pub(super) fn api_check_json_document_with_config_fixable_meta_and_extras(
+    results: &AnalysisResults,
+    root: &Path,
+    elapsed: Duration,
+    config_fixable: bool,
+    meta: Option<fallow_types::envelope::Meta>,
+    extras: CheckJsonExtraOutputs,
+    workspace_diagnostics: &[WorkspaceDiagnostic],
+) -> Result<serde_json::Value, serde_json::Error> {
+    fallow_api::serialize_check_json(CheckJsonOutputInput {
+        results,
+        root,
+        elapsed,
+        config_fixable,
+        meta,
+        extras,
+        workspace_diagnostics: workspace_diagnostics.to_vec(),
+        next_steps: crate::report::suggestions::build_dead_code_next_steps(
+            results,
+            root,
+            crate::report::suggestions::setup_pointer_applicable(root),
+            crate::report::suggestions::due_impact_digest(root),
+        ),
+        envelope_mode: crate::output_runtime::current_root_envelope_mode(),
+        telemetry_analysis_run_id: crate::output_runtime::telemetry_analysis_run_id().as_deref(),
     })
 }
 
-/// Inject `actions` arrays into complexity findings in a health JSON output.
+/// Build the `CheckOutput` body the audit family embeds as its `dead_code`
+/// section.
 ///
-/// Walks `findings` and `targets` arrays, appending machine-actionable
-/// fix and suppress hints to each item.
-#[allow(
-    clippy::redundant_pub_crate,
-    reason = "pub(crate) needed — used by audit.rs via re-export, but not part of public API"
-)]
-pub(crate) fn inject_health_actions(output: &mut serde_json::Value) {
-    let Some(map) = output.as_object_mut() else {
-        return;
-    };
+/// `analysis_diagnostics` is the dead-code analysis's own by-value diagnostic
+/// list. Rendering must not import process history from another analysis run.
+pub fn api_check_json_payload_with_config_fixable(
+    results: &AnalysisResults,
+    root: &Path,
+    elapsed: Duration,
+    config_fixable: bool,
+    analysis_diagnostics: &[WorkspaceDiagnostic],
+) -> Result<serde_json::Value, serde_json::Error> {
+    fallow_api::serialize_check_json_payload(CheckJsonPayloadInput {
+        results,
+        root,
+        elapsed,
+        config_fixable,
+        extras: CheckJsonExtraOutputs::default(),
+        workspace_diagnostics: analysis_diagnostics.to_vec(),
+    })
+}
 
-    // Complexity findings: refactor the function to reduce complexity
-    if let Some(findings) = map.get_mut("findings").and_then(|v| v.as_array_mut()) {
-        for item in findings {
-            let actions = build_health_finding_actions(item);
-            if let serde_json::Value::Object(obj) = item {
-                obj.insert("actions".to_string(), actions);
+pub fn check_json_extras(
+    regression: Option<&crate::regression::RegressionOutcome>,
+    baseline_deltas: Option<BaselineDeltas>,
+    baseline_matched: Option<(usize, usize)>,
+) -> CheckJsonExtraOutputs {
+    CheckJsonExtraOutputs {
+        regression: regression.map(regression_output),
+        baseline_deltas,
+        baseline: baseline_matched.map(|(entries, matched)| BaselineMatch { entries, matched }),
+    }
+}
+
+#[must_use]
+pub fn regression_output(outcome: &crate::regression::RegressionOutcome) -> RegressionResult {
+    match outcome {
+        crate::regression::RegressionOutcome::Pass {
+            baseline_total,
+            current_total,
+        } => {
+            let baseline_total = *baseline_total as i64;
+            let current_total = *current_total as i64;
+            RegressionResult {
+                status: RegressionStatus::Pass,
+                baseline_total: Some(baseline_total),
+                current_total: Some(current_total),
+                delta: Some(current_total - baseline_total),
+                tolerance: None,
+                tolerance_kind: None,
+                exceeded: false,
+                reason: None,
             }
         }
-    }
-
-    // Refactoring targets: apply the recommended refactoring
-    if let Some(targets) = map.get_mut("targets").and_then(|v| v.as_array_mut()) {
-        for item in targets {
-            let actions = build_refactoring_target_actions(item);
-            if let serde_json::Value::Object(obj) = item {
-                obj.insert("actions".to_string(), actions);
-            }
-        }
-    }
-
-    // Hotspots: files that are both complex and frequently changing
-    if let Some(hotspots) = map.get_mut("hotspots").and_then(|v| v.as_array_mut()) {
-        for item in hotspots {
-            let actions = build_hotspot_actions(item);
-            if let serde_json::Value::Object(obj) = item {
-                obj.insert("actions".to_string(), actions);
-            }
-        }
-    }
-
-    // Coverage gaps: untested files and exports
-    if let Some(gaps) = map.get_mut("coverage_gaps").and_then(|v| v.as_object_mut()) {
-        if let Some(files) = gaps.get_mut("files").and_then(|v| v.as_array_mut()) {
-            for item in files {
-                let actions = build_untested_file_actions(item);
-                if let serde_json::Value::Object(obj) = item {
-                    obj.insert("actions".to_string(), actions);
+        crate::regression::RegressionOutcome::Exceeded {
+            baseline_total,
+            current_total,
+            tolerance,
+            ..
+        } => {
+            let baseline_total = *baseline_total as i64;
+            let current_total = *current_total as i64;
+            let (tolerance, tolerance_kind) = match tolerance {
+                crate::regression::Tolerance::Percentage(percent) => {
+                    (*percent, RegressionToleranceKind::Percentage)
                 }
-            }
-        }
-        if let Some(exports) = gaps.get_mut("exports").and_then(|v| v.as_array_mut()) {
-            for item in exports {
-                let actions = build_untested_export_actions(item);
-                if let serde_json::Value::Object(obj) = item {
-                    obj.insert("actions".to_string(), actions);
+                crate::regression::Tolerance::Absolute(count) => {
+                    (*count as f64, RegressionToleranceKind::Absolute)
                 }
+            };
+            RegressionResult {
+                status: RegressionStatus::Exceeded,
+                baseline_total: Some(baseline_total),
+                current_total: Some(current_total),
+                delta: Some(current_total - baseline_total),
+                tolerance: Some(tolerance),
+                tolerance_kind: Some(tolerance_kind),
+                exceeded: true,
+                reason: None,
             }
         }
-    }
-
-    // Production coverage actions are emitted by the sidecar and serialized
-    // directly via serde (see `ProductionCoverageAction` in
-    // `crates/cli/src/health_types/production_coverage.rs`), so no post-hoc
-    // injection is needed here.
-}
-
-/// Build the `actions` array for a single complexity finding.
-///
-/// When the finding was triggered by CRAP (alone or alongside complexity),
-/// the primary action switches to `add-tests` because coverage is the
-/// leverage point for lowering CRAP on a given complexity. When only
-/// cyclomatic/cognitive were exceeded, `refactor-function` remains primary.
-fn build_health_finding_actions(item: &serde_json::Value) -> serde_json::Value {
-    let name = item
-        .get("name")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("function");
-    let exceeded = item
-        .get("exceeded")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("");
-    let includes_crap = matches!(
-        exceeded,
-        "crap" | "cyclomatic_crap" | "cognitive_crap" | "all"
-    );
-    let crap_only = exceeded == "crap";
-
-    let mut actions: Vec<serde_json::Value> = Vec::new();
-    if includes_crap {
-        actions.push(serde_json::json!({
-            "type": "add-tests",
-            "auto_fixable": false,
-            "description": format!("Add test coverage for `{name}` to lower its CRAP score (coverage reduces risk even without refactoring)"),
-            "note": "CRAP = CC^2 * (1 - cov/100)^3 + CC; higher coverage is the fastest way to bring CRAP under threshold",
-        }));
-    }
-    if !crap_only {
-        actions.push(serde_json::json!({
-            "type": "refactor-function",
-            "auto_fixable": false,
-            "description": format!("Refactor `{name}` to reduce complexity (extract helper functions, simplify branching)"),
-            "note": "Consider splitting into smaller functions with single responsibilities",
-        }));
-    }
-
-    actions.push(serde_json::json!({
-        "type": "suppress-line",
-        "auto_fixable": false,
-        "description": "Suppress with an inline comment above the function declaration",
-        "comment": "// fallow-ignore-next-line complexity",
-        "placement": "above-function-declaration",
-    }));
-
-    serde_json::Value::Array(actions)
-}
-
-/// Build the `actions` array for a single hotspot entry.
-fn build_hotspot_actions(item: &serde_json::Value) -> serde_json::Value {
-    let path = item
-        .get("path")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("file");
-
-    let mut actions = vec![
-        serde_json::json!({
-            "type": "refactor-file",
-            "auto_fixable": false,
-            "description": format!("Refactor `{path}`, high complexity combined with frequent changes makes this a maintenance risk"),
-            "note": "Prioritize extracting complex functions, adding tests, or splitting the module",
-        }),
-        serde_json::json!({
-            "type": "add-tests",
-            "auto_fixable": false,
-            "description": format!("Add test coverage for `{path}` to reduce change risk"),
-            "note": "Frequently changed complex files benefit most from comprehensive test coverage",
-        }),
-    ];
-
-    if let Some(ownership) = item.get("ownership") {
-        // Bus factor of 1 is the canonical "single point of failure" signal.
-        if ownership
-            .get("bus_factor")
-            .and_then(serde_json::Value::as_u64)
-            == Some(1)
-        {
-            let top = ownership.get("top_contributor");
-            let owner = top
-                .and_then(|t| t.get("identifier"))
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("the sole contributor");
-            // Soften the note for files with very few commits — calling a
-            // 3-commit file a "knowledge loss risk" reads as catastrophizing
-            // for solo maintainers and small teams. Keep the action so
-            // agents still see the signal, but soften the framing.
-            let commits = top
-                .and_then(|t| t.get("commits"))
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0);
-            // File-specific note: name the candidate reviewers from the
-            // `suggested_reviewers` array when any exist, fall back to
-            // softened framing for low-commit files, and otherwise omit
-            // the note entirely (the description already carries the
-            // actionable ask; adding generic boilerplate wastes tokens).
-            let suggested: Vec<String> = ownership
-                .get("suggested_reviewers")
-                .and_then(serde_json::Value::as_array)
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|r| {
-                            r.get("identifier")
-                                .and_then(serde_json::Value::as_str)
-                                .map(String::from)
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            let mut low_bus_action = serde_json::json!({
-                "type": "low-bus-factor",
-                "auto_fixable": false,
-                "description": format!(
-                    "{owner} is the sole recent contributor to `{path}`; adding a second reviewer reduces knowledge-loss risk"
-                ),
-            });
-            if !suggested.is_empty() {
-                let list = suggested
-                    .iter()
-                    .map(|s| format!("@{s}"))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                low_bus_action["note"] =
-                    serde_json::Value::String(format!("Candidate reviewers: {list}"));
-            } else if commits < 5 {
-                low_bus_action["note"] = serde_json::Value::String(
-                    "Single recent contributor on a low-commit file. Consider a pair review for major changes."
-                        .to_string(),
-                );
-            }
-            // else: omit `note` entirely — description already carries the ask.
-            actions.push(low_bus_action);
-        }
-
-        // Unowned-hotspot: file matches no CODEOWNERS rule. Skip when null
-        // (no CODEOWNERS file discovered).
-        if ownership
-            .get("unowned")
-            .and_then(serde_json::Value::as_bool)
-            == Some(true)
-        {
-            actions.push(serde_json::json!({
-                "type": "unowned-hotspot",
-                "auto_fixable": false,
-                "description": format!("Add a CODEOWNERS entry for `{path}`"),
-                "note": "Frequently-changed files without declared owners create review bottlenecks",
-                "suggested_pattern": suggest_codeowners_pattern(path),
-                "heuristic": "directory-deepest",
-            }));
-        }
-
-        // Drift: original author no longer maintains; add a notice action so
-        // agents can route the next change to the new top contributor.
-        if ownership.get("drift").and_then(serde_json::Value::as_bool) == Some(true) {
-            let reason = ownership
-                .get("drift_reason")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("ownership has shifted from the original author");
-            actions.push(serde_json::json!({
-                "type": "ownership-drift",
-                "auto_fixable": false,
-                "description": format!("Update CODEOWNERS for `{path}`: {reason}"),
-                "note": "Drift suggests the declared or original owner is no longer the right reviewer",
-            }));
-        }
-    }
-
-    serde_json::Value::Array(actions)
-}
-
-/// Suggest a CODEOWNERS pattern for an unowned hotspot.
-///
-/// Picks the deepest directory containing the file
-/// (e.g. `src/api/users/handlers.ts` -> `/src/api/users/`) so agents can
-/// paste a tightly-scoped default. Earlier versions used the first two
-/// directory levels but that catches too many siblings in monorepos
-/// (`/src/api/` could span 200 files across 8 sub-domains). The deepest
-/// directory keeps the suggestion reviewable while still being a directory
-/// pattern rather than a per-file rule.
-///
-/// The action emits this alongside `"heuristic": "directory-deepest"` so
-/// consumers can branch on the strategy if it evolves.
-fn suggest_codeowners_pattern(path: &str) -> String {
-    let normalized = path.replace('\\', "/");
-    let trimmed = normalized.trim_start_matches('/');
-    let mut components: Vec<&str> = trimmed.split('/').collect();
-    components.pop(); // drop the file itself
-    if components.is_empty() {
-        return format!("/{trimmed}");
-    }
-    format!("/{}/", components.join("/"))
-}
-
-/// Build the `actions` array for a single refactoring target.
-fn build_refactoring_target_actions(item: &serde_json::Value) -> serde_json::Value {
-    let recommendation = item
-        .get("recommendation")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("Apply the recommended refactoring");
-
-    let category = item
-        .get("category")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("refactoring");
-
-    let mut actions = vec![serde_json::json!({
-        "type": "apply-refactoring",
-        "auto_fixable": false,
-        "description": recommendation,
-        "category": category,
-    })];
-
-    // Targets with evidence linking to specific functions get a suppress action
-    if item.get("evidence").is_some() {
-        actions.push(serde_json::json!({
-            "type": "suppress-line",
-            "auto_fixable": false,
-            "description": "Suppress the underlying complexity finding",
-            "comment": "// fallow-ignore-next-line complexity",
-        }));
-    }
-
-    serde_json::Value::Array(actions)
-}
-
-/// Build the `actions` array for an untested file.
-fn build_untested_file_actions(item: &serde_json::Value) -> serde_json::Value {
-    let path = item
-        .get("path")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("file");
-
-    serde_json::Value::Array(vec![
-        serde_json::json!({
-            "type": "add-tests",
-            "auto_fixable": false,
-            "description": format!("Add test coverage for `{path}`"),
-            "note": "No test dependency path reaches this runtime file",
-        }),
-        serde_json::json!({
-            "type": "suppress-file",
-            "auto_fixable": false,
-            "description": format!("Suppress coverage gap reporting for `{path}`"),
-            "comment": "// fallow-ignore-file coverage-gaps",
-        }),
-    ])
-}
-
-/// Build the `actions` array for an untested export.
-fn build_untested_export_actions(item: &serde_json::Value) -> serde_json::Value {
-    let path = item
-        .get("path")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("file");
-    let export_name = item
-        .get("export_name")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("export");
-
-    serde_json::Value::Array(vec![
-        serde_json::json!({
-            "type": "add-test-import",
-            "auto_fixable": false,
-            "description": format!("Import and test `{export_name}` from `{path}`"),
-            "note": "This export is runtime-reachable but no test-reachable module references it",
-        }),
-        serde_json::json!({
-            "type": "suppress-file",
-            "auto_fixable": false,
-            "description": format!("Suppress coverage gap reporting for `{path}`"),
-            "comment": "// fallow-ignore-file coverage-gaps",
-        }),
-    ])
-}
-
-// ── Duplication action injection ────────────────────────────────
-
-/// Inject `actions` arrays into clone families/groups in a duplication JSON output.
-///
-/// Walks `clone_families` and `clone_groups` arrays, appending
-/// machine-actionable fix and config hints to each item.
-#[allow(
-    clippy::redundant_pub_crate,
-    reason = "pub(crate) needed — used by audit.rs via re-export, but not part of public API"
-)]
-pub(crate) fn inject_dupes_actions(output: &mut serde_json::Value) {
-    let Some(map) = output.as_object_mut() else {
-        return;
-    };
-
-    // Clone families: extract shared module/function
-    if let Some(families) = map.get_mut("clone_families").and_then(|v| v.as_array_mut()) {
-        for item in families {
-            let actions = build_clone_family_actions(item);
-            if let serde_json::Value::Object(obj) = item {
-                obj.insert("actions".to_string(), actions);
-            }
-        }
-    }
-
-    // Clone groups: extract shared code
-    if let Some(groups) = map.get_mut("clone_groups").and_then(|v| v.as_array_mut()) {
-        for item in groups {
-            let actions = build_clone_group_actions(item);
-            if let serde_json::Value::Object(obj) = item {
-                obj.insert("actions".to_string(), actions);
-            }
-        }
+        crate::regression::RegressionOutcome::Skipped { reason } => RegressionResult {
+            status: RegressionStatus::Skipped,
+            baseline_total: None,
+            current_total: None,
+            delta: None,
+            tolerance: None,
+            tolerance_kind: None,
+            exceeded: false,
+            reason: Some((*reason).to_string()),
+        },
     }
 }
 
-/// Build the `actions` array for a single clone family.
-fn build_clone_family_actions(item: &serde_json::Value) -> serde_json::Value {
-    let group_count = item
-        .get("groups")
-        .and_then(|v| v.as_array())
-        .map_or(0, Vec::len);
-
-    let total_lines = item
-        .get("total_duplicated_lines")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(0);
-
-    let mut actions = vec![serde_json::json!({
-        "type": "extract-shared",
-        "auto_fixable": false,
-        "description": format!(
-            "Extract {group_count} duplicated code block{} ({total_lines} lines) into a shared module",
-            if group_count == 1 { "" } else { "s" }
-        ),
-        "note": "These clone groups share the same files, indicating a structural relationship — refactor together",
-    })];
-
-    // Include any refactoring suggestions from the family
-    if let Some(suggestions) = item.get("suggestions").and_then(|v| v.as_array()) {
-        for suggestion in suggestions {
-            if let Some(desc) = suggestion
-                .get("description")
-                .and_then(serde_json::Value::as_str)
-            {
-                actions.push(serde_json::json!({
-                    "type": "apply-suggestion",
-                    "auto_fixable": false,
-                    "description": desc,
-                }));
-            }
-        }
+pub fn build_baseline_deltas_output<'a>(
+    total_delta: i64,
+    per_category: impl Iterator<Item = (&'a str, usize, usize, i64)>,
+) -> BaselineDeltas {
+    BaselineDeltas {
+        total_delta,
+        per_category: per_category
+            .map(|(category, current, baseline, delta)| {
+                (
+                    category.to_string(),
+                    BaselineCategoryDelta {
+                        current,
+                        baseline,
+                        delta,
+                    },
+                )
+            })
+            .collect(),
     }
-
-    actions.push(serde_json::json!({
-        "type": "suppress-line",
-        "auto_fixable": false,
-        "description": "Suppress with an inline comment above the duplicated code",
-        "comment": "// fallow-ignore-next-line code-duplication",
-    }));
-
-    serde_json::Value::Array(actions)
-}
-
-/// Build the `actions` array for a single clone group.
-fn build_clone_group_actions(item: &serde_json::Value) -> serde_json::Value {
-    let instance_count = item
-        .get("instances")
-        .and_then(|v| v.as_array())
-        .map_or(0, Vec::len);
-
-    let line_count = item
-        .get("line_count")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(0);
-
-    let actions = vec![
-        serde_json::json!({
-            "type": "extract-shared",
-            "auto_fixable": false,
-            "description": format!(
-                "Extract duplicated code ({line_count} lines, {instance_count} instance{}) into a shared function",
-                if instance_count == 1 { "" } else { "s" }
-            ),
-        }),
-        serde_json::json!({
-            "type": "suppress-line",
-            "auto_fixable": false,
-            "description": "Suppress with an inline comment above the duplicated code",
-            "comment": "// fallow-ignore-next-line code-duplication",
-        }),
-    ];
-
-    serde_json::Value::Array(actions)
 }
 
 /// Insert a `_meta` key into a JSON object value.
+#[cfg(test)]
 fn insert_meta(output: &mut serde_json::Value, meta: serde_json::Value) {
     if let serde_json::Value::Object(map) = output {
+        let telemetry = map
+            .get("_meta")
+            .and_then(|existing| existing.get("telemetry"))
+            .cloned();
+        let mut meta = meta;
+        if let (Some(telemetry), Some(meta_map)) = (telemetry, meta.as_object_mut()) {
+            meta_map.insert("telemetry".to_string(), telemetry);
+        }
         map.insert("_meta".to_string(), meta);
     }
 }
 
-/// Build the JSON envelope + health payload shared by `print_health_json` and
-/// the CLI integration test suite. Exposed so snapshot tests can lock the
-/// on-the-wire shape without routing through stdout capture.
-///
-/// # Errors
-///
-/// Returns an error if the report cannot be serialized to JSON.
-pub fn build_health_json(
-    report: &crate::health_types::HealthReport,
+pub(super) fn api_health_json_document(
+    report: &fallow_output::HealthReport,
     root: &Path,
     elapsed: Duration,
     explain: bool,
+    type_aware: Option<&fallow_types::envelope::TypeAwareMeta>,
+    workspace_diagnostics: &[WorkspaceDiagnostic],
 ) -> Result<serde_json::Value, serde_json::Error> {
-    let report_value = serde_json::to_value(report)?;
-    let mut output = build_json_envelope(report_value, elapsed);
-    let root_prefix = format!("{}/", root.display());
-    strip_root_prefix(&mut output, &root_prefix);
-    inject_health_actions(&mut output);
-    if explain {
-        insert_meta(&mut output, explain::health_meta());
-    }
+    let output = fallow_api::serialize_health_report_json(fallow_api::HealthJsonReportInput {
+        report: report.clone(),
+        root,
+        elapsed,
+        explain,
+        type_aware: type_aware.cloned(),
+        grouped_by: None,
+        groups: None,
+        workspace_diagnostics: workspace_diagnostics.to_vec(),
+        next_steps: fallow_output::build_health_next_steps(
+            crate::report::suggestions::health_next_steps_input(
+                report,
+                root,
+                crate::report::suggestions::setup_pointer_applicable(root),
+                crate::report::suggestions::due_impact_digest(root),
+            ),
+        ),
+        envelope_mode: crate::output_runtime::current_root_envelope_mode(),
+        telemetry_analysis_run_id: crate::output_runtime::telemetry_analysis_run_id().as_deref(),
+    })?;
     Ok(output)
 }
 
-pub(super) fn print_health_json(
-    report: &crate::health_types::HealthReport,
+#[expect(
+    clippy::too_many_arguments,
+    reason = "grouped health output keeps render options and run-owned diagnostics explicit"
+)]
+fn api_grouped_health_json_document(
+    report: &fallow_output::HealthReport,
+    grouping: &fallow_output::HealthGrouping,
     root: &Path,
     elapsed: Duration,
     explain: bool,
+    type_aware: Option<&fallow_types::envelope::TypeAwareMeta>,
+    workspace_diagnostics: &[WorkspaceDiagnostic],
+) -> Result<serde_json::Value, serde_json::Error> {
+    fallow_api::serialize_health_report_json(fallow_api::HealthJsonReportInput {
+        report: report.clone(),
+        root,
+        elapsed,
+        explain,
+        type_aware: type_aware.cloned(),
+        grouped_by: Some(group_by_mode_from_label(grouping.mode)),
+        groups: Some(grouping.groups.clone()),
+        workspace_diagnostics: workspace_diagnostics.to_vec(),
+        next_steps: fallow_output::build_health_next_steps(
+            crate::report::suggestions::health_next_steps_input(
+                report,
+                root,
+                crate::report::suggestions::setup_pointer_applicable(root),
+                crate::report::suggestions::due_impact_digest(root),
+            ),
+        ),
+        envelope_mode: crate::output_runtime::current_root_envelope_mode(),
+        telemetry_analysis_run_id: crate::output_runtime::telemetry_analysis_run_id().as_deref(),
+    })
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "health output keeps render options and run-owned diagnostics explicit"
+)]
+pub(super) fn print_health_json(
+    report: &fallow_output::HealthReport,
+    root: &Path,
+    elapsed: Duration,
+    explain: bool,
+    type_aware: Option<&fallow_types::envelope::TypeAwareMeta>,
+    workspace_diagnostics: &[WorkspaceDiagnostic],
+    json_style: crate::json_style::JsonStyle,
 ) -> ExitCode {
-    match build_health_json(report, root, elapsed, explain) {
-        Ok(output) => emit_json(&output, "JSON"),
+    match api_health_json_document(
+        report,
+        root,
+        elapsed,
+        explain,
+        type_aware,
+        workspace_diagnostics,
+    ) {
+        Ok(output) => emit_report_json(&output, "JSON", json_style),
         Err(e) => {
             eprintln!("Error: failed to serialize health report: {e}");
             ExitCode::from(2)
@@ -1052,30 +786,61 @@ pub(super) fn print_health_json(
     }
 }
 
-/// Build the JSON envelope + duplication payload shared by `print_duplication_json`
-/// and the programmatic API surface.
-///
-/// # Errors
-///
-/// Returns an error if the report cannot be serialized to JSON.
-pub fn build_duplication_json(
+#[expect(
+    clippy::too_many_arguments,
+    reason = "grouped health output keeps render options and semantic provenance explicit"
+)]
+pub(super) fn print_grouped_health_json(
+    report: &fallow_output::HealthReport,
+    grouping: &fallow_output::HealthGrouping,
+    root: &Path,
+    elapsed: Duration,
+    explain: bool,
+    type_aware: Option<&fallow_types::envelope::TypeAwareMeta>,
+    workspace_diagnostics: &[WorkspaceDiagnostic],
+    json_style: crate::json_style::JsonStyle,
+) -> ExitCode {
+    match api_grouped_health_json_document(
+        report,
+        grouping,
+        root,
+        elapsed,
+        explain,
+        type_aware,
+        workspace_diagnostics,
+    ) {
+        Ok(output) => emit_report_json(&output, "JSON", json_style),
+        Err(e) => {
+            eprintln!("Error: failed to serialize grouped health report: {e}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+pub(super) fn api_duplication_json_document(
     report: &DuplicationReport,
     root: &Path,
     elapsed: Duration,
     explain: bool,
+    workspace_diagnostics: &[WorkspaceDiagnostic],
 ) -> Result<serde_json::Value, serde_json::Error> {
-    let report_value = serde_json::to_value(report)?;
-
-    let mut output = build_json_envelope(report_value, elapsed);
-    let root_prefix = format!("{}/", root.display());
-    strip_root_prefix(&mut output, &root_prefix);
-    inject_dupes_actions(&mut output);
-
-    if explain {
-        insert_meta(&mut output, explain::dupes_meta());
-    }
-
-    Ok(output)
+    let payload = DupesReportPayload::from_report(report);
+    let next_steps = crate::report::suggestions::build_dupes_next_steps(
+        &payload,
+        root,
+        crate::report::suggestions::setup_pointer_applicable(root),
+        crate::report::suggestions::due_impact_digest(root),
+    );
+    fallow_api::serialize_duplication_json(DuplicationJsonOutputInput {
+        report,
+        root,
+        elapsed,
+        meta: explain.then(fallow_output::dupes_meta),
+        workspace_diagnostics: workspace_diagnostics.to_vec(),
+        next_steps,
+        envelope_mode: crate::output_runtime::current_root_envelope_mode(),
+        telemetry_analysis_run_id: crate::output_runtime::telemetry_analysis_run_id().as_deref(),
+    })
 }
 
 pub(super) fn print_duplication_json(
@@ -1083,9 +848,11 @@ pub(super) fn print_duplication_json(
     root: &Path,
     elapsed: Duration,
     explain: bool,
+    workspace_diagnostics: &[WorkspaceDiagnostic],
+    json_style: crate::json_style::JsonStyle,
 ) -> ExitCode {
-    match build_duplication_json(report, root, elapsed, explain) {
-        Ok(output) => emit_json(&output, "JSON"),
+    match api_duplication_json_document(report, root, elapsed, explain, workspace_diagnostics) {
+        Ok(output) => emit_report_json(&output, "JSON", json_style),
         Err(e) => {
             eprintln!("Error: failed to serialize duplication report: {e}");
             ExitCode::from(2)
@@ -1093,9 +860,93 @@ pub(super) fn print_duplication_json(
     }
 }
 
-pub(super) fn print_trace_json<T: serde::Serialize>(value: &T) {
-    match serde_json::to_string_pretty(value) {
-        Ok(json) => println!("{json}"),
+fn api_grouped_duplication_json_document(
+    report: &DuplicationReport,
+    grouping: &DuplicationGrouping,
+    root: &Path,
+    elapsed: Duration,
+    explain: bool,
+    workspace_diagnostics: &[WorkspaceDiagnostic],
+) -> Result<serde_json::Value, serde_json::Error> {
+    let payload = DupesReportPayload::from_report(report);
+    let next_steps = crate::report::suggestions::build_dupes_next_steps(
+        &payload,
+        root,
+        crate::report::suggestions::setup_pointer_applicable(root),
+        crate::report::suggestions::due_impact_digest(root),
+    );
+    fallow_api::serialize_grouped_duplication_json(GroupedDuplicationJsonOutputInput {
+        report,
+        grouping,
+        root,
+        elapsed,
+        meta: explain.then(fallow_output::dupes_meta),
+        workspace_diagnostics: workspace_diagnostics.to_vec(),
+        next_steps,
+        envelope_mode: crate::output_runtime::current_root_envelope_mode(),
+        telemetry_analysis_run_id: crate::output_runtime::telemetry_analysis_run_id().as_deref(),
+    })
+}
+
+fn group_by_mode_from_label(label: &str) -> GroupByMode {
+    match label {
+        "directory" => GroupByMode::Directory,
+        "package" => GroupByMode::Package,
+        "section" => GroupByMode::Section,
+        _ => GroupByMode::Owner,
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "grouped duplication output keeps render options and run-owned diagnostics explicit"
+)]
+pub(super) fn print_grouped_duplication_json(
+    report: &DuplicationReport,
+    grouping: &DuplicationGrouping,
+    root: &Path,
+    elapsed: Duration,
+    explain: bool,
+    workspace_diagnostics: &[WorkspaceDiagnostic],
+    json_style: crate::json_style::JsonStyle,
+) -> ExitCode {
+    match api_grouped_duplication_json_document(
+        report,
+        grouping,
+        root,
+        elapsed,
+        explain,
+        workspace_diagnostics,
+    ) {
+        Ok(output) => emit_report_json(&output, "JSON", json_style),
+        Err(e) => {
+            eprintln!("Error: failed to serialize grouped duplication report: {e}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+pub(super) fn print_trace_json<T: serde::Serialize>(
+    value: &T,
+    json_style: crate::json_style::JsonStyle,
+) {
+    let value = match fallow_output::serialize_trace_json_output(
+        value,
+        crate::output_runtime::current_root_envelope_mode(),
+        crate::output_runtime::telemetry_analysis_run_id().as_deref(),
+    ) {
+        Ok(value) => value,
+        Err(e) => {
+            eprintln!("Error: failed to build trace output: {e}");
+            #[expect(
+                clippy::exit,
+                reason = "fatal serialization error requires immediate exit"
+            )]
+            std::process::exit(2);
+        }
+    };
+    match json_style.serialize(&value) {
+        Ok(json) => outln!("{json}"),
         Err(e) => {
             eprintln!("Error: failed to serialize trace output: {e}");
             #[expect(
@@ -1107,29 +958,196 @@ pub(super) fn print_trace_json<T: serde::Serialize>(value: &T) {
     }
 }
 
+pub(super) fn print_semantic_trace_json<T: serde::Serialize>(
+    value: &T,
+    explain: bool,
+    json_style: crate::json_style::JsonStyle,
+) {
+    let mut value = match fallow_output::serialize_trace_json_output(
+        value,
+        crate::output_runtime::current_root_envelope_mode(),
+        crate::output_runtime::telemetry_analysis_run_id().as_deref(),
+    ) {
+        Ok(value) => value,
+        Err(e) => {
+            eprintln!("Error: failed to build semantic trace output: {e}");
+            #[expect(
+                clippy::exit,
+                reason = "fatal serialization error requires immediate exit"
+            )]
+            std::process::exit(2);
+        }
+    };
+    attach_semantic_explain_meta(&mut value, explain);
+    match json_style.serialize(&value) {
+        Ok(json) => outln!("{json}"),
+        Err(e) => {
+            eprintln!("Error: failed to serialize semantic trace output: {e}");
+            #[expect(
+                clippy::exit,
+                reason = "fatal serialization error requires immediate exit"
+            )]
+            std::process::exit(2);
+        }
+    }
+}
+
+pub(super) fn print_semantic_impact_json<T: serde::Serialize>(
+    value: &T,
+    explain: bool,
+    json_style: crate::json_style::JsonStyle,
+) {
+    let mut value = match fallow_output::serialize_named_json_output(
+        value,
+        "impact",
+        crate::output_runtime::current_root_envelope_mode(),
+    ) {
+        Ok(value) => value,
+        Err(e) => {
+            eprintln!("Error: failed to build impact output: {e}");
+            #[expect(
+                clippy::exit,
+                reason = "fatal serialization error requires immediate exit"
+            )]
+            std::process::exit(2);
+        }
+    };
+    attach_semantic_explain_meta(&mut value, explain);
+    match json_style.serialize(&value) {
+        Ok(json) => outln!("{json}"),
+        Err(e) => {
+            eprintln!("Error: failed to serialize impact output: {e}");
+            #[expect(
+                clippy::exit,
+                reason = "fatal serialization error requires immediate exit"
+            )]
+            std::process::exit(2);
+        }
+    }
+}
+
+fn attach_semantic_explain_meta(value: &mut serde_json::Value, explain: bool) {
+    if !explain {
+        return;
+    }
+    let Some(root) = value.as_object_mut() else {
+        return;
+    };
+    let meta = root
+        .entry("_meta")
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    let Some(meta) = meta.as_object_mut() else {
+        return;
+    };
+    meta.entry("docs").or_insert_with(|| {
+        serde_json::Value::String("https://docs.fallow.tools/features/type-aware".to_string())
+    });
+    meta.entry("field_definitions").or_insert_with(|| {
+        serde_json::json!({
+            "semantic": "Authoritative checker-backed evidence. When present, trust semantic.identity, semantic.status, and semantic.references over the syntactic root trace fields. The proof covers only the lane named by semantic.target.namespace, so when the root trace lists a reference the proof does not, the root evidence is wider rather than stale.",
+            "semantic.identity": "Compatibility identity for the selected effective TypeScript projects and semantic capabilities.",
+            "semantic.status": "Whether checker-backed evidence is complete, partial, or unavailable.",
+            "semantic.references": "Bounded exact TypeScript checker references for the requested module export or class member.",
+            "identity": "Compatibility identity for this exact-symbol semantic impact query.",
+            "status": "Whether exact-symbol impact evidence is complete, partial, or unavailable.",
+            "direct_consumers": "Files that import or re-export this exact module export.",
+            "affected_files": "Transitively affected project files derived from the exact consumer graph.",
+            "targeted_tests": "Test entry points with a proven dependency path to the exact symbol."
+        })
+    });
+    meta.entry("metrics").or_insert_with(|| {
+        serde_json::json!({
+            "semantic.total_reference_count": {
+                "name": "Exact reference count",
+                "description": "Checker-resolved references before evidence bounding.",
+                "range": "[0, infinity)",
+                "interpretation": "Zero is meaningful only when semantic.status is complete."
+            },
+            "total_direct_consumer_count": {
+                "name": "Direct consumer count",
+                "description": "Exact module consumers before evidence bounding.",
+                "range": "[0, infinity)",
+                "interpretation": "Higher means a wider immediate change surface."
+            },
+            "total_affected_file_count": {
+                "name": "Affected file count",
+                "description": "Transitive exact-symbol impact files before evidence bounding.",
+                "range": "[0, infinity)",
+                "interpretation": "Higher means a wider downstream change surface."
+            },
+            "total_targeted_test_count": {
+                "name": "Targeted test count",
+                "description": "Tests with a proven dependency path to the exact symbol.",
+                "range": "[0, infinity)",
+                "interpretation": "Use these tests first, then retain the normal project verification gates."
+            }
+        })
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::health_types::{
-        ProductionCoverageAction, ProductionCoverageConfidence, ProductionCoverageEvidence,
-        ProductionCoverageFinding, ProductionCoverageHotPath, ProductionCoverageMessage,
-        ProductionCoverageReport, ProductionCoverageReportVerdict, ProductionCoverageSummary,
-        ProductionCoverageVerdict, ProductionCoverageWatermark,
-    };
     use crate::report::test_helpers::sample_results;
-    use fallow_core::extract::MemberKind;
-    use fallow_core::results::*;
+    use fallow_output::{
+        RuntimeCoverageAction, RuntimeCoverageConfidence, RuntimeCoverageDataSource,
+        RuntimeCoverageEvidence, RuntimeCoverageFinding, RuntimeCoverageHotPath,
+        RuntimeCoverageMessage, RuntimeCoverageReport, RuntimeCoverageReportVerdict,
+        RuntimeCoverageSchemaVersion, RuntimeCoverageSummary, RuntimeCoverageVerdict,
+        RuntimeCoverageWatermark,
+    };
+    use fallow_types::extract::MemberKind;
+    use fallow_types::output_dead_code::*;
+    use fallow_types::results::*;
     use std::path::PathBuf;
     use std::time::Duration;
+
+    #[test]
+    fn typed_regression_output_matches_legacy_json_shape() {
+        let outcome = crate::regression::RegressionOutcome::Exceeded {
+            baseline_total: 10,
+            current_total: 13,
+            tolerance: crate::regression::Tolerance::Absolute(2),
+            type_deltas: Vec::new(),
+        };
+
+        assert_eq!(
+            serde_json::to_value(regression_output(&outcome)).expect("regression serializes"),
+            outcome.to_json()
+        );
+    }
+
+    #[test]
+    fn typed_baseline_deltas_output_matches_legacy_json_shape() {
+        let typed = build_baseline_deltas_output(
+            2,
+            [("unused_exports", 4_usize, 2_usize, 2_i64)].into_iter(),
+        );
+
+        assert_eq!(
+            serde_json::to_value(typed).expect("baseline deltas serialize"),
+            serde_json::json!({
+                "total_delta": 2,
+                "per_category": {
+                    "unused_exports": {
+                        "current": 4,
+                        "baseline": 2,
+                        "delta": 2
+                    }
+                }
+            })
+        );
+    }
 
     #[test]
     fn json_output_has_metadata_fields() {
         let root = PathBuf::from("/project");
         let results = AnalysisResults::default();
         let elapsed = Duration::from_millis(123);
-        let output = build_json(&results, &root, elapsed).expect("should serialize");
+        let output = api_check_json_document(&results, &root, elapsed).expect("should serialize");
 
-        assert_eq!(output["schema_version"], 4);
+        assert_eq!(output["kind"], "dead-code");
+        assert_eq!(output["schema_version"], 9);
         assert!(output["version"].is_string());
         assert_eq!(output["elapsed_ms"], 123);
         assert_eq!(output["total_issues"], 0);
@@ -1140,7 +1158,7 @@ mod tests {
         let root = PathBuf::from("/project");
         let results = sample_results(&root);
         let elapsed = Duration::from_millis(50);
-        let output = build_json(&results, &root, elapsed).expect("should serialize");
+        let output = api_check_json_document(&results, &root, elapsed).expect("should serialize");
 
         assert_eq!(output["unused_files"].as_array().unwrap().len(), 1);
         assert_eq!(output["unused_exports"].as_array().unwrap().len(), 1);
@@ -1163,12 +1181,20 @@ mod tests {
     }
 
     #[test]
-    fn health_json_includes_production_coverage_with_relative_paths_and_actions() {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "test fixture; linear setup/assert, length is not a maintainability concern"
+    )]
+    fn health_json_includes_runtime_coverage_with_relative_paths_and_actions() {
         let root = PathBuf::from("/project");
-        let report = crate::health_types::HealthReport {
-            production_coverage: Some(ProductionCoverageReport {
-                verdict: ProductionCoverageReportVerdict::ColdCodeDetected,
-                summary: ProductionCoverageSummary {
+        let report = fallow_output::HealthReport {
+            runtime_coverage: Some(RuntimeCoverageReport {
+                schema_version: RuntimeCoverageSchemaVersion::V1,
+                verdict: RuntimeCoverageReportVerdict::ColdCodeDetected,
+                signals: Vec::new(),
+                summary: RuntimeCoverageSummary {
+                    data_source: RuntimeCoverageDataSource::Local,
+                    last_received_at: None,
                     functions_tracked: 3,
                     functions_hit: 1,
                     functions_unhit: 1,
@@ -1177,22 +1203,23 @@ mod tests {
                     trace_count: 2_847_291,
                     period_days: 30,
                     deployments_seen: 14,
-                    capture_quality: Some(crate::health_types::ProductionCoverageCaptureQuality {
+                    capture_quality: Some(fallow_output::RuntimeCoverageCaptureQuality {
                         window_seconds: 720,
                         instances_observed: 1,
                         lazy_parse_warning: true,
                         untracked_ratio_percent: 42.5,
                     }),
                 },
-                findings: vec![ProductionCoverageFinding {
+                findings: vec![RuntimeCoverageFinding {
                     id: "fallow:prod:deadbeef".to_owned(),
+                    stable_id: None,
                     path: root.join("src/cold.ts"),
                     function: "coldPath".to_owned(),
                     line: 12,
-                    verdict: ProductionCoverageVerdict::ReviewRequired,
+                    verdict: RuntimeCoverageVerdict::ReviewRequired,
                     invocations: Some(0),
-                    confidence: ProductionCoverageConfidence::Medium,
-                    evidence: ProductionCoverageEvidence {
+                    confidence: RuntimeCoverageConfidence::Medium,
+                    evidence: RuntimeCoverageEvidence {
                         static_status: "used".to_owned(),
                         test_coverage: "not_covered".to_owned(),
                         v8_tracking: "tracked".to_owned(),
@@ -1200,64 +1227,136 @@ mod tests {
                         observation_days: 30,
                         deployments_observed: 14,
                     },
-                    actions: vec![ProductionCoverageAction {
+                    actions: vec![RuntimeCoverageAction {
                         kind: "review-deletion".to_owned(),
-                        description: "Tracked in production coverage with zero invocations."
+                        description: "Tracked in runtime coverage with zero invocations."
                             .to_owned(),
                         auto_fixable: false,
                     }],
+                    source_hash: None,
+                    discriminators: None,
                 }],
-                hot_paths: vec![ProductionCoverageHotPath {
+                hot_paths: vec![RuntimeCoverageHotPath {
                     id: "fallow:hot:cafebabe".to_owned(),
+                    stable_id: None,
                     path: root.join("src/hot.ts"),
                     function: "hotPath".to_owned(),
                     line: 3,
+                    end_line: 9,
                     invocations: 250,
                     percentile: 99,
                     actions: vec![],
                 }],
-                watermark: Some(ProductionCoverageWatermark::LicenseExpiredGrace),
-                warnings: vec![ProductionCoverageMessage {
+                blast_radius: vec![],
+                importance: vec![],
+                watermark: Some(RuntimeCoverageWatermark::LicenseExpiredGrace),
+                warnings: vec![RuntimeCoverageMessage {
                     code: "partial-merge".to_owned(),
                     message: "Merged coverage omitted one chunk.".to_owned(),
                 }],
+                actionable: true,
+                actionability_reason: None,
+                actionability_verdict: None,
+                provenance: fallow_output::RuntimeCoverageProvenance::default(),
             }),
             ..Default::default()
         };
 
-        let report_value = serde_json::to_value(&report).expect("should serialize health report");
-        let mut output = build_json_envelope(report_value, Duration::from_millis(7));
+        let envelope: fallow_output::HealthOutput<
+            fallow_output::HealthReport,
+            fallow_output::HealthGroup,
+        > = fallow_output::HealthOutput {
+            schema_version: SchemaVersion(fallow_output::HEALTH_SCHEMA_VERSION),
+            version: ToolVersion(env!("CARGO_PKG_VERSION").to_string()),
+            elapsed_ms: ElapsedMs(7),
+            report,
+            grouped_by: None,
+            groups: None,
+            meta: None,
+            workspace_diagnostics: Vec::new(),
+            next_steps: Vec::new(),
+        };
+        let mut output = serde_json::to_value(&envelope).expect("should serialize health envelope");
         strip_root_prefix(&mut output, "/project/");
-        inject_health_actions(&mut output);
 
         assert_eq!(
-            output["production_coverage"]["verdict"],
+            output["runtime_coverage"]["verdict"],
             serde_json::Value::String("cold-code-detected".to_owned())
         );
         assert_eq!(
-            output["production_coverage"]["summary"]["functions_tracked"],
+            output["runtime_coverage"]["schema_version"],
+            serde_json::Value::String("1".to_owned())
+        );
+        assert_eq!(
+            output["runtime_coverage"]["summary"]["functions_tracked"],
             serde_json::Value::from(3)
         );
         assert_eq!(
-            output["production_coverage"]["summary"]["coverage_percent"],
+            output["runtime_coverage"]["summary"]["coverage_percent"],
             serde_json::Value::from(33.3)
         );
-        let finding = &output["production_coverage"]["findings"][0];
+        let finding = &output["runtime_coverage"]["findings"][0];
         assert_eq!(finding["path"], "src/cold.ts");
         assert_eq!(finding["verdict"], "review_required");
         assert_eq!(finding["id"], "fallow:prod:deadbeef");
         assert_eq!(finding["actions"][0]["type"], "review-deletion");
-        let hot_path = &output["production_coverage"]["hot_paths"][0];
+        let hot_path = &output["runtime_coverage"]["hot_paths"][0];
         assert_eq!(hot_path["path"], "src/hot.ts");
         assert_eq!(hot_path["function"], "hotPath");
         assert_eq!(hot_path["percentile"], 99);
         assert_eq!(
-            output["production_coverage"]["watermark"],
+            output["runtime_coverage"]["watermark"],
             serde_json::Value::String("license-expired-grace".to_owned())
         );
         assert_eq!(
-            output["production_coverage"]["warnings"][0]["code"],
+            output["runtime_coverage"]["warnings"][0]["code"],
             serde_json::Value::String("partial-merge".to_owned())
+        );
+    }
+
+    #[test]
+    fn grouped_health_json_uses_api_contract_for_group_paths() {
+        let root = PathBuf::from("/project");
+        let grouping = fallow_output::HealthGrouping {
+            mode: "package",
+            groups: vec![fallow_output::HealthGroup {
+                key: "app".to_string(),
+                owners: None,
+                files_analyzed: 1,
+                functions_above_threshold: 0,
+                coverage_source_consistency: None,
+                vital_signs: None,
+                health_score: None,
+                findings: Vec::new(),
+                file_scores: Vec::new(),
+                hotspots: Vec::new(),
+                large_functions: vec![fallow_output::LargeFunctionEntry {
+                    path: root.join("src/large.ts"),
+                    name: "large".to_string(),
+                    line: 12,
+                    line_count: 80,
+                }],
+                targets: Vec::new(),
+                actions_meta: None,
+            }],
+        };
+
+        let output = api_grouped_health_json_document(
+            &fallow_output::HealthReport::default(),
+            &grouping,
+            &root,
+            Duration::ZERO,
+            false,
+            None,
+            &[],
+        )
+        .expect("grouped health JSON should serialize");
+
+        assert_eq!(output["kind"], "health");
+        assert_eq!(output["grouped_by"], "package");
+        assert_eq!(
+            output["groups"][0]["large_functions"][0]["path"],
+            "src/large.ts"
         );
     }
 
@@ -1266,12 +1365,13 @@ mod tests {
         let root = PathBuf::from("/project");
         let results = AnalysisResults::default();
         let elapsed = Duration::from_millis(0);
-        let output = build_json(&results, &root, elapsed).expect("should serialize");
+        let output = api_check_json_document(&results, &root, elapsed).expect("should serialize");
         let keys: Vec<&String> = output.as_object().unwrap().keys().collect();
-        assert_eq!(keys[0], "schema_version");
-        assert_eq!(keys[1], "version");
-        assert_eq!(keys[2], "elapsed_ms");
-        assert_eq!(keys[3], "total_issues");
+        assert_eq!(keys[0], "kind");
+        assert_eq!(keys[1], "schema_version");
+        assert_eq!(keys[2], "version");
+        assert_eq!(keys[3], "elapsed_ms");
+        assert_eq!(keys[4], "total_issues");
     }
 
     #[test]
@@ -1280,7 +1380,7 @@ mod tests {
         let results = sample_results(&root);
         let total = results.total_issues();
         let elapsed = Duration::from_millis(0);
-        let output = build_json(&results, &root, elapsed).expect("should serialize");
+        let output = api_check_json_document(&results, &root, elapsed).expect("should serialize");
 
         assert_eq!(output["total_issues"], total);
     }
@@ -1289,17 +1389,19 @@ mod tests {
     fn json_unused_export_contains_expected_fields() {
         let root = PathBuf::from("/project");
         let mut results = AnalysisResults::default();
-        results.unused_exports.push(UnusedExport {
-            path: root.join("src/utils.ts"),
-            export_name: "helperFn".to_string(),
-            is_type_only: false,
-            line: 10,
-            col: 4,
-            span_start: 120,
-            is_re_export: false,
-        });
+        results
+            .unused_exports
+            .push(UnusedExportFinding::with_actions(UnusedExport {
+                path: root.join("src/utils.ts"),
+                export_name: "helperFn".to_string(),
+                is_type_only: false,
+                line: 10,
+                col: 4,
+                span_start: 120,
+                is_re_export: false,
+            }));
         let elapsed = Duration::from_millis(0);
-        let output = build_json(&results, &root, elapsed).expect("should serialize");
+        let output = api_check_json_document(&results, &root, elapsed).expect("should serialize");
 
         let export = &output["unused_exports"][0];
         assert_eq!(export["export_name"], "helperFn");
@@ -1315,7 +1417,7 @@ mod tests {
         let root = PathBuf::from("/project");
         let results = sample_results(&root);
         let elapsed = Duration::from_millis(42);
-        let output = build_json(&results, &root, elapsed).expect("should serialize");
+        let output = api_check_json_document(&results, &root, elapsed).expect("should serialize");
 
         let json_str = serde_json::to_string_pretty(&output).expect("should stringify");
         let reparsed: serde_json::Value =
@@ -1323,14 +1425,12 @@ mod tests {
         assert_eq!(reparsed, output);
     }
 
-    // ── Empty results ───────────────────────────────────────────────
-
     #[test]
     fn json_empty_results_produce_valid_structure() {
         let root = PathBuf::from("/project");
         let results = AnalysisResults::default();
         let elapsed = Duration::from_millis(0);
-        let output = build_json(&results, &root, elapsed).expect("should serialize");
+        let output = api_check_json_document(&results, &root, elapsed).expect("should serialize");
 
         assert_eq!(output["total_issues"], 0);
         assert_eq!(output["unused_files"].as_array().unwrap().len(), 0);
@@ -1358,7 +1458,7 @@ mod tests {
         let root = PathBuf::from("/project");
         let results = AnalysisResults::default();
         let elapsed = Duration::from_millis(0);
-        let output = build_json(&results, &root, elapsed).expect("should serialize");
+        let output = api_check_json_document(&results, &root, elapsed).expect("should serialize");
 
         let json_str = serde_json::to_string(&output).expect("should stringify");
         let reparsed: serde_json::Value =
@@ -1366,17 +1466,17 @@ mod tests {
         assert_eq!(reparsed["total_issues"], 0);
     }
 
-    // ── Path stripping ──────────────────────────────────────────────
-
     #[test]
     fn json_paths_are_relative_to_root() {
         let root = PathBuf::from("/project");
         let mut results = AnalysisResults::default();
-        results.unused_files.push(UnusedFile {
-            path: root.join("src/deep/nested/file.ts"),
-        });
+        results
+            .unused_files
+            .push(UnusedFileFinding::with_actions(UnusedFile {
+                path: root.join("src/deep/nested/file.ts"),
+            }));
         let elapsed = Duration::from_millis(0);
-        let output = build_json(&results, &root, elapsed).expect("should serialize");
+        let output = api_check_json_document(&results, &root, elapsed).expect("should serialize");
 
         let path = output["unused_files"][0]["path"].as_str().unwrap();
         assert_eq!(path, "src/deep/nested/file.ts");
@@ -1387,16 +1487,20 @@ mod tests {
     fn json_strips_root_from_nested_locations() {
         let root = PathBuf::from("/project");
         let mut results = AnalysisResults::default();
-        results.unlisted_dependencies.push(UnlistedDependency {
-            package_name: "chalk".to_string(),
-            imported_from: vec![ImportSite {
-                path: root.join("src/cli.ts"),
-                line: 2,
-                col: 0,
-            }],
-        });
+        results
+            .unlisted_dependencies
+            .push(UnlistedDependencyFinding::with_actions(
+                UnlistedDependency {
+                    package_name: "chalk".to_string(),
+                    imported_from: vec![ImportSite {
+                        path: root.join("src/cli.ts"),
+                        line: 2,
+                        col: 0,
+                    }],
+                },
+            ));
         let elapsed = Duration::from_millis(0);
-        let output = build_json(&results, &root, elapsed).expect("should serialize");
+        let output = api_check_json_document(&results, &root, elapsed).expect("should serialize");
 
         let site_path = output["unlisted_dependencies"][0]["imported_from"][0]["path"]
             .as_str()
@@ -1408,23 +1512,25 @@ mod tests {
     fn json_strips_root_from_duplicate_export_locations() {
         let root = PathBuf::from("/project");
         let mut results = AnalysisResults::default();
-        results.duplicate_exports.push(DuplicateExport {
-            export_name: "Config".to_string(),
-            locations: vec![
-                DuplicateLocation {
-                    path: root.join("src/config.ts"),
-                    line: 15,
-                    col: 0,
-                },
-                DuplicateLocation {
-                    path: root.join("src/types.ts"),
-                    line: 30,
-                    col: 0,
-                },
-            ],
-        });
+        results
+            .duplicate_exports
+            .push(DuplicateExportFinding::with_actions(DuplicateExport {
+                export_name: "Config".to_string(),
+                locations: vec![
+                    DuplicateLocation {
+                        path: root.join("src/config.ts"),
+                        line: 15,
+                        col: 0,
+                    },
+                    DuplicateLocation {
+                        path: root.join("src/types.ts"),
+                        line: 30,
+                        col: 0,
+                    },
+                ],
+            }));
         let elapsed = Duration::from_millis(0);
-        let output = build_json(&results, &root, elapsed).expect("should serialize");
+        let output = api_check_json_document(&results, &root, elapsed).expect("should serialize");
 
         let loc0 = output["duplicate_exports"][0]["locations"][0]["path"]
             .as_str()
@@ -1440,15 +1546,20 @@ mod tests {
     fn json_strips_root_from_circular_dependency_files() {
         let root = PathBuf::from("/project");
         let mut results = AnalysisResults::default();
-        results.circular_dependencies.push(CircularDependency {
-            files: vec![root.join("src/a.ts"), root.join("src/b.ts")],
-            length: 2,
-            line: 1,
-            col: 0,
-            is_cross_package: false,
-        });
+        results
+            .circular_dependencies
+            .push(CircularDependencyFinding::with_actions(
+                CircularDependency {
+                    files: vec![root.join("src/a.ts"), root.join("src/b.ts")],
+                    length: 2,
+                    line: 1,
+                    col: 0,
+                    edges: Vec::new(),
+                    is_cross_package: false,
+                },
+            ));
         let elapsed = Duration::from_millis(0);
-        let output = build_json(&results, &root, elapsed).expect("should serialize");
+        let output = api_check_json_document(&results, &root, elapsed).expect("should serialize");
 
         let files = output["circular_dependencies"][0]["files"]
             .as_array()
@@ -1461,27 +1572,29 @@ mod tests {
     fn json_path_outside_root_not_stripped() {
         let root = PathBuf::from("/project");
         let mut results = AnalysisResults::default();
-        results.unused_files.push(UnusedFile {
-            path: PathBuf::from("/other/project/src/file.ts"),
-        });
+        results
+            .unused_files
+            .push(UnusedFileFinding::with_actions(UnusedFile {
+                path: PathBuf::from("/other/project/src/file.ts"),
+            }));
         let elapsed = Duration::from_millis(0);
-        let output = build_json(&results, &root, elapsed).expect("should serialize");
+        let output = api_check_json_document(&results, &root, elapsed).expect("should serialize");
 
         let path = output["unused_files"][0]["path"].as_str().unwrap();
         assert!(path.contains("/other/project/"));
     }
 
-    // ── Individual issue type field verification ────────────────────
-
     #[test]
     fn json_unused_file_contains_path() {
         let root = PathBuf::from("/project");
         let mut results = AnalysisResults::default();
-        results.unused_files.push(UnusedFile {
-            path: root.join("src/orphan.ts"),
-        });
+        results
+            .unused_files
+            .push(UnusedFileFinding::with_actions(UnusedFile {
+                path: root.join("src/orphan.ts"),
+            }));
         let elapsed = Duration::from_millis(0);
-        let output = build_json(&results, &root, elapsed).expect("should serialize");
+        let output = api_check_json_document(&results, &root, elapsed).expect("should serialize");
 
         let file = &output["unused_files"][0];
         assert_eq!(file["path"], "src/orphan.ts");
@@ -1491,17 +1604,19 @@ mod tests {
     fn json_unused_type_contains_expected_fields() {
         let root = PathBuf::from("/project");
         let mut results = AnalysisResults::default();
-        results.unused_types.push(UnusedExport {
-            path: root.join("src/types.ts"),
-            export_name: "OldInterface".to_string(),
-            is_type_only: true,
-            line: 20,
-            col: 0,
-            span_start: 300,
-            is_re_export: false,
-        });
+        results
+            .unused_types
+            .push(UnusedTypeFinding::with_actions(UnusedExport {
+                path: root.join("src/types.ts"),
+                export_name: "OldInterface".to_string(),
+                is_type_only: true,
+                line: 20,
+                col: 0,
+                span_start: 300,
+                is_re_export: false,
+            }));
         let elapsed = Duration::from_millis(0);
-        let output = build_json(&results, &root, elapsed).expect("should serialize");
+        let output = api_check_json_document(&results, &root, elapsed).expect("should serialize");
 
         let typ = &output["unused_types"][0];
         assert_eq!(typ["export_name"], "OldInterface");
@@ -1514,32 +1629,62 @@ mod tests {
     fn json_unused_dependency_contains_expected_fields() {
         let root = PathBuf::from("/project");
         let mut results = AnalysisResults::default();
-        results.unused_dependencies.push(UnusedDependency {
-            package_name: "axios".to_string(),
-            location: DependencyLocation::Dependencies,
-            path: root.join("package.json"),
-            line: 10,
-        });
+        results
+            .unused_dependencies
+            .push(UnusedDependencyFinding::with_actions(UnusedDependency {
+                package_name: "axios".to_string(),
+                location: DependencyLocation::Dependencies,
+                path: root.join("package.json"),
+                line: 10,
+                used_in_workspaces: Vec::new(),
+            }));
         let elapsed = Duration::from_millis(0);
-        let output = build_json(&results, &root, elapsed).expect("should serialize");
+        let output = api_check_json_document(&results, &root, elapsed).expect("should serialize");
 
         let dep = &output["unused_dependencies"][0];
         assert_eq!(dep["package_name"], "axios");
         assert_eq!(dep["line"], 10);
+        assert!(dep.get("used_in_workspaces").is_none());
+    }
+
+    #[test]
+    fn json_unused_dependency_includes_cross_workspace_context() {
+        let root = PathBuf::from("/project");
+        let mut results = AnalysisResults::default();
+        results
+            .unused_dependencies
+            .push(UnusedDependencyFinding::with_actions(UnusedDependency {
+                package_name: "lodash-es".to_string(),
+                location: DependencyLocation::Dependencies,
+                path: root.join("packages/shared/package.json"),
+                line: 6,
+                used_in_workspaces: vec![root.join("packages/consumer")],
+            }));
+        let elapsed = Duration::from_millis(0);
+        let output = api_check_json_document(&results, &root, elapsed).expect("should serialize");
+
+        let dep = &output["unused_dependencies"][0];
+        assert_eq!(
+            dep["used_in_workspaces"],
+            serde_json::json!(["packages/consumer"])
+        );
     }
 
     #[test]
     fn json_unused_dev_dependency_contains_expected_fields() {
         let root = PathBuf::from("/project");
         let mut results = AnalysisResults::default();
-        results.unused_dev_dependencies.push(UnusedDependency {
-            package_name: "vitest".to_string(),
-            location: DependencyLocation::DevDependencies,
-            path: root.join("package.json"),
-            line: 15,
-        });
+        results
+            .unused_dev_dependencies
+            .push(UnusedDevDependencyFinding::with_actions(UnusedDependency {
+                package_name: "vitest".to_string(),
+                location: DependencyLocation::DevDependencies,
+                path: root.join("package.json"),
+                line: 15,
+                used_in_workspaces: Vec::new(),
+            }));
         let elapsed = Duration::from_millis(0);
-        let output = build_json(&results, &root, elapsed).expect("should serialize");
+        let output = api_check_json_document(&results, &root, elapsed).expect("should serialize");
 
         let dep = &output["unused_dev_dependencies"][0];
         assert_eq!(dep["package_name"], "vitest");
@@ -1549,14 +1694,19 @@ mod tests {
     fn json_unused_optional_dependency_contains_expected_fields() {
         let root = PathBuf::from("/project");
         let mut results = AnalysisResults::default();
-        results.unused_optional_dependencies.push(UnusedDependency {
-            package_name: "fsevents".to_string(),
-            location: DependencyLocation::OptionalDependencies,
-            path: root.join("package.json"),
-            line: 12,
-        });
+        results
+            .unused_optional_dependencies
+            .push(UnusedOptionalDependencyFinding::with_actions(
+                UnusedDependency {
+                    package_name: "fsevents".to_string(),
+                    location: DependencyLocation::OptionalDependencies,
+                    path: root.join("package.json"),
+                    line: 12,
+                    used_in_workspaces: Vec::new(),
+                },
+            ));
         let elapsed = Duration::from_millis(0);
-        let output = build_json(&results, &root, elapsed).expect("should serialize");
+        let output = api_check_json_document(&results, &root, elapsed).expect("should serialize");
 
         let dep = &output["unused_optional_dependencies"][0];
         assert_eq!(dep["package_name"], "fsevents");
@@ -1567,16 +1717,18 @@ mod tests {
     fn json_unused_enum_member_contains_expected_fields() {
         let root = PathBuf::from("/project");
         let mut results = AnalysisResults::default();
-        results.unused_enum_members.push(UnusedMember {
-            path: root.join("src/enums.ts"),
-            parent_name: "Color".to_string(),
-            member_name: "Purple".to_string(),
-            kind: MemberKind::EnumMember,
-            line: 5,
-            col: 2,
-        });
+        results
+            .unused_enum_members
+            .push(UnusedEnumMemberFinding::with_actions(UnusedMember {
+                path: root.join("src/enums.ts"),
+                parent_name: "Color".to_string(),
+                member_name: "Purple".to_string(),
+                kind: MemberKind::EnumMember,
+                line: 5,
+                col: 2,
+            }));
         let elapsed = Duration::from_millis(0);
-        let output = build_json(&results, &root, elapsed).expect("should serialize");
+        let output = api_check_json_document(&results, &root, elapsed).expect("should serialize");
 
         let member = &output["unused_enum_members"][0];
         assert_eq!(member["parent_name"], "Color");
@@ -1589,16 +1741,18 @@ mod tests {
     fn json_unused_class_member_contains_expected_fields() {
         let root = PathBuf::from("/project");
         let mut results = AnalysisResults::default();
-        results.unused_class_members.push(UnusedMember {
-            path: root.join("src/api.ts"),
-            parent_name: "ApiClient".to_string(),
-            member_name: "deprecatedFetch".to_string(),
-            kind: MemberKind::ClassMethod,
-            line: 100,
-            col: 4,
-        });
+        results
+            .unused_class_members
+            .push(UnusedClassMemberFinding::with_actions(UnusedMember {
+                path: root.join("src/api.ts"),
+                parent_name: "ApiClient".to_string(),
+                member_name: "deprecatedFetch".to_string(),
+                kind: MemberKind::ClassMethod,
+                line: 100,
+                col: 4,
+            }));
         let elapsed = Duration::from_millis(0);
-        let output = build_json(&results, &root, elapsed).expect("should serialize");
+        let output = api_check_json_document(&results, &root, elapsed).expect("should serialize");
 
         let member = &output["unused_class_members"][0];
         assert_eq!(member["parent_name"], "ApiClient");
@@ -1610,15 +1764,17 @@ mod tests {
     fn json_unresolved_import_contains_expected_fields() {
         let root = PathBuf::from("/project");
         let mut results = AnalysisResults::default();
-        results.unresolved_imports.push(UnresolvedImport {
-            path: root.join("src/app.ts"),
-            specifier: "@acme/missing-pkg".to_string(),
-            line: 7,
-            col: 0,
-            specifier_col: 0,
-        });
+        results
+            .unresolved_imports
+            .push(UnresolvedImportFinding::with_actions(UnresolvedImport {
+                path: root.join("src/app.ts"),
+                specifier: "@acme/missing-pkg".to_string(),
+                line: 7,
+                col: 0,
+                specifier_col: 0,
+            }));
         let elapsed = Duration::from_millis(0);
-        let output = build_json(&results, &root, elapsed).expect("should serialize");
+        let output = api_check_json_document(&results, &root, elapsed).expect("should serialize");
 
         let import = &output["unresolved_imports"][0];
         assert_eq!(import["specifier"], "@acme/missing-pkg");
@@ -1630,23 +1786,27 @@ mod tests {
     fn json_unlisted_dependency_contains_import_sites() {
         let root = PathBuf::from("/project");
         let mut results = AnalysisResults::default();
-        results.unlisted_dependencies.push(UnlistedDependency {
-            package_name: "dotenv".to_string(),
-            imported_from: vec![
-                ImportSite {
-                    path: root.join("src/config.ts"),
-                    line: 1,
-                    col: 0,
+        results
+            .unlisted_dependencies
+            .push(UnlistedDependencyFinding::with_actions(
+                UnlistedDependency {
+                    package_name: "dotenv".to_string(),
+                    imported_from: vec![
+                        ImportSite {
+                            path: root.join("src/config.ts"),
+                            line: 1,
+                            col: 0,
+                        },
+                        ImportSite {
+                            path: root.join("src/server.ts"),
+                            line: 3,
+                            col: 0,
+                        },
+                    ],
                 },
-                ImportSite {
-                    path: root.join("src/server.ts"),
-                    line: 3,
-                    col: 0,
-                },
-            ],
-        });
+            ));
         let elapsed = Duration::from_millis(0);
-        let output = build_json(&results, &root, elapsed).expect("should serialize");
+        let output = api_check_json_document(&results, &root, elapsed).expect("should serialize");
 
         let dep = &output["unlisted_dependencies"][0];
         assert_eq!(dep["package_name"], "dotenv");
@@ -1660,23 +1820,25 @@ mod tests {
     fn json_duplicate_export_contains_locations() {
         let root = PathBuf::from("/project");
         let mut results = AnalysisResults::default();
-        results.duplicate_exports.push(DuplicateExport {
-            export_name: "Button".to_string(),
-            locations: vec![
-                DuplicateLocation {
-                    path: root.join("src/ui.ts"),
-                    line: 10,
-                    col: 0,
-                },
-                DuplicateLocation {
-                    path: root.join("src/components.ts"),
-                    line: 25,
-                    col: 0,
-                },
-            ],
-        });
+        results
+            .duplicate_exports
+            .push(DuplicateExportFinding::with_actions(DuplicateExport {
+                export_name: "Button".to_string(),
+                locations: vec![
+                    DuplicateLocation {
+                        path: root.join("src/ui.ts"),
+                        line: 10,
+                        col: 0,
+                    },
+                    DuplicateLocation {
+                        path: root.join("src/components.ts"),
+                        line: 25,
+                        col: 0,
+                    },
+                ],
+            }));
         let elapsed = Duration::from_millis(0);
-        let output = build_json(&results, &root, elapsed).expect("should serialize");
+        let output = api_check_json_document(&results, &root, elapsed).expect("should serialize");
 
         let dup = &output["duplicate_exports"][0];
         assert_eq!(dup["export_name"], "Button");
@@ -1687,16 +1849,121 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_export_add_to_config_is_auto_fixable_when_config_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join(".fallowrc.json"), "{}\n").unwrap();
+        let mut results = AnalysisResults::default();
+        results
+            .duplicate_exports
+            .push(DuplicateExportFinding::with_actions(DuplicateExport {
+                export_name: "Button".to_string(),
+                locations: vec![
+                    DuplicateLocation {
+                        path: root.join("src/ui.ts"),
+                        line: 10,
+                        col: 0,
+                    },
+                    DuplicateLocation {
+                        path: root.join("src/components.ts"),
+                        line: 25,
+                        col: 0,
+                    },
+                ],
+            }));
+
+        let output = api_check_json_document(&results, root, Duration::ZERO).unwrap();
+        let actions = output["duplicate_exports"][0]["actions"]
+            .as_array()
+            .unwrap();
+        assert_eq!(actions[0]["type"], "add-to-config");
+        assert_eq!(actions[0]["auto_fixable"], true);
+    }
+
+    #[test]
+    fn duplicate_export_add_to_config_is_auto_fixable_when_create_fallback_allowed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut results = AnalysisResults::default();
+        results
+            .duplicate_exports
+            .push(DuplicateExportFinding::with_actions(DuplicateExport {
+                export_name: "Button".to_string(),
+                locations: vec![
+                    DuplicateLocation {
+                        path: root.join("src/ui.ts"),
+                        line: 10,
+                        col: 0,
+                    },
+                    DuplicateLocation {
+                        path: root.join("src/components.ts"),
+                        line: 25,
+                        col: 0,
+                    },
+                ],
+            }));
+
+        let output = api_check_json_document(&results, root, Duration::ZERO).unwrap();
+        let actions = output["duplicate_exports"][0]["actions"]
+            .as_array()
+            .unwrap();
+        assert_eq!(actions[0]["type"], "add-to-config");
+        assert_eq!(actions[0]["auto_fixable"], true);
+    }
+
+    #[test]
+    fn duplicate_export_add_to_config_is_not_auto_fixable_in_monorepo_subpackage() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path();
+        std::fs::write(
+            workspace.join("pnpm-workspace.yaml"),
+            "packages:\n  - 'packages/*'\n",
+        )
+        .unwrap();
+        let sub = workspace.join("packages/ui");
+        std::fs::create_dir_all(&sub).unwrap();
+        let mut results = AnalysisResults::default();
+        results
+            .duplicate_exports
+            .push(DuplicateExportFinding::with_actions(DuplicateExport {
+                export_name: "Button".to_string(),
+                locations: vec![
+                    DuplicateLocation {
+                        path: sub.join("src/ui.ts"),
+                        line: 10,
+                        col: 0,
+                    },
+                    DuplicateLocation {
+                        path: sub.join("src/components.ts"),
+                        line: 25,
+                        col: 0,
+                    },
+                ],
+            }));
+
+        let output = api_check_json_document(&results, &sub, Duration::ZERO).unwrap();
+        let actions = output["duplicate_exports"][0]["actions"]
+            .as_array()
+            .unwrap();
+        assert_eq!(actions[0]["type"], "add-to-config");
+        assert_eq!(actions[0]["auto_fixable"], false);
+    }
+
+    #[test]
     fn json_type_only_dependency_contains_expected_fields() {
         let root = PathBuf::from("/project");
         let mut results = AnalysisResults::default();
-        results.type_only_dependencies.push(TypeOnlyDependency {
-            package_name: "zod".to_string(),
-            path: root.join("package.json"),
-            line: 8,
-        });
+        results
+            .type_only_dependencies
+            .push(TypeOnlyDependencyFinding::with_actions(
+                TypeOnlyDependency {
+                    package_name: "zod".to_string(),
+                    path: root.join("package.json"),
+                    line: 8,
+                },
+            ));
         let elapsed = Duration::from_millis(0);
-        let output = build_json(&results, &root, elapsed).expect("should serialize");
+        let output = api_check_json_document(&results, &root, elapsed).expect("should serialize");
 
         let dep = &output["type_only_dependencies"][0];
         assert_eq!(dep["package_name"], "zod");
@@ -1707,19 +1974,24 @@ mod tests {
     fn json_circular_dependency_contains_expected_fields() {
         let root = PathBuf::from("/project");
         let mut results = AnalysisResults::default();
-        results.circular_dependencies.push(CircularDependency {
-            files: vec![
-                root.join("src/a.ts"),
-                root.join("src/b.ts"),
-                root.join("src/c.ts"),
-            ],
-            length: 3,
-            line: 5,
-            col: 0,
-            is_cross_package: false,
-        });
+        results
+            .circular_dependencies
+            .push(CircularDependencyFinding::with_actions(
+                CircularDependency {
+                    files: vec![
+                        root.join("src/a.ts"),
+                        root.join("src/b.ts"),
+                        root.join("src/c.ts"),
+                    ],
+                    length: 3,
+                    line: 5,
+                    col: 0,
+                    edges: Vec::new(),
+                    is_cross_package: false,
+                },
+            ));
         let elapsed = Duration::from_millis(0);
-        let output = build_json(&results, &root, elapsed).expect("should serialize");
+        let output = api_check_json_document(&results, &root, elapsed).expect("should serialize");
 
         let cycle = &output["circular_dependencies"][0];
         assert_eq!(cycle["length"], 3);
@@ -1728,59 +2000,57 @@ mod tests {
         assert_eq!(files.len(), 3);
     }
 
-    // ── Re-export tagging ───────────────────────────────────────────
-
     #[test]
     fn json_re_export_flagged_correctly() {
         let root = PathBuf::from("/project");
         let mut results = AnalysisResults::default();
-        results.unused_exports.push(UnusedExport {
-            path: root.join("src/index.ts"),
-            export_name: "reExported".to_string(),
-            is_type_only: false,
-            line: 1,
-            col: 0,
-            span_start: 0,
-            is_re_export: true,
-        });
+        results
+            .unused_exports
+            .push(UnusedExportFinding::with_actions(UnusedExport {
+                path: root.join("src/index.ts"),
+                export_name: "reExported".to_string(),
+                is_type_only: false,
+                line: 1,
+                col: 0,
+                span_start: 0,
+                is_re_export: true,
+            }));
         let elapsed = Duration::from_millis(0);
-        let output = build_json(&results, &root, elapsed).expect("should serialize");
+        let output = api_check_json_document(&results, &root, elapsed).expect("should serialize");
 
         assert_eq!(output["unused_exports"][0]["is_re_export"], true);
     }
 
-    // ── Schema version stability ────────────────────────────────────
-
     #[test]
-    fn json_schema_version_is_4() {
+    fn json_schema_version_is_pinned() {
         let root = PathBuf::from("/project");
         let results = AnalysisResults::default();
         let elapsed = Duration::from_millis(0);
-        let output = build_json(&results, &root, elapsed).expect("should serialize");
+        let output = api_check_json_document(&results, &root, elapsed).expect("should serialize");
 
-        assert_eq!(output["schema_version"], SCHEMA_VERSION);
-        assert_eq!(output["schema_version"], 4);
+        assert_eq!(
+            output["schema_version"],
+            fallow_output::CHECK_SCHEMA_VERSION
+        );
+        assert_eq!(output["schema_version"], 9);
     }
-
-    // ── Version string ──────────────────────────────────────────────
 
     #[test]
     fn json_version_matches_cargo_pkg_version() {
         let root = PathBuf::from("/project");
         let results = AnalysisResults::default();
         let elapsed = Duration::from_millis(0);
-        let output = build_json(&results, &root, elapsed).expect("should serialize");
+        let output = api_check_json_document(&results, &root, elapsed).expect("should serialize");
 
         assert_eq!(output["version"], env!("CARGO_PKG_VERSION"));
     }
-
-    // ── Elapsed time encoding ───────────────────────────────────────
 
     #[test]
     fn json_elapsed_ms_zero_duration() {
         let root = PathBuf::from("/project");
         let results = AnalysisResults::default();
-        let output = build_json(&results, &root, Duration::ZERO).expect("should serialize");
+        let output =
+            api_check_json_document(&results, &root, Duration::ZERO).expect("should serialize");
 
         assert_eq!(output["elapsed_ms"], 0);
     }
@@ -1790,7 +2060,7 @@ mod tests {
         let root = PathBuf::from("/project");
         let results = AnalysisResults::default();
         let elapsed = Duration::from_mins(2);
-        let output = build_json(&results, &root, elapsed).expect("should serialize");
+        let output = api_check_json_document(&results, &root, elapsed).expect("should serialize");
 
         assert_eq!(output["elapsed_ms"], 120_000);
     }
@@ -1799,36 +2069,37 @@ mod tests {
     fn json_elapsed_ms_sub_millisecond_truncated() {
         let root = PathBuf::from("/project");
         let results = AnalysisResults::default();
-        // 500 microseconds = 0 milliseconds (truncated)
         let elapsed = Duration::from_micros(500);
-        let output = build_json(&results, &root, elapsed).expect("should serialize");
+        let output = api_check_json_document(&results, &root, elapsed).expect("should serialize");
 
         assert_eq!(output["elapsed_ms"], 0);
     }
-
-    // ── Multiple issues of same type ────────────────────────────────
 
     #[test]
     fn json_multiple_unused_files() {
         let root = PathBuf::from("/project");
         let mut results = AnalysisResults::default();
-        results.unused_files.push(UnusedFile {
-            path: root.join("src/a.ts"),
-        });
-        results.unused_files.push(UnusedFile {
-            path: root.join("src/b.ts"),
-        });
-        results.unused_files.push(UnusedFile {
-            path: root.join("src/c.ts"),
-        });
+        results
+            .unused_files
+            .push(UnusedFileFinding::with_actions(UnusedFile {
+                path: root.join("src/a.ts"),
+            }));
+        results
+            .unused_files
+            .push(UnusedFileFinding::with_actions(UnusedFile {
+                path: root.join("src/b.ts"),
+            }));
+        results
+            .unused_files
+            .push(UnusedFileFinding::with_actions(UnusedFile {
+                path: root.join("src/c.ts"),
+            }));
         let elapsed = Duration::from_millis(0);
-        let output = build_json(&results, &root, elapsed).expect("should serialize");
+        let output = api_check_json_document(&results, &root, elapsed).expect("should serialize");
 
         assert_eq!(output["unused_files"].as_array().unwrap().len(), 3);
         assert_eq!(output["total_issues"], 3);
     }
-
-    // ── strip_root_prefix unit tests ────────────────────────────────
 
     #[test]
     fn strip_root_prefix_on_string_value() {
@@ -1885,9 +2156,18 @@ mod tests {
     }
 
     #[test]
+    fn strip_root_prefix_rewrites_embedded_path_strings() {
+        let mut value =
+            serde_json::json!("Add \"/project/src/file.ts\" to boundaries.coverage.allowUnmatched");
+        strip_root_prefix(&mut value, "/project/");
+        assert_eq!(
+            value,
+            "Add \"src/file.ts\" to boundaries.coverage.allowUnmatched"
+        );
+    }
+
+    #[test]
     fn strip_root_prefix_handles_empty_string_after_strip() {
-        // Edge case: the string IS the prefix (without trailing content).
-        // This shouldn't happen in practice but should not panic.
         let mut value = serde_json::json!("/project/");
         strip_root_prefix(&mut value, "/project/");
         assert_eq!(value, "");
@@ -1909,20 +2189,13 @@ mod tests {
         assert_eq!(value["groups"][0]["instances"][1]["file"], "src/b.ts");
     }
 
-    // ── Full sample results round-trip ──────────────────────────────
-
     #[test]
     fn json_full_sample_results_total_issues_correct() {
         let root = PathBuf::from("/project");
         let results = sample_results(&root);
         let elapsed = Duration::from_millis(100);
-        let output = build_json(&results, &root, elapsed).expect("should serialize");
+        let output = api_check_json_document(&results, &root, elapsed).expect("should serialize");
 
-        // sample_results adds one of each issue type (12 total).
-        // unused_files + unused_exports + unused_types + unused_dependencies
-        // + unused_dev_dependencies + unused_enum_members + unused_class_members
-        // + unresolved_imports + unlisted_dependencies + duplicate_exports
-        // + type_only_dependencies + circular_dependencies
         assert_eq!(output["total_issues"], results.total_issues());
     }
 
@@ -1931,15 +2204,12 @@ mod tests {
         let root = PathBuf::from("/project");
         let results = sample_results(&root);
         let elapsed = Duration::from_millis(0);
-        let output = build_json(&results, &root, elapsed).expect("should serialize");
+        let output = api_check_json_document(&results, &root, elapsed).expect("should serialize");
 
         let json_str = serde_json::to_string(&output).expect("should stringify");
-        // The root prefix should be stripped from all paths.
         assert!(!json_str.contains("/project/src/"));
         assert!(!json_str.contains("/project/package.json"));
     }
-
-    // ── JSON output is deterministic ────────────────────────────────
 
     #[test]
     fn json_output_is_deterministic() {
@@ -1947,36 +2217,165 @@ mod tests {
         let results = sample_results(&root);
         let elapsed = Duration::from_millis(50);
 
-        let output1 = build_json(&results, &root, elapsed).expect("first build");
-        let output2 = build_json(&results, &root, elapsed).expect("second build");
+        let output1 = api_check_json_document(&results, &root, elapsed).expect("first build");
+        let output2 = api_check_json_document(&results, &root, elapsed).expect("second build");
 
         assert_eq!(output1, output2);
     }
 
-    // ── Metadata not overwritten by results fields ──────────────────
-
     #[test]
     fn json_results_fields_do_not_shadow_metadata() {
-        // Ensure that serialized results don't contain keys like "schema_version"
-        // that could overwrite the metadata fields we insert first.
         let root = PathBuf::from("/project");
         let results = AnalysisResults::default();
         let elapsed = Duration::from_millis(99);
-        let output = build_json(&results, &root, elapsed).expect("should serialize");
+        let output = api_check_json_document(&results, &root, elapsed).expect("should serialize");
 
-        // Metadata should reflect our explicit values, not anything from AnalysisResults.
-        assert_eq!(output["schema_version"], 4);
+        assert_eq!(output["kind"], "dead-code");
+        assert_eq!(output["schema_version"], 9);
         assert_eq!(output["elapsed_ms"], 99);
     }
 
-    // ── All 14 issue type arrays present ────────────────────────────
+    #[test]
+    fn type_aware_metadata_is_emitted_without_explain() {
+        let root = PathBuf::from("/project");
+        let results = AnalysisResults::default();
+        let type_aware = fallow_types::envelope::TypeAwareMeta {
+            executed: true,
+            identity: None,
+            required_completeness: None,
+            queries: Vec::new(),
+            candidate_decisions: Vec::new(),
+            symbol_traces: Vec::new(),
+            api_surface: None,
+            symbol_impacts: Vec::new(),
+            type_coupling: None,
+            protocol_version: 2,
+            sidecar_version: Some("0.1.0".to_string()),
+            backend: "typescript-go".to_string(),
+            backend_version: Some("7.0.2".to_string()),
+            selected_tsconfigs: vec!["tsconfig.json".to_string()],
+            candidate_count: 2,
+            confirmed_used_count: 1,
+            contract_preserved_count: 0,
+            no_static_references_count: 0,
+            fix_eligible_count: 0,
+            unresolved_count: 1,
+            abstained_count: 0,
+            abstention_reasons: fallow_types::envelope::TypeAwareAbstentionCounts::default(),
+            projects: Vec::new(),
+            warning_count: 1,
+            warnings: vec!["unresolved finding kept".to_owned()],
+            elapsed_ms: 12,
+            phase_timings_ms: fallow_types::envelope::TypeAwarePhaseTimings::default(),
+        };
+        let output = api_check_json_document_with_config_fixable_meta_and_extras(
+            &results,
+            &root,
+            Duration::default(),
+            false,
+            check_output_meta(false, Some(&type_aware)),
+            CheckJsonExtraOutputs::default(),
+            &[],
+        )
+        .expect("type-aware metadata should serialize");
+
+        assert_eq!(output["_meta"]["type_aware"]["backend"], "typescript-go");
+        assert_eq!(
+            output["_meta"]["type_aware"]["warnings"][0],
+            "unresolved finding kept"
+        );
+        assert!(output["_meta"].get("rules").is_none());
+    }
+
+    #[test]
+    fn type_aware_explain_defines_semantic_metrics() {
+        let type_aware = fallow_types::envelope::TypeAwareMeta::default();
+        let meta = check_output_meta(true, Some(&type_aware)).expect("metadata");
+
+        assert!(
+            meta.field_definitions
+                .contains_key("type_aware.protocol_version")
+        );
+        assert!(meta.metrics.contains_key("type_aware.protocol_version"));
+        for metric in [
+            "type_aware.candidate_count",
+            "type_aware.elapsed_ms",
+            "type_aware.phase_timings_ms.project_setup",
+            "type_aware.phase_timings_ms.diagnostics",
+            "type_aware.phase_timings_ms.symbol_scan",
+            "type_aware.projects[].candidate_count",
+            "type_aware.projects[].confirmed_used_count",
+            "type_aware.projects[].contract_preserved_count",
+            "type_aware.projects[].no_static_references_count",
+            "type_aware.projects[].fix_eligible_count",
+            "type_aware.projects[].unresolved_count",
+            "type_aware.projects[].abstained_count",
+            "type_aware.projects[].blocking_diagnostic_count",
+            "type_aware.projects[].source_file_count",
+            "type_aware.abstention_reasons.no_project",
+            "type_aware.abstention_reasons.ambiguous_project",
+            "type_aware.abstention_reasons.blocking_diagnostics",
+            "type_aware.abstention_reasons.svelte_virtual_module_exports",
+            "type_aware.abstention_reasons.unknown_symbol",
+            "type_aware.abstention_reasons.unsupported_syntax",
+            "type_aware.abstention_reasons.capacity",
+        ] {
+            assert!(meta.metrics.contains_key(metric), "missing metric {metric}");
+        }
+        let candidates = meta.metrics["type_aware.candidate_count"]
+            .description
+            .as_deref()
+            .expect("candidate description");
+        assert!(candidates.contains("class members"));
+        assert!(candidates.contains("exports"));
+        assert!(candidates.contains("types"));
+        let confirmed = meta.metrics["type_aware.confirmed_used_count"]
+            .description
+            .as_deref()
+            .expect("confirmed-used description");
+        assert!(confirmed.contains("imports"));
+        assert!(confirmed.contains("re-exports"));
+        assert!(confirmed.contains("property or element access"));
+    }
+
+    #[test]
+    fn focused_semantic_explain_marks_authoritative_fields() {
+        let mut output = serde_json::json!({
+            "kind": "trace",
+            "semantic": {
+                "identity": {"completeness": "complete"},
+                "status": "complete",
+                "references": []
+            },
+            "_meta": {
+                "telemetry": {"analysis_run_id": "run-1"}
+            }
+        });
+
+        attach_semantic_explain_meta(&mut output, true);
+
+        assert_eq!(output["_meta"]["telemetry"]["analysis_run_id"], "run-1");
+        let semantic_definition = output["_meta"]["field_definitions"]["semantic"]
+            .as_str()
+            .expect("semantic field definition");
+        assert!(semantic_definition.contains("trust semantic.identity"));
+        // Issue #2371: the in-band definition is the only guidance an agent
+        // always sees, so it must carry the same lane carve-out as the agent
+        // rules; without it an agent discards a corrected root trace.
+        assert!(
+            semantic_definition.contains("semantic.target.namespace")
+                && semantic_definition.contains("wider"),
+            "the definition scopes the proof to its lane: {semantic_definition}"
+        );
+        assert!(output["_meta"]["metrics"]["semantic.total_reference_count"].is_object());
+    }
 
     #[test]
     fn json_all_issue_type_arrays_present_in_empty_results() {
         let root = PathBuf::from("/project");
         let results = AnalysisResults::default();
         let elapsed = Duration::from_millis(0);
-        let output = build_json(&results, &root, elapsed).expect("should serialize");
+        let output = api_check_json_document(&results, &root, elapsed).expect("should serialize");
 
         let expected_arrays = [
             "unused_files",
@@ -1992,6 +2391,7 @@ mod tests {
             "duplicate_exports",
             "type_only_dependencies",
             "test_only_dependencies",
+            "dev_dependencies_in_production",
             "circular_dependencies",
         ];
         for key in &expected_arrays {
@@ -2001,8 +2401,6 @@ mod tests {
             );
         }
     }
-
-    // ── insert_meta ─────────────────────────────────────────────────
 
     #[test]
     fn insert_meta_adds_key_to_object() {
@@ -2017,7 +2415,6 @@ mod tests {
         let mut output = serde_json::json!([1, 2, 3]);
         let meta = serde_json::json!({ "docs": "https://example.com" });
         insert_meta(&mut output, meta);
-        // Should not panic or add anything
         assert!(output.is_array());
     }
 
@@ -2029,45 +2426,29 @@ mod tests {
         assert_eq!(output["_meta"], meta);
     }
 
-    // ── build_json_envelope ─────────────────────────────────────────
-
     #[test]
-    fn build_json_envelope_has_metadata_fields() {
-        let report = serde_json::json!({ "findings": [] });
-        let elapsed = Duration::from_millis(42);
-        let output = build_json_envelope(report, elapsed);
+    fn insert_meta_preserves_existing_telemetry_meta() {
+        let mut output = serde_json::json!({
+            "_meta": {
+                "telemetry": {
+                    "analysis_run_id": "run_test123"
+                }
+            }
+        });
+        insert_meta(
+            &mut output,
+            serde_json::json!({ "docs": "https://example.com" }),
+        );
 
-        assert_eq!(output["schema_version"], 4);
-        assert!(output["version"].is_string());
-        assert_eq!(output["elapsed_ms"], 42);
-        assert!(output["findings"].is_array());
+        assert_eq!(
+            output["_meta"]["docs"].as_str(),
+            Some("https://example.com")
+        );
+        assert_eq!(
+            output["_meta"]["telemetry"]["analysis_run_id"].as_str(),
+            Some("run_test123")
+        );
     }
-
-    #[test]
-    fn build_json_envelope_metadata_appears_first() {
-        let report = serde_json::json!({ "data": "value" });
-        let output = build_json_envelope(report, Duration::from_millis(10));
-
-        let keys: Vec<&String> = output.as_object().unwrap().keys().collect();
-        assert_eq!(keys[0], "schema_version");
-        assert_eq!(keys[1], "version");
-        assert_eq!(keys[2], "elapsed_ms");
-    }
-
-    #[test]
-    fn build_json_envelope_non_object_report() {
-        // If report_value is not an Object, only metadata fields appear
-        let report = serde_json::json!("not an object");
-        let output = build_json_envelope(report, Duration::from_millis(0));
-
-        let obj = output.as_object().unwrap();
-        assert_eq!(obj.len(), 3);
-        assert!(obj.contains_key("schema_version"));
-        assert!(obj.contains_key("version"));
-        assert!(obj.contains_key("elapsed_ms"));
-    }
-
-    // ── strip_root_prefix with null value ──
 
     #[test]
     fn strip_root_prefix_null_unchanged() {
@@ -2076,16 +2457,12 @@ mod tests {
         assert!(value.is_null());
     }
 
-    // ── strip_root_prefix with empty string ──
-
     #[test]
     fn strip_root_prefix_empty_string() {
         let mut value = serde_json::json!("");
         strip_root_prefix(&mut value, "/project/");
         assert_eq!(value, "");
     }
-
-    // ── strip_root_prefix on mixed nested structure ──
 
     #[test]
     fn strip_root_prefix_mixed_types() {
@@ -2109,45 +2486,49 @@ mod tests {
         assert_eq!(value["nested"]["deep"]["path"], "c.ts");
     }
 
-    // ── JSON with explain meta for check ──
-
     #[test]
     fn json_check_meta_integrates_correctly() {
         let root = PathBuf::from("/project");
         let results = AnalysisResults::default();
         let elapsed = Duration::from_millis(0);
-        let mut output = build_json(&results, &root, elapsed).expect("should serialize");
-        insert_meta(&mut output, crate::explain::check_meta());
+        let mut output =
+            api_check_json_document(&results, &root, elapsed).expect("should serialize");
+        insert_meta(
+            &mut output,
+            serde_json::to_value(fallow_output::check_meta()).unwrap(),
+        );
 
         assert!(output["_meta"]["docs"].is_string());
         assert!(output["_meta"]["rules"].is_object());
     }
 
-    // ── JSON unused member kind serialization ──
-
     #[test]
     fn json_unused_member_kind_serialized() {
         let root = PathBuf::from("/project");
         let mut results = AnalysisResults::default();
-        results.unused_enum_members.push(UnusedMember {
-            path: root.join("src/enums.ts"),
-            parent_name: "Color".to_string(),
-            member_name: "Red".to_string(),
-            kind: MemberKind::EnumMember,
-            line: 3,
-            col: 2,
-        });
-        results.unused_class_members.push(UnusedMember {
-            path: root.join("src/class.ts"),
-            parent_name: "Foo".to_string(),
-            member_name: "bar".to_string(),
-            kind: MemberKind::ClassMethod,
-            line: 10,
-            col: 4,
-        });
+        results
+            .unused_enum_members
+            .push(UnusedEnumMemberFinding::with_actions(UnusedMember {
+                path: root.join("src/enums.ts"),
+                parent_name: "Color".to_string(),
+                member_name: "Red".to_string(),
+                kind: MemberKind::EnumMember,
+                line: 3,
+                col: 2,
+            }));
+        results
+            .unused_class_members
+            .push(UnusedClassMemberFinding::with_actions(UnusedMember {
+                path: root.join("src/class.ts"),
+                parent_name: "Foo".to_string(),
+                member_name: "bar".to_string(),
+                kind: MemberKind::ClassMethod,
+                line: 10,
+                col: 4,
+            }));
 
         let elapsed = Duration::from_millis(0);
-        let output = build_json(&results, &root, elapsed).expect("should serialize");
+        let output = api_check_json_document(&results, &root, elapsed).expect("should serialize");
 
         let enum_member = &output["unused_enum_members"][0];
         assert!(enum_member["kind"].is_string());
@@ -2155,32 +2536,30 @@ mod tests {
         assert!(class_member["kind"].is_string());
     }
 
-    // ── Actions injection ──────────────────────────────────────────
-
     #[test]
     fn json_unused_export_has_actions() {
         let root = PathBuf::from("/project");
         let mut results = AnalysisResults::default();
-        results.unused_exports.push(UnusedExport {
-            path: root.join("src/utils.ts"),
-            export_name: "helperFn".to_string(),
-            is_type_only: false,
-            line: 10,
-            col: 4,
-            span_start: 120,
-            is_re_export: false,
-        });
-        let output = build_json(&results, &root, Duration::ZERO).unwrap();
+        results
+            .unused_exports
+            .push(UnusedExportFinding::with_actions(UnusedExport {
+                path: root.join("src/utils.ts"),
+                export_name: "helperFn".to_string(),
+                is_type_only: false,
+                line: 10,
+                col: 4,
+                span_start: 120,
+                is_re_export: false,
+            }));
+        let output = api_check_json_document(&results, &root, Duration::ZERO).unwrap();
 
         let actions = output["unused_exports"][0]["actions"].as_array().unwrap();
         assert_eq!(actions.len(), 2);
 
-        // Fix action
         assert_eq!(actions[0]["type"], "remove-export");
         assert_eq!(actions[0]["auto_fixable"], true);
         assert!(actions[0].get("note").is_none());
 
-        // Suppress action
         assert_eq!(actions[1]["type"], "suppress-line");
         assert_eq!(
             actions[1]["comment"],
@@ -2189,13 +2568,83 @@ mod tests {
     }
 
     #[test]
+    fn json_boundary_coverage_action_descriptions_use_relative_paths() {
+        let root = PathBuf::from("/project");
+        let mut results = AnalysisResults::default();
+        results
+            .boundary_coverage_violations
+            .push(BoundaryCoverageViolationFinding::with_actions(
+                BoundaryCoverageViolation {
+                    path: root.join("src/middleware/error.ts"),
+                    line: 1,
+                    col: 0,
+                },
+            ));
+
+        let output = api_check_json_document(&results, &root, Duration::ZERO).unwrap();
+        let action = &output["boundary_coverage_violations"][0]["actions"][1];
+
+        assert_eq!(
+            output["boundary_coverage_violations"][0]["path"],
+            "src/middleware/error.ts"
+        );
+        assert_eq!(action["value"], "src/middleware/error.ts");
+        assert_eq!(
+            action["description"],
+            "Add \"src/middleware/error.ts\" to boundaries.coverage.allowUnmatched in fallow config"
+        );
+    }
+
+    #[test]
+    fn json_same_line_findings_share_multi_kind_suppression_comment() {
+        let root = PathBuf::from("/project");
+        let mut results = AnalysisResults::default();
+        results
+            .unused_exports
+            .push(UnusedExportFinding::with_actions(UnusedExport {
+                path: root.join("src/api.ts"),
+                export_name: "helperFn".to_string(),
+                is_type_only: false,
+                line: 10,
+                col: 4,
+                span_start: 120,
+                is_re_export: false,
+            }));
+        results
+            .unused_types
+            .push(UnusedTypeFinding::with_actions(UnusedExport {
+                path: root.join("src/api.ts"),
+                export_name: "OldType".to_string(),
+                is_type_only: true,
+                line: 10,
+                col: 0,
+                span_start: 60,
+                is_re_export: false,
+            }));
+        let output = api_check_json_document(&results, &root, Duration::ZERO).unwrap();
+
+        let export_actions = output["unused_exports"][0]["actions"].as_array().unwrap();
+        let type_actions = output["unused_types"][0]["actions"].as_array().unwrap();
+        assert_eq!(
+            export_actions[1]["comment"],
+            "// fallow-ignore-next-line unused-export, unused-type"
+        );
+        assert_eq!(
+            type_actions[1]["comment"],
+            "// fallow-ignore-next-line unused-export, unused-type"
+        );
+    }
+
+    #[test]
     fn json_unused_file_has_file_suppress_and_note() {
         let root = PathBuf::from("/project");
         let mut results = AnalysisResults::default();
-        results.unused_files.push(UnusedFile {
-            path: root.join("src/dead.ts"),
-        });
-        let output = build_json(&results, &root, Duration::ZERO).unwrap();
+        results
+            .unused_files
+            .push(UnusedFileFinding::with_actions(UnusedFile {
+                path: root.join("src/dead.ts"),
+            }));
+        let output = api_check_json_document(&results, &root, Duration::ZERO).unwrap();
 
         let actions = output["unused_files"][0]["actions"].as_array().unwrap();
         assert_eq!(actions[0]["type"], "delete-file");
@@ -2209,13 +2658,16 @@ mod tests {
     fn json_unused_dependency_has_config_suppress_with_package_name() {
         let root = PathBuf::from("/project");
         let mut results = AnalysisResults::default();
-        results.unused_dependencies.push(UnusedDependency {
-            package_name: "lodash".to_string(),
-            location: DependencyLocation::Dependencies,
-            path: root.join("package.json"),
-            line: 5,
-        });
-        let output = build_json(&results, &root, Duration::ZERO).unwrap();
+        results
+            .unused_dependencies
+            .push(UnusedDependencyFinding::with_actions(UnusedDependency {
+                package_name: "lodash".to_string(),
+                location: DependencyLocation::Dependencies,
+                path: root.join("package.json"),
+                line: 5,
+                used_in_workspaces: Vec::new(),
+            }));
+        let output = api_check_json_document(&results, &root, Duration::ZERO).unwrap();
 
         let actions = output["unused_dependencies"][0]["actions"]
             .as_array()
@@ -2223,19 +2675,46 @@ mod tests {
         assert_eq!(actions[0]["type"], "remove-dependency");
         assert_eq!(actions[0]["auto_fixable"], true);
 
-        // Config suppress includes actual package name
         assert_eq!(actions[1]["type"], "add-to-config");
         assert_eq!(actions[1]["config_key"], "ignoreDependencies");
         assert_eq!(actions[1]["value"], "lodash");
     }
 
     #[test]
+    fn json_cross_workspace_dependency_is_not_auto_fixable() {
+        let root = PathBuf::from("/project");
+        let mut results = AnalysisResults::default();
+        results
+            .unused_dependencies
+            .push(UnusedDependencyFinding::with_actions(UnusedDependency {
+                package_name: "lodash-es".to_string(),
+                location: DependencyLocation::Dependencies,
+                path: root.join("packages/shared/package.json"),
+                line: 5,
+                used_in_workspaces: vec![root.join("packages/consumer")],
+            }));
+        let output = api_check_json_document(&results, &root, Duration::ZERO).unwrap();
+
+        let actions = output["unused_dependencies"][0]["actions"]
+            .as_array()
+            .unwrap();
+        assert_eq!(actions[0]["type"], "move-dependency");
+        assert_eq!(actions[0]["auto_fixable"], false);
+        assert!(
+            actions[0]["note"]
+                .as_str()
+                .unwrap()
+                .contains("will not remove")
+        );
+        assert_eq!(actions[1]["type"], "add-to-config");
+    }
+
+    #[test]
     fn json_empty_results_have_no_actions_in_empty_arrays() {
         let root = PathBuf::from("/project");
         let results = AnalysisResults::default();
-        let output = build_json(&results, &root, Duration::ZERO).unwrap();
+        let output = api_check_json_document(&results, &root, Duration::ZERO).unwrap();
 
-        // Empty arrays should remain empty
         assert!(output["unused_exports"].as_array().unwrap().is_empty());
         assert!(output["unused_files"].as_array().unwrap().is_empty());
     }
@@ -2244,7 +2723,7 @@ mod tests {
     fn json_all_issue_types_have_actions() {
         let root = PathBuf::from("/project");
         let results = sample_results(&root);
-        let output = build_json(&results, &root, Duration::ZERO).unwrap();
+        let output = api_check_json_document(&results, &root, Duration::ZERO).unwrap();
 
         let issue_keys = [
             "unused_files",
@@ -2260,6 +2739,7 @@ mod tests {
             "duplicate_exports",
             "type_only_dependencies",
             "test_only_dependencies",
+            "dev_dependencies_in_production",
             "circular_dependencies",
         ];
 
@@ -2275,12 +2755,155 @@ mod tests {
         }
     }
 
-    // ── Health actions injection ───────────────────────────────────
+    /// Test helper: deserialize a JSON finding shape into a typed
+    /// [`ComplexityViolation`], run [`HealthFinding::with_actions`] with
+    /// the supplied thresholds, and return the resulting `actions` array
+    /// as `serde_json::Value` so existing JSON-shape assertions keep
+    /// working after PR B2 of #384 moved finding action selection from
+    /// the JSON post-pass into the typed wrapper.
+    fn build_actions_for_finding_json(
+        finding_json: serde_json::Value,
+        opts: fallow_output::HealthActionOptions,
+        max_cyclomatic_threshold: u16,
+        max_cognitive_threshold: u16,
+        max_crap_threshold: f64,
+    ) -> Vec<serde_json::Value> {
+        let mut value = finding_json;
+        if let Some(map) = value.as_object_mut() {
+            map.entry("col".to_string())
+                .or_insert(serde_json::Value::from(0_u32));
+            map.entry("line_count".to_string())
+                .or_insert(serde_json::Value::from(0_u32));
+            map.entry("param_count".to_string())
+                .or_insert(serde_json::Value::from(0_u8));
+            map.entry("severity".to_string())
+                .or_insert(serde_json::Value::String("moderate".to_string()));
+        }
+        let violation = synthesize_complexity_violation(&value);
+        let ctx = fallow_output::HealthActionContext {
+            opts,
+            max_cyclomatic_threshold,
+            max_cognitive_threshold,
+            max_crap_threshold,
+            crap_refactor_band: 5,
+        };
+        let finding = fallow_output::HealthFinding::with_actions(violation, &ctx);
+        let serialized = serde_json::to_value(&finding).expect("serialize HealthFinding");
+        serialized["actions"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Reads a JSON object with finding-shape fields and produces a
+    /// [`ComplexityViolation`]. Test-only: panics on schema mismatches so
+    /// authors notice when synthetic fixtures drift from the canonical
+    /// shape.
+    fn synthesize_complexity_violation(
+        value: &serde_json::Value,
+    ) -> fallow_output::ComplexityViolation {
+        use fallow_output::{CoverageSource, CoverageTier, ExceededThreshold, FindingSeverity};
+        let exceeded = match value["exceeded"].as_str().unwrap_or("crap") {
+            "cyclomatic" => ExceededThreshold::Cyclomatic,
+            "cognitive" => ExceededThreshold::Cognitive,
+            "both" => ExceededThreshold::Both,
+            "crap" => ExceededThreshold::Crap,
+            "cyclomatic_crap" => ExceededThreshold::CyclomaticCrap,
+            "cognitive_crap" => ExceededThreshold::CognitiveCrap,
+            "all" => ExceededThreshold::All,
+            other => panic!("unknown exceeded label: {other}"),
+        };
+        let severity = match value["severity"].as_str().unwrap_or("moderate") {
+            "moderate" => FindingSeverity::Moderate,
+            "high" => FindingSeverity::High,
+            "critical" => FindingSeverity::Critical,
+            other => panic!("unknown severity label: {other}"),
+        };
+        let coverage_tier = value
+            .get("coverage_tier")
+            .and_then(|v| v.as_str())
+            .map(|t| match t {
+                "none" => CoverageTier::None,
+                "partial" => CoverageTier::Partial,
+                "high" => CoverageTier::High,
+                other => panic!("unknown coverage_tier label: {other}"),
+            });
+        let coverage_source =
+            value
+                .get("coverage_source")
+                .and_then(|v| v.as_str())
+                .map(|s| match s {
+                    "istanbul" => CoverageSource::Istanbul,
+                    "estimated" => CoverageSource::Estimated,
+                    "estimated_component_inherited" => CoverageSource::EstimatedComponentInherited,
+                    other => panic!("unknown coverage_source label: {other}"),
+                });
+        fallow_output::ComplexityViolation {
+            path: std::path::PathBuf::from(value["path"].as_str().unwrap_or("src/x.ts")),
+            name: value["name"].as_str().unwrap_or("fn").to_string(),
+            line: u32::try_from(value["line"].as_u64().unwrap_or(0)).unwrap_or(0),
+            col: u32::try_from(value["col"].as_u64().unwrap_or(0)).unwrap_or(0),
+            cyclomatic: u16::try_from(value["cyclomatic"].as_u64().unwrap_or(0)).unwrap_or(0),
+            cognitive: u16::try_from(value["cognitive"].as_u64().unwrap_or(0)).unwrap_or(0),
+            line_count: u32::try_from(value["line_count"].as_u64().unwrap_or(0)).unwrap_or(0),
+            param_count: u8::try_from(value["param_count"].as_u64().unwrap_or(0)).unwrap_or(0),
+            react_hook_count: u16::try_from(value["react_hook_count"].as_u64().unwrap_or(0))
+                .unwrap_or(0),
+            react_jsx_max_depth: u16::try_from(value["react_jsx_max_depth"].as_u64().unwrap_or(0))
+                .unwrap_or(0),
+            react_prop_count: u16::try_from(value["react_prop_count"].as_u64().unwrap_or(0))
+                .unwrap_or(0),
+            react_hook_profile: value.get("react_hook_profile").map(|p| {
+                let read_u16 = |key: &str| {
+                    u16::try_from(p.get(key).and_then(serde_json::Value::as_u64).unwrap_or(0))
+                        .unwrap_or(0)
+                };
+                fallow_output::ReactHookProfile {
+                    state: read_u16("state"),
+                    effect: read_u16("effect"),
+                    memo: read_u16("memo"),
+                    callback: read_u16("callback"),
+                    custom: read_u16("custom"),
+                    max_effect_dep_arity: p
+                        .get("max_effect_dep_arity")
+                        .and_then(serde_json::Value::as_u64)
+                        .and_then(|v| u32::try_from(v).ok()),
+                }
+            }),
+            exceeded,
+            severity,
+            crap: value.get("crap").and_then(|v| v.as_f64()),
+            coverage_pct: value.get("coverage_pct").and_then(|v| v.as_f64()),
+            coverage_tier,
+            coverage_source,
+            inherited_from: value
+                .get("inherited_from")
+                .and_then(|v| v.as_str())
+                .map(std::path::PathBuf::from),
+            component_rollup: value.get("component_rollup").and_then(|v| {
+                let map = v.as_object()?;
+                Some(fallow_output::ComponentRollup {
+                    component: map.get("component")?.as_str()?.to_string(),
+                    class_worst_function: map.get("class_worst_function")?.as_str()?.to_string(),
+                    class_cyclomatic: u16::try_from(map.get("class_cyclomatic")?.as_u64()?).ok()?,
+                    class_cognitive: u16::try_from(map.get("class_cognitive")?.as_u64()?).ok()?,
+                    template_path: std::path::PathBuf::from(map.get("template_path")?.as_str()?),
+                    template_cyclomatic: u16::try_from(map.get("template_cyclomatic")?.as_u64()?)
+                        .ok()?,
+                    template_cognitive: u16::try_from(map.get("template_cognitive")?.as_u64()?)
+                        .ok()?,
+                })
+            }),
+            contributions: Vec::new(),
+            effective_thresholds: None,
+            threshold_source: None,
+        }
+    }
 
     #[test]
     fn health_finding_has_actions() {
-        let mut output = serde_json::json!({
-            "findings": [{
+        let actions = build_actions_for_finding_json(
+            serde_json::json!({
                 "path": "src/utils.ts",
                 "name": "processData",
                 "line": 10,
@@ -2289,12 +2912,13 @@ mod tests {
                 "cognitive": 30,
                 "line_count": 150,
                 "exceeded": "both"
-            }]
-        });
+            }),
+            fallow_output::HealthActionOptions::default(),
+            20,
+            15,
+            30.0,
+        );
 
-        inject_health_actions(&mut output);
-
-        let actions = output["findings"][0]["actions"].as_array().unwrap();
         assert_eq!(actions.len(), 2);
         assert_eq!(actions[0]["type"], "refactor-function");
         assert_eq!(actions[0]["auto_fixable"], false);
@@ -2312,237 +2936,9 @@ mod tests {
     }
 
     #[test]
-    fn refactoring_target_has_actions() {
-        let mut output = serde_json::json!({
-            "targets": [{
-                "path": "src/big-module.ts",
-                "priority": 85.0,
-                "efficiency": 42.5,
-                "recommendation": "Split module: 12 exports, 4 unused",
-                "category": "split_high_impact",
-                "effort": "medium",
-                "confidence": "high",
-                "evidence": { "unused_exports": 4 }
-            }]
-        });
-
-        inject_health_actions(&mut output);
-
-        let actions = output["targets"][0]["actions"].as_array().unwrap();
-        assert_eq!(actions.len(), 2);
-        assert_eq!(actions[0]["type"], "apply-refactoring");
-        assert_eq!(
-            actions[0]["description"],
-            "Split module: 12 exports, 4 unused"
-        );
-        assert_eq!(actions[0]["category"], "split_high_impact");
-        // Target with evidence gets suppress action
-        assert_eq!(actions[1]["type"], "suppress-line");
-    }
-
-    #[test]
-    fn refactoring_target_without_evidence_has_no_suppress() {
-        let mut output = serde_json::json!({
-            "targets": [{
-                "path": "src/simple.ts",
-                "priority": 30.0,
-                "efficiency": 15.0,
-                "recommendation": "Consider extracting helper functions",
-                "category": "extract_complex_functions",
-                "effort": "small",
-                "confidence": "medium"
-            }]
-        });
-
-        inject_health_actions(&mut output);
-
-        let actions = output["targets"][0]["actions"].as_array().unwrap();
-        assert_eq!(actions.len(), 1);
-        assert_eq!(actions[0]["type"], "apply-refactoring");
-    }
-
-    #[test]
-    fn health_empty_findings_no_actions() {
-        let mut output = serde_json::json!({
-            "findings": [],
-            "targets": []
-        });
-
-        inject_health_actions(&mut output);
-
-        assert!(output["findings"].as_array().unwrap().is_empty());
-        assert!(output["targets"].as_array().unwrap().is_empty());
-    }
-
-    #[test]
-    fn hotspot_has_actions() {
-        let mut output = serde_json::json!({
-            "hotspots": [{
-                "path": "src/utils.ts",
-                "complexity_score": 45.0,
-                "churn_score": 12,
-                "hotspot_score": 540.0
-            }]
-        });
-
-        inject_health_actions(&mut output);
-
-        let actions = output["hotspots"][0]["actions"].as_array().unwrap();
-        assert_eq!(actions.len(), 2);
-        assert_eq!(actions[0]["type"], "refactor-file");
-        assert!(
-            actions[0]["description"]
-                .as_str()
-                .unwrap()
-                .contains("src/utils.ts")
-        );
-        assert_eq!(actions[1]["type"], "add-tests");
-    }
-
-    #[test]
-    fn hotspot_low_bus_factor_emits_action() {
-        let mut output = serde_json::json!({
-            "hotspots": [{
-                "path": "src/api.ts",
-                "ownership": {
-                    "bus_factor": 1,
-                    "contributor_count": 1,
-                    "top_contributor": {"identifier": "alice@x", "share": 1.0, "stale_days": 5, "commits": 30},
-                    "unowned": null,
-                    "drift": false,
-                }
-            }]
-        });
-
-        inject_health_actions(&mut output);
-
-        let actions = output["hotspots"][0]["actions"].as_array().unwrap();
-        assert!(
-            actions
-                .iter()
-                .filter_map(|a| a["type"].as_str())
-                .any(|t| t == "low-bus-factor"),
-            "low-bus-factor action should be present",
-        );
-        let bus = actions
-            .iter()
-            .find(|a| a["type"] == "low-bus-factor")
-            .unwrap();
-        assert!(bus["description"].as_str().unwrap().contains("alice@x"));
-    }
-
-    #[test]
-    fn hotspot_unowned_emits_action_with_pattern() {
-        let mut output = serde_json::json!({
-            "hotspots": [{
-                "path": "src/api/users.ts",
-                "ownership": {
-                    "bus_factor": 2,
-                    "contributor_count": 4,
-                    "top_contributor": {"identifier": "alice@x", "share": 0.5, "stale_days": 5, "commits": 10},
-                    "unowned": true,
-                    "drift": false,
-                }
-            }]
-        });
-
-        inject_health_actions(&mut output);
-
-        let actions = output["hotspots"][0]["actions"].as_array().unwrap();
-        let unowned = actions
-            .iter()
-            .find(|a| a["type"] == "unowned-hotspot")
-            .expect("unowned-hotspot action should be present");
-        // Deepest directory containing the file -> /src/api/
-        // (file `users.ts` is at depth 2, so the deepest dir is `/src/api/`).
-        assert_eq!(unowned["suggested_pattern"], "/src/api/");
-        assert_eq!(unowned["heuristic"], "directory-deepest");
-    }
-
-    #[test]
-    fn hotspot_unowned_skipped_when_codeowners_missing() {
-        let mut output = serde_json::json!({
-            "hotspots": [{
-                "path": "src/api.ts",
-                "ownership": {
-                    "bus_factor": 2,
-                    "contributor_count": 4,
-                    "top_contributor": {"identifier": "alice@x", "share": 0.5, "stale_days": 5, "commits": 10},
-                    "unowned": null,
-                    "drift": false,
-                }
-            }]
-        });
-
-        inject_health_actions(&mut output);
-
-        let actions = output["hotspots"][0]["actions"].as_array().unwrap();
-        assert!(
-            !actions.iter().any(|a| a["type"] == "unowned-hotspot"),
-            "unowned action must not fire when CODEOWNERS file is absent"
-        );
-    }
-
-    #[test]
-    fn hotspot_drift_emits_action() {
-        let mut output = serde_json::json!({
-            "hotspots": [{
-                "path": "src/old.ts",
-                "ownership": {
-                    "bus_factor": 1,
-                    "contributor_count": 2,
-                    "top_contributor": {"identifier": "bob@x", "share": 0.9, "stale_days": 1, "commits": 18},
-                    "unowned": null,
-                    "drift": true,
-                    "drift_reason": "original author alice@x has 5% share",
-                }
-            }]
-        });
-
-        inject_health_actions(&mut output);
-
-        let actions = output["hotspots"][0]["actions"].as_array().unwrap();
-        let drift = actions
-            .iter()
-            .find(|a| a["type"] == "ownership-drift")
-            .expect("ownership-drift action should be present");
-        assert!(drift["description"].as_str().unwrap().contains("alice@x"));
-    }
-
-    // ── suggest_codeowners_pattern ─────────────────────────────────
-
-    #[test]
-    fn codeowners_pattern_uses_deepest_directory() {
-        // Deepest dir keeps the suggestion tightly-scoped; the prior
-        // "first two levels" heuristic over-generalized in monorepos.
-        assert_eq!(
-            suggest_codeowners_pattern("src/api/users/handlers.ts"),
-            "/src/api/users/"
-        );
-    }
-
-    #[test]
-    fn codeowners_pattern_for_root_file() {
-        assert_eq!(suggest_codeowners_pattern("README.md"), "/README.md");
-    }
-
-    #[test]
-    fn codeowners_pattern_normalizes_backslashes() {
-        assert_eq!(
-            suggest_codeowners_pattern("src\\api\\users.ts"),
-            "/src/api/"
-        );
-    }
-
-    #[test]
-    fn codeowners_pattern_two_level_path() {
-        assert_eq!(suggest_codeowners_pattern("src/foo.ts"), "/src/");
-    }
-
-    #[test]
     fn health_finding_suppress_has_placement() {
-        let mut output = serde_json::json!({
-            "findings": [{
+        let actions = build_actions_for_finding_json(
+            serde_json::json!({
                 "path": "src/utils.ts",
                 "name": "processData",
                 "line": 10,
@@ -2551,104 +2947,678 @@ mod tests {
                 "cognitive": 30,
                 "line_count": 150,
                 "exceeded": "both"
-            }]
-        });
+            }),
+            fallow_output::HealthActionOptions::default(),
+            20,
+            15,
+            30.0,
+        );
 
-        inject_health_actions(&mut output);
-
-        let suppress = &output["findings"][0]["actions"][1];
-        assert_eq!(suppress["placement"], "above-function-declaration");
+        assert_eq!(actions[1]["placement"], "above-function-declaration");
     }
 
-    // ── Duplication actions injection ─────────────────────────────
-
     #[test]
-    fn clone_family_has_actions() {
-        let mut output = serde_json::json!({
-            "clone_families": [{
-                "files": ["src/a.ts", "src/b.ts"],
-                "groups": [
-                    { "instances": [{"file": "src/a.ts"}, {"file": "src/b.ts"}], "token_count": 100, "line_count": 20 }
-                ],
-                "total_duplicated_lines": 20,
-                "total_duplicated_tokens": 100,
-                "suggestions": [
-                    { "kind": "ExtractFunction", "description": "Extract shared validation logic", "estimated_savings": 15 }
-                ]
-            }]
-        });
-
-        inject_dupes_actions(&mut output);
-
-        let actions = output["clone_families"][0]["actions"].as_array().unwrap();
-        assert_eq!(actions.len(), 3);
-        assert_eq!(actions[0]["type"], "extract-shared");
-        assert_eq!(actions[0]["auto_fixable"], false);
-        assert!(
-            actions[0]["description"]
-                .as_str()
-                .unwrap()
-                .contains("20 lines")
+    fn html_template_health_finding_uses_html_suppression() {
+        let actions = build_actions_for_finding_json(
+            serde_json::json!({
+                "path": "src/app.component.html",
+                "name": "<template>",
+                "line": 1,
+                "col": 0,
+                "cyclomatic": 25,
+                "cognitive": 30,
+                "line_count": 40,
+                "exceeded": "both"
+            }),
+            fallow_output::HealthActionOptions::default(),
+            20,
+            15,
+            30.0,
         );
-        // Suggestion forwarded as action
-        assert_eq!(actions[1]["type"], "apply-suggestion");
-        assert!(
-            actions[1]["description"]
-                .as_str()
-                .unwrap()
-                .contains("validation logic")
-        );
-        // Suppress action
-        assert_eq!(actions[2]["type"], "suppress-line");
+
+        let suppress = &actions[1];
+        assert_eq!(suppress["type"], "suppress-file");
         assert_eq!(
-            actions[2]["comment"],
-            "// fallow-ignore-next-line code-duplication"
+            suppress["comment"],
+            "<!-- fallow-ignore-file complexity -->"
+        );
+        assert_eq!(suppress["placement"], "top-of-template");
+    }
+
+    #[test]
+    fn inline_template_health_finding_uses_decorator_suppression() {
+        let actions = build_actions_for_finding_json(
+            serde_json::json!({
+                "path": "src/app.component.ts",
+                "name": "<template>",
+                "line": 5,
+                "col": 0,
+                "cyclomatic": 25,
+                "cognitive": 30,
+                "line_count": 40,
+                "exceeded": "both"
+            }),
+            fallow_output::HealthActionOptions::default(),
+            20,
+            15,
+            30.0,
+        );
+
+        let refactor = &actions[0];
+        assert_eq!(refactor["type"], "refactor-function");
+        assert!(
+            refactor["description"]
+                .as_str()
+                .unwrap()
+                .contains("template complexity")
+        );
+        let suppress = &actions[1];
+        assert_eq!(suppress["type"], "suppress-line");
+        assert_eq!(
+            suppress["description"],
+            "Suppress with an inline comment above the Angular decorator"
+        );
+        assert_eq!(suppress["placement"], "above-angular-decorator");
+    }
+
+    /// Helper: build a health JSON envelope with a single CRAP-only finding.
+    /// Default cognitive complexity is 12 (above the cognitive floor at the
+    /// default `max_cognitive_threshold / 2 = 7.5`); use
+    /// `crap_only_finding_envelope_with_cognitive` to exercise low-cog cases
+    /// (flat dispatchers, JSX render maps) where the cognitive floor should
+    /// suppress the secondary refactor.
+    fn crap_only_finding_envelope(
+        coverage_tier: Option<&str>,
+        cyclomatic: u16,
+        max_cyclomatic_threshold: u16,
+    ) -> serde_json::Value {
+        crap_only_finding_envelope_with_max_crap(
+            coverage_tier,
+            cyclomatic,
+            12,
+            max_cyclomatic_threshold,
+            15,
+            30.0,
+        )
+    }
+
+    fn crap_only_finding_envelope_with_cognitive(
+        coverage_tier: Option<&str>,
+        cyclomatic: u16,
+        cognitive: u16,
+        max_cyclomatic_threshold: u16,
+    ) -> serde_json::Value {
+        crap_only_finding_envelope_with_max_crap(
+            coverage_tier,
+            cyclomatic,
+            cognitive,
+            max_cyclomatic_threshold,
+            15,
+            30.0,
+        )
+    }
+
+    /// Build a synthetic health JSON envelope around a single typed
+    /// [`HealthFinding`] so the existing JSON-shaped assertions in this
+    /// module keep working after PR B2 of #384 moved action selection from
+    /// the JSON post-pass into [`HealthFinding::with_actions`]. Defaults to
+    /// the un-suppressed action context; callers that want to exercise the
+    /// `omit_suppress_line` path should go through
+    /// [`build_finding_envelope_with_ctx`].
+    fn crap_only_finding_envelope_with_max_crap(
+        coverage_tier: Option<&str>,
+        cyclomatic: u16,
+        cognitive: u16,
+        max_cyclomatic_threshold: u16,
+        max_cognitive_threshold: u16,
+        max_crap_threshold: f64,
+    ) -> serde_json::Value {
+        build_finding_envelope_with_ctx(
+            coverage_tier,
+            cyclomatic,
+            cognitive,
+            max_cyclomatic_threshold,
+            max_cognitive_threshold,
+            max_crap_threshold,
+            fallow_output::HealthActionOptions::default(),
+        )
+    }
+
+    /// Build a single-finding health JSON envelope with the supplied action
+    /// context. Used by the suppress-line gating tests to exercise the
+    /// `baseline-active` / `config-disabled` reasons.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "test scaffold; positional envelope builder over independent metric/threshold knobs, bundling adds churn with no production value"
+    )]
+    fn build_finding_envelope_with_ctx(
+        coverage_tier: Option<&str>,
+        cyclomatic: u16,
+        cognitive: u16,
+        max_cyclomatic_threshold: u16,
+        max_cognitive_threshold: u16,
+        max_crap_threshold: f64,
+        action_opts: fallow_output::HealthActionOptions,
+    ) -> serde_json::Value {
+        let tier = coverage_tier.map(|t| match t {
+            "none" => fallow_output::CoverageTier::None,
+            "partial" => fallow_output::CoverageTier::Partial,
+            "high" => fallow_output::CoverageTier::High,
+            other => panic!("unknown coverage tier label: {other}"),
+        });
+        let violation = fallow_output::ComplexityViolation {
+            path: std::path::PathBuf::from("src/risk.ts"),
+            name: "computeScore".to_string(),
+            line: 12,
+            col: 0,
+            cyclomatic,
+            cognitive,
+            line_count: 40,
+            param_count: 0,
+            react_hook_count: 0,
+            react_jsx_max_depth: 0,
+            react_prop_count: 0,
+            react_hook_profile: None,
+            exceeded: fallow_output::ExceededThreshold::Crap,
+            severity: fallow_output::FindingSeverity::Moderate,
+            crap: Some(35.5),
+            coverage_pct: None,
+            coverage_tier: tier,
+            coverage_source: None,
+            inherited_from: None,
+            component_rollup: None,
+            contributions: Vec::new(),
+            effective_thresholds: None,
+            threshold_source: None,
+        };
+        let ctx = fallow_output::HealthActionContext {
+            opts: action_opts,
+            max_cyclomatic_threshold,
+            max_cognitive_threshold,
+            max_crap_threshold,
+            crap_refactor_band: 5,
+        };
+        let finding = fallow_output::HealthFinding::with_actions(violation, &ctx);
+        let actions_meta = if action_opts.omit_suppress_line {
+            Some(serde_json::json!({
+                "suppression_hints_omitted": true,
+                "reason": action_opts.omit_reason.unwrap_or("unspecified"),
+                "scope": "health-findings",
+            }))
+        } else {
+            None
+        };
+        let mut envelope = serde_json::json!({
+            "findings": [serde_json::to_value(&finding).unwrap()],
+            "summary": {
+                "max_cyclomatic_threshold": max_cyclomatic_threshold,
+                "max_cognitive_threshold": max_cognitive_threshold,
+                "max_crap_threshold": max_crap_threshold,
+            },
+        });
+        if let Some(meta) = actions_meta
+            && let Some(map) = envelope.as_object_mut()
+        {
+            map.insert("actions_meta".to_string(), meta);
+        }
+        envelope
+    }
+
+    #[test]
+    fn crap_only_tier_none_emits_add_tests() {
+        let output = crap_only_finding_envelope(Some("none"), 6, 20);
+        let actions = output["findings"][0]["actions"].as_array().unwrap();
+        assert!(
+            actions.iter().any(|a| a["type"] == "add-tests"),
+            "tier=none crap-only must emit add-tests, got {actions:?}"
+        );
+        assert!(
+            !actions.iter().any(|a| a["type"] == "increase-coverage"),
+            "tier=none must not emit increase-coverage"
         );
     }
 
     #[test]
-    fn clone_group_has_actions() {
-        let mut output = serde_json::json!({
-            "clone_groups": [{
-                "instances": [
-                    {"file": "src/a.ts", "start_line": 1, "end_line": 10},
-                    {"file": "src/b.ts", "start_line": 5, "end_line": 14}
-                ],
-                "token_count": 50,
-                "line_count": 10
-            }]
-        });
-
-        inject_dupes_actions(&mut output);
-
-        let actions = output["clone_groups"][0]["actions"].as_array().unwrap();
-        assert_eq!(actions.len(), 2);
-        assert_eq!(actions[0]["type"], "extract-shared");
+    fn crap_only_tier_partial_emits_increase_coverage() {
+        let output = crap_only_finding_envelope(Some("partial"), 6, 20);
+        let actions = output["findings"][0]["actions"].as_array().unwrap();
         assert!(
-            actions[0]["description"]
-                .as_str()
-                .unwrap()
-                .contains("10 lines")
+            actions.iter().any(|a| a["type"] == "increase-coverage"),
+            "tier=partial crap-only must emit increase-coverage, got {actions:?}"
         );
         assert!(
-            actions[0]["description"]
-                .as_str()
-                .unwrap()
-                .contains("2 instances")
+            !actions.iter().any(|a| a["type"] == "add-tests"),
+            "tier=partial must not emit add-tests"
         );
-        assert_eq!(actions[1]["type"], "suppress-line");
     }
 
     #[test]
-    fn dupes_empty_results_no_actions() {
-        let mut output = serde_json::json!({
-            "clone_families": [],
-            "clone_groups": []
-        });
+    fn crap_only_tier_high_emits_increase_coverage_when_full_coverage_can_clear_crap() {
+        let output = crap_only_finding_envelope(Some("high"), 20, 30);
+        let actions = output["findings"][0]["actions"].as_array().unwrap();
+        assert!(
+            actions.iter().any(|a| a["type"] == "increase-coverage"),
+            "tier=high crap-only must still emit increase-coverage when full coverage can clear CRAP, got {actions:?}"
+        );
+        assert!(
+            !actions.iter().any(|a| a["type"] == "refactor-function"),
+            "coverage-remediable crap-only findings should not get refactor-function unless near the cyclomatic threshold"
+        );
+        assert!(
+            !actions.iter().any(|a| a["type"] == "add-tests"),
+            "tier=high must not emit add-tests"
+        );
+    }
 
-        inject_dupes_actions(&mut output);
+    #[test]
+    fn crap_only_emits_refactor_when_full_coverage_cannot_clear_crap() {
+        let output = crap_only_finding_envelope_with_max_crap(Some("high"), 35, 12, 50, 15, 30.0);
+        let actions = output["findings"][0]["actions"].as_array().unwrap();
+        assert!(
+            actions.iter().any(|a| a["type"] == "refactor-function"),
+            "full-coverage-impossible CRAP-only finding must emit refactor-function, got {actions:?}"
+        );
+        assert!(
+            !actions.iter().any(|a| a["type"] == "increase-coverage"),
+            "must not emit increase-coverage when even 100% coverage cannot clear CRAP"
+        );
+        assert!(
+            !actions.iter().any(|a| a["type"] == "add-tests"),
+            "must not emit add-tests when even 100% coverage cannot clear CRAP"
+        );
+    }
 
-        assert!(output["clone_families"].as_array().unwrap().is_empty());
-        assert!(output["clone_groups"].as_array().unwrap().is_empty());
+    #[test]
+    fn crap_only_high_cc_appends_secondary_refactor() {
+        let output = crap_only_finding_envelope(Some("none"), 16, 20);
+        let actions = output["findings"][0]["actions"].as_array().unwrap();
+        assert!(
+            actions.iter().any(|a| a["type"] == "add-tests"),
+            "near-threshold crap-only still emits the primary tier action"
+        );
+        assert!(
+            actions.iter().any(|a| a["type"] == "refactor-function"),
+            "near-threshold crap-only must also emit secondary refactor-function"
+        );
+    }
+
+    #[test]
+    fn crap_only_far_below_threshold_no_secondary_refactor() {
+        let output = crap_only_finding_envelope(Some("none"), 6, 20);
+        let actions = output["findings"][0]["actions"].as_array().unwrap();
+        assert!(
+            !actions.iter().any(|a| a["type"] == "refactor-function"),
+            "low-CC crap-only should not get a secondary refactor-function"
+        );
+    }
+
+    #[test]
+    fn crap_only_near_threshold_low_cognitive_no_secondary_refactor() {
+        let output = crap_only_finding_envelope_with_cognitive(Some("none"), 17, 2, 20);
+        let actions = output["findings"][0]["actions"].as_array().unwrap();
+        assert!(
+            actions.iter().any(|a| a["type"] == "add-tests"),
+            "primary tier action still emits"
+        );
+        assert!(
+            !actions.iter().any(|a| a["type"] == "refactor-function"),
+            "near-threshold CC with cognitive below floor must NOT emit secondary refactor (got {actions:?})"
+        );
+    }
+
+    #[test]
+    fn crap_only_near_threshold_high_cognitive_emits_secondary_refactor() {
+        let output = crap_only_finding_envelope_with_cognitive(Some("none"), 16, 10, 20);
+        let actions = output["findings"][0]["actions"].as_array().unwrap();
+        assert!(
+            actions.iter().any(|a| a["type"] == "add-tests"),
+            "primary tier action still emits"
+        );
+        assert!(
+            actions.iter().any(|a| a["type"] == "refactor-function"),
+            "near-threshold CC with cognitive above floor must emit secondary refactor (got {actions:?})"
+        );
+    }
+
+    #[test]
+    fn crap_only_secondary_refactor_respects_configured_band() {
+        let violation = fallow_output::ComplexityViolation {
+            path: std::path::PathBuf::from("src/risk.ts"),
+            name: "computeScore".to_string(),
+            line: 12,
+            col: 0,
+            cyclomatic: 14,
+            cognitive: 10,
+            line_count: 40,
+            param_count: 0,
+            react_hook_count: 0,
+            react_jsx_max_depth: 0,
+            react_prop_count: 0,
+            react_hook_profile: None,
+            exceeded: fallow_output::ExceededThreshold::Crap,
+            severity: fallow_output::FindingSeverity::Moderate,
+            crap: Some(35.5),
+            coverage_pct: None,
+            coverage_tier: Some(fallow_output::CoverageTier::None),
+            coverage_source: None,
+            inherited_from: None,
+            component_rollup: None,
+            contributions: Vec::new(),
+            effective_thresholds: None,
+            threshold_source: None,
+        };
+        let narrow_ctx = fallow_output::HealthActionContext {
+            opts: fallow_output::HealthActionOptions::default(),
+            max_cyclomatic_threshold: 20,
+            max_cognitive_threshold: 15,
+            max_crap_threshold: 30.0,
+            crap_refactor_band: 5,
+        };
+        let wide_ctx = fallow_output::HealthActionContext {
+            crap_refactor_band: 6,
+            ..narrow_ctx
+        };
+
+        let narrow_actions = fallow_output::build_health_finding_actions(&violation, &narrow_ctx);
+        let wide_actions = fallow_output::build_health_finding_actions(&violation, &wide_ctx);
+
+        assert!(
+            !narrow_actions.iter().any(|a| {
+                matches!(
+                    a.kind,
+                    fallow_types::output_health::HealthFindingActionType::RefactorFunction
+                )
+            }),
+            "default band should not refactor a CRAP-only finding 6 below max cyclomatic"
+        );
+        assert!(
+            wide_actions.iter().any(|a| {
+                matches!(
+                    a.kind,
+                    fallow_types::output_health::HealthFindingActionType::RefactorFunction
+                )
+            }),
+            "configured wider band should emit the secondary refactor action"
+        );
+    }
+
+    #[test]
+    fn cyclomatic_only_emits_only_refactor_function() {
+        let actions = build_actions_for_finding_json(
+            serde_json::json!({
+                "path": "src/cyclo.ts",
+                "name": "branchy",
+                "line": 5,
+                "col": 0,
+                "cyclomatic": 25,
+                "cognitive": 10,
+                "line_count": 80,
+                "exceeded": "cyclomatic",
+            }),
+            fallow_output::HealthActionOptions::default(),
+            20,
+            15,
+            30.0,
+        );
+        assert!(
+            actions.iter().any(|a| a["type"] == "refactor-function"),
+            "non-CRAP findings emit refactor-function"
+        );
+        assert!(
+            !actions.iter().any(|a| a["type"] == "add-tests"),
+            "non-CRAP findings must not emit add-tests"
+        );
+        assert!(
+            !actions.iter().any(|a| a["type"] == "increase-coverage"),
+            "non-CRAP findings must not emit increase-coverage"
+        );
+    }
+
+    #[test]
+    fn suppress_line_omitted_when_baseline_active() {
+        let output = build_finding_envelope_with_ctx(
+            Some("none"),
+            6,
+            12,
+            20,
+            15,
+            30.0,
+            fallow_output::HealthActionOptions {
+                omit_suppress_line: true,
+                omit_reason: Some("baseline-active"),
+            },
+        );
+        let actions = output["findings"][0]["actions"].as_array().unwrap();
+        assert!(
+            !actions.iter().any(|a| a["type"] == "suppress-line"),
+            "baseline-active must not emit suppress-line, got {actions:?}"
+        );
+        assert_eq!(
+            output["actions_meta"]["suppression_hints_omitted"],
+            serde_json::Value::Bool(true)
+        );
+        assert_eq!(output["actions_meta"]["reason"], "baseline-active");
+        assert_eq!(output["actions_meta"]["scope"], "health-findings");
+    }
+
+    #[test]
+    fn suppress_line_omitted_when_config_disabled() {
+        let output = build_finding_envelope_with_ctx(
+            Some("none"),
+            6,
+            12,
+            20,
+            15,
+            30.0,
+            fallow_output::HealthActionOptions {
+                omit_suppress_line: true,
+                omit_reason: Some("config-disabled"),
+            },
+        );
+        assert_eq!(output["actions_meta"]["reason"], "config-disabled");
+    }
+
+    #[test]
+    fn suppress_line_emitted_by_default() {
+        let output = crap_only_finding_envelope(Some("none"), 6, 20);
+        let actions = output["findings"][0]["actions"].as_array().unwrap();
+        assert!(
+            actions.iter().any(|a| a["type"] == "suppress-line"),
+            "default opts must emit suppress-line"
+        );
+        assert!(
+            output.get("actions_meta").is_none(),
+            "actions_meta must be absent when no omission occurred"
+        );
+    }
+
+    /// Drift guard: every action `type` value emitted by the action builder
+    /// must appear in `docs/output-schema.json`'s `HealthFindingAction.type`
+    /// enum. Previously the schema listed only `[refactor-function,
+    /// suppress-line]` while the code emitted `add-tests` for CRAP findings,
+    /// silently producing schema-invalid output for any consumer using the
+    /// schema for validation.
+    #[test]
+    fn every_emitted_health_action_type_is_in_schema_enum() {
+        let cases = [
+            ("crap", Some("none"), 6_u16, 20_u16),
+            ("crap", Some("partial"), 6, 20),
+            ("crap", Some("high"), 12, 20),
+            ("crap", Some("none"), 16, 20), // near threshold => secondary refactor
+            ("cyclomatic", None, 25, 20),
+            ("cognitive_crap", Some("partial"), 6, 20),
+            ("all", Some("none"), 25, 20),
+        ];
+
+        let mut emitted: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for (exceeded, tier, cc, max) in cases {
+            let mut finding = serde_json::json!({
+                "path": "src/x.ts",
+                "name": "fn",
+                "line": 1,
+                "col": 0,
+                "cyclomatic": cc,
+                "cognitive": 5,
+                "line_count": 10,
+                "exceeded": exceeded,
+                "crap": 35.0,
+            });
+            if let Some(t) = tier {
+                finding["coverage_tier"] = serde_json::Value::String(t.to_owned());
+            }
+            let actions = build_actions_for_finding_json(
+                finding,
+                fallow_output::HealthActionOptions::default(),
+                max,
+                15,
+                30.0,
+            );
+            for action in &actions {
+                if let Some(ty) = action["type"].as_str() {
+                    emitted.insert(ty.to_owned());
+                }
+            }
+        }
+
+        let schema_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("docs")
+            .join("output-schema.json");
+        let raw = std::fs::read_to_string(&schema_path)
+            .expect("docs/output-schema.json must be readable for the drift-guard test");
+        let schema: serde_json::Value = serde_json::from_str(&raw).expect("schema parses");
+        let type_field = &schema["definitions"]["HealthFindingAction"]["properties"]["type"];
+        let type_def = if let Some(reference) = type_field.get("$ref").and_then(|r| r.as_str()) {
+            let name = reference
+                .strip_prefix("#/definitions/")
+                .expect("HealthFindingAction.type $ref points into #/definitions/");
+            &schema["definitions"][name]
+        } else {
+            type_field
+        };
+        let mut enum_values: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        if let Some(arr) = type_def.get("enum").and_then(|e| e.as_array()) {
+            for v in arr {
+                if let Some(s) = v.as_str() {
+                    enum_values.insert(s.to_owned());
+                }
+            }
+        }
+        if let Some(arr) = type_def.get("oneOf").and_then(|e| e.as_array()) {
+            for branch in arr {
+                if let Some(s) = branch.get("const").and_then(|c| c.as_str()) {
+                    enum_values.insert(s.to_owned());
+                }
+            }
+        }
+        assert!(
+            !enum_values.is_empty(),
+            "could not extract HealthFindingActionType variants from schema (neither `enum` nor `oneOf` with `const` branches)"
+        );
+
+        for ty in &emitted {
+            assert!(
+                enum_values.contains(ty),
+                "build_health_finding_actions emitted action type `{ty}` but \
+                 docs/output-schema.json HealthFindingAction.type enum does \
+                 not list it. Add it to the schema (and any downstream \
+                 typed consumers) when introducing a new action type."
+            );
+        }
+    }
+
+    /// Regression for issue #412: prevent reintroduction of the legacy
+    /// `inject_*` / `augment_*` post-pass pattern in this file. Every
+    /// JSON `actions[]` array on every finding type should flow from a
+    /// typed `serde(flatten)` envelope, not from a post-construction
+    /// mutation of a `serde_json::Value` tree.
+    ///
+    /// The allow-list mirrors the `HAND_MAINTAINED_ALLOW_LIST` pattern
+    /// in `crates/cli/src/bin/schema_emit.rs`: each entry pairs a name
+    /// with the issue that retires it. It is empty today; any addition
+    /// needs an issue reference in the same commit. The gate also
+    /// asserts no STALE entries, so removing a function without
+    /// removing its allow-list entry fails the test and forces the
+    /// cleanup commit.
+    #[test]
+    fn no_new_post_pass_helpers_in_json_rs() {
+        const POST_PASS_ALLOW_LIST: &[(&str, &str)] = &[];
+        let source_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("report")
+            .join("json.rs");
+        let source = std::fs::read_to_string(&source_path).expect(
+            "crates/cli/src/report/json.rs must be readable for the post-pass drift-guard test",
+        );
+        let mut found: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for line in source.lines() {
+            if let Some(name) = extract_post_pass_fn_name(line) {
+                found.insert(name.to_owned());
+            }
+        }
+        let allow: std::collections::BTreeSet<&'static str> =
+            POST_PASS_ALLOW_LIST.iter().map(|(name, _)| *name).collect();
+        let unexpected: Vec<&str> = found
+            .iter()
+            .filter(|name| !allow.contains(name.as_str()))
+            .map(String::as_str)
+            .collect();
+        let stale: Vec<&str> = allow
+            .iter()
+            .filter(|name| !found.contains(**name))
+            .copied()
+            .collect();
+        assert!(
+            unexpected.is_empty(),
+            "new post-pass helper(s) defined in crates/cli/src/report/json.rs are not in \
+             POST_PASS_ALLOW_LIST: {unexpected:?}.\n\
+             The typed `serde(flatten)` envelope is the source of truth for `actions[]` on \
+             every finding. If a new post-pass is genuinely needed, file a tracking issue, \
+             add the entry to POST_PASS_ALLOW_LIST with the issue link as the reason, and \
+             reference the issue in the PR body. See issue #412 for context."
+        );
+        assert!(
+            stale.is_empty(),
+            "stale entries in POST_PASS_ALLOW_LIST (function no longer defined in \
+             crates/cli/src/report/json.rs): {stale:?}.\n\
+             Remove them in the same commit that retired the function."
+        );
+    }
+
+    /// Extracts an `inject_<name>` or `augment_<name>` identifier from a
+    /// Rust function-definition line, handling `pub`, `pub(...)`,
+    /// `async`, `const`, and `unsafe` modifiers. Returns `None` for
+    /// non-definition lines (comments, call sites, doc strings).
+    fn extract_post_pass_fn_name(line: &str) -> Option<&str> {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("//") {
+            return None;
+        }
+        let mut rest = trimmed;
+        if let Some(after) = rest.strip_prefix("pub") {
+            let after = after.trim_start();
+            rest = if let Some(after) = after.strip_prefix('(') {
+                let close = after.find(')')?;
+                after[close + 1..].trim_start()
+            } else {
+                after
+            };
+        }
+        for prefix in ["async ", "const ", "unsafe "] {
+            if let Some(after) = rest.strip_prefix(prefix) {
+                rest = after.trim_start();
+            }
+        }
+        let after_fn = rest.strip_prefix("fn ")?;
+        let name_end = after_fn
+            .find(|c: char| !c.is_alphanumeric() && c != '_')
+            .unwrap_or(after_fn.len());
+        let name = &after_fn[..name_end];
+        if name.starts_with("inject_") || name.starts_with("augment_") {
+            Some(name)
+        } else {
+            None
+        }
     }
 }

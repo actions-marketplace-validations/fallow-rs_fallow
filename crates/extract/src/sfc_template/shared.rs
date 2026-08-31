@@ -1,14 +1,17 @@
 use std::sync::LazyLock;
 
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::template_usage::{TemplateSnippetKind, TemplateUsage, analyze_template_snippet};
+use crate::template_usage::{
+    TemplateSnippetKind, TemplateUsage, analyze_template_snippet,
+    analyze_template_snippet_with_bound_targets,
+};
 
 use super::scanners::scan_curly_section;
 
 /// Regex for stripping HTML comments (`<!-- ... -->`), shared by Vue and Svelte.
 pub(super) static HTML_COMMENT_RE: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r"(?s)<!--.*?-->").expect("valid regex"));
+    LazyLock::new(|| crate::static_regex(r"(?s)<!--.*?-->"));
 
 pub(super) fn merge_expression_usage(
     usage: &mut TemplateUsage,
@@ -26,6 +29,7 @@ pub(super) fn merge_expression_usage(
     );
 }
 
+#[cfg(test)]
 pub(super) fn merge_statement_usage(
     usage: &mut TemplateUsage,
     snippet: &str,
@@ -42,6 +46,7 @@ pub(super) fn merge_statement_usage(
     );
 }
 
+#[cfg(test)]
 pub(super) fn merge_expression_usage_allow_dollar_refs(
     usage: &mut TemplateUsage,
     snippet: &str,
@@ -58,6 +63,7 @@ pub(super) fn merge_expression_usage_allow_dollar_refs(
     );
 }
 
+#[cfg(test)]
 pub(super) fn merge_statement_usage_allow_dollar_refs(
     usage: &mut TemplateUsage,
     snippet: &str,
@@ -72,6 +78,78 @@ pub(super) fn merge_statement_usage_allow_dollar_refs(
         locals,
         true,
     );
+}
+
+pub(super) fn merge_expression_usage_with_bound_targets(
+    usage: &mut TemplateUsage,
+    snippet: &str,
+    imported_bindings: &FxHashSet<String>,
+    bound_targets: &FxHashMap<String, String>,
+    locals: &[String],
+) {
+    merge_snippet_usage_with_bound_targets(&mut BoundSnippetUsageInput {
+        usage,
+        snippet,
+        kind: TemplateSnippetKind::Expression,
+        imported_bindings,
+        bound_targets,
+        locals,
+        allow_dollar_prefixed_refs: false,
+    });
+}
+
+pub(super) fn merge_statement_usage_with_bound_targets(
+    usage: &mut TemplateUsage,
+    snippet: &str,
+    imported_bindings: &FxHashSet<String>,
+    bound_targets: &FxHashMap<String, String>,
+    locals: &[String],
+) {
+    merge_snippet_usage_with_bound_targets(&mut BoundSnippetUsageInput {
+        usage,
+        snippet,
+        kind: TemplateSnippetKind::Statement,
+        imported_bindings,
+        bound_targets,
+        locals,
+        allow_dollar_prefixed_refs: false,
+    });
+}
+
+pub(super) fn merge_expression_usage_allow_dollar_refs_with_bound_targets(
+    usage: &mut TemplateUsage,
+    snippet: &str,
+    imported_bindings: &FxHashSet<String>,
+    bound_targets: &FxHashMap<String, String>,
+    locals: &[String],
+) {
+    merge_snippet_usage_with_bound_targets(&mut BoundSnippetUsageInput {
+        usage,
+        snippet,
+        kind: TemplateSnippetKind::Expression,
+        imported_bindings,
+        bound_targets,
+        locals,
+        allow_dollar_prefixed_refs: true,
+    });
+}
+
+pub(super) fn merge_statement_usage_allow_dollar_refs_with_bound_targets(
+    usage: &mut TemplateUsage,
+    snippet: &str,
+    imported_bindings: &FxHashSet<String>,
+    bound_targets: &FxHashMap<String, String>,
+    locals: &[String],
+) {
+    merge_snippet_usage_with_bound_targets(&mut BoundSnippetUsageInput {
+        usage,
+        snippet,
+        kind: TemplateSnippetKind::Statement,
+        imported_bindings,
+        bound_targets,
+        locals,
+        allow_dollar_prefixed_refs: true,
+    });
 }
 
 fn merge_snippet_usage(
@@ -91,6 +169,29 @@ fn merge_snippet_usage(
     ));
 }
 
+struct BoundSnippetUsageInput<'a> {
+    usage: &'a mut TemplateUsage,
+    snippet: &'a str,
+    kind: TemplateSnippetKind,
+    imported_bindings: &'a FxHashSet<String>,
+    bound_targets: &'a FxHashMap<String, String>,
+    locals: &'a [String],
+    allow_dollar_prefixed_refs: bool,
+}
+
+fn merge_snippet_usage_with_bound_targets(input: &mut BoundSnippetUsageInput<'_>) {
+    input
+        .usage
+        .merge(analyze_template_snippet_with_bound_targets(
+            input.snippet,
+            input.kind,
+            input.imported_bindings,
+            input.bound_targets,
+            input.locals,
+            input.allow_dollar_prefixed_refs,
+        ));
+}
+
 pub(super) fn merge_component_tag_usage(
     usage: &mut TemplateUsage,
     tag_name: &str,
@@ -99,7 +200,7 @@ pub(super) fn merge_component_tag_usage(
     allow_kebab_case: bool,
 ) {
     let tag_name = tag_name.trim();
-    if tag_name.is_empty() || imported_bindings.is_empty() {
+    if tag_name.is_empty() {
         return;
     }
 
@@ -126,17 +227,25 @@ fn mark_binding_used(
     imported_bindings: &FxHashSet<String>,
     locals: &[String],
 ) {
-    if binding.is_empty()
-        || locals.iter().any(|local| local == binding)
-        || !imported_bindings.contains(binding)
-    {
+    if binding.is_empty() || locals.iter().any(|local| local == binding) {
         return;
     }
 
-    usage.used_bindings.insert(binding.to_string());
+    if imported_bindings.contains(binding) {
+        usage.used_bindings.insert(binding.to_string());
+        return;
+    }
+
+    if binding
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_uppercase())
+    {
+        usage.unresolved_tag_names.insert(binding.to_string());
+    }
 }
 
-fn kebab_to_camel_case(source: &str) -> String {
+pub(super) fn kebab_to_camel_case(source: &str) -> String {
     let mut camel = String::new();
     let mut uppercase_next = false;
 
@@ -193,7 +302,16 @@ fn collect_pattern_usage(
         return;
     }
 
-    // Strip trailing TypeScript type annotations (same as extract_pattern_binding_names).
+    if pattern.contains(',') {
+        let parts = split_top_level(pattern, ',');
+        if parts.len() > 1 {
+            for part in parts {
+                collect_pattern_usage(usage, part.trim(), imported_bindings, locals, bindings);
+            }
+            return;
+        }
+    }
+
     let pattern = strip_trailing_type_annotation(pattern);
 
     if let Some(inner) = strip_wrapping(pattern, '{', '}') {
@@ -223,13 +341,6 @@ fn collect_pattern_usage(
         return;
     }
 
-    if pattern.contains(',') {
-        for part in split_top_level(pattern, ',') {
-            collect_pattern_usage(usage, part.trim(), imported_bindings, locals, bindings);
-        }
-        return;
-    }
-
     if let Some((lhs, rhs)) = split_top_level_once(pattern, '=') {
         merge_expression_usage(usage, rhs, imported_bindings, locals);
         collect_pattern_usage(usage, lhs, imported_bindings, locals, bindings);
@@ -248,11 +359,16 @@ pub(super) fn extract_pattern_binding_names(pattern: &str) -> Vec<String> {
         return Vec::new();
     }
 
-    // Strip trailing TypeScript type annotations from destructuring patterns.
-    // e.g. `{ href, content }: Props` → `{ href, content }`
-    //      `[a, b]: number[]`         → `[a, b]`
-    // Without this, the pattern falls through to the comma-split path which
-    // recurses infinitely because `split_top_level` returns the whole string.
+    if pattern.contains(',') {
+        let parts = split_top_level(pattern, ',');
+        if parts.len() > 1 {
+            return parts
+                .into_iter()
+                .flat_map(|part| extract_pattern_binding_names(part.trim()))
+                .collect();
+        }
+    }
+
     let pattern = strip_trailing_type_annotation(pattern);
 
     if let Some(inner) = strip_wrapping(pattern, '{', '}') {
@@ -276,13 +392,6 @@ pub(super) fn extract_pattern_binding_names(pattern: &str) -> Vec<String> {
 
     if let Some(inner) = strip_wrapping(pattern, '[', ']') {
         return split_top_level(inner, ',')
-            .into_iter()
-            .flat_map(|part| extract_pattern_binding_names(part.trim()))
-            .collect();
-    }
-
-    if pattern.contains(',') {
-        return split_top_level(pattern, ',')
             .into_iter()
             .flat_map(|part| extract_pattern_binding_names(part.trim()))
             .collect();
@@ -371,33 +480,40 @@ fn strip_wrapping(source: &str, open: char, close: char) -> Option<&str> {
         .and_then(|inner| inner.strip_suffix(close))
 }
 
-/// Strip a trailing TypeScript type annotation from a destructuring pattern.
+/// Strip a trailing TypeScript type annotation from a single binding pattern.
 ///
-/// Handles patterns like `{ a, b }: SomeType` → `{ a, b }` by finding the
-/// matching closing delimiter (`}` or `]`) and discarding everything after it.
-/// Returns the input unchanged when there is no trailing annotation.
+/// Handles `{ a, b }: Props` → `{ a, b }`, `[a, b]: number[]` → `[a, b]`,
+/// and plain `name: Type` → `name`. Returns the substring before the first
+/// top-level `:` (outside brackets and quoted strings), or the input unchanged
+/// when no such colon exists.
+///
+/// The caller must split multi-binding patterns on top-level commas first;
+/// otherwise a tuple type like `x: [number, number]` followed by `, y` would
+/// be misinterpreted, and even without a second binding the colon-before-comma
+/// rule could not be enforced.
 fn strip_trailing_type_annotation(pattern: &str) -> &str {
-    let first = match pattern.bytes().next() {
-        Some(b'{') => b'}',
-        Some(b'[') => b']',
-        _ => return pattern,
-    };
+    let mut depth = 0_i32;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut in_backtick = false;
+    let mut escape = false;
 
-    let mut depth: u32 = 0;
-    for (i, byte) in pattern.bytes().enumerate() {
-        match byte {
-            b'{' | b'[' | b'(' => depth += 1,
-            b'}' | b']' | b')' => {
-                depth -= 1;
-                if byte == first && depth == 0 {
-                    // Found the matching close; if `: ...` follows, strip it.
-                    let rest = pattern[i + 1..].trim_start();
-                    if rest.starts_with(':') {
-                        return &pattern[..=i];
-                    }
-                    return pattern;
-                }
+    for (idx, ch) in pattern.char_indices() {
+        if escape {
+            escape = false;
+            continue;
+        }
+        match ch {
+            '\\' if in_single || in_double || in_backtick => {
+                escape = true;
             }
+            '\'' if !in_double && !in_backtick => in_single = !in_single,
+            '"' if !in_single && !in_backtick => in_double = !in_double,
+            '`' if !in_single && !in_double => in_backtick = !in_backtick,
+            _ if in_single || in_double || in_backtick => {}
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            ':' if depth == 0 => return &pattern[..idx],
             _ => {}
         }
     }
@@ -421,8 +537,6 @@ fn valid_identifier(source: &str) -> Option<&str> {
         .all(|ch| matches!(ch, 'A'..='Z' | 'a'..='z' | '0'..='9' | '_' | '$'))
         .then_some(source)
 }
-
-// ── Shared HTML tag attribute parser ─────────────────────────────
 
 /// A parsed HTML/SFC tag with its name, attributes, and self-closing status.
 #[derive(Debug)]
@@ -448,68 +562,40 @@ pub(super) fn parse_tag_attrs(tag: &str, braced_values: bool) -> ParsedTag {
     let self_closing = inner.ends_with('/');
     let inner = inner.trim_end_matches('/').trim_end();
 
-    let name_end = inner
-        .char_indices()
-        .find_map(|(idx, ch)| ch.is_whitespace().then_some(idx))
-        .unwrap_or(inner.len());
+    let name_end = scan_tag_name_end(inner);
     let name = inner[..name_end].trim().to_string();
 
+    ParsedTag {
+        name,
+        attrs: parse_attrs(inner, name_end, braced_values),
+        self_closing,
+    }
+}
+
+fn scan_tag_name_end(inner: &str) -> usize {
+    inner
+        .char_indices()
+        .find_map(|(idx, ch)| ch.is_whitespace().then_some(idx))
+        .unwrap_or(inner.len())
+}
+
+fn parse_attrs(inner: &str, start: usize, braced_values: bool) -> Vec<ParsedAttr> {
     let mut attrs = Vec::new();
-    let mut index = name_end;
+    let mut index = start;
 
     while index < inner.len() {
-        let remaining = &inner[index..];
-        let trimmed = remaining.trim_start();
-        index += remaining.len() - trimmed.len();
+        index = skip_whitespace(inner, index);
         if index >= inner.len() {
             break;
         }
 
-        let name_end = inner[index..]
-            .char_indices()
-            .find_map(|(offset, ch)| (ch.is_whitespace() || ch == '=').then_some(index + offset))
-            .unwrap_or(inner.len());
-        let attr_name = inner[index..name_end].trim();
-        index = name_end;
+        let (attr_name, next_index) = scan_attr_name(inner, index);
+        index = skip_whitespace(inner, next_index);
 
-        let remaining = &inner[index..];
-        let trimmed = remaining.trim_start();
-        index += remaining.len() - trimmed.len();
-
-        let mut value = None;
-        if inner.as_bytes().get(index) == Some(&b'=') {
-            index += 1;
-            let remaining = &inner[index..];
-            let trimmed = remaining.trim_start();
-            index += remaining.len() - trimmed.len();
-            if let Some(quote) = inner.as_bytes().get(index).copied() {
-                if quote == b'\'' || quote == b'"' {
-                    let quote = quote as char;
-                    index += 1;
-                    let value_start = index;
-                    while index < inner.len() && inner.as_bytes()[index] as char != quote {
-                        index += 1;
-                    }
-                    value = Some(inner[value_start..index].to_string());
-                    if index < inner.len() {
-                        index += 1;
-                    }
-                } else if braced_values && quote == b'{' {
-                    let Some((expr, next_index)) = scan_curly_section(inner, index, 1, 1) else {
-                        break;
-                    };
-                    value = Some(format!("{{{expr}}}"));
-                    index = next_index;
-                } else {
-                    let value_end = inner[index..]
-                        .char_indices()
-                        .find_map(|(offset, ch)| ch.is_whitespace().then_some(index + offset))
-                        .unwrap_or(inner.len());
-                    value = Some(inner[index..value_end].to_string());
-                    index = value_end;
-                }
-            }
-        }
+        let Some((value, next_index)) = parse_attr_value(inner, index, braced_values) else {
+            break;
+        };
+        index = next_index;
 
         if !attr_name.is_empty() {
             attrs.push(ParsedAttr {
@@ -519,11 +605,74 @@ pub(super) fn parse_tag_attrs(tag: &str, braced_values: bool) -> ParsedTag {
         }
     }
 
-    ParsedTag {
-        name,
-        attrs,
-        self_closing,
+    attrs
+}
+
+fn skip_whitespace(source: &str, index: usize) -> usize {
+    let remaining = &source[index..];
+    let trimmed = remaining.trim_start();
+    index + remaining.len() - trimmed.len()
+}
+
+fn scan_attr_name(inner: &str, index: usize) -> (&str, usize) {
+    let name_end = inner[index..]
+        .char_indices()
+        .find_map(|(offset, ch)| (ch.is_whitespace() || ch == '=').then_some(index + offset))
+        .unwrap_or(inner.len());
+
+    (inner[index..name_end].trim(), name_end)
+}
+
+fn parse_attr_value(
+    inner: &str,
+    index: usize,
+    braced_values: bool,
+) -> Option<(Option<String>, usize)> {
+    if inner.as_bytes().get(index) != Some(&b'=') {
+        return Some((None, index));
     }
+
+    let index = skip_whitespace(inner, index + 1);
+    let Some(marker) = inner.as_bytes().get(index).copied() else {
+        return Some((None, index));
+    };
+
+    match marker {
+        b'\'' | b'"' => Some(parse_quoted_attr_value(inner, index, marker)),
+        b'{' if braced_values => parse_braced_attr_value(inner, index),
+        _ => Some(parse_unquoted_attr_value(inner, index)),
+    }
+}
+
+fn parse_quoted_attr_value(inner: &str, quote_index: usize, quote: u8) -> (Option<String>, usize) {
+    let mut index = quote_index + 1;
+    let value_start = index;
+
+    while index < inner.len() && inner.as_bytes()[index] != quote {
+        index += 1;
+    }
+
+    let value = Some(inner[value_start..index].to_string());
+    let next_index = if index < inner.len() {
+        index + 1
+    } else {
+        index
+    };
+    (value, next_index)
+}
+
+fn parse_braced_attr_value(inner: &str, index: usize) -> Option<(Option<String>, usize)> {
+    let (expr, next_index) = scan_curly_section(inner, index, 1, 1)?;
+    Some((Some(format!("{{{expr}}}")), next_index))
+}
+
+fn parse_unquoted_attr_value(inner: &str, index: usize) -> (Option<String>, usize) {
+    let value_end = inner[index..]
+        .char_indices()
+        .find_map(|(offset, ch)| ch.is_whitespace().then_some(index + offset))
+        .unwrap_or(inner.len());
+
+    (Some(inner[index..value_end].to_string()), value_end)
 }
 
 #[cfg(test)]
@@ -534,13 +683,50 @@ mod tests {
         extract_pattern_binding_names, kebab_to_camel_case, merge_component_tag_usage,
         merge_expression_usage, merge_expression_usage_allow_dollar_refs,
         merge_pattern_binding_usage, merge_statement_usage,
-        merge_statement_usage_allow_dollar_refs, split_top_level, split_top_level_once,
-        strip_trailing_type_annotation, strip_wrapping, trim_outer_parens, uppercase_first,
-        valid_identifier,
+        merge_statement_usage_allow_dollar_refs, parse_tag_attrs, split_top_level,
+        split_top_level_once, strip_trailing_type_annotation, strip_wrapping, trim_outer_parens,
+        uppercase_first, valid_identifier,
     };
     use crate::template_usage::TemplateUsage;
 
-    // --- extract_pattern_binding_names ---
+    #[test]
+    fn parse_tag_attrs_handles_vue_values_and_flags() {
+        let parsed = parse_tag_attrs(
+            r#"<Widget :items="items" disabled @click='save(item)' data-id=card />"#,
+            false,
+        );
+
+        assert_eq!(parsed.name, "Widget");
+        assert!(parsed.self_closing);
+        assert_eq!(parsed.attrs[0].name, ":items");
+        assert_eq!(parsed.attrs[0].value.as_deref(), Some("items"));
+        assert_eq!(parsed.attrs[1].name, "disabled");
+        assert_eq!(parsed.attrs[1].value, None);
+        assert_eq!(parsed.attrs[2].name, "@click");
+        assert_eq!(parsed.attrs[2].value.as_deref(), Some("save(item)"));
+        assert_eq!(parsed.attrs[3].name, "data-id");
+        assert_eq!(parsed.attrs[3].value.as_deref(), Some("card"));
+    }
+
+    #[test]
+    fn parse_tag_attrs_handles_svelte_braced_values() {
+        let parsed = parse_tag_attrs(
+            r#"<button class:active={ready && count > 0} aria-label="Save" {...props}>"#,
+            true,
+        );
+
+        assert_eq!(parsed.name, "button");
+        assert!(!parsed.self_closing);
+        assert_eq!(parsed.attrs[0].name, "class:active");
+        assert_eq!(
+            parsed.attrs[0].value.as_deref(),
+            Some("{ready && count > 0}")
+        );
+        assert_eq!(parsed.attrs[1].name, "aria-label");
+        assert_eq!(parsed.attrs[1].value.as_deref(), Some("Save"));
+        assert_eq!(parsed.attrs[2].name, "{...props}");
+        assert_eq!(parsed.attrs[2].value, None);
+    }
 
     #[test]
     fn extracts_nested_object_pattern_bindings() {
@@ -609,8 +795,6 @@ mod tests {
         assert_eq!(extract_pattern_binding_names("x = 42"), vec!["x"],);
     }
 
-    // --- merge_pattern_binding_usage ---
-
     #[test]
     fn pattern_usage_tracks_default_initializer_references() {
         let mut usage = TemplateUsage::default();
@@ -664,15 +848,12 @@ mod tests {
 
     #[test]
     fn pattern_usage_typed_destructure_does_not_infinite_recurse() {
-        // Regression: `{ id, name }: Item` caused infinite recursion via
-        // the same mechanism as extract_pattern_binding_names.
         let mut usage = TemplateUsage::default();
         let imported_bindings = FxHashSet::from_iter(["id".to_string(), "name".to_string()]);
 
         let locals =
             merge_pattern_binding_usage(&mut usage, "{ id, name }: Item", &imported_bindings, &[]);
 
-        // id and name become locals (shadowing imports)
         assert_eq!(locals.len(), 2);
         assert!(locals.contains(&"id".to_string()));
         assert!(locals.contains(&"name".to_string()));
@@ -690,8 +871,6 @@ mod tests {
         assert!(locals.contains(&"a".to_string()));
         assert!(locals.contains(&"b".to_string()));
     }
-
-    // --- merge_component_tag_usage ---
 
     #[test]
     fn component_tag_usage_marks_exact_binding_used() {
@@ -804,8 +983,6 @@ mod tests {
         assert!(usage.used_bindings.is_empty());
     }
 
-    // --- merge_expression_usage ---
-
     #[test]
     fn expression_usage_marks_imported_binding() {
         let mut usage = TemplateUsage::default();
@@ -815,8 +992,6 @@ mod tests {
 
         assert!(usage.used_bindings.contains("formatDate"));
     }
-
-    // --- merge_statement_usage ---
 
     #[test]
     fn statement_usage_marks_imported_binding() {
@@ -828,8 +1003,6 @@ mod tests {
         assert!(usage.used_bindings.contains("doSomething"));
     }
 
-    // --- merge_expression_usage_allow_dollar_refs ---
-
     #[test]
     fn expression_usage_dollar_refs_resolves_store_binding() {
         let mut usage = TemplateUsage::default();
@@ -839,8 +1012,6 @@ mod tests {
 
         assert!(usage.used_bindings.contains("count"));
     }
-
-    // --- merge_statement_usage_allow_dollar_refs ---
 
     #[test]
     fn statement_usage_dollar_refs_resolves_store_binding() {
@@ -856,8 +1027,6 @@ mod tests {
 
         assert!(usage.used_bindings.contains("store"));
     }
-
-    // --- kebab_to_camel_case ---
 
     #[test]
     fn kebab_to_camel_basic() {
@@ -897,8 +1066,6 @@ mod tests {
         assert_eq!(kebab_to_camel_case(""), "");
     }
 
-    // --- uppercase_first ---
-
     #[test]
     fn uppercase_first_basic() {
         assert_eq!(uppercase_first("hello"), "Hello");
@@ -918,8 +1085,6 @@ mod tests {
     fn uppercase_first_single_char() {
         assert_eq!(uppercase_first("a"), "A");
     }
-
-    // --- valid_identifier ---
 
     #[test]
     fn valid_identifier_simple() {
@@ -961,8 +1126,6 @@ mod tests {
         assert_eq!(valid_identifier("my var"), None);
     }
 
-    // --- trim_outer_parens ---
-
     #[test]
     fn trim_parens_removes_outer() {
         assert_eq!(trim_outer_parens("(foo)"), "foo");
@@ -988,8 +1151,6 @@ mod tests {
         assert_eq!(trim_outer_parens(""), "");
     }
 
-    // --- strip_wrapping ---
-
     #[test]
     fn strip_wrapping_curly() {
         assert_eq!(strip_wrapping("{ a, b }", '{', '}'), Some(" a, b "));
@@ -1009,8 +1170,6 @@ mod tests {
     fn strip_wrapping_mismatched() {
         assert_eq!(strip_wrapping("{a, b", '{', '}'), None);
     }
-
-    // --- strip_trailing_type_annotation ---
 
     #[test]
     fn strip_type_from_object_destructure() {
@@ -1046,7 +1205,31 @@ mod tests {
         );
     }
 
-    // --- split_top_level ---
+    #[test]
+    fn strip_type_from_simple_identifier() {
+        assert_eq!(strip_trailing_type_annotation("x: number"), "x");
+    }
+
+    #[test]
+    fn strip_type_from_identifier_with_tuple_type() {
+        assert_eq!(strip_trailing_type_annotation("x: [number, number]"), "x");
+    }
+
+    #[test]
+    fn extract_pattern_typed_tuple_param() {
+        assert_eq!(
+            extract_pattern_binding_names("x: [number, number]"),
+            vec!["x"]
+        );
+    }
+
+    #[test]
+    fn extract_pattern_multiple_typed_params() {
+        assert_eq!(
+            extract_pattern_binding_names("a: number, b: string"),
+            vec!["a", "b"]
+        );
+    }
 
     #[test]
     fn split_top_level_simple() {
@@ -1092,8 +1275,6 @@ mod tests {
     fn split_top_level_no_delimiter() {
         assert_eq!(split_top_level("abc", ','), vec!["abc"]);
     }
-
-    // --- split_top_level_once ---
 
     #[test]
     fn split_top_level_once_simple() {
@@ -1142,8 +1323,6 @@ mod tests {
         );
     }
 
-    // --- mark_binding_used edge cases ---
-
     #[test]
     fn component_tag_kebab_all_dashes_does_not_mark_empty() {
         let mut usage = TemplateUsage::default();
@@ -1151,7 +1330,6 @@ mod tests {
 
         merge_component_tag_usage(&mut usage, "---", &imported_bindings, &[], true);
 
-        // kebab_to_camel_case("---") returns "" which is empty, so no conversion marking
         assert!(usage.used_bindings.is_empty());
     }
 }

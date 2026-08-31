@@ -21,7 +21,7 @@ pub struct SdkPattern {
 /// Feature flag detection configuration.
 ///
 /// Controls which patterns fallow uses to detect feature flags in source code.
-/// Configured via the `flags` section in `.fallowrc.json` or `fallow.toml`.
+/// Configured via the `flags` section in `.fallowrc.json`, `.fallowrc.jsonc`, `fallow.toml`, or `.fallow.toml`.
 ///
 /// # Examples
 ///
@@ -40,7 +40,9 @@ pub struct SdkPattern {
 #[serde(rename_all = "camelCase")]
 pub struct FlagsConfig {
     /// Additional SDK call patterns to detect as feature flags.
-    /// These are merged with the built-in patterns (LaunchDarkly, Statsig, Unleash, GrowthBook).
+    /// These are merged with the built-in patterns for common providers
+    /// including LaunchDarkly, Statsig, Unleash, GrowthBook, Split, PostHog,
+    /// Vercel Flags, ConfigCat, Flagsmith, Optimizely, and Eppo.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sdk_patterns: Vec<SdkPattern>,
 

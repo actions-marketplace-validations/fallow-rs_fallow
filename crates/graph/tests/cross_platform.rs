@@ -1,3 +1,9 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "tests and benches use unwrap and expect to keep fixture setup concise"
+)]
+
 //! Cross-platform path handling tests for the fallow-graph crate.
 //!
 //! Exercises path separator normalization, case sensitivity, unicode paths,
@@ -11,28 +17,20 @@ use fallow_graph::resolve::{extract_package_name, is_path_alias};
 use fallow_types::discover::{DiscoveredFile, FileId};
 use rustc_hash::FxHashMap;
 
-// ---------------------------------------------------------------------------
-// Path separator normalization
-// ---------------------------------------------------------------------------
-
 #[test]
 fn forward_slash_paths_resolve_in_path_to_id_lookup() {
     let path = PathBuf::from("/project/src/utils.ts");
     let mut map: FxHashMap<&Path, FileId> = FxHashMap::default();
     map.insert(path.as_path(), FileId(0));
 
-    // Forward slashes should work directly
     let lookup = PathBuf::from("/project/src/utils.ts");
     assert_eq!(map.get(lookup.as_path()), Some(&FileId(0)));
 }
 
 #[test]
 fn path_with_trailing_separator_differs() {
-    // Paths with and without trailing separators are different Path objects
     let p1 = PathBuf::from("/project/src/");
     let p2 = PathBuf::from("/project/src");
-    // On Unix, trailing slash is stripped by PathBuf normalization
-    // On Windows, it may differ. This test documents the behavior.
     assert_eq!(
         p1.components().collect::<Vec<_>>(),
         p2.components().collect::<Vec<_>>(),
@@ -61,15 +59,8 @@ fn node_modules_extraction_with_forward_slashes() {
     assert!(nm_idx.is_some(), "should find node_modules component");
 }
 
-// ---------------------------------------------------------------------------
-// Case sensitivity
-// ---------------------------------------------------------------------------
-
 #[test]
 fn path_comparison_is_case_sensitive_on_unix() {
-    // On Linux and macOS (APFS case-sensitive), these are different paths.
-    // On macOS (APFS case-insensitive, the default), the filesystem treats
-    // them as the same, but PathBuf comparison is always byte-exact.
     let p1 = PathBuf::from("/project/src/Utils.ts");
     let p2 = PathBuf::from("/project/src/utils.ts");
     assert_ne!(
@@ -85,9 +76,7 @@ fn case_sensitive_path_to_id_lookup() {
     let mut map: FxHashMap<&Path, FileId> = FxHashMap::default();
     map.insert(lower.as_path(), FileId(0));
 
-    // Exact case should match
     assert_eq!(map.get(lower.as_path()), Some(&FileId(0)));
-    // Different case should not match (byte-exact lookup)
     assert_eq!(map.get(upper.as_path()), None);
 }
 
@@ -96,10 +85,6 @@ fn package_name_extraction_preserves_case() {
     assert_eq!(extract_package_name("React"), "React");
     assert_eq!(extract_package_name("@Scope/Package"), "@Scope/Package");
 }
-
-// ---------------------------------------------------------------------------
-// Paths with spaces
-// ---------------------------------------------------------------------------
 
 #[test]
 fn path_with_spaces_in_directory() {
@@ -155,10 +140,6 @@ fn discovered_file_with_spaces_sorts_deterministically() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Unicode paths
-// ---------------------------------------------------------------------------
-
 #[test]
 fn unicode_path_components() {
     let path = PathBuf::from("/projekt/src/komponenten/Schaltflaeche.tsx");
@@ -185,7 +166,6 @@ fn unicode_emoji_in_directory_name() {
 
 #[test]
 fn unicode_path_in_node_modules() {
-    // While unusual, npm technically allows unicode in package paths
     let path = PathBuf::from("/project/node_modules/\u{00FC}ber-lib/index.js");
     let components: Vec<&str> = path
         .components()
@@ -216,17 +196,11 @@ fn unicode_discovered_files_sort_stably() {
         },
     ];
     files.sort_unstable_by(|a, b| a.path.cmp(&b.path));
-    // Sorted by byte order: 'a' (0x61) < '\u{00E9}' (0xC3 0xA9 in UTF-8)
     assert_eq!(files[0].path, PathBuf::from("/project/alpha.ts"));
 }
 
-// ---------------------------------------------------------------------------
-// Long paths
-// ---------------------------------------------------------------------------
-
 #[test]
 fn long_path_does_not_panic() {
-    // Generate a path approaching common OS limits (260 on Windows, 4096 on Linux/macOS)
     let mut long_path = String::from("/project");
     for i in 0..50 {
         write!(&mut long_path, "/deeply_nested_directory_{i:03}").unwrap();
@@ -237,7 +211,6 @@ fn long_path_does_not_panic() {
     assert!(path.to_str().is_some());
     assert_eq!(path.file_name().and_then(OsStr::to_str), Some("index.ts"));
 
-    // Verify it can be used as a hashmap key without panicking
     let mut map: FxHashMap<&Path, FileId> = FxHashMap::default();
     map.insert(path.as_path(), FileId(0));
     assert_eq!(map.get(path.as_path()), Some(&FileId(0)));
@@ -248,7 +221,7 @@ fn very_long_filename_does_not_panic() {
     let filename = "a".repeat(200) + ".ts";
     let path = PathBuf::from(format!("/project/src/{filename}"));
     assert!(path.to_str().is_some());
-    assert!(path.extension().and_then(OsStr::to_str) == Some("ts"));
+    assert_eq!(path.extension().and_then(OsStr::to_str), Some("ts"));
 }
 
 #[test]
@@ -264,21 +237,14 @@ fn long_path_in_discovered_file() {
         path: PathBuf::from(&components),
         size_bytes: 42,
     };
-    // Should not panic during any operation
     assert_eq!(file.id, FileId(0));
     assert!(file.path.to_str().is_some());
 }
-
-// ---------------------------------------------------------------------------
-// Relative path resolution
-// ---------------------------------------------------------------------------
 
 #[test]
 fn parent_traversal_resolves_correctly() {
     let base = PathBuf::from("/project/src/components");
     let resolved = base.join("../utils/helpers.ts");
-    // Note: PathBuf::join does NOT normalize `..` — it keeps them literal.
-    // The OS normalizes on canonicalize(). This documents the behavior.
     let components: Vec<_> = resolved.components().collect();
     assert!(
         components
@@ -303,10 +269,6 @@ fn multiple_parent_traversals() {
 fn curdir_in_path_normalized_by_components() {
     let path = PathBuf::from("/project/./src/./utils.ts");
     let components: Vec<_> = path.components().collect();
-    // Rust's PathBuf::components() normalizes away `.` (CurDir) components
-    // on all platforms. This is important for fallow's path handling: even
-    // if a path string contains `./`, the components iterator won't include
-    // CurDir entries, so path comparisons remain consistent.
     let curdir_count = components
         .iter()
         .filter(|c| matches!(c, std::path::Component::CurDir))
@@ -333,10 +295,6 @@ fn strip_prefix_mismatch() {
     let relative = file.strip_prefix(&root);
     assert!(relative.is_err(), "different roots should not strip");
 }
-
-// ---------------------------------------------------------------------------
-// Dot files and hidden directories
-// ---------------------------------------------------------------------------
 
 /// The allowlist from `discover.rs` — we test that the expected directories
 /// are handled correctly at the path level.
@@ -395,10 +353,6 @@ fn dotfile_in_non_hidden_directory() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Path alias detection with edge cases
-// ---------------------------------------------------------------------------
-
 #[test]
 fn path_alias_tilde_double_slash() {
     assert!(is_path_alias("~~/utils/shared"));
@@ -416,21 +370,15 @@ fn path_alias_hash_prefix() {
 
 #[test]
 fn path_alias_scoped_uppercase_is_alias() {
-    // PascalCase scoped packages are tsconfig aliases, not npm packages
     assert!(is_path_alias("@Components/Button"));
     assert!(is_path_alias("@Hooks/useApi"));
 }
 
 #[test]
 fn path_alias_scoped_lowercase_is_not_alias() {
-    // Lowercase scoped packages are real npm packages
     assert!(!is_path_alias("@babel/core"));
     assert!(!is_path_alias("@types/node"));
 }
-
-// ---------------------------------------------------------------------------
-// Package name extraction edge cases
-// ---------------------------------------------------------------------------
 
 #[test]
 fn extract_package_name_deeply_nested_subpath() {
@@ -454,10 +402,6 @@ fn extract_package_name_with_dots() {
 fn extract_package_name_single_char() {
     assert_eq!(extract_package_name("x"), "x");
 }
-
-// ---------------------------------------------------------------------------
-// Source fallback output directory handling (cross-platform path construction)
-// ---------------------------------------------------------------------------
 
 #[test]
 fn output_dir_names_in_path() {
@@ -497,10 +441,6 @@ fn nested_output_dirs_last_position() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Windows-specific path tests (only compiled on Windows)
-// ---------------------------------------------------------------------------
-
 #[cfg(target_os = "windows")]
 mod windows_paths {
     use super::*;
@@ -523,7 +463,6 @@ mod windows_paths {
     fn mixed_separators_normalize() {
         let path = PathBuf::from(r"C:\Users/project\src/index.ts");
         assert_eq!(path.file_name().and_then(OsStr::to_str), Some("index.ts"));
-        // On Windows, PathBuf normalizes mixed separators
         assert!(path.components().count() >= 4);
     }
 
@@ -550,27 +489,19 @@ mod windows_paths {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Windows path string manipulation tests (cross-platform, string-level)
-// ---------------------------------------------------------------------------
-
 mod windows_path_strings {
     use super::*;
 
     #[test]
     fn backslash_in_specifier_is_not_bare() {
-        // On all platforms, import specifiers with backslashes are unusual
-        // but should be handled without panicking
         let specifier = r".\utils\helpers";
         assert!(specifier.starts_with('.'));
     }
 
     #[test]
     fn unc_style_string_parsing() {
-        // Test that a UNC-style string can be parsed as path components
         let unc = r"\\server\share\project\node_modules\pkg\index.js";
         let path = PathBuf::from(unc);
-        // Should not panic
         let _components: Vec<_> = path.components().collect();
     }
 
@@ -585,7 +516,6 @@ mod windows_path_strings {
     fn mixed_separator_string() {
         let mixed = r"C:\Users/project\src/index.ts";
         let path = PathBuf::from(mixed);
-        // Should not panic regardless of platform
         let _ = path.file_name();
         let _ = path.parent();
         let _ = path.extension();
@@ -593,16 +523,10 @@ mod windows_path_strings {
 
     #[test]
     fn extract_package_name_with_backslash_subpath() {
-        // npm packages use forward slashes, but test that backslashes
-        // are handled without panicking
         let name = extract_package_name("lodash");
         assert_eq!(name, "lodash");
     }
 }
-
-// ---------------------------------------------------------------------------
-// Pnpm virtual store path handling across platforms
-// ---------------------------------------------------------------------------
 
 #[test]
 fn pnpm_path_components_parse_correctly() {
@@ -630,7 +554,6 @@ fn pnpm_path_with_peer_deps_suffix() {
     let path = PathBuf::from(
         "/project/node_modules/.pnpm/@myorg+ui@1.0.0_react@18.2.0/node_modules/@myorg/ui/dist/index.js",
     );
-    // The version+peer portion is just one component
     let components: Vec<&str> = path
         .components()
         .filter_map(|c| match c {
@@ -645,10 +568,6 @@ fn pnpm_path_with_peer_deps_suffix() {
         "peer dep suffix should be part of the version component"
     );
 }
-
-// ---------------------------------------------------------------------------
-// FileId stability under path ordering
-// ---------------------------------------------------------------------------
 
 #[test]
 #[expect(
@@ -693,7 +612,6 @@ fn file_id_assignment_is_deterministic_by_path_sort() {
     reason = "test file counts are trivially small"
 )]
 fn file_id_assignment_stable_regardless_of_size() {
-    // Change sizes but keep paths the same — IDs should be identical
     let make_files = |sizes: [u64; 3]| {
         let mut files = vec![
             DiscoveredFile {

@@ -5,8 +5,7 @@
 //! transitive imports) are reachable from the HTML entry point.
 //!
 //! Also scans for Angular template syntax (`{{ }}`, `[prop]`, `(event)`, `@if`, etc.)
-//! and stores referenced identifiers as `MemberAccess` entries with a sentinel object,
-//! enabling the analysis phase to credit component class members used in external templates.
+//! and stores referenced identifiers as typed semantic facts.
 
 use std::path::Path;
 use std::sync::LazyLock;
@@ -14,54 +13,71 @@ use std::sync::LazyLock;
 use oxc_span::Span;
 
 use crate::asset_url::normalize_asset_url;
-use crate::sfc_template::angular::{self, ANGULAR_TPL_SENTINEL};
-use crate::{ImportInfo, ImportedName, MemberAccess, ModuleInfo};
+use crate::sfc_template::angular;
+use crate::{
+    AngularTemplateMemberAccessFact, ImportInfo, ImportedName, MemberAccess, ModuleInfo,
+    SemanticFact,
+};
 use fallow_types::discover::FileId;
 
 /// Regex to match HTML comments (`<!-- ... -->`) for stripping before extraction.
 static HTML_COMMENT_RE: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r"(?s)<!--.*?-->").expect("valid regex"));
+    LazyLock::new(|| crate::static_regex(r"(?s)<!--.*?-->"));
 
 /// Regex to extract `src` attribute from `<script>` tags.
 /// Matches both `<script src="...">` and `<script type="module" src="...">`.
 /// Uses `(?s)` so `.` matches newlines (multi-line attributes).
 static SCRIPT_SRC_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(r#"(?si)<script\b(?:[^>"']|"[^"]*"|'[^']*')*?\bsrc\s*=\s*["']([^"']+)["']"#)
-        .expect("valid regex")
+    crate::static_regex(r#"(?si)<script\b(?:[^>"']|"[^"]*"|'[^']*')*?\bsrc\s*=\s*["']([^"']+)["']"#)
 });
 
 /// Regex to extract `href` attribute from `<link>` tags with `rel="stylesheet"` or
 /// `rel="modulepreload"`.
 /// Handles attributes in any order (rel before or after href).
 static LINK_HREF_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(
+    crate::static_regex(
         r#"(?si)<link\b(?:[^>"']|"[^"]*"|'[^']*')*?\brel\s*=\s*["'](stylesheet|modulepreload)["'](?:[^>"']|"[^"]*"|'[^']*')*?\bhref\s*=\s*["']([^"']+)["']"#,
     )
-    .expect("valid regex")
 });
 
 /// Regex for the reverse attribute order: href before rel.
 static LINK_HREF_REVERSE_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(
+    crate::static_regex(
         r#"(?si)<link\b(?:[^>"']|"[^"]*"|'[^']*')*?\bhref\s*=\s*["']([^"']+)["'](?:[^>"']|"[^"]*"|'[^']*')*?\brel\s*=\s*["'](stylesheet|modulepreload)["']"#,
     )
-    .expect("valid regex")
 });
 
 /// Check if a path is an HTML file.
-// Keep in sync with fallow_core::analyze::predicates::is_html_file (crate boundary prevents sharing)
-pub(crate) fn is_html_file(path: &Path) -> bool {
+pub fn is_html_file(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
         .is_some_and(|ext| ext == "html")
 }
 
 /// Returns true if an HTML asset reference is a remote URL that should be skipped.
-pub(crate) fn is_remote_url(src: &str) -> bool {
+pub fn is_remote_url(src: &str) -> bool {
     src.starts_with("http://")
         || src.starts_with("https://")
         || src.starts_with("//")
         || src.starts_with("data:")
+}
+
+/// Build-time template placeholders that aren't valid import specifiers and
+/// never resolve to a real file. Skip them at extraction time so they don't
+/// enter the import graph as unresolvable specifiers.
+///
+/// - `{{ ... }}` covers Handlebars (Ember `index.html`'s `{{rootURL}}`,
+///   `{{config.assetsPath}}`), Mustache (Jekyll, Hugo), Jinja2 (Pelican /
+///   11ty plugins), and pre-compiled Vue / Angular templates whose
+///   interpolation has leaked into a checked-in HTML scaffold.
+/// - `###...###` covers ember-cli blueprint scaffold placeholders
+///   (`###APPNAME###`, `###DUMMY###`) checked in as addon-fixture templates.
+///
+/// Neither shape is a legal URL or path character outside template engines,
+/// so the skip is generic across frameworks rather than gated on a plugin.
+/// Returns `true` for any `src` / `href` value that contains either marker.
+pub fn is_template_placeholder(value: &str) -> bool {
+    value.contains("{{") || value.contains("###")
 }
 
 /// Extract local (non-remote) asset references from HTML-like markup.
@@ -70,14 +86,14 @@ pub(crate) fn is_remote_url(src: &str) -> bool {
 /// between the HTML file parser and the JS/TS visitor's tagged template
 /// literal override so `` html`<script src="...">` `` in Hono/lit-html/htm
 /// layouts emits the same asset edges as a real `.html` file.
-pub(crate) fn collect_asset_refs(source: &str) -> Vec<String> {
+pub fn collect_asset_refs(source: &str) -> Vec<String> {
     let stripped = HTML_COMMENT_RE.replace_all(source, "");
     let mut refs: Vec<String> = Vec::new();
 
     for cap in SCRIPT_SRC_RE.captures_iter(&stripped) {
         if let Some(m) = cap.get(1) {
             let src = m.as_str().trim();
-            if !src.is_empty() && !is_remote_url(src) {
+            if !src.is_empty() && !is_remote_url(src) && !is_template_placeholder(src) {
                 refs.push(src.to_string());
             }
         }
@@ -86,7 +102,7 @@ pub(crate) fn collect_asset_refs(source: &str) -> Vec<String> {
     for cap in LINK_HREF_RE.captures_iter(&stripped) {
         if let Some(m) = cap.get(2) {
             let href = m.as_str().trim();
-            if !href.is_empty() && !is_remote_url(href) {
+            if !href.is_empty() && !is_remote_url(href) && !is_template_placeholder(href) {
                 refs.push(href.to_string());
             }
         }
@@ -94,7 +110,7 @@ pub(crate) fn collect_asset_refs(source: &str) -> Vec<String> {
     for cap in LINK_HREF_REVERSE_RE.captures_iter(&stripped) {
         if let Some(m) = cap.get(1) {
             let href = m.as_str().trim();
-            if !href.is_empty() && !is_remote_url(href) {
+            if !href.is_empty() && !is_remote_url(href) && !is_template_placeholder(href) {
                 refs.push(href.to_string());
             }
         }
@@ -103,12 +119,54 @@ pub(crate) fn collect_asset_refs(source: &str) -> Vec<String> {
     refs
 }
 
-/// Parse an HTML file, extracting script and stylesheet references as imports.
-pub(crate) fn parse_html_to_module(file_id: FileId, source: &str, content_hash: u64) -> ModuleInfo {
-    let suppressions = crate::suppress::parse_suppressions_from_source(source);
+/// Regex matching an opening or closing custom-element tag. The HTML spec
+/// requires a custom-element name to contain a hyphen, so `[a-z][a-z0-9]*-...`
+/// captures `<x-foo>` / `<my-element>` while native tags (`div`, `span`) never
+/// match. The capture stops before attributes / `>` / `/`.
+static CUSTOM_ELEMENT_TAG_RE: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| crate::static_regex(r"</?\s*([a-z][a-z0-9]*-[a-z0-9-]*)"));
 
-    // Bare filenames (e.g., `src="app.js"`) are normalized to `./app.js` so
-    // the resolver doesn't misclassify them as npm packages.
+/// Collect the custom-element tag names rendered in an `html` template snippet
+/// (`<x-foo>` / `</x-foo>` -> `x-foo`). HTML comments are stripped first so a
+/// commented-out `<!-- <x-foo> -->` does not credit the element. Deduped; native
+/// HTML tags are excluded by the hyphen requirement. Feeds the Lit
+/// `unrendered-component` arm's project-wide rendered-tag union.
+pub fn collect_custom_element_tags(source: &str) -> Vec<String> {
+    let stripped = HTML_COMMENT_RE.replace_all(source, "");
+    let mut tags: Vec<String> = Vec::new();
+    for cap in CUSTOM_ELEMENT_TAG_RE.captures_iter(&stripped) {
+        if let Some(m) = cap.get(1) {
+            let tag = m.as_str();
+            if !tags.iter().any(|t| t == tag) {
+                tags.push(tag.to_string());
+            }
+        }
+    }
+    tags
+}
+
+/// Parse an HTML file, extracting script and stylesheet references as imports.
+#[cfg(test)]
+pub fn parse_html_to_module(file_id: FileId, source: &str, content_hash: u64) -> ModuleInfo {
+    parse_html_to_module_with_complexity(file_id, source, content_hash, false)
+}
+
+/// Computed building blocks for an HTML [`ModuleInfo`], gathered before the
+/// struct is assembled.
+struct HtmlModuleParts {
+    imports: Vec<ImportInfo>,
+    member_accesses: Vec<MemberAccess>,
+    semantic_facts: Vec<SemanticFact>,
+    security_sinks: Vec<fallow_types::extract::SinkSite>,
+    angular_used_selectors: Vec<String>,
+    has_dynamic_component_render: bool,
+    complexity: Vec<fallow_types::extract::FunctionComplexity>,
+}
+
+/// Collect the asset-reference imports, Angular template member accesses /
+/// security sinks / used selectors, and (optionally) template complexity for an
+/// HTML source.
+fn collect_html_module_parts(source: &str, need_complexity: bool) -> HtmlModuleParts {
     let mut imports: Vec<ImportInfo> = collect_asset_refs(source)
         .into_iter()
         .map(|raw| ImportInfo {
@@ -116,56 +174,112 @@ pub(crate) fn parse_html_to_module(file_id: FileId, source: &str, content_hash: 
             imported_name: ImportedName::SideEffect,
             local_name: String::new(),
             is_type_only: false,
+            is_type_only_star: false,
+            from_style: false,
             span: Span::default(),
             source_span: Span::default(),
         })
         .collect();
 
-    // Deduplicate: the same asset may be referenced by both <script src> and
-    // <link rel="modulepreload" href> for the same path.
     imports.sort_unstable_by(|a, b| a.source.cmp(&b.source));
     imports.dedup_by(|a, b| a.source == b.source);
 
-    // Scan for Angular template syntax ({{ }}, [prop], (event), @if, etc.).
-    // Referenced identifiers are stored as MemberAccess entries with a sentinel
-    // object name so the analysis phase can bridge them to the component class.
-    let template_refs = angular::collect_angular_template_refs(source);
-    let member_accesses: Vec<MemberAccess> = template_refs
-        .into_iter()
-        .map(|name| MemberAccess {
-            object: ANGULAR_TPL_SENTINEL.to_string(),
-            member: name,
+    let angular::AngularTemplateRefs {
+        identifiers,
+        member_accesses: template_member_accesses,
+        security_sinks,
+    } = angular::collect_angular_template_refs(source);
+    let identifiers: Vec<String> = identifiers.into_iter().collect();
+    let semantic_facts: Vec<SemanticFact> = identifiers
+        .iter()
+        .cloned()
+        .map(|member| {
+            SemanticFact::AngularTemplateMemberAccess(AngularTemplateMemberAccessFact { member })
         })
         .collect();
+    let member_accesses = template_member_accesses;
+
+    // Angular external template (`templateUrl`): harvest the custom element
+    // selector tags rendered here so the Angular `unrendered-component` detector
+    // unions them into the project-wide used-selector set, and flag the
+    // `*ngComponentOutlet` dynamic-render escape hatch (project-wide abstain).
+    let angular_used_selectors = angular::collect_angular_used_selectors(source);
+    let has_dynamic_component_render = source.contains("ngComponentOutlet");
+
+    let complexity = if need_complexity {
+        crate::template_complexity::compute_angular_template_complexity(source)
+            .into_iter()
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    HtmlModuleParts {
+        imports,
+        member_accesses,
+        semantic_facts,
+        security_sinks,
+        angular_used_selectors,
+        has_dynamic_component_render,
+        complexity,
+    }
+}
+
+/// Parse an HTML file and optionally compute Angular template complexity.
+pub fn parse_html_to_module_with_complexity(
+    file_id: FileId,
+    source: &str,
+    content_hash: u64,
+    need_complexity: bool,
+) -> ModuleInfo {
+    let parsed_suppressions = crate::suppress::parse_suppressions_from_source(source);
+    let parts = collect_html_module_parts(source, need_complexity);
+    html_module_info(file_id, content_hash, source, parsed_suppressions, parts)
+}
+
+/// Assemble the `ModuleInfo` for an HTML file from its computed parts; all
+/// JS-level fields stay empty since HTML carries no module structure.
+fn html_module_info(
+    file_id: FileId,
+    content_hash: u64,
+    source: &str,
+    parsed_suppressions: crate::suppress::ParsedSuppressions,
+    parts: HtmlModuleParts,
+) -> ModuleInfo {
+    let HtmlModuleParts {
+        imports,
+        member_accesses,
+        semantic_facts,
+        security_sinks,
+        angular_used_selectors,
+        has_dynamic_component_render,
+        complexity,
+    } = parts;
 
     ModuleInfo {
-        file_id,
-        exports: Vec::new(),
         imports,
-        re_exports: Vec::new(),
-        dynamic_imports: Vec::new(),
-        dynamic_import_patterns: Vec::new(),
-        require_calls: Vec::new(),
-        member_accesses,
-        whole_object_uses: Vec::new(),
-        has_cjs_exports: false,
+        member_accesses: member_accesses.into(),
+        semantic_facts: semantic_facts.into(),
         content_hash,
-        suppressions,
-        unused_import_bindings: Vec::new(),
-        type_referenced_import_bindings: Vec::new(),
-        value_referenced_import_bindings: Vec::new(),
+        suppressions: parsed_suppressions.suppressions,
+        unknown_suppression_kinds: parsed_suppressions.unknown_kinds,
         line_offsets: fallow_types::extract::compute_line_offsets(source),
-        complexity: Vec::new(),
-        flag_uses: Vec::new(),
-        class_heritage: vec![],
+        complexity,
+        security_sinks,
+        // Custom-element tags rendered in a standalone `.html` document (an app
+        // shell, demo, or dev page) feed the Lit `unrendered-component` arm's
+        // project-wide rendered-tag union, so an element rendered only from HTML
+        // (e.g. a root `<my-app>` in `index.html`) is not falsely flagged.
+        used_custom_element_tags: collect_custom_element_tags(source),
+        angular_used_selectors,
+        has_dynamic_component_render,
+        ..ModuleInfo::empty(file_id)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ── is_html_file ─────────────────────────────────────────────
 
     #[test]
     fn is_html_file_html() {
@@ -197,8 +311,6 @@ mod tests {
         assert!(!is_html_file(Path::new("App.vue")));
     }
 
-    // ── is_remote_url ────────────────────────────────────────────
-
     #[test]
     fn remote_url_http() {
         assert!(is_remote_url("http://example.com/script.js"));
@@ -228,8 +340,6 @@ mod tests {
     fn local_root_relative_not_remote() {
         assert!(!is_remote_url("/src/entry.js"));
     }
-
-    // ── parse_html_to_module: script src extraction ──────────────
 
     #[test]
     fn extracts_module_script_src() {
@@ -273,6 +383,53 @@ mod tests {
     }
 
     #[test]
+    fn skips_handlebars_placeholder_in_script_src() {
+        let info = parse_html_to_module(
+            FileId(0),
+            r#"<script src="{{rootURL}}assets/app.js"></script>
+               <script src="{{config.assetsPath}}vendor.js"></script>"#,
+            0,
+        );
+        assert!(
+            info.imports.is_empty(),
+            "Handlebars-placeholder script srcs should not enter the import graph; got {:?}",
+            info.imports
+        );
+    }
+
+    #[test]
+    fn skips_handlebars_placeholder_in_link_href() {
+        let info = parse_html_to_module(
+            FileId(0),
+            r#"<link rel="stylesheet" href="{{rootURL}}assets/app.css">"#,
+            0,
+        );
+        assert!(info.imports.is_empty());
+    }
+
+    #[test]
+    fn skips_ember_cli_blueprint_placeholder() {
+        let info = parse_html_to_module(
+            FileId(0),
+            r####"<script src="###APPNAME###/app.js"></script>"####,
+            0,
+        );
+        assert!(info.imports.is_empty());
+    }
+
+    #[test]
+    fn extracts_normal_specifier_alongside_placeholders() {
+        let info = parse_html_to_module(
+            FileId(0),
+            r#"<script src="{{rootURL}}assets/app.js"></script>
+               <script src="./src/main.ts"></script>"#,
+            0,
+        );
+        assert_eq!(info.imports.len(), 1);
+        assert_eq!(info.imports[0].source, "./src/main.ts");
+    }
+
+    #[test]
     fn skips_remote_script() {
         let info = parse_html_to_module(
             FileId(0),
@@ -291,8 +448,6 @@ mod tests {
         );
         assert!(info.imports.is_empty());
     }
-
-    // ── parse_html_to_module: link href extraction ───────────────
 
     #[test]
     fn extracts_stylesheet_link() {
@@ -326,12 +481,6 @@ mod tests {
         assert_eq!(info.imports.len(), 1);
         assert_eq!(info.imports[0].source, "./src/global.css");
     }
-
-    // ── Bare asset references normalized to relative paths ──────
-    // Regression tests for the same class of bug as #99 (Angular templateUrl).
-    // Browsers resolve `src="app.js"` and `href="styles.css"` relative to the
-    // HTML file, so emitting these as bare specifiers would misclassify them
-    // as unlisted npm packages.
 
     #[test]
     fn bare_script_src_normalized_to_relative() {
@@ -393,8 +542,6 @@ mod tests {
 
     #[test]
     fn root_absolute_script_src_unchanged() {
-        // `/src/main.ts` is a web convention (Vite root-relative) and must
-        // stay absolute so the resolver's HTML special case applies.
         let info = parse_html_to_module(FileId(0), r#"<script src="/src/main.ts"></script>"#, 0);
         assert_eq!(info.imports.len(), 1);
         assert_eq!(info.imports[0].source, "/src/main.ts");
@@ -438,8 +585,6 @@ mod tests {
         assert!(info.imports.is_empty());
     }
 
-    // ── HTML comment stripping ───────────────────────────────────
-
     #[test]
     fn skips_commented_out_script() {
         let info = parse_html_to_module(
@@ -464,8 +609,6 @@ mod tests {
         assert_eq!(info.imports[0].source, "./new.css");
     }
 
-    // ── Multi-line attributes ────────────────────────────────────
-
     #[test]
     fn handles_multiline_script_tag() {
         let info = parse_html_to_module(
@@ -487,8 +630,6 @@ mod tests {
         assert_eq!(info.imports.len(), 1);
         assert_eq!(info.imports[0].source, "./src/global.css");
     }
-
-    // ── Full HTML document ───────────────────────────────────────
 
     #[test]
     fn full_vite_html() {
@@ -512,8 +653,6 @@ mod tests {
         assert!(sources.contains(&"./src/global.css"));
         assert!(sources.contains(&"./src/entry.js"));
     }
-
-    // ── Edge cases ───────────────────────────────────────────────
 
     #[test]
     fn empty_html() {
@@ -560,13 +699,8 @@ mod tests {
             "<!-- fallow-ignore-file -->\n<script src=\"./entry.js\"></script>",
             0,
         );
-        // HTML comments use <!-- --> not //, so suppression parsing
-        // from source text won't find standard JS-style comments.
-        // This is expected — HTML suppression is not supported.
         assert_eq!(info.imports.len(), 1);
     }
-
-    // ── Angular template scanning ──────────────────────────────
 
     #[test]
     fn angular_template_extracts_member_refs() {
@@ -577,21 +711,31 @@ mod tests {
              <button (click)=\"onButtonClick()\">Toggle</button>",
             0,
         );
-        let names: rustc_hash::FxHashSet<&str> = info
-            .member_accesses
+        let fact_names: rustc_hash::FxHashSet<&str> = info
+            .semantic_facts
             .iter()
-            .filter(|a| a.object == ANGULAR_TPL_SENTINEL)
-            .map(|a| a.member.as_str())
+            .filter_map(|fact| {
+                if let SemanticFact::AngularTemplateMemberAccess(access) = fact {
+                    Some(access.member.as_str())
+                } else {
+                    None
+                }
+            })
             .collect();
-        assert!(names.contains("title"), "should contain 'title'");
+        assert!(fact_names.contains("title"), "should contain 'title'");
         assert!(
-            names.contains("isHighlighted"),
+            fact_names.contains("isHighlighted"),
             "should contain 'isHighlighted'"
         );
-        assert!(names.contains("greeting"), "should contain 'greeting'");
+        assert!(fact_names.contains("greeting"), "should contain 'greeting'");
         assert!(
-            names.contains("onButtonClick"),
+            fact_names.contains("onButtonClick"),
             "should contain 'onButtonClick'"
+        );
+        assert!(
+            info.member_accesses.is_empty(),
+            "Angular template refs should emit typed facts instead of member accesses: {:?}",
+            info.member_accesses
         );
     }
 

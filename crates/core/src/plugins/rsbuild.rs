@@ -24,14 +24,12 @@ define_plugin! {
     resolve_config(config_path, source, _root) {
         let mut result = PluginResult::default();
 
-        // Extract import sources as referenced dependencies
         let imports = config_parser::extract_imports(source, config_path);
         for imp in &imports {
             let dep = crate::resolve::extract_package_name(imp);
             result.referenced_dependencies.push(dep);
         }
 
-        // source.entry -> entry points (string or object with string values)
         let entries = config_parser::extract_config_string_or_array(
             source,
             config_path,
@@ -39,10 +37,6 @@ define_plugin! {
         );
         result.extend_entry_patterns(entries);
 
-        // plugins -> extract plugin package names from imports
-        // Rsbuild plugins are typically imported and passed to the plugins array,
-        // so the import extraction above already covers them. Additionally extract
-        // any string references or require() calls in the plugins array.
         let plugin_requires =
             config_parser::extract_config_require_strings(source, config_path, "plugins");
         for dep in &plugin_requires {
@@ -81,7 +75,7 @@ mod tests {
             source,
             std::path::Path::new("/project"),
         );
-        assert_eq!(result.entry_patterns, vec!["./src/index.tsx"]);
+        assert_eq!(result.entry_patterns, vec!["src/index.tsx"]);
     }
 
     #[test]
@@ -102,8 +96,8 @@ mod tests {
             source,
             std::path::Path::new("/project"),
         );
-        assert!(has_entry_pattern(&result, "./src/main.tsx"));
-        assert!(has_entry_pattern(&result, "./src/admin.tsx"));
+        assert!(has_entry_pattern(&result, "src/main.tsx"));
+        assert!(has_entry_pattern(&result, "src/admin.tsx"));
     }
 
     #[test]
@@ -127,7 +121,7 @@ mod tests {
         let deps = &result.referenced_dependencies;
         assert!(deps.contains(&"@rsbuild/core".to_string()));
         assert!(deps.contains(&"@rsbuild/plugin-react".to_string()));
-        assert_eq!(result.entry_patterns, vec!["./src/index.tsx"]);
+        assert_eq!(result.entry_patterns, vec!["src/index.tsx"]);
     }
 
     #[test]
@@ -148,6 +142,6 @@ mod tests {
             source,
             std::path::Path::new("/project"),
         );
-        assert_eq!(result.entry_patterns, vec!["./src/index.ts"]);
+        assert_eq!(result.entry_patterns, vec!["src/index.ts"]);
     }
 }

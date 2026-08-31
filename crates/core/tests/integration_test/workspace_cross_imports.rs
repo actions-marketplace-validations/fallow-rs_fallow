@@ -4,7 +4,6 @@ use super::common::{create_config, fixture_path};
 fn workspace_cross_import_resolves() {
     let root = fixture_path("workspace-cross-imports");
 
-    // Set up node_modules symlinks for cross-workspace resolution
     let nm = root.join("node_modules").join("@myorg");
     let _ = std::fs::create_dir_all(&nm);
     #[cfg(unix)]
@@ -19,14 +18,13 @@ fn workspace_cross_import_resolves() {
     let config = create_config(root);
     let results = fallow_core::analyze(&config).expect("analysis should succeed");
 
-    // No unresolved imports — cross-workspace @myorg/core should resolve
     assert!(
         results.unresolved_imports.is_empty(),
         "cross-workspace imports should resolve, found unresolved: {:?}",
         results
             .unresolved_imports
             .iter()
-            .map(|i| &i.specifier)
+            .map(|i| &i.import.specifier)
             .collect::<Vec<_>>()
     );
 }
@@ -35,7 +33,6 @@ fn workspace_cross_import_resolves() {
 fn workspace_cross_import_detects_orphan() {
     let root = fixture_path("workspace-cross-imports");
 
-    // Set up node_modules symlinks
     let nm = root.join("node_modules").join("@myorg");
     let _ = std::fs::create_dir_all(&nm);
     #[cfg(unix)]
@@ -53,7 +50,14 @@ fn workspace_cross_import_detects_orphan() {
     let unused_file_names: Vec<String> = results
         .unused_files
         .iter()
-        .map(|f| f.path.file_name().unwrap().to_string_lossy().to_string())
+        .map(|f| {
+            f.file
+                .path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .to_string()
+        })
         .collect();
 
     assert!(
@@ -66,7 +70,6 @@ fn workspace_cross_import_detects_orphan() {
 fn workspace_cross_import_detects_unused_export() {
     let root = fixture_path("workspace-cross-imports");
 
-    // Set up node_modules symlinks
     let nm = root.join("node_modules").join("@myorg");
     let _ = std::fs::create_dir_all(&nm);
     #[cfg(unix)]
@@ -84,16 +87,14 @@ fn workspace_cross_import_detects_unused_export() {
     let unused_export_names: Vec<&str> = results
         .unused_exports
         .iter()
-        .map(|e| e.export_name.as_str())
+        .map(|e| e.export.export_name.as_str())
         .collect();
 
-    // unusedCoreExport is not imported by the web package
     assert!(
         unused_export_names.contains(&"unusedCoreExport"),
         "unusedCoreExport should be unused, found: {unused_export_names:?}"
     );
 
-    // coreHelper IS imported by web, should NOT be flagged
     assert!(
         !unused_export_names.contains(&"coreHelper"),
         "coreHelper should NOT be unused (imported by web), found: {unused_export_names:?}"
@@ -126,15 +127,21 @@ fn workspace_self_reference_resolves_secondary_entry_points() {
     let unused_file_names: Vec<String> = results
         .unused_files
         .iter()
-        .map(|f| f.path.file_name().unwrap().to_string_lossy().to_string())
+        .map(|f| {
+            f.file
+                .path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .to_string()
+        })
         .collect();
 
-    // None of the ui-kit secondary entry point files should be reported.
-    // Before the fix, button/modal/tabs/internal-base were all flagged.
     for secondary in ["button", "modal", "tabs", "internal/base"] {
         assert!(
             !results.unused_files.iter().any(|f| {
-                f.path
+                f.file
+                    .path
                     .to_string_lossy()
                     .replace('\\', "/")
                     .contains(&format!("ui-kit/{secondary}/index.ts"))
@@ -143,12 +150,10 @@ fn workspace_self_reference_resolves_secondary_entry_points() {
         );
     }
 
-    // Cross-workspace self-referencing imports should not surface as unresolved
-    // nor as unlisted dependencies.
     let unresolved_specifiers: Vec<&str> = results
         .unresolved_imports
         .iter()
-        .map(|i| i.specifier.as_str())
+        .map(|i| i.import.specifier.as_str())
         .collect();
     assert!(
         !unresolved_specifiers
@@ -160,7 +165,7 @@ fn workspace_self_reference_resolves_secondary_entry_points() {
     let unlisted_package_names: Vec<&str> = results
         .unlisted_dependencies
         .iter()
-        .map(|d| d.package_name.as_str())
+        .map(|d| d.dep.package_name.as_str())
         .collect();
     assert!(
         !unlisted_package_names.contains(&"@repro/ui-kit"),

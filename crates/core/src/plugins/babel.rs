@@ -33,7 +33,6 @@ define_plugin! {
     resolve_config(config_path, source, _root) {
         let mut result = PluginResult::default();
 
-        // Handle JSON configs (.babelrc, .babelrc.json)
         let is_json = config_path.extension().is_some_and(|ext| ext == "json")
             || config_path
                 .file_name()
@@ -51,8 +50,6 @@ define_plugin! {
             result.referenced_dependencies.push(dep);
         }
 
-        // presets -> referenced dependencies (shallow to avoid options objects)
-        // Babel short name resolution: "env" -> "@babel/preset-env"
         let presets =
             config_parser::extract_config_shallow_strings(&parse_source, parse_path, "presets");
         for preset in &presets {
@@ -61,8 +58,6 @@ define_plugin! {
                 .push(resolve_babel_preset_name(preset));
         }
 
-        // plugins -> referenced dependencies (shallow to avoid options objects)
-        // Babel short name resolution: "transform-runtime" -> "@babel/plugin-transform-runtime"
         let plugins =
             config_parser::extract_config_shallow_strings(&parse_source, parse_path, "plugins");
         for plugin in &plugins {
@@ -71,7 +66,6 @@ define_plugin! {
                 .push(resolve_babel_plugin_name(plugin));
         }
 
-        // extends -> referenced dependency or config file
         if let Some(extends) =
             config_parser::extract_config_string(&parse_source, parse_path, &["extends"])
         {
@@ -115,7 +109,7 @@ fn resolve_babel_preset_name(name: &str) -> String {
 /// - `"@babel/plugin-transform-runtime"` → `"@babel/plugin-transform-runtime"` (already full)
 /// - `"babel-plugin-foo"` → `"babel-plugin-foo"` (already full)
 /// - `"module:my-plugin"` → `"my-plugin"` (module: prefix)
-fn resolve_babel_plugin_name(name: &str) -> String {
+pub(super) fn resolve_babel_plugin_name(name: &str) -> String {
     let name = name.strip_prefix("module:").unwrap_or(name);
 
     if name.starts_with("babel-plugin-") || name.contains("/plugin-") {
@@ -136,8 +130,6 @@ fn resolve_babel_plugin_name(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ── Babel preset name resolution ────────────────────────────────
 
     #[test]
     fn preset_short_name() {
@@ -165,8 +157,6 @@ mod tests {
         );
     }
 
-    // ── Babel plugin name resolution ────────────────────────────────
-
     #[test]
     fn plugin_short_name() {
         assert_eq!(
@@ -190,8 +180,6 @@ mod tests {
             "@babel/plugin-transform-runtime"
         );
     }
-
-    // ── resolve_config integration ──────────────────────────────────
 
     #[test]
     fn resolve_config_presets_and_plugins() {

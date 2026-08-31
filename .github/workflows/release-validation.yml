@@ -1,0 +1,308 @@
+# Every release-gating validation job, extracted so it can run BEFORE a
+# version number exists anywhere. Three consumers:
+#   1. release.yml `uses:` this workflow (workflow_call), so the manually
+#      dispatched tag-last flow gates publishes on exactly this set;
+#   2. the /fallow-release pre-flight dispatches it on main and waits for
+#      green BEFORE bumping any version (workflow_dispatch), so a failing
+#      check can never burn a release tag again (v3.4.0 and v3.4.1 were both
+#      lost to a Windows-only CRLF byte-comparison failure that had never run
+#      pre-tag);
+#   3. a weekly cron surfaces runner-image or dependency drift between
+#      releases instead of at the next release.
+name: Release Validation
+
+on:
+  workflow_call:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 5 * * 1'
+
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows-verify:
+    name: Windows correctness and lifecycle
+    runs-on: windows-latest
+    timeout-minutes: 75
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup-rust
+        with:
+          components: clippy, rustfmt
+          cache-key: release-windows-verify
+
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+        with:
+          version: 10.33.0
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+
+      - name: Install type-aware sidecar dependencies
+        run: npm ci --prefix tools/type-aware-sidecar --no-audit --no-fund --ignore-scripts
+
+      - name: Test Windows npm launcher
+        run: npm --prefix npm/fallow test
+      - name: Test Windows child-process wiring
+        run: node --test tools/type-aware-sidecar/test/windows-child-process.test.mjs
+
+      - name: Run workspace tests
+        run: cargo test --workspace --lib --bins --tests --examples
+
+      - name: Run runtime-coverage integration tests
+        run: cargo test -p fallow-cli --features test-sidecar-key --test runtime_coverage_tests
+
+      - name: Run schema drift gate
+        run: cargo test -p fallow-cli --features schema-emit --bin fallow-schema-emit
+
+      - name: Install contract bundle dependencies
+        run: cd editors/vscode && pnpm install --frozen-lockfile --ignore-scripts
+
+      - name: Build current CLI and LSP binaries
+        run: cargo build -p fallow-cli --bin fallow -p fallow-lsp --bin fallow-lsp
+
+      - name: Run installed npm candidate against pinned Preact
+        env:
+          FALLOW_CANDIDATE_BIN: ${{ github.workspace }}\target\debug\fallow.exe
+        run: node scripts/type-aware-windows-candidate-smoke.mjs
+
+      - name: Run staged subgenerator integration tests
+        run: node --test scripts/subgenerator-staging.test.mjs
+
+      - name: Run contract bundle drift gate
+        run: npm run generate:contracts:check
+        env:
+          CI: true
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Clippy (test-sidecar-key feature)
+        run: cargo clippy -p fallow-cli --features test-sidecar-key --all-targets -- -D warnings
+
+      - name: Clippy (schema-emit feature)
+        run: cargo clippy -p fallow-cli --features schema-emit --bin fallow-schema-emit --tests -- -D warnings
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Install NAPI package dependencies
+        run: cd crates/napi && npm ci --omit=optional --ignore-scripts
+
+      - name: Build NAPI package
+        run: cd crates/napi && npx napi build --platform --profile napi-release --no-js && npm run publish:prepare
+
+      - name: Run NAPI smoke test
+        run: cd crates/napi && npm test
+
+      - name: Run audit orphan-sweep and lock lifecycle tests
+        run: >
+          cargo test -p fallow-cli --lib --
+          --exact
+          audit::tests::audit_orphan_sweep_removes_dead_pid_worktree
+          audit::tests::audit_orphan_sweep_keeps_live_pid_worktree
+          audit::tests::reusable_worktree_lock_excludes_concurrent_acquires
+
+      - name: Run MCP timeout process-tree lifecycle test
+        run: >
+          cargo test -p fallow-mcp --bin fallow-mcp
+          server::tests::run::run_fallow_timeout_terminates_and_reaps_windows_job_tree
+          -- --exact
+
+      - name: Check for uncommitted changes
+        run: git diff --exit-code
+
+  vscode-package-targets:
+    name: Package VS Code target artifacts
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+        with:
+          version: 10.33.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+          cache: pnpm
+          cache-dependency-path: editors/vscode/pnpm-lock.yaml
+      - name: Install VS Code dependencies
+        run: cd editors/vscode && pnpm install --frozen-lockfile --ignore-scripts
+      - name: Test target VSIX packaging contracts
+        run: pnpm --dir editors/vscode test:packaging
+      - name: Package target VSIX artifacts
+        run: pnpm --dir editors/vscode package:variants -- --output-dir "$RUNNER_TEMP/fallow-vscode-targets"
+      - name: Upload target VSIX artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: validation-vscode-targets
+          path: ${{ runner.temp }}/fallow-vscode-targets
+
+  vscode-target-host:
+    name: VS Code target host (${{ matrix.target }})
+    needs: vscode-package-targets
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 35
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux-x64
+            cli: target/debug/fallow
+            lsp: target/debug/fallow-lsp
+          - os: windows-latest
+            target: win32-x64
+            cli: target/debug/fallow.exe
+            lsp: target/debug/fallow-lsp.exe
+          - os: macos-15-intel
+            target: darwin-x64
+            cli: target/debug/fallow
+            lsp: target/debug/fallow-lsp
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: release-vscode-target-${{ matrix.target }}
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+        with:
+          version: 10.33.0
+      - name: Initialize pnpm store on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $store = pnpm store path --silent
+          New-Item -ItemType Directory -Force -Path $store | Out-Null
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+          cache: pnpm
+          cache-dependency-path: editors/vscode/pnpm-lock.yaml
+      - name: Cache VS Code test download
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v5
+        with:
+          path: ${{ runner.temp }}/fallow-vscode-test-cache
+          key: release-vscode-target-${{ matrix.target }}-vscode-1.96.0
+      - name: Install VS Code dependencies
+        run: cd editors/vscode && pnpm install --frozen-lockfile --ignore-scripts
+      - name: Build current CLI and LSP binaries
+        run: cargo build -p fallow-cli --bin fallow -p fallow-lsp --bin fallow-lsp
+      - name: Download Ubuntu-built target VSIX artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: validation-vscode-targets
+          path: ${{ runner.temp }}/fallow-vscode-targets
+      - name: Extract and verify the exact target VSIX on Unix
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          FALLOW_VSIX_TARGET: ${{ matrix.target }}
+        run: |
+          version="$(node -p "require('./editors/vscode/package.json').version")"
+          vsix="$RUNNER_TEMP/fallow-vscode-targets/fallow-vscode-$version-$FALLOW_VSIX_TARGET.vsix"
+          test -f "$vsix"
+          destination="$RUNNER_TEMP/fallow-vscode-$FALLOW_VSIX_TARGET"
+          unzip -q "$vsix" -d "$destination"
+          pnpm --dir editors/vscode verify:vsix "$destination/extension" "$vsix" --target "$FALLOW_VSIX_TARGET"
+          echo "FALLOW_EXTENSION_PATH=$(realpath "$destination/extension")" >> "$GITHUB_ENV"
+      - name: Extract and verify the exact target VSIX on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          FALLOW_VSIX_TARGET: ${{ matrix.target }}
+        run: |
+          $version = (Get-Content editors/vscode/package.json | ConvertFrom-Json).version
+          $vsix = Join-Path $env:RUNNER_TEMP "fallow-vscode-targets/fallow-vscode-$version-$env:FALLOW_VSIX_TARGET.vsix"
+          if (-not (Test-Path -PathType Leaf $vsix)) { throw "Expected target VSIX was not downloaded: $vsix" }
+          $archive = Join-Path $env:RUNNER_TEMP "fallow-vscode-$env:FALLOW_VSIX_TARGET.zip"
+          $destination = Join-Path $env:RUNNER_TEMP "fallow-vscode-$env:FALLOW_VSIX_TARGET"
+          Copy-Item $vsix $archive
+          Expand-Archive -Path $archive -DestinationPath $destination
+          pnpm --dir editors/vscode verify:vsix "$destination/extension" $vsix --target $env:FALLOW_VSIX_TARGET
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $extensionPath = (Resolve-Path "$destination/extension").Path
+          "FALLOW_EXTENSION_PATH=$extensionPath" >> $env:GITHUB_ENV
+      - name: Run exact target VSIX host smoke on Linux
+        if: runner.os == 'Linux'
+        env:
+          FALLOW_BIN: ${{ github.workspace }}/${{ matrix.cli }}
+          FALLOW_LSP_BIN: ${{ github.workspace }}/${{ matrix.lsp }}
+          FALLOW_VSCODE_TEST_CACHE_PATH: ${{ runner.temp }}/fallow-vscode-test-cache
+        run: xvfb-run -a pnpm --dir editors/vscode run test:integration:real
+      - name: Run exact target VSIX host smoke
+        if: runner.os != 'Linux'
+        env:
+          FALLOW_BIN: ${{ github.workspace }}/${{ matrix.cli }}
+          FALLOW_LSP_BIN: ${{ github.workspace }}/${{ matrix.lsp }}
+          FALLOW_VSCODE_TEST_CACHE_PATH: ${{ runner.temp }}/fallow-vscode-test-cache
+        run: pnpm --dir editors/vscode run test:integration:real
+
+  zed-verify:
+    name: Zed verification (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+        with:
+          components: rustfmt
+          targets: wasm32-wasip2
+      - name: Run tests
+        run: cargo test --manifest-path editors/zed/Cargo.toml
+      - name: Build wasm extension
+        run: cargo build --target wasm32-wasip2 --manifest-path editors/zed/Cargo.toml
+      - name: Format
+        run: cargo fmt --check --manifest-path editors/zed/Cargo.toml
+
+  check-codegen:
+    name: Check codegen drift
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup-rust
+        with:
+          components: clippy, rustfmt
+
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+        with:
+          version: 10.33.0
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+        with:
+          node-version: '22'
+
+      - name: Install dependencies
+        run: cd editors/vscode && pnpm install --frozen-lockfile --ignore-scripts
+
+      - name: Verify generated contract bundle
+        run: CI=true npm run generate:contracts:check

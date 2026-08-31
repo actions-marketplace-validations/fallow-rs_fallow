@@ -2,8 +2,6 @@ use fallow_types::extract::ExportName;
 
 use crate::tests::{parse_ts as parse_source, parse_ts_with_complexity};
 
-// -- Function overload deduplication --
-
 #[test]
 fn function_overloads_deduplicated_to_single_export() {
     let info = parse_source(
@@ -18,8 +16,6 @@ fn function_overloads_deduplicated_to_single_export() {
     assert_eq!(info.exports[0].name, ExportName::Named("parse".to_string()));
 }
 
-// ── Line offsets populated ───────────────────────────────────
-
 #[test]
 fn line_offsets_populated_for_ts_file() {
     let info = parse_source("const a = 1;\nconst b = 2;\nconst c = 3;\n");
@@ -29,8 +25,6 @@ fn line_offsets_populated_for_ts_file() {
     );
     assert_eq!(info.line_offsets[0], 0, "First line starts at byte 0");
 }
-
-// ── Complexity metrics populated ─────────────────────────────
 
 #[test]
 fn complexity_metrics_populated_for_functions() {
@@ -53,8 +47,6 @@ fn complexity_metrics_populated_for_functions() {
     assert!(f.unwrap().cyclomatic > 1);
 }
 
-// ── Function overload deduplication ──────────────────────────
-
 #[test]
 fn function_overload_deduplication() {
     let info = parse_source(
@@ -64,7 +56,6 @@ export function foo(x: string | number): string | number {
     return x;
 }",
     );
-    // Should deduplicate to single export
     let foo_count = info
         .exports
         .iter()

@@ -1,18 +1,20 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "tests and benches use unwrap and expect to keep fixture setup concise"
+)]
+
 #[path = "common/mod.rs"]
 mod common;
 
-use common::{fixture_path, parse_json, redact_all, run_fallow, run_fallow_raw};
-
-// ---------------------------------------------------------------------------
-// Exit code semantics
-// ---------------------------------------------------------------------------
-
-// check always exits 1 when error-severity issues exist (default severity = error).
-// --fail-on-issues additionally promotes warn-severity rules to error.
+use common::{
+    fixture_path, parse_json, redact_all, redact_paths, run_fallow, run_fallow_combined,
+    run_fallow_in_root, run_fallow_raw, run_fallow_raw_with_env,
+    run_fallow_raw_with_type_aware_sidecar,
+};
 
 #[test]
 fn check_with_issues_exits_1() {
-    // basic-project has issues with default error severity → exit 1
     let output = run_fallow("check", "basic-project", &["--format", "json", "--quiet"]);
     assert_eq!(
         output.code, 1,
@@ -22,8 +24,6 @@ fn check_with_issues_exits_1() {
 
 #[test]
 fn check_warn_severity_exits_0_without_fail_flag() {
-    // config-file-project has rules.unused-files = "warn" in .fallowrc.json
-    // With only warn-severity rules, should exit 0
     let output = run_fallow(
         "check",
         "config-file-project",
@@ -33,7 +33,6 @@ fn check_warn_severity_exits_0_without_fail_flag() {
         output.code, 0,
         "check with only warn-severity issues should exit 0 without --fail-on-issues"
     );
-    // Verify issues were actually found (not just "no issues at all")
     let json = parse_json(&output);
     assert!(
         json["total_issues"].as_u64().unwrap_or(0) > 0,
@@ -43,7 +42,6 @@ fn check_warn_severity_exits_0_without_fail_flag() {
 
 #[test]
 fn check_warn_severity_exits_1_with_fail_on_issues() {
-    // --fail-on-issues promotes warns to errors
     let output = run_fallow(
         "check",
         "config-file-project",
@@ -67,9 +65,175 @@ fn check_ci_flag_implies_fail_on_issues() {
     assert_eq!(output.code, 1, "--ci should imply --fail-on-issues");
 }
 
-// ---------------------------------------------------------------------------
-// Format switching
-// ---------------------------------------------------------------------------
+/// The fixture from issue #2445: an import from the `domain` zone into the
+/// `adapter` zone that both allow-nothing rules forbid, optionally with a
+/// per-path override that matches neither side of the import.
+fn boundary_violation_project(with_unrelated_override: bool) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("temporary project");
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src/domain")).expect("create domain directory");
+    std::fs::create_dir_all(root.join("src/adapter")).expect("create adapter directory");
+    std::fs::write(
+        root.join("package.json"),
+        r#"{"name":"boundary-override-repro","private":true,"type":"module"}"#,
+    )
+    .expect("write package");
+    let overrides = if with_unrelated_override {
+        r#""overrides": [{ "files": ["src/other/**"], "rules": { "unused-exports": "off" } }],"#
+    } else {
+        ""
+    };
+    std::fs::write(
+        root.join(".fallowrc.json"),
+        format!(
+            r#"{{
+  "entry": ["src/main.ts"],
+  "rules": {{ "boundary-violation": "error" }},
+  {overrides}
+  "boundaries": {{
+    "zones": [
+      {{ "name": "domain", "patterns": ["src/domain/**"] }},
+      {{ "name": "adapter", "patterns": ["src/adapter/**"] }}
+    ],
+    "rules": [
+      {{ "from": "domain", "allow": [] }},
+      {{ "from": "adapter", "allow": [] }}
+    ]
+  }}
+}}"#
+        ),
+    )
+    .expect("write config");
+    std::fs::write(root.join("src/main.ts"), "import \"./domain/value.ts\";\n")
+        .expect("write entry point");
+    std::fs::write(
+        root.join("src/domain/value.ts"),
+        "import { adapterValue } from \"../adapter/value.ts\";\nconsole.log(adapterValue);\n",
+    )
+    .expect("write domain file");
+    std::fs::write(
+        root.join("src/adapter/value.ts"),
+        "export const adapterValue = 1;\n",
+    )
+    .expect("write adapter file");
+    dir
+}
+
+const BOUNDARY_FAIL_ARGS: &[&str] = &[
+    "--boundary-violations",
+    "--fail-on-issues",
+    "--no-cache",
+    "--format",
+    "json",
+    "--quiet",
+];
+
+#[test]
+fn boundary_violation_fails_on_issues_with_unrelated_override() {
+    let dir = boundary_violation_project(true);
+    let output = run_fallow_in_root("dead-code", dir.path(), BOUNDARY_FAIL_ARGS);
+    let json = parse_json(&output);
+    assert_eq!(
+        json["boundary_violations"].as_array().map(Vec::len),
+        Some(1),
+        "the domain -> adapter import should be reported; stdout: {}",
+        output.stdout
+    );
+    assert_eq!(
+        output.code, 1,
+        "an error-severity boundary violation must fail the run even when an unrelated per-path override exists"
+    );
+}
+
+#[test]
+fn boundary_violation_fails_on_issues_without_override() {
+    let dir = boundary_violation_project(false);
+    let output = run_fallow_in_root("dead-code", dir.path(), BOUNDARY_FAIL_ARGS);
+    assert_eq!(
+        output.code, 1,
+        "an error-severity boundary violation must fail the run"
+    );
+}
+
+/// A `warn` rule plus a per-path override that matches nothing relevant.
+fn warn_with_unrelated_override_project() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("temporary project");
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src")).expect("create source directory");
+    std::fs::write(
+        root.join("package.json"),
+        r#"{"name":"warn-override-repro","private":true,"type":"module"}"#,
+    )
+    .expect("write package");
+    std::fs::write(
+        root.join(".fallowrc.json"),
+        r#"{
+  "entry": ["src/main.ts"],
+  "rules": { "unused-exports": "warn" },
+  "overrides": [{ "files": ["src/other/**"], "rules": { "unused-files": "off" } }]
+}"#,
+    )
+    .expect("write config");
+    std::fs::write(
+        root.join("src/main.ts"),
+        "import { used } from \"./lib.ts\";\nconsole.log(used);\n",
+    )
+    .expect("write entry point");
+    std::fs::write(
+        root.join("src/lib.ts"),
+        "export const used = 1;\nexport const unused = 2;\n",
+    )
+    .expect("write library file");
+    dir
+}
+
+#[test]
+fn warn_rule_with_unrelated_override_exits_1_with_fail_on_issues() {
+    let dir = warn_with_unrelated_override_project();
+    let output = run_fallow_in_root(
+        "dead-code",
+        dir.path(),
+        &[
+            "--unused-exports",
+            "--fail-on-issues",
+            "--no-cache",
+            "--format",
+            "json",
+            "--quiet",
+        ],
+    );
+    assert_eq!(
+        output.code, 1,
+        "--fail-on-issues must promote a warn rule to error even when overrides exist; stdout: {}",
+        output.stdout
+    );
+}
+
+#[test]
+fn warn_rule_with_unrelated_override_exits_0_without_fail_on_issues() {
+    let dir = warn_with_unrelated_override_project();
+    let output = run_fallow_in_root(
+        "dead-code",
+        dir.path(),
+        &[
+            "--unused-exports",
+            "--no-cache",
+            "--format",
+            "json",
+            "--quiet",
+        ],
+    );
+    let json = parse_json(&output);
+    assert!(
+        json["total_issues"].as_u64().unwrap_or(0) > 0,
+        "the unused export should be reported; stdout: {}",
+        output.stdout
+    );
+    assert_eq!(
+        output.code, 0,
+        "a warn-only run without --fail-on-issues exits 0"
+    );
+}
 
 #[test]
 fn check_json_format_produces_valid_json() {
@@ -80,6 +244,523 @@ fn check_json_format_produces_valid_json() {
         "JSON output should have schema_version"
     );
     assert!(json.is_object(), "JSON output should be an object");
+}
+
+#[test]
+fn empty_type_aware_candidate_set_starts_no_companion() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("package.json"),
+        r#"{"name":"clean-type-aware","exports":"./src/index.ts"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("tsconfig.json"),
+        r#"{"compilerOptions":{"strict":true,"noEmit":true},"include":["src/**/*.ts"]}"#,
+    )
+    .unwrap();
+    std::fs::write(root.join("src/index.ts"), "export const live = 1;\n").unwrap();
+    let root_arg = root.to_string_lossy();
+    let missing_companion = root.join("missing-type-aware-companion");
+    let missing_companion_arg = missing_companion.to_string_lossy();
+
+    let output = run_fallow_raw_with_env(
+        &[
+            "dead-code",
+            "--root",
+            &root_arg,
+            "--type-aware",
+            "--unused-exports",
+            "--format",
+            "json",
+            "--quiet",
+        ],
+        &[("FALLOW_TYPE_AWARE_BIN", &missing_companion_arg)],
+    );
+
+    assert_eq!(
+        output.code, 0,
+        "stdout: {}\nstderr: {}",
+        output.stdout, output.stderr
+    );
+    let json = parse_json(&output);
+    assert_eq!(json["total_issues"], 0);
+    assert_eq!(json["_meta"]["type_aware"]["elapsed_ms"], 0);
+    assert_eq!(
+        json["_meta"]["type_aware"]["identity"]["capabilities"],
+        serde_json::json!(["symbol-use"])
+    );
+}
+
+#[test]
+fn focused_type_aware_trace_rejects_unsupported_output_formats() {
+    let output = run_fallow(
+        "dead-code",
+        "basic-project",
+        &[
+            "--type-aware",
+            "--trace",
+            "src/index.ts:anotherUnused3",
+            "--format",
+            "compact",
+            "--quiet",
+        ],
+    );
+
+    assert_eq!(output.code, 2);
+    assert!(
+        output
+            .stderr
+            .contains("focused trace and impact queries support human and JSON output"),
+        "stderr: {}",
+        output.stderr
+    );
+    assert!(output.stdout.is_empty(), "stdout: {}", output.stdout);
+}
+
+#[test]
+fn configured_type_aware_accepts_gitlab_review_renderer() {
+    let root = fixture_path("type-aware-unused-export-refinement");
+    let root_arg = root.to_string_lossy();
+    let config_dir = tempfile::tempdir().expect("type-aware config directory");
+    let config_path = config_dir.path().join("fallow.json");
+    std::fs::write(&config_path, r#"{"typeAware":{"enabled":true}}"#)
+        .expect("write type-aware config");
+    let config_arg = config_path.to_string_lossy();
+    let output = run_fallow_raw_with_type_aware_sidecar(&[
+        "dead-code",
+        "--root",
+        &root_arg,
+        "--config",
+        &config_arg,
+        "--unused-exports",
+        "--unused-types",
+        "--format",
+        "review-gitlab",
+        "--quiet",
+    ]);
+
+    assert_eq!(output.code, 1, "stderr: {}", output.stderr);
+    let envelope = parse_json(&output);
+    assert_eq!(envelope["meta"]["schema"], "fallow-review-envelope/v3");
+    let rendered = output.stdout;
+    assert!(
+        !rendered.contains("PublicApi")
+            && !rendered.contains("PublicComplex")
+            && !rendered.contains("PublicMerged"),
+        "semantically used findings leaked into the review: {rendered}"
+    );
+    assert!(rendered.contains("actuallyUnused"), "review: {rendered}");
+}
+
+#[test]
+fn explicit_type_aware_accepts_gitlab_sticky_comment_renderer() {
+    let root = fixture_path("type-aware-unused-export-refinement");
+    let root_arg = root.to_string_lossy();
+    let output = run_fallow_raw_with_type_aware_sidecar(&[
+        "dead-code",
+        "--root",
+        &root_arg,
+        "--type-aware",
+        "--unused-exports",
+        "--unused-types",
+        "--format",
+        "pr-comment-gitlab",
+        "--quiet",
+    ]);
+
+    assert_eq!(output.code, 1, "stderr: {}", output.stderr);
+    assert!(output.stdout.contains("<!-- fallow-id: fallow-results -->"));
+    for suppressed in ["PublicApi", "PublicComplex", "PublicMerged"] {
+        assert!(
+            !output.stdout.contains(suppressed),
+            "{suppressed} leaked into the sticky comment: {}",
+            output.stdout
+        );
+    }
+    assert_eq!(output.stdout.matches("actuallyUnused").count(), 1);
+}
+
+#[test]
+fn required_type_aware_review_fails_closed_when_companion_is_missing() {
+    let root = fixture_path("type-aware-unused-export-refinement");
+    let root_arg = root.to_string_lossy();
+    let missing = root.join("missing-type-aware-companion");
+    let missing_arg = missing.to_string_lossy();
+    let output = run_fallow_raw_with_env(
+        &[
+            "dead-code",
+            "--root",
+            &root_arg,
+            "--type-aware",
+            "--type-aware-require",
+            "complete",
+            "--unused-exports",
+            "--format",
+            "review-gitlab",
+            "--quiet",
+        ],
+        &[("FALLOW_TYPE_AWARE_BIN", &missing_arg)],
+    );
+
+    assert_eq!(output.code, 2);
+    assert!(output.stdout.is_empty(), "stdout: {}", output.stdout);
+    assert!(
+        output.stderr.contains("Type-aware analysis failed")
+            && !output.stderr.contains("Quality gate passed"),
+        "stderr: {}",
+        output.stderr
+    );
+}
+
+#[test]
+fn type_aware_class_method_impact_uses_exact_owner_identity() {
+    let root = fixture_path("type-aware-class-method-impact");
+    let root_arg = root.to_string_lossy();
+    let output = run_fallow_raw_with_type_aware_sidecar(&[
+        "dead-code",
+        "--root",
+        &root_arg,
+        "--type-aware",
+        "--symbol-impact",
+        "src/repository.ts:UserRepository.save",
+        "--format",
+        "json",
+        "--quiet",
+    ]);
+
+    assert_eq!(
+        output.code, 0,
+        "stdout: {}\nstderr: {}",
+        output.stdout, output.stderr
+    );
+    let json = parse_json(&output);
+    assert_eq!(json["target"]["owner"], serde_json::json!("UserRepository"));
+    assert_eq!(json["target"]["local_name"], serde_json::json!("save"));
+    let direct_consumers = json["direct_consumers"]
+        .as_array()
+        .expect("direct consumers");
+    assert!(
+        direct_consumers
+            .iter()
+            .any(|consumer| consumer["path"] == "src/service.ts")
+    );
+    assert!(
+        direct_consumers
+            .iter()
+            .all(|consumer| consumer["path"] != "src/repository.ts"),
+        "the same-named AuditRepository.save declaration is not a consumer"
+    );
+
+    let preview = run_fallow_raw_with_type_aware_sidecar(&[
+        "fix",
+        "--root",
+        &root_arg,
+        "--type-aware",
+        "--dry-run",
+        "--format",
+        "json",
+        "--quiet",
+    ]);
+    assert_eq!(
+        preview.code, 0,
+        "stdout: {}\nstderr: {}",
+        preview.stdout, preview.stderr
+    );
+    let preview = parse_json(&preview);
+    let fixes = preview["fixes"].as_array().expect("fix preview");
+    assert!(fixes.iter().any(|fix| {
+        fix["type"] == "remove_class_member"
+            && fix["parent"] == "UserRepository"
+            && fix["name"] == "purge"
+            && fix["closed_world_eligible"] == true
+    }));
+    assert!(
+        fixes
+            .iter()
+            .all(|fix| !(fix["parent"] == "UserRepository" && fix["name"] == "save")),
+        "an exact call must prevent a class-member fix"
+    );
+}
+
+#[test]
+fn type_aware_preserves_reachable_aliases_and_reports_actual_unused_export() {
+    let root = fixture_path("type-aware-unused-export-refinement");
+    let root_arg = root.to_string_lossy();
+    let type_aware_args = [
+        "dead-code",
+        "--root",
+        &root_arg,
+        "--type-aware",
+        "--unused-exports",
+        "--unused-types",
+        "--format",
+        "json",
+        "--quiet",
+    ];
+    let typed_output = run_fallow_raw_with_type_aware_sidecar(&type_aware_args);
+    assert_ne!(
+        typed_output.code, 2,
+        "stdout: {}\nstderr: {}",
+        typed_output.stdout, typed_output.stderr
+    );
+    let typed = parse_json(&typed_output);
+    let typed_exports = typed["unused_exports"].as_array().expect("unused exports");
+    let typed_types = typed["unused_types"].as_array().expect("unused types");
+
+    for reachable_alias in ["PublicApi", "PublicComplex", "PublicMerged"] {
+        assert!(
+            typed_exports
+                .iter()
+                .chain(typed_types)
+                .all(|issue| issue["export_name"] != reachable_alias),
+            "{reachable_alias} has a reachable exact consumer"
+        );
+    }
+
+    let actually_unused = typed_exports
+        .iter()
+        .find(|issue| issue["export_name"] == "actuallyUnused")
+        .expect("confirmed unused export");
+    assert_eq!(actually_unused["actions"][0]["auto_fixable"], true);
+
+    assert!(
+        typed_exports
+            .iter()
+            .any(|issue| issue["export_name"] == "mixedNonCrediting"),
+        "mixed unreachable-read and bare-re-export evidence must not hide dead code: {typed_exports:?}"
+    );
+
+    let decisions = typed["_meta"]["type_aware"]["candidate_decisions"]
+        .as_array()
+        .expect("candidate decisions");
+    let unused_decision = decisions
+        .iter()
+        .find(|decision| decision["subject"]["exported_name"] == "actuallyUnused")
+        .expect("unused export decision");
+    assert_eq!(
+        unused_decision["decision"],
+        "confirmed-no-static-references"
+    );
+
+    let mixed_decision = decisions
+        .iter()
+        .find(|decision| decision["subject"]["exported_name"] == "mixedNonCrediting")
+        .expect("mixed non-crediting evidence decision");
+    assert_eq!(mixed_decision["decision"], "retained-abstained");
+}
+
+#[test]
+fn type_aware_framework_contract_requires_package_provenance() {
+    let dir = tempfile::tempdir().expect("temporary project");
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src")).expect("create source directory");
+    std::fs::create_dir_all(root.join("node_modules/lit")).expect("create fake lit package");
+    std::fs::write(
+        root.join("package.json"),
+        r#"{"name":"framework-contract","private":true,"type":"module","main":"src/index.ts","dependencies":{"lit":"1.0.0"}}"#,
+    )
+    .expect("write package");
+    std::fs::write(
+        root.join("tsconfig.json"),
+        r#"{"compilerOptions":{"module":"nodenext","moduleResolution":"nodenext","strict":true},"include":["src/**/*.ts"]}"#,
+    )
+    .expect("write tsconfig");
+    std::fs::write(
+        root.join("node_modules/lit/package.json"),
+        r#"{"name":"lit","version":"1.0.0","types":"index.d.ts"}"#,
+    )
+    .expect("write fake lit manifest");
+    std::fs::write(
+        root.join("node_modules/lit/index.d.ts"),
+        "export declare class LitElement {}\n",
+    )
+    .expect("write fake lit declaration");
+    std::fs::write(
+        root.join("src/real.ts"),
+        "import { LitElement } from \"lit\";\nexport class RealElement extends LitElement {\n  render(): unknown { return null; }\n}\n",
+    )
+    .expect("write package-backed class");
+    std::fs::write(
+        root.join("src/local.ts"),
+        "class LitElement {}\nexport class LocalElement extends LitElement {\n  render(): unknown { return null; }\n}\n",
+    )
+    .expect("write local same-name class");
+    std::fs::write(
+        root.join("src/index.ts"),
+        "import { RealElement } from \"./real.js\";\nimport { LocalElement } from \"./local.js\";\nnew RealElement();\nnew LocalElement();\n",
+    )
+    .expect("write entry point");
+
+    let root_arg = root.to_string_lossy();
+    let output = run_fallow_raw_with_type_aware_sidecar(&[
+        "dead-code",
+        "--root",
+        &root_arg,
+        "--unused-class-members",
+        "--type-aware",
+        "--format",
+        "json",
+        "--quiet",
+    ]);
+
+    assert_eq!(
+        output.code, 1,
+        "stdout: {}\nstderr: {}",
+        output.stdout, output.stderr
+    );
+    let json = parse_json(&output);
+    let decisions = json["_meta"]["type_aware"]["candidate_decisions"]
+        .as_array()
+        .unwrap_or_else(|| panic!("semantic decisions missing: {}", output.stdout));
+    let real = decisions
+        .iter()
+        .find(|decision| decision["subject"]["owner"] == "RealElement")
+        .expect("real framework method decision");
+    assert_eq!(real["decision"], "contract-preserved");
+    assert_eq!(real["framework_contract"]["package"], "lit");
+    assert!(
+        real["explanation"]
+            .as_str()
+            .is_some_and(|explanation| explanation.contains("lit contract"))
+    );
+    let local = decisions
+        .iter()
+        .find(|decision| decision["subject"]["owner"] == "LocalElement")
+        .expect("local same-name method decision");
+    assert_eq!(local["decision"], "confirmed-no-static-references");
+    assert!(local.get("framework_contract").is_none());
+    assert_eq!(local["closed_world_eligible"], true);
+}
+
+#[test]
+fn duplicate_export_add_to_config_is_auto_fixable_with_explicit_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src/one")).unwrap();
+    std::fs::create_dir_all(root.join("src/two")).unwrap();
+    std::fs::write(
+        root.join("package.json"),
+        r#"{"name":"explicit-config","main":"src/index.ts"}"#,
+    )
+    .unwrap();
+    let config_path = root.join("custom.fallow.json");
+    std::fs::write(&config_path, "{}\n").unwrap();
+    std::fs::write(
+        root.join("src/index.ts"),
+        "export { Button } from './one';\nexport { Button as Button2 } from './two';\nconsole.log(Button2);\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("src/one/index.ts"), "export const Button = 1;\n").unwrap();
+    std::fs::write(root.join("src/two/index.ts"), "export const Button = 2;\n").unwrap();
+
+    let output = run_fallow_in_root(
+        "dead-code",
+        root,
+        &[
+            "--config",
+            config_path.to_str().unwrap(),
+            "--duplicate-exports",
+            "--format",
+            "json",
+            "--quiet",
+        ],
+    );
+    assert_eq!(
+        output.code, 1,
+        "duplicate export should be reported: stdout={}, stderr={}",
+        output.stdout, output.stderr
+    );
+
+    let json = parse_json(&output);
+    let actions = json["duplicate_exports"][0]["actions"].as_array().unwrap();
+    assert_eq!(actions[0]["type"], "add-to-config");
+    assert_eq!(actions[0]["auto_fixable"], true);
+}
+
+#[test]
+fn combined_performance_includes_duplication_stage() {
+    let output = run_fallow_combined(
+        "duplicate-code",
+        &["--only", "dead-code,dupes", "--performance", "--quiet"],
+    );
+    assert!(
+        output.code == 0 || output.code == 1,
+        "combined performance run should not crash: stdout={}\nstderr={}",
+        output.stdout,
+        output.stderr
+    );
+    assert!(
+        output.stderr.contains("Pipeline Performance"),
+        "combined --performance should print pipeline table: {}",
+        output.stderr
+    );
+    assert!(
+        output.stderr.contains("duplication:"),
+        "pipeline table should include duplication stage: {}",
+        output.stderr
+    );
+}
+
+/// Combined mode runs check and dupes via `rayon::join`. Verify the parallel
+/// scheduling does not leak nondeterminism into the rendered JSON: repeated
+/// runs against the same fixture must produce byte-identical output once the
+/// inherently nondeterministic wall-clock fields are stripped.
+#[test]
+fn combined_parallel_output_is_deterministic() {
+    fn normalize(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Object(map) => {
+                map.remove("elapsed_ms");
+                if let Some(telemetry) = map
+                    .get_mut("_meta")
+                    .and_then(|meta| meta.get_mut("telemetry"))
+                    .and_then(|telemetry| telemetry.as_object_mut())
+                {
+                    telemetry.remove("analysis_run_id");
+                }
+                for v in map.values_mut() {
+                    normalize(v);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for v in items {
+                    normalize(v);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut canonicalized: Vec<String> = std::iter::repeat_with(|| {
+        let output = run_fallow_combined(
+            "duplicate-code",
+            &["--only", "dead-code,dupes", "--format", "json", "--quiet"],
+        );
+        assert!(
+            output.code == 0 || output.code == 1,
+            "combined run should not crash: stdout={}\nstderr={}",
+            output.stdout,
+            output.stderr
+        );
+        let mut value = parse_json(&output);
+        normalize(&mut value);
+        serde_json::to_string(&value).expect("re-serialize canonical json")
+    })
+    .take(3)
+    .collect();
+
+    let first = canonicalized.remove(0);
+    for (idx, run) in canonicalized.iter().enumerate() {
+        assert_eq!(
+            &first,
+            run,
+            "combined parallel run #{} differed from run #0",
+            idx + 1
+        );
+    }
 }
 
 #[test]
@@ -138,9 +819,24 @@ fn check_codeclimate_format_is_array() {
     assert!(json.is_array(), "codeclimate output should be a JSON array");
 }
 
-// ---------------------------------------------------------------------------
-// Issue type filtering
-// ---------------------------------------------------------------------------
+#[test]
+fn check_gitlab_codequality_alias_is_array() {
+    let output = run_fallow(
+        "check",
+        "basic-project",
+        &["--format", "gitlab-codequality", "--quiet"],
+    );
+    let json: serde_json::Value = serde_json::from_str(&output.stdout).unwrap_or_else(|e| {
+        panic!(
+            "failed to parse gitlab-codequality JSON: {e}\nstdout: {}",
+            output.stdout
+        )
+    });
+    assert!(
+        json.is_array(),
+        "gitlab-codequality output should be a JSON array"
+    );
+}
 
 #[test]
 fn check_unused_files_filter_limits_output() {
@@ -199,10 +895,6 @@ fn check_unused_deps_filter() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// JSON structure validation
-// ---------------------------------------------------------------------------
-
 #[test]
 fn check_json_has_total_issues() {
     let output = run_fallow("check", "basic-project", &["--format", "json", "--quiet"]);
@@ -227,10 +919,6 @@ fn check_json_has_version_and_elapsed() {
         "JSON should have elapsed_ms"
     );
 }
-
-// ---------------------------------------------------------------------------
-// Error handling
-// ---------------------------------------------------------------------------
 
 #[test]
 fn check_invalid_root_exits_2() {
@@ -261,14 +949,6 @@ fn check_json_error_format() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Human output snapshots (Phase 6)
-// ---------------------------------------------------------------------------
-
-// NOTE: full human output snapshot (all issue types combined) is not snapshotted
-// because FxHashMap iteration order makes dependency listing non-deterministic.
-// Individual issue-type snapshots below are stable.
-
 #[test]
 fn check_human_output_unused_files_only() {
     let output = run_fallow("check", "basic-project", &["--unused-files", "--quiet"]);
@@ -285,7 +965,51 @@ fn check_human_output_unused_exports_only() {
     insta::assert_snapshot!("check_human_unused_exports_only", redacted);
 }
 
-// NOTE: unused-deps human snapshot skipped — dependency iteration order is non-deterministic
+fn combined_check_unused_export_names(json: &serde_json::Value) -> Vec<String> {
+    json["check"]["unused_exports"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v["export_name"].as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[test]
+fn include_entry_exports_works_in_combined_mode() {
+    let output = run_fallow_combined(
+        "entry-export-validation",
+        &["--include-entry-exports", "--format", "json", "--quiet"],
+    );
+    assert!(
+        !output.stderr.contains("unexpected argument")
+            && !output.stderr.contains("error: unrecognized argument"),
+        "combined mode must accept --include-entry-exports; stderr: {}",
+        output.stderr
+    );
+    let json = parse_json(&output);
+    let names = combined_check_unused_export_names(&json);
+    assert!(
+        names.iter().any(|n| n == "meatdata"),
+        "meatdata typo should be flagged in combined mode with --include-entry-exports, got: {names:?}"
+    );
+}
+
+#[test]
+fn include_entry_exports_via_config_file_in_combined_mode() {
+    let output = run_fallow_combined(
+        "entry-export-validation-config",
+        &["--format", "json", "--quiet"],
+    );
+    let json = parse_json(&output);
+    let names = combined_check_unused_export_names(&json);
+    assert!(
+        names.iter().any(|n| n == "meatdata"),
+        "meatdata should be flagged via includeEntryExports in config, got: {names:?}"
+    );
+}
+
 #[test]
 fn check_human_output_unused_deps_has_content() {
     let output = run_fallow("check", "basic-project", &["--unused-deps", "--quiet"]);
@@ -296,5 +1020,1175 @@ fn check_human_output_unused_deps_has_content() {
     assert!(
         output.stdout.contains("unused-dep"),
         "should list unused-dep"
+    );
+}
+
+/// Build a project with one unused file under `src/legacy` and one under `src`,
+/// plus the given `ignoreFindings` patterns.
+fn ignore_findings_project(patterns: &str) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("temporary project");
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src/legacy")).expect("create source directories");
+    std::fs::write(
+        root.join("package.json"),
+        r#"{"name":"ignore-findings","private":true,"type":"module","main":"src/index.ts"}"#,
+    )
+    .expect("write package");
+    std::fs::write(
+        root.join(".fallowrc.json"),
+        format!(r#"{{"ignoreFindings": {patterns}}}"#),
+    )
+    .expect("write config");
+    std::fs::write(
+        root.join("src/index.ts"),
+        "export const main = (): void => {};\n",
+    )
+    .expect("write entry point");
+    std::fs::write(root.join("src/legacy/old.ts"), "export const old = 1;\n")
+        .expect("write legacy file");
+    std::fs::write(root.join("src/orphan.ts"), "export const orphan = 1;\n")
+        .expect("write orphan file");
+    dir
+}
+
+#[test]
+fn ignore_findings_pattern_matching_nothing_prints_note() {
+    let dir = ignore_findings_project(r#"["src/legacy/**", "src/legcy/**"]"#);
+    let output = run_fallow_in_root("dead-code", dir.path(), &["--unused-files"]);
+
+    assert!(
+        output
+            .stderr
+            .contains("ignoreFindings pattern matched no finding")
+            && output.stderr.contains("src/legcy/**"),
+        "stderr should name the pattern that matched nothing; stderr: {}",
+        output.stderr
+    );
+    assert!(
+        !output.stderr.contains("src/legacy/**"),
+        "the matching pattern should not be named; stderr: {}",
+        output.stderr
+    );
+}
+
+#[test]
+fn ignore_findings_pattern_that_matches_prints_no_note() {
+    let dir = ignore_findings_project(r#"["src/legacy/**"]"#);
+    let output = run_fallow_in_root("dead-code", dir.path(), &["--unused-files"]);
+
+    assert!(
+        !output.stderr.contains("ignoreFindings"),
+        "a matching pattern should stay silent; stderr: {}",
+        output.stderr
+    );
+}
+
+#[test]
+fn no_ignore_findings_configuration_prints_no_note() {
+    let dir = ignore_findings_project("[]");
+    let output = run_fallow_in_root("dead-code", dir.path(), &["--unused-files"]);
+
+    assert!(
+        !output.stderr.contains("ignoreFindings"),
+        "an empty configuration should stay silent; stderr: {}",
+        output.stderr
+    );
+}
+
+#[test]
+fn ignore_findings_note_stays_out_of_json_output() {
+    let dir = ignore_findings_project(r#"["src/legacy/**", "src/legcy/**"]"#);
+    let output = run_fallow_in_root(
+        "dead-code",
+        dir.path(),
+        &["--unused-files", "--format", "json"],
+    );
+
+    assert!(
+        !output.stdout.contains("ignoreFindings") && !output.stderr.contains("ignoreFindings"),
+        "json output must not carry the human note; stdout: {}\nstderr: {}",
+        output.stdout,
+        output.stderr
+    );
+}
+
+/// Issue #2358: a bun.lockb-only repo with overrides gets no unused-override
+/// findings (resolution is unreadable); the JSON envelope must explain the
+/// skip through `workspace_diagnostics[]` and the human run must warn.
+#[test]
+fn bun_lockb_only_override_skip_surfaces_in_json_and_human_output() {
+    let output = run_fallow(
+        "dead-code",
+        "issue-2358-bun-lockb-diagnostic",
+        &["--format", "json", "--quiet", "--no-cache"],
+    );
+    let json = parse_json(&output);
+    assert!(
+        json["unused_dependency_overrides"]
+            .as_array()
+            .is_none_or(Vec::is_empty),
+        "the unused-override check must stay skipped: {}",
+        json["unused_dependency_overrides"]
+    );
+    let diagnostics = json["workspace_diagnostics"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let skips: Vec<&serde_json::Value> = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic["kind"] == "bun-lockb-override-resolution-skipped")
+        .collect();
+    assert_eq!(
+        skips.len(),
+        1,
+        "exactly one skip diagnostic for the root manifest: {diagnostics:?}"
+    );
+    assert_eq!(skips[0]["path"], "package.json");
+    let message = skips[0]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("no parseable text lockfile")
+            && message.contains("bun install --save-text-lockfile"),
+        "message states the cause and the text-lockfile next step: {message}"
+    );
+
+    let root = fixture_path("issue-2358-bun-lockb-diagnostic");
+    let human = run_fallow_raw_with_env(
+        &[
+            "dead-code",
+            "--root",
+            root.to_str().expect("fixture path is UTF-8"),
+            "--no-cache",
+        ],
+        &[("RUST_LOG", "warn")],
+    );
+    assert!(
+        human.stderr.contains("no parseable text lockfile")
+            && human.stderr.contains("bun install --save-text-lockfile"),
+        "human run warns about the skip on stderr; stderr: {}",
+        human.stderr
+    );
+}
+
+/// Issue #2367: a bun repo that pins versions under Yarn-style `resolutions`
+/// gets unused-override findings in JSON output, sourced to `package.json`
+/// with the bun hint naming `resolutions`.
+#[test]
+fn bun_resolutions_surface_as_unused_overrides_in_json_output() {
+    let output = run_fallow(
+        "dead-code",
+        "issue-2367-bun-resolutions",
+        &["--format", "json", "--quiet", "--no-cache"],
+    );
+    let json = parse_json(&output);
+    let findings = json["unused_dependency_overrides"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let mut keys: Vec<&str> = findings
+        .iter()
+        .filter_map(|finding| finding["raw_key"].as_str())
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        vec!["**/trim-newlines", "left-pad"],
+        "the two unresolved resolutions pins are reported: {findings:?}"
+    );
+    for finding in &findings {
+        assert_eq!(finding["source"], "package.json");
+        assert_eq!(finding["path"], "package.json");
+        let hint = finding["hint"].as_str().unwrap_or_default();
+        assert!(
+            hint.contains("resolutions") && hint.contains("bun install --frozen-lockfile"),
+            "the bun hint names the resolutions origin: {hint}"
+        );
+    }
+    assert!(
+        json["workspace_diagnostics"]
+            .as_array()
+            .is_none_or(Vec::is_empty),
+        "a parseable bun.lock resolves normally: {}",
+        json["workspace_diagnostics"]
+    );
+}
+
+/// The #2371 probe: `src/impl.ts` exports a value whose only consumer is the
+/// bound `import type` in `src/index.ts`.
+fn write_type_only_import_probe(root: &std::path::Path) {
+    std::fs::create_dir_all(root.join("src")).expect("create source directory");
+    std::fs::write(
+        root.join("package.json"),
+        r#"{"name":"probe","type":"module","main":"src/index.ts"}"#,
+    )
+    .expect("write package.json");
+    std::fs::write(
+        root.join("src/index.ts"),
+        "import type { helper } from './impl';\nexport type T = typeof helper;\n",
+    )
+    .expect("write index.ts");
+    std::fs::write(
+        root.join("src/impl.ts"),
+        "export const helper = (): number => 1;\n",
+    )
+    .expect("write impl.ts");
+}
+
+/// A `tsconfig.json` the sidecar can select for a probe under `src`.
+fn write_probe_tsconfig(root: &std::path::Path) {
+    std::fs::write(
+        root.join("tsconfig.json"),
+        r#"{"compilerOptions":{"strict":true,"module":"ESNext","moduleResolution":"Bundler","target":"ES2022","noEmit":true},"include":["src"]}"#,
+    )
+    .expect("write tsconfig.json");
+}
+
+/// Issue #2371: a value-only export whose only credit is a bound
+/// `import type` is not reported by dead-code, and the trace must say so
+/// through the type namespace instead of contradicting the verdict.
+#[test]
+fn trace_reports_the_type_lane_credit_of_a_value_only_export() {
+    let dir = tempfile::tempdir().expect("temporary project");
+    let root = dir.path();
+    write_type_only_import_probe(root);
+
+    let verdict = parse_json(&run_fallow_in_root(
+        "dead-code",
+        root,
+        &["--format", "json", "--quiet", "--no-cache"],
+    ));
+    assert_eq!(
+        verdict["unused_exports"].as_array().map(Vec::len),
+        Some(0),
+        "the type-only import credits the value export: {}",
+        verdict["unused_exports"]
+    );
+
+    let trace = parse_json(&run_fallow_in_root(
+        "dead-code",
+        root,
+        &[
+            "--trace",
+            "src/impl.ts:helper",
+            "--format",
+            "json",
+            "--quiet",
+            "--no-cache",
+        ],
+    ));
+    assert_eq!(trace["kind"], "trace");
+    assert_eq!(trace["namespace"], "type");
+    assert_eq!(trace["is_used"], true);
+    assert_eq!(trace["direct_references"][0]["from_file"], "src/index.ts");
+    assert_eq!(trace["direct_references"][0]["kind"], "named import");
+    assert_eq!(trace["reason"], "Used by 1 file(s)");
+
+    let human = run_fallow_in_root(
+        "dead-code",
+        root,
+        &["--trace", "src/impl.ts:helper", "--quiet", "--no-cache"],
+    );
+    // The human renderer prints native paths, so normalize separators before
+    // matching: on Windows the same lines read `src\impl.ts`.
+    let stderr = redact_paths(&human.stderr, root);
+    assert!(
+        stderr.contains("USED helper in src/impl.ts")
+            && stderr.contains("Namespace: type")
+            && stderr.contains("-> src/index.ts (named import)"),
+        "human trace reports the type-lane credit; stderr: {stderr}"
+    );
+}
+
+/// Issue #2371: the checker proof beside the syntactic trace follows the local
+/// alias read through a type-only import. The proof stays scoped to the value
+/// declaration occupied by `helper`, while the root graph trace reports its
+/// type-lane credit.
+#[test]
+fn type_aware_trace_proves_typeof_read_through_type_only_import() {
+    let dir = tempfile::tempdir().expect("temporary project");
+    let root = dir.path();
+    write_type_only_import_probe(root);
+    write_probe_tsconfig(root);
+    let root_arg = root.to_string_lossy();
+
+    let output = run_fallow_raw_with_type_aware_sidecar(&[
+        "dead-code",
+        "--root",
+        &root_arg,
+        "--trace",
+        "src/impl.ts:helper",
+        "--type-aware",
+        "--format",
+        "json",
+        "--quiet",
+        "--no-cache",
+    ]);
+
+    let trace = parse_json(&output);
+    assert_eq!(trace["namespace"], "type", "stderr: {}", output.stderr);
+    assert_eq!(trace["is_used"], true);
+    assert_eq!(trace["direct_references"][0]["from_file"], "src/index.ts");
+    assert_eq!(
+        trace["semantic"]["target"]["namespace"], "value",
+        "the proof covers the declaration's own lane: {}",
+        trace["semantic"]
+    );
+    assert_eq!(trace["semantic"]["assertion"], "references-found");
+
+    let human = run_fallow_raw_with_type_aware_sidecar(&[
+        "dead-code",
+        "--root",
+        &root_arg,
+        "--trace",
+        "src/impl.ts:helper",
+        "--type-aware",
+        "--quiet",
+        "--no-cache",
+    ]);
+    let stderr = redact_paths(&human.stderr, root);
+    assert!(
+        stderr.contains("Type-aware proof: references-found (complete)")
+            && stderr.contains("src/index.ts:2:23 (value-reference, Value)"),
+        "the proof lists the value read through the local alias; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn filtered_type_aware_dead_code_keeps_unreachable_only_export_evidence() {
+    let root = fixture_path("issue-2390-trace-consistency");
+    let root_arg = root.to_string_lossy();
+    let output = run_fallow_raw_with_type_aware_sidecar(&[
+        "dead-code",
+        "--root",
+        &root_arg,
+        "--type-aware",
+        "--unused-exports",
+        "--format",
+        "json",
+        "--quiet",
+        "--no-cache",
+    ]);
+
+    let report = parse_json(&output);
+    let helper = report["unused_exports"]
+        .as_array()
+        .expect("unused exports")
+        .iter()
+        .find(|finding| finding["path"] == "src/lonely.ts" && finding["export_name"] == "helper")
+        .unwrap_or_else(|| {
+            panic!("unreachable-only checker evidence must not hide helper: {report}")
+        });
+    assert_eq!(helper["semantic"]["decision"], "retained-abstained");
+}
+
+#[test]
+fn type_aware_trace_does_not_credit_an_unreachable_consumer() {
+    let root = fixture_path("issue-2390-trace-consistency");
+    let root_arg = root.to_string_lossy();
+    let output = run_fallow_raw_with_type_aware_sidecar(&[
+        "dead-code",
+        "--root",
+        &root_arg,
+        "--trace",
+        "src/lonely.ts:helper",
+        "--type-aware",
+        "--format",
+        "json",
+        "--quiet",
+        "--no-cache",
+    ]);
+
+    let trace = parse_json(&output);
+    assert_eq!(trace["is_used"], false);
+    assert_eq!(
+        trace["semantic"]["assertion"],
+        "references-only-in-unreachable-files"
+    );
+    assert_eq!(trace["semantic"]["status"], "partial");
+    assert_eq!(trace["semantic"]["references"][0]["path"], "src/orphan.ts");
+}
+
+fn combined_root_diagnostics_of_kind(
+    json: &serde_json::Value,
+    kind: &str,
+) -> Vec<serde_json::Value> {
+    json["workspace_diagnostics"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|diagnostic| diagnostic["kind"] == kind)
+        .collect()
+}
+
+/// Write a project whose `pnpm-workspace.yaml` does not parse, the second
+/// analysis-stage diagnostic kind, and return its temp dir.
+fn malformed_pnpm_workspace_project() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("package.json"),
+        r#"{"name":"issue-2366-malformed-pnpm-workspace-yaml","private":true}"#,
+    )
+    .expect("write package.json");
+    std::fs::write(
+        dir.path().join("pnpm-workspace.yaml"),
+        "catalog:\n  react: ^18.2.0\n{this is\nnot: valid: yaml: at: all\n",
+    )
+    .expect("write malformed pnpm-workspace.yaml");
+    std::fs::create_dir_all(dir.path().join("src")).expect("create src");
+    std::fs::write(
+        dir.path().join("src/index.ts"),
+        "export const greet = (name: string): string => `hello ${name}`;\n",
+    )
+    .expect("write source");
+    dir
+}
+
+/// Issue #2366: the bare combined run (`fallow --format json`) must carry the
+/// analysis-stage workspace diagnostics that `dead-code --format json` carries.
+/// The combined root is the single carrier, so no section repeats the array.
+/// Both kinds the analyze stage records are covered: the bun.lockb override
+/// skip and a malformed `pnpm-workspace.yaml`.
+#[test]
+fn combined_json_root_carries_analysis_stage_workspace_diagnostics() {
+    let output = run_fallow_combined(
+        "issue-2358-bun-lockb-diagnostic",
+        &["--format", "json", "--quiet", "--no-cache"],
+    );
+    let json = parse_json(&output);
+    let skips = combined_root_diagnostics_of_kind(&json, "bun-lockb-override-resolution-skipped");
+    assert_eq!(
+        skips.len(),
+        1,
+        "exactly one bun.lockb skip diagnostic on the combined root: {}",
+        json["workspace_diagnostics"]
+    );
+    assert_eq!(skips[0]["path"], "package.json");
+
+    let dir = malformed_pnpm_workspace_project();
+    let output = run_fallow_raw(&[
+        "--root",
+        dir.path().to_str().expect("temp path is UTF-8"),
+        "--format",
+        "json",
+        "--quiet",
+        "--no-cache",
+    ]);
+    let json = parse_json(&output);
+    let malformed = combined_root_diagnostics_of_kind(&json, "malformed-pnpm-workspace-yaml");
+    assert_eq!(
+        malformed.len(),
+        1,
+        "exactly one malformed yaml diagnostic on the combined root: {}",
+        json["workspace_diagnostics"]
+    );
+    assert_eq!(malformed[0]["path"], "pnpm-workspace.yaml");
+    assert!(
+        json["check"].is_object() && json["dupes"].is_object() && json["health"].is_object(),
+        "all three sections ran, so the absence checks below are not vacuous: {json}"
+    );
+    assert!(
+        json["check"].get("workspace_diagnostics").is_none()
+            && json["dupes"].get("workspace_diagnostics").is_none()
+            && json["health"].get("workspace_diagnostics").is_none(),
+        "the root is the only carrier; no section repeats the array: {json}"
+    );
+}
+
+/// Issue #2366: the carrier is unconditional, so a combined run that drops the
+/// `check` section still reports what its analyses recorded. `--skip check`
+/// and `--only health` both still run a dead-code analyze pass, which is what
+/// records the analysis-stage kinds and warns on stderr.
+#[test]
+fn combined_json_carries_workspace_diagnostics_without_a_check_section() {
+    for section_flags in [
+        ["--skip", "check"].as_slice(),
+        ["--only", "health"].as_slice(),
+    ] {
+        let mut args = vec!["--format", "json", "--quiet", "--no-cache"];
+        args.extend_from_slice(section_flags);
+        let output = run_fallow_combined("issue-2358-bun-lockb-diagnostic", &args);
+        let json = parse_json(&output);
+        assert!(
+            json.get("check").is_none(),
+            "{section_flags:?} drops the check section: {json}"
+        );
+        let skips =
+            combined_root_diagnostics_of_kind(&json, "bun-lockb-override-resolution-skipped");
+        assert_eq!(
+            skips.len(),
+            1,
+            "{section_flags:?} still carries the skip diagnostic: {}",
+            json["workspace_diagnostics"]
+        );
+        assert_eq!(skips[0]["path"], "package.json");
+    }
+}
+
+/// Issue #2366: `--only dupes` runs no dead-code analyze pass, so it records no
+/// analysis-stage kind, but the workspace-discovery diagnostics config load
+/// records still reach the combined root.
+#[test]
+fn combined_json_only_dupes_carries_workspace_discovery_diagnostics() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(dir.path().join("packages/no-manifest/src")).expect("create packages");
+    std::fs::create_dir_all(dir.path().join("src")).expect("create src");
+    std::fs::write(
+        dir.path().join("package.json"),
+        r#"{"name":"issue-2366-only-dupes","private":true,"main":"src/index.ts","workspaces":["packages/*"]}"#,
+    )
+    .expect("write package.json");
+    std::fs::write(dir.path().join("src/index.ts"), "export const value = 1;\n")
+        .expect("write source");
+    std::fs::write(
+        dir.path().join("packages/no-manifest/src/a.ts"),
+        "export const other = 2;\n",
+    )
+    .expect("write workspace source");
+
+    let output = run_fallow_raw(&[
+        "--root",
+        dir.path().to_str().expect("temp path is UTF-8"),
+        "--format",
+        "json",
+        "--quiet",
+        "--no-cache",
+        "--only",
+        "dupes",
+    ]);
+    let json = parse_json(&output);
+    assert!(
+        json["dupes"].is_object() && json.get("check").is_none() && json.get("health").is_none(),
+        "only the dupes section ran: {json}"
+    );
+    let unmatched = combined_root_diagnostics_of_kind(&json, "glob-matched-no-package-json");
+    assert_eq!(
+        unmatched.len(),
+        1,
+        "the workspace glob diagnostic reaches a dupes-only combined run: {}",
+        json["workspace_diagnostics"]
+    );
+    assert_eq!(unmatched[0]["path"], "packages/no-manifest");
+}
+
+/// Issue #2366: one glob declared in both `package.json` and
+/// `pnpm-workspace.yaml`, in the two spellings those files conventionally use,
+/// is ONE diagnostic per matched directory.
+///
+/// Config load expands both manifests and records a diagnostic from each, so
+/// the process registry the standalone envelopes read verbatim held the same
+/// finding twice, with `./pkgs/*` and `pkgs/*` as its `pattern`. Keying the
+/// fold on the typed payload would have kept both spellings as distinct
+/// entries, doubling the array on a real monorepo, so the recorded pattern
+/// drops the no-op `./`, the recorded path drops the matching no-op `.`
+/// component, and workspace discovery folds its own list before returning it.
+/// `list_tests` covers the same shape on the workspace listing envelope, which
+/// reads that list instead of the registry.
+#[test]
+fn one_glob_declared_in_two_manifests_reports_one_diagnostic() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("pkgs/aaa")).expect("create package-less dir");
+    std::fs::create_dir_all(root.join("src")).expect("create src");
+    std::fs::write(
+        root.join("package.json"),
+        r#"{"name":"issue-2366-two-manifests","private":true,"main":"src/index.ts","workspaces":["./pkgs/*"]}"#,
+    )
+    .expect("write package.json");
+    std::fs::write(
+        root.join("pnpm-workspace.yaml"),
+        "packages:\n  - \"pkgs/*\"\n",
+    )
+    .expect("write pnpm-workspace.yaml");
+    std::fs::write(root.join("src/index.ts"), "export const value = 1;\n").expect("write source");
+    std::fs::write(root.join("pkgs/aaa/readme.txt"), "no package.json here\n")
+        .expect("write filler");
+
+    for args in [["dead-code"].as_slice(), ["list"].as_slice(), [].as_slice()] {
+        let mut argv = args.to_vec();
+        argv.extend_from_slice(&[
+            "--root",
+            root.to_str().expect("temp path is UTF-8"),
+            "--format",
+            "json",
+            "--quiet",
+            "--no-cache",
+        ]);
+        let json = parse_json(&run_fallow_raw(&argv));
+        let patterns: Vec<String> = json["workspace_diagnostics"]
+            .as_array()
+            .map(|diagnostics| {
+                diagnostics
+                    .iter()
+                    .filter(|entry| entry["kind"] == "glob-matched-no-package-json")
+                    .map(|entry| entry["pattern"].as_str().unwrap_or_default().to_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(
+            patterns,
+            ["pkgs/*"],
+            "`fallow {args:?}` reports the directory once: {}",
+            json["workspace_diagnostics"]
+        );
+    }
+}
+
+/// Write a project whose test file is over the `--max-file-size 1` ceiling, so
+/// a NON-production walk records `skipped-large-file` for it and a production
+/// walk (which excludes test files) never sees it. `production_config` is the
+/// `.fallowrc.json` body that splits the per-analysis production modes.
+fn split_production_large_test_file_project(production_config: &str) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("package.json"),
+        r#"{"name":"issue-2366-split-production","private":true,"main":"src/index.ts"}"#,
+    )
+    .expect("write package.json");
+    std::fs::write(dir.path().join(".fallowrc.json"), production_config)
+        .expect("write .fallowrc.json");
+    std::fs::create_dir_all(dir.path().join("src")).expect("create src");
+    std::fs::write(dir.path().join("src/index.ts"), "export const value = 1;\n")
+        .expect("write source");
+    std::fs::write(
+        dir.path().join("src/huge.test.ts"),
+        "// filler\n".repeat(150_000),
+    )
+    .expect("write oversized test file");
+    dir
+}
+
+/// Two oversized files, one production and one test, plus both analysis-stage
+/// diagnostic kinds: under a `production` split every walk in the run skips a
+/// different pair, so each analysis contributes its own source-discovery list
+/// and the union has entries from more than one observation point.
+fn split_production_two_large_files_project(production_config: &str) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("package.json"),
+        r#"{"name":"issue-2366-repeat-runs","private":true,"main":"src/index.ts","overrides":{"ws":"^8.21.0"},"dependencies":{"ws":"^8.18.0"}}"#,
+    )
+    .expect("write package.json");
+    std::fs::write(
+        dir.path().join("bun.lockb"),
+        b"\x00binary lockfile placeholder\x00",
+    )
+    .expect("write bun.lockb placeholder");
+    std::fs::write(
+        dir.path().join("pnpm-workspace.yaml"),
+        "catalog:\n  react: ^18.2.0\n{this is\nnot: valid: yaml: at: all\n",
+    )
+    .expect("write malformed pnpm-workspace.yaml");
+    std::fs::write(dir.path().join(".fallowrc.json"), production_config)
+        .expect("write .fallowrc.json");
+    std::fs::create_dir_all(dir.path().join("src")).expect("create src");
+    std::fs::write(dir.path().join("src/index.ts"), "export const value = 1;\n")
+        .expect("write source");
+    std::fs::write(
+        dir.path().join("src/huge.prod.ts"),
+        "// filler\n".repeat(150_000),
+    )
+    .expect("write oversized production file");
+    std::fs::write(
+        dir.path().join("src/huge.test.ts"),
+        "// filler\n".repeat(150_000),
+    )
+    .expect("write oversized test file");
+    dir
+}
+
+/// Write a project whose only source outside `src/` sits in a dot-prefixed
+/// directory discovery does not traverse, so a walk records exactly one
+/// `skipped-source-dotdir` (issue #461).
+fn skipped_source_dotdir_project() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("package.json"),
+        r#"{"name":"issue-461-skipped-source-dotdir","private":true,"main":"src/index.ts"}"#,
+    )
+    .expect("write package.json");
+    std::fs::create_dir_all(dir.path().join("src")).expect("create src");
+    std::fs::write(dir.path().join("src/index.ts"), "export const value = 1;\n")
+        .expect("write source");
+    std::fs::create_dir_all(dir.path().join(".claude/hooks")).expect("create .claude/hooks");
+    std::fs::write(
+        dir.path().join(".claude/hooks/probe.mjs"),
+        "export const hook = () => 1;\n",
+    )
+    .expect("write hook");
+    dir
+}
+
+/// Issue #461: the diagnostic has to survive combined mode's per-analysis
+/// config reload to reach the JSON envelope, which is exactly what
+/// `WorkspaceDiagnosticKind::is_source_discovery` decides. A kind left out of
+/// that classifier passes every unit test in the workspace and is still wiped
+/// from the combined root before serialization (the issue #1086 failure).
+#[test]
+fn combined_json_root_carries_the_skipped_source_dotdir_diagnostic() {
+    let dir = skipped_source_dotdir_project();
+    let root = dir.path().to_str().expect("temp path is UTF-8");
+    let json = parse_json(&run_fallow_raw(&[
+        "--root",
+        root,
+        "--format",
+        "json",
+        "--quiet",
+        "--no-cache",
+    ]));
+
+    let reported = combined_root_diagnostics_of_kind(&json, "skipped-source-dotdir");
+    assert_eq!(
+        reported.len(),
+        1,
+        "the combined root reports the skip once: {}",
+        json["workspace_diagnostics"]
+    );
+    assert_eq!(reported[0]["path"], ".claude");
+    assert!(
+        reported[0]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("--root")),
+        "the message names the only remedy that analyzes the directory: {}",
+        reported[0]["message"]
+    );
+}
+
+/// Issue #461 plus issue #2366: the diagnostic must also be classified as
+/// walk-recorded, so a concurrent walk's dotdir set is never folded into
+/// another analysis's list. A kind missing from
+/// `WorkspaceDiagnosticKind::is_source_walk_recorded` makes the combined
+/// root's array order depend on which walk wrote last.
+#[test]
+fn combined_json_root_workspace_diagnostics_stay_byte_identical_with_a_skipped_dotdir() {
+    let dir = skipped_source_dotdir_project();
+    let root = dir.path().to_str().expect("temp path is UTF-8");
+    let mut observed: Vec<serde_json::Value> = Vec::new();
+    for _ in 0..6 {
+        let json = parse_json(&run_fallow_raw(&[
+            "--root",
+            root,
+            "--format",
+            "json",
+            "--quiet",
+            "--no-cache",
+        ]));
+        observed.push(json["workspace_diagnostics"].clone());
+    }
+    for (index, run) in observed.iter().enumerate() {
+        assert_eq!(
+            run, &observed[0],
+            "run {index} disagrees with the first run about the combined root's \
+             workspace_diagnostics[]"
+        );
+    }
+}
+
+/// Issue #2366: the combined root's union must be the same ARRAY on every run
+/// of the same command, not just the same set.
+///
+/// Under this split the dead-code and duplication walks run under
+/// `rayon::join` on one root, and each walk replaces the registry's
+/// source-discovery set. While the dead-code analysis folded a live registry
+/// read into its own list, whether the duplication walk had already written
+/// decided whether its skip arrived inside the dead-code section's list or
+/// later from the duplication section's, so the same command emitted two
+/// different orders across repeat runs. Every analysis now carries its own
+/// walk's skips by value and the live read drops walk-recorded entries, so the
+/// order is fixed by section order alone.
+#[test]
+fn combined_json_root_workspace_diagnostics_are_byte_identical_across_repeat_runs() {
+    let dir = split_production_two_large_files_project(
+        r#"{"production":{"deadCode":true,"health":false,"dupes":false}}"#,
+    );
+    let root = dir.path().to_str().expect("temp path is UTF-8");
+    let mut observed: Vec<serde_json::Value> = Vec::new();
+    for _ in 0..6 {
+        let json = parse_json(&run_fallow_raw(&[
+            "--root",
+            root,
+            "--max-file-size",
+            "1",
+            "--format",
+            "json",
+            "--quiet",
+            "--no-cache",
+        ]));
+        observed.push(json["workspace_diagnostics"].clone());
+    }
+
+    let entries: Vec<(String, String)> = observed[0]
+        .as_array()
+        .expect("the root carries the array")
+        .iter()
+        .map(|diagnostic| {
+            (
+                diagnostic["kind"].as_str().unwrap_or_default().to_owned(),
+                diagnostic["path"].as_str().unwrap_or_default().to_owned(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        entries,
+        [
+            (
+                "skipped-large-file".to_owned(),
+                "src/huge.prod.ts".to_owned()
+            ),
+            (
+                "malformed-pnpm-workspace-yaml".to_owned(),
+                "pnpm-workspace.yaml".to_owned()
+            ),
+            (
+                "bun-lockb-override-resolution-skipped".to_owned(),
+                "package.json".to_owned()
+            ),
+            (
+                "skipped-large-file".to_owned(),
+                "src/huge.test.ts".to_owned()
+            ),
+        ],
+        "the union runs in section order: the dead-code analysis's own list \
+         (its production walk's skip plus the analysis-stage entries it recorded), \
+         then the skip only the full-file-set walks saw"
+    );
+    for (index, run) in observed.iter().enumerate() {
+        assert_eq!(
+            run, &observed[0],
+            "run {index} disagrees with the first run about the combined root's \
+             workspace_diagnostics[]"
+        );
+    }
+}
+
+/// Issue #2366: a combined run walks the project once per analysis, and a
+/// per-analysis `production` mode gives those walks different file sets, so
+/// each walk records a different source-discovery list and clears the previous
+/// one. The combined root must report the UNION of what the run recorded, in
+/// both directions of the split, otherwise the answer depends on which walk
+/// happened to run last and the root contradicts the standalone `dead-code`
+/// envelope of the same project.
+#[test]
+fn combined_json_root_unions_workspace_diagnostics_across_split_production_modes() {
+    for production_config in [
+        r#"{"production":{"deadCode":true,"health":false,"dupes":false}}"#,
+        r#"{"production":{"deadCode":false,"health":true,"dupes":true}}"#,
+    ] {
+        let dir = split_production_large_test_file_project(production_config);
+        let root = dir.path().to_str().expect("temp path is UTF-8");
+        let output = run_fallow_raw(&[
+            "--root",
+            root,
+            "--max-file-size",
+            "1",
+            "--format",
+            "json",
+            "--quiet",
+            "--no-cache",
+        ]);
+        let json = parse_json(&output);
+        assert!(
+            json["check"].is_object() && json["dupes"].is_object() && json["health"].is_object(),
+            "all three sections ran under {production_config}: {json}"
+        );
+        let skipped = combined_root_diagnostics_of_kind(&json, "skipped-large-file");
+        assert_eq!(
+            skipped.len(),
+            1,
+            "the combined root reports the oversized file under {production_config}: {}",
+            json["workspace_diagnostics"]
+        );
+        assert_eq!(skipped[0]["path"], "src/huge.test.ts");
+    }
+}
+
+/// Issue #2366: the combined root and the programmatic combined envelope are
+/// built from different inputs (the CLI folds each analysis's captured list
+/// plus a final registry read, the programmatic route folds the typed
+/// sections' own lists), so pin that a non-production dead-code pass under a
+/// production health/dupes split reaches the standalone envelope and the
+/// combined root alike. Without the union the combined root is empty here
+/// while `dead-code --format json` on the same project reports the entry.
+#[test]
+fn combined_json_root_matches_standalone_dead_code_under_a_production_split() {
+    let dir = split_production_large_test_file_project(
+        r#"{"production":{"deadCode":false,"health":true,"dupes":true}}"#,
+    );
+    let root = dir.path().to_str().expect("temp path is UTF-8");
+    let standalone = parse_json(&run_fallow_raw(&[
+        "dead-code",
+        "--root",
+        root,
+        "--max-file-size",
+        "1",
+        "--format",
+        "json",
+        "--quiet",
+        "--no-cache",
+    ]));
+    let combined = parse_json(&run_fallow_raw(&[
+        "--root",
+        root,
+        "--max-file-size",
+        "1",
+        "--format",
+        "json",
+        "--quiet",
+        "--no-cache",
+    ]));
+    assert_eq!(
+        standalone["workspace_diagnostics"], combined["workspace_diagnostics"],
+        "the combined root carries the standalone dead-code list: standalone {} vs combined {}",
+        standalone["workspace_diagnostics"], combined["workspace_diagnostics"]
+    );
+    assert_eq!(
+        combined_root_diagnostics_of_kind(&combined, "skipped-large-file").len(),
+        1,
+        "the comparison above is not vacuous: {}",
+        combined["workspace_diagnostics"]
+    );
+}
+
+/// Issue #2366: with `--production-dead-code --production-health` the only
+/// analysis that walks the full file set is duplication, so the oversized test
+/// file is recorded by the dupes walk alone and neither the dead-code nor the
+/// health section's own list carries it. The combined root must still report
+/// it, from the duplication section's own captured list.
+///
+/// This split is also the case that runs the dead-code and duplication walks
+/// under `rayon::join`, so a registry read would answer "whichever walk wrote
+/// last" and the assertion below would hold only on some runs.
+#[test]
+fn combined_json_root_carries_a_diagnostic_only_the_dupes_walk_recorded() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("package.json"),
+        r#"{"name":"issue-2366-dupes-only-carrier","private":true,"main":"src/index.ts"}"#,
+    )
+    .expect("write package.json");
+    std::fs::create_dir_all(dir.path().join("src")).expect("create src");
+    std::fs::write(dir.path().join("src/index.ts"), "export const value = 1;\n")
+        .expect("write source");
+    std::fs::write(
+        dir.path().join("src/huge.test.ts"),
+        "// filler\n".repeat(150_000),
+    )
+    .expect("write oversized test file");
+
+    let json = parse_json(&run_fallow_raw(&[
+        "--root",
+        dir.path().to_str().expect("temp path is UTF-8"),
+        "--max-file-size",
+        "1",
+        "--production-dead-code",
+        "--production-health",
+        "--format",
+        "json",
+        "--quiet",
+        "--no-cache",
+    ]));
+    assert!(json["dupes"].is_object(), "the dupes section ran: {json}");
+    let skipped = combined_root_diagnostics_of_kind(&json, "skipped-large-file");
+    assert_eq!(
+        skipped.len(),
+        1,
+        "the combined root reports what only the dupes walk saw: {}",
+        json["workspace_diagnostics"]
+    );
+    assert_eq!(skipped[0]["path"], "src/huge.test.ts");
+}
+
+/// Issues #2366 and #2396: every standalone analysis envelope carries the
+/// workspace-discovery list captured by its own run, matching both the
+/// workspace listing and the combined root.
+fn undeclared_workspace_fixture() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(dir.path().join("packages/inner/src")).expect("create inner package");
+    std::fs::create_dir_all(dir.path().join("src")).expect("create src");
+    std::fs::write(
+        dir.path().join("package.json"),
+        r#"{"name":"issue-2366-undeclared","private":true,"main":"src/index.ts","workspaces":["packages/declared"]}"#,
+    )
+    .expect("write package.json");
+    std::fs::write(
+        dir.path().join("packages/inner/package.json"),
+        r#"{"name":"inner-pkg","version":"1.0.0"}"#,
+    )
+    .expect("write inner package.json");
+    std::fs::write(dir.path().join("src/index.ts"), "export const value = 1;\n")
+        .expect("write source");
+    std::fs::write(
+        dir.path().join("packages/inner/src/index.ts"),
+        "export const inner = 2;\n",
+    )
+    .expect("write inner source");
+    dir
+}
+
+fn assert_undeclared_workspace_diagnostic(output: &serde_json::Value, context: &str) {
+    let diagnostics = output["workspace_diagnostics"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|diagnostic| diagnostic["kind"] == "undeclared-workspace")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        diagnostics.len(),
+        1,
+        "{context}: {}",
+        output["workspace_diagnostics"]
+    );
+    assert_eq!(diagnostics[0]["path"], "packages/inner");
+}
+
+#[test]
+fn analysis_envelopes_agree_with_the_workspace_listing_on_undeclared_workspaces() {
+    let dir = undeclared_workspace_fixture();
+    let root = dir.path().to_str().expect("temp path is UTF-8");
+
+    let listing = parse_json(&run_fallow_raw(&[
+        "list",
+        "--workspaces",
+        "--root",
+        root,
+        "--format",
+        "json",
+        "--quiet",
+    ]));
+    assert_undeclared_workspace_diagnostic(
+        &listing,
+        "the workspace listing reports the undeclared package",
+    );
+
+    let combined = parse_json(&run_fallow_raw(&[
+        "--root",
+        root,
+        "--format",
+        "json",
+        "--quiet",
+        "--no-cache",
+    ]));
+    assert_undeclared_workspace_diagnostic(
+        &combined,
+        "the combined root reports what the workspace listing reports",
+    );
+
+    for command in ["dead-code", "check", "health", "dupes"] {
+        let output = parse_json(&run_fallow_raw(&[
+            command,
+            "--root",
+            root,
+            "--format",
+            "json",
+            "--quiet",
+            "--no-cache",
+        ]));
+        assert_undeclared_workspace_diagnostic(
+            &output,
+            &format!("{command} reports the run-owned undeclared workspace"),
+        );
+    }
+
+    for command in [
+        vec![
+            "security",
+            "--root",
+            root,
+            "--format",
+            "json",
+            "--quiet",
+            "--no-cache",
+        ],
+        vec![
+            "security",
+            "--root",
+            root,
+            "--summary",
+            "--format",
+            "json",
+            "--quiet",
+            "--no-cache",
+        ],
+        vec![
+            "security",
+            "--root",
+            root,
+            "--no-cache",
+            "blind-spots",
+            "--format",
+            "json",
+            "--quiet",
+        ],
+    ] {
+        let output = parse_json(&run_fallow_raw(&command));
+        assert_undeclared_workspace_diagnostic(
+            &output,
+            "security-family output reports its run-owned diagnostic",
+        );
+    }
+}
+
+/// Issue #2366: two overlapping workspace globs (`["pkgs/*", "pkgs/a*"]`, the
+/// shape a monorepo gets from `["packages/*", "packages/*/*"]`) report the same
+/// package-less directory twice, once per pattern. The union that builds the
+/// combined root must keep both, otherwise the root is NARROWER than the
+/// standalone `dead-code` envelope it unions.
+#[test]
+fn combined_json_root_keeps_both_overlapping_glob_diagnostics() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(dir.path().join("pkgs/aaa")).expect("create package-less directory");
+    std::fs::create_dir_all(dir.path().join("src")).expect("create src");
+    std::fs::write(
+        dir.path().join("package.json"),
+        r#"{"name":"issue-2366-overlapping-globs","private":true,"main":"src/index.ts","workspaces":["pkgs/*","pkgs/a*"]}"#,
+    )
+    .expect("write package.json");
+    std::fs::write(dir.path().join("src/index.ts"), "export const value = 1;\n")
+        .expect("write source");
+    std::fs::write(
+        dir.path().join("pkgs/aaa/readme.txt"),
+        "no package.json here\n",
+    )
+    .expect("write filler");
+    let root = dir.path().to_str().expect("temp path is UTF-8");
+
+    let standalone = parse_json(&run_fallow_raw(&[
+        "dead-code",
+        "--root",
+        root,
+        "--format",
+        "json",
+        "--quiet",
+        "--no-cache",
+    ]));
+    let combined = parse_json(&run_fallow_raw(&[
+        "--root",
+        root,
+        "--format",
+        "json",
+        "--quiet",
+        "--no-cache",
+    ]));
+
+    let patterns: Vec<String> =
+        combined_root_diagnostics_of_kind(&combined, "glob-matched-no-package-json")
+            .iter()
+            .map(|diagnostic| {
+                diagnostic["pattern"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned()
+            })
+            .collect();
+    assert_eq!(
+        patterns,
+        ["pkgs/*", "pkgs/a*"],
+        "both globs matched the same directory and both are reported: {}",
+        combined["workspace_diagnostics"]
+    );
+    assert_eq!(
+        standalone["workspace_diagnostics"], combined["workspace_diagnostics"],
+        "the combined root is never narrower than the standalone dead-code envelope: \
+         standalone {} vs combined {}",
+        standalone["workspace_diagnostics"], combined["workspace_diagnostics"]
     );
 }

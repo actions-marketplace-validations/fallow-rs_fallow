@@ -1,3 +1,9 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "tests and benches use unwrap and expect to keep fixture setup concise"
+)]
+
 //! End-to-end tests that `fallow dupes` and combined-mode dupes respect
 //! `--workspace` and `--changed-workspaces` scoping.
 //!
@@ -30,8 +36,6 @@ fn build_dupes_fixture() -> TempDir {
     )
     .unwrap();
 
-    // A non-trivial duplicated block. Comfortably above min_tokens (50) and
-    // min_lines (5) so Mild mode will pick it up deterministically.
     let duplicated_block = r"
 export function transform(input: { items: number[]; scale: number }) {
     const { items, scale } = input;
@@ -101,10 +105,6 @@ fn combined_dupes_clone_groups(json: &serde_json::Value) -> usize {
         .map_or(0, std::vec::Vec::len)
 }
 
-// ────────────────────────────────────────────────────────────────
-// Standalone `fallow dupes` with --workspace
-// ────────────────────────────────────────────────────────────────
-
 #[test]
 fn dupes_without_scope_finds_cross_package_clone() {
     let tmp = build_dupes_fixture();
@@ -128,11 +128,6 @@ fn dupes_without_scope_finds_cross_package_clone() {
 #[test]
 fn dupes_workspace_scope_drops_cross_package_only_group() {
     let tmp = build_dupes_fixture();
-    // Both instances of the clone live in ui+api. Scoping to `@mono/ui` alone
-    // must still retain the group (one instance is under ui), but scoping to
-    // a third package name that doesn't exist — or to a single workspace with
-    // no instances — drops the group. We use `@mono/ui` here which should keep
-    // the group since one instance is in ui.
     let out = run_fallow_raw(&[
         "dupes",
         "--root",
@@ -145,7 +140,6 @@ fn dupes_workspace_scope_drops_cross_package_only_group() {
     ]);
     assert_eq!(out.code, 0);
     let json = parse_json(&out);
-    // At least one instance is in ui, so the cross-workspace group is retained.
     assert!(
         count_clone_groups(&json) >= 1,
         "group with an instance under ui should be retained, got {}",
@@ -153,16 +147,9 @@ fn dupes_workspace_scope_drops_cross_package_only_group() {
     );
 }
 
-// ────────────────────────────────────────────────────────────────
-// Combined-mode dupes with --changed-workspaces
-// ────────────────────────────────────────────────────────────────
-
 #[test]
 fn combined_changed_workspaces_head_drops_all_dupes() {
     let tmp = build_dupes_fixture();
-    // HEAD diff = empty, so 0 workspaces in scope, so all clone groups drop.
-    // Before the fix shipped in this test's PR, combined mode's dupes was
-    // unscoped and this assertion would fail.
     let out = run_fallow_raw(&[
         "--root",
         tmp.path().to_str().unwrap(),
@@ -188,8 +175,6 @@ fn combined_changed_workspaces_head_drops_all_dupes() {
 #[test]
 fn combined_workspace_scope_applies_to_dupes() {
     let tmp = build_dupes_fixture();
-    // Sanity: with explicit --workspace, we still see the group because ui+api
-    // overlap with the ui scope (one instance is there).
     let out_with_scope = run_fallow_raw(&[
         "--root",
         tmp.path().to_str().unwrap(),
@@ -204,9 +189,4 @@ fn combined_workspace_scope_applies_to_dupes() {
         combined_dupes_clone_groups(&json) >= 1,
         "ui scope keeps the cross-package group (instance under ui)"
     );
-    // Regression for the pre-existing gap this change closes: WITHOUT the fix,
-    // this assertion would still be satisfied because dupes was always
-    // unfiltered. With the fix, it still passes but only because the cross-
-    // package clone genuinely has an instance under ui. The two prior tests
-    // (HEAD diff empty → 0 dupes) are what catch the regression.
 }

@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -8,8 +9,8 @@ use crate::discover::FileId;
 use crate::graph::ModuleGraph;
 use crate::resolve::ResolvedModule;
 use crate::results::{
-    DependencyLocation, ImportSite, TestOnlyDependency, TypeOnlyDependency, UnlistedDependency,
-    UnresolvedImport, UnusedDependency,
+    DependencyLocation, DevDependencyInProduction, ImportSite, TestOnlyDependency,
+    TypeOnlyDependency, UnlistedDependency, UnresolvedImport, UnusedDependency,
 };
 use crate::suppress::{IssueKind, SuppressionContext};
 
@@ -18,6 +19,28 @@ use super::predicates::{
     is_builtin_module, is_config_file, is_implicit_dependency, is_path_alias, is_virtual_module,
 };
 use super::{LineOffsetsMap, byte_offset_to_line_col};
+
+use crate::plugins::{CompiledPathRule, ProvidedDependencyRule};
+
+/// Return `true` if a virtual-module `prefix` from the active plugin set covers
+/// `spec`. Two shapes are recognised:
+///
+/// - **Plain prefix match** (`@docusaurus/`, `@theme/`, `#imports`, `$app/`):
+///   any specifier that `starts_with(prefix)` is covered. This handles the
+///   common case where a plugin registers an entire namespace.
+/// - **Trailing-slash exact-bare match** (`ember/`): the bare specifier `ember`
+///   also matches (via the second branch's `strip_suffix('/')` shortcut),
+///   while real npm packages like `ember-cli` and `ember-data` deliberately
+///   do not. A no-slash entry would prefix-match them and silence legitimate
+///   missing-dep reports.
+///
+/// Centralised here so the `unresolved-import` and `unlisted-dependency`
+/// suppression sites use the same matcher as plugin test helpers (see
+/// `Plugin::virtual_module_prefixes` consumers in `crates/core/src/plugins/`).
+#[must_use]
+pub fn matches_virtual_prefix(prefix: &str, spec: &str) -> bool {
+    spec.starts_with(prefix) || prefix.strip_suffix('/').is_some_and(|base| spec == base)
+}
 
 /// Return `true` if a workspace `package.json` path is covered by `ignorePatterns`.
 ///
@@ -53,48 +76,244 @@ pub struct DepCategoryConfig {
 /// Shared sets used by `collect_unused_for_category` to filter dependencies.
 pub struct SharedDepSets<'a> {
     pub plugin_referenced: &'a FxHashSet<&'a str>,
+    pub package_plugin_referenced: &'a FxHashSet<&'a str>,
     pub plugin_tooling: &'a FxHashSet<&'a str>,
     pub script_used: &'a FxHashSet<&'a str>,
-    pub workspace_names: &'a FxHashSet<&'a str>,
     pub ignore_deps: &'a FxHashSet<&'a str>,
+}
+
+struct PeerDependencyResolver {
+    cache: FxHashMap<(PathBuf, String), Vec<String>>,
+}
+
+impl PeerDependencyResolver {
+    fn new() -> Self {
+        Self {
+            cache: FxHashMap::default(),
+        }
+    }
+
+    fn peer_dependency_closure<'b>(
+        &mut self,
+        package_root: &Path,
+        seeds: impl IntoIterator<Item = &'b str>,
+    ) -> FxHashSet<String> {
+        let mut peer_used = FxHashSet::default();
+        let mut expanded = FxHashSet::default();
+        let mut queue: Vec<String> = seeds.into_iter().map(str::to_string).collect();
+
+        while let Some(package_name) = queue.pop() {
+            if !expanded.insert(package_name.clone()) {
+                continue;
+            }
+
+            for peer in self.peer_dependencies_for(package_root, &package_name) {
+                if peer_used.insert(peer.clone()) {
+                    queue.push(peer);
+                }
+            }
+        }
+
+        peer_used
+    }
+
+    fn peer_dependencies_for(&mut self, package_root: &Path, package_name: &str) -> Vec<String> {
+        let key = (package_root.to_path_buf(), package_name.to_string());
+        if let Some(cached) = self.cache.get(&key) {
+            return cached.clone();
+        }
+
+        let peer_dependencies: Vec<String> =
+            find_installed_package_json(package_root, package_name)
+                .and_then(|path| PackageJson::load(&path).ok())
+                .map(|pkg| pkg.required_peer_dependency_names())
+                .unwrap_or_default();
+
+        self.cache.insert(key, peer_dependencies.clone());
+        peer_dependencies
+    }
+}
+
+fn find_installed_package_json(package_root: &Path, package_name: &str) -> Option<PathBuf> {
+    for base in package_root.ancestors() {
+        let candidate = node_modules_package_json(base, package_name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn node_modules_package_json(base: &Path, package_name: &str) -> PathBuf {
+    let mut path = base.join("node_modules");
+    for segment in package_name.split('/') {
+        path.push(segment);
+    }
+    path.join("package.json")
+}
+
+fn deepest_matching_workspace<'a>(path: &Path, workspace_roots: &[&'a Path]) -> Option<&'a Path> {
+    workspace_roots
+        .iter()
+        .copied()
+        .filter(|root| path.starts_with(root))
+        .max_by_key(|root| root.components().count())
+}
+
+fn dependency_owning_workspace_roots<'a>(
+    workspaces: &'a [fallow_config::WorkspaceInfo],
+    config: &ResolvedConfig,
+) -> Vec<&'a Path> {
+    workspaces
+        .iter()
+        .filter(|workspace| read_workspace_package(workspace, config).is_some())
+        .map(|workspace| workspace.root.as_path())
+        .collect()
+}
+
+/// Reverse index: workspace root -> packages with ANY file under that root using
+/// them. Each module's deepest matching workspace root is pre-computed once in parallel so the
+/// package_usage walk costs O(packages * avg_files_per_package) instead of
+/// O(packages * files * workspaces).
+fn collect_workspace_used_packages<'a>(
+    graph: &'a ModuleGraph,
+    workspace_roots: &[&'a Path],
+) -> FxHashMap<&'a Path, FxHashSet<&'a str>> {
+    use rayon::prelude::*;
+    let module_workspaces: Vec<Option<&Path>> = graph
+        .modules
+        .par_iter()
+        .map(|module| deepest_matching_workspace(&module.path, workspace_roots))
+        .collect();
+    let mut by_ws: FxHashMap<&Path, FxHashSet<&str>> = workspace_roots
+        .iter()
+        .map(|root| (*root, FxHashSet::default()))
+        .collect();
+    for (package_name, file_ids) in &graph.package_usage {
+        for id in file_ids {
+            if let Some(Some(ws_path)) = module_workspaces.get(id.0 as usize) {
+                by_ws
+                    .entry(*ws_path)
+                    .or_default()
+                    .insert(package_name.as_str());
+            }
+        }
+    }
+    by_ws
+}
+
+fn shared_dep_sets<'a>(
+    plugin_referenced: &'a FxHashSet<&'a str>,
+    package_plugin_referenced: &'a FxHashSet<&'a str>,
+    plugin_tooling: &'a FxHashSet<&'a str>,
+    script_used: &'a FxHashSet<&'a str>,
+    ignore_deps: &'a FxHashSet<&'a str>,
+) -> SharedDepSets<'a> {
+    SharedDepSets {
+        plugin_referenced,
+        package_plugin_referenced,
+        plugin_tooling,
+        script_used,
+        ignore_deps,
+    }
 }
 
 /// Collect unused dependencies for a single category (prod, dev, or optional).
 ///
 /// Filters `dep_names` against usage data and category-specific rules, returning
 /// `UnusedDependency` entries for deps that are unused.
-pub fn collect_unused_for_category(
-    dep_names: Vec<String>,
-    category: &DepCategoryConfig,
-    shared: &SharedDepSets<'_>,
-    is_used: impl Fn(&str) -> bool,
-    pkg_path: &Path,
-    pkg_content: Option<&str>,
-) -> Vec<UnusedDependency> {
-    dep_names
+pub struct UnusedCategoryInput<'a> {
+    pub dep_names: Vec<String>,
+    pub category: &'a DepCategoryConfig,
+    pub shared: &'a SharedDepSets<'a>,
+    pub is_used: &'a dyn Fn(&str) -> bool,
+    pub used_in_workspaces: &'a dyn Fn(&str) -> Vec<PathBuf>,
+    pub pkg_path: &'a Path,
+    pub pkg_content: Option<&'a str>,
+}
+
+pub fn collect_unused_for_category(input: UnusedCategoryInput<'_>) -> Vec<UnusedDependency> {
+    input
+        .dep_names
         .into_iter()
-        .filter(|dep| !is_used(dep))
-        .filter(|dep| !shared.script_used.contains(dep.as_str()))
-        .filter(|dep| !category.check_implicit || !is_implicit_dependency(dep))
+        .filter(|dep| !(input.is_used)(dep))
+        .filter(|dep| !input.shared.script_used.contains(dep.as_str()))
+        .filter(|dep| !input.category.check_implicit || !is_implicit_dependency(dep))
         .filter(|dep| {
-            !category.check_known_tooling || !crate::plugins::is_known_tooling_dependency(dep)
+            !input.category.check_known_tooling || !crate::plugins::is_known_tooling_dependency(dep)
         })
         .filter(|dep| {
-            !category.check_plugin_tooling || !shared.plugin_tooling.contains(dep.as_str())
+            !input.category.check_plugin_tooling
+                || !input.shared.plugin_tooling.contains(dep.as_str())
         })
-        .filter(|dep| !shared.plugin_referenced.contains(dep.as_str()))
-        .filter(|dep| !shared.ignore_deps.contains(dep.as_str()))
-        .filter(|dep| !shared.workspace_names.contains(dep.as_str()))
+        .filter(|dep| !input.shared.plugin_referenced.contains(dep.as_str()))
+        .filter(|dep| {
+            !input
+                .shared
+                .package_plugin_referenced
+                .contains(dep.as_str())
+        })
+        .filter(|dep| !input.shared.ignore_deps.contains(dep.as_str()))
         .map(|dep| {
-            let line = pkg_content.map_or(1, |c| find_dep_line_in_json(c, &dep));
+            let line = input
+                .pkg_content
+                .map_or(1, |c| find_dep_line_in_json(c, &dep));
+            let used_in_workspaces = (input.used_in_workspaces)(&dep);
             UnusedDependency {
                 package_name: dep,
-                location: category.location.clone(),
-                path: pkg_path.to_path_buf(),
+                location: input.category.location.clone(),
+                path: input.pkg_path.to_path_buf(),
                 line,
+                used_in_workspaces,
             }
         })
         .collect()
+}
+
+/// Build a reverse index from package name to workspace roots that import it.
+fn collect_package_workspace_usage(
+    graph: &ModuleGraph,
+    workspace_roots: &[&Path],
+) -> FxHashMap<String, Vec<PathBuf>> {
+    let mut usage: FxHashMap<String, Vec<PathBuf>> = FxHashMap::default();
+
+    for (package_name, file_ids) in &graph.package_usage {
+        for id in file_ids {
+            let Some(module) = graph.modules.get(id.0 as usize) else {
+                continue;
+            };
+            let Some(ws_root) = deepest_matching_workspace(&module.path, workspace_roots) else {
+                continue;
+            };
+            usage
+                .entry(package_name.clone())
+                .or_default()
+                .push(ws_root.to_path_buf());
+        }
+    }
+
+    for roots in usage.values_mut() {
+        roots.sort();
+        roots.dedup();
+    }
+
+    usage
+}
+
+fn used_in_other_workspaces(
+    package_workspace_usage: &FxHashMap<String, Vec<PathBuf>>,
+    dep: &str,
+    declaring_workspace_root: &Path,
+) -> Vec<PathBuf> {
+    package_workspace_usage
+        .get(dep)
+        .map_or_else(Vec::new, |roots| {
+            roots
+                .iter()
+                .filter(|root| root.as_path() != declaring_workspace_root)
+                .cloned()
+                .collect()
+        })
 }
 
 /// Category configs for the three dependency types.
@@ -125,11 +344,57 @@ const fn optional_category() -> DepCategoryConfig {
     }
 }
 
+fn package_referenced_dependencies_by_path(
+    plugin_result: &crate::plugins::AggregatedPluginResult,
+) -> FxHashMap<PathBuf, FxHashSet<&str>> {
+    let mut by_path: FxHashMap<PathBuf, FxHashSet<&str>> = FxHashMap::default();
+    for (pkg_path, dep) in &plugin_result.package_referenced_dependencies {
+        by_path
+            .entry(pkg_path.clone())
+            .or_default()
+            .insert(dep.as_str());
+    }
+    by_path
+}
+
+fn plugin_referenced_set(
+    plugin_result: Option<&crate::plugins::AggregatedPluginResult>,
+) -> FxHashSet<&str> {
+    plugin_result
+        .map(|pr| {
+            pr.referenced_dependencies
+                .iter()
+                .map(String::as_str)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn plugin_tooling_set(
+    plugin_result: Option<&crate::plugins::AggregatedPluginResult>,
+) -> FxHashSet<&str> {
+    plugin_result
+        .map(|pr| pr.tooling_dependencies.iter().map(String::as_str).collect())
+        .unwrap_or_default()
+}
+
+fn script_used_set(
+    plugin_result: Option<&crate::plugins::AggregatedPluginResult>,
+) -> FxHashSet<&str> {
+    plugin_result
+        .map(|pr| pr.script_used_packages.iter().map(String::as_str).collect())
+        .unwrap_or_default()
+}
+
 /// Find dependencies in package.json that are never imported.
 ///
 /// Checks both the root package.json and each workspace's package.json.
 /// For workspace deps, only files within that workspace are considered when
 /// determining whether a dependency is used (mirroring `find_unlisted_dependencies`).
+#[deprecated(
+    since = "2.76.0",
+    note = "fallow_core is internal; use fallow_api::run_dead_code for typed output; serialize with fallow_api::serialize_dead_code_programmatic_json for JSON output. See docs/fallow-core-migration.md."
+)]
 pub fn find_unused_dependencies(
     graph: &ModuleGraph,
     pkg: &PackageJson,
@@ -141,144 +406,357 @@ pub fn find_unused_dependencies(
     Vec<UnusedDependency>,
     Vec<UnusedDependency>,
 ) {
-    // Collect deps referenced in config files (discovered by plugins)
-    let plugin_referenced: FxHashSet<&str> = plugin_result
-        .map(|pr| {
-            pr.referenced_dependencies
-                .iter()
-                .map(String::as_str)
-                .collect()
-        })
-        .unwrap_or_default();
+    let scan = build_unused_dependency_scan(graph, config, plugin_result, workspaces);
+    let shared = scan.root_shared(config);
 
-    // Collect tooling deps from plugins
-    let plugin_tooling: FxHashSet<&str> = plugin_result
-        .map(|pr| pr.tooling_dependencies.iter().map(String::as_str).collect())
-        .unwrap_or_default();
+    let (mut unused_deps, mut unused_dev_deps, mut unused_optional_deps) =
+        collect_root_unused_dependencies(pkg, config, &shared, &scan.usage);
+    let root_flagged =
+        root_flagged_dependencies(&unused_deps, &unused_dev_deps, &unused_optional_deps);
 
-    // Collect packages used as binaries in package.json scripts
-    let script_used: FxHashSet<&str> = plugin_result
-        .map(|pr| pr.script_used_packages.iter().map(String::as_str).collect())
-        .unwrap_or_default();
-
-    // Collect workspace package names — these are internal deps, not npm packages
-    let workspace_names: FxHashSet<&str> = workspaces.iter().map(|ws| ws.name.as_str()).collect();
-
-    // Pre-compute ignore deps as FxHashSet for O(1) lookups instead of O(n) linear scan
-    let ignore_deps: FxHashSet<&str> = config
-        .ignore_dependencies
-        .iter()
-        .map(String::as_str)
-        .collect();
-
-    // Build per-package set of files that use it (globally)
-    let used_packages: FxHashSet<&str> = graph.package_usage.keys().map(String::as_str).collect();
-
-    let root_pkg_path = config.root.join("package.json");
-    let root_pkg_content = read_pkg_json_content(&root_pkg_path);
-
-    let shared = SharedDepSets {
-        plugin_referenced: &plugin_referenced,
-        plugin_tooling: &plugin_tooling,
-        script_used: &script_used,
-        workspace_names: &workspace_names,
-        ignore_deps: &ignore_deps,
-    };
-
-    let is_used_globally = |dep: &str| used_packages.contains(dep);
-
-    // --- Root package.json check (existing behavior: any file can satisfy usage) ---
-    let mut unused_deps = collect_unused_for_category(
-        pkg.production_dependency_names(),
-        &prod_category(),
-        &shared,
-        is_used_globally,
-        &root_pkg_path,
-        root_pkg_content.as_deref(),
+    let inputs = scan.workspace_inputs(config, &root_flagged);
+    append_workspace_unused_dependencies(
+        workspaces,
+        &inputs,
+        &mut unused_deps,
+        &mut unused_dev_deps,
+        &mut unused_optional_deps,
     );
-
-    let mut unused_dev_deps = collect_unused_for_category(
-        pkg.dev_dependency_names(),
-        &dev_category(),
-        &shared,
-        is_used_globally,
-        &root_pkg_path,
-        root_pkg_content.as_deref(),
-    );
-
-    let mut unused_optional_deps = collect_unused_for_category(
-        pkg.optional_dependency_names(),
-        &optional_category(),
-        &shared,
-        is_used_globally,
-        &root_pkg_path,
-        root_pkg_content.as_deref(),
-    );
-
-    // --- Workspace package.json checks: scope usage to files within each workspace ---
-    // Track which deps are already flagged from root to avoid double-reporting
-    let root_flagged: FxHashSet<String> = unused_deps
-        .iter()
-        .chain(unused_dev_deps.iter())
-        .chain(unused_optional_deps.iter())
-        .map(|d| d.package_name.clone())
-        .collect();
-
-    for ws in workspaces {
-        let ws_pkg_path = ws.root.join("package.json");
-        if is_package_json_ignored(&ws_pkg_path, config) {
-            continue;
-        }
-        let Ok(ws_pkg) = PackageJson::load(&ws_pkg_path) else {
-            continue;
-        };
-        let ws_pkg_content = read_pkg_json_content(&ws_pkg_path);
-
-        // Helper: check if a dependency is used by any file within this workspace.
-        // Uses raw path comparison (module paths are absolute, workspace root is absolute)
-        // to avoid per-file canonicalize() syscalls.
-        let ws_root = &ws.root;
-        let is_used_in_workspace = |dep: &str| -> bool {
-            root_flagged.contains(dep)
-                || graph.package_usage.get(dep).is_some_and(|file_ids| {
-                    file_ids.iter().any(|id| {
-                        graph
-                            .modules
-                            .get(id.0 as usize)
-                            .is_some_and(|module| module.path.starts_with(ws_root))
-                    })
-                })
-        };
-
-        unused_deps.extend(collect_unused_for_category(
-            ws_pkg.production_dependency_names(),
-            &prod_category(),
-            &shared,
-            is_used_in_workspace,
-            &ws_pkg_path,
-            ws_pkg_content.as_deref(),
-        ));
-
-        unused_dev_deps.extend(collect_unused_for_category(
-            ws_pkg.dev_dependency_names(),
-            &dev_category(),
-            &shared,
-            is_used_in_workspace,
-            &ws_pkg_path,
-            ws_pkg_content.as_deref(),
-        ));
-
-        unused_optional_deps.extend(collect_unused_for_category(
-            ws_pkg.optional_dependency_names(),
-            &optional_category(),
-            &shared,
-            is_used_in_workspace,
-            &ws_pkg_path,
-            ws_pkg_content.as_deref(),
-        ));
-    }
 
     (unused_deps, unused_dev_deps, unused_optional_deps)
+}
+
+struct UnusedDependencyScan<'a> {
+    plugin_referenced: FxHashSet<&'a str>,
+    plugin_tooling: FxHashSet<&'a str>,
+    script_used: FxHashSet<&'a str>,
+    package_referenced: FxHashMap<PathBuf, FxHashSet<&'a str>>,
+    empty_package_referenced: FxHashSet<&'a str>,
+    ignore_deps: FxHashSet<&'a str>,
+    usage: DependencyUsageIndices<'a>,
+}
+
+impl<'a> UnusedDependencyScan<'a> {
+    fn root_shared(&'a self, config: &ResolvedConfig) -> SharedDepSets<'a> {
+        shared_dep_sets(
+            &self.plugin_referenced,
+            self.package_referenced
+                .get(&config.root.join("package.json"))
+                .unwrap_or(&self.empty_package_referenced),
+            &self.plugin_tooling,
+            &self.script_used,
+            &self.ignore_deps,
+        )
+    }
+
+    fn workspace_inputs(
+        &'a self,
+        config: &'a ResolvedConfig,
+        root_flagged: &'a FxHashSet<String>,
+    ) -> WorkspaceUnusedDependencyInputs<'a> {
+        WorkspaceUnusedDependencyInputs {
+            config,
+            package_referenced: &self.package_referenced,
+            empty_package_referenced: &self.empty_package_referenced,
+            plugin_referenced: &self.plugin_referenced,
+            plugin_tooling: &self.plugin_tooling,
+            script_used: &self.script_used,
+            ignore_deps: &self.ignore_deps,
+            workspace_used_packages: &self.usage.workspace_used_packages,
+            package_workspace_usage: &self.usage.package_workspace_usage,
+            root_flagged,
+        }
+    }
+}
+
+fn build_unused_dependency_scan<'a>(
+    graph: &'a ModuleGraph,
+    config: &'a ResolvedConfig,
+    plugin_result: Option<&'a crate::plugins::AggregatedPluginResult>,
+    workspaces: &'a [fallow_config::WorkspaceInfo],
+) -> UnusedDependencyScan<'a> {
+    UnusedDependencyScan {
+        plugin_referenced: plugin_referenced_set(plugin_result),
+        plugin_tooling: plugin_tooling_set(plugin_result),
+        script_used: script_used_set(plugin_result),
+        package_referenced: plugin_result
+            .map(package_referenced_dependencies_by_path)
+            .unwrap_or_default(),
+        empty_package_referenced: FxHashSet::default(),
+        ignore_deps: config
+            .ignore_dependencies
+            .iter()
+            .map(String::as_str)
+            .collect(),
+        usage: collect_dependency_usage_indices(graph, config, workspaces),
+    }
+}
+
+fn append_workspace_unused_dependencies(
+    workspaces: &[fallow_config::WorkspaceInfo],
+    inputs: &WorkspaceUnusedDependencyInputs<'_>,
+    unused_deps: &mut Vec<UnusedDependency>,
+    unused_dev_deps: &mut Vec<UnusedDependency>,
+    unused_optional_deps: &mut Vec<UnusedDependency>,
+) {
+    for (prod, dev, optional) in collect_workspaces_unused_dependencies(workspaces, inputs) {
+        unused_deps.extend(prod);
+        unused_dev_deps.extend(dev);
+        unused_optional_deps.extend(optional);
+    }
+}
+
+type UnusedDependencyTriple = (
+    Vec<UnusedDependency>,
+    Vec<UnusedDependency>,
+    Vec<UnusedDependency>,
+);
+
+/// Package-usage indices shared by the root and per-workspace unused-dependency passes.
+struct DependencyUsageIndices<'a> {
+    used_packages: FxHashSet<&'a str>,
+    package_workspace_usage: FxHashMap<String, Vec<PathBuf>>,
+    workspace_used_packages: FxHashMap<&'a Path, FxHashSet<&'a str>>,
+    root_peer_used: FxHashSet<String>,
+}
+
+/// Compute the package-usage indices used to decide whether a dependency is used.
+fn collect_dependency_usage_indices<'a>(
+    graph: &'a ModuleGraph,
+    config: &ResolvedConfig,
+    workspaces: &'a [fallow_config::WorkspaceInfo],
+) -> DependencyUsageIndices<'a> {
+    let used_packages: FxHashSet<&str> = graph.package_usage.keys().map(String::as_str).collect();
+    let root_peer_used = PeerDependencyResolver::new()
+        .peer_dependency_closure(&config.root, used_packages.iter().copied());
+    let workspace_roots = dependency_owning_workspace_roots(workspaces, config);
+    DependencyUsageIndices {
+        package_workspace_usage: collect_package_workspace_usage(graph, &workspace_roots),
+        workspace_used_packages: collect_workspace_used_packages(graph, &workspace_roots),
+        used_packages,
+        root_peer_used,
+    }
+}
+
+fn collect_root_unused_dependencies(
+    pkg: &PackageJson,
+    config: &ResolvedConfig,
+    shared: &SharedDepSets<'_>,
+    usage: &DependencyUsageIndices<'_>,
+) -> UnusedDependencyTriple {
+    let root_pkg_path = config.root.join("package.json");
+    let root_pkg_content = read_pkg_json_content(&root_pkg_path);
+    let is_used_globally =
+        |dep: &str| usage.used_packages.contains(dep) || usage.root_peer_used.contains(dep);
+
+    collect_root_unused_categories(
+        pkg,
+        shared,
+        &is_used_globally,
+        &root_pkg_path,
+        root_pkg_content.as_deref(),
+    )
+}
+
+fn root_flagged_dependencies(
+    unused_deps: &[UnusedDependency],
+    unused_dev_deps: &[UnusedDependency],
+    unused_optional_deps: &[UnusedDependency],
+) -> FxHashSet<String> {
+    unused_deps
+        .iter()
+        .chain(unused_dev_deps)
+        .chain(unused_optional_deps)
+        .map(|d| d.package_name.clone())
+        .collect()
+}
+
+/// Collect unused prod/dev/optional dependencies for the root package.json.
+fn collect_root_unused_categories(
+    pkg: &PackageJson,
+    shared: &SharedDepSets<'_>,
+    is_used_globally: &dyn Fn(&str) -> bool,
+    root_pkg_path: &Path,
+    root_pkg_content: Option<&str>,
+) -> UnusedDependencyTriple {
+    let no_workspace_context = |_dep: &str| Vec::new();
+    let category = |dep_names: Vec<String>, category: &DepCategoryConfig| {
+        collect_unused_for_category(UnusedCategoryInput {
+            dep_names,
+            category,
+            shared,
+            is_used: is_used_globally,
+            used_in_workspaces: &no_workspace_context,
+            pkg_path: root_pkg_path,
+            pkg_content: root_pkg_content,
+        })
+    };
+
+    let unused_deps = category(pkg.production_dependency_names(), &prod_category());
+    let unused_dev_deps = category(pkg.dev_dependency_names(), &dev_category());
+    let unused_optional_deps = category(pkg.optional_dependency_names(), &optional_category());
+    (unused_deps, unused_dev_deps, unused_optional_deps)
+}
+
+/// Run the per-workspace unused-dependency pass in parallel.
+fn collect_workspaces_unused_dependencies(
+    workspaces: &[fallow_config::WorkspaceInfo],
+    inputs: &WorkspaceUnusedDependencyInputs<'_>,
+) -> Vec<UnusedDependencyTriple> {
+    use rayon::prelude::*;
+    workspaces
+        .par_iter()
+        .map(|ws| collect_workspace_unused_dependencies(ws, inputs))
+        .collect()
+}
+
+struct WorkspaceUnusedDependencyInputs<'a> {
+    config: &'a ResolvedConfig,
+    package_referenced: &'a FxHashMap<PathBuf, FxHashSet<&'a str>>,
+    empty_package_referenced: &'a FxHashSet<&'a str>,
+    plugin_referenced: &'a FxHashSet<&'a str>,
+    plugin_tooling: &'a FxHashSet<&'a str>,
+    script_used: &'a FxHashSet<&'a str>,
+    ignore_deps: &'a FxHashSet<&'a str>,
+    workspace_used_packages: &'a FxHashMap<&'a Path, FxHashSet<&'a str>>,
+    package_workspace_usage: &'a FxHashMap<String, Vec<PathBuf>>,
+    root_flagged: &'a FxHashSet<String>,
+}
+
+fn collect_workspace_unused_dependencies<'a>(
+    ws: &'a fallow_config::WorkspaceInfo,
+    inputs: &WorkspaceUnusedDependencyInputs<'a>,
+) -> (
+    Vec<UnusedDependency>,
+    Vec<UnusedDependency>,
+    Vec<UnusedDependency>,
+) {
+    let Some((ws_pkg_path, ws_pkg_content, ws_pkg)) = read_workspace_package(ws, inputs.config)
+    else {
+        return (Vec::new(), Vec::new(), Vec::new());
+    };
+    let ws_package_referenced = inputs
+        .package_referenced
+        .get(&ws_pkg_path)
+        .unwrap_or(inputs.empty_package_referenced);
+    let ws_shared = shared_dep_sets(
+        inputs.plugin_referenced,
+        ws_package_referenced,
+        inputs.plugin_tooling,
+        inputs.script_used,
+        inputs.ignore_deps,
+    );
+
+    let ws_root = ws.root.as_path();
+    let ws_used_packages: FxHashSet<&str> = inputs
+        .workspace_used_packages
+        .get(&ws_root)
+        .cloned()
+        .unwrap_or_default();
+    let usage = workspace_dependency_usage(
+        ws_root,
+        &ws_used_packages,
+        inputs.package_workspace_usage,
+        inputs.root_flagged,
+    );
+
+    collect_workspace_unused_categories(&ws_pkg, &ws_shared, &usage, &ws_pkg_path, &ws_pkg_content)
+}
+
+fn read_workspace_package(
+    ws: &fallow_config::WorkspaceInfo,
+    config: &ResolvedConfig,
+) -> Option<(PathBuf, String, PackageJson)> {
+    let ws_pkg_path = ws.root.join("package.json");
+    if is_package_json_ignored(&ws_pkg_path, config) {
+        return None;
+    }
+    let ws_pkg_content = std::fs::read_to_string(&ws_pkg_path).ok()?;
+    let ws_pkg = serde_json::from_str::<PackageJson>(&ws_pkg_content).ok()?;
+    Some((ws_pkg_path, ws_pkg_content, ws_pkg))
+}
+
+struct WorkspaceDependencyUsage<'a> {
+    ws_root: &'a Path,
+    ws_peer_used: FxHashSet<String>,
+    package_workspace_usage: &'a FxHashMap<String, Vec<PathBuf>>,
+    root_flagged: &'a FxHashSet<String>,
+}
+
+impl WorkspaceDependencyUsage<'_> {
+    fn is_used_in_workspace(&self, dep: &str) -> bool {
+        self.root_flagged.contains(dep)
+            || self.ws_peer_used.contains(dep)
+            || self
+                .package_workspace_usage
+                .get(dep)
+                .is_some_and(|roots| roots.iter().any(|root| root == self.ws_root))
+    }
+
+    fn used_in_other_workspaces(&self, dep: &str) -> Vec<PathBuf> {
+        used_in_other_workspaces(self.package_workspace_usage, dep, self.ws_root)
+    }
+}
+
+fn workspace_dependency_usage<'a>(
+    ws_root: &'a Path,
+    ws_used_packages: &FxHashSet<&str>,
+    package_workspace_usage: &'a FxHashMap<String, Vec<PathBuf>>,
+    root_flagged: &'a FxHashSet<String>,
+) -> WorkspaceDependencyUsage<'a> {
+    let ws_peer_used = PeerDependencyResolver::new()
+        .peer_dependency_closure(ws_root, ws_used_packages.iter().copied());
+    WorkspaceDependencyUsage {
+        ws_root,
+        ws_peer_used,
+        package_workspace_usage,
+        root_flagged,
+    }
+}
+
+fn collect_workspace_unused_categories(
+    ws_pkg: &PackageJson,
+    ws_shared: &SharedDepSets<'_>,
+    usage: &WorkspaceDependencyUsage<'_>,
+    ws_pkg_path: &Path,
+    ws_pkg_content: &str,
+) -> (
+    Vec<UnusedDependency>,
+    Vec<UnusedDependency>,
+    Vec<UnusedDependency>,
+) {
+    let is_used_in_workspace = |dep: &str| usage.is_used_in_workspace(dep);
+    let used_in_workspaces = |dep: &str| usage.used_in_other_workspaces(dep);
+
+    let prod = collect_unused_for_category(UnusedCategoryInput {
+        dep_names: ws_pkg.production_dependency_names(),
+        category: &prod_category(),
+        shared: ws_shared,
+        is_used: &is_used_in_workspace,
+        used_in_workspaces: &used_in_workspaces,
+        pkg_path: ws_pkg_path,
+        pkg_content: Some(ws_pkg_content),
+    });
+    let dev = collect_unused_for_category(UnusedCategoryInput {
+        dep_names: ws_pkg.dev_dependency_names(),
+        category: &dev_category(),
+        shared: ws_shared,
+        is_used: &is_used_in_workspace,
+        used_in_workspaces: &used_in_workspaces,
+        pkg_path: ws_pkg_path,
+        pkg_content: Some(ws_pkg_content),
+    });
+    let optional = collect_unused_for_category(UnusedCategoryInput {
+        dep_names: ws_pkg.optional_dependency_names(),
+        category: &optional_category(),
+        shared: ws_shared,
+        is_used: &is_used_in_workspace,
+        used_in_workspaces: &used_in_workspaces,
+        pkg_path: ws_pkg_path,
+        pkg_content: Some(ws_pkg_content),
+    });
+
+    (prod, dev, optional)
 }
 
 /// Check if a dependency should be skipped during unused dependency analysis.
@@ -289,6 +767,10 @@ pub fn find_unused_dependencies(
 ///
 /// Retained for test coverage of the individual guard logic.
 #[cfg(test)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "test-only guard helper; params are independent suppression sets, bundling would not aid readability"
+)]
 fn should_skip_dependency(
     dep: &str,
     root_flagged: &FxHashSet<String>,
@@ -323,13 +805,10 @@ pub fn find_type_only_dependencies(
 
     let mut type_only_deps = Vec::new();
 
-    // Check root production dependencies
     for dep in pkg.production_dependency_names() {
-        // Skip internal workspace packages
         if workspace_names.contains(dep.as_str()) {
             continue;
         }
-        // Skip ignored dependencies
         if config.ignore_dependencies.iter().any(|d| d == &dep) {
             continue;
         }
@@ -338,12 +817,9 @@ pub fn find_type_only_dependencies(
         let has_type_only_usage = graph.type_only_package_usage.contains_key(dep.as_str());
 
         if !has_any_usage {
-            // Not used at all — this will be caught by unused_dependencies
             continue;
         }
 
-        // Check if ALL usages are type-only: the number of type-only usages must equal
-        // the total number of usages for this package
         let total_count = graph.package_usage.get(dep.as_str()).map_or(0, Vec::len);
         let type_only_count = graph
             .type_only_package_usage
@@ -365,6 +841,57 @@ pub fn find_type_only_dependencies(
     type_only_deps
 }
 
+/// Return the process-wide glob set matching production-excluded test/story files.
+///
+/// Returns `None` when the glob set fails to compile, mirroring the original
+/// early-return-empty behavior of both dependency detectors. The `Option` is
+/// cached too, so a failed compilation is never replaced with an empty matcher.
+fn production_exclude_globset() -> Option<&'static globset::GlobSet> {
+    static SET: OnceLock<Option<globset::GlobSet>> = OnceLock::new();
+    SET.get_or_init(|| {
+        let mut builder = globset::GlobSetBuilder::new();
+        for pattern in crate::discover::PRODUCTION_EXCLUDE_PATTERNS {
+            if let Ok(glob) = globset::GlobBuilder::new(pattern)
+                .literal_separator(true)
+                .build()
+            {
+                builder.add(glob);
+            }
+        }
+        builder.build().ok()
+    })
+    .as_ref()
+}
+
+/// Return `true` when every file importing `dep` is a test/story or config file
+/// and the dependency is not exclusively type-only imported.
+fn dependency_is_test_only(
+    dep: &str,
+    graph: &ModuleGraph,
+    config: &ResolvedConfig,
+    test_globs: &globset::GlobSet,
+) -> bool {
+    let Some(file_ids) = graph.package_usage.get(dep) else {
+        return false;
+    };
+
+    let total_count = file_ids.len();
+    let type_only_count = graph.type_only_package_usage.get(dep).map_or(0, Vec::len);
+    if type_only_count == total_count {
+        return false;
+    }
+
+    file_ids.iter().all(|id| {
+        graph.modules.get(id.0 as usize).is_some_and(|module| {
+            let relative = module
+                .path
+                .strip_prefix(&config.root)
+                .unwrap_or(&module.path);
+            test_globs.is_match(relative) || is_config_file(&module.path)
+        })
+    })
+}
+
 /// Find production dependencies that are only imported by test/dev files.
 ///
 /// When NOT in production mode (where test files are still discovered), a dep
@@ -375,21 +902,8 @@ pub fn find_test_only_dependencies(
     config: &ResolvedConfig,
     workspaces: &[fallow_config::WorkspaceInfo],
 ) -> Vec<TestOnlyDependency> {
-    // Build a GlobSet from the production exclude patterns (test/dev/story files)
-    let test_globs = {
-        let mut builder = globset::GlobSetBuilder::new();
-        for pattern in crate::discover::PRODUCTION_EXCLUDE_PATTERNS {
-            if let Ok(glob) = globset::GlobBuilder::new(pattern)
-                .literal_separator(true)
-                .build()
-            {
-                builder.add(glob);
-            }
-        }
-        match builder.build() {
-            Ok(set) => set,
-            Err(_) => return Vec::new(),
-        }
+    let Some(test_globs) = production_exclude_globset() else {
+        return Vec::new();
     };
 
     let root_pkg_path = config.root.join("package.json");
@@ -411,36 +925,7 @@ pub fn find_test_only_dependencies(
             continue;
         }
 
-        let Some(file_ids) = graph.package_usage.get(dep.as_str()) else {
-            // Not used at all — caught by unused_dependencies
-            continue;
-        };
-
-        // Skip if already caught as type-only (all usages are type-only imports)
-        let total_count = file_ids.len();
-        let type_only_count = graph
-            .type_only_package_usage
-            .get(dep.as_str())
-            .map_or(0, Vec::len);
-        if type_only_count == total_count {
-            continue;
-        }
-
-        // Check if ALL importing files are test/dev/config files.
-        // Test/story files are matched by glob patterns from PRODUCTION_EXCLUDE_PATTERNS.
-        // Config files use the curated `is_config_file` predicate which avoids false
-        // matches on application config files like `app.config.ts` (see #111, #112).
-        let all_test_only = file_ids.iter().all(|id| {
-            graph.modules.get(id.0 as usize).is_some_and(|module| {
-                let relative = module
-                    .path
-                    .strip_prefix(&config.root)
-                    .unwrap_or(&module.path);
-                test_globs.is_match(relative) || is_config_file(&module.path)
-            })
-        });
-
-        if all_test_only {
+        if dependency_is_test_only(&dep, graph, config, test_globs) {
             let line = root_pkg_content
                 .as_deref()
                 .map_or(1, |c| find_dep_line_in_json(c, &dep));
@@ -455,6 +940,162 @@ pub fn find_test_only_dependencies(
     test_only_deps
 }
 
+/// Return `true` when at least one PRODUCTION (non-test, non-config) file
+/// imports `dep` via a runtime/value import.
+///
+/// `package_usage` records one entry per import statement and
+/// `type_only_package_usage` one entry per `import type` statement, so for a
+/// given file the count of value imports is `total - type_only`. A file with a
+/// value import of `dep` is therefore one whose `total` occurrences exceed its
+/// `type_only` occurrences. This mirrors the per-statement granularity the
+/// `type-only-dependency` / `test-only-dependency` detectors rely on, so a
+/// production file that imports `dep` ONLY via `import type` is not flagged.
+///
+/// Files owned by a workspace package are skipped: this rule reasons about the
+/// ROOT manifest only, and a workspace file's runtime resolution is governed by
+/// the workspace's own `package.json` (a package hoisted into root
+/// `devDependencies` but declared in the workspace's `dependencies` would
+/// otherwise be a false positive). Per-workspace detection is the shared
+/// follow-up with the sibling dependency-family detectors.
+///
+/// Only files reachable from a RUNTIME entry point count as production
+/// evidence (`is_runtime_reachable`, the graph's production scope). Repo
+/// tooling the test globs do not cover (`scripts/`, `benchmarks/`, `.github/`,
+/// playgrounds, and anything reachable only through a config-file support
+/// entry such as a rollup config chain) is not part of the shipped artifact,
+/// so a devDependency imported only there must not be promoted.
+fn dependency_has_prod_value_import(
+    dep: &str,
+    graph: &ModuleGraph,
+    config: &ResolvedConfig,
+    test_globs: &globset::GlobSet,
+    workspaces: &[fallow_config::WorkspaceInfo],
+) -> bool {
+    let Some(file_ids) = graph.package_usage.get(dep) else {
+        return false;
+    };
+
+    let mut per_file: FxHashMap<FileId, (u32, u32)> = FxHashMap::default();
+    for id in file_ids {
+        per_file.entry(*id).or_default().0 += 1;
+    }
+    if let Some(type_only_ids) = graph.type_only_package_usage.get(dep) {
+        for id in type_only_ids {
+            per_file.entry(*id).or_default().1 += 1;
+        }
+    }
+
+    per_file.iter().any(|(id, (total, type_only))| {
+        // No value import in this file: every occurrence was `import type`.
+        if total <= type_only {
+            return false;
+        }
+        graph.modules.get(id.0 as usize).is_some_and(|module| {
+            if !module.is_runtime_reachable() {
+                return false;
+            }
+            let relative = module
+                .path
+                .strip_prefix(&config.root)
+                .unwrap_or(&module.path);
+            !(test_globs.is_match(relative)
+                || is_config_file(&module.path)
+                || workspaces
+                    .iter()
+                    .any(|ws| module.path.starts_with(&ws.root)))
+        })
+    })
+}
+
+/// Find `devDependencies` imported by production code with a runtime/value
+/// import.
+///
+/// The promote-side mirror of [`find_test_only_dependencies`]: where the
+/// test-only rule demotes a production dependency imported only from tests, this
+/// rule promotes a dev dependency imported at runtime from production code.
+/// A production-only install (`pnpm install --prod`) omits `devDependencies`, so
+/// such a package would break at runtime and belongs in `dependencies`.
+///
+/// A dev dependency is NOT flagged when its only production imports are
+/// type-only (types are erased at build time, mirroring the
+/// `type-only-dependency` import-kind analysis), when it is also listed in
+/// `dependencies` / `peerDependencies` / `optionalDependencies` (runtime is
+/// provided by another manifest section), when it is a known tooling package
+/// (`@types/*`, `typescript`, ...), a workspace package, or config-ignored via
+/// `ignoreDependencies`.
+///
+/// Like [`find_test_only_dependencies`], this checks the root `package.json`
+/// against the project-wide import graph; per-workspace `package.json` parity is
+/// a shared follow-up with the sibling dependency-family detectors.
+pub fn find_dev_dependencies_in_production(
+    graph: &ModuleGraph,
+    pkg: &PackageJson,
+    config: &ResolvedConfig,
+    workspaces: &[fallow_config::WorkspaceInfo],
+) -> Vec<DevDependencyInProduction> {
+    let Some(test_globs) = production_exclude_globset() else {
+        return Vec::new();
+    };
+
+    let root_pkg_path = config.root.join("package.json");
+    let root_pkg_content = read_pkg_json_content(&root_pkg_path);
+    let workspace_names: FxHashSet<&str> = workspaces.iter().map(|ws| ws.name.as_str()).collect();
+    let ignore_deps: FxHashSet<&str> = config
+        .ignore_dependencies
+        .iter()
+        .map(String::as_str)
+        .collect();
+
+    // Packages resolvable at runtime through another manifest section: a
+    // devDependency that is also a prod/peer/optional dependency is legitimately
+    // value-imported in production, so it must not be flagged.
+    let prod_names = pkg.production_dependency_names();
+    let optional_names = pkg.optional_dependency_names();
+    let runtime_provided: FxHashSet<&str> = prod_names
+        .iter()
+        .chain(optional_names.iter())
+        .map(String::as_str)
+        .chain(
+            pkg.peer_dependencies
+                .as_ref()
+                .into_iter()
+                .flat_map(|deps| deps.keys().map(String::as_str)),
+        )
+        .collect();
+
+    let mut findings = Vec::new();
+
+    for dep in pkg.dev_dependency_names() {
+        if workspace_names.contains(dep.as_str()) {
+            continue;
+        }
+        if ignore_deps.contains(dep.as_str()) {
+            continue;
+        }
+        if runtime_provided.contains(dep.as_str()) {
+            continue;
+        }
+        // `@types/*`, `typescript`, `prettier`, ... are genuine dev tooling and
+        // are never promoted, matching the dev category of unused-dep detection.
+        if crate::plugins::is_known_tooling_dependency(&dep) {
+            continue;
+        }
+
+        if dependency_has_prod_value_import(&dep, graph, config, test_globs, workspaces) {
+            let line = root_pkg_content
+                .as_deref()
+                .map_or(1, |c| find_dep_line_in_json(c, &dep));
+            findings.push(DevDependencyInProduction {
+                package_name: dep,
+                path: root_pkg_path.clone(),
+                line,
+            });
+        }
+    }
+
+    findings
+}
+
 /// Check whether a package is listed in root deps or in the workspace that owns `file_path`.
 pub fn is_package_listed_for_file(
     file_path: &Path,
@@ -462,12 +1103,22 @@ pub fn is_package_listed_for_file(
     root_deps: &FxHashSet<String>,
     ws_dep_map: &[(PathBuf, FxHashSet<String>)],
 ) -> bool {
-    if root_deps.contains(package_name) {
-        return true;
+    if let Some(ws_deps) = owning_workspace_deps(file_path, ws_dep_map) {
+        return ws_deps.contains(package_name);
     }
+
+    root_deps.contains(package_name)
+}
+
+fn owning_workspace_deps<'a>(
+    file_path: &Path,
+    ws_dep_map: &'a [(PathBuf, FxHashSet<String>)],
+) -> Option<&'a FxHashSet<String>> {
     ws_dep_map
         .iter()
-        .any(|(ws_root, ws_deps)| file_path.starts_with(ws_root) && ws_deps.contains(package_name))
+        .filter(|(ws_root, _)| file_path.starts_with(ws_root))
+        .max_by_key(|(ws_root, _)| ws_root.components().count())
+        .map(|(_, ws_deps)| ws_deps)
 }
 
 /// Check if a corresponding `@types/<package>` is listed in dependencies.
@@ -478,20 +1129,29 @@ pub fn is_package_listed_for_file(
 /// regardless of whether it uses the `import type` syntax.
 ///
 /// For scoped packages like `@scope/pkg`, the DefinitelyTyped convention is `@types/scope__pkg`.
-fn has_types_package(package_name: &str, all_workspace_deps: &FxHashSet<String>) -> bool {
-    let types_name = package_name.strip_prefix('@').map_or_else(
+fn types_package_name(package_name: &str) -> String {
+    package_name.strip_prefix('@').map_or_else(
         || format!("@types/{package_name}"),
-        // @scope/pkg -> @types/scope__pkg
         |scoped| format!("@types/{}", scoped.replacen('/', "__", 1)),
-    );
-    all_workspace_deps.contains(&types_name)
+    )
+}
+
+fn has_types_package_for_file(
+    file_path: &Path,
+    package_name: &str,
+    root_deps: &FxHashSet<String>,
+    ws_dep_map: &[(PathBuf, FxHashSet<String>)],
+) -> bool {
+    let types_name = types_package_name(package_name);
+    is_package_listed_for_file(file_path, &types_name, root_deps, ws_dep_map)
 }
 
 /// Look up the import location (line, col) for a given package in a given file.
 ///
-/// Falls back to `(1, 0)` when no span is found (e.g. re-export-only usages).
+/// Falls back to `(1, 0)` when no source edge span is found.
+#[cfg(test)]
 pub fn find_import_location(
-    import_spans_by_file: &FxHashMap<FileId, Vec<(&str, u32)>>,
+    import_spans_by_file: &FxHashMap<FileId, Vec<(&str, &str, u32)>>,
     line_offsets_by_file: &LineOffsetsMap<'_>,
     file_id: FileId,
     package_name: &str,
@@ -501,50 +1161,245 @@ pub fn find_import_location(
         .and_then(|spans| {
             spans
                 .iter()
-                .find(|(name, _)| *name == package_name)
-                .map(|(_, span_start)| {
+                .find(|(name, source, _)| *name == package_name && !is_builtin_module(source))
+                .or_else(|| spans.iter().find(|(name, _, _)| *name == package_name))
+                .map(|(_, _, span_start)| {
                     byte_offset_to_line_col(line_offsets_by_file, file_id, *span_start)
                 })
         })
         .unwrap_or((1, 0))
 }
 
-/// Find dependencies used in imports but not listed in package.json.
-pub fn find_unlisted_dependencies(
-    graph: &ModuleGraph,
-    pkg: &PackageJson,
-    config: &ResolvedConfig,
-    workspaces: &[fallow_config::WorkspaceInfo],
-    plugin_result: Option<&crate::plugins::AggregatedPluginResult>,
-    resolved_modules: &[ResolvedModule],
+fn relative_module_path(module_path: &Path, root: &Path) -> String {
+    module_path
+        .strip_prefix(root)
+        .unwrap_or(module_path)
+        .to_string_lossy()
+        .into_owned()
+}
+
+struct CompiledProvidedDependencyRule<'a> {
+    rule: &'a ProvidedDependencyRule,
+    path_matcher: CompiledPathRule,
+}
+
+fn compile_provided_dependency_rules(
+    rules: &[ProvidedDependencyRule],
+) -> Vec<CompiledProvidedDependencyRule<'_>> {
+    rules
+        .iter()
+        .filter_map(|rule| {
+            CompiledPathRule::for_used_export_rule(&rule.path, "provided dependency")
+                .map(|path_matcher| CompiledProvidedDependencyRule { rule, path_matcher })
+        })
+        .collect()
+}
+
+fn import_is_provided(
+    rules: &[CompiledProvidedDependencyRule<'_>],
+    relative_path: &str,
+    source_specifier: &str,
+) -> bool {
+    rules.iter().any(|rule| {
+        rule.path_matcher.matches(relative_path) && rule.rule.covers_specifier(source_specifier)
+    })
+}
+
+fn package_has_file_scoped_provider(rules: &[ProvidedDependencyRule], package_name: &str) -> bool {
+    rules
+        .iter()
+        .any(|rule| rule.may_cover_package(package_name))
+}
+
+fn find_unprovided_import_location(
+    import_spans_by_file: &FxHashMap<FileId, Vec<(&str, &str, u32)>>,
     line_offsets_by_file: &LineOffsetsMap<'_>,
-) -> Vec<UnlistedDependency> {
-    let all_deps: FxHashSet<String> = pkg.all_dependency_names().into_iter().collect();
+    provided_rules: &[CompiledProvidedDependencyRule<'_>],
+    relative_path: &str,
+    file_id: FileId,
+    package_name: &str,
+) -> Option<(u32, u32)> {
+    import_spans_by_file.get(&file_id).and_then(|spans| {
+        spans
+            .iter()
+            .filter(|(name, _, _)| *name == package_name)
+            .find(|(_, source, _)| {
+                !is_builtin_module(source)
+                    && !import_is_provided(provided_rules, relative_path, source)
+            })
+            .or_else(|| {
+                spans.iter().find(|(name, source, _)| {
+                    *name == package_name
+                        && !import_is_provided(provided_rules, relative_path, source)
+                })
+            })
+            .map(|(_, _, span_start)| {
+                byte_offset_to_line_col(line_offsets_by_file, file_id, *span_start)
+            })
+    })
+}
 
-    // Build a set of all deps across all workspace package.json files.
-    // In monorepos, imports in workspace files reference deps from that workspace's package.json.
-    let mut all_workspace_deps: FxHashSet<String> = all_deps.clone();
-    // Also collect workspace package names — internal workspace deps should not be flagged
-    let mut workspace_names: FxHashSet<String> = FxHashSet::default();
-    // Map: canonical workspace root -> set of dep names (for per-file checks)
-    let mut ws_dep_map: Vec<(PathBuf, FxHashSet<String>)> = Vec::new();
+fn package_imports_are_all_builtin(
+    import_spans_by_file: &FxHashMap<FileId, Vec<(&str, &str, u32)>>,
+    file_id: FileId,
+    package_name: &str,
+) -> bool {
+    let Some(imports) = import_spans_by_file.get(&file_id) else {
+        return false;
+    };
 
-    for ws in workspaces {
-        workspace_names.insert(ws.name.clone());
-        let ws_pkg_path = ws.root.join("package.json");
-        if is_package_json_ignored(&ws_pkg_path, config) {
-            continue;
-        }
-        if let Ok(ws_pkg) = PackageJson::load(&ws_pkg_path) {
-            let ws_deps: FxHashSet<String> = ws_pkg.all_dependency_names().into_iter().collect();
-            all_workspace_deps.extend(ws_deps.iter().cloned());
-            // Use raw workspace root path for starts_with checks (avoids per-file canonicalize)
-            ws_dep_map.push((ws.root.clone(), ws_deps));
+    let mut saw_package = false;
+    for (name, source, _) in imports {
+        if *name == package_name {
+            saw_package = true;
+            if !is_builtin_module(source) {
+                return false;
+            }
         }
     }
 
-    // Collect virtual module prefixes from active plugins (e.g., Docusaurus @theme/, @site/)
-    let virtual_prefixes: Vec<&str> = plugin_result
+    saw_package
+}
+
+/// A package whose every import in this file used the Deno `npm:` scheme is
+/// self-declaring: Supabase Edge Functions and Deno deliberately inline the
+/// dependency in the specifier instead of listing it in package.json, so it
+/// must not surface as an unlisted dependency. Mirrors the per-file `bun:`
+/// carve-out (`package_imports_are_all_builtin`) and stays conservative: a
+/// package also imported via a bare specifier (e.g. `import 'foo'` in a Node
+/// file) is NOT all-`npm:`, so the genuine missing-dependency report survives.
+/// The resolver normalizes `npm:<pkg>` to its package name for usage crediting
+/// but leaves the original `npm:` prefix on `ImportInfo.source`, which is the
+/// string compared here. See issue #624.
+fn package_imports_are_all_npm_scheme(
+    import_spans_by_file: &FxHashMap<FileId, Vec<(&str, &str, u32)>>,
+    file_id: FileId,
+    package_name: &str,
+) -> bool {
+    let Some(imports) = import_spans_by_file.get(&file_id) else {
+        return false;
+    };
+
+    let mut saw_package = false;
+    for (name, source, _) in imports {
+        if *name == package_name {
+            saw_package = true;
+            if !source.starts_with("npm:") {
+                return false;
+            }
+        }
+    }
+
+    saw_package
+}
+
+fn workspace_dependency_map(
+    workspaces: &[fallow_config::WorkspaceInfo],
+    config: &ResolvedConfig,
+) -> Vec<(PathBuf, FxHashSet<String>)> {
+    let ambient_workspace_names: FxHashSet<String> = workspaces
+        .iter()
+        .filter(|ws| fallow_config::dir_has_deno_json(&ws.root))
+        .map(|ws| ws.name.clone())
+        .collect();
+
+    let mut ws_dep_map = Vec::new();
+    for ws in workspaces {
+        let ws_pkg_path = ws.root.join("package.json");
+        if ws_pkg_path.is_file() && is_package_json_ignored(&ws_pkg_path, config) {
+            continue;
+        }
+
+        let Ok(Some((_name, ws_pkg, _deps))) =
+            fallow_config::load_member_package_manifest(&ws.root)
+        else {
+            continue;
+        };
+
+        let mut ws_deps: FxHashSet<String> = ws_pkg.all_dependency_names().into_iter().collect();
+        ws_deps.insert(ws.name.clone());
+        if fallow_config::dir_has_deno_json(&ws.root) {
+            ws_deps.extend(ambient_workspace_names.iter().cloned());
+        }
+        ws_dep_map.push((ws.root.clone(), ws_deps));
+    }
+    ws_dep_map
+}
+
+fn import_spans_by_file(
+    resolved_modules: &[ResolvedModule],
+) -> FxHashMap<FileId, Vec<(&str, &str, u32)>> {
+    let mut import_spans_by_file: FxHashMap<FileId, Vec<(&str, &str, u32)>> = FxHashMap::default();
+    for rm in resolved_modules {
+        for edge in rm.all_resolved_source_edges() {
+            if let Some(name) = edge.target().package_usage_name() {
+                import_spans_by_file.entry(rm.file_id).or_default().push((
+                    name,
+                    edge.source_specifier(),
+                    edge.span().start,
+                ));
+            }
+        }
+    }
+    import_spans_by_file
+}
+
+#[derive(Clone, Copy)]
+pub struct UnlistedDependencyInput<'a> {
+    pub graph: &'a ModuleGraph,
+    pub pkg: &'a PackageJson,
+    pub config: &'a ResolvedConfig,
+    pub workspaces: &'a [fallow_config::WorkspaceInfo],
+    pub plugin_result: Option<&'a crate::plugins::AggregatedPluginResult>,
+    pub resolved_modules: &'a [ResolvedModule],
+    pub line_offsets_by_file: &'a LineOffsetsMap<'a>,
+}
+
+/// Find dependencies used in imports but not listed in package.json.
+pub fn find_unlisted_dependencies(input: UnlistedDependencyInput<'_>) -> Vec<UnlistedDependency> {
+    let parts = build_unlisted_dependency_context_parts(&input);
+    let ctx = UnlistedDependencyContext {
+        graph: input.graph,
+        config: input.config,
+        all_deps: &parts.all_deps,
+        ws_dep_map: &parts.ws_dep_map,
+        virtual_prefixes: &parts.virtual_prefixes,
+        virtual_suffixes: &parts.virtual_suffixes,
+        plugin_tooling: &parts.plugin_tooling,
+        provided_dependency_rules: parts.provided_dependency_rules,
+        compiled_provided_dependency_rules: &parts.compiled_provided_dependency_rules,
+        import_spans_by_file: &parts.import_spans_by_file,
+        ignore_deps: &parts.ignore_deps,
+        line_offsets_by_file: input.line_offsets_by_file,
+    };
+
+    collect_unlisted_dependencies(&ctx)
+}
+
+struct UnlistedDependencyContextParts<'a> {
+    all_deps: FxHashSet<String>,
+    ws_dep_map: Vec<(PathBuf, FxHashSet<String>)>,
+    virtual_prefixes: Vec<&'a str>,
+    virtual_suffixes: Vec<&'a str>,
+    plugin_tooling: FxHashSet<&'a str>,
+    provided_dependency_rules: &'a [ProvidedDependencyRule],
+    compiled_provided_dependency_rules: Vec<CompiledProvidedDependencyRule<'a>>,
+    import_spans_by_file: FxHashMap<FileId, Vec<(&'a str, &'a str, u32)>>,
+    ignore_deps: FxHashSet<&'a str>,
+}
+
+struct UnlistedDependencyPluginParts<'a> {
+    virtual_prefixes: Vec<&'a str>,
+    virtual_suffixes: Vec<&'a str>,
+    plugin_tooling: FxHashSet<&'a str>,
+    provided_dependency_rules: &'a [ProvidedDependencyRule],
+    compiled_provided_dependency_rules: Vec<CompiledProvidedDependencyRule<'a>>,
+}
+
+fn build_unlisted_dependency_plugin_parts(
+    plugin_result: Option<&crate::plugins::AggregatedPluginResult>,
+) -> UnlistedDependencyPluginParts<'_> {
+    let virtual_prefixes = plugin_result
         .map(|pr| {
             pr.virtual_module_prefixes
                 .iter()
@@ -553,94 +1408,87 @@ pub fn find_unlisted_dependencies(
         })
         .unwrap_or_default();
 
-    // Collect tooling dependencies from active plugins — these are framework-provided
-    // packages (e.g., Nuxt provides `ofetch`, `h3`, `vue-router` at runtime) that may
-    // be imported in user code without being listed in package.json.
-    let plugin_tooling: FxHashSet<&str> = plugin_result
-        .map(|pr| pr.tooling_dependencies.iter().map(String::as_str).collect())
+    let virtual_suffixes = plugin_result
+        .map(|pr| {
+            pr.virtual_package_suffixes
+                .iter()
+                .map(String::as_str)
+                .collect()
+        })
         .unwrap_or_default();
 
-    // Build a lookup: FileId -> Vec<(package_name, span_start)> from resolved modules,
-    // so we can recover the import location when building UnlistedDependency results.
-    let mut import_spans_by_file: FxHashMap<FileId, Vec<(&str, u32)>> = FxHashMap::default();
-    for rm in resolved_modules {
-        for import in &rm.resolved_imports {
-            if let crate::resolve::ResolveResult::NpmPackage(name) = &import.target {
-                import_spans_by_file
-                    .entry(rm.file_id)
-                    .or_default()
-                    .push((name.as_str(), import.info.span.start));
-            }
-        }
-        // Re-exports don't have span info on ReExportInfo, so skip them here.
-        // The import span lookup will fall back to (1, 0) for re-export-only usages.
+    let plugin_tooling = plugin_result
+        .map(|pr| pr.tooling_dependencies.iter().map(String::as_str).collect())
+        .unwrap_or_default();
+    let provided_dependency_rules: &[ProvidedDependencyRule] =
+        plugin_result.map_or(&[], |pr| pr.provided_dependencies.as_slice());
+    let compiled_provided_dependency_rules =
+        compile_provided_dependency_rules(provided_dependency_rules);
+
+    UnlistedDependencyPluginParts {
+        virtual_prefixes,
+        virtual_suffixes,
+        plugin_tooling,
+        provided_dependency_rules,
+        compiled_provided_dependency_rules,
+    }
+}
+
+fn build_unlisted_dependency_context_parts<'a>(
+    input: &UnlistedDependencyInput<'a>,
+) -> UnlistedDependencyContextParts<'a> {
+    let mut all_deps: FxHashSet<String> = input.pkg.all_dependency_names().into_iter().collect();
+    if let Some(root_name) = &input.pkg.name {
+        all_deps.insert(root_name.clone());
     }
 
-    let ignore_deps: FxHashSet<&str> = config
+    // Deno workspaces expose member packages without package.json dependency
+    // entries. Treat discovered workspace names as listed at the root too so
+    // files outside a member directory do not false-positive as unlisted.
+    if fallow_config::dir_has_deno_json(&input.config.root) {
+        all_deps.extend(
+            input
+                .workspaces
+                .iter()
+                .filter(|ws| fallow_config::dir_has_deno_json(&ws.root))
+                .map(|ws| ws.name.clone()),
+        );
+    }
+
+    let ws_dep_map = workspace_dependency_map(input.workspaces, input.config);
+
+    let plugin_parts = build_unlisted_dependency_plugin_parts(input.plugin_result);
+    let import_spans_by_file = import_spans_by_file(input.resolved_modules);
+
+    let ignore_deps = input
+        .config
         .ignore_dependencies
         .iter()
         .map(String::as_str)
         .collect();
 
+    UnlistedDependencyContextParts {
+        all_deps,
+        ws_dep_map,
+        virtual_prefixes: plugin_parts.virtual_prefixes,
+        virtual_suffixes: plugin_parts.virtual_suffixes,
+        plugin_tooling: plugin_parts.plugin_tooling,
+        provided_dependency_rules: plugin_parts.provided_dependency_rules,
+        compiled_provided_dependency_rules: plugin_parts.compiled_provided_dependency_rules,
+        import_spans_by_file,
+        ignore_deps,
+    }
+}
+
+/// Walk `package_usage`, gathering per-package import sites into findings.
+fn collect_unlisted_dependencies(ctx: &UnlistedDependencyContext<'_>) -> Vec<UnlistedDependency> {
     let mut unlisted: FxHashMap<String, Vec<ImportSite>> = FxHashMap::default();
 
-    for (package_name, file_ids) in &graph.package_usage {
-        if is_builtin_module(package_name) || is_path_alias(package_name) {
+    for (package_name, file_ids) in &ctx.graph.package_usage {
+        if should_skip_unlisted_package(package_name, ctx) {
             continue;
         }
-        if is_virtual_module(package_name) {
-            continue;
-        }
-        if workspace_names.contains(package_name) {
-            continue;
-        }
-        if ignore_deps.contains(package_name.as_str()) {
-            continue;
-        }
-        if plugin_tooling.contains(package_name.as_str()) {
-            continue;
-        }
-        if virtual_prefixes.iter().any(|prefix| {
-            package_name.starts_with(prefix)
-                || prefix
-                    .strip_suffix('/')
-                    .is_some_and(|base| package_name == base)
-        }) {
-            continue;
-        }
-        // Quick check: if listed in any root or workspace deps, skip
-        if all_workspace_deps.contains(package_name) {
-            continue;
-        }
-        // When @types/<package> is listed, the bare package is used for types only —
-        // TypeScript resolves types from @types/ and erases the import at compile time.
-        if has_types_package(package_name, &all_workspace_deps) {
-            continue;
-        }
-
-        // Slower fallback: check if each importing file belongs to a workspace that lists this dep.
-        // Uses raw path comparison (module paths are absolute) to avoid per-file canonicalize().
-        let mut unlisted_sites: Vec<ImportSite> = Vec::new();
-        for id in file_ids {
-            let Some(module) = graph.modules.get(id.0 as usize) else {
-                continue;
-            };
-            if is_package_listed_for_file(&module.path, package_name, &all_deps, &ws_dep_map) {
-                continue;
-            }
-            let (line, col) = find_import_location(
-                &import_spans_by_file,
-                line_offsets_by_file,
-                *id,
-                package_name,
-            );
-            unlisted_sites.push(ImportSite {
-                path: module.path.clone(),
-                line,
-                col,
-            });
-        }
-
+        let mut unlisted_sites = collect_unlisted_import_sites(package_name, file_ids, ctx);
         if !unlisted_sites.is_empty() {
             unlisted_sites.sort_by(|a, b| a.path.cmp(&b.path).then(a.line.cmp(&b.line)));
             unlisted_sites.dedup_by(|a, b| a.path == b.path);
@@ -657,83 +1505,258 @@ pub fn find_unlisted_dependencies(
         .collect()
 }
 
+struct UnlistedDependencyContext<'a> {
+    graph: &'a ModuleGraph,
+    config: &'a ResolvedConfig,
+    all_deps: &'a FxHashSet<String>,
+    ws_dep_map: &'a [(std::path::PathBuf, FxHashSet<String>)],
+    virtual_prefixes: &'a [&'a str],
+    virtual_suffixes: &'a [&'a str],
+    plugin_tooling: &'a FxHashSet<&'a str>,
+    provided_dependency_rules: &'a [ProvidedDependencyRule],
+    compiled_provided_dependency_rules: &'a [CompiledProvidedDependencyRule<'a>],
+    import_spans_by_file: &'a FxHashMap<FileId, Vec<(&'a str, &'a str, u32)>>,
+    ignore_deps: &'a FxHashSet<&'a str>,
+    line_offsets_by_file: &'a LineOffsetsMap<'a>,
+}
+
+fn should_skip_unlisted_package(package_name: &str, ctx: &UnlistedDependencyContext<'_>) -> bool {
+    ((package_name != "bun" && is_builtin_module(package_name)) || is_path_alias(package_name))
+        || is_virtual_module(package_name)
+        || ctx.ignore_deps.contains(package_name)
+        || (ctx.plugin_tooling.contains(package_name)
+            && !package_has_file_scoped_provider(ctx.provided_dependency_rules, package_name))
+        || ctx
+            .virtual_prefixes
+            .iter()
+            .any(|prefix| matches_virtual_prefix(prefix, package_name))
+        || ctx
+            .virtual_suffixes
+            .iter()
+            .any(|suffix| package_name.ends_with(suffix))
+}
+
+fn collect_unlisted_import_sites(
+    package_name: &str,
+    file_ids: &[FileId],
+    ctx: &UnlistedDependencyContext<'_>,
+) -> Vec<ImportSite> {
+    file_ids
+        .iter()
+        .filter_map(|id| collect_unlisted_import_site(package_name, *id, ctx))
+        .collect()
+}
+
+fn collect_unlisted_import_site(
+    package_name: &str,
+    id: FileId,
+    ctx: &UnlistedDependencyContext<'_>,
+) -> Option<ImportSite> {
+    let module = ctx.graph.modules.get(id.0 as usize)?;
+    if package_name == "bun"
+        && package_imports_are_all_builtin(ctx.import_spans_by_file, id, package_name)
+    {
+        return None;
+    }
+    if package_imports_are_all_npm_scheme(ctx.import_spans_by_file, id, package_name) {
+        return None;
+    }
+    if is_package_listed_for_file(&module.path, package_name, ctx.all_deps, ctx.ws_dep_map) {
+        return None;
+    }
+    if has_types_package_for_file(&module.path, package_name, ctx.all_deps, ctx.ws_dep_map) {
+        return None;
+    }
+    let relative_path = relative_module_path(&module.path, &ctx.config.root);
+    let (line, col) = find_unprovided_import_location(
+        ctx.import_spans_by_file,
+        ctx.line_offsets_by_file,
+        ctx.compiled_provided_dependency_rules,
+        &relative_path,
+        id,
+        package_name,
+    )?;
+    Some(ImportSite {
+        path: module.path.clone(),
+        line,
+        col,
+    })
+}
+
+/// Plumbing for the per-spec skip checks in `find_unresolved_imports`.
+struct UnresolvedImportFilters<'a> {
+    config: &'a ResolvedConfig,
+    virtual_prefixes: &'a [&'a str],
+    generated_patterns: &'a [&'a str],
+    generated_type_prefixes: &'a [&'a str],
+}
+
+/// Return `true` when an unresolvable specifier should be silenced (builtin,
+/// virtual, generated artifact, type-only generated prefix, or config-ignored).
+fn unresolved_spec_is_silenced(
+    spec: &str,
+    is_type_only: bool,
+    filters: &UnresolvedImportFilters<'_>,
+) -> bool {
+    if is_builtin_module(spec) || is_virtual_module(spec) {
+        return true;
+    }
+    if filters
+        .virtual_prefixes
+        .iter()
+        .any(|prefix| matches_virtual_prefix(prefix, spec))
+    {
+        return true;
+    }
+    if !filters.generated_patterns.is_empty() {
+        let bare = spec
+            .strip_suffix(".js")
+            .or_else(|| spec.strip_suffix(".ts"))
+            .unwrap_or(spec);
+        if filters
+            .generated_patterns
+            .iter()
+            .any(|pat| bare.ends_with(pat))
+        {
+            return true;
+        }
+    }
+    if is_type_only
+        && filters
+            .generated_type_prefixes
+            .iter()
+            .any(|prefix| spec.starts_with(prefix))
+    {
+        return true;
+    }
+    // Config compilation strips a single leading "./" from
+    // ignoreUnresolvedImports globs (see #1385), so the specifier must be
+    // stripped the same way or exact-path entries like "./generated/x.js"
+    // never match. The raw form is still tried so wildcard patterns that
+    // count the "./" segment keep matching.
+    let normalized_spec = spec.strip_prefix("./").unwrap_or(spec);
+    filters
+        .config
+        .ignore_unresolved_imports
+        .iter()
+        .any(|matcher| matcher.is_match(spec) || matcher.is_match(normalized_spec))
+}
+
+/// Resolve the anchor `(line, col)` plus the specifier column for an edge.
+///
+/// The finding anchors on the source specifier (the string the user must
+/// edit) when the extractor recorded its span. A multi-line statement
+/// extracts one edge per binding line, so anchoring on the declaration span
+/// would point at an arbitrary binding instead of the specifier. When the
+/// specifier sits on the declaration line, the declaration column is kept so
+/// single-line reporting is unchanged.
+fn unresolved_import_location(
+    edge: &crate::resolve::ResolvedSourceEdge<'_>,
+    file_id: FileId,
+    line_offsets_by_file: &LineOffsetsMap<'_>,
+) -> (u32, u32, u32) {
+    let (line, col) = byte_offset_to_line_col(line_offsets_by_file, file_id, edge.span().start);
+
+    let source_span = edge.source_span();
+    if source_span.end > source_span.start {
+        let (specifier_line, specifier_col) =
+            byte_offset_to_line_col(line_offsets_by_file, file_id, source_span.start);
+        if specifier_line == line {
+            (line, col, specifier_col)
+        } else {
+            (specifier_line, specifier_col, specifier_col)
+        }
+    } else {
+        (line, col, col)
+    }
+}
+
+/// Check whether a suppression covers the statement that owns this edge.
+///
+/// The finding anchors on the specifier line, but a suppression comment
+/// above the statement targets the statement's first line, and pre-anchor
+/// suppressions may sit on any binding line in between. Probing every
+/// statement line keeps all three placements working and consumes the
+/// matched suppression so it is not reported stale.
+fn unresolved_import_suppressed(
+    suppressions: &SuppressionContext<'_>,
+    edge: &crate::resolve::ResolvedSourceEdge<'_>,
+    file_id: FileId,
+    anchor_line: u32,
+    line_offsets_by_file: &LineOffsetsMap<'_>,
+) -> bool {
+    let statement_span = edge.statement_span();
+    let statement_line = if statement_span.end > statement_span.start {
+        byte_offset_to_line_col(line_offsets_by_file, file_id, statement_span.start).0
+    } else {
+        byte_offset_to_line_col(line_offsets_by_file, file_id, edge.span().start).0
+    };
+
+    let first = statement_line.min(anchor_line);
+    let last = statement_line.max(anchor_line);
+    (first..=last)
+        .any(|line| suppressions.is_suppressed(file_id, line, IssueKind::UnresolvedImport))
+}
+
 /// Find imports that could not be resolved.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "frozen deprecated public API; signature must not change"
+)]
 pub fn find_unresolved_imports(
     resolved_modules: &[ResolvedModule],
-    _config: &ResolvedConfig,
+    config: &ResolvedConfig,
     suppressions: &SuppressionContext<'_>,
     virtual_prefixes: &[&str],
     generated_patterns: &[&str],
+    generated_type_prefixes: &[&str],
     line_offsets_by_file: &LineOffsetsMap<'_>,
 ) -> Vec<UnresolvedImport> {
+    let filters = UnresolvedImportFilters {
+        config,
+        virtual_prefixes,
+        generated_patterns,
+        generated_type_prefixes,
+    };
     let mut unresolved = Vec::new();
 
     for module in resolved_modules {
-        for import in &module.resolved_imports {
-            if let crate::resolve::ResolveResult::Unresolvable(spec) = &import.target {
-                // Skip virtual module imports using the `virtual:` convention
-                // (e.g., `virtual:pwa-register`, `virtual:uno.css`)
-                if is_virtual_module(spec) {
-                    continue;
-                }
-                // Skip virtual module imports provided by active framework plugins
-                // (e.g., Nuxt's #imports, #app, #components, #build).
-                // Note: `spec` is the full import specifier (e.g., `$app/navigation`),
-                // not the extracted package name, so trailing-slash prefixes like `$app/`
-                // always match when the import has a subpath.
-                if virtual_prefixes
-                    .iter()
-                    .any(|prefix| spec.starts_with(prefix))
-                {
-                    continue;
-                }
-                // Skip build-time generated relative imports from framework plugins
-                // (e.g., SvelteKit's `./$types` / `./$types.js` route type imports).
-                // Strip `.js` or `.ts` extension before matching so `/$types.js` and
-                // `/$types.ts` both match the `/$types` pattern.
-                if !generated_patterns.is_empty() {
-                    let bare = spec
-                        .strip_suffix(".js")
-                        .or_else(|| spec.strip_suffix(".ts"))
-                        .unwrap_or(spec);
-                    if generated_patterns.iter().any(|pat| bare.ends_with(pat)) {
-                        continue;
-                    }
-                }
-
-                let (line, col) = byte_offset_to_line_col(
-                    line_offsets_by_file,
-                    module.file_id,
-                    import.info.span.start,
-                );
-
-                // Compute the column of the source string literal for precise LSP highlighting.
-                // Falls back to the import statement column when source_span is not available
-                // (e.g., synthetic CSS/SFC imports that use Span::default()).
-                let specifier_col = if import.info.source_span.end > import.info.source_span.start {
-                    let (_, sc) = byte_offset_to_line_col(
-                        line_offsets_by_file,
-                        module.file_id,
-                        import.info.source_span.start,
-                    );
-                    sc
-                } else {
-                    col
-                };
-
-                // Check inline suppression
-                if suppressions.is_suppressed(module.file_id, line, IssueKind::UnresolvedImport) {
-                    continue;
-                }
-
-                unresolved.push(UnresolvedImport {
-                    path: module.path.clone(),
-                    specifier: spec.clone(),
-                    line,
-                    col,
-                    specifier_col,
-                });
+        // A multi-binding re-export statement yields one edge per binding, all
+        // with the same unresolvable specifier. Report each specifier once per
+        // module, anchored on the first edge in source order. The dedup key is
+        // claimed before the suppression check so one suppression on the
+        // anchored statement retires the whole specifier instead of moving the
+        // finding to the next binding or statement.
+        let mut reported_specs: FxHashSet<String> = FxHashSet::default();
+        for edge in module.all_resolved_source_edges() {
+            let crate::resolve::ResolveResult::Unresolvable(spec) = edge.target() else {
+                continue;
+            };
+            if reported_specs.contains(spec.as_str()) {
+                continue;
             }
+            if unresolved_spec_is_silenced(spec, edge.is_type_only(), &filters) {
+                continue;
+            }
+            let (line, col, specifier_col) =
+                unresolved_import_location(&edge, module.file_id, line_offsets_by_file);
+            reported_specs.insert(spec.clone());
+            if unresolved_import_suppressed(
+                suppressions,
+                &edge,
+                module.file_id,
+                line,
+                line_offsets_by_file,
+            ) {
+                continue;
+            }
+            unresolved.push(UnresolvedImport {
+                path: module.path.clone(),
+                specifier: spec.clone(),
+                line,
+                col,
+                specifier_col,
+            });
         }
     }
 
@@ -741,5 +1764,9 @@ pub fn find_unresolved_imports(
 }
 
 #[cfg(test)]
+#[expect(
+    deprecated,
+    reason = "Core-internal policy keeps direct detector unit tests while the public warning targets external callers"
+)]
 #[path = "unused_deps_tests/mod.rs"]
 mod tests;

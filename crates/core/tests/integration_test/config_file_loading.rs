@@ -1,22 +1,16 @@
 use super::common::{create_config, fixture_path};
 use fallow_config::{FallowConfig, OutputFormat, Severity};
 
-// ---------------------------------------------------------------------------
-// Hidden directory allowlist
-// ---------------------------------------------------------------------------
-
 #[test]
 fn hidden_dir_allowlist_includes_storybook() {
     let root = fixture_path("hidden-dir-allowlist");
     let config = create_config(root);
     let results = fallow_core::analyze(&config).expect("analysis should succeed");
 
-    // .storybook/ is on the allowlist, so .storybook/main.ts should be discovered
-    // and NOT reported as an unused file (it's imported by src/index.ts)
     let unused_files: Vec<String> = results
         .unused_files
         .iter()
-        .map(|f| f.path.to_string_lossy().to_string())
+        .map(|f| f.file.path.to_string_lossy().to_string())
         .collect();
 
     assert!(
@@ -31,16 +25,15 @@ fn hidden_dir_non_allowlisted_is_skipped() {
     let config = create_config(root);
     let results = fallow_core::analyze(&config).expect("analysis should succeed");
 
-    // .hidden-other/ is NOT on the allowlist, so secret.ts should not be discovered at all
     let all_paths: Vec<String> = results
         .unused_files
         .iter()
-        .map(|f| f.path.to_string_lossy().to_string())
+        .map(|f| f.file.path.to_string_lossy().to_string())
         .chain(
             results
                 .unused_exports
                 .iter()
-                .map(|e| e.path.to_string_lossy().to_string()),
+                .map(|e| e.export.path.to_string_lossy().to_string()),
         )
         .collect();
 
@@ -50,21 +43,16 @@ fn hidden_dir_non_allowlisted_is_skipped() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Astro file parsing
-// ---------------------------------------------------------------------------
-
 #[test]
 fn astro_files_parsed_and_analyzed() {
     let root = fixture_path("astro-project");
     let config = create_config(root);
     let results = fallow_core::analyze(&config).expect("analysis should succeed");
 
-    // Orphan.astro should be in unused files since nothing imports it
     let unused_files: Vec<String> = results
         .unused_files
         .iter()
-        .map(|f| f.path.to_string_lossy().to_string())
+        .map(|f| f.file.path.to_string_lossy().to_string())
         .collect();
 
     assert!(
@@ -72,10 +60,6 @@ fn astro_files_parsed_and_analyzed() {
         "Orphan.astro should be in unused_files. Got: {unused_files:?}"
     );
 }
-
-// ---------------------------------------------------------------------------
-// MDX project
-// ---------------------------------------------------------------------------
 
 #[test]
 fn mdx_unused_file_detected() {
@@ -86,7 +70,7 @@ fn mdx_unused_file_detected() {
     let unused_files: Vec<String> = results
         .unused_files
         .iter()
-        .map(|f| f.path.to_string_lossy().to_string())
+        .map(|f| f.file.path.to_string_lossy().to_string())
         .collect();
 
     assert!(
@@ -95,9 +79,29 @@ fn mdx_unused_file_detected() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Complexity project (used by health tests)
-// ---------------------------------------------------------------------------
+#[test]
+fn mdx_code_fence_imports_do_not_report_unresolved() {
+    let root = fixture_path("mdx-project");
+    let config = create_config(root);
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+
+    let unresolved_specifiers: Vec<&str> = results
+        .unresolved_imports
+        .iter()
+        .map(|u| u.import.specifier.as_str())
+        .collect();
+
+    assert!(
+        unresolved_specifiers.contains(&"./real-missing"),
+        "top-level MDX imports should still be analyzed, found: {unresolved_specifiers:?}"
+    );
+    for specifier in ["./exampleSlice", "./store/hooks"] {
+        assert!(
+            !unresolved_specifiers.contains(&specifier),
+            "MDX code fence import {specifier} should not be unresolved, found: {unresolved_specifiers:?}"
+        );
+    }
+}
 
 #[test]
 fn complexity_project_analyzes_without_errors() {
@@ -110,10 +114,6 @@ fn complexity_project_analyzes_without_errors() {
         "complexity-project should have no unresolved imports"
     );
 }
-
-// ---------------------------------------------------------------------------
-// Error handling: no package.json
-// ---------------------------------------------------------------------------
 
 #[test]
 fn error_no_package_json_produces_empty_results() {
@@ -128,16 +128,11 @@ fn error_no_package_json_produces_empty_results() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// TOML config file loading
-// ---------------------------------------------------------------------------
-
 #[test]
 fn toml_config_loads_and_applies_rules() {
     let root = fixture_path("config-toml-project");
     let config_path = root.join("fallow.toml");
 
-    // Verify the TOML config is discovered and loaded correctly
     let found = FallowConfig::find_config_path(&root);
     assert_eq!(
         found.as_deref(),
@@ -147,29 +142,25 @@ fn toml_config_loads_and_applies_rules() {
 
     let loaded = FallowConfig::load(&config_path).expect("TOML config should load");
 
-    // The fixture sets `unused-files = "warn"` in [rules]
     assert_eq!(
         loaded.rules.unused_files,
         Severity::Warn,
         "unused-files should be Warn per fallow.toml"
     );
 
-    // All other rules should still be at their defaults (Error)
     assert_eq!(
         loaded.rules.unused_exports,
         Severity::Error,
         "unused-exports should default to Error"
     );
 
-    // Resolve and run analysis to confirm the config is applied end-to-end
-    let resolved = loaded.resolve(root, OutputFormat::Human, 4, true, true);
+    let resolved = loaded.resolve(root, OutputFormat::Human, 4, true, true, None);
     let results = fallow_core::analyze(&resolved).expect("analysis should succeed");
 
-    // orphan.ts is unused, so it should be detected (warn still detects, just doesn't fail CI)
     let unused_files: Vec<String> = results
         .unused_files
         .iter()
-        .map(|f| f.path.to_string_lossy().replace('\\', "/"))
+        .map(|f| f.file.path.to_string_lossy().replace('\\', "/"))
         .collect();
 
     assert!(
@@ -177,11 +168,10 @@ fn toml_config_loads_and_applies_rules() {
         "orphan.ts should be in unused_files. Got: {unused_files:?}"
     );
 
-    // unusedFunction in utils.ts should be detected as an unused export
     let unused_export_names: Vec<&str> = results
         .unused_exports
         .iter()
-        .map(|e| e.export_name.as_str())
+        .map(|e| e.export.export_name.as_str())
         .collect();
 
     assert!(

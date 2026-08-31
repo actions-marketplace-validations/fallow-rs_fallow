@@ -1,16 +1,19 @@
-use std::io::Read as _;
+use std::net::Ipv6Addr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use rustc_hash::FxHashSet;
+use fallow_types::path_util::is_absolute_path_any_platform;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::FallowConfig;
 
 /// Supported config file names in priority order.
-///
-/// `find_and_load` checks these names in order within each directory,
-/// returning the first match found.
-pub(super) const CONFIG_NAMES: &[&str] = &[".fallowrc.json", "fallow.toml", ".fallow.toml"];
+pub(super) const CONFIG_NAMES: &[&str] = &[
+    ".fallowrc.json",
+    ".fallowrc.jsonc",
+    "fallow.toml",
+    ".fallow.toml",
+];
 
 pub(super) const MAX_EXTENDS_DEPTH: usize = 10;
 
@@ -26,6 +29,13 @@ const HTTP_PREFIX: &str = "http://";
 /// Default timeout for fetching remote configs via URL extends.
 const DEFAULT_URL_TIMEOUT_SECS: u64 = 5;
 
+/// Host-controlled trust policy for loading a fallow config.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ConfigLoadOptions {
+    /// Permit `https://` entries in the config inheritance graph.
+    pub allow_remote_extends: bool,
+}
+
 /// Detect config format from file extension.
 pub(super) enum ConfigFormat {
     Toml,
@@ -35,7 +45,7 @@ pub(super) enum ConfigFormat {
 impl ConfigFormat {
     pub(super) fn from_path(path: &Path) -> Self {
         match path.extension().and_then(|e| e.to_str()) {
-            Some("json") => Self::Json,
+            Some("json" | "jsonc") => Self::Json,
             _ => Self::Toml,
         }
     }
@@ -63,10 +73,11 @@ pub(super) fn deep_merge_json(base: &mut serde_json::Value, overlay: serde_json:
 pub(super) fn parse_config_to_value(path: &Path) -> Result<serde_json::Value, miette::Report> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| miette::miette!("Failed to read config file {}: {}", path.display(), e))?;
+    let content = content.trim_start_matches('\u{FEFF}');
 
     match ConfigFormat::from_path(path) {
         ConfigFormat::Toml => {
-            let toml_value: toml::Value = toml::from_str(&content).map_err(|e| {
+            let toml_value: toml::Value = toml::from_str(content).map_err(|e| {
                 miette::miette!("Failed to parse config file {}: {}", path.display(), e)
             })?;
             serde_json::to_value(toml_value).map_err(|e| {
@@ -77,35 +88,15 @@ pub(super) fn parse_config_to_value(path: &Path) -> Result<serde_json::Value, mi
                 )
             })
         }
-        ConfigFormat::Json => {
-            let mut stripped = String::new();
-            json_comments::StripComments::new(content.as_bytes())
-                .read_to_string(&mut stripped)
-                .map_err(|e| {
-                    miette::miette!("Failed to strip comments from {}: {}", path.display(), e)
-                })?;
-            serde_json::from_str(&stripped).map_err(|e| {
-                miette::miette!("Failed to parse config file {}: {}", path.display(), e)
-            })
-        }
+        ConfigFormat::Json => crate::jsonc::parse_to_value(content)
+            .map_err(|e| miette::miette!("Failed to parse config file {}: {}", path.display(), e)),
     }
 }
 
-/// Return `true` if `dir` contains a VCS marker indicating a repository root.
-///
-/// Used as the walk-up stop condition for config discovery. Matches `.git`
-/// (directory for normal repos, file for git submodules/worktrees), `.hg`
-/// (Mercurial), and `.svn` (Subversion). We intentionally do NOT treat
-/// `package.json` as a stop boundary so monorepo sub-packages can inherit a
-/// root config. This matches Prettier/ESLint/Biome behavior.
 fn is_repo_root(dir: &Path) -> bool {
     dir.join(".git").exists() || dir.join(".hg").exists() || dir.join(".svn").exists()
 }
 
-/// Verify that `resolved` stays within `base_dir` after canonicalization.
-///
-/// Prevents path traversal attacks where a subpath or `package.json` field
-/// like `../../etc/passwd` escapes the intended directory.
 fn resolve_confined(
     base_dir: &Path,
     resolved: &Path,
@@ -135,7 +126,6 @@ fn resolve_confined(
     Ok(canonical_file)
 }
 
-/// Validate that a parsed package name is a legal npm package name.
 fn validate_npm_package_name(name: &str, source_config: &Path) -> Result<(), miette::Report> {
     if name.starts_with('@') && !name.contains('/') {
         return Err(miette::miette!(
@@ -154,16 +144,8 @@ fn validate_npm_package_name(name: &str, source_config: &Path) -> Result<(), mie
     Ok(())
 }
 
-/// Parse an npm specifier into `(package_name, optional_subpath)`.
-///
-/// Scoped: `@scope/name` → `("@scope/name", None)`,
-///         `@scope/name/strict.json` → `("@scope/name", Some("strict.json"))`.
-/// Unscoped: `name` → `("name", None)`,
-///           `name/strict.json` → `("name", Some("strict.json"))`.
 fn parse_npm_specifier(specifier: &str) -> (&str, Option<&str>) {
     if specifier.starts_with('@') {
-        // Scoped: @scope/name[/subpath]
-        // Find the second '/' which separates name from subpath.
         let mut slashes = 0;
         for (i, ch) in specifier.char_indices() {
             if ch == '/' {
@@ -173,7 +155,6 @@ fn parse_npm_specifier(specifier: &str) -> (&str, Option<&str>) {
                 }
             }
         }
-        // No subpath — entire string is the package name.
         (specifier, None)
     } else if let Some(slash) = specifier.find('/') {
         (&specifier[..slash], Some(&specifier[slash + 1..]))
@@ -182,12 +163,6 @@ fn parse_npm_specifier(specifier: &str) -> (&str, Option<&str>) {
     }
 }
 
-/// Resolve the default export path from a `package.json` `exports` field.
-///
-/// Handles the common patterns:
-/// - `"exports": "./config.json"` (string shorthand)
-/// - `"exports": {".": "./config.json"}` (object with default entry point)
-/// - `"exports": {".": {"default": "./config.json"}}` (conditional exports)
 fn resolve_package_exports(pkg: &serde_json::Value, package_dir: &Path) -> Option<PathBuf> {
     let exports = pkg.get("exports")?;
     match exports {
@@ -207,21 +182,10 @@ fn resolve_package_exports(pkg: &serde_json::Value, package_dir: &Path) -> Optio
                 _ => None,
             }
         }
-        // Array export fallback form (e.g., `[\"./config.json\", null]`) is not supported;
-        // falls through to main/config name scan.
         _ => None,
     }
 }
 
-/// Find a fallow config file inside an npm package directory.
-///
-/// Resolution order:
-/// 1. `package.json` `exports` field (default entry point)
-/// 2. `package.json` `main` field
-/// 3. Standard config file names (`.fallowrc.json`, `fallow.toml`, `.fallow.toml`)
-///
-/// Paths from `exports`/`main` are confined to the package directory to prevent
-/// path traversal attacks from malicious packages.
 fn find_config_in_npm_package(
     package_dir: &Path,
     source_config: &Path,
@@ -276,11 +240,6 @@ fn find_config_in_npm_package(
     ))
 }
 
-/// Resolve an npm package specifier to a config file path.
-///
-/// Walks up from `config_dir` looking for `node_modules/<package_name>`.
-/// If a subpath is given (e.g., `@scope/name/strict.json`), resolves that file directly.
-/// Otherwise, finds the config file inside the package via [`find_config_in_npm_package`].
 fn resolve_npm_package(
     config_dir: &Path,
     specifier: &str,
@@ -337,61 +296,136 @@ fn resolve_npm_package(
     ))
 }
 
-/// Normalize a URL for deduplication.
-///
-/// - Lowercase scheme and host (path casing is preserved — it's server-dependent).
-/// - Strip fragment (`#...`) and query string (`?...`).
-/// - Strip trailing slash from path.
-/// - Normalize default HTTPS port (`:443` → omitted).
+/// Normalize a URL for config resource identity.
 fn normalize_url_for_dedup(url: &str) -> String {
-    // Split at the first `://` to get scheme, then find host boundary.
     let Some((scheme, rest)) = url.split_once("://") else {
         return url.to_string();
     };
     let scheme = scheme.to_ascii_lowercase();
 
-    // Split host from path at the first `/` after the authority.
-    let (authority, path) = rest.split_once('/').map_or((rest, ""), |(a, p)| (a, p));
-    let authority = authority.to_ascii_lowercase();
+    let rest = rest.split_once('#').map_or(rest, |(value, _)| value);
+    let authority_end = rest.find(['/', '?']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(authority_end);
+    let authority = normalize_url_authority(authority, &scheme);
 
-    // Strip default HTTPS port.
-    let authority = authority.strip_suffix(":443").unwrap_or(&authority);
+    let tail = if tail == "/" {
+        ""
+    } else if tail.starts_with("/?") {
+        &tail[1..]
+    } else {
+        tail
+    };
 
-    // Strip fragment and query string from path, then trailing slash.
-    let path = path.split_once('#').map_or(path, |(p, _)| p);
-    let path = path.split_once('?').map_or(path, |(p, _)| p);
-    let path = path.strip_suffix('/').unwrap_or(path);
-
-    if path.is_empty() {
+    if tail.is_empty() {
         format!("{scheme}://{authority}")
     } else {
-        format!("{scheme}://{authority}/{path}")
+        format!("{scheme}://{authority}{tail}")
     }
 }
 
+/// Normalize only the case-insensitive parts of a URL authority and its default port.
+fn normalize_url_authority(authority: &str, scheme: &str) -> String {
+    let (userinfo, host_port) = authority
+        .rsplit_once('@')
+        .map_or((None, authority), |(userinfo, host_port)| {
+            (Some(userinfo), host_port)
+        });
+
+    let (host, port) = if host_port.starts_with('[') {
+        host_port.find("]:").map_or((host_port, None), |separator| {
+            let (host, port) = host_port.split_at(separator + 1);
+            (host, port.strip_prefix(':'))
+        })
+    } else {
+        host_port
+            .rsplit_once(':')
+            .map_or((host_port, None), |(host, port)| (host, Some(port)))
+    };
+
+    let port = port.map(|value| {
+        value
+            .parse::<u16>()
+            .map_or_else(|_| value.to_string(), |number| number.to_string())
+    });
+    let port =
+        port.filter(|port| !matches!((scheme, port.as_str()), ("http", "80") | ("https", "443")));
+    let host = host
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .and_then(|value| value.parse::<Ipv6Addr>().ok())
+        .map_or_else(
+            || host.to_ascii_lowercase(),
+            |address| format!("[{address}]"),
+        );
+
+    match (userinfo, port.as_deref()) {
+        (Some(userinfo), Some(port)) => format!("{userinfo}@{host}:{port}"),
+        (Some(userinfo), None) => format!("{userinfo}@{host}"),
+        (None, Some(port)) => format!("{host}:{port}"),
+        (None, None) => host,
+    }
+}
+
+/// Format a remote config location for diagnostics without exposing URL secrets.
+fn remote_config_display(location: &str) -> String {
+    let Some((scheme, rest)) = location.split_once("://") else {
+        return location.to_string();
+    };
+
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(authority_end);
+    let authority = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    let path_end = tail.find(['?', '#']).unwrap_or(tail.len());
+    let path = &tail[..path_end];
+
+    format!("{scheme}://{authority}{path}")
+}
+
+/// Format a fetch error without trusting the HTTP client's URL rendering.
+fn remote_fetch_error_display(error: &ureq::Error, _url: &str) -> String {
+    match error {
+        ureq::Error::RequireHttpsOnly(redirect_target) => format!(
+            "configured for https only: {}",
+            remote_config_display(redirect_target)
+        ),
+        ureq::Error::StatusCode(code) => format!("http status {code}"),
+        ureq::Error::HostNotFound => "host not found".to_string(),
+        ureq::Error::Timeout(_) => "request timed out".to_string(),
+        _ => "request failed".to_string(),
+    }
+}
+
+fn starts_with_url_prefix(value: &str, prefix: &str) -> bool {
+    value
+        .get(..prefix.len())
+        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(prefix))
+}
+
 /// Read the `FALLOW_EXTENDS_TIMEOUT_SECS` env var, falling back to [`DEFAULT_URL_TIMEOUT_SECS`].
-///
-/// A value of `0` is treated as invalid and falls back to the default (a zero-duration
-/// timeout would make every request fail immediately with an opaque timeout error).
 fn url_timeout() -> Duration {
-    std::env::var("FALLOW_EXTENDS_TIMEOUT_SECS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok().filter(|&n| n > 0))
+    url_timeout_from(std::env::var("FALLOW_EXTENDS_TIMEOUT_SECS").ok().as_deref())
+}
+
+/// Parse a raw `FALLOW_EXTENDS_TIMEOUT_SECS` value into a timeout, falling back
+/// to [`DEFAULT_URL_TIMEOUT_SECS`] for absent, zero, or non-numeric input. Pure
+/// so the parsing branches stay testable without mutating the process env.
+fn url_timeout_from(raw: Option<&str>) -> Duration {
+    raw.and_then(|v| v.parse::<u64>().ok().filter(|&n| n > 0))
         .map_or(
             Duration::from_secs(DEFAULT_URL_TIMEOUT_SECS),
             Duration::from_secs,
         )
 }
 
-/// Maximum response body size for fetched config files (1 MB).
-/// Config files are never legitimately larger than a few kilobytes.
+/// Maximum response body size for fetched config files.
 const MAX_URL_CONFIG_BYTES: u64 = 1024 * 1024;
 
 /// Fetch a remote JSON config from an HTTPS URL.
-///
-/// Returns the parsed `serde_json::Value`. Only JSON (with optional JSONC comments) is
-/// supported for URL-sourced configs — TOML cannot be detected without a file extension.
 fn fetch_url_config(url: &str, source: &str) -> Result<serde_json::Value, miette::Report> {
+    let url_display = remote_config_display(url);
+    let source_display = remote_config_display(source);
     let timeout = url_timeout();
     let agent = ureq::Agent::config_builder()
         .timeout_global(Some(timeout))
@@ -400,8 +434,10 @@ fn fetch_url_config(url: &str, source: &str) -> Result<serde_json::Value, miette
         .new_agent();
 
     let mut response = agent.get(url).call().map_err(|e| {
+        let error_display = remote_fetch_error_display(&e, url);
         miette::miette!(
-            "Failed to fetch remote config from {url} (referenced from {source}): {e}. \
+            "Failed to fetch remote config from {url_display} \
+             (referenced from {source_display}): {error_display}. \
              If this URL is unavailable, use a local path or npm: specifier instead"
         )
     })?;
@@ -413,258 +449,633 @@ fn fetch_url_config(url: &str, source: &str) -> Result<serde_json::Value, miette
         .read_to_string()
         .map_err(|e| {
             miette::miette!(
-                "Failed to read response body from {url} (referenced from {source}): {e}"
+                "Failed to read response body from {url_display} \
+                 (referenced from {source_display}): {e}"
             )
         })?;
 
-    // Strip JSONC comments before parsing.
-    let mut stripped = String::new();
-    json_comments::StripComments::new(body.as_bytes())
-        .read_to_string(&mut stripped)
-        .map_err(|e| {
-            miette::miette!(
-                "Failed to strip comments from remote config {url} (referenced from {source}): {e}"
-            )
-        })?;
-
-    serde_json::from_str(&stripped).map_err(|e| {
+    crate::jsonc::parse_to_value(&body).map_err(|e| {
         miette::miette!(
-            "Failed to parse remote config as JSON from {url} (referenced from {source}): {e}. \
+            "Failed to parse remote config as JSON from {url_display} \
+             (referenced from {source_display}): {e}. \
              Only JSON/JSONC is supported for URL-sourced configs"
         )
     })
 }
 
-/// Extract the `extends` array from a parsed JSON config value, removing it from the object.
-fn extract_extends(value: &mut serde_json::Value) -> Vec<String> {
-    value
-        .as_object_mut()
-        .and_then(|obj| obj.remove("extends"))
-        .and_then(|v| match v {
-            serde_json::Value::Array(arr) => Some(
-                arr.into_iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect::<Vec<_>>(),
-            ),
-            serde_json::Value::String(s) => Some(vec![s]),
-            _ => None,
-        })
-        .unwrap_or_default()
+trait RemoteConfigFetcher {
+    fn fetch(&mut self, url: &str, source: &str) -> Result<serde_json::Value, miette::Report>;
 }
 
-/// Resolve extends entries from a URL-sourced config.
-///
-/// URL-sourced configs may extend other URLs or `npm:` packages, but NOT relative
-/// paths (there is no filesystem base directory for a URL).
-fn resolve_url_extends(
-    url: &str,
-    visited: &mut FxHashSet<String>,
-    depth: usize,
-) -> Result<serde_json::Value, miette::Report> {
-    if depth >= MAX_EXTENDS_DEPTH {
-        return Err(miette::miette!(
-            "Config extends chain too deep (>={MAX_EXTENDS_DEPTH} levels) at {url}"
-        ));
+struct NetworkRemoteConfigFetcher;
+
+impl RemoteConfigFetcher for NetworkRemoteConfigFetcher {
+    fn fetch(&mut self, url: &str, source: &str) -> Result<serde_json::Value, miette::Report> {
+        fetch_url_config(url, source)
     }
-
-    let normalized = normalize_url_for_dedup(url);
-    if !visited.insert(normalized) {
-        return Err(miette::miette!(
-            "Circular extends detected: {url} was already visited in the extends chain"
-        ));
-    }
-
-    let mut value = fetch_url_config(url, url)?;
-    let extends = extract_extends(&mut value);
-
-    if extends.is_empty() {
-        return Ok(value);
-    }
-
-    let mut merged = serde_json::Value::Object(serde_json::Map::new());
-
-    for entry in &extends {
-        let base = if entry.starts_with(HTTPS_PREFIX) {
-            resolve_url_extends(entry, visited, depth + 1)?
-        } else if entry.starts_with(HTTP_PREFIX) {
-            return Err(miette::miette!(
-                "URL extends must use https://, got http:// URL '{}' (in remote config {}). \
-                 Change the URL to use https:// instead",
-                entry,
-                url
-            ));
-        } else if let Some(npm_specifier) = entry.strip_prefix(NPM_PREFIX) {
-            // npm: from URL context — no config_dir to walk up from, so we use the cwd.
-            // This is a best-effort fallback; the npm package must be available in the
-            // working directory's node_modules tree.
-            let cwd = std::env::current_dir().map_err(|e| {
-                miette::miette!(
-                    "Cannot resolve npm: specifier from URL-sourced config: \
-                     failed to determine current directory: {e}"
-                )
-            })?;
-            tracing::warn!(
-                "Resolving npm:{npm_specifier} from URL-sourced config ({url}) using the \
-                 current working directory for node_modules lookup"
-            );
-            let path_placeholder = PathBuf::from(url);
-            let npm_path = resolve_npm_package(&cwd, npm_specifier, &path_placeholder)?;
-            resolve_extends_file(&npm_path, visited, depth + 1)?
-        } else {
-            return Err(miette::miette!(
-                "Relative paths in 'extends' are not supported when the base config was \
-                 fetched from a URL ('{url}'). Use another https:// URL or npm: reference \
-                 instead. Got: '{entry}'"
-            ));
-        };
-        deep_merge_json(&mut merged, base);
-    }
-
-    deep_merge_json(&mut merged, value);
-    Ok(merged)
 }
 
-/// Resolve extends from a local config file.
-///
-/// This is the main recursive resolver for file-based configs. It reads the file,
-/// extracts `extends`, and recursively resolves each entry (relative paths, npm
-/// packages, or HTTPS URLs).
-fn resolve_extends_file(
-    path: &Path,
-    visited: &mut FxHashSet<String>,
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum ConfigResourceId {
+    Local(PathBuf),
+    Remote(String),
+}
+
+struct ExtendsResolver<'a, Fetcher> {
+    options: ConfigLoadOptions,
+    active: FxHashSet<ConfigResourceId>,
+    resolved: FxHashMap<ConfigResourceId, serde_json::Value>,
+    fetcher: &'a mut Fetcher,
+}
+
+#[derive(Clone, Copy)]
+struct LocalExtendsEntry<'a> {
+    path: &'a Path,
+    config_dir: &'a Path,
+    entry: &'a str,
+    sealed: bool,
+    sealed_dir_canonical: Option<&'a Path>,
     depth: usize,
-) -> Result<serde_json::Value, miette::Report> {
-    if depth >= MAX_EXTENDS_DEPTH {
-        return Err(miette::miette!(
-            "Config extends chain too deep (>={MAX_EXTENDS_DEPTH} levels) at {}",
-            path.display()
-        ));
+}
+
+impl<'a, Fetcher: RemoteConfigFetcher> ExtendsResolver<'a, Fetcher> {
+    fn new(options: ConfigLoadOptions, fetcher: &'a mut Fetcher) -> Self {
+        Self {
+            options,
+            active: FxHashSet::default(),
+            resolved: FxHashMap::default(),
+            fetcher,
+        }
     }
 
-    let canonical = dunce::canonicalize(path).map_err(|e| {
-        miette::miette!(
-            "Config file not found or unresolvable: {}: {}",
-            path.display(),
-            e
-        )
-    })?;
-
-    if !visited.insert(canonical.to_string_lossy().into_owned()) {
-        return Err(miette::miette!(
-            "Circular extends detected: {} was already visited in the extends chain",
-            path.display()
-        ));
-    }
-
-    let mut value = parse_config_to_value(path)?;
-    let extends = extract_extends(&mut value);
-
-    if extends.is_empty() {
-        return Ok(value);
-    }
-
-    let config_dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let sealed = value
-        .get("sealed")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
-    // Canonicalize the config directory once when sealed; reused inside the
-    // loop for each `extends` confinement check.
-    let sealed_dir_canonical = if sealed {
-        Some(dunce::canonicalize(config_dir).map_err(|e| {
+    fn resolve_local(
+        &mut self,
+        path: &Path,
+        depth: usize,
+    ) -> Result<serde_json::Value, miette::Report> {
+        if depth >= MAX_EXTENDS_DEPTH {
+            return Err(miette::miette!(
+                "Config extends chain too deep (>={MAX_EXTENDS_DEPTH} levels) at {}",
+                path.display()
+            ));
+        }
+        let canonical = dunce::canonicalize(path).map_err(|e| {
             miette::miette!(
-                "Sealed config directory '{}' could not be canonicalized: {e}",
-                config_dir.display()
+                "Config file not found or unresolvable: {}: {}",
+                path.display(),
+                e
             )
-        })?)
-    } else {
-        None
-    };
-    let mut merged = serde_json::Value::Object(serde_json::Map::new());
+        })?;
+        let identity = ConfigResourceId::Local(canonical.clone());
+        if let Some(value) = self.resolved.get(&identity) {
+            return Ok(value.clone());
+        }
+        if !self.active.insert(identity.clone()) {
+            return Err(miette::miette!(
+                "Circular extends detected: {} is already active in the extends chain",
+                path.display()
+            ));
+        }
 
-    for extend_path_str in &extends {
-        let base = if extend_path_str.starts_with(HTTPS_PREFIX) {
-            if sealed {
-                return Err(miette::miette!(
-                    "'sealed: true' config at {} rejects URL extends '{}'. \
-                     Sealed configs only allow file-relative extends within \
-                     the config's directory",
-                    path.display(),
-                    extend_path_str
-                ));
-            }
-            resolve_url_extends(extend_path_str, visited, depth + 1)?
-        } else if extend_path_str.starts_with(HTTP_PREFIX) {
+        let result = self.resolve_local_uncached(&canonical, depth);
+        self.active.remove(&identity);
+        if let Ok(value) = &result {
+            self.resolved.insert(identity, value.clone());
+        }
+        result
+    }
+
+    fn resolve_local_uncached(
+        &mut self,
+        path: &Path,
+        depth: usize,
+    ) -> Result<serde_json::Value, miette::Report> {
+        let mut value = parse_config_to_value(path)?;
+        let extends = extract_extends(&mut value, &path.display().to_string())?;
+        if extends.is_empty() {
+            return Ok(value);
+        }
+
+        let config_dir = path.parent().unwrap_or_else(|| Path::new("."));
+        let sealed = value
+            .get("sealed")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let sealed_dir_canonical = sealed_config_dir(config_dir, sealed)?;
+        let mut merged = serde_json::Value::Object(serde_json::Map::new());
+        for entry in &extends {
+            let base = self.resolve_local_entry(LocalExtendsEntry {
+                path,
+                config_dir,
+                entry,
+                sealed,
+                sealed_dir_canonical: sealed_dir_canonical.as_deref(),
+                depth,
+            })?;
+            deep_merge_json(&mut merged, base);
+        }
+        deep_merge_json(&mut merged, value);
+        Ok(merged)
+    }
+
+    fn resolve_local_entry(
+        &mut self,
+        input: LocalExtendsEntry<'_>,
+    ) -> Result<serde_json::Value, miette::Report> {
+        let LocalExtendsEntry {
+            path,
+            config_dir,
+            entry,
+            sealed,
+            sealed_dir_canonical,
+            depth,
+        } = input;
+        if starts_with_url_prefix(entry, HTTPS_PREFIX) {
+            reject_sealed_remote_extends(path, entry, sealed, "URL")?;
+            return self.resolve_remote(entry, depth + 1);
+        }
+        if starts_with_url_prefix(entry, HTTP_PREFIX) {
+            let entry_display = remote_config_display(entry);
             return Err(miette::miette!(
                 "URL extends must use https://, got http:// URL '{}' (in {}). \
                  Change the URL to use https:// instead",
-                extend_path_str,
+                entry_display,
                 path.display()
             ));
-        } else if let Some(npm_specifier) = extend_path_str.strip_prefix(NPM_PREFIX) {
-            if sealed {
-                return Err(miette::miette!(
-                    "'sealed: true' config at {} rejects npm extends '{}'. \
-                     Sealed configs only allow file-relative extends within \
-                     the config's directory",
-                    path.display(),
-                    extend_path_str
-                ));
-            }
+        }
+        if let Some(npm_specifier) = entry.strip_prefix(NPM_PREFIX) {
+            reject_sealed_remote_extends(path, entry, sealed, "npm")?;
             let npm_path = resolve_npm_package(config_dir, npm_specifier, path)?;
-            resolve_extends_file(&npm_path, visited, depth + 1)?
-        } else {
-            if Path::new(extend_path_str).is_absolute() {
-                return Err(miette::miette!(
-                    "extends paths must be relative, got absolute path: {} (in {})",
-                    extend_path_str,
-                    path.display()
-                ));
-            }
-            let p = config_dir.join(extend_path_str);
-            if !p.exists() {
-                return Err(miette::miette!(
-                    "Extended config file not found: {} (referenced from {})",
-                    p.display(),
-                    path.display()
-                ));
-            }
-            if let Some(dir_canonical) = &sealed_dir_canonical {
-                let p_canonical = dunce::canonicalize(&p).map_err(|e| {
-                    miette::miette!(
-                        "Sealed config extends path '{}' could not be canonicalized: {e}",
-                        p.display()
-                    )
-                })?;
-                if !p_canonical.starts_with(dir_canonical) {
-                    return Err(miette::miette!(
-                        "'sealed: true' config at {} rejects extends '{}' which resolves \
-                         outside the config's directory ({}). Sealed configs only allow \
-                         extends within the config's directory",
-                        path.display(),
-                        extend_path_str,
-                        p_canonical.display()
-                    ));
-                }
-            }
-            resolve_extends_file(&p, visited, depth + 1)?
-        };
-        deep_merge_json(&mut merged, base);
+            return self.resolve_local(&npm_path, depth + 1);
+        }
+        if is_absolute_path_any_platform(Path::new(entry)) {
+            return Err(miette::miette!(
+                "extends paths must be relative, got absolute path: {} (in {})",
+                entry,
+                path.display()
+            ));
+        }
+        let resolved_path = config_dir.join(entry);
+        if !resolved_path.exists() {
+            return Err(miette::miette!(
+                "Extended config file not found: {} (referenced from {})",
+                resolved_path.display(),
+                path.display()
+            ));
+        }
+        validate_sealed_relative_extends(path, entry, &resolved_path, sealed_dir_canonical)?;
+        self.resolve_local(&resolved_path, depth + 1)
     }
 
-    deep_merge_json(&mut merged, value);
-    Ok(merged)
+    fn resolve_remote(
+        &mut self,
+        url: &str,
+        depth: usize,
+    ) -> Result<serde_json::Value, miette::Report> {
+        if depth >= MAX_EXTENDS_DEPTH {
+            let url_display = remote_config_display(url);
+            return Err(miette::miette!(
+                "Config extends chain too deep (>={MAX_EXTENDS_DEPTH} levels) at {url_display}"
+            ));
+        }
+        if !self.options.allow_remote_extends {
+            let url_display = remote_config_display(url);
+            return Err(miette::miette!(
+                "Remote config extends '{url_display}' is disabled by default. \
+                 CLI users can pass --allow-remote-extends. Library callers can use \
+                 ConfigLoadOptions {{ allow_remote_extends: true }}"
+            ));
+        }
+
+        let identity = ConfigResourceId::Remote(normalize_url_for_dedup(url));
+        if let Some(value) = self.resolved.get(&identity) {
+            return Ok(value.clone());
+        }
+        if !self.active.insert(identity.clone()) {
+            let url_display = remote_config_display(url);
+            return Err(miette::miette!(
+                "Circular extends detected: {url_display} is already active in the extends chain"
+            ));
+        }
+
+        let result = self.resolve_remote_uncached(url, depth);
+        self.active.remove(&identity);
+        if let Ok(value) = &result {
+            self.resolved.insert(identity, value.clone());
+        }
+        result
+    }
+
+    fn resolve_remote_uncached(
+        &mut self,
+        url: &str,
+        depth: usize,
+    ) -> Result<serde_json::Value, miette::Report> {
+        let mut value = self.fetcher.fetch(url, url)?;
+        let extends = extract_extends(&mut value, &remote_config_display(url))?;
+        if extends.is_empty() {
+            return Ok(value);
+        }
+
+        let url_display = remote_config_display(url);
+        let mut merged = serde_json::Value::Object(serde_json::Map::new());
+        for entry in &extends {
+            let base = if starts_with_url_prefix(entry, HTTPS_PREFIX) {
+                self.resolve_remote(entry, depth + 1)?
+            } else if starts_with_url_prefix(entry, HTTP_PREFIX) {
+                let entry_display = remote_config_display(entry);
+                return Err(miette::miette!(
+                    "URL extends must use https://, got http:// URL '{}' (in remote config {}). \
+                     Change the URL to use https:// instead",
+                    entry_display,
+                    url_display
+                ));
+            } else if let Some(npm_specifier) = entry.strip_prefix(NPM_PREFIX) {
+                let cwd = std::env::current_dir().map_err(|e| {
+                    miette::miette!(
+                        "Cannot resolve npm: specifier from URL-sourced config: \
+                         failed to determine current directory: {e}"
+                    )
+                })?;
+                let path_placeholder = PathBuf::from(&url_display);
+                let npm_path = resolve_npm_package(&cwd, npm_specifier, &path_placeholder)?;
+                self.resolve_local(&npm_path, depth + 1)?
+            } else {
+                return Err(miette::miette!(
+                    "Relative paths in 'extends' are not supported when the base config was \
+                     fetched from a URL ('{url_display}'). Use another https:// URL or npm: reference \
+                     instead. Got: '{entry}'"
+                ));
+            };
+            deep_merge_json(&mut merged, base);
+        }
+        deep_merge_json(&mut merged, value);
+        Ok(merged)
+    }
+}
+
+/// Extract the `extends` array from a parsed JSON config value.
+///
+/// Fails loud on malformed values: the key is removed before
+/// deserialization, so `FallowConfig`'s `deny_unknown_fields` never sees a
+/// bad `extends` and the base config would otherwise go unmerged silently.
+fn extract_extends(
+    value: &mut serde_json::Value,
+    source: &str,
+) -> Result<Vec<String>, miette::Report> {
+    let Some(extends) = value.as_object_mut().and_then(|obj| obj.remove("extends")) else {
+        return Ok(Vec::new());
+    };
+    match extends {
+        serde_json::Value::String(s) => Ok(vec![s]),
+        serde_json::Value::Array(arr) => arr
+            .into_iter()
+            .map(|entry| match entry {
+                serde_json::Value::String(s) => Ok(s),
+                other => Err(miette::miette!(
+                    "extends entries must be strings, got {} (in {source})",
+                    json_type_name(&other)
+                )),
+            })
+            .collect(),
+        other => Err(miette::miette!(
+            "extends must be a string or an array of strings, got {} (in {source})",
+            json_type_name(&other)
+        )),
+    }
+}
+
+fn json_type_name(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Array(_) => "an array",
+        serde_json::Value::Object(_) => "an object",
+    }
+}
+
+#[cfg(test)]
+fn resolve_url_extends(
+    url: &str,
+    _visited: &mut FxHashSet<String>,
+    depth: usize,
+) -> Result<serde_json::Value, miette::Report> {
+    let mut fetcher = NetworkRemoteConfigFetcher;
+    ExtendsResolver::new(
+        ConfigLoadOptions {
+            allow_remote_extends: true,
+        },
+        &mut fetcher,
+    )
+    .resolve_remote(url, depth)
+}
+
+fn sealed_config_dir(config_dir: &Path, sealed: bool) -> Result<Option<PathBuf>, miette::Report> {
+    if !sealed {
+        return Ok(None);
+    }
+    dunce::canonicalize(config_dir).map(Some).map_err(|e| {
+        miette::miette!(
+            "Sealed config directory '{}' could not be canonicalized: {e}",
+            config_dir.display()
+        )
+    })
+}
+
+fn reject_sealed_remote_extends(
+    path: &Path,
+    entry: &str,
+    sealed: bool,
+    kind: &str,
+) -> Result<(), miette::Report> {
+    if sealed {
+        let entry_display = remote_config_display(entry);
+        Err(miette::miette!(
+            "'sealed: true' config at {} rejects {} extends '{}'. \
+             Sealed configs only allow file-relative extends within \
+             the config's directory",
+            path.display(),
+            kind,
+            entry_display
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_sealed_relative_extends(
+    path: &Path,
+    entry: &str,
+    resolved_path: &Path,
+    sealed_dir_canonical: Option<&Path>,
+) -> Result<(), miette::Report> {
+    let Some(dir_canonical) = sealed_dir_canonical else {
+        return Ok(());
+    };
+    let p_canonical = dunce::canonicalize(resolved_path).map_err(|e| {
+        miette::miette!(
+            "Sealed config extends path '{}' could not be canonicalized: {e}",
+            resolved_path.display()
+        )
+    })?;
+    if p_canonical.starts_with(dir_canonical) {
+        Ok(())
+    } else {
+        Err(miette::miette!(
+            "'sealed: true' config at {} rejects extends '{}' which resolves \
+             outside the config's directory ({}). Sealed configs only allow \
+             extends within the config's directory",
+            path.display(),
+            entry,
+            p_canonical.display()
+        ))
+    }
 }
 
 /// Public entry point: resolve a config file with all its extends chain.
 ///
 /// Delegates to [`resolve_extends_file`] with a fresh visited set.
+#[cfg(test)]
 pub(super) fn resolve_extends(
     path: &Path,
-    visited: &mut FxHashSet<String>,
+    _visited: &mut FxHashSet<String>,
     depth: usize,
 ) -> Result<serde_json::Value, miette::Report> {
-    resolve_extends_file(path, visited, depth)
+    let mut fetcher = NetworkRemoteConfigFetcher;
+    ExtendsResolver::new(ConfigLoadOptions::default(), &mut fetcher).resolve_local(path, depth)
+}
+
+/// Collect every unknown key under `rules` or `overrides[].rules` in a merged
+/// config value (issue #467, phase 1).
+///
+/// Today `RulesConfig` / `PartialRulesConfig` carry serde aliases but NOT
+/// `deny_unknown_fields`, so typos like `unsued-files` are silently dropped and
+/// the user's intent is lost. This pass walks the merged value before
+/// deserialization and surfaces every unknown key, with a Levenshtein-distance
+/// suggestion when the typo is close to a known name.
+///
+/// Returns the findings so the caller can render them; tests can assert
+/// against the list without subscribing to tracing output.
+///
+/// Phase 2 (a future minor release) flips both structs to
+/// `#[serde(deny_unknown_fields)]` and the warning becomes a hard error.
+pub(super) fn collect_unknown_rule_keys(
+    merged: &serde_json::Value,
+) -> Vec<super::rules::UnknownRuleKey> {
+    use super::rules::find_unknown_rule_keys;
+
+    let mut findings = Vec::new();
+
+    if let Some(rules) = merged.get("rules") {
+        findings.extend(find_unknown_rule_keys(rules, "rules"));
+    }
+
+    if let Some(overrides) = merged.get("overrides").and_then(|v| v.as_array()) {
+        for (i, entry) in overrides.iter().enumerate() {
+            if let Some(rules) = entry.get("rules") {
+                let context = format!("overrides[{i}].rules");
+                findings.extend(find_unknown_rule_keys(rules, &context));
+            }
+        }
+    }
+
+    findings
+}
+
+thread_local! {
+    /// Per-thread capture of unknown-rule findings, for the wiring regression
+    /// test in this module. Each test installs a fresh capture via
+    /// [`capture_unknown_rule_warnings`], runs `FallowConfig::load`, and reads
+    /// back the findings. Thread-local so parallel test execution does not
+    /// race; bypassed entirely in production code (`UnknownRuleCapture::None`).
+    #[cfg(test)]
+    static UNKNOWN_RULE_CAPTURE: std::cell::RefCell<Option<Vec<super::rules::UnknownRuleKey>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Install a thread-local capture buffer and run `body`. Returns the findings
+/// emitted by every `warn_on_unknown_rule_keys` call within `body`'s call tree
+/// on the current thread, in order. Test-only.
+#[cfg(test)]
+pub(super) fn capture_unknown_rule_warnings<F: FnOnce() -> R, R>(
+    body: F,
+) -> (R, Vec<super::rules::UnknownRuleKey>) {
+    UNKNOWN_RULE_CAPTURE.with(|cell| {
+        *cell.borrow_mut() = Some(Vec::new());
+    });
+    let result = body();
+    let findings = UNKNOWN_RULE_CAPTURE.with(|cell| cell.borrow_mut().take().unwrap_or_default());
+    (result, findings)
+}
+
+/// Emit a `tracing::warn!` per finding from [`collect_unknown_rule_keys`].
+///
+/// `config_path` is the file the merged value originated from; it appears in
+/// the warning text AND in the dedupe key so two different config files with
+/// the same typo each warn once instead of the second one being silenced.
+///
+/// Deduplicates within the process: `FallowConfig::load` runs multiple times
+/// per analysis (combined mode runs check + dupes + health, each through the
+/// same config load path), so without a dedupe the same typo emits 3+ warnings
+/// per run.
+fn warn_on_unknown_rule_keys(config_path: &Path, merged: &serde_json::Value) {
+    use std::sync::{Mutex, OnceLock};
+
+    static WARNED: OnceLock<Mutex<FxHashSet<String>>> = OnceLock::new();
+    let warned = WARNED.get_or_init(|| Mutex::new(FxHashSet::default()));
+
+    let path_display = config_path.display().to_string();
+
+    for finding in collect_unknown_rule_keys(merged) {
+        let dedupe_key = format!("{path_display}::{}::{}", finding.context, finding.key);
+        if let Ok(mut set) = warned.lock()
+            && !set.insert(dedupe_key)
+        {
+            continue;
+        }
+
+        #[cfg(test)]
+        UNKNOWN_RULE_CAPTURE.with(|cell| {
+            if let Some(buf) = cell.borrow_mut().as_mut() {
+                buf.push(finding.clone());
+            }
+        });
+
+        if let Some(suggestion) = finding.suggestion {
+            tracing::warn!(
+                "unknown rule '{key}' in {context} of {path} (did you mean '{suggestion}'?); \
+                 the rule will be ignored. A future release will reject unknown rule names.",
+                key = finding.key,
+                context = finding.context,
+                path = path_display,
+            );
+        } else {
+            tracing::warn!(
+                "unknown rule '{key}' in {context} of {path}; the rule will be ignored. \
+                 A future release will reject unknown rule names.",
+                key = finding.key,
+                context = finding.context,
+                path = path_display,
+            );
+        }
+    }
+}
+
+/// Return the lower-precedence config names from [`CONFIG_NAMES`] that ALSO
+/// exist in `dir`, given that `chosen_index` is the index of the first-match
+/// (winning) name.
+///
+/// Only indices after `chosen_index` are scanned: a higher-precedence name
+/// cannot coexist undetected, because it would have been the first match.
+fn shadowed_config_names(dir: &Path, chosen_index: usize) -> Vec<&'static str> {
+    CONFIG_NAMES
+        .iter()
+        .skip(chosen_index + 1)
+        .filter(|name| dir.join(name).exists())
+        .copied()
+        .collect()
+}
+
+/// A captured coexistence warning: `(chosen file name, shadowed file names)`.
+/// Test-only; populated by `warn_on_coexisting_configs` under capture.
+#[cfg(test)]
+type CoexistWarning = (String, Vec<String>);
+
+thread_local! {
+    /// Per-thread capture of coexisting-config warnings, for the wiring
+    /// regression test in this module. Mirrors [`UNKNOWN_RULE_CAPTURE`]: each
+    /// test installs a fresh capture via
+    /// [`capture_coexisting_config_warnings`], runs `find_and_load`, and reads
+    /// back the `(chosen, shadowed)` pairs. Thread-local so parallel test
+    /// execution does not race; bypassed entirely in production code.
+    #[cfg(test)]
+    static COEXIST_CAPTURE: std::cell::RefCell<Option<Vec<CoexistWarning>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Install a thread-local capture buffer and run `body`. Returns every
+/// `(chosen, shadowed)` pair emitted by `warn_on_coexisting_configs` within
+/// `body`'s call tree on the current thread, in order. Test-only.
+#[cfg(test)]
+pub(super) fn capture_coexisting_config_warnings<F: FnOnce() -> R, R>(
+    body: F,
+) -> (R, Vec<CoexistWarning>) {
+    COEXIST_CAPTURE.with(|cell| {
+        *cell.borrow_mut() = Some(Vec::new());
+    });
+    let result = body();
+    let findings = COEXIST_CAPTURE.with(|cell| cell.borrow_mut().take().unwrap_or_default());
+    (result, findings)
+}
+
+/// Emit a `tracing::warn!` when `find_and_load` picked `chosen_path` while one
+/// or more lower-precedence config files (`shadowed`) coexist in the same
+/// directory. Silent precedence is the worst class of config bug: the user
+/// sees correct-looking output produced from the wrong source (#458).
+///
+/// `chosen_path` is the absolute candidate path of the winning config;
+/// `shadowed` are the bare names of the lower-precedence files that also exist.
+///
+/// Deduplicates within the process keyed on the canonical directory, because
+/// `find_and_load` runs multiple times per analysis (combined mode loads config
+/// for check + dupes + health); without the dedupe the same directory would
+/// warn 3+ times per run. Two different directories with coexisting configs
+/// warn independently.
+fn warn_on_coexisting_configs(chosen_path: &Path, shadowed: &[&str]) {
+    use std::sync::{Mutex, OnceLock};
+
+    if shadowed.is_empty() {
+        return;
+    }
+
+    let chosen_name = chosen_path.file_name().map_or_else(
+        || chosen_path.display().to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    );
+    let dir = chosen_path.parent().unwrap_or(chosen_path);
+
+    #[cfg(test)]
+    COEXIST_CAPTURE.with(|cell| {
+        if let Some(buf) = cell.borrow_mut().as_mut() {
+            buf.push((
+                chosen_name.clone(),
+                shadowed.iter().map(|s| (*s).to_owned()).collect(),
+            ));
+        }
+    });
+
+    static WARNED: OnceLock<Mutex<FxHashSet<String>>> = OnceLock::new();
+    let warned = WARNED.get_or_init(|| Mutex::new(FxHashSet::default()));
+    let dedupe_key = std::fs::canonicalize(dir)
+        .unwrap_or_else(|_| dir.to_path_buf())
+        .display()
+        .to_string();
+    if let Ok(mut set) = warned.lock()
+        && !set.insert(dedupe_key)
+    {
+        return;
+    }
+
+    tracing::warn!(
+        "multiple fallow config files in {dir}: loaded '{chosen}', ignoring '{shadowed}'. \
+         fallow uses the first match in precedence order \
+         (.fallowrc.json > .fallowrc.jsonc > fallow.toml > .fallow.toml); \
+         remove the unused file(s) to silence this warning.",
+        dir = dir.display(),
+        chosen = chosen_name,
+        shadowed = shadowed.join(", "),
+    );
+}
+
+fn load_with_fetcher<Fetcher: RemoteConfigFetcher>(
+    path: &Path,
+    options: ConfigLoadOptions,
+    fetcher: &mut Fetcher,
+) -> Result<FallowConfig, miette::Report> {
+    let merged = ExtendsResolver::new(options, fetcher).resolve_local(path, 0)?;
+    FallowConfig::from_merged(path, merged)
 }
 
 impl FallowConfig {
@@ -677,20 +1088,232 @@ impl FallowConfig {
     /// Supports `extends` for config inheritance. Extended configs are loaded
     /// and deep-merged before this config's values are applied.
     ///
+    /// User-supplied glob patterns (`entry`, `ignorePatterns`,
+    /// `dynamicallyLoaded`, `duplicates.ignore`, `similarCode.ignore`, `health.ignore`,
+    /// `health.thresholdOverrides[].files`, `boundaries.zones[].patterns`, `overrides[].files`,
+    /// `ignoreExports[].file`, `ignoreCatalogReferences[].consumer`) are
+    /// validated against absolute paths, `..` traversal segments, and invalid
+    /// glob syntax. Loading fails loud on any rejection so silent no-match
+    /// configs surface to the user. See issue #463.
+    ///
     /// # Errors
     ///
-    /// Returns an error when the config file cannot be read, merged, or deserialized.
+    /// Returns an error when the config file cannot be read, merged, or
+    /// deserialized, or when any user-supplied glob pattern is rejected.
     pub fn load(path: &Path) -> Result<Self, miette::Report> {
-        let mut visited = FxHashSet::default();
-        let merged = resolve_extends(path, &mut visited, 0)?;
+        Self::load_with_options(path, ConfigLoadOptions::default())
+    }
 
-        serde_json::from_value(merged).map_err(|e| {
-            miette::miette!(
-                "Failed to deserialize config from {}: {}",
-                path.display(),
-                e
-            )
-        })
+    /// Load config with a host-controlled inheritance trust policy.
+    ///
+    /// Remote `https://` extends are denied unless
+    /// [`ConfigLoadOptions::allow_remote_extends`] is explicitly enabled for
+    /// this call. Local and `npm:` extends are unaffected.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::load`], plus a trust-policy error
+    /// when a remote extends target is encountered without opt-in.
+    pub fn load_with_options(
+        path: &Path,
+        options: ConfigLoadOptions,
+    ) -> Result<Self, miette::Report> {
+        let mut fetcher = NetworkRemoteConfigFetcher;
+        load_with_fetcher(path, options, &mut fetcher)
+    }
+
+    fn from_merged(path: &Path, merged: serde_json::Value) -> Result<Self, miette::Report> {
+        warn_on_unknown_rule_keys(path, &merged);
+
+        let private_type_leaks_configured = merged
+            .get("rules")
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|rules| {
+                rules.contains_key("private-type-leaks") || rules.contains_key("private-type-leak")
+            });
+        let mut config: Self = serde_json::from_value(merged).map_err(|e| {
+            let reason = e.to_string();
+            // Unknown fields on overrides/ignoreExports entries are usually
+            // inline annotations; point at JSONC comments as the fix.
+            let hint = if matches!(ConfigFormat::from_path(path), ConfigFormat::Json)
+                && reason.contains("unknown field")
+                && (reason.contains("expected `files` or `rules`")
+                    || reason.contains("expected `file` or `exports`"))
+            {
+                " (annotations belong in a // comment; .fallowrc.json accepts JSONC)"
+            } else {
+                ""
+            };
+            miette::miette!("{reason} in {}{hint}", path.display())
+        })?;
+        config.rules.private_type_leaks_configured = private_type_leaks_configured;
+
+        config.validate_user_globs().map_err(|errors| {
+            let joined = errors
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n  - ");
+            miette::miette!("invalid config:\n  - {}", joined)
+        })?;
+        if !config.security.request_receivers_are_valid() {
+            return Err(miette::miette!(
+                "invalid config:\n  - security.requestReceivers entries must be non-empty strings"
+            ));
+        }
+        let threshold_override_errors = config.health.threshold_override_errors();
+        if !threshold_override_errors.is_empty() {
+            return Err(miette::miette!(
+                "invalid config:\n  - {}",
+                threshold_override_errors.join("\n  - ")
+            ));
+        }
+        if let Some(pattern) = &config.unused_component_props.ignore_pattern
+            && let Err(e) = regex::Regex::new(pattern)
+        {
+            return Err(miette::miette!(
+                "invalid config:\n  - unusedComponentProps.ignorePattern is not a valid regex: {e}"
+            ));
+        }
+
+        Ok(config)
+    }
+
+    /// Validate all user-supplied glob patterns and directory paths in this config.
+    ///
+    /// Accumulates errors from every glob- or path-bearing field so the user
+    /// sees ALL offending values in one run rather than fixing them one at a
+    /// time.
+    ///
+    /// Covered filesystem glob fields: `entry`, `ignorePatterns`, `ignoreFindings`,
+    /// `dynamicallyLoaded`, `duplicates.ignore`, `similarCode.ignore`, `health.ignore`,
+    /// `health.thresholdOverrides[].files`, `overrides[].files`, `ignoreExports[].file`,
+    /// `ignoreCatalogReferences[].consumer`, `boundaries.zones[].patterns`,
+    /// `boundaries.coverage.allowUnmatched`,
+    /// plus every glob-bearing field on inline `framework[]` plugin
+    /// definitions (entry points, always-used, config patterns, used-exports
+    /// patterns, and `fileExists` detection patterns; the last reaches
+    /// `glob::glob` on disk so a `..` segment there is a real path traversal).
+    ///
+    /// Covered specifier glob fields: `ignoreUnresolvedImports`. These match
+    /// raw import strings, so parent-relative specifiers like `../generated/**`
+    /// are valid and only glob syntax is checked.
+    ///
+    /// Covered directory-path fields: `boundaries.zones[].root` and
+    /// `boundaries.zones[].autoDiscover`. These are literal paths (not
+    /// globs), so only the absolute-path + traversal checks apply.
+    ///
+    /// # Errors
+    ///
+    /// Returns a non-empty `Vec` of
+    /// [`glob_validation::GlobValidationError`](super::glob_validation::GlobValidationError)
+    /// when any field contains a rejected value.
+    pub fn validate_user_globs(
+        &self,
+    ) -> Result<(), Vec<super::glob_validation::GlobValidationError>> {
+        let mut errors = Vec::new();
+
+        self.validate_top_level_globs(&mut errors);
+        self.validate_ignore_rule_globs(&mut errors);
+        self.validate_boundary_globs(&mut errors);
+
+        for plugin in &self.framework {
+            if let Err(mut plugin_errors) = plugin.validate_user_globs() {
+                errors.append(&mut plugin_errors);
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+
+    /// Validate the top-level filesystem and specifier glob fields plus the
+    /// per-override and threshold-override file globs.
+    fn validate_top_level_globs(
+        &self,
+        errors: &mut Vec<super::glob_validation::GlobValidationError>,
+    ) {
+        use super::glob_validation::{
+            validate_user_finding_ignore_globs, validate_user_globs, validate_user_specifier_globs,
+        };
+
+        validate_user_globs(&self.entry, "entry", errors);
+        validate_user_globs(&self.ignore_patterns, "ignorePatterns", errors);
+        validate_user_finding_ignore_globs(&self.ignore_findings, "ignoreFindings", errors);
+        validate_user_globs(&self.dynamically_loaded, "dynamicallyLoaded", errors);
+        validate_user_specifier_globs(
+            &self.ignore_unresolved_imports,
+            "ignoreUnresolvedImports",
+            errors,
+        );
+        validate_user_globs(&self.duplicates.ignore, "duplicates.ignore", errors);
+        validate_user_globs(&self.similar_code.ignore, "similarCode.ignore", errors);
+        validate_user_globs(&self.health.ignore, "health.ignore", errors);
+        for override_entry in &self.health.threshold_overrides {
+            validate_user_globs(
+                &override_entry.files,
+                "health.thresholdOverrides[].files",
+                errors,
+            );
+        }
+        for override_entry in &self.overrides {
+            validate_user_globs(&override_entry.files, "overrides[].files", errors);
+        }
+    }
+
+    /// Validate the `ignoreExports` and `ignoreCatalogReferences` rule globs.
+    fn validate_ignore_rule_globs(
+        &self,
+        errors: &mut Vec<super::glob_validation::GlobValidationError>,
+    ) {
+        use super::glob_validation::compile_user_glob;
+
+        for rule in &self.ignore_exports {
+            if let Err(e) = compile_user_glob(&rule.file, "ignoreExports[].file") {
+                errors.push(e);
+            }
+        }
+
+        for rule in &self.ignore_catalog_references {
+            if let Some(consumer) = &rule.consumer
+                && let Err(e) = compile_user_glob(consumer, "ignoreCatalogReferences[].consumer")
+            {
+                errors.push(e);
+            }
+        }
+    }
+
+    /// Validate the `boundaries.zones[]` patterns/roots/autoDiscover and the
+    /// coverage `allowUnmatched` globs.
+    fn validate_boundary_globs(
+        &self,
+        errors: &mut Vec<super::glob_validation::GlobValidationError>,
+    ) {
+        use super::glob_validation::{
+            validate_user_globs, validate_user_path, validate_user_paths,
+        };
+
+        for zone in &self.boundaries.zones {
+            validate_user_globs(&zone.patterns, "boundaries.zones[].patterns", errors);
+            if let Some(root) = &zone.root
+                && let Err(e) = validate_user_path(root, "boundaries.zones[].root")
+            {
+                errors.push(e);
+            }
+            validate_user_paths(
+                &zone.auto_discover,
+                "boundaries.zones[].autoDiscover",
+                errors,
+            );
+        }
+        validate_user_globs(
+            &self.boundaries.coverage.allow_unmatched,
+            "boundaries.coverage.allowUnmatched",
+            errors,
+        );
     }
 
     /// Find the config file path without loading it.
@@ -719,22 +1342,41 @@ impl FallowConfig {
     ///
     /// Returns an error if a config file is found but cannot be read or parsed.
     pub fn find_and_load(start: &Path) -> Result<Option<(Self, PathBuf)>, String> {
+        Self::find_and_load_with_options(start, ConfigLoadOptions::default())
+    }
+
+    /// Find and load config with a host-controlled inheritance trust policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a config file is found but cannot be read, parsed,
+    /// or is not permitted by `options`.
+    pub fn find_and_load_with_options(
+        start: &Path,
+        options: ConfigLoadOptions,
+    ) -> Result<Option<(Self, PathBuf)>, String> {
         let mut dir = start;
         loop {
-            for name in CONFIG_NAMES {
+            for (idx, name) in CONFIG_NAMES.iter().enumerate() {
                 let candidate = dir.join(name);
                 if candidate.exists() {
-                    match Self::load(&candidate) {
+                    warn_on_coexisting_configs(&candidate, &shadowed_config_names(dir, idx));
+                    match Self::load_with_options(&candidate, options) {
                         Ok(config) => return Ok(Some((config, candidate))),
                         Err(e) => {
-                            return Err(format!("Failed to parse {}: {e}", candidate.display()));
+                            // Most load errors already name the config file;
+                            // add the path only when the reason lacks it, so
+                            // it is mentioned exactly once.
+                            let msg = e.to_string();
+                            return Err(if msg.contains(&candidate.display().to_string()) {
+                                msg
+                            } else {
+                                format!("Failed to parse {}: {msg}", candidate.display())
+                            });
                         }
                     }
                 }
             }
-            // Stop at project root indicators (VCS markers). We intentionally
-            // do NOT stop at `package.json` so that monorepo sub-packages
-            // inherit a root config placed alongside the workspace root.
             if is_repo_root(dir) {
                 break;
             }
@@ -751,13 +1393,80 @@ impl FallowConfig {
     pub fn json_schema() -> serde_json::Value {
         serde_json::to_value(schemars::schema_for!(FallowConfig)).unwrap_or_default()
     }
+
+    /// Validate boundary zone references and zone-root-prefix conflicts AFTER
+    /// preset and auto-discover expansion.
+    ///
+    /// Runs the same expand sequence as [`FallowConfig::resolve`] (preset
+    /// expansion gated on tsconfig `rootDir`, then `expand_auto_discover`)
+    /// before invoking
+    /// [`BoundaryConfig::validate_zone_references`](super::boundaries::BoundaryConfig::validate_zone_references)
+    /// and
+    /// [`BoundaryConfig::validate_root_prefixes`](super::boundaries::BoundaryConfig::validate_root_prefixes),
+    /// so Bulletproof-style presets whose authored rule references logical
+    /// groups (`features`) still load cleanly.
+    ///
+    /// Call sites (`runtime_support::load_config_for_analysis` in the CLI,
+    /// `core::lib::config_for_project` for LSP and programmatic embedders)
+    /// surface every collected error in a single rendered diagnostic, then
+    /// exit with code 2. Previously these failures emitted `tracing::error!`
+    /// and continued, producing a flood of false-positive boundary violations
+    /// at analysis time (#468).
+    ///
+    /// `root` is the project root used by `expand_auto_discover` to scan for
+    /// child directories. Caller is responsible for passing the same root it
+    /// later hands to `resolve()`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a non-empty `Vec<ZoneValidationError>` aggregating every
+    /// offending zone reference and redundant-root-prefix pattern; the empty
+    /// case becomes `Ok(())`.
+    pub fn validate_resolved_boundaries(
+        &self,
+        root: &Path,
+    ) -> Result<(), Vec<super::boundaries::ZoneValidationError>> {
+        use super::boundaries::ZoneValidationError;
+
+        let mut boundaries = self.boundaries.clone();
+        if boundaries.preset.is_some() {
+            let source_root = crate::workspace::parse_tsconfig_root_dir(root)
+                .filter(|r| r != "." && !r.starts_with("..") && !Path::new(r).is_absolute())
+                .unwrap_or_else(|| "src".to_owned());
+            boundaries.expand(&source_root);
+        }
+        let _logical_groups = boundaries.expand_auto_discover(root);
+
+        let mut errors: Vec<ZoneValidationError> = boundaries
+            .validate_zone_references()
+            .into_iter()
+            .map(ZoneValidationError::UnknownZoneReference)
+            .collect();
+        errors.extend(
+            boundaries
+                .validate_root_prefixes()
+                .into_iter()
+                .map(ZoneValidationError::RedundantRootPrefix),
+        );
+        errors.extend(
+            boundaries
+                .validate_call_rules()
+                .into_iter()
+                .map(ZoneValidationError::InvalidForbiddenCallee),
+        );
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::io::Read as _;
-
     use super::*;
+    use crate::CacheConfig;
     use crate::PackageJson;
     use crate::config::format::OutputFormat;
     use crate::config::rules::Severity;
@@ -765,6 +1474,29 @@ mod tests {
     /// Create a panic-safe temp directory (RAII cleanup via `tempfile::TempDir`).
     fn test_dir(_name: &str) -> tempfile::TempDir {
         tempfile::tempdir().expect("create temp dir")
+    }
+
+    #[derive(Default)]
+    struct MockRemoteFetcher {
+        responses: rustc_hash::FxHashMap<String, serde_json::Value>,
+        requests: Vec<String>,
+    }
+
+    impl MockRemoteFetcher {
+        fn with_response(mut self, url: &str, value: serde_json::Value) -> Self {
+            self.responses.insert(url.to_string(), value);
+            self
+        }
+    }
+
+    impl RemoteConfigFetcher for MockRemoteFetcher {
+        fn fetch(&mut self, url: &str, _source: &str) -> Result<serde_json::Value, miette::Report> {
+            self.requests.push(url.to_string());
+            self.responses
+                .get(url)
+                .cloned()
+                .ok_or_else(|| miette::miette!("missing mock response for {url}"))
+        }
     }
 
     #[test]
@@ -805,6 +1537,18 @@ ignoreDependencies = ["autoprefixer", "postcss"]
     }
 
     #[test]
+    fn fallow_config_deserialize_ignore_unresolved_imports() {
+        let toml_str = r#"
+ignoreUnresolvedImports = ["@example/icons", "@example/icons/**", "../generated/**"]
+"#;
+        let config: FallowConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            config.ignore_unresolved_imports,
+            vec!["@example/icons", "@example/icons/**", "../generated/**"]
+        );
+    }
+
+    #[test]
     fn fallow_config_resolve_default_ignores() {
         let config = FallowConfig::default();
         let resolved = config.resolve(
@@ -813,9 +1557,9 @@ ignoreDependencies = ["autoprefixer", "postcss"]
             4,
             true,
             true,
+            None,
         );
 
-        // Default ignores should be compiled
         assert!(resolved.ignore_patterns.is_match("node_modules/foo/bar.ts"));
         assert!(resolved.ignore_patterns.is_match("dist/bundle.js"));
         assert!(resolved.ignore_patterns.is_match("build/output.js"));
@@ -830,6 +1574,7 @@ ignoreDependencies = ["autoprefixer", "postcss"]
         let config = FallowConfig {
             entry: vec!["src/**/*.ts".to_string()],
             ignore_patterns: vec!["**/*.generated.ts".to_string()],
+            ignore_findings: vec!["**/*.test.ts".to_string(), "!src/public/**".to_string()],
             ..Default::default()
         };
         let resolved = config.resolve(
@@ -838,9 +1583,20 @@ ignoreDependencies = ["autoprefixer", "postcss"]
             4,
             false,
             true,
+            None,
         );
 
         assert!(resolved.ignore_patterns.is_match("src/foo.generated.ts"));
+        assert!(
+            resolved
+                .ignore_findings
+                .is_ignored("src/private/app.test.ts")
+        );
+        assert!(
+            !resolved
+                .ignore_findings
+                .is_ignored("src/public/app.test.ts")
+        );
         assert_eq!(resolved.entry_patterns, vec!["src/**/*.ts"]);
         assert!(matches!(resolved.output, OutputFormat::Json));
         assert!(!resolved.no_cache);
@@ -855,6 +1611,7 @@ ignoreDependencies = ["autoprefixer", "postcss"]
             4,
             true,
             true,
+            None,
         );
         assert_eq!(resolved.cache_dir, PathBuf::from("/tmp/project/.fallow"));
         assert!(resolved.no_cache);
@@ -963,7 +1720,6 @@ unused-types = "off"
         assert_eq!(config.rules.unused_files, Severity::Error);
         assert_eq!(config.rules.unused_exports, Severity::Warn);
         assert_eq!(config.rules.unused_types, Severity::Off);
-        // Unset fields default to error
         assert_eq!(config.rules.unresolved_imports, Severity::Error);
     }
 
@@ -996,24 +1752,20 @@ unknown_field = true
     #[test]
     fn fallow_config_deserialize_jsonc() {
         let jsonc_str = r#"{
-            // This is a comment
             "entry": ["src/main.ts"],
             "rules": {
                 "unused-files": "warn"
             }
         }"#;
-        let mut stripped = String::new();
-        json_comments::StripComments::new(jsonc_str.as_bytes())
-            .read_to_string(&mut stripped)
-            .unwrap();
-        let config: FallowConfig = serde_json::from_str(&stripped).unwrap();
+        let config: FallowConfig = crate::jsonc::parse_to_value(jsonc_str).unwrap();
         assert_eq!(config.entry, vec!["src/main.ts"]);
         assert_eq!(config.rules.unused_files, Severity::Warn);
     }
 
     #[test]
     fn fallow_config_json_with_schema_field() {
-        let json_str = r#"{"$schema": "https://fallow.dev/schema.json", "entry": ["src/main.ts"]}"#;
+        let json_str =
+            r#"{"$schema": "./node_modules/fallow/schema.json", "entry": ["src/main.ts"]}"#;
         let config: FallowConfig = serde_json::from_str(json_str).unwrap();
         assert_eq!(config.entry, vec!["src/main.ts"]);
     }
@@ -1037,6 +1789,10 @@ unknown_field = true
             ConfigFormat::Json
         ));
         assert!(matches!(
+            ConfigFormat::from_path(Path::new(".fallowrc.jsonc")),
+            ConfigFormat::Json
+        ));
+        assert!(matches!(
             ConfigFormat::from_path(Path::new(".fallow.toml")),
             ConfigFormat::Toml
         ));
@@ -1045,8 +1801,9 @@ unknown_field = true
     #[test]
     fn config_names_priority_order() {
         assert_eq!(CONFIG_NAMES[0], ".fallowrc.json");
-        assert_eq!(CONFIG_NAMES[1], "fallow.toml");
-        assert_eq!(CONFIG_NAMES[2], ".fallow.toml");
+        assert_eq!(CONFIG_NAMES[1], ".fallowrc.jsonc");
+        assert_eq!(CONFIG_NAMES[2], "fallow.toml");
+        assert_eq!(CONFIG_NAMES[3], ".fallow.toml");
     }
 
     #[test]
@@ -1065,13 +1822,103 @@ unknown_field = true
     }
 
     #[test]
+    fn load_records_explicit_private_type_leaks_setting() {
+        let dir = test_dir("explicit-private-type-leaks");
+        let config_path = dir.path().join(".fallowrc.json");
+        std::fs::write(&config_path, r#"{"rules": {"private-type-leaks": "off"}}"#).unwrap();
+
+        let config = FallowConfig::load(&config_path).unwrap();
+        assert_eq!(config.rules.private_type_leaks, Severity::Off);
+        assert!(config.rules.private_type_leaks_configured);
+    }
+
+    #[test]
+    fn load_records_explicit_private_type_leaks_singular_alias() {
+        let dir = test_dir("explicit-private-type-leak-alias");
+        let config_path = dir.path().join(".fallowrc.json");
+        std::fs::write(&config_path, r#"{"rules": {"private-type-leak": "off"}}"#).unwrap();
+
+        let config = FallowConfig::load(&config_path).unwrap();
+        assert!(config.rules.private_type_leaks_configured);
+    }
+
+    #[test]
+    fn load_leaves_defaulted_private_type_leaks_unmarked() {
+        let dir = test_dir("defaulted-private-type-leaks");
+        let config_path = dir.path().join(".fallowrc.json");
+        std::fs::write(&config_path, r#"{"rules": {"unused-exports": "warn"}}"#).unwrap();
+
+        let config = FallowConfig::load(&config_path).unwrap();
+        assert_eq!(config.rules.private_type_leaks, Severity::Off);
+        assert!(!config.rules.private_type_leaks_configured);
+    }
+
+    /// The explicit-configuration flag is `serde(skip)`, so a serde round-trip
+    /// of a loaded config drops it and the type-aware `warn` default would
+    /// force the rule back on. No production path round-trips a
+    /// [`FallowConfig`] today; this test pins the hazard so introducing one
+    /// fails loudly instead of silently re-enabling an explicitly-off rule.
+    #[test]
+    fn serde_round_trip_drops_explicit_private_type_leaks_flag() {
+        let dir = test_dir("round-trip-private-type-leaks");
+        let config_path = dir.path().join(".fallowrc.json");
+        std::fs::write(&config_path, r#"{"rules": {"private-type-leaks": "off"}}"#).unwrap();
+
+        let config = FallowConfig::load(&config_path).unwrap();
+        assert!(config.rules.private_type_leaks_configured);
+
+        let serialized = serde_json::to_value(&config).unwrap();
+        let round_tripped: FallowConfig = serde_json::from_value(serialized).unwrap();
+
+        assert_eq!(round_tripped.rules.private_type_leaks, Severity::Off);
+        assert!(
+            !round_tripped.rules.private_type_leaks_configured,
+            "a serde round-trip drops the serde(skip) flag; any code path that \
+             round-trips a loaded FallowConfig must re-record it (see the field \
+             docs on RulesConfig::private_type_leaks_configured)"
+        );
+    }
+
+    #[test]
+    fn load_json_config_file_with_health_threshold_override() {
+        let dir = test_dir("json-health-threshold-override");
+        let config_path = dir.path().join(".fallowrc.json");
+        std::fs::write(
+            &config_path,
+            r#"{
+                "health": {
+                    "thresholdOverrides": [
+                        {
+                            "files": ["src/legacy.ts"],
+                            "functions": ["legacyFlow"],
+                            "maxCyclomatic": 30,
+                            "maxCognitive": 25,
+                            "maxCrap": 80.5,
+                            "reason": "legacy migration"
+                        }
+                    ]
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let config = FallowConfig::load(&config_path).unwrap();
+        let override_config = &config.health.threshold_overrides[0];
+        assert_eq!(override_config.files, vec!["src/legacy.ts"]);
+        assert_eq!(override_config.functions, vec!["legacyFlow"]);
+        assert_eq!(override_config.max_cyclomatic, Some(30));
+        assert_eq!(override_config.max_cognitive, Some(25));
+        assert_eq!(override_config.max_crap, Some(80.5));
+        assert_eq!(override_config.reason.as_deref(), Some("legacy migration"));
+    }
+
+    #[test]
     fn load_jsonc_config_file() {
         let dir = test_dir("jsonc-config");
         let config_path = dir.path().join(".fallowrc.json");
         std::fs::write(
             &config_path,
             r#"{
-                // Entry points for analysis
                 "entry": ["src/index.ts"],
                 /* Block comment */
                 "rules": {
@@ -1087,10 +1934,65 @@ unknown_field = true
     }
 
     #[test]
+    fn load_jsonc_config_file_with_health_threshold_override() {
+        let dir = test_dir("jsonc-health-threshold-override");
+        let config_path = dir.path().join(".fallowrc.jsonc");
+        std::fs::write(
+            &config_path,
+            r#"{
+                "health": {
+                    // Empty functions means every function in matching files.
+                    "thresholdOverrides": [
+                        { "files": ["src/legacy.ts"], "maxCognitive": 25 }
+                    ]
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let config = FallowConfig::load(&config_path).unwrap();
+        let override_config = &config.health.threshold_overrides[0];
+        assert_eq!(override_config.files, vec!["src/legacy.ts"]);
+        assert!(override_config.functions.is_empty());
+        assert_eq!(override_config.max_cognitive, Some(25));
+    }
+
+    #[test]
+    fn load_fallowrc_jsonc_extension() {
+        let dir = test_dir("jsonc-extension");
+        let config_path = dir.path().join(".fallowrc.jsonc");
+        std::fs::write(
+            &config_path,
+            r#"{
+                "ignoreDependencies": ["tailwindcss-react-aria-components"],
+                "entry": ["src/index.ts"]
+            }"#,
+        )
+        .unwrap();
+
+        let config = FallowConfig::load(&config_path).unwrap();
+        assert_eq!(config.entry, vec!["src/index.ts"]);
+        assert_eq!(
+            config.ignore_dependencies,
+            vec!["tailwindcss-react-aria-components"]
+        );
+    }
+
+    #[test]
     fn json_config_ignore_dependencies_camel_case() {
         let json_str = r#"{"ignoreDependencies": ["autoprefixer", "postcss"]}"#;
         let config: FallowConfig = serde_json::from_str(json_str).unwrap();
         assert_eq!(config.ignore_dependencies, vec!["autoprefixer", "postcss"]);
+    }
+
+    #[test]
+    fn json_config_ignore_unresolved_imports_camel_case() {
+        let json_str = r#"{"ignoreUnresolvedImports": ["@example/icons", "@example/icons/**"]}"#;
+        let config: FallowConfig = serde_json::from_str(json_str).unwrap();
+        assert_eq!(
+            config.ignore_unresolved_imports,
+            vec!["@example/icons", "@example/icons/**"]
+        );
     }
 
     #[test]
@@ -1126,8 +2028,6 @@ unknown_field = true
         assert!(config.duplicates.skip_local);
     }
 
-    // ── extends tests ──────────────────────────────────────────────
-
     #[test]
     fn extends_single_base() {
         let dir = test_dir("extends-single");
@@ -1146,7 +2046,6 @@ unknown_field = true
         let config = FallowConfig::load(&dir.path().join(".fallowrc.json")).unwrap();
         assert_eq!(config.rules.unused_files, Severity::Warn);
         assert_eq!(config.entry, vec!["src/index.ts"]);
-        // Unset fields from base still default
         assert_eq!(config.rules.unused_exports, Severity::Error);
     }
 
@@ -1156,19 +2055,18 @@ unknown_field = true
 
         std::fs::write(
             dir.path().join("base.json"),
-            r#"{"rules": {"unused-files": "warn", "unused-exports": "off"}}"#,
+            r#"{"ignoreFindings": ["generated/**"], "rules": {"unused-files": "warn", "unused-exports": "off"}}"#,
         )
         .unwrap();
         std::fs::write(
             dir.path().join(".fallowrc.json"),
-            r#"{"extends": ["base.json"], "rules": {"unused-files": "error"}}"#,
+            r#"{"extends": ["base.json"], "ignoreFindings": ["**/*.test.ts"], "rules": {"unused-files": "error"}}"#,
         )
         .unwrap();
 
         let config = FallowConfig::load(&dir.path().join(".fallowrc.json")).unwrap();
-        // Overlay overrides base
+        assert_eq!(config.ignore_findings, vec!["**/*.test.ts"]);
         assert_eq!(config.rules.unused_files, Severity::Error);
-        // Base value preserved when not overridden
         assert_eq!(config.rules.unused_exports, Severity::Off);
     }
 
@@ -1193,10 +2091,38 @@ unknown_field = true
         .unwrap();
 
         let config = FallowConfig::load(&dir.path().join(".fallowrc.json")).unwrap();
-        // grandparent: off -> parent: warn -> child: inherits warn
         assert_eq!(config.rules.unused_files, Severity::Warn);
-        // grandparent: warn, not overridden
         assert_eq!(config.rules.unused_exports, Severity::Warn);
+    }
+
+    #[test]
+    fn extends_local_diamond_reuses_resolved_base() {
+        let dir = test_dir("extends-local-diamond");
+        std::fs::write(
+            dir.path().join("base.json"),
+            r#"{"ignorePatterns": ["generated/**"]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("left.json"),
+            r#"{"extends": ["base.json"], "rules": {"unused-files": "warn"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("right.json"),
+            r#"{"extends": ["base.json"], "rules": {"unused-exports": "off"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join(".fallowrc.json"),
+            r#"{"extends": ["left.json", "right.json"]}"#,
+        )
+        .unwrap();
+
+        let config = FallowConfig::load(&dir.path().join(".fallowrc.json")).unwrap();
+        assert_eq!(config.ignore_patterns, vec!["generated/**"]);
+        assert_eq!(config.rules.unused_files, Severity::Warn);
+        assert_eq!(config.rules.unused_exports, Severity::Off);
     }
 
     #[test]
@@ -1213,6 +2139,341 @@ unknown_field = true
             err_msg.contains("Circular extends"),
             "Expected circular error, got: {err_msg}"
         );
+    }
+
+    #[test]
+    fn remote_extends_are_denied_before_fetch_by_default() {
+        let dir = test_dir("remote-default-denied");
+        let url = "https://config-user:config-password@config.example:8443/base.json?token=config-token#config-fragment";
+        std::fs::write(
+            dir.path().join(".fallowrc.json"),
+            format!(r#"{{"extends": "{url}"}}"#),
+        )
+        .unwrap();
+        let mut fetcher = MockRemoteFetcher::default().with_response(url, serde_json::json!({}));
+
+        let error = load_with_fetcher(
+            &dir.path().join(".fallowrc.json"),
+            ConfigLoadOptions::default(),
+            &mut fetcher,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            error.contains("https://config.example:8443/base.json"),
+            "denial must name the URL without secrets"
+        );
+        for secret in [
+            "config-user",
+            "config-password",
+            "config-token",
+            "config-fragment",
+        ] {
+            assert!(
+                !error.contains(secret),
+                "denial must not expose a secret value"
+            );
+        }
+        assert!(
+            error.contains("--allow-remote-extends"),
+            "denial must name the CLI opt-in"
+        );
+        assert!(
+            error.contains("ConfigLoadOptions"),
+            "denial must name the library opt-in"
+        );
+        assert!(
+            fetcher.requests.is_empty(),
+            "denial must happen before fetch"
+        );
+    }
+
+    #[test]
+    fn remote_parent_and_requested_url_secrets_are_redacted_in_errors() {
+        let dir = test_dir("remote-error-redaction");
+        let parent = "https://parent-user:parent-password@[2001:db8::1]:8443/base.json?token=parent-token#parent-fragment";
+        let requested = "http://child-user:child-password@child.example/child.json?token=child-token#child-fragment";
+        std::fs::write(
+            dir.path().join(".fallowrc.json"),
+            format!(r#"{{"extends": "{parent}"}}"#),
+        )
+        .unwrap();
+        let mut fetcher = MockRemoteFetcher::default()
+            .with_response(parent, serde_json::json!({"extends": requested}));
+
+        let error = load_with_fetcher(
+            &dir.path().join(".fallowrc.json"),
+            ConfigLoadOptions {
+                allow_remote_extends: true,
+            },
+            &mut fetcher,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            error.contains("http://child.example/child.json"),
+            "error must preserve the requested host and path"
+        );
+        assert!(
+            error.contains("https://[2001:db8::1]:8443/base.json"),
+            "error must preserve the remote parent host, port, and path"
+        );
+        for secret in [
+            "parent-user",
+            "parent-password",
+            "parent-token",
+            "parent-fragment",
+            "child-user",
+            "child-password",
+            "child-token",
+            "child-fragment",
+        ] {
+            assert!(
+                !error.contains(secret),
+                "remote error must not expose a secret value"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_fetch_network_error_redacts_requested_url_and_source() {
+        let url = "https://request-user:request-password@127.0.0.1:0/config.json?token=request-token#request-fragment";
+        let source = "https://source-user:source-password@source.example/parent.json?token=source-token#source-fragment";
+
+        let error = fetch_url_config(url, source)
+            .expect_err("the reserved local port must reject the request")
+            .to_string();
+
+        assert!(
+            error.contains("https://127.0.0.1:0/config.json"),
+            "network error must preserve the requested host, port, and path"
+        );
+        assert!(
+            error.contains("https://source.example/parent.json"),
+            "network error must preserve the source host and path"
+        );
+        for secret in [
+            "request-user",
+            "request-password",
+            "request-token",
+            "request-fragment",
+            "source-user",
+            "source-password",
+            "source-token",
+            "source-fragment",
+        ] {
+            assert!(
+                !error.contains(secret),
+                "network error must not expose a secret value"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_fetch_error_detail_does_not_trust_normalized_urls() {
+        let url = "https://request-user:request-password@config.example/config.json?token=request-token#request-fragment";
+        let normalized_error = ureq::Error::BadUri(
+            "https://request-user:request-password@config.example/config.json?token=request-token"
+                .to_string(),
+        );
+
+        assert!(
+            remote_fetch_error_display(&normalized_error, url) == "request failed",
+            "normalized network errors must not bypass URL redaction"
+        );
+    }
+
+    #[test]
+    fn remote_fetch_error_detail_does_not_trust_redirect_like_payloads() {
+        let original = "https://config.example/config.json";
+        let error = ureq::Error::BadUri(
+            "http://redirect-user:redirect-password@example.com/next.json?token=secret#anchor"
+                .to_string(),
+        );
+
+        let display = remote_fetch_error_display(&error, original);
+        assert_eq!(display, "request failed");
+        for secret in [
+            "redirect-user",
+            "redirect-password",
+            "token=secret",
+            "anchor",
+        ] {
+            assert!(
+                !display.contains(secret),
+                "untrusted error detail must be hidden"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_extends_dispatch_when_explicitly_allowed() {
+        let dir = test_dir("remote-explicitly-allowed");
+        let url = "https://config.example/base.json";
+        std::fs::write(
+            dir.path().join(".fallowrc.json"),
+            format!(r#"{{"extends": "{url}"}}"#),
+        )
+        .unwrap();
+        let mut fetcher = MockRemoteFetcher::default()
+            .with_response(url, serde_json::json!({"rules": {"unused-files": "warn"}}));
+
+        let config = load_with_fetcher(
+            &dir.path().join(".fallowrc.json"),
+            ConfigLoadOptions {
+                allow_remote_extends: true,
+            },
+            &mut fetcher,
+        )
+        .unwrap();
+
+        assert_eq!(config.rules.unused_files, Severity::Warn);
+        assert_eq!(fetcher.requests, vec![url]);
+    }
+
+    #[test]
+    fn uppercase_https_remote_extends_dispatch_when_allowed() {
+        let dir = test_dir("remote-uppercase-scheme");
+        let url = "HTTPS://config.example/base.json";
+        std::fs::write(
+            dir.path().join(".fallowrc.json"),
+            format!(r#"{{"extends": "{url}"}}"#),
+        )
+        .unwrap();
+        let mut fetcher = MockRemoteFetcher::default()
+            .with_response(url, serde_json::json!({"rules": {"unused-files": "warn"}}));
+
+        let config = load_with_fetcher(
+            &dir.path().join(".fallowrc.json"),
+            ConfigLoadOptions {
+                allow_remote_extends: true,
+            },
+            &mut fetcher,
+        )
+        .unwrap();
+
+        assert_eq!(config.rules.unused_files, Severity::Warn);
+        assert_eq!(fetcher.requests, vec![url]);
+    }
+
+    #[test]
+    fn remote_extends_diamond_reuses_mocked_base() {
+        let dir = test_dir("remote-diamond");
+        let left = "https://config.example/left.json";
+        let right = "https://config.example/right.json";
+        let base = "https://config.example/base.json";
+        std::fs::write(
+            dir.path().join(".fallowrc.json"),
+            format!(r#"{{"extends": ["{left}", "{right}"]}}"#),
+        )
+        .unwrap();
+        let mut fetcher = MockRemoteFetcher::default()
+            .with_response(
+                left,
+                serde_json::json!({
+                    "extends": base,
+                    "rules": {"unused-files": "warn"}
+                }),
+            )
+            .with_response(
+                right,
+                serde_json::json!({
+                    "extends": base,
+                    "rules": {"unused-exports": "off"}
+                }),
+            )
+            .with_response(
+                base,
+                serde_json::json!({"ignorePatterns": ["generated/**"]}),
+            );
+
+        let config = load_with_fetcher(
+            &dir.path().join(".fallowrc.json"),
+            ConfigLoadOptions {
+                allow_remote_extends: true,
+            },
+            &mut fetcher,
+        )
+        .unwrap();
+
+        assert_eq!(config.ignore_patterns, vec!["generated/**"]);
+        assert_eq!(config.rules.unused_files, Severity::Warn);
+        assert_eq!(config.rules.unused_exports, Severity::Off);
+        assert_eq!(
+            fetcher
+                .requests
+                .iter()
+                .filter(|request| *request == base)
+                .count(),
+            1,
+            "the shared remote base should be fetched once"
+        );
+    }
+
+    #[test]
+    fn remote_extends_active_cycle_still_fails() {
+        let dir = test_dir("remote-cycle");
+        let first = "https://config.example/first.json";
+        let second = "https://config.example/second.json";
+        std::fs::write(
+            dir.path().join(".fallowrc.json"),
+            format!(r#"{{"extends": "{first}"}}"#),
+        )
+        .unwrap();
+        let mut fetcher = MockRemoteFetcher::default()
+            .with_response(first, serde_json::json!({"extends": second}))
+            .with_response(second, serde_json::json!({"extends": first}));
+
+        let error = load_with_fetcher(
+            &dir.path().join(".fallowrc.json"),
+            ConfigLoadOptions {
+                allow_remote_extends: true,
+            },
+            &mut fetcher,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            error.contains("Circular extends"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn query_distinct_remote_extends_remain_distinct() {
+        let dir = test_dir("remote-query-distinct");
+        let first = "https://config.example/base.json?profile=one";
+        let second = "https://config.example/base.json?profile=two";
+        std::fs::write(
+            dir.path().join(".fallowrc.json"),
+            format!(r#"{{"extends": ["{first}", "{second}"]}}"#),
+        )
+        .unwrap();
+        let mut fetcher = MockRemoteFetcher::default()
+            .with_response(
+                first,
+                serde_json::json!({"rules": {"unused-files": "warn"}}),
+            )
+            .with_response(
+                second,
+                serde_json::json!({"rules": {"unused-exports": "off"}}),
+            );
+
+        let config = load_with_fetcher(
+            &dir.path().join(".fallowrc.json"),
+            ConfigLoadOptions {
+                allow_remote_extends: true,
+            },
+            &mut fetcher,
+        )
+        .unwrap();
+
+        assert_eq!(config.rules.unused_files, Severity::Warn);
+        assert_eq!(config.rules.unused_exports, Severity::Off);
+        assert_eq!(fetcher.requests, vec![first, second]);
     }
 
     #[test]
@@ -1234,8 +2495,6 @@ unknown_field = true
         );
     }
 
-    // ── sealed: true tests ──────────────────────────────────────────
-
     #[test]
     fn sealed_allows_in_directory_extends() {
         let dir = test_dir("sealed-allows-local");
@@ -1256,12 +2515,29 @@ unknown_field = true
     }
 
     #[test]
+    fn load_rejects_invalid_boundary_coverage_allow_unmatched_glob() {
+        let dir = test_dir("boundary-coverage-invalid-glob");
+        std::fs::write(
+            dir.path().join(".fallowrc.json"),
+            r#"{"boundaries":{"coverage":{"allowUnmatched":["[invalid"]}}}"#,
+        )
+        .unwrap();
+
+        let result = FallowConfig::load(&dir.path().join(".fallowrc.json"));
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("boundaries.coverage.allowUnmatched"),
+            "expected coverage field in error, got: {err_msg}"
+        );
+    }
+
+    #[test]
     fn sealed_rejects_extends_escaping_directory() {
         let dir = test_dir("sealed-rejects-escape");
         let sub = dir.path().join("packages").join("app");
         std::fs::create_dir_all(&sub).unwrap();
 
-        // Base config above the sealed config's directory
         std::fs::write(
             dir.path().join("base.json"),
             r#"{"ignorePatterns": ["dist/**"]}"#,
@@ -1343,7 +2619,6 @@ unknown_field = true
 
     #[test]
     fn sealed_false_allows_escaping_extends() {
-        // Without sealed (or sealed: false), escaping extends works fine
         let dir = test_dir("sealed-false-allows");
         let sub = dir.path().join("packages").join("app");
         std::fs::create_dir_all(&sub).unwrap();
@@ -1373,7 +2648,6 @@ unknown_field = true
             r#"{"ignorePatterns": ["gen/**"]}"#,
         )
         .unwrap();
-        // String form instead of array
         std::fs::write(
             dir.path().join(".fallowrc.json"),
             r#"{"extends": "base.json"}"#,
@@ -1396,20 +2670,15 @@ unknown_field = true
         .unwrap();
 
         let config = FallowConfig::load(&dir.path().join(".fallowrc.json")).unwrap();
-        // Arrays are replaced, not merged (overlay replaces base)
         assert_eq!(config.entry, vec!["src/b.ts"]);
     }
 
-    // ── npm extends tests ────────────────────────────────────────────
-
-    /// Set up a fake npm package in `node_modules/<name>` under `root`.
     fn create_npm_package(root: &Path, name: &str, config_json: &str) {
         let pkg_dir = root.join("node_modules").join(name);
         std::fs::create_dir_all(&pkg_dir).unwrap();
         std::fs::write(pkg_dir.join(".fallowrc.json"), config_json).unwrap();
     }
 
-    /// Set up a fake npm package with `package.json` `main` field.
     fn create_npm_package_with_main(root: &Path, name: &str, main: &str, config_json: &str) {
         let pkg_dir = root.join("node_modules").join(name);
         std::fs::create_dir_all(&pkg_dir).unwrap();
@@ -1575,20 +2844,17 @@ unknown_field = true
         .unwrap();
 
         let config = FallowConfig::load(&dir.path().join(".fallowrc.json")).unwrap();
-        // exports takes priority over main
         assert_eq!(config.rules.unused_files, Severity::Warn);
     }
 
     #[test]
     fn extends_npm_walk_up_directories() {
         let dir = test_dir("npm-walkup");
-        // node_modules at root level
         create_npm_package(
             dir.path(),
             "shared-config",
             r#"{"rules": {"unused-files": "warn"}}"#,
         );
-        // Config in a nested subdirectory
         let sub = dir.path().join("packages/app");
         std::fs::create_dir_all(&sub).unwrap();
         std::fs::write(
@@ -1624,7 +2890,6 @@ unknown_field = true
     #[test]
     fn extends_npm_chained_with_relative() {
         let dir = test_dir("npm-chained");
-        // npm package extends a relative file inside itself
         let pkg_dir = dir.path().join("node_modules/my-config");
         std::fs::create_dir_all(&pkg_dir).unwrap();
         std::fs::write(
@@ -1669,7 +2934,6 @@ unknown_field = true
         .unwrap();
 
         let config = FallowConfig::load(&dir.path().join(".fallowrc.json")).unwrap();
-        // local-overrides is later in the array, so it wins
         assert_eq!(config.rules.unused_files, Severity::Warn);
     }
 
@@ -1704,7 +2968,6 @@ unknown_field = true
         let dir = test_dir("npm-no-config");
         let pkg_dir = dir.path().join("node_modules/empty-pkg");
         std::fs::create_dir_all(&pkg_dir).unwrap();
-        // Package exists but has no config files and no package.json
         std::fs::write(pkg_dir.join("README.md"), "# empty").unwrap();
 
         std::fs::write(
@@ -1765,7 +3028,6 @@ unknown_field = true
             "fallow-config-acme",
             r#"{"rules": {"unused-files": "warn"}}"#,
         );
-        // Space after npm: — should be trimmed and resolve correctly
         std::fs::write(
             dir.path().join(".fallowrc.json"),
             r#"{"extends": "npm: fallow-config-acme"}"#,
@@ -1801,8 +3063,6 @@ unknown_field = true
         let config = FallowConfig::load(&dir.path().join(".fallowrc.json")).unwrap();
         assert_eq!(config.rules.unused_files, Severity::Off);
     }
-
-    // ── parse_npm_specifier unit tests ──────────────────────────────
 
     #[test]
     fn parse_npm_specifier_unscoped() {
@@ -1841,14 +3101,11 @@ unknown_field = true
         );
     }
 
-    // ── npm extends security tests ──────────────────────────────────
-
     #[test]
     fn extends_npm_subpath_traversal_rejected() {
         let dir = test_dir("npm-traversal-sub");
         let pkg_dir = dir.path().join("node_modules/evil-pkg");
         std::fs::create_dir_all(&pkg_dir).unwrap();
-        // Create a file outside the package that the traversal would reach
         std::fs::write(
             dir.path().join("secret.json"),
             r#"{"entry": ["stolen.ts"]}"#,
@@ -1938,7 +3195,6 @@ unknown_field = true
             r#"{"name": "evil-exports", "exports": "../../secret.json"}"#,
         )
         .unwrap();
-        // Create the target file outside the package
         std::fs::write(
             dir.path().join("secret.json"),
             r#"{"entry": ["stolen.ts"]}"#,
@@ -1959,8 +3215,6 @@ unknown_field = true
             "Expected traversal error, got: {err_msg}"
         );
     }
-
-    // ── deep_merge_json unit tests ───────────────────────────────────
 
     #[test]
     fn deep_merge_scalar_overlay_replaces_base() {
@@ -2024,8 +3278,6 @@ unknown_field = true
         assert_eq!(base, serde_json::json!({"a": 1, "b": 2}));
     }
 
-    // ── rule severity parsing via JSON config ────────────────────────
-
     #[test]
     fn rules_severity_error_warn_off_from_json() {
         let json_str = r#"{
@@ -2050,7 +3302,6 @@ unknown_field = true
         }"#;
         let config: FallowConfig = serde_json::from_str(json_str).unwrap();
         assert_eq!(config.rules.unused_files, Severity::Warn);
-        // All other rules default to error
         assert_eq!(config.rules.unused_exports, Severity::Error);
         assert_eq!(config.rules.unused_types, Severity::Error);
         assert_eq!(config.rules.unused_dependencies, Severity::Error);
@@ -2058,16 +3309,12 @@ unknown_field = true
         assert_eq!(config.rules.unlisted_dependencies, Severity::Error);
         assert_eq!(config.rules.duplicate_exports, Severity::Error);
         assert_eq!(config.rules.circular_dependencies, Severity::Error);
-        // type_only_dependencies defaults to warn, not error
         assert_eq!(config.rules.type_only_dependencies, Severity::Warn);
     }
-
-    // ── find_and_load tests ───────────────────────────────────────
 
     #[test]
     fn find_and_load_returns_none_when_no_config() {
         let dir = test_dir("find-none");
-        // Create a .git dir so it stops searching
         std::fs::create_dir(dir.path().join(".git")).unwrap();
 
         let result = FallowConfig::find_and_load(dir.path()).unwrap();
@@ -2086,6 +3333,43 @@ unknown_field = true
 
         let (config, path) = FallowConfig::find_and_load(dir.path()).unwrap().unwrap();
         assert_eq!(config.entry, vec!["src/main.ts"]);
+        assert!(path.ends_with(".fallowrc.json"));
+    }
+
+    #[test]
+    fn find_and_load_finds_fallowrc_jsonc() {
+        let dir = test_dir("find-jsonc");
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        std::fs::write(
+            dir.path().join(".fallowrc.jsonc"),
+            r#"{
+                "entry": ["src/main.ts"]
+            }"#,
+        )
+        .unwrap();
+
+        let (config, path) = FallowConfig::find_and_load(dir.path()).unwrap().unwrap();
+        assert_eq!(config.entry, vec!["src/main.ts"]);
+        assert!(path.ends_with(".fallowrc.jsonc"));
+    }
+
+    #[test]
+    fn find_and_load_prefers_fallowrc_json_over_jsonc() {
+        let dir = test_dir("find-json-vs-jsonc");
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        std::fs::write(
+            dir.path().join(".fallowrc.json"),
+            r#"{"entry": ["from-json.ts"]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join(".fallowrc.jsonc"),
+            r#"{"entry": ["from-jsonc.ts"]}"#,
+        )
+        .unwrap();
+
+        let (config, path) = FallowConfig::find_and_load(dir.path()).unwrap().unwrap();
+        assert_eq!(config.entry, vec!["from-json.ts"]);
         assert!(path.ends_with(".fallowrc.json"));
     }
 
@@ -2110,6 +3394,135 @@ unknown_field = true
     }
 
     #[test]
+    fn shadowed_config_names_empty_when_single_config() {
+        let dir = test_dir("shadow-single");
+        std::fs::write(dir.path().join(".fallowrc.json"), "").unwrap();
+        assert!(shadowed_config_names(dir.path(), 0).is_empty());
+    }
+
+    #[test]
+    fn shadowed_config_names_reports_lower_precedence_toml() {
+        let dir = test_dir("shadow-json-toml");
+        std::fs::write(dir.path().join(".fallowrc.json"), "").unwrap();
+        std::fs::write(dir.path().join("fallow.toml"), "").unwrap();
+        assert_eq!(shadowed_config_names(dir.path(), 0), vec!["fallow.toml"]);
+    }
+
+    #[test]
+    fn shadowed_config_names_reports_jsonc_sibling() {
+        let dir = test_dir("shadow-json-jsonc");
+        std::fs::write(dir.path().join(".fallowrc.json"), "").unwrap();
+        std::fs::write(dir.path().join(".fallowrc.jsonc"), "").unwrap();
+        assert_eq!(
+            shadowed_config_names(dir.path(), 0),
+            vec![".fallowrc.jsonc"]
+        );
+    }
+
+    #[test]
+    fn shadowed_config_names_reports_all_lower_when_four_coexist() {
+        let dir = test_dir("shadow-all-four");
+        for name in CONFIG_NAMES {
+            std::fs::write(dir.path().join(name), "").unwrap();
+        }
+        assert_eq!(
+            shadowed_config_names(dir.path(), 0),
+            vec![".fallowrc.jsonc", "fallow.toml", ".fallow.toml"],
+        );
+    }
+
+    #[test]
+    fn shadowed_config_names_scoped_to_indices_after_winner() {
+        let dir = test_dir("shadow-toml-dottoml");
+        std::fs::write(dir.path().join("fallow.toml"), "").unwrap();
+        std::fs::write(dir.path().join(".fallow.toml"), "").unwrap();
+        assert_eq!(shadowed_config_names(dir.path(), 2), vec![".fallow.toml"]);
+    }
+
+    #[test]
+    fn find_and_load_warns_when_configs_coexist() {
+        let dir = test_dir("coexist-warn");
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        std::fs::write(
+            dir.path().join(".fallowrc.json"),
+            r#"{"entry": ["from-json.ts"]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("fallow.toml"),
+            "entry = [\"from-toml.ts\"]\n",
+        )
+        .unwrap();
+
+        let (result, captured) =
+            capture_coexisting_config_warnings(|| FallowConfig::find_and_load(dir.path()));
+
+        let (config, path) = result.unwrap().unwrap();
+        assert_eq!(config.entry, vec!["from-json.ts"]);
+        assert!(path.ends_with(".fallowrc.json"));
+
+        assert_eq!(captured.len(), 1);
+        let (chosen, shadowed) = &captured[0];
+        assert_eq!(chosen, ".fallowrc.json");
+        assert_eq!(shadowed, &vec!["fallow.toml".to_owned()]);
+    }
+
+    #[test]
+    fn find_and_load_does_not_warn_for_single_config() {
+        let dir = test_dir("coexist-none");
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        std::fs::write(
+            dir.path().join(".fallowrc.json"),
+            r#"{"entry": ["only.ts"]}"#,
+        )
+        .unwrap();
+
+        let (result, captured) =
+            capture_coexisting_config_warnings(|| FallowConfig::find_and_load(dir.path()));
+        assert!(result.unwrap().is_some());
+        assert!(captured.is_empty());
+    }
+
+    #[test]
+    fn find_and_load_warns_per_directory_independently() {
+        let make = |name: &str| {
+            let dir = test_dir(name);
+            std::fs::create_dir(dir.path().join(".git")).unwrap();
+            std::fs::write(dir.path().join(".fallowrc.json"), r#"{"entry": ["a.ts"]}"#).unwrap();
+            std::fs::write(dir.path().join("fallow.toml"), "entry = [\"a.ts\"]\n").unwrap();
+            dir
+        };
+        let first = make("coexist-dir-a");
+        let second = make("coexist-dir-b");
+
+        let ((), captured) = capture_coexisting_config_warnings(|| {
+            FallowConfig::find_and_load(first.path()).unwrap();
+            FallowConfig::find_and_load(second.path()).unwrap();
+        });
+
+        assert_eq!(captured.len(), 2);
+        assert!(captured.iter().all(|(chosen, shadowed)| {
+            chosen == ".fallowrc.json" && shadowed == &vec!["fallow.toml".to_owned()]
+        }));
+    }
+
+    #[test]
+    fn explicit_load_does_not_warn_about_coexisting_configs() {
+        let dir = test_dir("coexist-explicit");
+        std::fs::write(
+            dir.path().join(".fallowrc.json"),
+            r#"{"entry": ["chosen.ts"]}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("fallow.toml"), "entry = [\"other.ts\"]\n").unwrap();
+
+        let chosen = dir.path().join("fallow.toml");
+        let (result, captured) = capture_coexisting_config_warnings(|| FallowConfig::load(&chosen));
+        assert!(result.is_ok());
+        assert!(captured.is_empty());
+    }
+
+    #[test]
     fn find_and_load_finds_fallow_toml() {
         let dir = test_dir("find-toml");
         std::fs::create_dir(dir.path().join(".git")).unwrap();
@@ -2128,20 +3541,13 @@ unknown_field = true
         let dir = test_dir("find-git-stop");
         let sub = dir.path().join("sub");
         std::fs::create_dir(&sub).unwrap();
-        // .git marker in root stops search
         std::fs::create_dir(dir.path().join(".git")).unwrap();
-        // Config file above .git should not be found from sub
-        // (sub has no .git or package.json, so it keeps searching up to parent)
-        // But parent has .git, so it stops there without finding config
         let result = FallowConfig::find_and_load(&sub).unwrap();
         assert!(result.is_none());
     }
 
     #[test]
     fn find_and_load_walks_past_package_json_in_monorepo() {
-        // Simulate a pnpm/npm/yarn workspace: root has `.git` + `.fallowrc.json`,
-        // sub-package has its own `package.json`. Config search from the
-        // sub-package must walk past its `package.json` and find the root config.
         let dir = test_dir("find-monorepo");
         std::fs::create_dir(dir.path().join(".git")).unwrap();
         std::fs::write(
@@ -2161,8 +3567,6 @@ unknown_field = true
 
     #[test]
     fn find_and_load_sub_package_config_wins_over_root() {
-        // Regression guard: if a monorepo sub-package has its own config,
-        // it must be preferred over the root config (first-match-wins).
         let dir = test_dir("find-monorepo-override");
         std::fs::create_dir(dir.path().join(".git")).unwrap();
         std::fs::write(
@@ -2183,10 +3587,6 @@ unknown_field = true
 
     #[test]
     fn find_and_load_stops_at_git_file_submodule() {
-        // Git submodules / worktrees have `.git` as a file (not a directory)
-        // pointing to the real gitdir. `.exists()` matches both, so submodule
-        // roots correctly stop the walk — config in the parent repo should
-        // NOT leak into a vendored submodule.
         let dir = test_dir("find-git-file");
         std::fs::create_dir(dir.path().join(".git")).unwrap();
         std::fs::write(
@@ -2197,7 +3597,6 @@ unknown_field = true
 
         let submodule = dir.path().join("vendor").join("lib");
         std::fs::create_dir_all(&submodule).unwrap();
-        // Simulate submodule: `.git` as a file pointing to parent's .git/modules
         std::fs::write(submodule.join(".git"), "gitdir: ../../.git/modules/lib\n").unwrap();
 
         let result = FallowConfig::find_and_load(&submodule).unwrap();
@@ -2232,8 +3631,6 @@ unknown_field = true
         assert!(result.is_err());
     }
 
-    // ── load TOML config file ────────────────────────────────────
-
     #[test]
     fn load_toml_config_file() {
         let dir = test_dir("toml-config");
@@ -2260,13 +3657,35 @@ minTokens = 100
         assert_eq!(config.duplicates.min_tokens, 100);
     }
 
-    // ── extends absolute path rejection ──────────────────────────
+    #[test]
+    fn load_toml_config_file_with_health_threshold_override() {
+        let dir = test_dir("toml-health-threshold-override");
+        let config_path = dir.path().join("fallow.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[health]
+thresholdOverrides = [
+  { files = ["src/legacy.ts"], functions = ["legacyFlow"], maxCyclomatic = 30, maxCognitive = 25, maxCrap = 80.5, reason = "legacy migration" }
+]
+"#,
+        )
+        .unwrap();
+
+        let config = FallowConfig::load(&config_path).unwrap();
+        let override_config = &config.health.threshold_overrides[0];
+        assert_eq!(override_config.files, vec!["src/legacy.ts"]);
+        assert_eq!(override_config.functions, vec!["legacyFlow"]);
+        assert_eq!(override_config.max_cyclomatic, Some(30));
+        assert_eq!(override_config.max_cognitive, Some(25));
+        assert_eq!(override_config.max_crap, Some(80.5));
+        assert_eq!(override_config.reason.as_deref(), Some("legacy migration"));
+    }
 
     #[test]
     fn extends_absolute_path_rejected() {
         let dir = test_dir("extends-absolute");
 
-        // Use a platform-appropriate absolute path
         #[cfg(unix)]
         let abs_path = "/absolute/path/config.json";
         #[cfg(windows)]
@@ -2284,12 +3703,49 @@ minTokens = 100
         );
     }
 
-    // ── resolve production mode ─────────────────────────────────
+    #[test]
+    fn extends_windows_drive_absolute_path_rejected_on_any_host() {
+        let dir = test_dir("extends-windows-absolute");
+
+        std::fs::write(
+            dir.path().join(".fallowrc.json"),
+            r#"{"extends": ["C:\\absolute\\path\\config.json"]}"#,
+        )
+        .unwrap();
+
+        let result = FallowConfig::load(&dir.path().join(".fallowrc.json"));
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("must be relative"),
+            "Expected 'must be relative' error, got: {err_msg}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn extends_posix_rooted_absolute_path_rejected_on_windows() {
+        let dir = test_dir("extends-posix-rooted-absolute");
+
+        std::fs::write(
+            dir.path().join(".fallowrc.json"),
+            r#"{"extends": ["/absolute/path/config.json"]}"#,
+        )
+        .unwrap();
+
+        let result = FallowConfig::load(&dir.path().join(".fallowrc.json"));
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("must be relative"),
+            "Expected 'must be relative' error, got: {err_msg}"
+        );
+    }
 
     #[test]
     fn resolve_production_mode_disables_dev_deps() {
         let config = FallowConfig {
-            production: true,
+            production: true.into(),
             ..Default::default()
         };
         let resolved = config.resolve(
@@ -2298,16 +3754,53 @@ minTokens = 100
             4,
             false,
             true,
+            None,
         );
         assert!(resolved.production);
         assert_eq!(resolved.rules.unused_dev_dependencies, Severity::Off);
         assert_eq!(resolved.rules.unused_optional_dependencies, Severity::Off);
-        // Other rules should remain at default (Error)
         assert_eq!(resolved.rules.unused_files, Severity::Error);
         assert_eq!(resolved.rules.unused_exports, Severity::Error);
     }
 
-    // ── config format fallback to TOML for unknown extensions ───
+    #[test]
+    fn include_entry_exports_deserializes_from_camelcase_json() {
+        let json = r#"{ "includeEntryExports": true }"#;
+        let config: FallowConfig = serde_json::from_str(json).unwrap();
+        assert!(config.include_entry_exports);
+    }
+
+    #[test]
+    fn include_entry_exports_deserializes_from_camelcase_toml() {
+        let toml_str = "includeEntryExports = true\n";
+        let config: FallowConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.include_entry_exports);
+    }
+
+    #[test]
+    fn include_entry_exports_default_is_false() {
+        let config: FallowConfig = serde_json::from_str("{}").unwrap();
+        assert!(!config.include_entry_exports);
+    }
+
+    #[test]
+    fn include_entry_exports_propagates_through_resolve() {
+        let config = FallowConfig {
+            include_entry_exports: true,
+            auto_imports: false,
+            cache: CacheConfig::default(),
+            ..Default::default()
+        };
+        let resolved = config.resolve(
+            PathBuf::from("/tmp/test"),
+            OutputFormat::Human,
+            1,
+            true,
+            true,
+            None,
+        );
+        assert!(resolved.include_entry_exports);
+    }
 
     #[test]
     fn config_format_defaults_to_toml_for_unknown() {
@@ -2320,8 +3813,6 @@ minTokens = 100
             ConfigFormat::Toml
         ));
     }
-
-    // ── deep_merge type coercion ─────────────────────────────────
 
     #[test]
     fn deep_merge_object_over_scalar_replaces() {
@@ -2339,10 +3830,8 @@ minTokens = 100
         assert_eq!(base, serde_json::json!(42));
     }
 
-    // ── extends with non-string/array extends field ──────────────
-
     #[test]
-    fn extends_non_string_non_array_ignored() {
+    fn extends_non_string_non_array_fails_loud() {
         let dir = test_dir("extends-numeric");
         std::fs::write(
             dir.path().join(".fallowrc.json"),
@@ -2350,12 +3839,13 @@ minTokens = 100
         )
         .unwrap();
 
-        // extends=42 is neither string nor array, so it's treated as no extends
-        let config = FallowConfig::load(&dir.path().join(".fallowrc.json")).unwrap();
-        assert_eq!(config.entry, vec!["src/index.ts"]);
+        let err = FallowConfig::load(&dir.path().join(".fallowrc.json")).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("extends must be a string or an array of strings"),
+            "unexpected error: {err}"
+        );
     }
-
-    // ── extends with multiple bases (later overrides earlier) ────
 
     #[test]
     fn extends_multiple_bases_later_wins() {
@@ -2378,11 +3868,50 @@ minTokens = 100
         .unwrap();
 
         let config = FallowConfig::load(&dir.path().join(".fallowrc.json")).unwrap();
-        // base-b is later in the array, so its value should win
         assert_eq!(config.rules.unused_files, Severity::Off);
     }
 
-    // ── config with production flag ──────────────────────────────
+    #[test]
+    fn load_rejects_empty_security_request_receivers() {
+        let dir = test_dir("empty-security-request-receivers");
+        std::fs::write(
+            dir.path().join(".fallowrc.json"),
+            r#"{"security": {"requestReceivers": ["req", "  "]}}"#,
+        )
+        .unwrap();
+
+        let result = FallowConfig::load(&dir.path().join(".fallowrc.json"));
+        let err = result.expect_err("empty receiver should be rejected");
+        assert!(
+            err.to_string().contains("security.requestReceivers"),
+            "error should name security.requestReceivers: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_normalizes_security_request_receivers() {
+        let dir = test_dir("normalize-security-request-receivers");
+        std::fs::write(
+            dir.path().join(".fallowrc.json"),
+            r#"{"security": {"requestReceivers": [" HttpReq ", "httpreq", "R"]}}"#,
+        )
+        .unwrap();
+
+        let config = FallowConfig::load(&dir.path().join(".fallowrc.json"))
+            .unwrap()
+            .resolve(
+                dir.path().to_path_buf(),
+                OutputFormat::Human,
+                1,
+                true,
+                true,
+                None,
+            );
+        assert_eq!(
+            config.security.request_receivers,
+            vec!["httpreq".to_string(), "r".to_string()]
+        );
+    }
 
     #[test]
     fn fallow_config_deserialize_production() {
@@ -2396,8 +3925,6 @@ minTokens = 100
         let config: FallowConfig = serde_json::from_str("{}").unwrap();
         assert!(!config.production);
     }
-
-    // ── optional dependency names ────────────────────────────────
 
     #[test]
     fn package_json_optional_dependency_names() {
@@ -2416,8 +3943,6 @@ minTokens = 100
         let pkg: PackageJson = serde_json::from_str(r#"{"name": "test"}"#).unwrap();
         assert!(pkg.optional_dependency_names().is_empty());
     }
-
-    // ── find_config_path ────────────────────────────────────────────
 
     #[test]
     fn find_config_path_returns_fallowrc_json() {
@@ -2506,8 +4031,6 @@ minTokens = 100
         assert_eq!(path, dir.path().join(".fallowrc.json"));
     }
 
-    // ── TOML extends support ────────────────────────────────────────
-
     #[test]
     fn extends_toml_base() {
         let dir = test_dir("extends-toml");
@@ -2527,8 +4050,6 @@ minTokens = 100
         assert_eq!(config.rules.unused_files, Severity::Warn);
         assert_eq!(config.entry, vec!["src/index.ts"]);
     }
-
-    // ── deep_merge_json edge cases ──────────────────────────────────
 
     #[test]
     fn deep_merge_boolean_overlay() {
@@ -2552,19 +4073,14 @@ minTokens = 100
         assert_eq!(base, serde_json::json!({"a": 1, "b": 2}));
     }
 
-    // ── MAX_EXTENDS_DEPTH constant ──────────────────────────────────
-
     #[test]
     fn max_extends_depth_is_reasonable() {
         assert_eq!(MAX_EXTENDS_DEPTH, 10);
     }
 
-    // ── Config names constant ───────────────────────────────────────
-
     #[test]
-    fn config_names_has_three_entries() {
-        assert_eq!(CONFIG_NAMES.len(), 3);
-        // All names should start with "." or "fallow"
+    fn config_names_has_four_entries() {
+        assert_eq!(CONFIG_NAMES.len(), 4);
         for name in CONFIG_NAMES {
             assert!(
                 name.starts_with('.') || name.starts_with("fallow"),
@@ -2572,8 +4088,6 @@ minTokens = 100
             );
         }
     }
-
-    // ── package.json peer dependency names ───────────────────────────
 
     #[test]
     fn package_json_peer_dependency_names() {
@@ -2589,8 +4103,6 @@ minTokens = 100
         assert!(all.contains(&"react-dom".to_string()));
         assert!(all.contains(&"react-native".to_string()));
     }
-
-    // ── package.json scripts field ──────────────────────────────────
 
     #[test]
     fn package_json_scripts_field() {
@@ -2609,8 +4121,6 @@ minTokens = 100
         assert_eq!(scripts.get("build"), Some(&"tsc".to_string()));
         assert_eq!(scripts.get("lint"), Some(&"fallow check".to_string()));
     }
-
-    // ── Extends with TOML-to-TOML chain ─────────────────────────────
 
     #[test]
     fn extends_toml_chain() {
@@ -2637,8 +4147,6 @@ minTokens = 100
         assert_eq!(config.rules.unused_files, Severity::Off);
     }
 
-    // ── find_and_load walks up to parent ────────────────────────────
-
     #[test]
     fn find_and_load_walks_up_directories() {
         let dir = test_dir("find-walk-up");
@@ -2649,15 +4157,12 @@ minTokens = 100
             r#"{"entry": ["src/main.ts"]}"#,
         )
         .unwrap();
-        // Create .git in root to stop search there
         std::fs::create_dir(dir.path().join(".git")).unwrap();
 
         let (config, path) = FallowConfig::find_and_load(&sub).unwrap().unwrap();
         assert_eq!(config.entry, vec!["src/main.ts"]);
         assert!(path.ends_with(".fallowrc.json"));
     }
-
-    // ── JSON schema generation ──────────────────────────────────────
 
     #[test]
     fn json_schema_contains_entry_field() {
@@ -2670,8 +4175,6 @@ minTokens = 100
             "schema should contain entry property"
         );
     }
-
-    // ── Duplicates config via JSON in FallowConfig ──────────────────
 
     #[test]
     fn fallow_config_json_duplicates_all_fields() {
@@ -2712,8 +4215,6 @@ minTokens = 100
         );
     }
 
-    // ── URL extends tests ───────────────────────────────────────────
-
     #[test]
     fn normalize_url_basic() {
         assert_eq!(
@@ -2723,10 +4224,65 @@ minTokens = 100
     }
 
     #[test]
-    fn normalize_url_trailing_slash() {
+    fn remote_config_display_redacts_url_secrets_and_preserves_local_paths() {
+        let cases = [
+            (
+                "https://user:password@example.com/config.json",
+                "https://example.com/config.json",
+            ),
+            (
+                "https://example.com/config.json?token=query-secret#fragment-secret",
+                "https://example.com/config.json",
+            ),
+            (
+                "https://user:password@[2001:db8::1]:8443/config.json?token=query-secret#fragment-secret",
+                "https://[2001:db8::1]:8443/config.json",
+            ),
+            (
+                "/workspace/configs/base.json?literal-query#literal-fragment",
+                "/workspace/configs/base.json?literal-query#literal-fragment",
+            ),
+        ];
+
+        for (case_index, (input, expected)) in cases.into_iter().enumerate() {
+            assert!(
+                remote_config_display(input) == expected,
+                "remote config display case {case_index} must be sanitized"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_fetch_error_redacts_require_https_only_redirect_target() {
+        let redirect_target =
+            "http://redirect-user:redirect-password@example.com/config.json?token=secret#anchor";
+        let dependency_error = ureq::Error::RequireHttpsOnly(redirect_target.to_string());
+
+        let display =
+            remote_fetch_error_display(&dependency_error, "https://config.example.com/config.json");
+
+        assert_eq!(
+            display,
+            "configured for https only: http://example.com/config.json"
+        );
+        for secret in [
+            "redirect-user",
+            "redirect-password",
+            "token=secret",
+            "anchor",
+        ] {
+            assert!(
+                !display.contains(secret),
+                "redirect secret must be redacted"
+            );
+        }
+    }
+
+    #[test]
+    fn normalize_url_preserves_non_root_trailing_slash() {
         assert_eq!(
             normalize_url_for_dedup("https://example.com/config/"),
-            "https://example.com/config"
+            "https://example.com/config/"
         );
     }
 
@@ -2752,7 +4308,6 @@ minTokens = 100
 
     #[test]
     fn normalize_url_preserves_path_case() {
-        // Path component casing is significant (server-dependent), only scheme+host lowercase.
         assert_eq!(
             normalize_url_for_dedup("https://GitHub.COM/Org/Repo/Fallow.json"),
             "https://github.com/Org/Repo/Fallow.json"
@@ -2760,10 +4315,20 @@ minTokens = 100
     }
 
     #[test]
-    fn normalize_url_strips_query_string() {
+    fn normalize_url_preserves_userinfo_case_and_normalizes_host() {
+        assert_eq!(
+            normalize_url_for_dedup(
+                "HTTPS://CaseSensitiveUser:CaseSensitivePassword@Example.COM/Config.json"
+            ),
+            "https://CaseSensitiveUser:CaseSensitivePassword@example.com/Config.json"
+        );
+    }
+
+    #[test]
+    fn normalize_url_preserves_query_string() {
         assert_eq!(
             normalize_url_for_dedup("https://example.com/config.json?v=1"),
-            "https://example.com/config.json"
+            "https://example.com/config.json?v=1"
         );
     }
 
@@ -2776,10 +4341,22 @@ minTokens = 100
     }
 
     #[test]
-    fn normalize_url_strips_query_and_fragment() {
+    fn normalize_url_preserves_query_and_strips_fragment() {
         assert_eq!(
             normalize_url_for_dedup("https://example.com/config.json?v=1#section"),
-            "https://example.com/config.json"
+            "https://example.com/config.json?v=1"
+        );
+    }
+
+    #[test]
+    fn normalize_url_query_selects_resource_but_fragment_does_not() {
+        assert_ne!(
+            normalize_url_for_dedup("https://example.com/config.json?tenant=one"),
+            normalize_url_for_dedup("https://example.com/config.json?tenant=two")
+        );
+        assert_eq!(
+            normalize_url_for_dedup("https://example.com/config.json?tenant=one#first"),
+            normalize_url_for_dedup("https://example.com/config.json?tenant=one#second")
         );
     }
 
@@ -2789,10 +4366,45 @@ minTokens = 100
             normalize_url_for_dedup("https://example.com:443/config.json"),
             "https://example.com/config.json"
         );
-        // Non-default port is preserved.
         assert_eq!(
             normalize_url_for_dedup("https://example.com:8443/config.json"),
             "https://example.com:8443/config.json"
+        );
+    }
+
+    #[test]
+    fn normalize_url_only_strips_the_scheme_default_port() {
+        assert_eq!(
+            normalize_url_for_dedup("http://example.com:80/config.json"),
+            "http://example.com/config.json"
+        );
+        assert_eq!(
+            normalize_url_for_dedup("http://example.com:443/config.json"),
+            "http://example.com:443/config.json"
+        );
+        assert_eq!(
+            normalize_url_for_dedup("https://example.com:80/config.json"),
+            "https://example.com:80/config.json"
+        );
+    }
+
+    #[test]
+    fn normalize_url_canonicalizes_numeric_ports_and_root_query_path() {
+        assert_eq!(
+            normalize_url_for_dedup("https://example.com:0443/?profile=one"),
+            "https://example.com?profile=one"
+        );
+        assert_eq!(
+            normalize_url_for_dedup("https://example.com:080/config.json"),
+            "https://example.com:80/config.json"
+        );
+    }
+
+    #[test]
+    fn normalize_url_canonicalizes_equivalent_ipv6_hosts() {
+        assert_eq!(
+            normalize_url_for_dedup("https://[2001:0DB8:0:0:0:0:0:1]/config.json"),
+            "https://[2001:db8::1]/config.json"
         );
     }
 
@@ -2820,13 +4432,11 @@ minTokens = 100
 
     #[test]
     fn extends_url_circular_detection() {
-        // Verify that the same URL appearing twice in the visited set is detected.
         let mut visited = FxHashSet::default();
         let url = "https://example.com/config.json";
         let normalized = normalize_url_for_dedup(url);
         visited.insert(normalized.clone());
 
-        // Inserting the same normalized URL should return false.
         assert!(
             !visited.insert(normalized),
             "Same URL should be detected as duplicate"
@@ -2835,7 +4445,6 @@ minTokens = 100
 
     #[test]
     fn extends_url_circular_case_insensitive() {
-        // URLs differing only in scheme/host casing should be detected as circular.
         let mut visited = FxHashSet::default();
         visited.insert(normalize_url_for_dedup("https://Example.COM/config.json"));
 
@@ -2852,9 +4461,8 @@ minTokens = 100
             "extends": ["a.json", "b.json"],
             "entry": ["src/index.ts"]
         });
-        let extends = extract_extends(&mut value);
+        let extends = extract_extends(&mut value, "test.json").unwrap();
         assert_eq!(extends, vec!["a.json", "b.json"]);
-        // extends should be removed from the value.
         assert!(value.get("extends").is_none());
         assert!(value.get("entry").is_some());
     }
@@ -2865,30 +4473,25 @@ minTokens = 100
             "extends": "base.json",
             "entry": ["src/index.ts"]
         });
-        let extends = extract_extends(&mut value);
+        let extends = extract_extends(&mut value, "test.json").unwrap();
         assert_eq!(extends, vec!["base.json"]);
     }
 
     #[test]
     fn extract_extends_none() {
         let mut value = serde_json::json!({"entry": ["src/index.ts"]});
-        let extends = extract_extends(&mut value);
+        let extends = extract_extends(&mut value, "test.json").unwrap();
         assert!(extends.is_empty());
     }
 
     #[test]
     fn url_timeout_default() {
-        // Without the env var set, should return the default.
         let timeout = url_timeout();
-        // We can't assert exact value since the env var might be set in the test environment,
-        // but we can assert it's a reasonable duration.
         assert!(timeout.as_secs() <= 300, "Timeout should be reasonable");
     }
 
     #[test]
     fn extends_url_mixed_with_file_and_npm() {
-        // Test that a config with a mix of file, npm, and URL extends parses correctly
-        // for the non-URL parts, and produces a clear error for the URL part (no server).
         let dir = test_dir("url-mixed");
         std::fs::write(
             dir.path().join("local.json"),
@@ -2911,7 +4514,7 @@ minTokens = 100
     }
 
     #[test]
-    fn extends_https_url_unreachable_errors() {
+    fn extends_https_url_default_denial_has_opt_in_hint() {
         let dir = test_dir("url-unreachable");
         std::fs::write(
             dir.path().join(".fallowrc.json"),
@@ -2927,8 +4530,1256 @@ minTokens = 100
             "Expected URL in error, got: {err_msg}"
         );
         assert!(
-            err_msg.contains("local path or npm:"),
+            err_msg.contains("--allow-remote-extends"),
             "Expected remediation hint, got: {err_msg}"
         );
+    }
+
+    #[test]
+    fn collect_unknown_rule_keys_flags_top_level_typo() {
+        let merged = serde_json::json!({
+            "rules": {
+                "unsued-files": "warn",
+                "unused-exports": "off"
+            }
+        });
+        let findings = collect_unknown_rule_keys(&merged);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].context, "rules");
+        assert_eq!(findings[0].key, "unsued-files");
+        assert_eq!(findings[0].suggestion, Some("unused-files"));
+    }
+
+    #[test]
+    fn collect_unknown_rule_keys_flags_overrides_typo() {
+        let merged = serde_json::json!({
+            "overrides": [
+                {
+                    "files": ["src/**/*.ts"],
+                    "rules": {
+                        "unsued-files": "warn"
+                    }
+                },
+                {
+                    "files": ["tests/**/*.ts"],
+                    "rules": {
+                        "circular-dependnecy": "off"
+                    }
+                }
+            ]
+        });
+        let findings = collect_unknown_rule_keys(&merged);
+        assert_eq!(findings.len(), 2);
+        assert_eq!(findings[0].context, "overrides[0].rules");
+        assert_eq!(findings[1].context, "overrides[1].rules");
+        assert_eq!(findings[1].suggestion, Some("circular-dependency"));
+    }
+
+    #[test]
+    fn collect_unknown_rule_keys_empty_for_valid_config() {
+        let merged = serde_json::json!({
+            "rules": {
+                "unused-files": "warn",
+                "unused-file": "off",
+                "circular-dependency": "off",
+                "boundary-violations": "warn"
+            },
+            "overrides": [
+                {
+                    "files": ["src/**"],
+                    "rules": {
+                        "unused-exports": "warn"
+                    }
+                }
+            ]
+        });
+        let findings = collect_unknown_rule_keys(&merged);
+        assert!(
+            findings.is_empty(),
+            "valid rule names and aliases must not be flagged: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn collect_unknown_rule_keys_ignores_missing_rules_section() {
+        let merged = serde_json::json!({
+            "entry": ["src/main.ts"]
+        });
+        let findings = collect_unknown_rule_keys(&merged);
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn load_wires_warn_on_unknown_rule_keys_into_load_path() {
+        let dir = test_dir("wiring");
+        let path = dir.path().join(".fallowrc.json");
+        let typo = format!(
+            "wiring-probe-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        );
+        std::fs::write(&path, format!(r#"{{"rules": {{"{typo}": "warn"}}}}"#)).unwrap();
+
+        let (config_res, captured) = capture_unknown_rule_warnings(|| FallowConfig::load(&path));
+
+        assert!(
+            config_res.is_ok(),
+            "load should succeed in phase 1: {:?}",
+            config_res.err()
+        );
+        assert_eq!(
+            captured.len(),
+            1,
+            "FallowConfig::load must invoke warn_on_unknown_rule_keys exactly once for one new unknown key, got: {captured:?}"
+        );
+        assert_eq!(captured[0].key, typo);
+        assert_eq!(captured[0].context, "rules");
+    }
+
+    #[test]
+    fn load_with_misspelled_rule_succeeds_and_ignores_typo() {
+        let dir = test_dir("misspelled-rule");
+        std::fs::write(
+            dir.path().join(".fallowrc.json"),
+            r#"{"rules": {"unsued-files": "warn"}}"#,
+        )
+        .unwrap();
+
+        let config = FallowConfig::load(&dir.path().join(".fallowrc.json"))
+            .expect("load should succeed in phase 1");
+
+        assert_eq!(config.rules.unused_files, Severity::Error);
+    }
+
+    #[test]
+    fn validate_resolved_boundaries_passes_on_valid_config() {
+        let dir = test_dir("boundaries-valid");
+        let config = FallowConfig {
+            boundaries: crate::BoundaryConfig {
+                coverage: crate::BoundaryCoverageConfig::default(),
+                calls: crate::BoundaryCallsConfig::default(),
+                preset: None,
+                zones: vec![
+                    crate::BoundaryZone {
+                        name: "ui".to_string(),
+                        patterns: vec!["src/components/**".to_string()],
+                        auto_discover: vec![],
+                        root: None,
+                    },
+                    crate::BoundaryZone {
+                        name: "db".to_string(),
+                        patterns: vec!["src/db/**".to_string()],
+                        auto_discover: vec![],
+                        root: None,
+                    },
+                ],
+                rules: vec![crate::BoundaryRule {
+                    from: "ui".to_string(),
+                    allow: vec!["db".to_string()],
+                    allow_type_only: vec![],
+                }],
+            },
+            ..FallowConfig::default()
+        };
+        config
+            .validate_resolved_boundaries(dir.path())
+            .expect("valid config should pass");
+    }
+
+    #[test]
+    fn validate_resolved_boundaries_aggregates_unknown_zone_refs() {
+        let dir = test_dir("boundaries-unknown-zones");
+        let config = FallowConfig {
+            boundaries: crate::BoundaryConfig {
+                coverage: crate::BoundaryCoverageConfig::default(),
+                calls: crate::BoundaryCallsConfig::default(),
+                preset: None,
+                zones: vec![crate::BoundaryZone {
+                    name: "ui".to_string(),
+                    patterns: vec!["src/ui/**".to_string()],
+                    auto_discover: vec![],
+                    root: None,
+                }],
+                rules: vec![
+                    crate::BoundaryRule {
+                        from: "typo-from".to_string(),
+                        allow: vec!["typo-allow".to_string()],
+                        allow_type_only: vec!["typo-type-only".to_string()],
+                    },
+                    crate::BoundaryRule {
+                        from: "ui".to_string(),
+                        allow: vec!["another-typo".to_string()],
+                        allow_type_only: vec![],
+                    },
+                ],
+            },
+            ..FallowConfig::default()
+        };
+
+        let errors = config
+            .validate_resolved_boundaries(dir.path())
+            .expect_err("invalid zone refs should fail");
+
+        assert_eq!(errors.len(), 4, "got: {errors:?}");
+
+        let rendered: Vec<String> = errors.iter().map(ToString::to_string).collect();
+        assert!(
+            rendered
+                .iter()
+                .any(|m| m.contains("typo-from") && m.contains("rules[0]") && m.contains("from"))
+        );
+        assert!(
+            rendered
+                .iter()
+                .any(|m| m.contains("typo-allow") && m.contains("rules[0]") && m.contains("allow"))
+        );
+        assert!(rendered.iter().any(|m| m.contains("typo-type-only")
+            && m.contains("rules[0]")
+            && m.contains("allowTypeOnly")));
+        assert!(
+            rendered.iter().any(|m| m.contains("another-typo")
+                && m.contains("rules[1]")
+                && m.contains("allow"))
+        );
+    }
+
+    #[test]
+    fn validate_resolved_boundaries_flags_redundant_root_prefix() {
+        let dir = test_dir("boundaries-redundant-prefix");
+        let config = FallowConfig {
+            boundaries: crate::BoundaryConfig {
+                coverage: crate::BoundaryCoverageConfig::default(),
+                calls: crate::BoundaryCallsConfig::default(),
+                preset: None,
+                zones: vec![crate::BoundaryZone {
+                    name: "ui".to_string(),
+                    patterns: vec!["packages/app/src/**".to_string()],
+                    auto_discover: vec![],
+                    root: Some("packages/app/".to_string()),
+                }],
+                rules: vec![],
+            },
+            ..FallowConfig::default()
+        };
+
+        let errors = config
+            .validate_resolved_boundaries(dir.path())
+            .expect_err("redundant root prefix should fail");
+        assert_eq!(errors.len(), 1, "got: {errors:?}");
+        let rendered = errors[0].to_string();
+        assert!(rendered.contains("FALLOW-BOUNDARY-ROOT-REDUNDANT-PREFIX"));
+        assert!(rendered.contains("zone 'ui'"));
+    }
+
+    #[test]
+    fn validate_resolved_boundaries_aggregates_unknown_zones_and_root_prefixes() {
+        let dir = test_dir("boundaries-mixed-errors");
+        let config = FallowConfig {
+            boundaries: crate::BoundaryConfig {
+                coverage: crate::BoundaryCoverageConfig::default(),
+                calls: crate::BoundaryCallsConfig::default(),
+                preset: None,
+                zones: vec![crate::BoundaryZone {
+                    name: "ui".to_string(),
+                    patterns: vec!["packages/app/src/**".to_string()],
+                    auto_discover: vec![],
+                    root: Some("packages/app/".to_string()),
+                }],
+                rules: vec![crate::BoundaryRule {
+                    from: "ui".to_string(),
+                    allow: vec!["typo-zone".to_string()],
+                    allow_type_only: vec![],
+                }],
+            },
+            ..FallowConfig::default()
+        };
+        let errors = config
+            .validate_resolved_boundaries(dir.path())
+            .expect_err("mixed errors should fail");
+        assert_eq!(errors.len(), 2, "got: {errors:?}");
+        let rendered: Vec<String> = errors.iter().map(ToString::to_string).collect();
+        assert!(
+            rendered
+                .iter()
+                .any(|m| m.contains("typo-zone") && m.contains("rules[0]"))
+        );
+        assert!(
+            rendered
+                .iter()
+                .any(|m| m.contains("FALLOW-BOUNDARY-ROOT-REDUNDANT-PREFIX"))
+        );
+    }
+
+    #[test]
+    fn validate_resolved_boundaries_passes_on_bulletproof_preset() {
+        let dir = test_dir("boundaries-bulletproof");
+        std::fs::create_dir_all(dir.path().join("src/features/auth")).unwrap();
+        let config = FallowConfig {
+            boundaries: crate::BoundaryConfig {
+                coverage: crate::BoundaryCoverageConfig::default(),
+                calls: crate::BoundaryCallsConfig::default(),
+                preset: Some(crate::BoundaryPreset::Bulletproof),
+                zones: vec![],
+                rules: vec![],
+            },
+            ..FallowConfig::default()
+        };
+        config
+            .validate_resolved_boundaries(dir.path())
+            .expect("Bulletproof with discoverable features should pass");
+    }
+
+    // ------------------------------------------------------------------
+    // parse_config_to_value: BOM stripping, TOML parse error, JSON parse error
+    // ------------------------------------------------------------------
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn parse_config_to_value_strips_utf8_bom() {
+        let dir = test_dir("parse-bom");
+        let path = dir.path().join("fallow.toml");
+        // Write TOML with a UTF-8 BOM prefix
+        let content_with_bom = "\u{FEFF}entry = [\"src/main.ts\"]\n";
+        std::fs::write(&path, content_with_bom).unwrap();
+
+        let value = parse_config_to_value(&path).unwrap();
+        assert!(
+            value.get("entry").is_some(),
+            "BOM should be stripped before TOML parsing"
+        );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn parse_config_to_value_toml_parse_error() {
+        let dir = test_dir("parse-toml-error");
+        let path = dir.path().join("fallow.toml");
+        std::fs::write(&path, "entry = [unquoted\n").unwrap();
+
+        let result = parse_config_to_value(&path);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("Failed to parse config file"),
+            "error should mention parse failure: {err}"
+        );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn parse_config_to_value_json_parse_error() {
+        let dir = test_dir("parse-json-error");
+        let path = dir.path().join(".fallowrc.json");
+        std::fs::write(&path, "{ this is not json }").unwrap();
+
+        let result = parse_config_to_value(&path);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("Failed to parse config file"),
+            "error should mention parse failure: {err}"
+        );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn parse_config_to_value_missing_file_error() {
+        let dir = test_dir("parse-missing");
+        let path = dir.path().join("nonexistent.toml");
+
+        let result = parse_config_to_value(&path);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("Failed to read config file"),
+            "error should mention read failure: {err}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // is_repo_root: svn boundary
+    // ------------------------------------------------------------------
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn find_and_load_stops_at_svn_dir() {
+        let dir = test_dir("find-svn-stop");
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::create_dir(dir.path().join(".svn")).unwrap();
+
+        let result = FallowConfig::find_and_load(&sub).unwrap();
+        assert!(result.is_none(), "svn boundary should stop config walk");
+    }
+
+    // ------------------------------------------------------------------
+    // validate_npm_package_name: dot-segment in the package name
+    // (path traversal but using a single dot)
+    // ------------------------------------------------------------------
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn extends_npm_single_dot_package_name_rejected() {
+        let dir = test_dir("npm-dot-name");
+        std::fs::write(
+            dir.path().join(".fallowrc.json"),
+            r#"{"extends": "npm:./relative"}"#,
+        )
+        .unwrap();
+
+        let result = FallowConfig::load(&dir.path().join(".fallowrc.json"));
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("path traversal"),
+            "single-dot component should be rejected as path traversal: {err}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // find_config_in_npm_package: main field points to nonexistent file,
+    // falls through to config-name scan
+    // ------------------------------------------------------------------
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn extends_npm_main_points_to_nonexistent_falls_through_to_config_name() {
+        let dir = test_dir("npm-main-missing");
+        let pkg_dir = dir.path().join("node_modules/my-config");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        // package.json with main pointing at a file that does not exist
+        std::fs::write(
+            pkg_dir.join("package.json"),
+            r#"{"name": "my-config", "main": "./missing.json"}"#,
+        )
+        .unwrap();
+        // But a recognized config name is present for the fallback scan
+        std::fs::write(
+            pkg_dir.join(".fallowrc.json"),
+            r#"{"rules": {"unused-files": "warn"}}"#,
+        )
+        .unwrap();
+
+        std::fs::write(
+            dir.path().join(".fallowrc.json"),
+            r#"{"extends": "npm:my-config"}"#,
+        )
+        .unwrap();
+
+        let config = FallowConfig::load(&dir.path().join(".fallowrc.json")).unwrap();
+        assert_eq!(config.rules.unused_files, Severity::Warn);
+    }
+
+    // ------------------------------------------------------------------
+    // find_config_in_npm_package: exports present but exports-pointed file
+    // does not exist, falls through to main then config name
+    // ------------------------------------------------------------------
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn extends_npm_exports_nonexistent_falls_through_to_main() {
+        let dir = test_dir("npm-exports-missing-file");
+        let pkg_dir = dir.path().join("node_modules/cfg-pkg");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        // exports points to a file that does not exist; main is valid
+        std::fs::write(
+            pkg_dir.join("package.json"),
+            r#"{"name": "cfg-pkg", "exports": "./missing-exports.json", "main": "./real.json"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            pkg_dir.join("real.json"),
+            r#"{"rules": {"unused-types": "off"}}"#,
+        )
+        .unwrap();
+
+        std::fs::write(
+            dir.path().join(".fallowrc.json"),
+            r#"{"extends": "npm:cfg-pkg"}"#,
+        )
+        .unwrap();
+
+        let config = FallowConfig::load(&dir.path().join(".fallowrc.json")).unwrap();
+        assert_eq!(config.rules.unused_types, Severity::Off);
+    }
+
+    // ------------------------------------------------------------------
+    // normalize_url_for_dedup: URL with no "://" scheme falls back to raw
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn normalize_url_no_scheme_returns_raw() {
+        // A string without "://" must come back unchanged
+        assert_eq!(normalize_url_for_dedup("not-a-url"), "not-a-url");
+        assert_eq!(normalize_url_for_dedup("/absolute/path"), "/absolute/path");
+    }
+
+    // ------------------------------------------------------------------
+    // normalize_url_for_dedup: query before fragment (fragment then query)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn normalize_url_fragment_only_stripped() {
+        // Fragment-only URL (no query)
+        assert_eq!(
+            normalize_url_for_dedup("https://example.com/file.json#anchor"),
+            "https://example.com/file.json"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // url_timeout: env var override
+    // ------------------------------------------------------------------
+
+    // These exercise the pure `url_timeout_from` parser rather than mutating the
+    // process-global env var, so they stay deterministic under parallel test
+    // execution (an env-mutating version raced and failed on Windows CI).
+    #[test]
+    fn url_timeout_uses_env_var_when_set() {
+        assert_eq!(url_timeout_from(Some("15")).as_secs(), 15);
+    }
+
+    #[test]
+    fn url_timeout_zero_falls_back_to_default() {
+        assert_eq!(
+            url_timeout_from(Some("0")),
+            Duration::from_secs(DEFAULT_URL_TIMEOUT_SECS),
+            "zero should fall back to the hardcoded default"
+        );
+    }
+
+    #[test]
+    fn url_timeout_non_numeric_falls_back_to_default() {
+        assert_eq!(
+            url_timeout_from(Some("not-a-number")),
+            Duration::from_secs(DEFAULT_URL_TIMEOUT_SECS),
+            "non-numeric value should fall back to the hardcoded default"
+        );
+    }
+
+    #[test]
+    fn url_timeout_absent_uses_default() {
+        assert_eq!(
+            url_timeout_from(None),
+            Duration::from_secs(DEFAULT_URL_TIMEOUT_SECS)
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // resolve_url_extends: depth limit reached
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn resolve_url_extends_depth_limit_error() {
+        let mut visited = FxHashSet::default();
+        let result = resolve_url_extends(
+            "https://example.invalid/config.json",
+            &mut visited,
+            MAX_EXTENDS_DEPTH, // at the limit
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("too deep"),
+            "error should mention depth limit: {err}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // resolve_extends_file: depth limit reached
+    // ------------------------------------------------------------------
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn resolve_extends_file_depth_limit_error() {
+        let dir = test_dir("extends-file-depth");
+        let path = dir.path().join(".fallowrc.json");
+        std::fs::write(&path, r#"{"entry": []}"#).unwrap();
+
+        let mut visited = FxHashSet::default();
+        let result = resolve_extends(&path, &mut visited, MAX_EXTENDS_DEPTH);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("too deep"),
+            "error should mention depth limit: {err}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // resolve_extends_file_entry: http:// in file-sourced extends
+    // ------------------------------------------------------------------
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn extends_http_url_in_file_extends_rejected() {
+        let dir = test_dir("file-extends-http");
+        std::fs::write(
+            dir.path().join(".fallowrc.json"),
+            r#"{"extends": ["http://example.com/config.json"]}"#,
+        )
+        .unwrap();
+
+        let result = FallowConfig::load(&dir.path().join(".fallowrc.json"));
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("https://"),
+            "error should suggest https: {err}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // sealed_config_dir: when sealed = true canonicalization runs
+    // ------------------------------------------------------------------
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn sealed_config_dir_returns_some_when_sealed() {
+        let dir = test_dir("sealed-dir");
+        let result = sealed_config_dir(dir.path(), true);
+        assert!(result.is_ok());
+        assert!(
+            result.unwrap().is_some(),
+            "sealed=true must return Some(canonicalized path)"
+        );
+    }
+
+    #[test]
+    fn sealed_config_dir_returns_none_when_not_sealed() {
+        let result = sealed_config_dir(Path::new("/nonexistent/path"), false);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none(), "sealed=false must return None");
+    }
+
+    // ------------------------------------------------------------------
+    // collect_unknown_rule_keys: overrides entry without a rules key
+    // (the inner `if let Some(rules)` branch is not taken)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn collect_unknown_rule_keys_override_without_rules_key() {
+        let merged = serde_json::json!({
+            "overrides": [
+                {
+                    "files": ["src/**/*.ts"]
+                    // no "rules" key here
+                },
+                {
+                    "files": ["tests/**"],
+                    "rules": {
+                        "unsued-exports": "off"
+                    }
+                }
+            ]
+        });
+        let findings = collect_unknown_rule_keys(&merged);
+        assert_eq!(
+            findings.len(),
+            1,
+            "only the entry with rules should produce a finding"
+        );
+        assert_eq!(findings[0].context, "overrides[1].rules");
+    }
+
+    // ------------------------------------------------------------------
+    // FallowConfig::load: deserialization failure
+    // ------------------------------------------------------------------
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn load_fails_on_deserialization_error() {
+        let dir = test_dir("deser-error");
+        let path = dir.path().join(".fallowrc.json");
+        // Valid JSON but contains a field value with the wrong type for the schema
+        std::fs::write(&path, r#"{"entry": "not-an-array"}"#).unwrap();
+
+        let result = FallowConfig::load(&path);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("invalid type") && err.contains(&path.display().to_string()),
+            "error should lead with the reason and name the config file: {err}"
+        );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn unknown_override_field_error_names_path_once_and_hints_at_jsonc() {
+        let dir = test_dir("override-unknown-field");
+        let path = dir.path().join(".fallowrc.json");
+        std::fs::write(
+            &path,
+            r#"{"overrides": [{"files": ["src/**"], "reason": "legacy"}]}"#,
+        )
+        .unwrap();
+
+        let err = FallowConfig::find_and_load(dir.path())
+            .expect_err("unknown override field must be rejected");
+        let path_str = path.display().to_string();
+        assert!(
+            err.contains("unknown field `reason`"),
+            "error should lead with the serde reason: {err}"
+        );
+        assert_eq!(
+            err.matches(&path_str).count(),
+            1,
+            "path must appear exactly once: {err}"
+        );
+        assert!(
+            err.contains("// comment") && err.contains("JSONC"),
+            "error should point annotations at JSONC comments: {err}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // FallowConfig::load: threshold override validation failure
+    // (covers lines 921-927)
+    // ------------------------------------------------------------------
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn load_rejects_threshold_override_with_empty_files() {
+        let dir = test_dir("threshold-empty-files");
+        let path = dir.path().join(".fallowrc.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "health": {
+                    "thresholdOverrides": [
+                        {"files": [], "maxCyclomatic": 30}
+                    ]
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let result = FallowConfig::load(&path);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("thresholdOverrides"),
+            "error should mention thresholdOverrides: {err}"
+        );
+        assert!(
+            err.contains("files"),
+            "error should name the files field: {err}"
+        );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn load_rejects_threshold_override_with_no_threshold_set() {
+        let dir = test_dir("threshold-no-threshold");
+        let path = dir.path().join(".fallowrc.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "health": {
+                    "thresholdOverrides": [
+                        {"files": ["src/legacy.ts"]}
+                    ]
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let result = FallowConfig::load(&path);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("maxCyclomatic")
+                || err.contains("maxCognitive")
+                || err.contains("maxCrap"),
+            "error should name at least one threshold field: {err}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // validate_ignore_rule_globs: ignoreCatalogReferences consumer glob
+    // validation (covers lines 1026-1032)
+    // ------------------------------------------------------------------
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn load_rejects_invalid_ignore_catalog_references_consumer_glob() {
+        let dir = test_dir("invalid-catalog-consumer-glob");
+        let path = dir.path().join(".fallowrc.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "ignoreCatalogReferences": [
+                    {"package": "react", "consumer": "[invalid-glob"}
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let result = FallowConfig::load(&path);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("ignoreCatalogReferences"),
+            "error should mention the field: {err}"
+        );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn load_accepts_ignore_catalog_references_without_consumer() {
+        let dir = test_dir("catalog-ref-no-consumer");
+        let path = dir.path().join(".fallowrc.json");
+        std::fs::write(
+            &path,
+            r#"{"ignoreCatalogReferences": [{"package": "react"}]}"#,
+        )
+        .unwrap();
+
+        let config = FallowConfig::load(&path).unwrap();
+        assert_eq!(config.ignore_catalog_references.len(), 1);
+        assert!(config.ignore_catalog_references[0].consumer.is_none());
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn load_accepts_unused_component_props_ignore_pattern() {
+        let dir = test_dir("unused-component-props-ignore-pattern");
+        let path = dir.path().join(".fallowrc.json");
+        std::fs::write(
+            &path,
+            r#"{"unusedComponentProps": {"ignorePattern": "^_"}}"#,
+        )
+        .unwrap();
+
+        let config = FallowConfig::load(&path).unwrap();
+        assert_eq!(
+            config.unused_component_props.ignore_pattern.as_deref(),
+            Some("^_")
+        );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn load_rejects_invalid_unused_component_props_ignore_pattern() {
+        let dir = test_dir("unused-component-props-bad-regex");
+        let path = dir.path().join(".fallowrc.json");
+        // `[` opens an unterminated character class: invalid regex.
+        std::fs::write(&path, r#"{"unusedComponentProps": {"ignorePattern": "["}}"#).unwrap();
+
+        let result = FallowConfig::load(&path);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("unusedComponentProps.ignorePattern"),
+            "error should mention the field: {err}"
+        );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn load_rejects_unknown_unused_component_props_field() {
+        let dir = test_dir("unused-component-props-unknown-field");
+        let path = dir.path().join(".fallowrc.json");
+        std::fs::write(
+            &path,
+            r#"{"unusedComponentProps": {"ignorePatterns": "^_"}}"#,
+        )
+        .unwrap();
+
+        // `deny_unknown_fields` rejects the plural typo.
+        assert!(FallowConfig::load(&path).is_err());
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn load_rejects_unknown_override_entry_key() {
+        let dir = test_dir("override-entry-unknown-key");
+        let path = dir.path().join(".fallowrc.json");
+        std::fs::write(
+            &path,
+            r#"{"overrides": [{"files": ["src/**"], "rule": {"unused-files": "off"}}]}"#,
+        )
+        .unwrap();
+
+        // `deny_unknown_fields` rejects the `rule` typo instead of silently
+        // producing an override with empty rules.
+        assert!(FallowConfig::load(&path).is_err());
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn load_rejects_unknown_ignore_exports_entry_key() {
+        let dir = test_dir("ignore-exports-entry-unknown-key");
+        let path = dir.path().join(".fallowrc.json");
+        std::fs::write(
+            &path,
+            r#"{"ignoreExports": [{"file": "src/a.ts", "exports": ["*"], "reason": "legacy"}]}"#,
+        )
+        .unwrap();
+
+        assert!(FallowConfig::load(&path).is_err());
+    }
+
+    // ------------------------------------------------------------------
+    // validate_resolved_boundaries: tsconfig rootDir filtering
+    // (covers lines 1158-1160 - rootDir value is ".", starts with "..", or
+    // is absolute; all should fall back to "src")
+    // ------------------------------------------------------------------
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn validate_resolved_boundaries_with_preset_uses_src_fallback_when_no_tsconfig() {
+        // No tsconfig.json present; parse_tsconfig_root_dir returns None,
+        // unwrap_or_else supplies "src". This exercises the filter + fallback branch.
+        let dir = test_dir("boundaries-preset-no-tsconfig");
+        std::fs::create_dir_all(dir.path().join("src/features/auth")).unwrap();
+        let config = FallowConfig {
+            boundaries: crate::BoundaryConfig {
+                coverage: crate::BoundaryCoverageConfig::default(),
+                calls: crate::BoundaryCallsConfig::default(),
+                preset: Some(crate::BoundaryPreset::Bulletproof),
+                zones: vec![],
+                rules: vec![],
+            },
+            ..FallowConfig::default()
+        };
+        // Should not panic; no zone-ref errors expected since preset adds zones
+        let _ = config.validate_resolved_boundaries(dir.path());
+    }
+
+    // ------------------------------------------------------------------
+    // validate_user_globs: framework plugin invalid glob triggers error path
+    // (covers lines 970-974)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn validate_user_globs_framework_plugin_invalid_entry_glob() {
+        use crate::ExternalPluginDef;
+        use crate::external_plugin::EntryPointRole;
+        let config = FallowConfig {
+            framework: vec![ExternalPluginDef {
+                schema: None,
+                name: "test-plugin".to_owned(),
+                detection: None,
+                enablers: vec![],
+                entry_points: vec!["[invalid-glob".to_owned()],
+                entry_point_role: EntryPointRole::Support,
+                manifest_entries: vec![],
+                config_patterns: vec![],
+                always_used: vec![],
+                tooling_dependencies: vec![],
+                used_exports: vec![],
+                used_class_members: vec![],
+            }],
+            ..FallowConfig::default()
+        };
+
+        let result = config.validate_user_globs();
+        assert!(
+            result.is_err(),
+            "invalid entry_points glob should fail validation"
+        );
+        let errors = result.unwrap_err();
+        assert!(!errors.is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // shadowed_config_names: no lower-precedence names after the last index
+    // ------------------------------------------------------------------
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn shadowed_config_names_empty_when_last_config_wins() {
+        let dir = test_dir("shadow-last");
+        std::fs::write(dir.path().join(".fallow.toml"), "").unwrap();
+        // chosen_index = 3 (last), so skip+1 = 4, nothing to check
+        assert!(shadowed_config_names(dir.path(), 3).is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // warn_on_coexisting_configs: path without filename (edge branch)
+    // shadowed is empty -> early return without recording
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn warn_on_coexisting_configs_empty_shadowed_is_silent() {
+        let ((), captured) = capture_coexisting_config_warnings(|| {
+            warn_on_coexisting_configs(Path::new(".fallowrc.json"), &[]);
+        });
+        assert!(
+            captured.is_empty(),
+            "empty shadowed list must produce no warning"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // extract_extends: malformed values fail loud instead of silently
+    // skipping the base config (the key is removed before deserialization,
+    // so deny_unknown_fields cannot catch these)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn extract_extends_rejects_number_value() {
+        let mut value = serde_json::json!({"extends": 42});
+        let err = extract_extends(&mut value, "test.json").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("extends must be a string or an array of strings, got a number"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn extract_extends_rejects_object_value() {
+        let mut value = serde_json::json!({"extends": {"path": "./base.json"}});
+        let err = extract_extends(&mut value, "test.json").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("extends must be a string or an array of strings, got an object"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn extract_extends_rejects_non_string_array_entry() {
+        let mut value = serde_json::json!({"extends": ["a.json", 42]});
+        let err = extract_extends(&mut value, "test.json").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("extends entries must be strings, got a number"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn load_rejects_malformed_extends_value() {
+        let dir = test_dir("malformed-extends");
+        let path = dir.path().join(".fallowrc.json");
+        std::fs::write(&path, r#"{"extends": 42}"#).unwrap();
+
+        let err = FallowConfig::load(&path).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("extends must be a string or an array of strings"),
+            "unexpected error: {err}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Typed resource identities keep local and remote namespaces disjoint.
+    // ------------------------------------------------------------------
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn config_resource_identity_cannot_collide_across_kinds() {
+        let dir = test_dir("visit-circular");
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, "{}").unwrap();
+
+        let canonical = dunce::canonicalize(path).unwrap();
+        let local = ConfigResourceId::Local(canonical.clone());
+        let remote = ConfigResourceId::Remote(canonical.to_string_lossy().into_owned());
+        assert_ne!(local, remote);
+    }
+
+    // ------------------------------------------------------------------
+    // find_and_load: stops at .svn dir (is_repo_root branch)
+    // ------------------------------------------------------------------
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn find_config_path_stops_at_svn_dir() {
+        let dir = test_dir("find-path-svn");
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::create_dir(dir.path().join(".svn")).unwrap();
+
+        let path = FallowConfig::find_config_path(&sub);
+        assert!(path.is_none(), "svn root should stop config search");
+    }
+
+    // ------------------------------------------------------------------
+    // deep_merge: array over object replaces
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn deep_merge_array_over_object_replaces() {
+        let mut base = serde_json::json!({"key": "value"});
+        deep_merge_json(&mut base, serde_json::json!(["a", "b"]));
+        assert_eq!(base, serde_json::json!(["a", "b"]));
+    }
+
+    // ------------------------------------------------------------------
+    // find_and_load: returns an error when config parses but glob validation fails
+    // ------------------------------------------------------------------
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn find_and_load_returns_error_for_invalid_glob_in_config() {
+        let dir = test_dir("find-invalid-glob");
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        std::fs::write(
+            dir.path().join(".fallowrc.json"),
+            r#"{"entry": ["[invalid-glob"]}"#,
+        )
+        .unwrap();
+
+        let result = FallowConfig::find_and_load(dir.path());
+        assert!(
+            result.is_err(),
+            "invalid glob should surface as an error from find_and_load"
+        );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn find_and_load_rejects_bare_finding_ignore_negation() {
+        let dir = test_dir("find-bare-finding-ignore-negation");
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        std::fs::write(
+            dir.path().join(".fallowrc.json"),
+            r#"{"ignoreFindings": ["!"]}"#,
+        )
+        .unwrap();
+
+        let error = FallowConfig::find_and_load(dir.path()).unwrap_err();
+        assert!(error.contains("ignoreFindings"), "error: {error}");
+        assert!(error.contains("requires a pattern"), "error: {error}");
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn find_and_load_rejects_finding_ignore_set_that_exceeds_matcher_limits() {
+        let dir = test_dir("find-oversized-finding-ignore-set");
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        let alternatives = (0..50_000)
+            .map(|index| format!("name{index}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let config = serde_json::json!({
+            "ignoreFindings": [format!("**/{{{alternatives}}}.ts")]
+        });
+        std::fs::write(
+            dir.path().join(".fallowrc.json"),
+            serde_json::to_vec(&config).unwrap(),
+        )
+        .unwrap();
+
+        let error = FallowConfig::find_and_load(dir.path()).unwrap_err();
+        assert!(error.contains("ignoreFindings"), "error: {error}");
+        assert!(
+            error.contains("cannot be compiled together"),
+            "error: {error}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // resolve_package_exports: Object map with "." key that is not a
+    // string or object returns None (the `_ => None` arm)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn resolve_package_exports_dot_key_array_returns_none() {
+        // "." value is an array, which is neither String nor Object
+        let pkg = serde_json::json!({
+            "exports": {".": ["array-value"]}
+        });
+        let result = resolve_package_exports(&pkg, Path::new("/tmp"));
+        assert!(result.is_none(), "array dot-export should return None");
+    }
+
+    #[test]
+    fn resolve_package_exports_exports_is_array_returns_none() {
+        // top-level "exports" is an array (not String or Object)
+        let pkg = serde_json::json!({
+            "exports": ["./index.js"]
+        });
+        let result = resolve_package_exports(&pkg, Path::new("/tmp"));
+        assert!(result.is_none(), "array-form exports should return None");
+    }
+
+    #[test]
+    fn resolve_package_exports_object_no_dot_key_returns_none() {
+        // Object exports without "." key
+        let pkg = serde_json::json!({
+            "exports": {"./sub": "./sub.js"}
+        });
+        let result = resolve_package_exports(&pkg, Path::new("/tmp"));
+        assert!(result.is_none(), "no dot key should return None");
+    }
+
+    #[test]
+    fn resolve_package_exports_conditions_without_known_key_returns_none() {
+        // "." is an Object but none of the known condition keys are present
+        let pkg = serde_json::json!({
+            "exports": {".": {"browser": "./browser.js"}}
+        });
+        let result = resolve_package_exports(&pkg, Path::new("/tmp"));
+        assert!(result.is_none(), "unknown condition key should return None");
+    }
+
+    // ------------------------------------------------------------------
+    // npm package: exports condition "import" key (one of the priority keys)
+    // ------------------------------------------------------------------
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn extends_npm_exports_import_condition() {
+        let dir = test_dir("npm-import-cond");
+        let pkg_dir = dir.path().join("node_modules/import-config");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(
+            pkg_dir.join("package.json"),
+            r#"{"name": "import-config", "exports": {".": {"import": "./esm.json"}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            pkg_dir.join("esm.json"),
+            r#"{"rules": {"unused-types": "warn"}}"#,
+        )
+        .unwrap();
+
+        std::fs::write(
+            dir.path().join(".fallowrc.json"),
+            r#"{"extends": "npm:import-config"}"#,
+        )
+        .unwrap();
+
+        let config = FallowConfig::load(&dir.path().join(".fallowrc.json")).unwrap();
+        assert_eq!(config.rules.unused_types, Severity::Warn);
+    }
+
+    // ------------------------------------------------------------------
+    // npm package: exports condition "require" key
+    // ------------------------------------------------------------------
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn extends_npm_exports_require_condition() {
+        let dir = test_dir("npm-require-cond");
+        let pkg_dir = dir.path().join("node_modules/require-config");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(
+            pkg_dir.join("package.json"),
+            r#"{"name": "require-config", "exports": {".": {"require": "./cjs.json"}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            pkg_dir.join("cjs.json"),
+            r#"{"rules": {"unused-class-members": "warn"}}"#,
+        )
+        .unwrap();
+
+        std::fs::write(
+            dir.path().join(".fallowrc.json"),
+            r#"{"extends": "npm:require-config"}"#,
+        )
+        .unwrap();
+
+        let config = FallowConfig::load(&dir.path().join(".fallowrc.json")).unwrap();
+        assert_eq!(config.rules.unused_class_members, Severity::Warn);
     }
 }

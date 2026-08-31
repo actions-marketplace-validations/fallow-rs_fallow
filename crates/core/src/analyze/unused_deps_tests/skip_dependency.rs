@@ -1,7 +1,5 @@
 use super::helpers::*;
 
-// ---- should_skip_dependency tests ----
-
 #[test]
 fn skip_dep_returns_false_when_no_guard_matches() {
     let (root_flagged, script_used, plugin_referenced, ignore_deps, workspace_names) = empty_sets();
@@ -114,7 +112,6 @@ fn skip_dep_when_used_in_workspace() {
 #[test]
 fn skip_dep_closure_receives_correct_dep_name() {
     let (root_flagged, script_used, plugin_referenced, ignore_deps, workspace_names) = empty_sets();
-    // Closure that only returns true for "axios"
     let result = should_skip_dependency(
         "axios",
         &root_flagged,
@@ -126,7 +123,6 @@ fn skip_dep_closure_receives_correct_dep_name() {
     );
     assert!(result);
 
-    // Different dep name should not match
     let result = should_skip_dependency(
         "express",
         &root_flagged,
@@ -144,7 +140,6 @@ fn skip_dep_no_match_with_similar_names() {
     let (mut root_flagged, script_used, plugin_referenced, ignore_deps, workspace_names) =
         empty_sets();
     root_flagged.insert("lodash-es".to_string());
-    // "lodash" is not the same as "lodash-es"
     assert!(!should_skip_dependency(
         "lodash",
         &root_flagged,
@@ -158,7 +153,6 @@ fn skip_dep_no_match_with_similar_names() {
 
 #[test]
 fn skip_dep_multiple_guards_match() {
-    // When multiple guards would match, function still returns true
     let (mut root_flagged, mut script_used, plugin_referenced, ignore_deps, workspace_names) =
         empty_sets();
     root_flagged.insert("eslint".to_string());
@@ -173,8 +167,6 @@ fn skip_dep_multiple_guards_match() {
         |_| false,
     ));
 }
-
-// ---- Additional coverage: should_skip_dependency with empty string ----
 
 #[test]
 fn skip_dep_empty_string_no_match() {

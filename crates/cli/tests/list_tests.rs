@@ -1,8 +1,15 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "tests and benches use unwrap and expect to keep fixture setup concise"
+)]
+
 #[path = "common/mod.rs"]
 mod common;
 
 use common::{CommandOutput, fallow_bin, parse_json, run_fallow};
 
+use std::fs;
 use std::process::Command;
 
 /// Run `fallow list` with the given args and return structured output.
@@ -10,7 +17,57 @@ fn run_list(fixture: &str, args: &[&str]) -> CommandOutput {
     run_fallow("list", fixture, args)
 }
 
-// ── show_all behavior ────────────────────────────────────────────
+fn write_project_with_invalid_tanstack_route_ignore_pattern(root: &std::path::Path) {
+    fs::create_dir_all(root.join("src/routes")).expect("create routes dir");
+    fs::write(
+        root.join("src/routes/index.tsx"),
+        "export const Route = {}\n",
+    )
+    .expect("write route file");
+    fs::write(
+        root.join("package.json"),
+        r#"{
+            "name": "invalid-tanstack-regex",
+            "dependencies": {
+                "@tanstack/react-router": "latest",
+                "@tanstack/router-plugin": "latest",
+                "vite": "latest"
+            }
+        }"#,
+    )
+    .expect("write package json");
+    fs::write(
+        root.join("vite.config.ts"),
+        r#"import { tanstackRouter } from "@tanstack/router-plugin/vite";
+
+export default {
+    plugins: [
+        tanstackRouter({
+            routeFileIgnorePattern: "^(?!layout\\.tsx$|__root\\.tsx$).+\\.tsx$",
+        }),
+    ],
+};
+"#,
+    )
+    .expect("write vite config");
+}
+
+fn run_fallow_combined_in_root(root: &std::path::Path, args: &[&str]) -> CommandOutput {
+    let output = Command::new(fallow_bin())
+        .arg("--root")
+        .arg(root)
+        .args(args)
+        .env("RUST_LOG", "")
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("failed to run fallow binary");
+
+    CommandOutput {
+        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+        code: output.status.code().unwrap_or(-1),
+    }
+}
 
 #[test]
 fn list_show_all_json_includes_plugins_files_and_entry_points() {
@@ -22,7 +79,6 @@ fn list_show_all_json_includes_plugins_files_and_entry_points() {
 
     let json = parse_json(&output);
 
-    // When no specific flags are set, all three sections should be present
     assert!(json.get("plugins").is_some(), "missing 'plugins' key");
     assert!(json.get("files").is_some(), "missing 'files' key");
     assert!(json.get("file_count").is_some(), "missing 'file_count' key");
@@ -65,8 +121,6 @@ fn list_show_all_entry_point_count_matches_array_length() {
         "entry_point_count ({ep_count}) should match entry_points array length ({ep_len})"
     );
 }
-
-// ── Individual flag filtering ────────────────────────────────────
 
 #[test]
 fn list_plugins_only_json_omits_files_and_entry_points() {
@@ -157,8 +211,6 @@ fn list_boundaries_only_json_omits_plugins_files_and_entry_points() {
     );
 }
 
-// ── File path output ─────────────────────────────────────────────
-
 #[test]
 fn list_json_files_are_relative_paths() {
     let output = run_list("basic-project", &["--files", "--format", "json"]);
@@ -172,7 +224,11 @@ fn list_json_files_are_relative_paths() {
             "file path should be relative, got: {path}"
         );
         assert!(
-            path.starts_with("src/") || path.starts_with("src\\"),
+            !path.contains('\\'),
+            "file path should use forward slashes, got: {path}"
+        );
+        assert!(
+            path.starts_with("src/"),
             "file path should start with src/, got: {path}"
         );
     }
@@ -190,10 +246,12 @@ fn list_json_entry_point_paths_are_relative() {
             !path.starts_with('/'),
             "entry point path should be relative, got: {path}"
         );
+        assert!(
+            !path.contains('\\'),
+            "entry point path should use forward slashes, got: {path}"
+        );
     }
 }
-
-// ── Plugin detection ─────────────────────────────────────────────
 
 #[test]
 fn list_basic_project_detects_typescript_plugin() {
@@ -243,8 +301,6 @@ fn list_external_plugin_detected() {
     );
 }
 
-// ── Entry point sources ──────────────────────────────────────────
-
 #[test]
 fn list_entry_point_has_source_field() {
     let output = run_list("basic-project", &["--entry-points", "--format", "json"]);
@@ -259,7 +315,6 @@ fn list_entry_point_has_source_field() {
             ep.get("source").is_some(),
             "entry point missing 'source' field"
         );
-        // source should be a non-empty string
         let source = ep["source"].as_str().unwrap();
         assert!(!source.is_empty(), "entry point source should not be empty");
     }
@@ -271,7 +326,6 @@ fn list_basic_project_main_entry_point_source() {
     let json = parse_json(&output);
 
     let eps = json["entry_points"].as_array().unwrap();
-    // basic-project has "main": "src/index.ts" in package.json
     let main_ep = eps
         .iter()
         .find(|ep| {
@@ -289,7 +343,6 @@ fn list_basic_project_main_entry_point_source() {
 
 #[test]
 fn list_plugin_discovered_entry_points_in_show_all_mode() {
-    // When no specific flags are set (show_all), plugin entry points are included
     let output = run_list("external-plugins", &["--format", "json"]);
     let json = parse_json(&output);
 
@@ -315,12 +368,10 @@ fn list_plugin_discovered_entry_points_in_show_all_mode() {
 
 #[test]
 fn list_entry_points_only_includes_plugin_entries() {
-    // show_all mode includes plugin-detected entry points
     let all_output = run_list("external-plugins", &["--format", "json"]);
     let all_json = parse_json(&all_output);
     let all_eps = all_json["entry_points"].as_array().unwrap();
 
-    // --entry-points only mode should include the same plugin-discovered entries
     let ep_output = run_list("external-plugins", &["--entry-points", "--format", "json"]);
     let ep_json = parse_json(&ep_output);
     let ep_only = ep_json["entry_points"].as_array().unwrap();
@@ -340,8 +391,6 @@ fn list_entry_points_only_includes_plugin_entries() {
     );
 }
 
-// ── Workspace support ────────────────────────────────────────────
-
 #[test]
 fn list_workspace_project_discovers_files_across_packages() {
     let output = run_list("workspace-project", &["--files", "--format", "json"]);
@@ -350,7 +399,6 @@ fn list_workspace_project_discovers_files_across_packages() {
     let json = parse_json(&output);
     let files = json["files"].as_array().unwrap();
 
-    // Should discover files from multiple workspace packages
     let has_app = files.iter().any(|f| {
         let p = f.as_str().unwrap();
         p.starts_with("packages/app/") || p.starts_with("packages\\app\\")
@@ -377,7 +425,6 @@ fn list_workspace_project_discovers_entry_points_from_multiple_packages() {
     let json = parse_json(&output);
     let eps = json["entry_points"].as_array().unwrap();
 
-    // Each workspace package has its own entry points
     let app_entries = eps
         .iter()
         .filter(|ep| {
@@ -464,14 +511,11 @@ fn list_boundaries_json_reports_not_configured_when_absent() {
     );
 }
 
-// ── Human output format ──────────────────────────────────────────
-
 #[test]
 fn list_human_output_plugins_section() {
     let output = run_list("basic-project", &["--plugins"]);
     assert_eq!(output.code, 0);
 
-    // Human output prints plugins to stderr
     assert!(
         output.stderr.contains("Active plugins:"),
         "human output should contain 'Active plugins:' header in stderr. Got stderr: {}",
@@ -482,7 +526,6 @@ fn list_human_output_plugins_section() {
         "human output should list typescript plugin in stderr. Got stderr: {}",
         output.stderr
     );
-    // stdout should be empty when only showing plugins
     assert!(
         output.stdout.trim().is_empty(),
         "stdout should be empty for --plugins in human format. Got: {}",
@@ -495,7 +538,6 @@ fn list_human_output_files_section() {
     let output = run_list("basic-project", &["--files"]);
     assert_eq!(output.code, 0);
 
-    // File count is on stderr
     assert!(
         output.stderr.contains("Discovered"),
         "human output should say 'Discovered' in stderr. Got stderr: {}",
@@ -507,7 +549,6 @@ fn list_human_output_files_section() {
         output.stderr
     );
 
-    // File paths are on stdout
     assert!(
         output.stdout.contains("index.ts"),
         "human output stdout should list index.ts. Got: {}",
@@ -520,7 +561,6 @@ fn list_human_output_entry_points_section() {
     let output = run_list("basic-project", &["--entry-points"]);
     assert_eq!(output.code, 0);
 
-    // Entry point count is on stderr
     assert!(
         output.stderr.contains("Found"),
         "human output should say 'Found' in stderr. Got stderr: {}",
@@ -532,7 +572,6 @@ fn list_human_output_entry_points_section() {
         output.stderr
     );
 
-    // Entry point paths and sources are on stdout
     assert!(
         output.stdout.contains("index.ts"),
         "human output stdout should list entry point path. Got: {}",
@@ -593,7 +632,6 @@ fn list_human_output_boundaries_section() {
 fn list_human_output_files_are_relative_paths() {
     let output = run_list("basic-project", &["--files"]);
 
-    // In human format, file paths should be relative (no absolute prefix)
     for line in output.stdout.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -607,8 +645,6 @@ fn list_human_output_files_are_relative_paths() {
         );
     }
 }
-
-// ── JSON structure validation ────────────────────────────────────
 
 #[test]
 fn list_json_plugins_array_items_have_name_field() {
@@ -645,8 +681,6 @@ fn list_json_entry_points_array_items_have_path_and_source() {
     }
 }
 
-// ── Files are sorted ─────────────────────────────────────────────
-
 #[test]
 fn list_json_files_are_sorted_alphabetically() {
     let output = run_list("basic-project", &["--files", "--format", "json"]);
@@ -664,8 +698,6 @@ fn list_json_files_are_sorted_alphabetically() {
     assert_eq!(files, sorted, "files should be in sorted order");
 }
 
-// ── Combining flags ──────────────────────────────────────────────
-
 #[test]
 fn list_plugins_and_files_together_json() {
     let output = run_list(
@@ -677,7 +709,6 @@ fn list_plugins_and_files_together_json() {
     let json = parse_json(&output);
     assert!(json.get("plugins").is_some(), "should include 'plugins'");
     assert!(json.get("files").is_some(), "should include 'files'");
-    // entry_points should not appear since that flag was not set
     assert!(
         json.get("entry_points").is_none(),
         "should omit 'entry_points' when only --plugins --files"
@@ -701,8 +732,6 @@ fn list_files_and_entry_points_together_json() {
     );
 }
 
-// ── Exit code ────────────────────────────────────────────────────
-
 #[test]
 fn list_returns_exit_code_0_on_success() {
     let output = run_list("basic-project", &["--format", "json"]);
@@ -712,7 +741,71 @@ fn list_returns_exit_code_0_on_success() {
     );
 }
 
-// ── CJS project ──────────────────────────────────────────────────
+#[test]
+fn combined_json_errors_on_invalid_plugin_regex() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    write_project_with_invalid_tanstack_route_ignore_pattern(dir.path());
+
+    let output = run_fallow_combined_in_root(dir.path(), &["--format", "json", "--quiet"]);
+
+    assert_eq!(output.code, 2, "stderr: {}", output.stderr);
+    let json = parse_json(&output);
+    assert_eq!(json["error"], serde_json::Value::Bool(true));
+    assert_eq!(json["exit_code"], serde_json::Value::from(2));
+    let message = json["message"]
+        .as_str()
+        .expect("message should be a string");
+    assert!(
+        message.contains("invalid plugin regex configuration"),
+        "message: {message}"
+    );
+    assert!(message.contains("tanstack-router"), "message: {message}");
+    assert!(
+        message.contains("entry_patterns[].exclude_segment_regexes"),
+        "message: {message}"
+    );
+    assert!(
+        message.contains("Rewrite the plugin config with Rust-compatible regex syntax"),
+        "message: {message}"
+    );
+    assert!(message.contains("vite.config.ts"), "message: {message}");
+    assert!(
+        !message.contains("future release"),
+        "message should not include old warning tail: {message}"
+    );
+}
+
+#[test]
+fn list_plugins_json_errors_on_invalid_plugin_regex() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    write_project_with_invalid_tanstack_route_ignore_pattern(dir.path());
+
+    let output = run_fallow_combined_in_root(
+        dir.path(),
+        &["list", "--plugins", "--format", "json", "--quiet"],
+    );
+
+    assert_eq!(output.code, 2, "stderr: {}", output.stderr);
+    let json = parse_json(&output);
+    assert_eq!(json["error"], serde_json::Value::Bool(true));
+    assert_eq!(json["exit_code"], serde_json::Value::from(2));
+    let message = json["message"]
+        .as_str()
+        .expect("message should be a string");
+    assert!(
+        message.contains("invalid plugin regex configuration"),
+        "message: {message}"
+    );
+    assert!(message.contains("tanstack-router"), "message: {message}");
+    assert!(
+        message.contains("entry_patterns[].exclude_segment_regexes"),
+        "message: {message}"
+    );
+    assert!(
+        message.contains("Rewrite the plugin config with Rust-compatible regex syntax"),
+        "message: {message}"
+    );
+}
 
 #[test]
 fn list_cjs_project_discovers_js_files() {
@@ -737,8 +830,6 @@ fn list_cjs_project_discovers_js_files() {
     );
 }
 
-// ── Vue project ──────────────────────────────────────────────────
-
 #[test]
 fn list_vue_project_discovers_vue_files() {
     let output = run_list("vue-project", &["--files", "--format", "json"]);
@@ -762,8 +853,6 @@ fn list_vue_project_discovers_vue_files() {
     );
 }
 
-// ── Svelte project ───────────────────────────────────────────────
-
 #[test]
 fn list_svelte_project_discovers_svelte_files() {
     let output = run_list("svelte-project", &["--files", "--format", "json"]);
@@ -782,8 +871,6 @@ fn list_svelte_project_discovers_svelte_files() {
         "svelte-project should discover .svelte files. Got: {files:?}"
     );
 }
-
-// ── CSS modules project ──────────────────────────────────────────
 
 #[test]
 fn list_css_modules_project_discovers_css_module_files() {
@@ -804,11 +891,8 @@ fn list_css_modules_project_discovers_css_module_files() {
     );
 }
 
-// ── Production mode ──────────────────────────────────────────────
-
 #[test]
 fn list_production_mode_flag_accepted() {
-    // Verify that --production flag doesn't cause errors
     let output = run_list(
         "basic-project",
         &["--production", "--files", "--format", "json"],
@@ -821,8 +905,6 @@ fn list_production_mode_flag_accepted() {
         "should still list files in production mode"
     );
 }
-
-// ── Invalid root ─────────────────────────────────────────────────
 
 #[test]
 fn list_invalid_root_returns_error() {
@@ -842,8 +924,6 @@ fn list_invalid_root_returns_error() {
     );
 }
 
-// ── JSON is valid ────────────────────────────────────────────────
-
 #[test]
 fn list_json_output_is_valid_json_object() {
     let output = run_list("basic-project", &["--format", "json"]);
@@ -853,24 +933,18 @@ fn list_json_output_is_valid_json_object() {
     assert!(json.is_object(), "JSON output should be an object");
 }
 
-// ── Empty plugins list ───────────────────────────────────────────
-
 #[test]
 fn list_project_without_known_plugins_has_empty_or_minimal_plugins() {
-    // detect-config has react but not any major framework
     let output = run_list("detect-config", &["--plugins", "--format", "json"]);
     assert_eq!(output.code, 0);
 
     let json = parse_json(&output);
-    // The project doesn't have any framework deps, but plugins is still an array
     let plugins = json["plugins"].as_array();
     assert!(
         plugins.is_some(),
         "plugins should always be an array, even if empty-ish"
     );
 }
-
-// ── Multiple entry point sources in one project ──────────────────
 
 #[test]
 fn list_workspace_project_entry_points_have_varied_sources() {
@@ -884,18 +958,14 @@ fn list_workspace_project_entry_points_have_varied_sources() {
         .map(|ep| ep["source"].as_str().unwrap())
         .collect();
 
-    // workspace-project has multiple entry point sources
     assert!(
         sources.len() > 1,
         "workspace-project should have multiple entry points. Got: {sources:?}"
     );
 }
 
-// ── Nextjs plugin-discovered entry points ────────────────────────
-
 #[test]
 fn list_nextjs_project_app_page_is_plugin_entry_point() {
-    // Must use show_all mode (no flags) to get plugin-discovered entry points
     let output = run_list("nextjs-project", &["--format", "json"]);
     let json = parse_json(&output);
 
@@ -914,4 +984,358 @@ fn list_nextjs_project_app_page_is_plugin_entry_point() {
         source, "nextjs",
         "page.tsx should be discovered by nextjs plugin. Got source: {source}"
     );
+}
+
+#[test]
+fn list_files_includes_plugin_scoped_hidden_dirs_for_react_router() {
+    let output = run_list("react-router-conventions", &["--files", "--format", "json"]);
+    assert_eq!(output.code, 0, "stderr was: {}", output.stderr);
+
+    let json = parse_json(&output);
+    let files: Vec<&str> = json["files"]
+        .as_array()
+        .expect("files array")
+        .iter()
+        .map(|v| v.as_str().expect("file path string"))
+        .collect();
+
+    assert!(
+        files.contains(&"app/.client/analytics.ts"),
+        "expected app/.client/analytics.ts in files: {files:?}"
+    );
+    assert!(
+        files.contains(&"app/.server/db.ts"),
+        "expected app/.server/db.ts in files: {files:?}"
+    );
+}
+
+#[test]
+fn list_files_includes_plugin_scoped_hidden_dirs_for_remix() {
+    let output = run_list("remix-conventions", &["--files", "--format", "json"]);
+    assert_eq!(output.code, 0, "stderr was: {}", output.stderr);
+
+    let json = parse_json(&output);
+    let files: Vec<&str> = json["files"]
+        .as_array()
+        .expect("files array")
+        .iter()
+        .map(|v| v.as_str().expect("file path string"))
+        .collect();
+
+    assert!(
+        files.contains(&"app/.client/analytics.ts"),
+        "expected app/.client/analytics.ts in files: {files:?}"
+    );
+    assert!(
+        files.contains(&"app/.server/db.ts"),
+        "expected app/.server/db.ts in files: {files:?}"
+    );
+}
+
+/// Issue #2366 follow-up: the `fallow workspaces` / `fallow list --workspaces`
+/// envelope has no post-serialization root-prefix strip, so its
+/// `workspace_diagnostics[].path` used to be the only absolute path in any
+/// fallow JSON envelope while the `workspaces[].path` next to it was relative.
+#[test]
+fn list_workspaces_json_emits_project_relative_diagnostic_paths() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let root = dir.path();
+    fs::create_dir_all(root.join("packages/inner/src")).expect("create inner package dir");
+    fs::create_dir_all(root.join("src")).expect("create source dir");
+    fs::write(
+        root.join("package.json"),
+        r#"{"name":"undeclared-workspace-root","private":true,"workspaces":["packages/declared"]}"#,
+    )
+    .expect("write root manifest");
+    fs::write(
+        root.join("packages/inner/package.json"),
+        r#"{"name":"inner-pkg","version":"1.0.0"}"#,
+    )
+    .expect("write inner manifest");
+    fs::write(root.join("src/index.ts"), "export const value = 1;\n").expect("write source");
+    fs::write(
+        root.join("packages/inner/src/index.ts"),
+        "export const inner = 2;\n",
+    )
+    .expect("write inner source");
+
+    for subcommand in ["list", "workspaces"] {
+        let args: Vec<&str> = if subcommand == "list" {
+            vec!["list", "--workspaces", "--format", "json", "--quiet"]
+        } else {
+            vec!["workspaces", "--format", "json", "--quiet"]
+        };
+        let output = run_fallow_combined_in_root(root, &args);
+        assert_eq!(output.code, 0, "stderr: {}", output.stderr);
+
+        let json = parse_json(&output);
+        let diagnostics = json["workspace_diagnostics"]
+            .as_array()
+            .expect("workspace_diagnostics array");
+        let path = diagnostics
+            .iter()
+            .find(|entry| entry["kind"] == "undeclared-workspace")
+            .expect("the undeclared workspace is reported")["path"]
+            .as_str()
+            .expect("diagnostic path string");
+        assert_eq!(
+            path, "packages/inner",
+            "`fallow {subcommand}` must emit a project-relative diagnostic path, got {path}"
+        );
+    }
+}
+
+/// Issue #2366: bare `fallow list --format json` reads the engine session's
+/// diagnostics snapshot, whose fold is keyed on the whole diagnostic kind
+/// rather than its id. Two overlapping workspace globs report the same
+/// package-less directory once per `pattern`, and bare `list` used to collapse
+/// them into one while `list --workspaces`, which reads the workspace value
+/// directly, reported both. Pin the agreement between the two.
+#[test]
+fn list_json_keeps_both_overlapping_glob_diagnostics() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let root = dir.path();
+    fs::create_dir_all(root.join("pkgs/aaa")).expect("create package-less dir");
+    fs::create_dir_all(root.join("src")).expect("create source dir");
+    fs::write(
+        root.join("package.json"),
+        r#"{"name":"overlapping-glob-root","private":true,"workspaces":["pkgs/*","pkgs/a*"]}"#,
+    )
+    .expect("write root manifest");
+    fs::write(root.join("src/index.ts"), "export const value = 1;\n").expect("write source");
+    fs::write(root.join("pkgs/aaa/readme.txt"), "no package.json here\n").expect("write filler");
+
+    for args in [
+        ["list", "--format", "json", "--quiet"].as_slice(),
+        ["list", "--workspaces", "--format", "json", "--quiet"].as_slice(),
+    ] {
+        let output = run_fallow_combined_in_root(root, args);
+        assert_eq!(output.code, 0, "stderr: {}", output.stderr);
+
+        let json = parse_json(&output);
+        let patterns: Vec<String> = json["workspace_diagnostics"]
+            .as_array()
+            .map(|diagnostics| {
+                diagnostics
+                    .iter()
+                    .filter(|entry| entry["kind"] == "glob-matched-no-package-json")
+                    .map(|entry| entry["pattern"].as_str().unwrap_or_default().to_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(
+            patterns,
+            ["pkgs/*", "pkgs/a*"],
+            "`fallow {args:?}` reports the directory once per matching glob: {}",
+            json["workspace_diagnostics"]
+        );
+    }
+}
+
+/// Build the issue-2366 repository shape: one glob declared in both
+/// `package.json` (spelled `./pkgs/*`) and `pnpm-workspace.yaml` (spelled
+/// `pkgs/*`), over two directories that carry no `package.json`.
+fn write_two_manifest_glob_project(root: &std::path::Path) {
+    fs::create_dir_all(root.join("pkgs/aaa")).expect("create first package-less dir");
+    fs::create_dir_all(root.join("pkgs/bbb")).expect("create second package-less dir");
+    fs::create_dir_all(root.join("src")).expect("create source dir");
+    fs::write(
+        root.join("package.json"),
+        r#"{"name":"two-manifest-root","private":true,"workspaces":["./pkgs/*"]}"#,
+    )
+    .expect("write root manifest");
+    fs::write(
+        root.join("pnpm-workspace.yaml"),
+        "packages:\n  - \"pkgs/*\"\n",
+    )
+    .expect("write pnpm workspace manifest");
+    fs::write(root.join("src/index.ts"), "export const value = 1;\n").expect("write source");
+    fs::write(root.join("pkgs/aaa/readme.txt"), "no package.json here\n").expect("write filler");
+    fs::write(root.join("pkgs/bbb/readme.txt"), "no package.json here\n").expect("write filler");
+}
+
+/// Issue #2366: `package.json` `workspaces` and `pnpm-workspace.yaml`
+/// `packages` are additive, so one glob declared in both is walked twice.
+/// Every envelope that carries `workspace_diagnostics[]` must report one entry
+/// per distinct matching pattern, with the same project-relative path shape,
+/// whichever manifest happened to be read first.
+#[test]
+fn every_envelope_reports_one_entry_per_directory_for_a_glob_in_two_manifests() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let root = dir.path();
+    write_two_manifest_glob_project(root);
+
+    for args in [
+        ["--format", "json", "--quiet"].as_slice(),
+        ["--skip", "check", "--format", "json", "--quiet"].as_slice(),
+        ["--only", "health", "--format", "json", "--quiet"].as_slice(),
+        ["dead-code", "--format", "json", "--quiet"].as_slice(),
+        ["check", "--format", "json", "--quiet"].as_slice(),
+        ["health", "--format", "json", "--quiet"].as_slice(),
+        ["dupes", "--format", "json", "--quiet"].as_slice(),
+        ["list", "--format", "json", "--quiet"].as_slice(),
+        ["list", "--workspaces", "--format", "json", "--quiet"].as_slice(),
+        ["workspaces", "--format", "json", "--quiet"].as_slice(),
+    ] {
+        let output = run_fallow_combined_in_root(root, args);
+        assert_eq!(output.code, 0, "stderr: {}", output.stderr);
+
+        let json = parse_json(&output);
+        let reported: Vec<(String, String)> = json["workspace_diagnostics"]
+            .as_array()
+            .expect("workspace_diagnostics array")
+            .iter()
+            .map(|entry| {
+                (
+                    entry["pattern"].as_str().unwrap_or_default().to_owned(),
+                    entry["path"].as_str().unwrap_or_default().to_owned(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            reported,
+            vec![
+                ("pkgs/*".to_owned(), "pkgs/aaa".to_owned()),
+                ("pkgs/*".to_owned(), "pkgs/bbb".to_owned()),
+            ],
+            "`fallow {args:?}` reports each directory once, project-relative: {}",
+            json["workspace_diagnostics"]
+        );
+    }
+}
+
+/// The aggregated stderr warning is built from the same list, so a duplicated
+/// entry makes it claim a directory count the repository does not have and
+/// name one directory twice among its examples.
+#[test]
+fn two_manifest_glob_warning_names_the_true_directory_count_once_each() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let root = dir.path();
+    write_two_manifest_glob_project(root);
+
+    let output = Command::new(fallow_bin())
+        .arg("--root")
+        .arg(root)
+        .args(["workspaces", "--format", "json"])
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("failed to run fallow binary");
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    let warnings: Vec<&str> = stderr
+        .lines()
+        .filter(|line| line.contains("no package.json"))
+        .collect();
+    assert_eq!(
+        warnings.len(),
+        1,
+        "one glob is one summary line, whichever manifests declare it: {stderr}"
+    );
+    assert!(
+        warnings[0].contains(
+            "Glob 'pkgs/*' matched 2 directories with no package.json \
+             (e.g. pkgs/aaa, pkgs/bbb)"
+        ),
+        "the summary counts the directories once each: {}",
+        warnings[0]
+    );
+}
+
+/// The human workspace listing renders the same list as the JSON envelope, so
+/// the deduplication moves it too: its header counts the entries and its body
+/// prints one line each. This is the non-JSON surface the change reaches, and
+/// the CHANGELOG names it next to the aggregated warning.
+#[test]
+fn two_manifest_glob_human_listing_prints_each_directory_once() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let root = dir.path();
+    write_two_manifest_glob_project(root);
+
+    let output = run_fallow_combined_in_root(root, &["workspaces"]);
+    assert_eq!(output.code, 0, "stderr: {}", output.stderr);
+
+    assert!(
+        output.stderr.contains("2 workspace discovery diagnostics:"),
+        "the block header counts the deduplicated entries: {}",
+        output.stderr
+    );
+    let entries: Vec<&str> = output
+        .stderr
+        .lines()
+        .filter(|line| line.trim_start().starts_with("- Glob "))
+        .collect();
+    assert_eq!(
+        entries.len(),
+        2,
+        "one line per directory, not one per manifest that declares the glob: {}",
+        output.stderr
+    );
+    for (entry, directory) in entries.iter().zip(["pkgs/aaa", "pkgs/bbb"]) {
+        assert!(
+            entry.contains(&format!("Glob 'pkgs/*' matched '{directory}'")),
+            "the block quotes the canonical glob spelling: {entry}"
+        );
+    }
+}
+
+/// Issue #2366: the `./` normalisation is independent of the deduplication.
+/// A repository that declares one glob, once, in one manifest still reports a
+/// different `pattern`, `path`, and `message` than before when that glob is
+/// spelled with a leading `./`, on the standalone envelopes as well. The
+/// CHANGELOG names this as one of the two shapes that move them, so pin it
+/// separately from the two-manifest fixture where the fold is also at work.
+#[test]
+fn a_dotted_glob_declared_once_reports_the_undotted_spelling_everywhere() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let root = dir.path();
+    fs::create_dir_all(root.join("pkgs/aaa")).expect("create package-less dir");
+    fs::create_dir_all(root.join("src")).expect("create source dir");
+    fs::write(
+        root.join("package.json"),
+        r#"{"name":"dotted-glob-root","private":true,"workspaces":["./pkgs/*"]}"#,
+    )
+    .expect("write root manifest");
+    fs::write(root.join("src/index.ts"), "export const value = 1;\n").expect("write source");
+    fs::write(root.join("pkgs/aaa/readme.txt"), "no package.json here\n").expect("write filler");
+
+    for args in [
+        ["dead-code", "--format", "json", "--quiet"].as_slice(),
+        ["check", "--format", "json", "--quiet"].as_slice(),
+        ["health", "--format", "json", "--quiet"].as_slice(),
+        ["dupes", "--format", "json", "--quiet"].as_slice(),
+        ["list", "--format", "json", "--quiet"].as_slice(),
+        ["list", "--workspaces", "--format", "json", "--quiet"].as_slice(),
+        ["workspaces", "--format", "json", "--quiet"].as_slice(),
+        ["--format", "json", "--quiet"].as_slice(),
+    ] {
+        let output = run_fallow_combined_in_root(root, args);
+        assert_eq!(output.code, 0, "stderr: {}", output.stderr);
+
+        let json = parse_json(&output);
+        let diagnostics = json["workspace_diagnostics"]
+            .as_array()
+            .expect("workspace_diagnostics array");
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "`fallow {args:?}` reports the one matched directory once: {}",
+            json["workspace_diagnostics"]
+        );
+        assert_eq!(
+            diagnostics[0]["pattern"], "pkgs/*",
+            "`fallow {args:?}` drops the no-op `./` prefix from the pattern"
+        );
+        assert_eq!(
+            diagnostics[0]["path"], "pkgs/aaa",
+            "`fallow {args:?}` drops the matching no-op `.` component from the path"
+        );
+        assert!(
+            diagnostics[0]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("Glob 'pkgs/*' matched 'pkgs/aaa'"),
+            "`fallow {args:?}` quotes the canonical spelling in the message: {}",
+            diagnostics[0]["message"]
+        );
+    }
 }

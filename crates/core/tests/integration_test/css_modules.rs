@@ -9,7 +9,7 @@ fn css_modules_exports_tracked() {
     let unused_file_names: Vec<String> = results
         .unused_files
         .iter()
-        .filter_map(|f| f.path.file_name())
+        .filter_map(|f| f.file.path.file_name())
         .filter_map(|n| n.to_str())
         .map(ToString::to_string)
         .collect();
@@ -29,7 +29,7 @@ fn css_modules_exports_tracked() {
     let unused_export_names: Vec<&str> = results
         .unused_exports
         .iter()
-        .map(|e| e.export_name.as_str())
+        .map(|e| e.export.export_name.as_str())
         .collect();
     assert!(
         unused_export_names.contains(&"sidebar"),

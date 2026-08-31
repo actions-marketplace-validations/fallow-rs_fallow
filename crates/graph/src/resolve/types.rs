@@ -1,24 +1,156 @@
 //! Type definitions and constants for import resolution.
 
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
+use dashmap::DashMap;
 use oxc_resolver::Resolver;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
+use serde_json::Value;
 
 use fallow_types::discover::FileId;
 
 /// Result of resolving an import specifier.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum ResolveResult {
     /// Resolved to a file within the project.
     InternalModule(FileId),
+    /// Resolved from a CommonJS `require()` to a file within the project.
+    CommonJsInternalModule(FileId),
+    /// Resolved to a project file through a framework convention auto-import.
+    SyntheticAutoImport(FileId),
+    /// Resolved to a workspace or self package source file while preserving
+    /// dependency usage for package accounting.
+    InternalPackageModule {
+        /// Internal source file reached by the package map.
+        file_id: FileId,
+        /// Package name that was used in the import specifier.
+        package_name: String,
+    },
+    /// Resolved from a CommonJS `require()` to workspace or self-package source.
+    CommonJsInternalPackageModule {
+        /// Internal source file reached by the package map.
+        file_id: FileId,
+        /// Package name used in the require specifier.
+        package_name: String,
+    },
     /// Resolved to a file outside the project (`node_modules`, `.json`, etc.).
     ExternalFile(PathBuf),
     /// Bare specifier — an npm package.
     NpmPackage(String),
+    /// Bare npm package referenced through CommonJS `require()`.
+    CommonJsNpmPackage(String),
     /// Could not resolve.
     Unresolvable(String),
+}
+
+impl ResolveResult {
+    /// Return the target file for any project-internal result.
+    #[must_use]
+    pub const fn internal_file_id(&self) -> Option<FileId> {
+        match self {
+            Self::InternalModule(file_id)
+            | Self::CommonJsInternalModule(file_id)
+            | Self::SyntheticAutoImport(file_id)
+            | Self::InternalPackageModule { file_id, .. }
+            | Self::CommonJsInternalPackageModule { file_id, .. } => Some(*file_id),
+            Self::ExternalFile(_)
+            | Self::NpmPackage(_)
+            | Self::CommonJsNpmPackage(_)
+            | Self::Unresolvable(_) => None,
+        }
+    }
+
+    /// Return whether this edge was synthesized from framework auto-import conventions.
+    #[must_use]
+    pub const fn is_synthetic_auto_import(&self) -> bool {
+        matches!(self, Self::SyntheticAutoImport(_))
+    }
+
+    /// Return whether this edge originated from CommonJS `require()`.
+    #[must_use]
+    pub const fn is_commonjs_require(&self) -> bool {
+        matches!(
+            self,
+            Self::CommonJsInternalModule(_)
+                | Self::CommonJsInternalPackageModule { .. }
+                | Self::CommonJsNpmPackage(_)
+        )
+    }
+
+    /// Return whether this target is an unresolved bare package edge.
+    #[must_use]
+    pub const fn is_bare_package(&self) -> bool {
+        matches!(self, Self::NpmPackage(_) | Self::CommonJsNpmPackage(_))
+    }
+
+    /// Retain CommonJS provenance on targets that can participate in upgrades.
+    #[must_use]
+    pub fn into_commonjs_require(self) -> Self {
+        match self {
+            Self::InternalModule(file_id) => Self::CommonJsInternalModule(file_id),
+            Self::InternalPackageModule {
+                file_id,
+                package_name,
+            } => Self::CommonJsInternalPackageModule {
+                file_id,
+                package_name,
+            },
+            Self::NpmPackage(package_name) => Self::CommonJsNpmPackage(package_name),
+            other => other,
+        }
+    }
+
+    /// Remove CommonJS provenance while preserving the resolved destination.
+    #[must_use]
+    pub fn into_es_module(self) -> Self {
+        match self {
+            Self::CommonJsInternalModule(file_id) => Self::InternalModule(file_id),
+            Self::CommonJsInternalPackageModule {
+                file_id,
+                package_name,
+            } => Self::InternalPackageModule {
+                file_id,
+                package_name,
+            },
+            Self::CommonJsNpmPackage(package_name) => Self::NpmPackage(package_name),
+            other => other,
+        }
+    }
+
+    /// Return the package name that should receive dependency usage credit.
+    #[must_use]
+    pub fn package_usage_name(&self) -> Option<&str> {
+        match self {
+            Self::InternalPackageModule { package_name, .. }
+            | Self::CommonJsInternalPackageModule { package_name, .. }
+            | Self::NpmPackage(package_name)
+            | Self::CommonJsNpmPackage(package_name) => Some(package_name),
+            Self::InternalModule(_)
+            | Self::CommonJsInternalModule(_)
+            | Self::SyntheticAutoImport(_)
+            | Self::ExternalFile(_)
+            | Self::Unresolvable(_) => None,
+        }
+    }
+}
+
+/// Resolver output for one extracted project.
+#[derive(Debug, Default)]
+pub struct ResolvedProject {
+    /// Modules with every ordinary import and re-export resolved.
+    pub modules: Vec<ResolvedModule>,
+    /// Proven test-time replacements whose targets resolve inside the project.
+    pub replaced_module_targets: Vec<ResolvedReplacedModuleTarget>,
+}
+
+/// One project-internal module replacement resolved from its declaring source file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedReplacedModuleTarget {
+    /// File that declares the replacement fact.
+    pub source_file: FileId,
+    /// Project file replaced for this source's test-root traversal.
+    pub target_file: FileId,
 }
 
 /// A resolved import with its target.
@@ -39,7 +171,78 @@ pub struct ResolvedReExport {
     pub target: ResolveResult,
 }
 
+/// Any source-bearing module edge that resolves one literal specifier.
+pub enum ResolvedSourceEdge<'a> {
+    /// Static or literal dynamic import edge.
+    Import(&'a ResolvedImport),
+    /// Re-export source edge.
+    ReExport(&'a ResolvedReExport),
+}
+
+impl<'a> ResolvedSourceEdge<'a> {
+    /// Return the original source specifier.
+    #[must_use]
+    pub fn source_specifier(&self) -> &'a str {
+        match self {
+            Self::Import(import) => &import.info.source,
+            Self::ReExport(re_export) => &re_export.info.source,
+        }
+    }
+
+    /// Return the resolved target.
+    #[must_use]
+    pub const fn target(&self) -> &'a ResolveResult {
+        match self {
+            Self::Import(import) => &import.target,
+            Self::ReExport(re_export) => &re_export.target,
+        }
+    }
+
+    /// Return whether this edge is type-only.
+    #[must_use]
+    pub const fn is_type_only(&self) -> bool {
+        match self {
+            Self::Import(import) => import.info.is_type_only,
+            Self::ReExport(re_export) => re_export.info.is_type_only,
+        }
+    }
+
+    /// Return the span of the full import or re-export declaration.
+    #[must_use]
+    pub const fn span(&self) -> oxc_span::Span {
+        match self {
+            Self::Import(import) => import.info.span,
+            Self::ReExport(re_export) => re_export.info.span,
+        }
+    }
+
+    /// Return the source literal span when the extractor has one.
+    #[must_use]
+    pub const fn source_span(&self) -> oxc_span::Span {
+        match self {
+            Self::Import(import) => import.info.source_span,
+            Self::ReExport(re_export) => re_export.info.source_span,
+        }
+    }
+
+    /// Return the span of the enclosing statement.
+    ///
+    /// Imports do not record a statement span, so their per-binding
+    /// declaration span is the closest available statement anchor.
+    #[must_use]
+    pub const fn statement_span(&self) -> oxc_span::Span {
+        match self {
+            Self::Import(import) => import.info.span,
+            Self::ReExport(re_export) => re_export.info.statement_span,
+        }
+    }
+}
+
 /// Fully resolved module with all imports mapped to targets.
+///
+/// The `Arc<[T]>` fields are refcounted views of the same allocations owned by
+/// the source [`fallow_types::extract::ModuleInfo`], not copies; see the note
+/// on that struct.
 #[derive(Debug)]
 pub struct ResolvedModule {
     /// Unique file identifier.
@@ -47,7 +250,7 @@ pub struct ResolvedModule {
     /// Absolute path to the module file.
     pub path: PathBuf,
     /// All export declarations in this module.
-    pub exports: Vec<fallow_types::extract::ExportInfo>,
+    pub exports: Arc<[fallow_types::extract::ExportInfo]>,
     /// All re-exports with resolved targets.
     pub re_exports: Vec<ResolvedReExport>,
     /// All static imports with resolved targets.
@@ -57,17 +260,38 @@ pub struct ResolvedModule {
     /// Dynamic import patterns matched against discovered files.
     pub resolved_dynamic_patterns: Vec<(fallow_types::extract::DynamicImportPattern, Vec<FileId>)>,
     /// Static member accesses (e.g., `Status.Active`).
-    pub member_accesses: Vec<fallow_types::extract::MemberAccess>,
+    pub member_accesses: Arc<[fallow_types::extract::MemberAccess]>,
+    /// Typed semantic facts produced by extraction for cross-layer analysis.
+    pub semantic_facts: Arc<[fallow_types::extract::SemanticFact]>,
     /// Identifiers used as whole objects (Object.values, for..in, spread, etc.).
-    pub whole_object_uses: Vec<String>,
+    pub whole_object_uses: Arc<[String]>,
     /// Whether this module uses `CommonJS` exports.
     pub has_cjs_exports: bool,
+    /// Whether this module declares at least one Angular `@Component({
+    /// templateUrl: ... })` decorator. Mirrors `ModuleInfo.has_angular_component_template_url`;
+    /// see that field for the contract this gate enforces.
+    pub has_angular_component_template_url: bool,
     /// Local names of import bindings that are never referenced in this file.
     pub unused_import_bindings: FxHashSet<String>,
     /// Local import bindings referenced from type positions.
     pub type_referenced_import_bindings: Vec<String>,
     /// Local import bindings referenced from runtime/value positions.
     pub value_referenced_import_bindings: Vec<String>,
+    /// Namespace-import aliases re-exported through an object literal.
+    /// See `fallow_types::extract::NamespaceObjectAlias` for the shape.
+    pub namespace_object_aliases: Vec<fallow_types::extract::NamespaceObjectAlias>,
+    /// Exported free-function factories that provably return one class instance.
+    /// See `fallow_types::extract::FactoryReturnExport` and issue #1441 (Part A).
+    pub exported_factory_returns: Arc<[fallow_types::extract::FactoryReturnExport]>,
+    /// Object-literal factory-return shapes (`export function createUi() {
+    /// return { orders: factory.ordersPage } }`), threaded from `ModuleInfo` for
+    /// the analyze-layer member-crediting join. See issue #1858.
+    pub exported_factory_return_object_shapes:
+        Arc<[fallow_types::extract::FactoryReturnObjectShapeExport]>,
+    /// Named-type property types declared by this module's top-level interfaces
+    /// and type-literal aliases. See `fallow_types::extract::TypeMemberTypeEntry`
+    /// and issue #1785.
+    pub type_member_types: Arc<[fallow_types::extract::TypeMemberTypeEntry]>,
 }
 
 impl Default for ResolvedModule {
@@ -75,18 +299,54 @@ impl Default for ResolvedModule {
         Self {
             file_id: FileId(0),
             path: PathBuf::new(),
-            exports: vec![],
+            exports: Arc::default(),
             re_exports: vec![],
             resolved_imports: vec![],
             resolved_dynamic_imports: vec![],
             resolved_dynamic_patterns: vec![],
-            member_accesses: vec![],
-            whole_object_uses: vec![],
+            member_accesses: Arc::default(),
+            semantic_facts: Arc::default(),
+            whole_object_uses: Arc::default(),
             has_cjs_exports: false,
+            has_angular_component_template_url: false,
             unused_import_bindings: FxHashSet::default(),
             type_referenced_import_bindings: vec![],
             value_referenced_import_bindings: vec![],
+            namespace_object_aliases: vec![],
+            exported_factory_returns: Arc::default(),
+            exported_factory_return_object_shapes: Arc::default(),
+            type_member_types: Arc::default(),
         }
+    }
+}
+
+impl ResolvedModule {
+    /// Iterate over all concrete resolved imports in source order buckets.
+    ///
+    /// Includes static `import`/`require` edges and literal dynamic `import()`
+    /// edges. Dynamic import patterns are intentionally excluded because they
+    /// resolve to sets of files rather than single import specifiers.
+    pub fn all_resolved_imports(&self) -> impl Iterator<Item = &ResolvedImport> {
+        self.resolved_imports
+            .iter()
+            .chain(self.resolved_dynamic_imports.iter())
+    }
+
+    /// Iterate over every literal source edge that has one resolved target.
+    ///
+    /// Includes static imports, literal dynamic imports, and re-export sources.
+    /// Dynamic import patterns are excluded because they resolve to sets of
+    /// files rather than single import specifiers.
+    pub fn all_resolved_source_edges(&self) -> impl Iterator<Item = ResolvedSourceEdge<'_>> {
+        self.resolved_imports
+            .iter()
+            .map(ResolvedSourceEdge::Import)
+            .chain(
+                self.resolved_dynamic_imports
+                    .iter()
+                    .map(ResolvedSourceEdge::Import),
+            )
+            .chain(self.re_exports.iter().map(ResolvedSourceEdge::ReExport))
     }
 }
 
@@ -97,18 +357,34 @@ impl Default for ResolvedModule {
 pub(super) struct ResolveContext<'a> {
     /// The oxc_resolver instance (configured once, shared across threads).
     pub resolver: &'a Resolver,
+    /// CSS-only resolver with package.json `sass` and `style` conditions enabled.
+    /// Used only for stylesheet package subpaths so JS/TS imports do not
+    /// accidentally prefer CSS export branches.
+    pub style_resolver: &'a Resolver,
+    /// Ordered extension list used by the resolver.
+    pub extensions: &'a [String],
     /// Canonical path → FileId lookup (raw paths when root is canonical).
     pub path_to_id: &'a FxHashMap<&'a Path, FileId>,
     /// Raw (non-canonical) path → FileId lookup.
     pub raw_path_to_id: &'a FxHashMap<&'a Path, FileId>,
     /// Workspace name → canonical root path.
     pub workspace_roots: &'a FxHashMap<&'a str, &'a Path>,
+    /// Package manifests for the root package and workspace packages.
+    pub package_manifests: &'a [PackageManifestInfo],
+    /// Whether any package scope declared a Deno import map; false skips map
+    /// lookup per import.
+    pub has_deno_import_maps: bool,
+    /// Ordered package condition names matching the resolver configuration.
+    pub condition_names: &'a [String],
     /// Plugin-provided path aliases (prefix, replacement).
     pub path_aliases: &'a [(String, String)],
     /// Absolute directories to search when resolving bare SCSS/Sass
     /// `@import` / `@use` specifiers. Populated from Angular's
     /// `stylePreprocessorOptions.includePaths` and equivalent settings.
     pub scss_include_paths: &'a [PathBuf],
+    /// Static directory URL mappings from framework config.
+    /// Each tuple is `(absolute_source_dir, normalized_url_mount)`.
+    pub static_dir_mappings: &'a [(PathBuf, String)],
     /// Project root directory.
     pub root: &'a Path,
     /// Lazy canonical path → FileId fallback for intra-project symlinks.
@@ -120,6 +396,100 @@ pub(super) struct ResolveContext<'a> {
     /// warning per affected file. Shared across all parallel resolver
     /// threads via `Mutex`. Empty and unused when no tsconfig errors occur.
     pub tsconfig_warned: &'a Mutex<FxHashSet<String>>,
+    /// Per-analysis cache for local tsconfig discovery and JSON parsing.
+    /// Import resolution calls these fallbacks for every unresolved or
+    /// tsconfig-poisoned specifier, so keeping it session-local avoids
+    /// repeated filesystem work without risking stale data across runs.
+    pub tsconfig_cache: &'a TsconfigCache,
+    /// Per-analysis cache of `dunce::canonicalize` results keyed by resolved
+    /// path. Every import resolving to a `node_modules` / output-dir / symlinked
+    /// target is realpath'd during classification, and the same package path is
+    /// re-canonicalized for every file that imports the package. The result is a
+    /// pure function of the path's on-disk state (constant within a run), so the
+    /// cache is session-local for watch-mode safety.
+    pub canonicalize_cache: &'a CanonicalizeCache,
+}
+
+/// Session-local cache of `dunce::canonicalize` results keyed by input path.
+#[derive(Default)]
+pub(super) struct CanonicalizeCache {
+    map: DashMap<PathBuf, Option<PathBuf>, FxBuildHasher>,
+}
+
+impl CanonicalizeCache {
+    /// Return the cached `dunce::canonicalize(path)` outcome, computing it on
+    /// first miss. `None` (a path that fails to canonicalize) is cached too so a
+    /// repeated probe of the same missing path does not re-issue the syscall.
+    pub fn get(&self, path: &Path) -> Option<PathBuf> {
+        if let Some(value) = self.map.get(path) {
+            return value.clone();
+        }
+        let value = dunce::canonicalize(path).ok();
+        self.map.insert(path.to_path_buf(), value.clone());
+        value
+    }
+}
+
+/// Session-local cache for tsconfig helper lookups used during import resolution.
+#[derive(Default)]
+pub(super) struct TsconfigCache {
+    json: DashMap<PathBuf, Option<Arc<Value>>, FxBuildHasher>,
+    chains: DashMap<PathBuf, Arc<[PathBuf]>, FxBuildHasher>,
+}
+
+impl TsconfigCache {
+    /// Return a cached parsed tsconfig JSON value, loading it on first miss.
+    ///
+    /// Handing back an [`Arc`] rather than a clone matters: a tsconfig chain is
+    /// walked several times per import specifier, and deep-copying every parsed
+    /// document on each hop dominated resolution on large project-reference
+    /// graphs.
+    pub fn json(
+        &self,
+        path: &Path,
+        load: impl FnOnce(&Path) -> Option<Value>,
+    ) -> Option<Arc<Value>> {
+        if let Some(value) = self.json.get(path) {
+            return value.clone();
+        }
+
+        let value = load(path).map(Arc::new);
+        self.json.insert(path.to_path_buf(), value.clone());
+        value
+    }
+
+    /// Return the cached tsconfig chain for a source file, if one exists.
+    pub fn chain(&self, from_file: &Path) -> Option<Arc<[PathBuf]>> {
+        self.chains.get(from_file).map(|entry| Arc::clone(&entry))
+    }
+
+    /// Store the computed tsconfig chain for a source file.
+    pub fn store_chain(&self, from_file: &Path, chain: Arc<[PathBuf]>) {
+        self.chains.insert(from_file.to_path_buf(), chain);
+    }
+}
+
+/// Package manifest data used by source fallbacks.
+#[derive(Debug, Clone)]
+pub(super) struct PackageManifestInfo {
+    /// Package root path as discovered from the workspace tree.
+    pub root: PathBuf,
+    /// Canonical package root path for node_modules symlink comparisons.
+    pub canonical_root: PathBuf,
+    /// Parsed package name.
+    pub name: Option<String>,
+    /// Parsed package.json fields.
+    pub package_json: fallow_config::PackageJson,
+    /// Effective Deno import map for this package scope.
+    pub deno_import_map: Vec<DenoImportMapEntry>,
+}
+
+/// One effective Deno import-map entry with the directory that declared it.
+#[derive(Debug, Clone)]
+pub(super) struct DenoImportMapEntry {
+    pub key: String,
+    pub target: String,
+    pub declaring_dir: PathBuf,
 }
 
 /// Thread-safe lazy canonical path index, built on first access.
@@ -140,7 +510,7 @@ impl<'a> CanonicalFallback<'a> {
     pub fn get(&self, canonical: &Path) -> Option<FileId> {
         let map = self.map.get_or_init(|| {
             tracing::debug!(
-                "intra-project symlinks detected — building canonical path index ({} files)",
+                "intra-project symlinks detected, building canonical path index ({} files)",
                 self.files.len()
             );
             self.files
@@ -185,7 +555,6 @@ mod tests {
         let canonical = dunce::canonicalize(&test_file).unwrap();
         assert_eq!(fallback.get(&canonical), Some(FileId(42)));
 
-        // Second call uses cached map (OnceLock)
         assert_eq!(fallback.get(&canonical), Some(FileId(42)));
 
         let _ = std::fs::remove_dir_all(&temp);
@@ -207,6 +576,112 @@ mod tests {
         assert!(fallback.get(Path::new("/nonexistent/file.ts")).is_none());
 
         let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn tsconfig_cache_loads_once_and_shares_the_parsed_document() {
+        let cache = TsconfigCache::default();
+        let path = Path::new("/project/tsconfig.json");
+        let loads = std::sync::atomic::AtomicUsize::new(0);
+        let load = |_: &Path| {
+            loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Some(serde_json::json!({ "compilerOptions": {} }))
+        };
+
+        let first = cache.json(path, load).unwrap();
+        let second = cache.json(path, load).unwrap();
+
+        assert_eq!(loads.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "repeat reads must share one allocation rather than deep-copy"
+        );
+    }
+
+    /// An unreadable tsconfig is cached as a miss so the read is not retried.
+    #[test]
+    fn tsconfig_cache_caches_a_failed_load() {
+        let cache = TsconfigCache::default();
+        let path = Path::new("/project/missing.json");
+        let loads = std::sync::atomic::AtomicUsize::new(0);
+        let load = |_: &Path| {
+            loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            None
+        };
+
+        assert!(cache.json(path, load).is_none());
+        assert!(cache.json(path, load).is_none());
+        assert_eq!(loads.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn tsconfig_cache_round_trips_a_chain() {
+        let cache = TsconfigCache::default();
+        let from_file = Path::new("/project/src/index.ts");
+        assert!(cache.chain(from_file).is_none());
+
+        let chain: Arc<[PathBuf]> = vec![PathBuf::from("/project/tsconfig.json")].into();
+        cache.store_chain(from_file, Arc::clone(&chain));
+
+        assert!(Arc::ptr_eq(&cache.chain(from_file).unwrap(), &chain));
+    }
+
+    /// Both caches are read concurrently by rayon workers during resolution.
+    #[test]
+    fn tsconfig_cache_is_consistent_under_concurrent_access() {
+        const THREADS: usize = 8;
+        const PATHS: usize = 32;
+
+        let cache = TsconfigCache::default();
+        std::thread::scope(|scope| {
+            for _ in 0..THREADS {
+                scope.spawn(|| {
+                    for index in 0..PATHS {
+                        let path = PathBuf::from(format!("/project/{index}/tsconfig.json"));
+                        let json = cache
+                            .json(&path, |_| Some(serde_json::json!({ "index": index })))
+                            .unwrap();
+                        assert_eq!(json["index"], index);
+                    }
+                });
+            }
+        });
+    }
+
+    #[test]
+    fn canonicalize_cache_returns_the_same_result_on_repeat_lookups() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let file = temp.path().join("file.ts");
+        std::fs::write(&file, "").unwrap();
+
+        let cache = CanonicalizeCache::default();
+        let expected = dunce::canonicalize(&file).ok();
+        assert_eq!(cache.get(&file), expected);
+        assert_eq!(cache.get(&file), expected);
+        assert!(cache.get(&temp.path().join("missing.ts")).is_none());
+    }
+
+    #[test]
+    fn commonjs_provenance_wraps_internal_and_bare_package_targets() {
+        assert!(matches!(
+            ResolveResult::InternalModule(FileId(4)).into_commonjs_require(),
+            ResolveResult::CommonJsInternalModule(FileId(4))
+        ));
+        assert!(matches!(
+            ResolveResult::InternalPackageModule {
+                file_id: FileId(5),
+                package_name: "pkg".to_string(),
+            }
+            .into_commonjs_require(),
+            ResolveResult::CommonJsInternalPackageModule {
+                file_id: FileId(5),
+                package_name,
+            } if package_name == "pkg"
+        ));
+        assert!(matches!(
+            ResolveResult::NpmPackage("pkg".to_string()).into_commonjs_require(),
+            ResolveResult::CommonJsNpmPackage(package_name) if package_name == "pkg"
+        ));
     }
 }
 

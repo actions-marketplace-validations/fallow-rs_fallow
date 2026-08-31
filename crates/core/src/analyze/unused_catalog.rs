@@ -1,0 +1,752 @@
+//! Detection of unused package manager catalog entries and unresolved references
+//! in workspace `package.json` files.
+//!
+//! pnpm 9+ supports two catalog forms in `pnpm-workspace.yaml`:
+//! - the top-level `catalog:` map ("default" catalog)
+//! - the top-level `catalogs:` map of named catalogs
+//!
+//! Bun supports matching catalog forms in root `package.json`, either under
+//! `workspaces.catalog` / `workspaces.catalogs` or top-level `catalog` /
+//! `catalogs`.
+//!
+//! Workspace packages reference catalog versions from their `dependencies` /
+//! `devDependencies` / `peerDependencies` / `optionalDependencies` via the
+//! `catalog:` protocol (`"react": "catalog:"`, `"old-react": "catalog:react17"`).
+//!
+//! Two findings are emitted:
+//!
+//! 1. **`unused-catalog-entries`**: a catalog entry no workspace `package.json`
+//!    references via the `catalog:` protocol. Also tracks `hardcoded_consumers`:
+//!    workspace packages declaring the same package with a non-`catalog:`
+//!    version range. Helps users decide whether to delete the catalog entry or
+//!    switch the consumers to `catalog:`.
+//!
+//! 2. **`unresolved-catalog-references`**: the inverse. A `package.json`
+//!    references a `catalog:` or `catalog:<name>` that does not declare the
+//!    consumed package. `pnpm install` errors with
+//!    the package manager install; fallow surfaces this statically before any
+//!    install runs. Each finding carries
+//!    `available_in_catalogs`: other catalogs in the same workspace that DO
+//!    declare the package, so consumers can flip the reference instead of
+//!    adding a new catalog entry. Suppression: `ignoreCatalogReferences`
+//!    config rules (per-package, optionally scoped by catalog name and/or
+//!    consumer glob).
+//!
+//! The default catalog can be referenced as either `catalog:` (bare) or
+//! `catalog:default`; both forms are treated as identical per the pnpm spec.
+
+use std::path::{Path, PathBuf};
+
+use fallow_config::{
+    CompiledIgnoreCatalogReferenceRule, PackageJson, PnpmCatalogData, ResolvedConfig,
+    WorkspaceDiagnostic, WorkspaceDiagnosticKind, WorkspaceInfo, parse_package_json_catalog_data,
+    parse_pnpm_catalog_data, record_workspace_diagnostics,
+};
+use fallow_types::results::{EmptyCatalogGroup, UnresolvedCatalogReference, UnusedCatalogEntry};
+use rustc_hash::FxHashSet;
+
+const PNPM_WORKSPACE_FILE: &str = "pnpm-workspace.yaml";
+const PACKAGE_JSON_FILE: &str = "package.json";
+
+/// Catalog analysis state: parsed catalog data and walked consumer references.
+/// Built once per analysis run so both detectors share parsing cost.
+pub struct PnpmCatalogState {
+    data: PnpmCatalogData,
+    consumers: CatalogConsumers,
+    source_path: PathBuf,
+}
+
+/// Read catalog declarations and walk workspace `package.json` files to build
+/// shared catalog analysis state. `pnpm-workspace.yaml` stays the preferred
+/// source when present; otherwise Bun-style root `package.json` catalogs are
+/// read from `workspaces.catalog` / `workspaces.catalogs`.
+pub fn gather_pnpm_catalog_state(
+    config: &ResolvedConfig,
+    workspaces: &[WorkspaceInfo],
+) -> Option<PnpmCatalogState> {
+    let yaml_path = config.root.join(PNPM_WORKSPACE_FILE);
+    let (data, source_path) = if let Ok(yaml_source) = std::fs::read_to_string(&yaml_path) {
+        let data = parse_pnpm_catalog_data(&yaml_source).unwrap_or_else(|error| {
+            report_malformed_pnpm_workspace_yaml(&config.root, &yaml_path, error);
+            PnpmCatalogData::default()
+        });
+        (data, PathBuf::from(PNPM_WORKSPACE_FILE))
+    } else {
+        let package_json_path = config.root.join(PACKAGE_JSON_FILE);
+        let package_json_source = std::fs::read_to_string(&package_json_path).ok()?;
+        let data = parse_package_json_catalog_data(&package_json_source);
+        if data.catalogs.is_empty() && data.empty_named_catalog_groups.is_empty() {
+            return None;
+        }
+        (data, PathBuf::from(PACKAGE_JSON_FILE))
+    };
+    let consumer_pkg_paths = collect_consumer_pkg_paths(config, workspaces);
+    let consumers = collect_catalog_consumers(&consumer_pkg_paths, &config.root);
+
+    Some(PnpmCatalogState {
+        data,
+        consumers,
+        source_path,
+    })
+}
+
+/// Record the degraded-continue diagnostic for a `pnpm-workspace.yaml` that
+/// exists but fails to parse: catalog and override analysis proceeds with no
+/// entries, and the cause surfaces in `workspace_diagnostics[]` JSON and as
+/// one deduplicated stderr warning instead of being silently discarded.
+pub fn report_malformed_pnpm_workspace_yaml(root: &Path, yaml_path: &Path, error: String) {
+    record_workspace_diagnostics(
+        root,
+        vec![WorkspaceDiagnostic::new(
+            root,
+            yaml_path.to_path_buf(),
+            WorkspaceDiagnosticKind::MalformedPnpmWorkspaceYaml { error },
+        )],
+    );
+}
+
+/// Emit one `UnusedCatalogEntry` for every catalog entry not referenced by any
+/// workspace `package.json` via the `catalog:` protocol.
+#[deprecated(
+    since = "2.76.0",
+    note = "fallow_core is internal; use fallow_api::run_dead_code for typed output; serialize with fallow_api::serialize_dead_code_programmatic_json for JSON output. See docs/fallow-core-migration.md."
+)]
+pub fn find_unused_catalog_entries(state: &PnpmCatalogState) -> Vec<UnusedCatalogEntry> {
+    if state.data.catalogs.is_empty() {
+        return Vec::new();
+    }
+
+    let mut findings = Vec::new();
+    for catalog in &state.data.catalogs {
+        for entry in &catalog.entries {
+            let key = ConsumerKey {
+                package_name: entry.package_name.as_str(),
+                catalog_name: catalog.name.as_str(),
+            };
+            if state.consumers.references.contains(&key.owned()) {
+                continue;
+            }
+
+            let hardcoded_consumers = state
+                .consumers
+                .hardcoded
+                .iter()
+                .filter(|(name, _)| name == &entry.package_name)
+                .map(|(_, path)| path.clone())
+                .collect();
+
+            findings.push(UnusedCatalogEntry {
+                entry_name: entry.package_name.clone(),
+                catalog_name: catalog.name.clone(),
+                path: state.source_path.clone(),
+                line: entry.line,
+                hardcoded_consumers,
+            });
+        }
+    }
+
+    findings
+}
+
+/// Emit one `EmptyCatalogGroup` for every named `catalogs.<name>:` group
+/// that has no package entries. The top-level default `catalog:` map is
+/// intentionally ignored.
+#[deprecated(
+    since = "2.76.0",
+    note = "fallow_core is internal; use fallow_api::run_dead_code for typed output; serialize with fallow_api::serialize_dead_code_programmatic_json for JSON output. See docs/fallow-core-migration.md."
+)]
+pub fn find_empty_catalog_groups(state: &PnpmCatalogState) -> Vec<EmptyCatalogGroup> {
+    state
+        .data
+        .empty_named_catalog_groups
+        .iter()
+        .map(|group| EmptyCatalogGroup {
+            catalog_name: group.name.clone(),
+            path: state.source_path.clone(),
+            line: group.line,
+        })
+        .collect()
+}
+
+/// Emit one `UnresolvedCatalogReference` for every `catalog:` / `catalog:<name>`
+/// reference whose target catalog does not declare the consumed package.
+///
+/// `available_in_catalogs` lists OTHER catalogs in the same workspace that DO
+/// declare the package, sorted lexicographically. When non-empty, the suggested
+/// fix is to flip the reference to one of those catalogs; when empty, the fix
+/// is to add the missing entry to the named catalog or to remove the reference.
+///
+/// Findings matching any rule in `ignore_rules` are suppressed.
+#[deprecated(
+    since = "2.76.0",
+    note = "fallow_core is internal; use fallow_api::run_dead_code for typed output; serialize with fallow_api::serialize_dead_code_programmatic_json for JSON output. See docs/fallow-core-migration.md."
+)]
+pub fn find_unresolved_catalog_references(
+    state: &PnpmCatalogState,
+    ignore_rules: &[CompiledIgnoreCatalogReferenceRule],
+    root: &Path,
+) -> Vec<UnresolvedCatalogReference> {
+    let mut findings = Vec::new();
+
+    for reference in &state.consumers.referenced_with_locations {
+        if catalog_has_entry(
+            &state.data,
+            &reference.catalog_name,
+            &reference.package_name,
+        ) {
+            continue;
+        }
+
+        let consumer_path_str = reference
+            .consumer_path
+            .strip_prefix(root)
+            .unwrap_or(&reference.consumer_path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        if ignore_rules.iter().any(|rule| {
+            rule.matches(
+                &reference.package_name,
+                &reference.catalog_name,
+                &consumer_path_str,
+            )
+        }) {
+            continue;
+        }
+
+        let available_in_catalogs = collect_available_in_catalogs(
+            &state.data,
+            &reference.package_name,
+            &reference.catalog_name,
+        );
+
+        findings.push(UnresolvedCatalogReference {
+            entry_name: reference.package_name.clone(),
+            catalog_name: reference.catalog_name.clone(),
+            path: reference.consumer_path.clone(),
+            line: reference.line,
+            available_in_catalogs,
+        });
+    }
+
+    findings
+}
+
+fn catalog_has_entry(data: &PnpmCatalogData, catalog_name: &str, package_name: &str) -> bool {
+    data.catalogs
+        .iter()
+        .filter(|catalog| catalog.name == catalog_name)
+        .flat_map(|catalog| catalog.entries.iter())
+        .any(|entry| entry.package_name == package_name)
+}
+
+fn collect_available_in_catalogs(
+    data: &PnpmCatalogData,
+    package_name: &str,
+    excluded_catalog: &str,
+) -> Vec<String> {
+    let mut catalogs: Vec<String> = data
+        .catalogs
+        .iter()
+        .filter(|catalog| catalog.name != excluded_catalog)
+        .filter(|catalog| {
+            catalog
+                .entries
+                .iter()
+                .any(|entry| entry.package_name == package_name)
+        })
+        .map(|catalog| catalog.name.clone())
+        .collect();
+    catalogs.sort();
+    catalogs.dedup();
+    catalogs
+}
+
+/// Collect every `package.json` path that participates in the workspace:
+/// the project root plus each declared workspace package.
+fn collect_consumer_pkg_paths(
+    config: &ResolvedConfig,
+    workspaces: &[WorkspaceInfo],
+) -> Vec<PathBuf> {
+    let mut paths = Vec::with_capacity(workspaces.len() + 1);
+    paths.push(config.root.join("package.json"));
+    for ws in workspaces {
+        paths.push(ws.root.join("package.json"));
+    }
+    paths
+}
+
+#[derive(Debug, Default)]
+struct CatalogConsumers {
+    /// `(package_name, catalog_name)` pairs referenced via `catalog:` protocol.
+    /// Catalog name `"default"` covers both the bare `catalog:` and explicit
+    /// `catalog:default` forms.
+    references: FxHashSet<OwnedConsumerKey>,
+    /// One entry per consumer-side `catalog:` reference, paired with the
+    /// consumer `package.json` location for `unresolved-catalog-references`
+    /// findings. Same package name appearing in `dependencies` AND
+    /// `devDependencies` produces two entries.
+    referenced_with_locations: Vec<ConsumerReference>,
+    /// `(package_name, path)` pairs declaring the package with a hardcoded
+    /// (non-`catalog:`) version range. Used to surface "this catalog entry
+    /// is unreferenced, but these consumers declare a hardcoded version."
+    hardcoded: Vec<(String, PathBuf)>,
+}
+
+#[derive(Debug, Clone)]
+struct ConsumerReference {
+    package_name: String,
+    catalog_name: String,
+    consumer_path: PathBuf,
+    line: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct OwnedConsumerKey {
+    package_name: String,
+    catalog_name: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ConsumerKey<'a> {
+    package_name: &'a str,
+    catalog_name: &'a str,
+}
+
+impl ConsumerKey<'_> {
+    fn owned(self) -> OwnedConsumerKey {
+        OwnedConsumerKey {
+            package_name: self.package_name.to_string(),
+            catalog_name: self.catalog_name.to_string(),
+        }
+    }
+}
+
+fn collect_catalog_consumers(pkg_paths: &[PathBuf], root: &Path) -> CatalogConsumers {
+    let mut consumers = CatalogConsumers::default();
+    for pkg_path in pkg_paths {
+        collect_catalog_consumers_from_package(pkg_path, root, &mut consumers);
+    }
+    consumers
+}
+
+fn collect_catalog_consumers_from_package(
+    pkg_path: &Path,
+    root: &Path,
+    consumers: &mut CatalogConsumers,
+) {
+    let Ok(raw_source) = std::fs::read_to_string(pkg_path) else {
+        return;
+    };
+    let Ok(pkg) = serde_json::from_str::<PackageJson>(&raw_source) else {
+        return;
+    };
+    let relative_path = pkg_path
+        .strip_prefix(root)
+        .map_or_else(|_| pkg_path.to_path_buf(), Path::to_path_buf);
+    let line_map = scan_dep_lines(&raw_source);
+    let ctx = CatalogConsumerContext {
+        line_map: &line_map,
+        absolute_path: pkg_path,
+        relative_path: &relative_path,
+    };
+
+    for (section, deps) in [
+        (DepSection::Dependencies, pkg.dependencies.as_ref()),
+        (DepSection::DevDependencies, pkg.dev_dependencies.as_ref()),
+        (DepSection::PeerDependencies, pkg.peer_dependencies.as_ref()),
+        (
+            DepSection::OptionalDependencies,
+            pkg.optional_dependencies.as_ref(),
+        ),
+    ] {
+        let Some(deps) = deps else {
+            continue;
+        };
+        for (name, version) in deps {
+            collect_catalog_consumer_dependency(consumers, name, version, section, &ctx);
+        }
+    }
+}
+
+/// Per-package location context for catalog consumer attribution.
+struct CatalogConsumerContext<'a> {
+    line_map: &'a DepLineMap,
+    absolute_path: &'a Path,
+    relative_path: &'a Path,
+}
+
+fn collect_catalog_consumer_dependency(
+    consumers: &mut CatalogConsumers,
+    name: &str,
+    version: &str,
+    section: DepSection,
+    ctx: &CatalogConsumerContext<'_>,
+) {
+    if let Some(catalog) = parse_catalog_reference(version) {
+        consumers.references.insert(OwnedConsumerKey {
+            package_name: name.to_string(),
+            catalog_name: catalog.to_string(),
+        });
+        let line = ctx.line_map.line_for(section, name).unwrap_or(1);
+        consumers.referenced_with_locations.push(ConsumerReference {
+            package_name: name.to_string(),
+            catalog_name: catalog.to_string(),
+            consumer_path: ctx.absolute_path.to_path_buf(),
+            line,
+        });
+    } else if is_hardcoded_version(version) {
+        consumers
+            .hardcoded
+            .push((name.to_string(), ctx.relative_path.to_path_buf()));
+    }
+}
+
+/// Parse a `catalog:` protocol value. Returns the catalog name (`"default"`
+/// for bare `catalog:` and explicit `catalog:default`, or the named catalog).
+/// Returns `None` for any non-catalog version string.
+fn parse_catalog_reference(value: &str) -> Option<&str> {
+    let rest = value.strip_prefix("catalog:")?;
+    if rest.is_empty() || rest == "default" {
+        Some("default")
+    } else {
+        Some(rest)
+    }
+}
+
+/// Identify version strings that represent a hardcoded version range, as
+/// opposed to a workspace cross-reference (`workspace:*`, `workspace:^`),
+/// a filesystem path (`file:..`), or a symlinked dependency (`link:..`).
+/// Catalog references are handled by the caller and never reach this
+/// function. Surfacing only true hardcoded ranges keeps
+/// `hardcoded_consumers` actionable: the user can decide whether to switch
+/// the consumer to `catalog:` rather than chase an internal workspace
+/// reference.
+fn is_hardcoded_version(value: &str) -> bool {
+    !(value.starts_with("workspace:")
+        || value.starts_with("file:")
+        || value.starts_with("link:")
+        || value.starts_with("portal:"))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum DepSection {
+    Dependencies,
+    DevDependencies,
+    PeerDependencies,
+    OptionalDependencies,
+}
+
+const DEP_SECTIONS: &[DepSection] = &[
+    DepSection::Dependencies,
+    DepSection::DevDependencies,
+    DepSection::PeerDependencies,
+    DepSection::OptionalDependencies,
+];
+
+impl DepSection {
+    const fn json_key(self) -> &'static str {
+        match self {
+            Self::Dependencies => "dependencies",
+            Self::DevDependencies => "devDependencies",
+            Self::PeerDependencies => "peerDependencies",
+            Self::OptionalDependencies => "optionalDependencies",
+        }
+    }
+}
+
+/// Maps `(section, package_name)` to its 1-based line number in the
+/// `package.json` source. Built via a section-aware line scanner so we can
+/// surface the consumer-side reference location for
+/// `unresolved-catalog-references` findings.
+#[derive(Debug, Default)]
+struct DepLineMap {
+    entries: Vec<((DepSection, String), u32)>,
+}
+
+impl DepLineMap {
+    fn line_for(&self, section: DepSection, package_name: &str) -> Option<u32> {
+        self.entries
+            .iter()
+            .find(|((sec, pkg), _)| *sec == section && pkg == package_name)
+            .map(|(_, line)| *line)
+    }
+}
+
+/// Walk the raw package.json source and record the 1-based line for each
+/// `"name":` key under the four dep sections. Tracks brace depth so nested
+/// objects under unrelated keys (e.g., `bin`, `peerDependenciesMeta`) do not
+/// pollute the map.
+///
+/// Plain JSON: no comments, no trailing commas. A package.json with comments
+/// would fail `serde_json::from_str` upstream and never reach this scanner.
+fn scan_dep_lines(source: &str) -> DepLineMap {
+    let mut scanner = DepLineScanner::default();
+    for (idx, raw_line) in source.lines().enumerate() {
+        scanner.scan_line(idx, raw_line);
+    }
+    scanner.finish()
+}
+
+#[derive(Default)]
+struct DepLineScanner {
+    entries: Vec<((DepSection, String), u32)>,
+    current_section: Option<DepSection>,
+    section_depth_at_open: u32,
+    current_depth: u32,
+}
+
+impl DepLineScanner {
+    fn scan_line(&mut self, idx: usize, raw_line: &str) {
+        let line_no = u32::try_from(idx).unwrap_or(u32::MAX).saturating_add(1);
+        let trimmed = raw_line.trim();
+        self.enter_section_if_opened(trimmed, raw_line);
+
+        let depth_before = self.current_depth;
+        let delta = brace_delta_outside_strings(raw_line);
+        self.record_dep_key_if_in_section(depth_before, trimmed, line_no);
+        self.current_depth = depth_before
+            .saturating_add(delta.opens)
+            .saturating_sub(delta.closes);
+        self.leave_section_if_closed();
+    }
+
+    fn enter_section_if_opened(&mut self, trimmed: &str, raw_line: &str) {
+        if self.current_section.is_some() {
+            return;
+        }
+
+        for section in DEP_SECTIONS {
+            let needle = format!("\"{}\"", section.json_key());
+            if trimmed.starts_with(&needle) && raw_line.contains('{') {
+                self.current_section = Some(*section);
+                self.section_depth_at_open = self.current_depth.saturating_add(1);
+                break;
+            }
+        }
+    }
+
+    fn record_dep_key_if_in_section(&mut self, depth_before: u32, trimmed: &str, line_no: u32) {
+        if let Some(section) = self.current_section
+            && depth_before == self.section_depth_at_open
+            && let Some(name) = parse_json_key(trimmed)
+        {
+            self.entries.push(((section, name), line_no));
+        }
+    }
+
+    fn leave_section_if_closed(&mut self) {
+        if self.current_section.is_some() && self.current_depth < self.section_depth_at_open {
+            self.current_section = None;
+        }
+    }
+
+    fn finish(self) -> DepLineMap {
+        DepLineMap {
+            entries: self.entries,
+        }
+    }
+}
+
+#[derive(Default)]
+struct BraceDelta {
+    opens: u32,
+    closes: u32,
+}
+
+fn brace_delta_outside_strings(raw_line: &str) -> BraceDelta {
+    let mut delta = BraceDelta::default();
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for ch in raw_line.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if ch == '"' {
+            in_string = !in_string;
+            continue;
+        }
+        if in_string {
+            continue;
+        }
+        match ch {
+            '{' => delta.opens = delta.opens.saturating_add(1),
+            '}' => delta.closes = delta.closes.saturating_add(1),
+            _ => {}
+        }
+    }
+
+    delta
+}
+
+/// Parse a JSON object key from a trimmed line of the form `"key": value,?`.
+/// Returns `None` for lines that do not start with a quoted key followed by
+/// `:`.
+fn parse_json_key(trimmed: &str) -> Option<String> {
+    let rest = trimmed.strip_prefix('"')?;
+    let end = rest.find('"')?;
+    let key = &rest[..end];
+    let after = rest[end.saturating_add(1)..].trim_start();
+    if after.starts_with(':') {
+        Some(key.to_string())
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn malformed_pnpm_workspace_yaml_records_a_diagnostic_and_empty_catalogs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("pnpm-workspace.yaml"),
+            "catalog:\n  react: ^18.2.0\n{this is\nnot: valid: yaml: at: all\n",
+        )
+        .expect("write pnpm-workspace.yaml");
+        let config = fallow_config::FallowConfig::default().resolve(
+            dir.path().to_path_buf(),
+            fallow_config::OutputFormat::Human,
+            1,
+            true,
+            true,
+            None,
+        );
+
+        let state = gather_pnpm_catalog_state(&config, &[])
+            .expect("pnpm-workspace.yaml exists, so the pnpm source is selected");
+
+        assert!(
+            state.data.catalogs.is_empty(),
+            "a parse failure must not fabricate catalog entries"
+        );
+        let diagnostics = fallow_config::workspace_diagnostics_for(dir.path());
+        assert!(
+            diagnostics.iter().any(|d| matches!(
+                d.kind,
+                WorkspaceDiagnosticKind::MalformedPnpmWorkspaceYaml { .. }
+            )),
+            "expected a malformed-pnpm-workspace-yaml diagnostic: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn parses_bare_catalog_as_default() {
+        assert_eq!(parse_catalog_reference("catalog:"), Some("default"));
+        assert_eq!(parse_catalog_reference("catalog:default"), Some("default"));
+    }
+
+    #[test]
+    fn parses_named_catalog() {
+        assert_eq!(parse_catalog_reference("catalog:react17"), Some("react17"));
+    }
+
+    #[test]
+    fn non_catalog_versions_return_none() {
+        assert_eq!(parse_catalog_reference("^18.2.0"), None);
+        assert_eq!(parse_catalog_reference("workspace:*"), None);
+        assert_eq!(parse_catalog_reference("npm:other-pkg@^1.0.0"), None);
+        assert_eq!(parse_catalog_reference(""), None);
+    }
+
+    #[test]
+    fn workspace_and_link_protocols_are_not_hardcoded() {
+        assert!(!is_hardcoded_version("workspace:*"));
+        assert!(!is_hardcoded_version("workspace:^"));
+        assert!(!is_hardcoded_version("workspace:~"));
+        assert!(!is_hardcoded_version("file:../other-pkg"));
+        assert!(!is_hardcoded_version("link:../symlinked"));
+        assert!(!is_hardcoded_version("portal:../portal"));
+    }
+
+    #[test]
+    fn semver_ranges_and_npm_specs_are_hardcoded() {
+        assert!(is_hardcoded_version("^1.0.0"));
+        assert!(is_hardcoded_version("~2.5.0"));
+        assert!(is_hardcoded_version("1.2.3"));
+        assert!(is_hardcoded_version(">=1.0.0 <2.0.0"));
+        assert!(is_hardcoded_version("npm:other-pkg@^1.0.0"));
+        assert!(is_hardcoded_version("github:user/repo#commit"));
+        assert!(is_hardcoded_version("https://example.com/pkg.tgz"));
+    }
+
+    #[test]
+    fn scan_dep_lines_captures_each_section() {
+        let source = r#"{
+  "name": "demo",
+  "dependencies": {
+    "react": "catalog:react17",
+    "lodash": "^4.0.0"
+  },
+  "devDependencies": {
+    "vitest": "catalog:"
+  }
+}
+"#;
+        let map = scan_dep_lines(source);
+        assert_eq!(map.line_for(DepSection::Dependencies, "react"), Some(4));
+        assert_eq!(map.line_for(DepSection::Dependencies, "lodash"), Some(5));
+        assert_eq!(map.line_for(DepSection::DevDependencies, "vitest"), Some(8));
+        assert_eq!(map.line_for(DepSection::Dependencies, "vitest"), None);
+    }
+
+    #[test]
+    fn scan_dep_lines_ignores_nested_object_keys() {
+        let source = r#"{
+  "peerDependencies": {
+    "react": "*"
+  },
+  "peerDependenciesMeta": {
+    "react": {
+      "optional": true
+    }
+  }
+}
+"#;
+        let map = scan_dep_lines(source);
+        assert_eq!(map.line_for(DepSection::PeerDependencies, "react"), Some(3));
+        let peer_react_hits = map
+            .entries
+            .iter()
+            .filter(|((sec, name), _)| *sec == DepSection::PeerDependencies && name == "react")
+            .count();
+        assert_eq!(peer_react_hits, 1);
+    }
+
+    #[test]
+    fn collect_available_in_catalogs_excludes_the_unresolved_one() {
+        let data = parse_pnpm_catalog_data(
+            r"
+catalogs:
+  react17:
+    react: ^17.0.2
+  react18:
+    react: ^18.2.0
+",
+        )
+        .expect("valid yaml");
+        let available = collect_available_in_catalogs(&data, "react", "react17");
+        assert_eq!(available, vec!["react18".to_string()]);
+    }
+
+    #[test]
+    fn catalog_has_entry_default_form() {
+        let data = parse_pnpm_catalog_data(
+            r"
+catalog:
+  react: ^18.2.0
+",
+        )
+        .expect("valid yaml");
+        assert!(catalog_has_entry(&data, "default", "react"));
+        assert!(!catalog_has_entry(&data, "default", "vue"));
+        assert!(!catalog_has_entry(&data, "react17", "react"));
+    }
+}

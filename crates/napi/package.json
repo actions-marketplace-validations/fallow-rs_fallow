@@ -1,18 +1,21 @@
 {
   "name": "@fallow-cli/fallow-node",
-  "version": "2.46.0",
-  "description": "Native Node.js bindings for fallow dead-code, duplication, and health analyses.",
-  "main": "index.js",
+  "version": "3.21.0",
+  "description": "Native Node.js bindings for fallow, codebase intelligence for TypeScript and JavaScript. Finds unused code, duplication, circular dependencies, complexity hotspots, architecture drift, and design-system styling drift. Optional runtime intelligence layer (Fallow Runtime) adds production execution evidence.",
+  "main": "loader.js",
   "types": "index.d.ts",
   "exports": {
     ".": {
       "types": "./index.d.ts",
-      "default": "./index.js"
+      "default": "./loader.js"
     }
   },
   "files": [
     "index.js",
+    "loader.js",
+    "type-aware-command.js",
     "index.d.ts",
+    "types",
     "README.md"
   ],
   "keywords": [
@@ -35,7 +38,7 @@
     "url": "https://github.com/fallow-rs/fallow/issues"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=22"
   },
   "napi": {
     "binaryName": "fallow-node",
@@ -47,28 +50,32 @@
       "aarch64-unknown-linux-gnu",
       "x86_64-unknown-linux-musl",
       "aarch64-unknown-linux-musl",
+      "aarch64-pc-windows-msvc",
       "x86_64-pc-windows-msvc"
     ]
   },
   "scripts": {
-    "build": "napi build --release --platform && npm run publish:prepare",
-    "build:debug": "napi build --platform && npm run publish:prepare",
-    "publish:prepare": "node scripts/write-dts.mjs",
+    "build": "napi build --profile napi-release --platform --no-js && npm run publish:prepare",
+    "build:debug": "napi build --platform --no-js && npm run publish:prepare",
+    "publish:prepare": "node scripts/write-dts-entry.mjs",
     "prepublishOnly": "npm run publish:prepare",
     "artifacts": "napi artifacts",
     "create-npm-dirs": "napi create-npm-dirs",
     "test": "node test.mjs"
   },
   "devDependencies": {
-    "@napi-rs/cli": "3.6.0"
+    "@napi-rs/cli": "3.8.6"
   },
   "optionalDependencies": {
-    "@fallow-cli/fallow-node-darwin-arm64": "2.46.0",
-    "@fallow-cli/fallow-node-darwin-x64": "2.46.0",
-    "@fallow-cli/fallow-node-linux-arm64-gnu": "2.46.0",
-    "@fallow-cli/fallow-node-linux-arm64-musl": "2.46.0",
-    "@fallow-cli/fallow-node-linux-x64-gnu": "2.46.0",
-    "@fallow-cli/fallow-node-linux-x64-musl": "2.46.0",
-    "@fallow-cli/fallow-node-win32-x64-msvc": "2.46.0"
+    "@fallow-cli/fallow-node-darwin-arm64": "3.21.0",
+    "@fallow-cli/fallow-node-darwin-x64": "3.21.0",
+    "@fallow-cli/fallow-node-linux-arm64-gnu": "3.21.0",
+    "@fallow-cli/fallow-node-linux-arm64-musl": "3.21.0",
+    "@fallow-cli/fallow-node-linux-x64-gnu": "3.21.0",
+    "@fallow-cli/fallow-node-linux-x64-musl": "3.21.0",
+    "@fallow-cli/fallow-node-win32-arm64-msvc": "3.21.0",
+    "@fallow-cli/fallow-node-win32-x64-msvc": "3.21.0",
+    "fallow-similar-code": "3.21.0",
+    "fallow-type-aware": "3.21.0"
   }
 }

@@ -5,7 +5,10 @@ import { runTests } from "@vscode/test-electron";
 
 const extensionDevelopmentPath = path.resolve(__dirname, "../../..");
 const extensionTestsPath = path.resolve(__dirname, "suite/index.js");
-const vscodeTestCachePath = path.join(os.tmpdir(), "fallow-vscode-test-cache");
+const vscodeTestCachePath = path.resolve(
+  process.env["FALLOW_VSCODE_TEST_CACHE_PATH"] ??
+    path.join(os.tmpdir(), "fallow-vscode-test-cache"),
+);
 const fixtureWorkspacePath = path.resolve(
   extensionDevelopmentPath,
   "test/integration/fixtures/workspace/package.json"
@@ -34,6 +37,14 @@ const handle = (message) => {
   }
   if (message.method === "shutdown") {
     send({ jsonrpc: "2.0", id: message.id, result: null });
+    return;
+  }
+  if (message.id !== undefined) {
+    send({
+      jsonrpc: "2.0",
+      id: message.id,
+      error: { code: -32601, message: "Method not found" },
+    });
     return;
   }
   if (message.method === "exit") {
@@ -76,6 +87,16 @@ const createFakeCli = (binDir: string): void => {
     `#!/usr/bin/env node
 const fs = require("node:fs");
 const args = process.argv.slice(2);
+
+// Respond to the extension's up-front version probe like a real binary: print
+// a version and exit WITHOUT logging, so it does not pollute the analysis-call
+// log the assertions read. Reported version is current, so version-gated flags
+// are not skipped in these fixtures.
+if (args[0] === "--version" || args[0] === "-V") {
+  process.stdout.write("fallow 3.15.0\\n");
+  process.exit(0);
+}
+
 const command = args[0] && !args[0].startsWith("-") ? args[0] : "combined";
 const logPath = ${JSON.stringify(logPath)};
 fs.appendFileSync(logPath, JSON.stringify({ command, args }) + "\\n");
@@ -91,6 +112,7 @@ const outputs = {
       unused_types: [],
       unused_dependencies: [],
       unused_dev_dependencies: [],
+      unused_optional_dependencies: [{ path: "package.json", package_name: "fsevents" }],
       unused_enum_members: [],
       unused_class_members: [],
       unresolved_imports: [],
@@ -132,6 +154,7 @@ const outputs = {
     unused_types: [],
     unused_dependencies: [],
     unused_dev_dependencies: [],
+    unused_optional_dependencies: [{ path: "package.json", package_name: "fsevents" }],
     unused_enum_members: [],
     unused_class_members: [],
     unresolved_imports: [],
@@ -264,6 +287,7 @@ const main = async (): Promise<void> => {
         `--extensions-dir=${extensionsDir}`,
         `--user-data-dir=${userDataDir}`,
       ],
+      version: "1.96.0",
     });
   } catch (error) {
     console.error("Failed to run extension tests");

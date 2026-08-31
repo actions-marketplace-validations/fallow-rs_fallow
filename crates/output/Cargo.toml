@@ -1,0 +1,33 @@
+[package]
+name = "fallow-output"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Output contract types for fallow reports"
+readme = "../../README.md"
+
+[lib]
+doctest = false
+
+[dependencies]
+fallow-config = { workspace = true }
+fallow-types = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+rustc-hash = { workspace = true }
+schemars = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[features]
+schema = ["dep:schemars", "fallow-types/schema"]
+
+[lints]
+workspace = true

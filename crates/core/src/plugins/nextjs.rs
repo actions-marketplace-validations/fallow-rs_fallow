@@ -10,7 +10,8 @@ use std::path::Path;
 use super::config_parser;
 use super::{Plugin, PluginResult};
 
-// Used exports for App Router page files
+const REACT_COMPILER_BABEL_PLUGIN: &str = "babel-plugin-react-compiler";
+
 const PAGE_EXPORTS: &[&str] = &[
     "default",
     "metadata",
@@ -67,29 +68,50 @@ const PAGES_ROUTER_EXPORTS: &[&str] = &[
 const PAGES_APP_EXPORTS: &[&str] = &["default", "reportWebVitals"];
 const PAGES_API_EXPORTS: &[&str] = &["default", "config"];
 const DEFAULT_ONLY_EXPORTS: &[&str] = &["default"];
+const FALLBACK_EXPORTS: &[&str] = &[
+    "default",
+    "metadata",
+    "generateMetadata",
+    "viewport",
+    "generateViewport",
+];
 const MIDDLEWARE_EXPORTS: &[&str] = &["default", "middleware", "config"];
 const PROXY_EXPORTS: &[&str] = &["default", "proxy", "config"];
 const INSTRUMENTATION_EXPORTS: &[&str] = &["register", "onRequestError"];
 const INSTRUMENTATION_CLIENT_EXPORTS: &[&str] = &["onRouterTransitionStart"];
 const MDX_COMPONENT_EXPORTS: &[&str] = &["useMDXComponents"];
-const ICON_EXPORTS: &[&str] = &["default", "size", "contentType", "generateImageMetadata"];
-const OG_IMAGE_EXPORTS: &[&str] = &[
+
+macro_rules! metadata_route_exports {
+    ($($export:literal),* $(,)?) => {
+        &[
+            $($export,)*
+            "dynamic",
+            "revalidate",
+            "fetchCache",
+            "runtime",
+            "preferredRegion",
+            "maxDuration",
+        ]
+    };
+}
+
+const ICON_EXPORTS: &[&str] =
+    metadata_route_exports!("default", "size", "contentType", "generateImageMetadata",);
+const OG_IMAGE_EXPORTS: &[&str] = metadata_route_exports!(
     "default",
     "size",
     "contentType",
     "generateImageMetadata",
     "alt",
-];
-const MANIFEST_EXPORTS: &[&str] = &["default"];
-const SITEMAP_EXPORTS: &[&str] = &["default", "generateSitemaps"];
-const ROBOTS_EXPORTS: &[&str] = &["default"];
-const GLOBAL_NOT_FOUND_EXPORTS: &[&str] = &["default", "metadata", "generateMetadata"];
+);
+const MANIFEST_EXPORTS: &[&str] = metadata_route_exports!("default");
+const SITEMAP_EXPORTS: &[&str] = metadata_route_exports!("default", "generateSitemaps");
+const ROBOTS_EXPORTS: &[&str] = metadata_route_exports!("default");
 
 define_plugin!(
     struct NextJsPlugin => "nextjs",
     enablers: &["next"],
     entry_patterns: &[
-        // App Router convention files
         "app/**/page.{ts,tsx,js,jsx}",
         "app/**/layout.{ts,tsx,js,jsx}",
         "app/**/loading.{ts,tsx,js,jsx}",
@@ -102,7 +124,6 @@ define_plugin!(
         "app/**/forbidden.{ts,tsx,js,jsx}",
         "app/**/unauthorized.{ts,tsx,js,jsx}",
         "app/global-not-found.{ts,tsx,js,jsx}",
-        // App Router metadata files
         "app/**/opengraph-image.{ts,tsx,js,jsx}",
         "app/**/twitter-image.{ts,tsx,js,jsx}",
         "app/**/icon.{ts,tsx,js,jsx}",
@@ -110,9 +131,7 @@ define_plugin!(
         "app/**/manifest.{ts,tsx,js,jsx}",
         "app/**/sitemap.{ts,tsx,js,jsx}",
         "app/**/robots.{ts,tsx,js,jsx}",
-        // Pages Router
         "pages/**/*.{ts,tsx,js,jsx}",
-        // src/ variants of App Router convention files
         "src/app/**/page.{ts,tsx,js,jsx}",
         "src/app/**/layout.{ts,tsx,js,jsx}",
         "src/app/**/loading.{ts,tsx,js,jsx}",
@@ -125,7 +144,6 @@ define_plugin!(
         "src/app/**/forbidden.{ts,tsx,js,jsx}",
         "src/app/**/unauthorized.{ts,tsx,js,jsx}",
         "src/app/global-not-found.{ts,tsx,js,jsx}",
-        // src/ variants of App Router metadata files
         "src/app/**/opengraph-image.{ts,tsx,js,jsx}",
         "src/app/**/twitter-image.{ts,tsx,js,jsx}",
         "src/app/**/icon.{ts,tsx,js,jsx}",
@@ -133,14 +151,11 @@ define_plugin!(
         "src/app/**/manifest.{ts,tsx,js,jsx}",
         "src/app/**/sitemap.{ts,tsx,js,jsx}",
         "src/app/**/robots.{ts,tsx,js,jsx}",
-        // src/ Pages Router
         "src/pages/**/*.{ts,tsx,js,jsx}",
-        // Middleware and proxy
         "middleware.{ts,js}",
         "src/middleware.{ts,js}",
         "proxy.{ts,js}",
         "src/proxy.{ts,js}",
-        // Instrumentation (Next.js 14+)
         "instrumentation.{ts,js}",
         "instrumentation-client.{ts,js}",
         "src/instrumentation.{ts,js}",
@@ -164,41 +179,37 @@ define_plugin!(
         "@next/mdx",
         "@next/bundle-analyzer",
         "@next/env",
-        // Virtual packages for enforcing server/client boundaries (imported but not in package.json)
         "server-only",
         "client-only",
     ],
     used_exports: [
-        // App Router pages
         ("app/**/page.{ts,tsx,js,jsx}", PAGE_EXPORTS),
         ("app/**/layout.{ts,tsx,js,jsx}", LAYOUT_EXPORTS),
         ("app/**/loading.{ts,tsx,js,jsx}", DEFAULT_ONLY_EXPORTS),
         ("app/**/error.{ts,tsx,js,jsx}", DEFAULT_ONLY_EXPORTS),
-        ("app/**/not-found.{ts,tsx,js,jsx}", DEFAULT_ONLY_EXPORTS),
+        ("app/**/not-found.{ts,tsx,js,jsx}", FALLBACK_EXPORTS),
         ("app/**/template.{ts,tsx,js,jsx}", DEFAULT_ONLY_EXPORTS),
-        ("app/**/default.{ts,tsx,js,jsx}", DEFAULT_ONLY_EXPORTS),
+        ("app/**/default.{ts,tsx,js,jsx}", FALLBACK_EXPORTS),
         ("app/**/route.{ts,tsx,js,jsx}", ROUTE_EXPORTS),
         ("app/**/global-error.{ts,tsx,js,jsx}", DEFAULT_ONLY_EXPORTS),
-        ("app/**/forbidden.{ts,tsx,js,jsx}", DEFAULT_ONLY_EXPORTS),
-        ("app/**/unauthorized.{ts,tsx,js,jsx}", DEFAULT_ONLY_EXPORTS),
-        ("app/global-not-found.{ts,tsx,js,jsx}", GLOBAL_NOT_FOUND_EXPORTS),
-        // Pages Router
+        ("app/**/forbidden.{ts,tsx,js,jsx}", FALLBACK_EXPORTS),
+        ("app/**/unauthorized.{ts,tsx,js,jsx}", FALLBACK_EXPORTS),
+        ("app/global-not-found.{ts,tsx,js,jsx}", FALLBACK_EXPORTS),
         ("pages/**/*.{ts,tsx,js,jsx}", PAGES_ROUTER_EXPORTS),
         ("pages/_app.{ts,tsx,js,jsx}", PAGES_APP_EXPORTS),
         ("pages/api/**/*.{ts,tsx,js,jsx}", PAGES_API_EXPORTS),
-        // src/ variants
         ("src/app/**/page.{ts,tsx,js,jsx}", PAGE_EXPORTS),
         ("src/app/**/layout.{ts,tsx,js,jsx}", LAYOUT_EXPORTS),
         ("src/app/**/loading.{ts,tsx,js,jsx}", DEFAULT_ONLY_EXPORTS),
         ("src/app/**/error.{ts,tsx,js,jsx}", DEFAULT_ONLY_EXPORTS),
-        ("src/app/**/not-found.{ts,tsx,js,jsx}", DEFAULT_ONLY_EXPORTS),
+        ("src/app/**/not-found.{ts,tsx,js,jsx}", FALLBACK_EXPORTS),
         ("src/app/**/template.{ts,tsx,js,jsx}", DEFAULT_ONLY_EXPORTS),
-        ("src/app/**/default.{ts,tsx,js,jsx}", DEFAULT_ONLY_EXPORTS),
+        ("src/app/**/default.{ts,tsx,js,jsx}", FALLBACK_EXPORTS),
         ("src/app/**/route.{ts,tsx,js,jsx}", ROUTE_EXPORTS),
         ("src/app/**/global-error.{ts,tsx,js,jsx}", DEFAULT_ONLY_EXPORTS),
-        ("src/app/**/forbidden.{ts,tsx,js,jsx}", DEFAULT_ONLY_EXPORTS),
-        ("src/app/**/unauthorized.{ts,tsx,js,jsx}", DEFAULT_ONLY_EXPORTS),
-        ("src/app/global-not-found.{ts,tsx,js,jsx}", GLOBAL_NOT_FOUND_EXPORTS),
+        ("src/app/**/forbidden.{ts,tsx,js,jsx}", FALLBACK_EXPORTS),
+        ("src/app/**/unauthorized.{ts,tsx,js,jsx}", FALLBACK_EXPORTS),
+        ("src/app/global-not-found.{ts,tsx,js,jsx}", FALLBACK_EXPORTS),
         ("src/pages/**/*.{ts,tsx,js,jsx}", PAGES_ROUTER_EXPORTS),
         ("src/pages/_app.{ts,tsx,js,jsx}", PAGES_APP_EXPORTS),
         ("src/pages/api/**/*.{ts,tsx,js,jsx}", PAGES_API_EXPORTS),
@@ -212,21 +223,17 @@ define_plugin!(
         ("src/instrumentation-client.{ts,js}", INSTRUMENTATION_CLIENT_EXPORTS),
         ("mdx-components.{ts,tsx,js,jsx}", MDX_COMPONENT_EXPORTS),
         ("src/mdx-components.{ts,tsx,js,jsx}", MDX_COMPONENT_EXPORTS),
-        // Metadata image files
         ("app/**/icon.{ts,tsx,js,jsx}", ICON_EXPORTS),
         ("app/**/apple-icon.{ts,tsx,js,jsx}", ICON_EXPORTS),
         ("app/**/opengraph-image.{ts,tsx,js,jsx}", OG_IMAGE_EXPORTS),
         ("app/**/twitter-image.{ts,tsx,js,jsx}", OG_IMAGE_EXPORTS),
-        // Metadata data files
         ("app/**/manifest.{ts,tsx,js,jsx}", MANIFEST_EXPORTS),
         ("app/**/sitemap.{ts,tsx,js,jsx}", SITEMAP_EXPORTS),
         ("app/**/robots.{ts,tsx,js,jsx}", ROBOTS_EXPORTS),
-        // src/ variants of metadata image files
         ("src/app/**/icon.{ts,tsx,js,jsx}", ICON_EXPORTS),
         ("src/app/**/apple-icon.{ts,tsx,js,jsx}", ICON_EXPORTS),
         ("src/app/**/opengraph-image.{ts,tsx,js,jsx}", OG_IMAGE_EXPORTS),
         ("src/app/**/twitter-image.{ts,tsx,js,jsx}", OG_IMAGE_EXPORTS),
-        // src/ variants of metadata data files
         ("src/app/**/manifest.{ts,tsx,js,jsx}", MANIFEST_EXPORTS),
         ("src/app/**/sitemap.{ts,tsx,js,jsx}", SITEMAP_EXPORTS),
         ("src/app/**/robots.{ts,tsx,js,jsx}", ROBOTS_EXPORTS),
@@ -234,19 +241,16 @@ define_plugin!(
     resolve_config(config_path, source, _root) {
         let mut result = PluginResult::default();
 
-        // Extract import sources as referenced dependencies
         let imports = config_parser::extract_imports(source, config_path);
         for imp in &imports {
             let dep = crate::resolve::extract_package_name(imp);
             result.referenced_dependencies.push(dep);
         }
 
-        // pageExtensions → modify entry patterns
         let page_extensions =
             config_parser::extract_config_string_array(source, config_path, &["pageExtensions"]);
         if !page_extensions.is_empty() {
             let ext_str = page_extensions.join(",");
-            // Generate entry patterns with custom extensions
             let base_patterns = [
                 "app/**/page",
                 "app/**/layout",
@@ -300,6 +304,16 @@ define_plugin!(
             result
                 .referenced_dependencies
                 .push(crate::resolve::extract_package_name(package));
+        }
+
+        if config_parser::extract_config_truthy_bool_or_object(
+            source,
+            config_path,
+            &["reactCompiler"],
+        ) {
+            result
+                .referenced_dependencies
+                .push(REACT_COMPILER_BABEL_PLUGIN.to_string());
         }
 
         result
@@ -420,7 +434,107 @@ mod tests {
         assert!(mdx_entry.1.contains(&"useMDXComponents"));
     }
 
-    // ── resolve_config tests ─────────────────────────────────────
+    #[test]
+    fn fallback_files_include_supported_metadata_exports() {
+        let plugin = NextJsPlugin;
+        let exports = plugin.used_exports();
+        let fallback_patterns = [
+            "app/**/not-found.{ts,tsx,js,jsx}",
+            "app/**/default.{ts,tsx,js,jsx}",
+            "app/**/forbidden.{ts,tsx,js,jsx}",
+            "app/**/unauthorized.{ts,tsx,js,jsx}",
+            "app/global-not-found.{ts,tsx,js,jsx}",
+            "src/app/**/not-found.{ts,tsx,js,jsx}",
+            "src/app/**/default.{ts,tsx,js,jsx}",
+            "src/app/**/forbidden.{ts,tsx,js,jsx}",
+            "src/app/**/unauthorized.{ts,tsx,js,jsx}",
+            "src/app/global-not-found.{ts,tsx,js,jsx}",
+        ];
+
+        for pattern in fallback_patterns {
+            let (_, used) = exports
+                .iter()
+                .find(|(candidate, _)| *candidate == pattern)
+                .unwrap_or_else(|| panic!("missing fallback pattern {pattern}"));
+
+            assert_eq!(*used, FALLBACK_EXPORTS, "unexpected exports for {pattern}");
+        }
+    }
+
+    #[test]
+    fn unsupported_special_files_remain_default_only() {
+        let plugin = NextJsPlugin;
+        let exports = plugin.used_exports();
+        let default_only_patterns = [
+            "app/**/loading.{ts,tsx,js,jsx}",
+            "app/**/error.{ts,tsx,js,jsx}",
+            "app/**/template.{ts,tsx,js,jsx}",
+            "app/**/global-error.{ts,tsx,js,jsx}",
+            "src/app/**/loading.{ts,tsx,js,jsx}",
+            "src/app/**/error.{ts,tsx,js,jsx}",
+            "src/app/**/template.{ts,tsx,js,jsx}",
+            "src/app/**/global-error.{ts,tsx,js,jsx}",
+        ];
+
+        for pattern in default_only_patterns {
+            let (_, used) = exports
+                .iter()
+                .find(|(candidate, _)| *candidate == pattern)
+                .unwrap_or_else(|| panic!("missing special-file pattern {pattern}"));
+
+            assert_eq!(
+                *used, DEFAULT_ONLY_EXPORTS,
+                "unexpected exports for {pattern}"
+            );
+        }
+    }
+
+    #[test]
+    fn metadata_routes_include_supported_segment_config_exports() {
+        let plugin = NextJsPlugin;
+        let exports = plugin.used_exports();
+        let metadata_route_patterns = [
+            "app/**/opengraph-image.{ts,tsx,js,jsx}",
+            "app/**/twitter-image.{ts,tsx,js,jsx}",
+            "app/**/icon.{ts,tsx,js,jsx}",
+            "app/**/apple-icon.{ts,tsx,js,jsx}",
+            "app/**/manifest.{ts,tsx,js,jsx}",
+            "app/**/sitemap.{ts,tsx,js,jsx}",
+            "app/**/robots.{ts,tsx,js,jsx}",
+            "src/app/**/opengraph-image.{ts,tsx,js,jsx}",
+            "src/app/**/twitter-image.{ts,tsx,js,jsx}",
+            "src/app/**/icon.{ts,tsx,js,jsx}",
+            "src/app/**/apple-icon.{ts,tsx,js,jsx}",
+            "src/app/**/manifest.{ts,tsx,js,jsx}",
+            "src/app/**/sitemap.{ts,tsx,js,jsx}",
+            "src/app/**/robots.{ts,tsx,js,jsx}",
+        ];
+
+        for pattern in metadata_route_patterns {
+            let (_, used) = exports
+                .iter()
+                .find(|(candidate, _)| *candidate == pattern)
+                .unwrap_or_else(|| panic!("missing metadata route pattern {pattern}"));
+
+            for config_export in [
+                "dynamic",
+                "revalidate",
+                "fetchCache",
+                "runtime",
+                "preferredRegion",
+                "maxDuration",
+            ] {
+                assert!(
+                    used.contains(&config_export),
+                    "{pattern} should credit {config_export}"
+                );
+            }
+            assert!(
+                !used.contains(&"dynamicParams"),
+                "{pattern} should not credit dynamicParams"
+            );
+        }
+    }
 
     #[test]
     fn resolve_config_page_extensions() {
@@ -432,7 +546,6 @@ mod tests {
         let plugin = NextJsPlugin;
         let result =
             plugin.resolve_config(Path::new("next.config.ts"), source, Path::new("/project"));
-        // Should generate entry patterns with the custom extensions
         assert!(
             !result.entry_patterns.is_empty(),
             "pageExtensions should generate entry patterns"
@@ -466,6 +579,30 @@ mod tests {
                 .iter()
                 .any(|p| p.starts_with("pages/api/**/*")),
             "should include pages/api when pageExtensions is customized"
+        );
+    }
+
+    #[test]
+    fn resolve_config_page_extensions_wrapped_named_const() {
+        // The official @next/mdx idiom: a separate `const nextConfig` passed to a
+        // wrapper call. The page entry patterns must still pick up the custom
+        // mdx extension. Regression for #1642.
+        let source = r#"
+            import createMDX from "@next/mdx";
+            const nextConfig = { pageExtensions: ["ts", "tsx", "md", "mdx"] };
+            const withMDX = createMDX({});
+            export default withMDX(nextConfig);
+        "#;
+        let plugin = NextJsPlugin;
+        let result =
+            plugin.resolve_config(Path::new("next.config.mjs"), source, Path::new("/project"));
+        assert!(
+            result
+                .entry_patterns
+                .iter()
+                .any(|p| p.starts_with("app/**/page") && p.contains("mdx")),
+            "wrapped named-const config should still yield mdx page entry patterns: {:?}",
+            result.entry_patterns
         );
     }
 
@@ -557,6 +694,98 @@ mod tests {
             result
                 .referenced_dependencies
                 .contains(&"lodash-es".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_config_react_compiler_true_references_babel_plugin() {
+        let source = r#"
+            import { defineConfig } from "next/config";
+
+            export default defineConfig({
+                reactCompiler: true,
+            });
+        "#;
+        let plugin = NextJsPlugin;
+        let result =
+            plugin.resolve_config(Path::new("next.config.ts"), source, Path::new("/project"));
+
+        assert!(
+            result
+                .referenced_dependencies
+                .contains(&REACT_COMPILER_BABEL_PLUGIN.to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_config_react_compiler_object_references_babel_plugin() {
+        let source = r#"
+            module.exports = {
+                reactCompiler: { compilationMode: "annotation" },
+            };
+        "#;
+        let plugin = NextJsPlugin;
+        let result =
+            plugin.resolve_config(Path::new("next.config.js"), source, Path::new("/project"));
+
+        assert!(
+            result
+                .referenced_dependencies
+                .contains(&REACT_COMPILER_BABEL_PLUGIN.to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_config_react_compiler_false_does_not_reference_babel_plugin() {
+        let source = r"
+            export default {
+                reactCompiler: false,
+            };
+        ";
+        let plugin = NextJsPlugin;
+        let result =
+            plugin.resolve_config(Path::new("next.config.ts"), source, Path::new("/project"));
+
+        assert!(
+            !result
+                .referenced_dependencies
+                .contains(&REACT_COMPILER_BABEL_PLUGIN.to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_config_react_compiler_null_does_not_reference_babel_plugin() {
+        let source = r"
+            export default {
+                reactCompiler: null,
+            };
+        ";
+        let plugin = NextJsPlugin;
+        let result =
+            plugin.resolve_config(Path::new("next.config.ts"), source, Path::new("/project"));
+
+        assert!(
+            !result
+                .referenced_dependencies
+                .contains(&REACT_COMPILER_BABEL_PLUGIN.to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_config_without_react_compiler_does_not_reference_babel_plugin() {
+        let source = r"
+            export default {
+                reactStrictMode: true,
+            };
+        ";
+        let plugin = NextJsPlugin;
+        let result =
+            plugin.resolve_config(Path::new("next.config.ts"), source, Path::new("/project"));
+
+        assert!(
+            !result
+                .referenced_dependencies
+                .contains(&REACT_COMPILER_BABEL_PLUGIN.to_string())
         );
     }
 

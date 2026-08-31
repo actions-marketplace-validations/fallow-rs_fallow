@@ -3,21 +3,31 @@ use fallow_config::{FallowConfig, OutputFormat, RulesConfig};
 
 fn create_production_config(root: std::path::PathBuf) -> fallow_config::ResolvedConfig {
     FallowConfig {
+        type_aware: fallow_config::TypeAwareConfig::default(),
         schema: None,
         extends: vec![],
         entry: vec![],
         ignore_patterns: vec![],
+        ignore_findings: vec![],
         framework: vec![],
         workspaces: None,
         ignore_dependencies: vec![],
+        ignore_unresolved_imports: vec![],
         ignore_exports: vec![],
+        ignore_catalog_references: vec![],
+        ignore_dependency_overrides: vec![],
+        ignore_exports_used_in_file: fallow_config::IgnoreExportsUsedInFileConfig::default(),
         used_class_members: vec![],
+        ignore_decorators: vec![],
+        unused_component_props: fallow_config::UnusedComponentPropsConfig::default(),
         duplicates: fallow_config::DuplicatesConfig::default(),
+        similar_code: fallow_config::SimilarCodeConfig::default(),
         health: fallow_config::HealthConfig::default(),
         rules: RulesConfig::default(),
         boundaries: fallow_config::BoundaryConfig::default(),
-        production: true,
+        production: true.into(),
         plugins: vec![],
+        rule_packs: vec![],
         dynamically_loaded: vec![],
         overrides: vec![],
         regression: None,
@@ -25,10 +35,15 @@ fn create_production_config(root: std::path::PathBuf) -> fallow_config::Resolved
         codeowners: None,
         public_packages: vec![],
         flags: fallow_config::FlagsConfig::default(),
+        security: fallow_config::SecurityConfig::default(),
+        fix: fallow_config::FixConfig::default(),
         resolve: fallow_config::ResolveConfig::default(),
         sealed: false,
+        include_entry_exports: false,
+        auto_imports: false,
+        cache: fallow_config::CacheConfig::default(),
     }
-    .resolve(root, OutputFormat::Human, 4, true, true)
+    .resolve(root, OutputFormat::Human, 4, true, true, None)
 }
 
 #[test]
@@ -40,11 +55,16 @@ fn production_mode_excludes_test_files() {
     let all_file_names: Vec<String> = results
         .unused_files
         .iter()
-        .map(|f| f.path.file_name().unwrap().to_string_lossy().to_string())
+        .map(|f| {
+            f.file
+                .path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .to_string()
+        })
         .collect();
 
-    // Test files should not appear at all (not even as unused) since
-    // production mode excludes them from discovery.
     assert!(
         !all_file_names.contains(&"utils.test.ts".to_string()),
         "utils.test.ts should not appear in production mode results, found: {all_file_names:?}"
@@ -57,15 +77,13 @@ fn production_mode_disables_dev_dependency_checking() {
     let config = create_production_config(root);
     let results = fallow_core::analyze(&config).expect("analysis should succeed");
 
-    // In production mode, unused_dev_dependencies should be empty
-    // because the rule is forced off.
     assert!(
         results.unused_dev_dependencies.is_empty(),
         "unused_dev_dependencies should be empty in production mode, found: {:?}",
         results
             .unused_dev_dependencies
             .iter()
-            .map(|d| d.package_name.as_str())
+            .map(|d| d.dep.package_name.as_str())
             .collect::<Vec<_>>()
     );
 }
@@ -79,11 +97,9 @@ fn production_mode_still_detects_unused_exports() {
     let unused_export_names: Vec<&str> = results
         .unused_exports
         .iter()
-        .map(|e| e.export_name.as_str())
+        .map(|e| e.export.export_name.as_str())
         .collect();
 
-    // testHelper is only used from the test file which is excluded,
-    // so in production mode it should be unused.
     assert!(
         unused_export_names.contains(&"testHelper"),
         "testHelper should be unused in production mode (test consumer excluded), found: {unused_export_names:?}"
@@ -92,17 +108,21 @@ fn production_mode_still_detects_unused_exports() {
 
 #[test]
 fn production_mode_does_not_exclude_nested_config_files() {
-    // Regression test for #111: **/*.config.* excluded Angular's src/app/app.config.ts
     let root = fixture_path("angular-production-config");
     let config = create_production_config(root);
     let results = fallow_core::analyze(&config).expect("analysis should succeed");
 
-    // app.config.ts is a runtime file imported by main.ts, NOT a tool config.
-    // It must be discovered in production mode so app.routes.ts stays reachable.
     let unused_file_names: Vec<String> = results
         .unused_files
         .iter()
-        .map(|f| f.path.file_name().unwrap().to_string_lossy().to_string())
+        .map(|f| {
+            f.file
+                .path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .to_string()
+        })
         .collect();
 
     assert!(
@@ -124,11 +144,16 @@ fn non_production_mode_includes_test_files() {
     let unused_file_names: Vec<String> = results
         .unused_files
         .iter()
-        .map(|f| f.path.file_name().unwrap().to_string_lossy().to_string())
+        .map(|f| {
+            f.file
+                .path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .to_string()
+        })
         .collect();
 
-    // In non-production mode, test-only.ts should be detected as unused
-    // (it's not imported by anything)
     assert!(
         unused_file_names.contains(&"test-only.ts".to_string()),
         "test-only.ts should be detected as unused in non-production mode, found: {unused_file_names:?}"
@@ -144,7 +169,7 @@ fn production_mode_still_parses_vite_config_aliases() {
     let unresolved_specs: Vec<&str> = results
         .unresolved_imports
         .iter()
-        .map(|u| u.specifier.as_str())
+        .map(|u| u.import.specifier.as_str())
         .collect();
 
     assert!(
@@ -162,7 +187,7 @@ fn production_mode_resolves_solution_style_tsconfig_paths() {
     let unresolved_specs: Vec<&str> = results
         .unresolved_imports
         .iter()
-        .map(|u| u.specifier.as_str())
+        .map(|u| u.import.specifier.as_str())
         .collect();
 
     assert!(
@@ -173,11 +198,117 @@ fn production_mode_resolves_solution_style_tsconfig_paths() {
     let unused_file_names: Vec<String> = results
         .unused_files
         .iter()
-        .map(|f| f.path.file_name().unwrap().to_string_lossy().to_string())
+        .map(|f| {
+            f.file
+                .path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .to_string()
+        })
         .collect();
 
     assert!(
         !unused_file_names.contains(&"messages.ts".to_string()),
         "messages.ts should be reachable via tsconfig.app.json paths alias: {unused_file_names:?}"
+    );
+}
+
+#[test]
+fn analyze_project_honors_per_analysis_dead_code_production() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("package.json"),
+        r#"{"name":"per-analysis-prod","main":"src/index.ts"}"#,
+    )
+    .unwrap();
+    std::fs::write(root.join("src/index.ts"), "export const ok = 1;\n").unwrap();
+    std::fs::write(root.join("src/utils.test.ts"), "export const dead = 1;\n").unwrap();
+    std::fs::write(
+        root.join(".fallowrc.json"),
+        r#"{"production":{"deadCode":true,"health":false,"dupes":false}}"#,
+    )
+    .unwrap();
+
+    let (mut loaded, _) = FallowConfig::find_and_load(root)
+        .expect("config discovery should succeed")
+        .expect("fixture config should be discovered");
+    loaded.production = loaded
+        .production
+        .for_analysis(fallow_config::ProductionAnalysis::DeadCode)
+        .into();
+    let config = loaded.resolve(root.to_path_buf(), OutputFormat::Human, 4, true, true, None);
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+
+    let unused_file_names: Vec<String> = results
+        .unused_files
+        .iter()
+        .map(|f| {
+            f.file
+                .path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .to_string()
+        })
+        .collect();
+
+    assert!(
+        !unused_file_names.contains(&"utils.test.ts".to_string()),
+        "per-analysis production.deadCode=true should exclude *.test.ts from analyze_project, found: {unused_file_names:?}"
+    );
+}
+
+/// Under production filtering the script catalog is filtered too, so
+/// `npm run lint -- --fix` inside a production script cannot reach the
+/// dev-only `lint` body and credit its binary (issue #2016).
+#[test]
+fn production_mode_does_not_follow_indirection_into_filtered_scripts() {
+    let root = fixture_path("production-script-indirection");
+    let config = create_production_config(root);
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+
+    let unused: Vec<&str> = results
+        .unused_dependencies
+        .iter()
+        .map(|dep| dep.dep.package_name.as_str())
+        .collect();
+
+    assert!(
+        unused.contains(&"indirect-only-tool"),
+        "indirect-only-tool is only reachable through a filtered-out script, got {unused:?}"
+    );
+}
+
+/// Counterpart of the production case: the same fixture must still credit
+/// `indirect-only-tool` when nothing is filtered.
+///
+/// This is a control, not a falsification of the indirection feature. Outside
+/// production the `lint` script is analyzed as a script of its own, so its
+/// binary would be credited even without following `npm run lint -- --fix`.
+/// The falsifying coverage for the indirection itself lives in the unit tests
+/// in `crates/core/src/scripts/mod.rs`, where the reached binary is named only
+/// inside the body that indirection has to enter.
+#[test]
+fn non_production_mode_follows_indirection_into_dev_scripts() {
+    let root = fixture_path("production-script-indirection");
+    let config = create_config(root);
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+
+    let unused: Vec<&str> = results
+        .unused_dependencies
+        .iter()
+        .map(|dep| dep.dep.package_name.as_str())
+        .collect();
+
+    assert!(
+        !unused.contains(&"indirect-only-tool"),
+        "the lint script is analyzed outside production mode, got {unused:?}"
+    );
+    assert!(
+        unused.contains(&"unused-control"),
+        "an unreferenced control dependency must still be reported, got {unused:?}"
     );
 }

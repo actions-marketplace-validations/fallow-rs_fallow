@@ -22,8 +22,10 @@ pub(super) const KNIP_UNMAPPABLE_FIELDS: &[(&str, &str, Option<&str>)] = &[
     ),
     (
         "ignoreFiles",
-        "No separate concept in fallow",
-        Some("use the `ignorePatterns` field instead"),
+        "Fallow has no dedicated ignoreFiles field",
+        Some(
+            "use overrides[].files with rules.unused-files = \"off\"; this keeps matching files in the analysis graph",
+        ),
     ),
     (
         "ignoreBinaries",
@@ -38,9 +40,8 @@ pub(super) const KNIP_UNMAPPABLE_FIELDS: &[(&str, &str, Option<&str>)] = &[
     (
         "ignoreUnresolved",
         "Unresolved import filtering is not configurable in fallow",
-        Some("use inline suppression comments: // fallow-ignore-next-line unresolved-imports"),
+        Some("use inline suppression comments: // fallow-ignore-next-line unresolved-import"),
     ),
-    ("ignoreExportsUsedInFile", "No equivalent in fallow", None),
     (
         "ignoreWorkspaces",
         "Workspace filtering is not configurable per-workspace",
@@ -160,8 +161,6 @@ mod tests {
     use super::*;
     use rustc_hash::FxHashSet;
 
-    // -- KNIP_RULE_MAP --------------------------------------------------------
-
     #[test]
     fn rule_map_has_no_empty_keys_or_values() {
         for (knip, fallow) in KNIP_RULE_MAP {
@@ -203,8 +202,6 @@ mod tests {
         );
     }
 
-    // -- KNIP_UNMAPPABLE_FIELDS -----------------------------------------------
-
     #[test]
     fn unmappable_fields_is_non_empty() {
         assert!(
@@ -238,8 +235,6 @@ mod tests {
         }
     }
 
-    // -- KNIP_UNMAPPABLE_ISSUE_TYPES ------------------------------------------
-
     #[test]
     fn unmappable_issue_types_is_non_empty() {
         assert!(
@@ -258,8 +253,6 @@ mod tests {
             );
         }
     }
-
-    // -- KNIP_PLUGIN_KEYS -----------------------------------------------------
 
     #[test]
     fn plugin_keys_is_non_empty() {

@@ -22,18 +22,11 @@ define_plugin! {
     tooling_dependencies: TOOLING_DEPENDENCIES,
     resolve_config(config_path, source, _root) {
         let mut result = PluginResult::default();
+        super::add_import_referenced_dependencies(&mut result, source, config_path);
 
-        let imports = config_parser::extract_imports(source, config_path);
-        for imp in &imports {
-            let dep = crate::resolve::extract_package_name(imp);
-            result.referenced_dependencies.push(dep);
-        }
-
-        // input -> entry points (string, array, or object)
         let inputs = config_parser::extract_config_string_or_array(source, config_path, &["input"]);
         result.extend_entry_patterns(inputs);
 
-        // external -> referenced dependencies (string array)
         let external =
             config_parser::extract_config_shallow_strings(source, config_path, "external");
         for ext in &external {
@@ -58,7 +51,7 @@ mod tests {
         let plugin = RollupPlugin;
         let result =
             plugin.resolve_config(Path::new("rollup.config.js"), source, Path::new("/project"));
-        assert_eq!(result.entry_patterns, vec!["./src/index.js"]);
+        assert_eq!(result.entry_patterns, vec!["src/index.js"]);
     }
 
     #[test]
@@ -71,10 +64,7 @@ mod tests {
         let plugin = RollupPlugin;
         let result =
             plugin.resolve_config(Path::new("rollup.config.js"), source, Path::new("/project"));
-        assert_eq!(
-            result.entry_patterns,
-            vec!["./src/index.js", "./src/cli.js"]
-        );
+        assert_eq!(result.entry_patterns, vec!["src/index.js", "src/cli.js"]);
     }
 
     #[test]
@@ -90,10 +80,7 @@ mod tests {
         let plugin = RollupPlugin;
         let result =
             plugin.resolve_config(Path::new("rollup.config.js"), source, Path::new("/project"));
-        assert_eq!(
-            result.entry_patterns,
-            vec!["./src/main.js", "./src/vendor.js"]
-        );
+        assert_eq!(result.entry_patterns, vec!["src/main.js", "src/vendor.js"]);
     }
 
     #[test]

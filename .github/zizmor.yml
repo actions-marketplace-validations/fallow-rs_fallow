@@ -9,7 +9,11 @@ rules:
     ignore:
       - action.yml
       - release.yml
-  # Caching in release workflow is acceptable — tags are immutable
+  # release.yml separates package-prep (cache restore allowed) from the
+  # privileged publish jobs (no cache, no checkout, only download-artifact +
+  # npm publish --ignore-scripts / vsce publish --packagePath). publish-crates
+  # runs `cargo publish --no-verify` so a poisoned cache cannot influence a
+  # build.rs that sees CARGO_REGISTRY_TOKEN.
   cache-poisoning:
     ignore:
       - release.yml
@@ -36,3 +40,12 @@ rules:
   template-injection:
     ignore:
       - ci.yml
+  # ci.yml smoke-installs the freshly built (unpublished) npm tarball, which has
+  # no lockfile by definition. release.yml installs pinned npm (the required
+  # two-step bootstrap) and pinned @vscode/vsce / ovsx publisher CLIs. All use
+  # exact version pins plus --ignore-scripts, so the ad-hoc install surface is
+  # already hardened (see .claude/rules/release-workflow.md).
+  adhoc-packages:
+    ignore:
+      - ci.yml
+      - release.yml

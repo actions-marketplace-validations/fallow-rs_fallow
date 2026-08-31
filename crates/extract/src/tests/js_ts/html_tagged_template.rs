@@ -5,9 +5,11 @@
 //! components emit HTML via a tagged template whose tag is the identifier
 //! `html`. See issue #105 (till's follow-up comment).
 
-use fallow_types::extract::ImportedName;
+use fallow_types::extract::{ImportedName, SemanticFact};
 
 use crate::tests::parse_ts;
+
+const DYNAMIC_CUSTOM_ELEMENT_TAG: &str = "<dynamic>";
 
 #[test]
 fn html_tagged_template_script_src_extracted() {
@@ -79,8 +81,6 @@ export const Layout = () => html`
 
 #[test]
 fn html_tagged_template_bare_src_normalized() {
-    // Bare specifiers become `./foo.js` so the resolver doesn't treat them
-    // as npm packages — same behavior as the HTML parser.
     let info = parse_ts(
         r#"import { html } from "hono/html";
 export const Layout = () => html`
@@ -149,8 +149,6 @@ export const Layout = () => html`
 
 #[test]
 fn html_tagged_template_comments_stripped() {
-    // HTML comments must not produce asset imports — the commented-out script
-    // is dead markup that should never reach the graph.
     let info = parse_ts(
         r#"import { html } from "hono/html";
 export const Layout = () => html`
@@ -166,9 +164,6 @@ export const Layout = () => html`
 
 #[test]
 fn html_tagged_template_interpolated_asset_across_boundary_skipped() {
-    // An asset reference split across an interpolation boundary can't be
-    // statically resolved, so both halves are ignored — preventing bogus
-    // imports like `./${base}.js` from flooding the resolver.
     let info = parse_ts(
         r#"import { html } from "hono/html";
 const base = "/static";
@@ -181,8 +176,6 @@ export const Layout = () => html`
 
 #[test]
 fn html_tagged_template_rel_icon_ignored() {
-    // Only stylesheet/modulepreload rel values are tracked — matching the
-    // HTML parser's whitelist.
     let info = parse_ts(
         r#"import { html } from "hono/html";
 export const Layout = () => html`
@@ -200,9 +193,6 @@ export const Layout = () => html`
 
 #[test]
 fn non_html_tag_ignored() {
-    // `css`, `sql`, `gql`, `styled.div` tagged templates are completely
-    // outside the scope of this override. No asset imports should be
-    // emitted, even though their text could match the HTML regex.
     let info = parse_ts(
         r#"const css = (strings: TemplateStringsArray, ...values: unknown[]) => "";
 const style = css`
@@ -218,8 +208,6 @@ const style = css`
 
 #[test]
 fn html_tagged_template_in_jsx_file_also_works() {
-    // Layouts can live in .tsx files and still use the html`` tag — make sure
-    // the override fires regardless of source type.
     let info = crate::tests::parse_tsx(
         r#"import { html } from "hono/html";
 export const Layout = () => html`
@@ -246,4 +234,98 @@ export const Layout = () => html`
 `;"#,
     );
     assert!(info.imports.iter().all(|i| !i.source.is_empty()));
+}
+
+#[test]
+fn lit_custom_element_decorator_records_registered_tag() {
+    let info = parse_ts(
+        r#"import { LitElement, html } from "lit";
+import { customElement } from "lit/decorators.js";
+@customElement("my-element")
+export class MyElement extends LitElement {
+  render() {
+    return html`<div></div>`;
+  }
+}"#,
+    );
+    let reg = info
+        .registered_custom_elements
+        .iter()
+        .find(|r| r.tag == "my-element")
+        .expect("my-element registered");
+    assert_eq!(reg.class_local_name, "MyElement");
+}
+
+#[test]
+fn custom_elements_define_records_registered_tag() {
+    let info = parse_ts(
+        r#"class XFoo extends HTMLElement {}
+customElements.define("x-foo", XFoo);"#,
+    );
+    let tags: Vec<&str> = info
+        .registered_custom_elements
+        .iter()
+        .map(|r| r.tag.as_str())
+        .collect();
+    assert!(tags.contains(&"x-foo"), "registered: {tags:?}");
+}
+
+#[test]
+fn html_template_records_used_custom_element_tags_excluding_native() {
+    let info = parse_ts(
+        r#"import { html } from "lit";
+export const tpl = () => html`<my-card><span>x</span><other-el></other-el></my-card>`;"#,
+    );
+    assert!(
+        info.used_custom_element_tags
+            .contains(&"my-card".to_string()),
+        "{:?}",
+        info.used_custom_element_tags
+    );
+    assert!(
+        info.used_custom_element_tags
+            .contains(&"other-el".to_string()),
+        "{:?}",
+        info.used_custom_element_tags
+    );
+    assert!(
+        !info.used_custom_element_tags.contains(&"span".to_string()),
+        "a native (non-hyphenated) tag must not be recorded: {:?}",
+        info.used_custom_element_tags
+    );
+}
+
+#[test]
+fn document_create_element_credits_custom_element_tag() {
+    let info = parse_ts(r#"document.body.appendChild(document.createElement("x-foo"));"#);
+    assert!(
+        info.used_custom_element_tags.contains(&"x-foo".to_string()),
+        "createElement should credit the tag as rendered: {:?}",
+        info.used_custom_element_tags
+    );
+    // A native (non-hyphenated) createElement is not a custom element.
+    let native = parse_ts(r#"document.createElement("div");"#);
+    assert!(native.used_custom_element_tags.is_empty());
+}
+
+#[test]
+fn dynamic_html_tag_records_typed_dynamic_render_fact() {
+    let info = parse_ts(
+        r#"import { html } from "lit";
+export const render = (tag) => html`<${tag}></${tag}>`;"#,
+    );
+    assert!(
+        info.semantic_facts
+            .iter()
+            .any(|fact| matches!(fact, SemanticFact::DynamicCustomElementRender(_))),
+        "a `<${{tag}}>` dynamic render must record a typed semantic fact: {:?}",
+        info.semantic_facts
+    );
+    assert!(
+        !info
+            .used_custom_element_tags
+            .contains(&DYNAMIC_CUSTOM_ELEMENT_TAG.to_string()),
+        "new extraction must not persist the legacy dynamic sentinel: {:?}",
+        info.used_custom_element_tags
+    );
 }

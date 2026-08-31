@@ -1,16 +1,23 @@
 target/
-.cargo/
+# Public smoke conformance artifacts live under target/public-smoke-conformance/
+# Ignore everything in .cargo/ (credentials, local overrides) but track
+# the committed workspace config so target-specific rustflags (e.g.
+# Windows main-thread stack size) ship with the repo.
+.cargo/*
+!.cargo/config.toml
 node_modules/
 !tests/fixtures/bin-script-deps/node_modules/
+!tests/fixtures/css-package-subpath-import/node_modules/
 !tests/fixtures/scss-node-modules-resolution/node_modules/
+!tests/fixtures/issue-754-eslint-meta-preset/node_modules/
 .DS_Store
 # macOS Spotlight index control markers (written into build output dirs)
 .metadata_never_index
 .metadata_never_index_unless_rootfs
 
 # Reference repos (for development only)
-reference
-reference/
+/reference
+/reference/
 
 # Coverage reports
 coverage/
@@ -29,6 +36,9 @@ benchmarks/knip6/
 
 # Incremental cache
 .fallow/
+
+# Ephemeral git worktrees created for parallel/agent work
+.worktrees/
 
 # Python cache
 __pycache__/
@@ -71,6 +81,8 @@ editors/vscode/LICENSE
 # Claude
 .claude/*
 !.claude/settings.json
+!.claude/hooks/
+!.claude/hooks/pre-bash-guard.py
 !.claude/skills/
 !.claude/rules/
 !.claude/agents/
@@ -78,3 +90,38 @@ editors/vscode/LICENSE
 # Codex
 .codex/
 AGENTS.md
+!/AGENTS.md
+!crates/cli/AGENTS.md
+!crates/core/AGENTS.md
+!crates/extract/AGENTS.md
+!crates/graph/AGENTS.md
+!editors/vscode/AGENTS.md
+!tests/AGENTS.md
+!.github/workflows/AGENTS.md
+
+# In-flight feature plans written by /fallow-implement and re-read by /panel-review,
+# the implementation phase, and /fallow-review. Transient; promoted concepts go to decisions/.
+.plans/
+# Stray undotted variant: research/plan scratch docs belong in the gitignored
+# .plans/, never committed. Ignored so `git add -A` cannot sweep one in again.
+plans/
+
+# Superpowers workflow artefacts are local agent state, never repository content.
+.superpowers/
+docs/superpowers/
+
+# Crash-handover markers from sdk-cli automation
+/HANDOVER-CRASH-*.md
+
+decisions
+decisions/
+
+# Runtime scratch the review app writes (human notes feed, captured framing).
+# App-subtree .gitignore already ignores it; this keeps a root `git add -A` safe.
+.fallow-review/
+
+# trigger-tree keeps telemetry local while sharing its project configuration.
+.trigger-tree/*
+!.trigger-tree/config.sh
+!.trigger-tree/README.md
+!.trigger-tree/gate.json

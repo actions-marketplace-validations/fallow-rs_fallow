@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "2.46.0"
+version = "3.21.0"
 edition = "2024"
 rust-version = "1.92"
 license = "MIT"
@@ -14,50 +14,69 @@ keywords = ["typescript", "javascript", "lint", "static-analysis", "code-quality
 categories = ["command-line-utilities", "development-tools"]
 
 [workspace.dependencies]
-fallow-core = { version = "2.46.0", path = "crates/core" }
-fallow-config = { version = "2.46.0", path = "crates/config" }
-fallow-extract = { version = "2.46.0", path = "crates/extract" }
-fallow-graph = { version = "2.46.0", path = "crates/graph" }
-fallow-types = { version = "2.46.0", path = "crates/types" }
-fallow-cli = { version = "2.46.0", path = "crates/cli" }
+fallow-api = { version = "3.21.0", path = "crates/api" }
+fallow-core = { version = "3.21.0", path = "crates/core" }
+fallow-config = { version = "3.21.0", path = "crates/config" }
+fallow-extract = { version = "3.21.0", path = "crates/extract" }
+fallow-engine = { version = "3.21.0", path = "crates/engine" }
+fallow-graph = { version = "3.21.0", path = "crates/graph" }
+fallow-output = { version = "3.21.0", path = "crates/output" }
+fallow-process = { version = "3.21.0", path = "crates/process" }
+fallow-security = { version = "3.21.0", path = "crates/security" }
+fallow-types = { version = "3.21.0", path = "crates/types" }
 
 # Parsing & analysis
-oxc_allocator = "0.125"
-oxc_ast = "0.125"
-oxc_ast_visit = "0.125"
-oxc_parser = "0.125"
-oxc_resolver = "11"
-oxc_semantic = "0.125"
-oxc_span = "0.125"
-oxc_str = "0.125"
-oxc_syntax = "0.125"
-oxc_coverage_instrument = "0.3"
+oxc_allocator = "0.126"
+oxc_ast = "0.126"
+oxc_ast_visit = "0.126"
+oxc_parser = "0.126"
+oxc_resolver = { version = "11", features = ["yarn_pnp"] }
+oxc_semantic = "0.126"
+oxc_span = "0.126"
+oxc_str = "0.126"
+oxc_syntax = "0.126"
+oxc_coverage_instrument = "0.9.0"
+# CSS AST parser (browser-grade, built on Mozilla cssparser/selectors). Pinned
+# exact because it has no stable release line and pre-release semver matching is
+# brittle. Used by fallow-extract for CSS class/import extraction and analytics.
+lightningcss = { version = "=1.0.0-alpha.72", default-features = false, features = [
+    "visitor",
+] }
+cssparser = "=0.37.0"
 
 # CLI
 clap = { version = "4", features = ["derive"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-json_comments = "0.2"
+serde_json = { version = "1", features = ["preserve_order"] }
+serde_yaml_ng = "0.10"
+semver = "1"
+jsonc-parser = { version = "0.33", features = ["cst", "serde", "serde_json"] }
 toml = "1.1"
+toml_edit = "0.25"
 schemars = "1"
+flate2 = "1"
 
 # Parallelism
 rayon = "1"
+dashmap = "6"
 
 # File system
 dunce = "1"
 ignore = "0.4"
 glob = "0.3"
 globset = { version = "0.4", features = ["serde1"] }
+rustix = { version = "1", features = ["fs", "process"] }
 regex = { version = "1", default-features = false, features = ["std", "perf", "unicode-perl", "unicode-case"] }
 
 # Hashing
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
+sha2 = "0.11"
 rustc-hash = "2"
 
 # HTTP
+httpdate = "1"
 ureq = { version = "3", default-features = false, features = ["json", "rustls"] }
 
 # Caching
@@ -75,20 +94,36 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Graph
 fixedbitset = "0.5"
 
+# Persisted graph cache serialization (postcard is already pulled in transitively
+# by oxc-browserslist; pin it directly so the persisted-graph-cache store uses a
+# stable, alloc-backed binary format).
+postcard = { version = "1", default-features = false, features = ["alloc"] }
+
 # LSP
-tower-lsp = "0.20"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "io-std", "process", "time"] }
+ls-types = "0.0.6"
+tower-lsp-server = "0.23"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "io-std", "process", "signal", "time"] }
 
 # File watching
 notify = "8"
-notify-debouncer-mini = "0.7"
+
+# Browser
+open = "5"
 
 # Testing
-criterion = { version = "0.8", features = ["html_reports"] }
+criterion = { package = "codspeed-criterion-compat", version = "=4.7.0", default-features = false }
 dhat = "0.3"
 insta = { version = "1", features = ["yaml"] }
+jsonschema = { version = "0.49", default-features = false }
 proptest = "1"
 tempfile = "3"
+libc = "0.2"
+
+# Windows-only Win32 bindings (process query, job objects, and console signal handling)
+windows-sys = { version = "0.61", features = ["Win32_System_Threading", "Win32_System_JobObjects", "Win32_System_Diagnostics_ToolHelp", "Win32_Foundation", "Win32_Security", "Win32_System_Console", "Win32_Storage_FileSystem", "Win32_Globalization"] }
+
+# Signal handling (Unix-only; Windows uses windows-sys::SetConsoleCtrlHandler directly)
+signal-hook = { version = "0.4", default-features = false, features = ["iterator"] }
 
 [workspace.lints.clippy]
 # Lint groups (priority -1 so individual overrides take precedence)
@@ -97,7 +132,7 @@ pedantic = { level = "warn", priority = -1 }
 nursery = { level = "warn", priority = -1 }
 cargo = { level = "warn", priority = -1 }
 
-# Restriction lints — catch common mistakes and enforce discipline
+# Restriction lints, catch common mistakes and enforce discipline
 dbg_macro = "warn"
 todo = "warn"
 print_stdout = "warn"
@@ -107,6 +142,8 @@ empty_drop = "warn"                     # Catch no-op Drop impls
 empty_structs_with_brackets = "warn"    # Use `struct Foo;` not `struct Foo {}`
 exit = "warn"                           # Prevent silent process::exit()
 get_unwrap = "warn"                     # Prefer .get() over [] indexing
+unwrap_used = "warn"                    # Require explicit justification for panic-prone unwrap()
+expect_used = "warn"                    # Require explicit justification for panic-prone expect()
 rc_buffer = "warn"                      # Prevent Rc<Vec<T>> anti-pattern
 rc_mutex = "warn"                       # Prevent Rc<Mutex<T>> anti-pattern
 undocumented_unsafe_blocks = "warn"     # All unsafe must have SAFETY comment
@@ -118,12 +155,23 @@ pathbuf_init_then_push = "warn"         # Use PathBuf::from() directly
 excessive_nesting = "warn"              # Catch deeply nested control flow (threshold in .clippy.toml)
 allow_attributes_without_reason = "warn" # Force reason on #[allow] to catch unjustified suppressions
 unimplemented = "warn"                  # Catch leftover unimplemented!() calls
-filetype_is_file = "warn"               # FileType::is_file() misses symlinks — use !is_dir()
+filetype_is_file = "warn"               # FileType::is_file() misses symlinks, use !is_dir()
 rest_pat_in_fully_bound_structs = "warn" # Catch `..` in patterns where all fields are already bound
 pub_underscore_fields = "warn"           # Catch accidentally public _-prefixed fields
 non_zero_suggestions = "warn"            # Suggest NonZero types for naturally non-zero values
 precedence_bits = "warn"                 # Catch bitwise operator precedence mistakes
 map_with_unused_argument_over_ranges = "warn" # Use `repeat`/`repeat_with` instead
+iter_on_single_items = "warn"          # Catch iterator use where a direct call is clearer
+redundant_clone = "warn"               # Catch avoidable clones before they reach hot paths
+significant_drop_in_scrutinee = "warn" # Catch temporaries dropped later than expected
+suspicious_operation_groupings = "warn" # Catch visually ambiguous arithmetic/bitwise grouping
+unused_peekable = "warn"               # Catch Peekable iterators that never peek
+
+# Process-spawn ban (method list lives in .clippy.toml). Allowed workspace-wide
+# so CLI and MCP can spawn worktrees, sidecars, and subprocesses off the core
+# analysis path. Core, extract, graph, and engine re-deny it at their crate
+# roots; engine-owned Git wrappers carry narrow expectations at their call sites.
+disallowed_methods = "allow"
 
 # Allow common pedantic false positives
 module_name_repetitions = "allow"
@@ -134,7 +182,7 @@ cast_possible_truncation = "allow"
 cast_sign_loss = "allow"
 cast_precision_loss = "allow"
 cast_possible_wrap = "allow"
-too_many_lines = "warn"                 # SIG unit size — threshold in .clippy.toml
+too_many_lines = "warn"                 # SIG unit size, threshold in .clippy.toml
 items_after_statements = "allow"
 single_match_else = "allow"
 if_not_else = "allow"
@@ -157,6 +205,8 @@ use_self = "allow"                      # Too noisy with generics
 multiple_crate_versions = "allow"       # Transitive dependency version conflicts
 
 [workspace.lints.rust]
+absolute_paths_not_starting_with_crate = "warn" # Prefer crate/self/super paths inside crates
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(miri)'] }
 unsafe_code = "warn"
 unsafe_op_in_unsafe_fn = "warn"         # Require unsafe blocks even inside unsafe fn
 unused_unsafe = "warn"                  # Catch unnecessary unsafe blocks
@@ -170,6 +220,11 @@ debug = false
 
 [profile.test]
 debug = false
+
+# Release-like lint profile without the cost of full release codegen.
+[profile.dev-no-debug-assertions]
+inherits = "dev"
+debug-assertions = false
 
 # Optimize proc-macro crates in dev for faster compilation
 [profile.dev.package.serde_derive]
@@ -188,9 +243,34 @@ lto = true
 codegen-units = 1
 strip = "symbols"
 opt-level = 3
-panic = "abort"                         # Smaller binary — no unwind tables needed
+panic = "abort"                         # Smaller binary, no unwind tables needed
 
-# Optimize heavy deps for size — not in the hot path
+# Profile-with-debug: release-equivalent codegen + debuginfo retained.
+# Use for samply / Instruments / perf without enabling LTO+strip in the
+# regular release profile.
+[profile.release-debug]
+inherits = "release"
+strip = "none"
+debug = "full"
+
+# Shipped @fallow/node addon: release-equivalent codegen, but panics unwind so
+# napi-rs can convert them to catchable JS errors instead of aborting the host
+# Node process. The CLI binary keeps panic = "abort".
+[profile.napi-release]
+inherits = "release"
+panic = "unwind"
+
+# Coverage profile for cargo-llvm-cov loops: preserve runtime checks while
+# avoiding full release build cost.
+[profile.coverage]
+inherits = "release"
+opt-level = 2
+codegen-units = 256
+lto = "thin"
+debug-assertions = true
+overflow-checks = true
+
+# Optimize heavy deps for size, not in the hot path
 [profile.release.package.regex-syntax]
 opt-level = "z"
 [profile.release.package.clap_builder]

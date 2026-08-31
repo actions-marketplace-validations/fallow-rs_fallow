@@ -1,28 +1,77 @@
 //! TypeScript plugin.
 //!
-//! Detects TypeScript projects and marks tsconfig files as always used.
-//! Parses tsconfig.json to extract project references, extended configs,
-//! type package dependencies, language service plugins, and array extends (TS 5.0+).
+//! Detects TypeScript projects and parses `tsconfig.json` for references,
+//! extended configs, type packages, language service plugins, and array extends.
 #![expect(
     clippy::excessive_nesting,
     reason = "tsconfig AST parsing requires deep nesting"
 )]
 
-use std::path::Path;
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+
+use rustc_hash::FxHashSet;
 
 use super::config_parser;
+use super::registry::ConfigCandidateIndex;
 use super::{Plugin, PluginResult};
 
-define_plugin!(
-    struct TypeScriptPlugin => "typescript",
-    enablers: &["typescript"],
-    config_patterns: &["tsconfig.json", "tsconfig.*.json"],
-    always_used: &["tsconfig.json", "tsconfig.*.json"],
-    tooling_dependencies: &["typescript", "ts-node", "tsx", "ts-loader"],
-    resolve_config(config_path, source, root) {
+const ENABLERS: &[&str] = &["typescript"];
+const CONFIG_PATTERNS: &[&str] = &["tsconfig.json", "tsconfig.*.json"];
+const ALWAYS_USED: &[&str] = &["tsconfig.json", "tsconfig.*.json"];
+const TOOLING_DEPENDENCIES: &[&str] = &["typescript", "ts-node", "tsx", "ts-loader"];
+
+pub struct TypeScriptPlugin;
+
+impl Plugin for TypeScriptPlugin {
+    fn name(&self) -> &'static str {
+        "typescript"
+    }
+
+    fn enablers(&self) -> &'static [&'static str] {
+        ENABLERS
+    }
+
+    fn config_patterns(&self) -> &'static [&'static str] {
+        CONFIG_PATTERNS
+    }
+
+    fn always_used(&self) -> &'static [&'static str] {
+        ALWAYS_USED
+    }
+
+    fn tooling_dependencies(&self) -> &'static [&'static str] {
+        TOOLING_DEPENDENCIES
+    }
+
+    /// Activate on a discovered `tsconfig.json` / `tsconfig.*.json`, not only on
+    /// a declared `typescript` dependency.
+    ///
+    /// The plugin is the sole registrar of `compilerOptions.paths` into the
+    /// project-wide alias table (`PluginResult.path_aliases`). A project that
+    /// configures `paths` in a tsconfig but does not list `typescript` in its
+    /// package.json (or keeps `paths` in a `tsconfig.app.json` the per-file
+    /// nearest-`tsconfig.json` chain never reads) would otherwise leave those
+    /// aliases unregistered, so an aliased import like
+    /// `@acme/internal/common/request-context` falls through to npm-package
+    /// classification and surfaces as a false `unlisted-dependency` finding
+    /// (issue #1911). Mirrors the config-file activation used by `danger` /
+    /// `k6` / `browser-extension`.
+    fn is_enabled_with_files(
+        &self,
+        deps: &[String],
+        root: &Path,
+        discovered_files: &[PathBuf],
+        candidate_index: Option<&ConfigCandidateIndex>,
+    ) -> bool {
+        self.is_enabled_with_deps(deps, root)
+            || tsconfig_present(root, discovered_files, candidate_index)
+    }
+
+    fn resolve_config(&self, config_path: &Path, source: &str, root: &Path) -> PluginResult {
         let mut result = PluginResult::default();
 
-        // tsconfig.json is JSON — wrap in parens to make it a valid JS expression for Oxc
         let is_json = config_path.extension().is_some_and(|ext| ext == "json");
         let (parse_source, parse_path_buf) = if is_json {
             (format!("({source})"), config_path.with_extension("js"))
@@ -31,7 +80,6 @@ define_plugin!(
         };
         let parse_path: &Path = &parse_path_buf;
 
-        // extends → referenced dependency or base config file
         if let Some(extends) =
             config_parser::extract_config_string(&parse_source, parse_path, &["extends"])
         {
@@ -45,8 +93,6 @@ define_plugin!(
             }
         }
 
-        // extends as array (TypeScript 5.0+)
-        // e.g. "extends": ["./tsconfig.base.json", "@tsconfig/node18"]
         let extends_arr =
             config_parser::extract_config_string_array(&parse_source, parse_path, &["extends"]);
         for ext in &extends_arr {
@@ -60,7 +106,6 @@ define_plugin!(
             }
         }
 
-        // compilerOptions.types → @types/* dependencies
         let types = config_parser::extract_config_string_array(
             &parse_source,
             parse_path,
@@ -76,7 +121,6 @@ define_plugin!(
             result.referenced_dependencies.push(base);
         }
 
-        // compilerOptions.jsxImportSource → referenced dependency
         if let Some(jsx_source) = config_parser::extract_config_string(
             &parse_source,
             parse_path,
@@ -85,7 +129,7 @@ define_plugin!(
             result.referenced_dependencies.push(jsx_source);
         }
 
-        for (find, replacement) in config_parser::extract_config_aliases(
+        for (find, replacement) in config_parser::extract_config_path_aliases(
             &parse_source,
             parse_path,
             &["compilerOptions", "paths"],
@@ -100,27 +144,110 @@ define_plugin!(
                 .push((normalized_find, normalized_replacement));
         }
 
-        // compilerOptions.plugins → referenced dependencies (TS language service plugins)
         parse_tsconfig_plugins(&parse_source, parse_path, &mut result);
 
-        // references → project reference paths
         parse_tsconfig_references(&parse_source, parse_path, root, &mut result);
 
         result
-    },
-);
+    }
+}
+
+/// Whether a `tsconfig.json` / `tsconfig.*.json` is present under `root`.
+///
+/// tsconfig files are non-source config candidates, so they never appear in the
+/// activation call's `discovered_files`; outside production mode the discovery
+/// walk's config index carries them (nested anywhere under `root`), and in
+/// production (`candidate_index` is `None`) bounded probes cover the root and
+/// unique source ancestors, matching the config search roots used after
+/// activation without introducing a recursive filesystem walk.
+fn tsconfig_present(
+    root: &Path,
+    discovered_files: &[PathBuf],
+    candidate_index: Option<&ConfigCandidateIndex>,
+) -> bool {
+    match candidate_index {
+        Some(index) => {
+            index.any_descendant_contains(root, OsStr::new("tsconfig.json"))
+                || tsconfig_variant_matcher()
+                    .is_some_and(|matcher| index.any_descendant_matches(root, matcher))
+        }
+        None => source_ancestor_has_tsconfig(root, discovered_files),
+    }
+}
+
+/// Cached matcher for the wildcard config filename (`tsconfig.app.json`,
+/// `tsconfig.base.json`). Excludes the exact `tsconfig.json`, handled separately.
+/// The pattern is a compile-time constant, so `None` is unreachable in practice.
+fn tsconfig_variant_matcher() -> Option<&'static globset::GlobMatcher> {
+    static MATCHER: OnceLock<Option<globset::GlobMatcher>> = OnceLock::new();
+    MATCHER
+        .get_or_init(|| {
+            globset::Glob::new("tsconfig.*.json")
+                .ok()
+                .map(|glob| glob.compile_matcher())
+        })
+        .as_ref()
+}
+
+/// Production-mode fallback over the root and unique directories containing or
+/// containing ancestors of discovered source files.
+fn source_ancestor_has_tsconfig(root: &Path, discovered_files: &[PathBuf]) -> bool {
+    source_ancestor_has_tsconfig_with(root, discovered_files, directory_has_tsconfig)
+}
+
+fn source_ancestor_has_tsconfig_with(
+    root: &Path,
+    discovered_files: &[PathBuf],
+    mut has_tsconfig: impl FnMut(&Path) -> bool,
+) -> bool {
+    if has_tsconfig(root) {
+        return true;
+    }
+
+    let mut probed = FxHashSet::default();
+    probed.insert(root.to_path_buf());
+    for file in discovered_files {
+        let Some(parent) = file.parent() else {
+            continue;
+        };
+        for ancestor in parent.ancestors().take_while(|dir| dir.starts_with(root)) {
+            if probed.insert(ancestor.to_path_buf()) && has_tsconfig(ancestor) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn directory_has_tsconfig(directory: &Path) -> bool {
+    if directory.join("tsconfig.json").is_file() {
+        return true;
+    }
+    let Some(matcher) = tsconfig_variant_matcher() else {
+        return false;
+    };
+    std::fs::read_dir(directory).is_ok_and(|entries| {
+        entries
+            .flatten()
+            .any(|entry| matcher.is_match(Path::new(&entry.file_name())))
+    })
+}
 
 fn normalize_tsconfig_path_alias(
     find: &str,
-    replacement: &str,
+    replacement: &Path,
     config_path: &Path,
     root: &Path,
 ) -> Option<(String, String)> {
     let normalized_find = find.strip_suffix('*').unwrap_or(find).to_string();
+    if normalized_find.is_empty() {
+        return None;
+    }
+    let replacement = config_parser::path_to_config_string(replacement);
     let normalized_replacement = replacement
         .strip_suffix("/*")
         .or_else(|| replacement.strip_suffix('*'))
-        .unwrap_or(replacement);
+        .unwrap_or(&replacement);
     let normalized_replacement =
         config_parser::normalize_config_path(normalized_replacement, config_path, root)?;
 
@@ -130,7 +257,7 @@ fn normalize_tsconfig_path_alias(
 /// Extract `compilerOptions.plugins[].name` from a tsconfig as referenced dependencies.
 fn parse_tsconfig_plugins(source: &str, path: &Path, result: &mut PluginResult) {
     use oxc_allocator::Allocator;
-    use oxc_ast::ast::{Expression, ObjectPropertyKind, PropertyKey};
+    use oxc_ast::ast::Expression;
     use oxc_parser::Parser;
     use oxc_span::SourceType;
 
@@ -142,35 +269,17 @@ fn parse_tsconfig_plugins(source: &str, path: &Path, result: &mut PluginResult) 
         return;
     };
 
-    // Navigate to compilerOptions
-    let compiler_opts = obj.properties.iter().find_map(|prop| {
-        if let ObjectPropertyKind::ObjectProperty(p) = prop {
-            let is_compiler_opts = match &p.key {
-                PropertyKey::StaticIdentifier(id) => id.name == "compilerOptions",
-                PropertyKey::StringLiteral(s) => s.value == "compilerOptions",
-                _ => false,
-            };
-            if is_compiler_opts && let Expression::ObjectExpression(obj) = &p.value {
-                return Some(obj);
-            }
-        }
-        None
-    });
-    let Some(compiler_opts) = compiler_opts else {
+    let Some(compiler_opts) = find_object_property_object(obj, "compilerOptions") else {
         return;
     };
 
-    // Find plugins array
     let plugins_arr = compiler_opts.properties.iter().find_map(|prop| {
-        if let ObjectPropertyKind::ObjectProperty(p) = prop {
-            let is_plugins = match &p.key {
-                PropertyKey::StaticIdentifier(id) => id.name == "plugins",
-                PropertyKey::StringLiteral(s) => s.value == "plugins",
-                _ => false,
-            };
-            if is_plugins && let Expression::ArrayExpression(arr) = &p.value {
-                return Some(arr);
-            }
+        use oxc_ast::ast::ObjectPropertyKind;
+        if let ObjectPropertyKind::ObjectProperty(p) = prop
+            && object_property_key_is(&p.key, "plugins")
+            && let Expression::ArrayExpression(arr) = &p.value
+        {
+            return Some(arr);
         }
         None
     });
@@ -178,22 +287,53 @@ fn parse_tsconfig_plugins(source: &str, path: &Path, result: &mut PluginResult) 
         return;
     };
 
-    // Extract "name" from each plugin object
     for el in &plugins_arr.elements {
         if let Some(Expression::ObjectExpression(plugin_obj)) = el.as_expression() {
-            for prop in &plugin_obj.properties {
-                if let ObjectPropertyKind::ObjectProperty(p) = prop {
-                    let is_name = match &p.key {
-                        PropertyKey::StaticIdentifier(id) => id.name == "name",
-                        PropertyKey::StringLiteral(s) => s.value == "name",
-                        _ => false,
-                    };
-                    if is_name && let Expression::StringLiteral(s) = &p.value {
-                        let dep = crate::resolve::extract_package_name(&s.value);
-                        result.referenced_dependencies.push(dep);
-                    }
-                }
-            }
+            collect_tsconfig_plugin_name(plugin_obj, result);
+        }
+    }
+}
+
+/// True when an object-property key is the static identifier or string literal `name`.
+fn object_property_key_is(key: &oxc_ast::ast::PropertyKey, name: &str) -> bool {
+    use oxc_ast::ast::PropertyKey;
+    match key {
+        PropertyKey::StaticIdentifier(id) => id.name == name,
+        PropertyKey::StringLiteral(s) => s.value == name,
+        _ => false,
+    }
+}
+
+/// Find a named object-valued property inside `obj`.
+fn find_object_property_object<'a>(
+    obj: &'a oxc_ast::ast::ObjectExpression<'a>,
+    name: &str,
+) -> Option<&'a oxc_ast::ast::ObjectExpression<'a>> {
+    use oxc_ast::ast::{Expression, ObjectPropertyKind};
+    obj.properties.iter().find_map(|prop| {
+        if let ObjectPropertyKind::ObjectProperty(p) = prop
+            && object_property_key_is(&p.key, name)
+            && let Expression::ObjectExpression(inner) = &p.value
+        {
+            return Some(&**inner);
+        }
+        None
+    })
+}
+
+/// Push the `name` field of a single tsconfig plugin object as a referenced dependency.
+fn collect_tsconfig_plugin_name(
+    plugin_obj: &oxc_ast::ast::ObjectExpression,
+    result: &mut PluginResult,
+) {
+    use oxc_ast::ast::{Expression, ObjectPropertyKind};
+    for prop in &plugin_obj.properties {
+        if let ObjectPropertyKind::ObjectProperty(p) = prop
+            && object_property_key_is(&p.key, "name")
+            && let Expression::StringLiteral(s) = &p.value
+        {
+            let dep = crate::resolve::extract_package_name(&s.value);
+            result.referenced_dependencies.push(dep);
         }
     }
 }
@@ -258,6 +398,150 @@ fn parse_tsconfig_references(source: &str, path: &Path, root: &Path, result: &mu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn activates_from_declared_typescript_dependency() {
+        let plugin = TypeScriptPlugin;
+        let deps = vec!["typescript".to_string()];
+
+        assert!(plugin.is_enabled_with_deps(&deps, Path::new("/project")));
+        assert!(plugin.is_enabled_with_files(&deps, Path::new("/project"), &[], None));
+    }
+
+    #[test]
+    fn activates_from_nested_tsconfig_variant_via_index() {
+        // A `tsconfig.app.json` (the issue #1911 shape) is a config candidate,
+        // not a source file, so it reaches the plugin through the discovery
+        // index rather than `discovered_files`. Activation must fire even with
+        // no `typescript` dependency, so the plugin's `compilerOptions.paths`
+        // are registered project-wide.
+        let plugin = TypeScriptPlugin;
+        let tsconfig = PathBuf::from("/repo/apps/web/tsconfig.app.json");
+        let index = ConfigCandidateIndex::build(std::iter::once(tsconfig.as_path()));
+
+        assert!(plugin.is_enabled_with_files(&[], Path::new("/repo"), &[], Some(&index)));
+        // Scoping: a tsconfig under a different root does not activate this root.
+        assert!(!plugin.is_enabled_with_files(&[], Path::new("/other"), &[], Some(&index)));
+    }
+
+    #[test]
+    fn activates_from_root_tsconfig_json_via_index() {
+        let plugin = TypeScriptPlugin;
+        let tsconfig = PathBuf::from("/repo/tsconfig.json");
+        let index = ConfigCandidateIndex::build(std::iter::once(tsconfig.as_path()));
+
+        assert!(plugin.is_enabled_with_files(&[], Path::new("/repo"), &[], Some(&index)));
+    }
+
+    #[test]
+    fn does_not_activate_without_tsconfig_or_dependency() {
+        let plugin = TypeScriptPlugin;
+        let unrelated = PathBuf::from("/repo/src/index.ts");
+        let index = ConfigCandidateIndex::build(std::iter::once(unrelated.as_path()));
+
+        assert!(!plugin.is_enabled_with_files(&[], Path::new("/repo"), &[], Some(&index)));
+    }
+
+    #[test]
+    fn similarly_named_files_do_not_activate_wildcard_matcher() {
+        let plugin = TypeScriptPlugin;
+        // A `mytsconfig.app.json` / `tsconfig.app.jsonc` must not match the
+        // `tsconfig.*.json` wildcard.
+        for name in ["/repo/mytsconfig.app.json", "/repo/tsconfig.app.jsonc"] {
+            let path = PathBuf::from(name);
+            let index = ConfigCandidateIndex::build(std::iter::once(path.as_path()));
+            assert!(
+                !plugin.is_enabled_with_files(&[], Path::new("/repo"), &[], Some(&index)),
+                "{name} should not activate the plugin"
+            );
+        }
+    }
+
+    #[test]
+    fn activates_from_root_tsconfig_variant_filesystem_probe() {
+        // Production mode passes `candidate_index: None`; a root-level tsconfig
+        // variant is found via the bounded filesystem probe.
+        let plugin = TypeScriptPlugin;
+        let tmp = tempfile::tempdir().expect("temp dir");
+        std::fs::write(tmp.path().join("tsconfig.base.json"), "{}").expect("write tsconfig");
+
+        assert!(plugin.is_enabled_with_files(&[], tmp.path(), &[], None));
+    }
+
+    #[test]
+    fn activates_from_nested_tsconfig_variant_via_production_source_ancestor() {
+        let plugin = TypeScriptPlugin;
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let app = tmp.path().join("apps/web");
+        std::fs::create_dir_all(app.join("src")).expect("create source directory");
+        std::fs::write(app.join("tsconfig.app.json"), "{}").expect("write tsconfig");
+        let source = app.join("src/main.ts");
+        std::fs::write(&source, "export {};").expect("write source");
+
+        assert!(plugin.is_enabled_with_files(&[], tmp.path(), &[source], None));
+    }
+
+    #[test]
+    fn production_source_ancestor_probe_stays_bounded_to_root() {
+        let plugin = TypeScriptPlugin;
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let project = tmp.path().join("project");
+        let sibling = tmp.path().join("sibling");
+        std::fs::create_dir_all(project.join("src")).expect("create project source directory");
+        std::fs::create_dir_all(&sibling).expect("create sibling directory");
+        std::fs::write(sibling.join("tsconfig.app.json"), "{}").expect("write tsconfig");
+        let source = project.join("src/main.ts");
+        std::fs::write(&source, "export {};").expect("write source");
+
+        assert!(!plugin.is_enabled_with_files(&[], &project, &[source], None));
+    }
+
+    #[test]
+    fn production_source_ancestor_probe_checks_root_first_and_stops() {
+        let root = PathBuf::from("repo");
+        let source = root.join("apps/web/src/main.ts");
+        let mut probed = Vec::new();
+
+        assert!(source_ancestor_has_tsconfig_with(
+            &root,
+            &[source],
+            |directory| {
+                probed.push(directory.to_path_buf());
+                directory == root
+            }
+        ));
+        assert_eq!(probed, vec![root]);
+    }
+
+    #[test]
+    fn production_source_ancestor_probe_checks_unique_ancestors_immediately() {
+        let root = PathBuf::from("repo");
+        let files = [
+            root.join("apps/web/src/main.ts"),
+            root.join("apps/web/src/other.ts"),
+            root.join("apps/web/tests/main.ts"),
+        ];
+        let mut probed = Vec::new();
+
+        assert!(!source_ancestor_has_tsconfig_with(
+            &root,
+            &files,
+            |directory| {
+                probed.push(directory.to_path_buf());
+                false
+            }
+        ));
+        assert_eq!(
+            probed,
+            vec![
+                root.clone(),
+                root.join("apps/web/src"),
+                root.join("apps/web"),
+                root.join("apps"),
+                root.join("apps/web/tests"),
+            ]
+        );
+    }
 
     #[test]
     fn resolve_config_extends_package() {
@@ -368,6 +652,29 @@ mod tests {
                 ("@/".to_string(), "src".to_string()),
                 ("@shared/".to_string(), "shared".to_string())
             ]
+        );
+    }
+
+    #[test]
+    fn resolve_config_drops_wildcard_only_path_alias() {
+        let source = r#"{
+            "compilerOptions": {
+                "paths": {
+                    "*": ["./src/*"],
+                    "@/*": ["./src/*"]
+                }
+            }
+        }"#;
+        let plugin = TypeScriptPlugin;
+        let result = plugin.resolve_config(
+            std::path::Path::new("/project/tsconfig.json"),
+            source,
+            std::path::Path::new("/project"),
+        );
+
+        assert_eq!(
+            result.path_aliases,
+            vec![("@/".to_string(), "src".to_string())],
         );
     }
 

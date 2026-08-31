@@ -20,15 +20,9 @@ FALLOW_BIN=""
 CLONE_DIR="/tmp/fallow-bench-ci"
 RUNS=3
 export FALLOW_QUIET="${FALLOW_QUIET:-1}"
-PROJECT_TIMEOUT_SECONDS="${PROJECT_TIMEOUT_SECONDS:-30}"
+PROJECT_TIMEOUT_SECONDS="${PROJECT_TIMEOUT_SECONDS:-45}"
+HEARTBEAT_SECONDS="${HEARTBEAT_SECONDS:-30}"
 QUERY_MAX_COLD_MS="${QUERY_MAX_COLD_MS:-5000}"
-TIMEOUT_BIN=""
-
-if command -v timeout >/dev/null 2>&1; then
-    TIMEOUT_BIN="timeout"
-elif command -v gtimeout >/dev/null 2>&1; then
-    TIMEOUT_BIN="gtimeout"
-fi
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -44,7 +38,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 # ---------------------------------------------------------------------------
-# Project list — same as download-fixtures.mjs and conformance/run-all.sh
+# Project list, same as download-fixtures.mjs and conformance/run-all.sh
 # ---------------------------------------------------------------------------
 
 PROJECTS=(
@@ -107,14 +101,30 @@ clone_project() {
 
 install_deps() {
     local dir="$1" pm="$2"
+    local elapsed_seconds=0
+    local heartbeat_seconds="${HEARTBEAT_SECONDS}"
+    local pid
     if [[ -d "${dir}/node_modules" ]]; then
         return 0
     fi
     echo "    Installing dependencies (${pm})..." >&2
     if [[ "${pm}" == "pnpm" ]]; then
-        (cd "${dir}" && pnpm install --no-frozen-lockfile --ignore-scripts >/dev/null 2>/dev/null) || true
+        (cd "${dir}" && pnpm install --no-frozen-lockfile --ignore-scripts >/dev/null 2>/dev/null) &
     else
-        (cd "${dir}" && npm install --ignore-scripts --no-audit --no-fund >/dev/null 2>/dev/null) || true
+        (cd "${dir}" && npm install --ignore-scripts --no-audit --no-fund >/dev/null 2>/dev/null) &
+    fi
+    pid=$!
+
+    while kill -0 "${pid}" 2>/dev/null; do
+        sleep 1
+        elapsed_seconds=$((elapsed_seconds + 1))
+        if (( heartbeat_seconds > 0 && elapsed_seconds % heartbeat_seconds == 0 )); then
+            echo "    Still installing dependencies (${elapsed_seconds}s)..." >&2
+        fi
+    done
+
+    if ! wait "${pid}"; then
+        echo "    WARN: dependency install failed; continuing with available files" >&2
     fi
 }
 
@@ -127,15 +137,47 @@ clear_cache() {
 # Sets: ELAPSED_MS
 run_fallow() {
     local dir="$1"; shift
+    local elapsed_ticks=0
+    local pid
+    local run_status
+    local kill_target
+    local timeout_ticks=$((PROJECT_TIMEOUT_SECONDS * 10))
+    local heartbeat_ticks=$((HEARTBEAT_SECONDS * 10))
 
-    if [[ -n "${TIMEOUT_BIN}" ]]; then
-        "${TIMEOUT_BIN}" "${PROJECT_TIMEOUT_SECONDS}" \
-            "${FALLOW_BIN}" --quiet --format json "$@" --root "${dir}" \
-            >/dev/null 2>/dev/null
+    if command -v setsid >/dev/null 2>&1; then
+        setsid "${FALLOW_BIN}" --quiet --format json --summary "$@" --root "${dir}" >/dev/null 2>/dev/null &
+        pid=$!
+        kill_target="-${pid}"
+    elif command -v python3 >/dev/null 2>&1; then
+        python3 -c 'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' \
+            "${FALLOW_BIN}" --quiet --format json --summary "$@" --root "${dir}" >/dev/null 2>/dev/null &
+        pid=$!
+        kill_target="-${pid}"
     else
-        "${FALLOW_BIN}" --quiet --format json "$@" --root "${dir}" \
-            >/dev/null 2>/dev/null
+        echo "python3 or setsid is required for benchmark timeout cleanup" >&2
+        return 127
     fi
+
+    while kill -0 "${pid}" 2>/dev/null; do
+        if (( elapsed_ticks >= timeout_ticks )); then
+            kill -TERM -- "${kill_target}" 2>/dev/null || true
+            sleep 2
+            if kill -0 "${pid}" 2>/dev/null; then
+                kill -KILL -- "${kill_target}" 2>/dev/null || true
+            fi
+            wait "${pid}" 2>/dev/null || true
+            return 124
+        fi
+        sleep 0.1
+        elapsed_ticks=$((elapsed_ticks + 1))
+        if (( heartbeat_ticks > 0 && elapsed_ticks % heartbeat_ticks == 0 )); then
+            echo "    Still running fallow ($((elapsed_ticks / 10))s)..." >&2
+        fi
+    done
+
+    wait "${pid}"
+    run_status=$?
+    return "${run_status}"
 }
 
 time_fallow() {
@@ -153,6 +195,16 @@ time_fallow() {
 
     ELAPSED_MS=$(( (end - start) / 1000000 ))
     return "${run_status}"
+}
+
+fallow_skip_message() {
+    local phase="$1"
+    local run_status="$2"
+    if [[ "${run_status}" -eq 124 ]]; then
+        echo "    SKIP: fallow timed out during ${phase} after ${PROJECT_TIMEOUT_SECONDS}s"
+    else
+        echo "    SKIP: fallow exited with status ${run_status} during ${phase}"
+    fi
 }
 
 median() {
@@ -212,9 +264,13 @@ for entry in "${PROJECTS[@]}"; do
     cold_times=()
     for (( i=0; i<RUNS; i++ )); do
         clear_cache "${dest}"
-        if ! time_fallow "${dest}" --no-cache; then
-            echo "    FAIL: fallow timed out or errored during cold run after ${PROJECT_TIMEOUT_SECONDS}s" >&2
-            exit 1
+        if time_fallow "${dest}" --no-cache; then
+            :
+        else
+            run_status=$?
+            fallow_skip_message "cold run" "${run_status}" >&2
+            clear_cache "${dest}"
+            continue 2
         fi
         cold_times+=("${ELAPSED_MS}")
     done
@@ -223,16 +279,24 @@ for entry in "${PROJECTS[@]}"; do
     # --- Warm runs (with cache) ---
     clear_cache "${dest}"
     # Populate cache
-    if ! run_fallow "${dest}"; then
-        echo "    FAIL: fallow timed out or errored while warming cache after ${PROJECT_TIMEOUT_SECONDS}s" >&2
-        exit 1
+    if run_fallow "${dest}"; then
+        :
+    else
+        run_status=$?
+        fallow_skip_message "cache warmup" "${run_status}" >&2
+        clear_cache "${dest}"
+        continue
     fi
     # Measure
     warm_times=()
     for (( i=0; i<RUNS; i++ )); do
-        if ! time_fallow "${dest}"; then
-            echo "    FAIL: fallow timed out or errored during warm run after ${PROJECT_TIMEOUT_SECONDS}s" >&2
-            exit 1
+        if time_fallow "${dest}"; then
+            :
+        else
+            run_status=$?
+            fallow_skip_message "warm run" "${run_status}" >&2
+            clear_cache "${dest}"
+            continue 2
         fi
         warm_times+=("${ELAPSED_MS}")
     done

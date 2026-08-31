@@ -3,6 +3,94 @@ use std::path::PathBuf;
 use super::common::{create_config, create_config_with_cache, fixture_path};
 
 #[test]
+fn source_read_failure_preserves_sparse_file_ids() {
+    use fallow_types::discover::{DiscoveredFile, FileId};
+
+    let project = tempfile::tempdir().expect("create project");
+    let files = ["a.ts", "b.ts", "c.ts"].map(|name| project.path().join(name));
+    for (index, path) in files.iter().enumerate() {
+        std::fs::write(path, format!("export const value{index} = {index};\n"))
+            .expect("write source");
+    }
+    let discovered: Vec<DiscoveredFile> = files
+        .iter()
+        .enumerate()
+        .map(|(index, path)| DiscoveredFile {
+            id: FileId(u32::try_from(index).expect("test index fits u32")),
+            path: path.clone(),
+            size_bytes: std::fs::metadata(path).expect("source metadata").len(),
+        })
+        .collect();
+    std::fs::remove_file(&files[1]).expect("remove middle source after discovery");
+
+    let result = fallow_core::extract::parse_all_files(&discovered, None, false);
+
+    assert_eq!(
+        result
+            .modules
+            .iter()
+            .map(|module| module.file_id)
+            .collect::<Vec<_>>(),
+        vec![FileId(0), FileId(2)]
+    );
+    assert_eq!(result.read_failures.len(), 1);
+    assert_eq!(result.read_failures[0].file_id, FileId(1));
+    assert_eq!(result.read_failures[0].path, files[1]);
+    assert!(!result.read_failures[0].error.is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn warm_metadata_cache_reports_source_that_becomes_unreadable() {
+    use std::os::unix::fs::PermissionsExt;
+
+    use fallow_core::cache::{CacheStore, module_to_cached};
+    use fallow_types::discover::{DiscoveredFile, FileId};
+    use fallow_types::source_fingerprint::SourceFingerprint;
+
+    let project = tempfile::tempdir().expect("create project");
+    let path = project.path().join("cached.ts");
+    std::fs::write(&path, "export const cached = 1;\n").expect("write source");
+    let metadata = std::fs::metadata(&path).expect("source metadata");
+    let discovered = [DiscoveredFile {
+        id: FileId(0),
+        path: path.clone(),
+        size_bytes: metadata.len(),
+    }];
+
+    let cold = fallow_core::extract::parse_all_files(&discovered, None, false);
+    let mut cache = CacheStore::new();
+    cache.insert(
+        &path,
+        module_to_cached(
+            cold.modules.first().expect("cold parse produces module"),
+            SourceFingerprint::from_metadata(&metadata),
+        ),
+    );
+
+    let original_mode = metadata.permissions().mode();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o0))
+        .expect("make source unreadable");
+    let warm = fallow_core::extract::parse_all_files(&discovered, Some(&cache), false);
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(original_mode))
+        .expect("restore source permissions");
+
+    assert!(
+        warm.modules.is_empty(),
+        "stale cached module must not be used"
+    );
+    assert_eq!(warm.cache_hits, 0);
+    assert_eq!(warm.read_failures.len(), 1);
+    assert_eq!(warm.read_failures[0].file_id, FileId(0));
+    assert_eq!(warm.read_failures[0].path, path);
+    assert!(!warm.read_failures[0].error.is_empty());
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "roundtrip fixture enumerates cache fields"
+)]
 fn cache_roundtrip() {
     use fallow_core::cache::CacheStore;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -19,40 +107,94 @@ fn cache_roundtrip() {
 
     let cached = fallow_core::cache::CachedModule {
         content_hash: 12345,
-        mtime_secs: 0,
+        mtime_ns: 0,
         file_size: 0,
+        last_access_secs: 0,
         exports: vec![],
         imports: vec![],
         re_exports: vec![],
         dynamic_imports: vec![],
         require_calls: vec![],
+        package_path_references: Box::default(),
         member_accesses: vec![],
-        whole_object_uses: vec![],
+        semantic_facts: None,
+        whole_object_uses: Box::default(),
         dynamic_import_patterns: vec![],
         has_cjs_exports: false,
+        has_angular_component_template_url: false,
         unused_import_bindings: vec![],
         type_referenced_import_bindings: vec![],
         value_referenced_import_bindings: vec![],
         suppressions: vec![],
+        unknown_suppression_kinds: vec![],
         line_offsets: vec![],
         complexity: vec![],
         flag_uses: vec![],
         class_heritage: vec![],
+        exported_factory_returns: None,
+        exported_factory_return_object_shapes: None,
+        type_member_types: None,
+        injection_tokens: vec![],
+        local_type_declarations: vec![],
+        public_signature_type_references: vec![],
+        namespace_object_aliases: vec![],
+        iconify_prefixes: vec![],
+        iconify_icon_names: vec![],
+        auto_import_candidates: Vec::new(),
+        directives: Vec::new(),
+        client_only_dynamic_import_spans: Vec::new(),
+        security_sinks: Vec::new(),
+        security_sinks_skipped: 0,
+        security_unresolved_callee_sites: Vec::new(),
+        tainted_bindings: Vec::new(),
+        sanitized_sink_args: Vec::new(),
+        security_control_sites: Vec::new(),
+        callee_uses: Vec::new(),
+        misplaced_directives: Vec::new(),
+        inline_server_action_exports: Vec::new(),
+        di_key_sites: Vec::new(),
+        has_dynamic_provide: false,
+        component_props: Vec::new(),
+        has_props_attrs_fallthrough: false,
+        has_define_expose: false,
+        has_define_model: false,
+        has_unharvestable_props: false,
+        component_emits: Vec::new(),
+        angular_inputs: Vec::new(),
+        angular_outputs: Vec::new(),
+        has_unharvestable_emits: false,
+        has_dynamic_emit: false,
+        has_emit_whole_object_use: false,
+        load_return_keys: Vec::new(),
+        has_unharvestable_load: false,
+        has_load_data_whole_use: false,
+        component_functions: Vec::new(),
+        react_props: Vec::new(),
+        hook_uses: Vec::new(),
+        render_edges: Vec::new(),
+        svelte_dispatched_events: Vec::new(),
+        svelte_listened_events: Vec::new(),
+        angular_component_selectors: Vec::new(),
+        registered_custom_elements: Vec::new(),
+        used_custom_element_tags: Vec::new(),
+        angular_used_selectors: Vec::new(),
+        angular_entry_component_refs: Vec::new(),
+        has_dynamic_component_render: false,
+        has_dynamic_dispatch: false,
     };
 
     store.insert(std::path::Path::new("test.ts"), cached);
     assert_eq!(store.len(), 1);
 
-    // Save and reload
-    store.save(&temp_dir).unwrap();
-    let loaded = CacheStore::load(&temp_dir).unwrap();
+    store
+        .save(&temp_dir, 0, fallow_extract::cache::DEFAULT_CACHE_MAX_SIZE)
+        .unwrap();
+    let loaded =
+        CacheStore::load(&temp_dir, 0, fallow_extract::cache::DEFAULT_CACHE_MAX_SIZE).unwrap();
     assert_eq!(loaded.len(), 1);
 
-    // Correct hash -> hit
     assert!(loaded.get(std::path::Path::new("test.ts"), 12345).is_some());
-    // Wrong hash -> miss
     assert!(loaded.get(std::path::Path::new("test.ts"), 99999).is_none());
-    // Unknown file -> miss
     assert!(
         loaded
             .get(std::path::Path::new("other.ts"), 12345)
@@ -62,11 +204,8 @@ fn cache_roundtrip() {
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
 
-// ── Incremental analysis (Phase A) tests ──────────────────────────
-
 #[test]
 fn incremental_no_cache_all_misses() {
-    // First run without any existing cache: all files should be cache misses
     let root = fixture_path("basic-project");
     let files = fallow_core::discover::discover_files(&create_config(root));
     let parse_result = fallow_core::extract::parse_all_files(&files, None, false);
@@ -77,25 +216,89 @@ fn incremental_no_cache_all_misses() {
 }
 
 #[test]
+fn retaining_modules_releases_graph_payload_after_analysis() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src")).expect("create src dir");
+    std::fs::write(
+        root.join("package.json"),
+        r#"{"name":"payload-release-fixture","version":"1.0.0"}"#,
+    )
+    .expect("write package.json");
+    std::fs::write(root.join("src/lazy.ts"), "export const lazy = 1;\n")
+        .expect("write lazy module");
+    std::fs::write(root.join("src/required.ts"), "exports.value = 2;\n")
+        .expect("write required module");
+    std::fs::write(
+        root.join("src/index.ts"),
+        r#"
+export async function load(flag: boolean) {
+  const required = require("./required");
+  if (flag) {
+    return import("./lazy");
+  }
+  return required.value;
+}
+"#,
+    )
+    .expect("write index module");
+
+    let config = create_config(root.to_path_buf());
+    let files = fallow_core::discover::discover_files(&config);
+    let parsed = fallow_core::extract::parse_all_files(&files, None, true);
+    let parsed_index = parsed
+        .modules
+        .iter()
+        .find(|module| {
+            files
+                .get(module.file_id.0 as usize)
+                .is_some_and(|file| file.path.ends_with("src/index.ts"))
+        })
+        .expect("parsed index module should exist");
+    assert!(!parsed_index.dynamic_imports.is_empty());
+    assert!(!parsed_index.require_calls.is_empty());
+
+    let output =
+        fallow_core::analyze_retaining_modules(&config, true, false).expect("analysis succeeds");
+    let retained_modules = output.modules.expect("retained modules");
+    let retained_files = output.files.expect("retained files");
+    let retained_index = retained_modules
+        .iter()
+        .find(|module| {
+            retained_files
+                .get(module.file_id.0 as usize)
+                .is_some_and(|file| file.path.ends_with("src/index.ts"))
+        })
+        .expect("retained index module should exist");
+
+    assert!(retained_index.dynamic_imports.is_empty());
+    assert_eq!(retained_index.dynamic_imports.capacity(), 0);
+    assert!(retained_index.require_calls.is_empty());
+    assert_eq!(retained_index.require_calls.capacity(), 0);
+    assert!(!retained_index.line_offsets.is_empty());
+    assert!(!retained_index.complexity.is_empty());
+}
+
+#[test]
 fn incremental_with_cache_all_hits() {
-    // Build a cache from the first parse, then parse again — should be all hits
     let root = fixture_path("basic-project");
     let config = create_config(root);
     let files = fallow_core::discover::discover_files(&config);
 
-    // First parse: build cache
     let first = fallow_core::extract::parse_all_files(&files, None, false);
     let mut cache_store = fallow_core::cache::CacheStore::new();
     for module in &first.modules {
         if let Some(file) = files.get(module.file_id.0 as usize) {
             cache_store.insert(
                 &file.path,
-                fallow_core::cache::module_to_cached(module, 0, 0),
+                fallow_core::cache::module_to_cached(
+                    module,
+                    fallow_types::source_fingerprint::SourceFingerprint::new(0, 0),
+                ),
             );
         }
     }
 
-    // Second parse: should hit cache for every file
     let second = fallow_core::extract::parse_all_files(&files, Some(&cache_store), false);
     assert_eq!(second.cache_hits, first.modules.len());
     assert_eq!(second.cache_misses, 0);
@@ -104,27 +307,26 @@ fn incremental_with_cache_all_hits() {
 
 #[test]
 fn incremental_results_identical() {
-    // Results from a cached run should be identical to a fresh run
     let root = fixture_path("basic-project");
     let config = create_config(root);
     let files = fallow_core::discover::discover_files(&config);
 
-    // First parse
     let first = fallow_core::extract::parse_all_files(&files, None, false);
     let mut cache_store = fallow_core::cache::CacheStore::new();
     for module in &first.modules {
         if let Some(file) = files.get(module.file_id.0 as usize) {
             cache_store.insert(
                 &file.path,
-                fallow_core::cache::module_to_cached(module, 0, 0),
+                fallow_core::cache::module_to_cached(
+                    module,
+                    fallow_types::source_fingerprint::SourceFingerprint::new(0, 0),
+                ),
             );
         }
     }
 
-    // Second parse (from cache)
     let second = fallow_core::extract::parse_all_files(&files, Some(&cache_store), false);
 
-    // Verify all module data matches
     assert_eq!(first.modules.len(), second.modules.len());
     for (a, b) in first.modules.iter().zip(second.modules.iter()) {
         assert_eq!(a.file_id, b.file_id);
@@ -140,18 +342,14 @@ fn incremental_results_identical() {
 
 #[test]
 fn incremental_full_pipeline_results_match() {
-    // Full pipeline results should be identical whether using cache or not
     let root = fixture_path("basic-project");
     let tmp_cache = tempfile::tempdir().expect("create temp dir");
     let config = create_config_with_cache(root, tmp_cache.path().to_path_buf());
 
-    // First run: populates cache
     let first = fallow_core::analyze(&config).expect("first analysis should succeed");
 
-    // Second run: uses cache
     let second = fallow_core::analyze(&config).expect("second analysis should succeed");
 
-    // Results should be identical
     assert_eq!(first.unused_files.len(), second.unused_files.len());
     assert_eq!(first.unused_exports.len(), second.unused_exports.len());
     assert_eq!(first.unused_types.len(), second.unused_types.len());
@@ -163,36 +361,89 @@ fn incremental_full_pipeline_results_match() {
 
 #[test]
 fn incremental_cache_prune_stale_entries() {
-    // Cache entries for deleted files should be pruned
     let mut store = fallow_core::cache::CacheStore::new();
     let make_module = || fallow_core::cache::CachedModule {
         content_hash: 1,
-        mtime_secs: 0,
+        mtime_ns: 0,
         file_size: 0,
+        last_access_secs: 0,
         exports: vec![],
         imports: vec![],
         re_exports: vec![],
         dynamic_imports: vec![],
         require_calls: vec![],
+        package_path_references: Box::default(),
         member_accesses: vec![],
-        whole_object_uses: vec![],
+        semantic_facts: None,
+        whole_object_uses: Box::default(),
         dynamic_import_patterns: vec![],
         has_cjs_exports: false,
+        has_angular_component_template_url: false,
         unused_import_bindings: vec![],
         type_referenced_import_bindings: vec![],
         value_referenced_import_bindings: vec![],
         suppressions: vec![],
+        unknown_suppression_kinds: vec![],
         line_offsets: vec![],
         complexity: vec![],
         flag_uses: vec![],
         class_heritage: vec![],
+        exported_factory_returns: None,
+        exported_factory_return_object_shapes: None,
+        type_member_types: None,
+        injection_tokens: vec![],
+        local_type_declarations: vec![],
+        public_signature_type_references: vec![],
+        namespace_object_aliases: vec![],
+        iconify_prefixes: vec![],
+        iconify_icon_names: vec![],
+        auto_import_candidates: Vec::new(),
+        directives: Vec::new(),
+        client_only_dynamic_import_spans: Vec::new(),
+        security_sinks: Vec::new(),
+        security_sinks_skipped: 0,
+        security_unresolved_callee_sites: Vec::new(),
+        tainted_bindings: Vec::new(),
+        sanitized_sink_args: Vec::new(),
+        security_control_sites: Vec::new(),
+        callee_uses: Vec::new(),
+        misplaced_directives: Vec::new(),
+        inline_server_action_exports: Vec::new(),
+        di_key_sites: Vec::new(),
+        has_dynamic_provide: false,
+        component_props: Vec::new(),
+        has_props_attrs_fallthrough: false,
+        has_define_expose: false,
+        has_define_model: false,
+        has_unharvestable_props: false,
+        component_emits: Vec::new(),
+        angular_inputs: Vec::new(),
+        angular_outputs: Vec::new(),
+        has_unharvestable_emits: false,
+        has_dynamic_emit: false,
+        has_emit_whole_object_use: false,
+        load_return_keys: Vec::new(),
+        has_unharvestable_load: false,
+        has_load_data_whole_use: false,
+        component_functions: Vec::new(),
+        react_props: Vec::new(),
+        hook_uses: Vec::new(),
+        render_edges: Vec::new(),
+        svelte_dispatched_events: Vec::new(),
+        svelte_listened_events: Vec::new(),
+        angular_component_selectors: Vec::new(),
+        registered_custom_elements: Vec::new(),
+        used_custom_element_tags: Vec::new(),
+        angular_used_selectors: Vec::new(),
+        angular_entry_component_refs: Vec::new(),
+        has_dynamic_component_render: false,
+        has_dynamic_dispatch: false,
     };
 
     store.insert(std::path::Path::new("/project/existing.ts"), make_module());
     store.insert(std::path::Path::new("/project/deleted.ts"), make_module());
     assert_eq!(store.len(), 2);
 
-    // Only "existing.ts" is in the current file set
     let files = vec![fallow_core::discover::DiscoveredFile {
         id: fallow_core::discover::FileId(0),
         path: PathBuf::from("/project/existing.ts"),

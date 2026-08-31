@@ -4,7 +4,6 @@
 //! Parses `project.json` to extract executor references as tooling dependencies
 //! and `options.main` as entry points.
 
-#[cfg(test)]
 use std::path::Path;
 
 use super::config_parser;
@@ -13,7 +12,7 @@ use super::{Plugin, PluginResult};
 define_plugin!(
     struct NxPlugin => "nx",
     enablers: &["nx"],
-    config_patterns: &["**/project.json"],
+    config_patterns: &["nx.json", "**/project.json"],
     always_used: &["nx.json", "**/project.json"],
     tooling_dependencies: &[
         "nx",
@@ -38,11 +37,12 @@ define_plugin!(
         "@nx/nest",
     ],
     resolve_config(config_path, source, _root) {
+        if config_path.file_name().is_some_and(|name| name == "nx.json") {
+            return resolve_nx_json(config_path, source);
+        }
+
         let mut result = PluginResult::default();
 
-        // project.json: targets.*.executor → referenced dependency
-        // Format: "@angular/build:application" or "@nx/vite:build"
-        // Extract the package name before the ":" separator.
         let executor_strings = config_parser::extract_config_object_nested_strings(
             source,
             config_path,
@@ -57,20 +57,12 @@ define_plugin!(
             }
         }
 
-        // Compute project root relative to workspace root for Nx token expansion.
-        // `{projectRoot}` is the directory containing project.json relative to
-        // the workspace root. `{workspaceRoot}` is the workspace root itself.
-        // All path-valued fields below may use these tokens. See issue #114.
         let project_root_rel = config_path
             .parent()
             .and_then(|p| p.strip_prefix(_root).ok())
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default();
 
-        // project.json: targets.*.options.{main,browser} → entry point.
-        // The Angular CLI's newer `@angular/build:application` executor uses
-        // `browser` instead of `main`; both forms appear in real Nx projects,
-        // so extract either as an entry point. Mirrors `angular.rs`.
         for field in &["main", "browser"] {
             let mains = config_parser::extract_config_object_nested_strings(
                 source,
@@ -85,13 +77,6 @@ define_plugin!(
             }
         }
 
-        // project.json: targets.*.options.{styles,scripts} → entry patterns.
-        // Global stylesheets and scripts declared for the Angular build
-        // executor are real entry points (bundled into the app output); they
-        // must be marked reachable or their contents get false-flagged as
-        // unused files / unused imports. Mirrors the angular.json handling
-        // in `angular.rs`. See issue #125 (follow-up) — Nx projects using
-        // `project.json` previously lost this coverage.
         for field in &["styles", "scripts"] {
             let entries = config_parser::extract_config_object_nested_string_or_array(
                 source,
@@ -106,7 +91,6 @@ define_plugin!(
             }
         }
 
-        // project.json: targets.*.options.tsConfig → always used
         let tsconfigs = config_parser::extract_config_object_nested_strings(
             source,
             config_path,
@@ -119,11 +103,6 @@ define_plugin!(
             result.always_used_files.push(path.to_string());
         }
 
-        // project.json: targets.*.options.stylePreprocessorOptions.includePaths
-        // Angular executors invoked through Nx consume the same
-        // stylePreprocessorOptions as the Angular CLI. Resolve paths relative
-        // to the workspace root so bare SCSS `@import '...'` specifiers can
-        // find shared partials. See issues #103, #114.
         let include_paths = config_parser::extract_config_object_nested_string_or_array(
             source,
             config_path,
@@ -142,6 +121,72 @@ define_plugin!(
     },
 );
 
+/// Read the workspace-level dependency references out of `nx.json`.
+///
+/// Nx cannot run a target whose plugin, executor, or task runner is missing, so
+/// every package named here is load-bearing.
+fn resolve_nx_json(config_path: &Path, source: &str) -> PluginResult {
+    let mut result = PluginResult::default();
+
+    let plugins = config_parser::extract_config_shallow_strings_or_object_property(
+        source,
+        config_path,
+        "plugins",
+        "plugin",
+    );
+
+    let executors = config_parser::extract_config_object_nested_strings(
+        source,
+        config_path,
+        &["targetDefaults"],
+        &["executor"],
+    );
+
+    // Nx also accepts an executor string as a `targetDefaults` key, which sets
+    // defaults for every target that runs it. A plain target name has no colon.
+    let executor_keys: Vec<String> =
+        config_parser::extract_config_object_keys(source, config_path, &["targetDefaults"])
+            .into_iter()
+            .filter(|key| key.contains(':'))
+            .collect();
+
+    let runners = config_parser::extract_config_object_nested_strings(
+        source,
+        config_path,
+        &["tasksRunnerOptions"],
+        &["runner"],
+    );
+
+    for reference in plugins
+        .iter()
+        .chain(&executors)
+        .chain(&executor_keys)
+        .chain(&runners)
+    {
+        if let Some(package) = nx_reference_package(reference) {
+            result.referenced_dependencies.push(package);
+        }
+    }
+
+    result
+}
+
+/// Resolve an Nx plugin, executor, or task-runner reference to its npm package.
+///
+/// Executors are `<package>:<executor>` and a plugin may name a subpath such as
+/// `@nx/vite/plugin`. A workspace-local plugin is addressed by path, which is a
+/// file rather than a dependency.
+fn nx_reference_package(reference: &str) -> Option<String> {
+    if reference.starts_with("./") || reference.starts_with('/') {
+        return None;
+    }
+    let package = reference.split(':').next()?;
+    if package.is_empty() {
+        return None;
+    }
+    Some(crate::resolve::extract_package_name(package))
+}
+
 /// Expand Nx workspace tokens in a path string.
 ///
 /// - `{projectRoot}` → the project's root directory relative to the workspace root
@@ -152,8 +197,6 @@ fn expand_nx_tokens(path: &str, project_root_rel: &str) -> String {
     if !path.contains('{') {
         return path.to_string();
     }
-    // Replace `{token}/rest` as a unit so that empty replacements don't leave
-    // a leading `/` (e.g., `{projectRoot}/src` with empty root → `src`).
     let result = if project_root_rel.is_empty() {
         path.replace("{projectRoot}/", "")
             .replace("{projectRoot}", "")
@@ -223,9 +266,6 @@ mod tests {
 
     #[test]
     fn resolve_config_extracts_browser_as_entry() {
-        // @angular/build:application (new Angular 17+ builder used via Nx)
-        // uses `browser` instead of `main`. The Nx plugin must treat both
-        // as entry points so the referenced source file is reachable.
         let source = r#"{
             "targets": {
                 "build": {
@@ -244,10 +284,6 @@ mod tests {
 
     #[test]
     fn resolve_config_extracts_styles_as_entry() {
-        // project.json's `styles` array declares global stylesheets that the
-        // Angular build executor bundles into the application. They are
-        // reachable entry points; without this extraction they are reported
-        // as unused files. See issue #125 follow-up.
         let source = r#"{
             "targets": {
                 "build": {
@@ -270,10 +306,6 @@ mod tests {
 
     #[test]
     fn resolve_config_extracts_styles_object_form() {
-        // Nx project.json inherits the Angular CLI schema under
-        // `@angular/build:application` — `styles` entries can be
-        // `{ input, bundleName, inject }` object form for vendor stylesheets.
-        // See #126.
         let source = r#"{
             "targets": {
                 "build": {
@@ -317,8 +349,6 @@ mod tests {
 
     #[test]
     fn resolve_config_expands_project_root_in_styles() {
-        // `{projectRoot}` tokens must be expanded in `styles` entries just
-        // like they are in `main`, `browser`, and include paths.
         let source = r#"{
             "targets": {
                 "build": {
@@ -361,8 +391,6 @@ mod tests {
 
     #[test]
     fn resolve_config_extracts_scss_include_paths() {
-        // Issue #103: Nx's project.json mirrors Angular's
-        // stylePreprocessorOptions.includePaths when an Angular executor is used.
         let tmp = tempfile::tempdir().expect("create temp dir");
         let root = tmp.path();
         std::fs::create_dir_all(root.join("libs/shared/scss")).unwrap();
@@ -408,7 +436,6 @@ mod tests {
             }
         }"#;
         let plugin = NxPlugin;
-        // project.json at apps/myapp/, so {projectRoot} = "apps/myapp"
         let result = plugin.resolve_config(
             Path::new("/workspace/apps/myapp/project.json"),
             source,
@@ -444,7 +471,6 @@ mod tests {
 
     #[test]
     fn resolve_config_expands_project_root_token() {
-        // Issue #114: {projectRoot} placeholder in includePaths must be expanded.
         let tmp = tempfile::tempdir().expect("create temp dir");
         let root = tmp.path();
         std::fs::create_dir_all(root.join("src/style-paths")).unwrap();
@@ -462,7 +488,6 @@ mod tests {
             }
         }"#;
         let plugin = NxPlugin;
-        // project.json is at the workspace root, so {projectRoot} = ""
         let result = plugin.resolve_config(root.join("project.json").as_path(), source, root);
         assert_eq!(result.scss_include_paths.len(), 1);
         assert_eq!(result.scss_include_paths[0], root.join("src/style-paths"));
@@ -470,8 +495,6 @@ mod tests {
 
     #[test]
     fn resolve_config_expands_project_root_token_in_subproject() {
-        // {projectRoot} for a project.json inside apps/myapp/ should expand
-        // to "apps/myapp" relative to the workspace root.
         let tmp = tempfile::tempdir().expect("create temp dir");
         let root = tmp.path();
         std::fs::create_dir_all(root.join("apps/myapp/src/styles")).unwrap();
@@ -545,10 +568,75 @@ mod tests {
 
     #[test]
     fn expand_nx_tokens_empty_project_root() {
-        // Standalone app: project.json at workspace root, {projectRoot} = ""
         assert_eq!(
             expand_nx_tokens("{projectRoot}/src/styles", ""),
             "src/styles"
         );
+    }
+
+    #[test]
+    fn resolve_nx_json_credits_plugins_target_defaults_and_runner() {
+        let source = r#"{
+            "plugins": [
+                "nx-stylelint",
+                { "plugin": "@monodon/rust/plugin", "options": {} },
+                "./tools/local-plugin"
+            ],
+            "targetDefaults": {
+                "@jscutlery/semver:version": { "cache": true },
+                "build": { "executor": "@nx/vite:build" }
+            },
+            "tasksRunnerOptions": {
+                "default": { "runner": "nx-cloud" }
+            }
+        }"#;
+        let result = NxPlugin.resolve_config(Path::new("nx.json"), source, Path::new("/project"));
+        let deps = &result.referenced_dependencies;
+        assert!(deps.contains(&"nx-stylelint".to_string()), "{deps:?}");
+        assert!(
+            deps.contains(&"@monodon/rust".to_string()),
+            "a plugin subpath must credit its scoped package, not the subpath: {deps:?}"
+        );
+        assert!(deps.contains(&"@jscutlery/semver".to_string()), "{deps:?}");
+        assert!(deps.contains(&"@nx/vite".to_string()), "{deps:?}");
+        assert!(deps.contains(&"nx-cloud".to_string()), "{deps:?}");
+    }
+
+    #[test]
+    fn resolve_nx_json_skips_local_paths_and_plain_target_names() {
+        let source = r#"{
+            "plugins": ["./tools/local-plugin", "/abs/plugin"],
+            "targetDefaults": {
+                "build": { "cache": true },
+                "e2e": { "executor": "./tools/executors/e2e:run" }
+            }
+        }"#;
+        let result = NxPlugin.resolve_config(Path::new("nx.json"), source, Path::new("/project"));
+        assert!(
+            result.referenced_dependencies.is_empty(),
+            "workspace-local paths and plain target names are not packages: {:?}",
+            result.referenced_dependencies
+        );
+    }
+
+    #[test]
+    fn resolve_config_project_json_ignores_nx_json_keys() {
+        let source = r#"{
+            "plugins": ["nx-stylelint"],
+            "tasksRunnerOptions": { "default": { "runner": "nx-cloud" } },
+            "targets": { "build": { "executor": "@nx/vite:build" } }
+        }"#;
+        let result = NxPlugin.resolve_config(
+            Path::new("apps/app/project.json"),
+            source,
+            Path::new("/project"),
+        );
+        let deps = &result.referenced_dependencies;
+        assert!(deps.contains(&"@nx/vite".to_string()), "{deps:?}");
+        assert!(
+            !deps.contains(&"nx-stylelint".to_string()),
+            "nx.json-only keys must not be read from project.json: {deps:?}"
+        );
+        assert!(!deps.contains(&"nx-cloud".to_string()), "{deps:?}");
     }
 }

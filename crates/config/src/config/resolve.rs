@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// Controls how fallow resolves import specifiers against package.json
 /// `exports` / `imports` fields and tsconfig paths. Configured via the
-/// `resolve` section in `.fallowrc.json` or `fallow.toml`.
+/// `resolve` section in `.fallowrc.json`, `.fallowrc.jsonc`, `fallow.toml`, or `.fallow.toml`.
 ///
 /// # Examples
 ///

@@ -1,8 +1,15 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "tests and benches use unwrap and expect to keep fixture setup concise"
+)]
+
 #[path = "common/mod.rs"]
 mod common;
 
 use common::run_fallow_raw;
 use std::fs;
+use std::process::Command;
 
 /// Create a unique temp dir for init tests.
 fn init_temp_dir(suffix: &str) -> std::path::PathBuf {
@@ -15,7 +22,6 @@ fn init_temp_dir(suffix: &str) -> std::path::PathBuf {
         let _ = fs::remove_dir_all(&dir);
     }
     fs::create_dir_all(&dir).unwrap();
-    // init requires a package.json to exist
     fs::write(
         dir.join("package.json"),
         r#"{"name": "init-test", "main": "index.ts"}"#,
@@ -28,10 +34,6 @@ fn init_temp_dir(suffix: &str) -> std::path::PathBuf {
 fn cleanup(dir: &std::path::Path) {
     let _ = fs::remove_dir_all(dir);
 }
-
-// ---------------------------------------------------------------------------
-// Init creates config files
-// ---------------------------------------------------------------------------
 
 #[test]
 fn init_creates_fallowrc_json() {
@@ -77,18 +79,162 @@ fn init_exits_nonzero_if_config_exists() {
     cleanup(&dir);
 }
 
+/// Issue #1794: without a local `node_modules/fallow/schema.json`, `fallow
+/// init` writes the remote GitHub URL fallback.
+#[test]
+fn init_schema_falls_back_to_remote_without_local_schema() {
+    let dir = init_temp_dir("schema-remote");
+    let output = run_fallow_raw(&["init", "--root", dir.to_str().unwrap(), "--quiet"]);
+    assert_eq!(
+        output.code, 0,
+        "init should succeed, stderr: {}",
+        output.stderr
+    );
+    let config_path = dir.join(".fallowrc.json");
+    let content = fs::read_to_string(&config_path).unwrap();
+    assert!(
+        content.contains(
+            "\"$schema\": \"https://raw.githubusercontent.com/fallow-rs/fallow/main/schema.json\""
+        ),
+        "expected remote schema fallback without node_modules/fallow, got: {content}"
+    );
+    fallow_config::FallowConfig::load(&config_path)
+        .unwrap_or_else(|e| panic!("init output must load as FallowConfig: {e:?}"));
+    cleanup(&dir);
+}
+
+/// Issue #1794: with a local `node_modules/fallow/schema.json` present
+/// (simulating an npm install of fallow), `fallow init` writes the local,
+/// version-aligned schema path instead of the remote URL, and the resulting
+/// config still loads through the real config loader.
+#[test]
+fn init_schema_prefers_local_when_node_modules_fallow_present() {
+    let dir = init_temp_dir("schema-local");
+    fs::create_dir_all(dir.join("node_modules/fallow")).unwrap();
+    fs::write(dir.join("node_modules/fallow/schema.json"), "{}").unwrap();
+
+    let output = run_fallow_raw(&["init", "--root", dir.to_str().unwrap(), "--quiet"]);
+    assert_eq!(
+        output.code, 0,
+        "init should succeed, stderr: {}",
+        output.stderr
+    );
+    let config_path = dir.join(".fallowrc.json");
+    let content = fs::read_to_string(&config_path).unwrap();
+    assert!(
+        content.contains("\"$schema\": \"./node_modules/fallow/schema.json\""),
+        "expected local schema path with node_modules/fallow present, got: {content}"
+    );
+    assert!(!content.contains("raw.githubusercontent.com"));
+
+    fallow_config::FallowConfig::load(&config_path)
+        .unwrap_or_else(|e| panic!("init output with local schema must load: {e:?}"));
+    cleanup(&dir);
+}
+
 #[test]
 fn init_created_config_is_valid_json() {
     let dir = init_temp_dir("valid");
     run_fallow_raw(&["init", "--root", dir.to_str().unwrap(), "--quiet"]);
     let content = fs::read_to_string(dir.join(".fallowrc.json")).unwrap();
-    // Init generates JSONC (with comments). Strip single-line comments before parsing.
-    let stripped: String = content
-        .lines()
-        .filter(|line| !line.trim_start().starts_with("//"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let _: serde_json::Value = serde_json::from_str(&stripped)
-        .unwrap_or_else(|e| panic!("init should produce valid JSON: {e}\ncontent: {content}"));
+    let _: serde_json::Value =
+        jsonc_parser::parse_to_serde_value(&content, &jsonc_parser::ParseOptions::default())
+            .unwrap_or_else(|e| {
+                panic!("init should produce valid JSONC: {e}\ncontent: {content}");
+            });
     cleanup(&dir);
+}
+
+#[test]
+fn hooks_namespace_installs_and_uninstalls_git_hook() {
+    let dir = init_temp_dir("hooks-namespace-git");
+    let git = Command::new("git")
+        .arg("init")
+        .arg("-q")
+        .current_dir(&dir)
+        .status()
+        .expect("git init should run");
+    assert!(git.success());
+
+    let root = dir.to_str().unwrap();
+    let install = run_fallow_raw(&[
+        "--root", root, "hooks", "install", "--target", "git", "--branch", "develop",
+    ]);
+    assert_eq!(
+        install.code, 0,
+        "hooks install --target git should succeed, stderr: {}",
+        install.stderr
+    );
+
+    let hook_path = dir.join(".git/hooks/pre-commit");
+    let hook = fs::read_to_string(&hook_path).unwrap();
+    assert!(hook.contains("Generated by fallow hooks install --target git"));
+    assert!(hook.contains("BASE=\"develop\""));
+
+    let uninstall = run_fallow_raw(&["--root", root, "hooks", "uninstall", "--target", "git"]);
+    assert_eq!(
+        uninstall.code, 0,
+        "hooks uninstall --target git should succeed, stderr: {}",
+        uninstall.stderr
+    );
+    assert!(!hook_path.exists());
+    cleanup(&dir);
+}
+
+#[test]
+fn hooks_namespace_agent_dry_run_uses_setup_hooks_engine() {
+    let dir = init_temp_dir("hooks-namespace-agent");
+    let output = run_fallow_raw(&[
+        "--root",
+        dir.to_str().unwrap(),
+        "hooks",
+        "install",
+        "--target",
+        "agent",
+        "--agent",
+        "claude",
+        "--dry-run",
+    ]);
+    assert_eq!(
+        output.code, 0,
+        "hooks install --target agent should succeed, stderr: {}",
+        output.stderr
+    );
+    assert!(
+        output
+            .stderr
+            .contains("fallow hooks install --target agent (install) (dry run)"),
+        "expected hooks namespace summary, stderr: {}",
+        output.stderr
+    );
+    assert!(!dir.join(".claude").exists());
+    cleanup(&dir);
+}
+
+#[test]
+fn hooks_namespace_validation_respects_json_format() {
+    let output = run_fallow_raw(&[
+        "--format", "json", "hooks", "install", "--target", "git", "--agent", "claude",
+    ]);
+    assert_eq!(
+        output.code, 2,
+        "target mismatch should exit 2, stderr: {}",
+        output.stderr
+    );
+
+    assert!(
+        output.stderr.is_empty(),
+        "json errors should not emit human stderr: {}",
+        output.stderr
+    );
+    let json: serde_json::Value =
+        serde_json::from_str(&output.stdout).expect("stdout should be structured JSON");
+    assert_eq!(json["error"], true);
+    assert!(
+        json["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("--agent, --user, and --gitignore-claude"),
+        "unexpected error payload: {json}"
+    );
 }

@@ -1,16 +1,81 @@
 use super::common::{create_config, fixture_path};
 
 #[test]
+fn issue_2075_sass_partials_resolve_after_tsconfig_alias_expansion() {
+    let root = fixture_path("issue-2075-sass-alias-partial");
+    let config = create_config(root);
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+
+    assert!(
+        results.unresolved_imports.is_empty(),
+        "all aliased Sass partials and controls should resolve: {:?}",
+        results.unresolved_imports
+    );
+
+    let unused_file_names: Vec<String> = results
+        .unused_files
+        .iter()
+        .filter_map(|issue| issue.file.path.file_name())
+        .filter_map(|name| name.to_str())
+        .map(ToString::to_string)
+        .collect();
+    assert!(
+        !unused_file_names.contains(&"_tokens.scss".to_string()),
+        "the aliased SCSS partial should be reachable: {unused_file_names:?}"
+    );
+    assert!(
+        !unused_file_names.contains(&"_sfc-tokens.scss".to_string()),
+        "the partial imported from an SFC style block should be reachable: {unused_file_names:?}"
+    );
+    assert!(
+        !unused_file_names.contains(&"_sass-tokens.sass".to_string()),
+        "the aliased indented-Sass partial should be reachable: {unused_file_names:?}"
+    );
+    assert!(
+        !unused_file_names.contains(&"_index.scss".to_string()),
+        "the aliased Sass directory partial should be reachable: {unused_file_names:?}"
+    );
+    assert!(
+        !unused_file_names.contains(&"_precedence.scss".to_string()),
+        "SCSS partial candidates should be probed before the next extension: {unused_file_names:?}"
+    );
+    assert!(
+        unused_file_names.contains(&"precedence.sass".to_string()),
+        "the lower-precedence direct Sass candidate should remain unreachable: {unused_file_names:?}"
+    );
+}
+
+#[test]
+fn issue_2075_ts_imports_do_not_use_sass_partial_alias_fallback() {
+    let root = fixture_path("issue-2075-ts-alias-control");
+    let config = create_config(root);
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+
+    assert!(
+        results
+            .unresolved_imports
+            .iter()
+            .any(|issue| issue.import.specifier == "@/styles/tokens"),
+        "a JS/TS-context alias must not gain Sass partial resolution"
+    );
+    assert!(
+        results.unused_files.iter().any(|issue| {
+            issue.file.path.file_name().and_then(|name| name.to_str()) == Some("_tokens.scss")
+        }),
+        "the Sass partial must remain unreachable from a JS/TS-context alias"
+    );
+}
+
+#[test]
 fn scss_partial_files_resolved_via_underscore_convention() {
     let root = fixture_path("scss-partial-project");
     let config = create_config(root);
     let results = fallow_core::analyze(&config).expect("analysis should succeed");
 
-    // _variables.scss and _mixins.scss should NOT be reported as unused files
     let unused_file_names: Vec<String> = results
         .unused_files
         .iter()
-        .filter_map(|f| f.path.file_name())
+        .filter_map(|f| f.file.path.file_name())
         .filter_map(|n| n.to_str())
         .map(ToString::to_string)
         .collect();
@@ -23,11 +88,10 @@ fn scss_partial_files_resolved_via_underscore_convention() {
         "_mixins.scss should be used via @use: {unused_file_names:?}"
     );
 
-    // No unresolved imports for SCSS partial references
     let unresolved_specs: Vec<&str> = results
         .unresolved_imports
         .iter()
-        .map(|u| u.specifier.as_str())
+        .map(|u| u.import.specifier.as_str())
         .collect();
     assert!(
         !unresolved_specs.iter().any(|s| s.contains("variables")),
@@ -38,18 +102,16 @@ fn scss_partial_files_resolved_via_underscore_convention() {
         "mixins should be resolved: {unresolved_specs:?}"
     );
 
-    // No unlisted dependencies for SCSS partials
     let unlisted: Vec<&str> = results
         .unlisted_dependencies
         .iter()
-        .map(|u| u.package_name.as_str())
+        .map(|u| u.dep.package_name.as_str())
         .collect();
     assert!(
         !unlisted.contains(&"variables"),
         "'variables' should not be an unlisted dep: {unlisted:?}"
     );
 
-    // Directory index: _index.scss should be resolved via @use 'components'
     assert!(
         !unused_file_names.contains(&"_index.scss".to_string()),
         "_index.scss should be used via @use 'components': {unused_file_names:?}"
@@ -62,10 +124,6 @@ fn scss_partial_files_resolved_via_underscore_convention() {
 
 #[test]
 fn angular_style_preprocessor_include_paths_resolve_bare_scss_imports() {
-    // Issue #103: Angular's `stylePreprocessorOptions.includePaths` allows bare
-    // SCSS `@import 'variables'` / `@use 'mixins'` to resolve against extra
-    // directories. The Angular plugin extracts these from angular.json and the
-    // graph resolver retries failing bare SCSS specifiers against each path.
     let root = fixture_path("angular-scss-include-paths");
     let config = create_config(root);
     let results = fallow_core::analyze(&config).expect("analysis should succeed");
@@ -73,7 +131,7 @@ fn angular_style_preprocessor_include_paths_resolve_bare_scss_imports() {
     let unresolved_specs: Vec<&str> = results
         .unresolved_imports
         .iter()
-        .map(|u| u.specifier.as_str())
+        .map(|u| u.import.specifier.as_str())
         .collect();
 
     assert!(
@@ -85,11 +143,10 @@ fn angular_style_preprocessor_include_paths_resolve_bare_scss_imports() {
         "@use 'mixins' should resolve via includePaths: {unresolved_specs:?}"
     );
 
-    // Partial files reached only via includePaths must not be flagged unused.
     let unused_file_names: Vec<String> = results
         .unused_files
         .iter()
-        .filter_map(|f| f.path.file_name())
+        .filter_map(|f| f.file.path.file_name())
         .filter_map(|n| n.to_str())
         .map(ToString::to_string)
         .collect();
@@ -105,11 +162,6 @@ fn angular_style_preprocessor_include_paths_resolve_bare_scss_imports() {
 
 #[test]
 fn scss_bare_specifiers_resolve_from_node_modules() {
-    // Issue #125: Sass's `@import` / `@use` resolution searches `node_modules/`
-    // for bare specifiers. `@import 'bootstrap/scss/functions'` should resolve
-    // to `node_modules/bootstrap/scss/_functions.scss` (partial convention) and
-    // `@import 'animate.css/animate.min'` should resolve to
-    // `node_modules/animate.css/animate.min.css` (CSS extension append).
     let root = fixture_path("scss-node-modules-resolution");
     let config = create_config(root);
     let results = fallow_core::analyze(&config).expect("analysis should succeed");
@@ -117,7 +169,7 @@ fn scss_bare_specifiers_resolve_from_node_modules() {
     let unresolved_specs: Vec<&str> = results
         .unresolved_imports
         .iter()
-        .map(|u| u.specifier.as_str())
+        .map(|u| u.import.specifier.as_str())
         .collect();
 
     assert!(
@@ -146,12 +198,10 @@ fn scss_bare_specifiers_resolve_from_node_modules() {
          (CSS extension append): {unresolved_specs:?}"
     );
 
-    // Packages resolved via node_modules must be tracked as used so that
-    // `unused-dependencies` does not flag them.
     let unused_dep_names: Vec<&str> = results
         .unused_dependencies
         .iter()
-        .map(|d| d.package_name.as_str())
+        .map(|d| d.dep.package_name.as_str())
         .collect();
     assert!(
         !unused_dep_names.contains(&"bootstrap"),
@@ -165,11 +215,6 @@ fn scss_bare_specifiers_resolve_from_node_modules() {
 
 #[test]
 fn external_package_scss_subpaths_credit_nested_style_dependencies() {
-    // Real-world styleguide packages often expose raw SCSS entrypoints from
-    // node_modules. When the consumer imports that SCSS, nested imports like
-    // `bootstrap/scss/functions` and `/node_modules/@vuepic/vue-datepicker/dist/main`
-    // are build-time requirements of the app even though they live inside the
-    // external package source tree.
     let root = fixture_path("external-style-package-deps");
     let config = create_config(root);
     let results = fallow_core::analyze(&config).expect("analysis should succeed");
@@ -177,7 +222,7 @@ fn external_package_scss_subpaths_credit_nested_style_dependencies() {
     let unused_dep_names: Vec<&str> = results
         .unused_dependencies
         .iter()
-        .map(|d| d.package_name.as_str())
+        .map(|d| d.dep.package_name.as_str())
         .collect();
 
     assert!(
@@ -195,5 +240,90 @@ fn external_package_scss_subpaths_credit_nested_style_dependencies() {
     assert!(
         unused_dep_names.contains(&"unused-package"),
         "real unused dependencies should still be reported: {unused_dep_names:?}"
+    );
+}
+
+#[test]
+fn angular_material_scss_package_entrypoint_resolves_external_relative_graph() {
+    let root = fixture_path("angular-material-scss-entrypoint");
+    let config = create_config(root);
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+
+    let unresolved_specs: Vec<&str> = results
+        .unresolved_imports
+        .iter()
+        .map(|u| u.import.specifier.as_str())
+        .collect();
+    assert!(
+        !unresolved_specs.contains(&"@angular/material"),
+        "Angular Material Sass entrypoint should resolve: {unresolved_specs:?}"
+    );
+
+    let unused_dep_names: Vec<&str> = results
+        .unused_dependencies
+        .iter()
+        .map(|d| d.dep.package_name.as_str())
+        .collect();
+    assert!(
+        !unused_dep_names.contains(&"@angular/material"),
+        "Angular Material imported via SCSS must not be reported as unused: {unused_dep_names:?}"
+    );
+    assert!(
+        unused_dep_names.contains(&"unused-package"),
+        "real unused dependencies should still be reported: {unused_dep_names:?}"
+    );
+
+    let unlisted_dep_names: Vec<&str> = results
+        .unlisted_dependencies
+        .iter()
+        .map(|d| d.dep.package_name.as_str())
+        .collect();
+    assert!(
+        !unlisted_dep_names.contains(&"@angular/cdk"),
+        "external package internals should not create unlisted deps: {unlisted_dep_names:?}"
+    );
+}
+
+#[test]
+fn scss_bare_import_does_not_collide_with_sibling_tsx() {
+    let root = fixture_path("scss-bare-import-tsx-collision");
+    let config = create_config(root);
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+
+    assert!(
+        results.circular_dependencies.is_empty(),
+        "expected no circular dependencies, got: {:?}",
+        results
+            .circular_dependencies
+            .iter()
+            .map(|c| c
+                .cycle
+                .files
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>())
+            .collect::<Vec<_>>()
+    );
+
+    let unresolved_specs: Vec<&str> = results
+        .unresolved_imports
+        .iter()
+        .map(|u| u.import.specifier.as_str())
+        .collect();
+    assert!(
+        unresolved_specs.is_empty(),
+        "expected no unresolved imports, got: {unresolved_specs:?}"
+    );
+
+    let unused_files: Vec<String> = results
+        .unused_files
+        .iter()
+        .filter_map(|f| f.file.path.file_name())
+        .filter_map(|n| n.to_str())
+        .map(ToString::to_string)
+        .collect();
+    assert!(
+        !unused_files.contains(&"Widget.scss".to_string()),
+        "Widget.scss must be reachable via Helper.scss `@use 'Widget'`: {unused_files:?}"
     );
 }

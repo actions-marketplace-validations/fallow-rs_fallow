@@ -51,7 +51,6 @@ define_plugin! {
     resolve_config(config_path, source, _root) {
         let mut result = PluginResult::default();
 
-        // Hardhat configs load plugins via both `import` and side-effect `require()`
         let sources = config_parser::extract_imports_and_requires(source, config_path);
         for src in &sources {
             let dep = crate::resolve::extract_package_name(src);

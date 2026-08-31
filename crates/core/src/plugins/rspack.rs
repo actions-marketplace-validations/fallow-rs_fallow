@@ -40,19 +40,16 @@ define_plugin! {
     resolve_config(config_path, source, _root) {
         let mut result = PluginResult::default();
 
-        // Extract import sources as referenced dependencies
         let imports = config_parser::extract_imports(source, config_path);
         for imp in &imports {
             let dep = crate::resolve::extract_package_name(imp);
             result.referenced_dependencies.push(dep);
         }
 
-        // entry -> entry points (string, array, or object with string values)
         let entries =
             config_parser::extract_config_string_or_array(source, config_path, &["entry"]);
         result.extend_entry_patterns(entries);
 
-        // require() calls for loaders/plugins in CJS configs
         let require_deps =
             config_parser::extract_config_require_strings(source, config_path, "plugins");
         for dep in &require_deps {
@@ -61,7 +58,6 @@ define_plugin! {
                 .push(crate::resolve::extract_package_name(dep));
         }
 
-        // externals -> referenced dependencies (string array form)
         let externals =
             config_parser::extract_config_shallow_strings(source, config_path, "externals");
         for ext in &externals {
@@ -70,7 +66,6 @@ define_plugin! {
                 .push(crate::resolve::extract_package_name(ext));
         }
 
-        // module.rules -> extract loader package names (reuse webpack's loader parsing)
         super::webpack::parse_webpack_loaders(source, config_path, &mut result);
 
         result
@@ -90,7 +85,7 @@ mod tests {
             source,
             std::path::Path::new("/project"),
         );
-        assert_eq!(result.entry_patterns, vec!["./src/app.tsx"]);
+        assert_eq!(result.entry_patterns, vec!["src/app.tsx"]);
     }
 
     #[test]
@@ -110,7 +105,7 @@ mod tests {
                 .referenced_dependencies
                 .contains(&"@rspack/cli".to_string())
         );
-        assert_eq!(result.entry_patterns, vec!["./src/main.ts"]);
+        assert_eq!(result.entry_patterns, vec!["src/main.ts"]);
     }
 
     #[test]

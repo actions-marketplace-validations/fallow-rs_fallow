@@ -32,7 +32,6 @@ impl Plugin for PnpmPlugin {
     }
 
     fn is_enabled(&self, pkg: &PackageJson, root: &Path) -> bool {
-        // pnpm is almost never listed as a dependency; detect by file existence
         root.join("pnpm-workspace.yaml").exists() || root.join("pnpm-lock.yaml").exists() || {
             let deps = pkg.all_dependency_names();
             self.is_enabled_with_deps(&deps, root)

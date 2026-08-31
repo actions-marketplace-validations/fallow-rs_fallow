@@ -57,7 +57,13 @@ fn all_svelte_sfc_regexes_compile() {
 
 #[test]
 fn all_astro_regexes_compile() {
-    parse("Page.astro", "---\nconst title = 'hi'\n---\n<html></html>");
+    parse(
+        "Page.astro",
+        "---\nconst title = 'hi'\n---\n\
+         <!-- comment -->\n\
+         <script src=\"./client.ts\"></script>\n\
+         <script>import './side-effect';</script>",
+    );
 }
 
 #[test]

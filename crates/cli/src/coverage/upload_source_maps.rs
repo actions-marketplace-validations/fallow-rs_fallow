@@ -1,0 +1,1634 @@
+//! `fallow coverage upload-source-maps` - upload build source maps to fallow cloud.
+//!
+//! This is a CI-side helper for bundled runtime coverage. The beacon reports
+//! coverage against deployed bundle paths; source maps uploaded here let the
+//! cloud resolver map those positions back to original source files.
+
+use std::io::Read as _;
+use std::path::{Path, PathBuf};
+use std::process::{Command, ExitCode};
+use std::time::SystemTime;
+
+use colored::Colorize as _;
+use fallow_engine::changed_files::clear_ambient_git_env;
+use globset::{Glob, GlobSet, GlobSetBuilder};
+use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
+
+use crate::api::{
+    NETWORK_EXIT_CODE, ResponseBodyReader, parse_error_envelope, response_message_suffix,
+    retry_delay_for_status, sanitize_network_error, should_retry_status,
+    try_api_agent_with_timeout,
+};
+use crate::coverage::upload_common::{self, take_last_two_segments, url_encode_path_segment};
+use crate::report::format_bytes;
+
+const LOG_PREFIX: &str = "fallow coverage upload-source-maps";
+const DEFAULT_ENDPOINT: &str = "https://api.fallow.cloud";
+const CONNECT_TIMEOUT_SECS: u64 = 5;
+const TOTAL_TIMEOUT_SECS: u64 = 60;
+const MAX_ATTEMPTS: u8 = 3;
+const WARN_MAP_BYTES: u64 = 10 * 1024 * 1024;
+const MAX_MAP_BYTES: u64 = 100 * 1024 * 1024;
+
+#[derive(Debug, Clone)]
+pub struct UploadSourceMapsArgs {
+    pub dir: PathBuf,
+    pub include: String,
+    pub exclude: Vec<String>,
+    pub repo: Option<String>,
+    pub git_sha: Option<String>,
+    pub endpoint: Option<String>,
+    pub strip_path: bool,
+    pub dry_run: bool,
+    pub concurrency: usize,
+    pub fail_fast: bool,
+}
+
+#[derive(Debug)]
+enum UploadSourceMapsError {
+    Validation(String),
+    Network(String),
+    Partial(Vec<MapOutcome>),
+}
+
+impl UploadSourceMapsError {
+    fn into_exit(self) -> ExitCode {
+        match self {
+            Self::Validation(message) => {
+                eprintln!("{LOG_PREFIX}: {}: {message}", "error".red().bold());
+                ExitCode::from(2)
+            }
+            Self::Network(message) => {
+                eprintln!("{LOG_PREFIX}: {}: {message}", "error".red().bold());
+                ExitCode::from(NETWORK_EXIT_CODE)
+            }
+            Self::Partial(outcomes) => {
+                print_failure_summary(&outcomes);
+                ExitCode::from(1)
+            }
+        }
+    }
+}
+
+pub fn run(args: &UploadSourceMapsArgs, root: &Path) -> ExitCode {
+    match run_inner(args, root) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => err.into_exit(),
+    }
+}
+
+fn run_inner(args: &UploadSourceMapsArgs, root: &Path) -> Result<(), UploadSourceMapsError> {
+    let build_dir = resolve_build_dir(root, &args.dir);
+    if !build_dir.is_dir() {
+        return Err(UploadSourceMapsError::Validation(format!(
+            "directory not found: {}",
+            build_dir.display()
+        )));
+    }
+
+    let include_patterns = vec![args.include.clone()];
+    let include = compile_glob_set(&include_patterns, "--include")?;
+    let exclude = compile_glob_set(&args.exclude, "--exclude")?;
+    let repo = resolve_repo_name(args.repo.as_deref(), root)?;
+    let git_sha = resolve_git_sha(args.git_sha.as_deref(), root)?;
+    let maps = collect_source_maps(root, &build_dir, &include, &exclude, args.strip_path)?;
+
+    if maps.is_empty() {
+        return Err(UploadSourceMapsError::Validation(format!(
+            "no .map files found in {} (did the build step run?)",
+            build_dir.display()
+        )));
+    }
+
+    if args.dry_run {
+        print_dry_run(&repo, &git_sha, args.endpoint.as_deref(), &maps);
+        return Ok(());
+    }
+
+    let api_key = resolve_api_key()?;
+    upload_maps(args, &repo, &git_sha, &api_key, &maps)
+}
+
+fn resolve_build_dir(root: &Path, dir: &Path) -> PathBuf {
+    if dir.is_absolute() {
+        dir.to_path_buf()
+    } else {
+        root.join(dir)
+    }
+}
+
+fn compile_glob_set(patterns: &[String], flag: &str) -> Result<GlobSet, UploadSourceMapsError> {
+    let mut builder = GlobSetBuilder::new();
+    for pattern in patterns {
+        let glob = Glob::new(pattern).map_err(|err| {
+            UploadSourceMapsError::Validation(format!("invalid {flag} '{pattern}': {err}"))
+        })?;
+        builder.add(glob);
+        if let Some(without_prefix) = pattern.strip_prefix("**/") {
+            builder.add(Glob::new(without_prefix).map_err(|err| {
+                UploadSourceMapsError::Validation(format!("invalid {flag} '{pattern}': {err}"))
+            })?);
+        }
+    }
+    builder.build().map_err(|err| {
+        UploadSourceMapsError::Validation(format!("failed to compile {flag}: {err}"))
+    })
+}
+
+fn resolve_repo_name(explicit: Option<&str>, root: &Path) -> Result<String, UploadSourceMapsError> {
+    if let Some(repo) = explicit {
+        return validate_repo_name(repo.trim()).map(str::to_owned);
+    }
+    if let Some(repo) = package_json_repository_name(root) {
+        return validate_repo_name(&repo).map(str::to_owned);
+    }
+    if let Some(repo) = git_origin_repo_name(root) {
+        return validate_repo_name(&repo).map(str::to_owned);
+    }
+    Err(UploadSourceMapsError::Validation(
+        "unable to determine repo name; pass --repo".to_owned(),
+    ))
+}
+
+fn package_json_repository_name(root: &Path) -> Option<String> {
+    let package_json = std::fs::read_to_string(root.join("package.json")).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&package_json).ok()?;
+    let repository = value.get("repository")?;
+    let url = match repository {
+        serde_json::Value::String(url) => url.as_str(),
+        serde_json::Value::Object(map) => map.get("url")?.as_str()?,
+        _ => return None,
+    };
+    parse_repo_name_from_url(url)
+}
+
+fn git_origin_repo_name(root: &Path) -> Option<String> {
+    let mut command = Command::new("git");
+    command
+        .args(["remote", "get-url", "origin"])
+        .current_dir(root);
+    clear_ambient_git_env(&mut command);
+    let output = command.output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_repo_name_from_url(String::from_utf8_lossy(&output.stdout).trim())
+}
+
+fn parse_repo_name_from_url(url: &str) -> Option<String> {
+    let stripped_suffix = url
+        .trim()
+        .trim_end_matches('/')
+        .trim_end_matches(".git")
+        .trim_end_matches('/');
+    if !stripped_suffix.contains(':')
+        && let Some(project_id) = take_last_two_segments(stripped_suffix)
+    {
+        return Some(project_id);
+    }
+    if let Some((_, path)) = stripped_suffix.split_once(':')
+        && let Some(project_id) = take_last_two_segments(path)
+    {
+        return Some(project_id);
+    }
+    if let Some(path_part) = stripped_suffix.split("://").nth(1)
+        && let Some((_, tail)) = path_part.split_once('/')
+        && let Some(project_id) = take_last_two_segments(tail)
+    {
+        return Some(project_id);
+    }
+    None
+}
+
+fn validate_repo_name(repo: &str) -> Result<&str, UploadSourceMapsError> {
+    if repo.is_empty() {
+        return Err(UploadSourceMapsError::Validation(
+            "unable to determine repo name; pass --repo".to_owned(),
+        ));
+    }
+    if repo.contains("..") || repo.contains('\\') {
+        return Err(UploadSourceMapsError::Validation(
+            "repo name must not contain '..' or backslashes".to_owned(),
+        ));
+    }
+    Ok(repo)
+}
+
+fn resolve_git_sha(explicit: Option<&str>, root: &Path) -> Result<String, UploadSourceMapsError> {
+    let sha = if let Some(sha) = explicit {
+        sha.trim().to_owned()
+    } else if let Some(sha) = env_non_empty("GITHUB_SHA")
+        .or_else(|| env_non_empty("CI_COMMIT_SHA"))
+        .or_else(|| env_non_empty("COMMIT_SHA"))
+    {
+        sha
+    } else {
+        let mut command = Command::new("git");
+        command.args(["rev-parse", "HEAD"]).current_dir(root);
+        clear_ambient_git_env(&mut command);
+        let output = command.output().map_err(|_| {
+            UploadSourceMapsError::Validation(
+                "unable to determine git SHA; pass --git-sha or set $GITHUB_SHA".to_owned(),
+            )
+        })?;
+        if !output.status.success() {
+            return Err(UploadSourceMapsError::Validation(
+                "unable to determine git SHA; pass --git-sha or set $GITHUB_SHA".to_owned(),
+            ));
+        }
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    };
+    validate_git_sha(&sha)?;
+    Ok(sha)
+}
+
+fn env_non_empty(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+fn validate_git_sha(sha: &str) -> Result<(), UploadSourceMapsError> {
+    if !(7..=40).contains(&sha.len()) || !sha.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return Err(UploadSourceMapsError::Validation(
+            "unable to determine git SHA; pass --git-sha or set $GITHUB_SHA".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct SourceMapCandidate {
+    path: PathBuf,
+    canonical_root: PathBuf,
+    resolved_path: PathBuf,
+    rel_path: PathBuf,
+    file_name: String,
+    /// The map's path relative to the REPO ROOT (e.g.
+    /// `dashboard/dist/assets/app.js.map`), posix-separated. `None` when the map
+    /// is not under the repo root (an absolute `--dir` outside it) or the path
+    /// fails the same safety checks as `file_name`. The cloud resolves each
+    /// `sources[]` entry against this path's directory so a monorepo
+    /// sub-package map's `../../src/x` resolves to `dashboard/src/x` instead of
+    /// collapsing to `src/x` and losing the package prefix (issue #260). It is
+    /// distinct from `file_name`, which keys the upload's storage + identity.
+    map_path: Option<String>,
+    bytes: u64,
+}
+
+fn collect_source_maps(
+    repo_root: &Path,
+    dir: &Path,
+    include: &GlobSet,
+    exclude: &GlobSet,
+    strip_path: bool,
+) -> Result<Vec<SourceMapCandidate>, UploadSourceMapsError> {
+    let canonical_root = std::fs::canonicalize(dir).map_err(|err| {
+        UploadSourceMapsError::Validation(format!(
+            "failed to resolve selected build directory {}: {err}",
+            dir.display()
+        ))
+    })?;
+    let mut maps = Vec::new();
+    let mut input = SourceMapWalkInput {
+        repo_root,
+        root: dir,
+        canonical_root: &canonical_root,
+        include,
+        exclude,
+        strip_path,
+        maps: &mut maps,
+    };
+    collect_source_maps_inner(&mut input, dir)?;
+    maps.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+    Ok(maps)
+}
+
+struct SourceMapWalkInput<'a> {
+    repo_root: &'a Path,
+    root: &'a Path,
+    canonical_root: &'a Path,
+    include: &'a GlobSet,
+    exclude: &'a GlobSet,
+    strip_path: bool,
+    maps: &'a mut Vec<SourceMapCandidate>,
+}
+
+fn collect_source_maps_inner(
+    input: &mut SourceMapWalkInput<'_>,
+    dir: &Path,
+) -> Result<(), UploadSourceMapsError> {
+    let entries = std::fs::read_dir(dir).map_err(|err| {
+        UploadSourceMapsError::Validation(format!("failed to read {}: {err}", dir.display()))
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|err| {
+            UploadSourceMapsError::Validation(format!("failed to read {}: {err}", dir.display()))
+        })?;
+        let path = entry.path();
+        let file_type = entry.file_type().map_err(|err| {
+            UploadSourceMapsError::Validation(format!("failed to stat {}: {err}", path.display()))
+        })?;
+        let rel_path = path.strip_prefix(input.root).unwrap_or(&path).to_path_buf();
+        if input.exclude.is_match(&rel_path) {
+            continue;
+        }
+        if file_type.is_dir() {
+            collect_source_maps_inner(input, &path)?;
+            continue;
+        }
+        if !input.include.is_match(&rel_path) || !path.is_file() {
+            continue;
+        }
+        let resolved_path = std::fs::canonicalize(&path).map_err(|err| {
+            UploadSourceMapsError::Validation(format!(
+                "failed to resolve source map {}: {err}",
+                path.display()
+            ))
+        })?;
+        if !resolved_path.starts_with(input.canonical_root) {
+            return Err(UploadSourceMapsError::Validation(format!(
+                "source map {} resolves outside selected build directory",
+                path.display()
+            )));
+        }
+        let bytes = std::fs::metadata(&resolved_path).map_or(0, |metadata| metadata.len());
+        let file_name = map_file_name(&rel_path, input.strip_path)?;
+        let map_path = repo_relative_map_path(input.repo_root, &path);
+        input.maps.push(SourceMapCandidate {
+            path,
+            canonical_root: input.canonical_root.to_path_buf(),
+            resolved_path,
+            rel_path,
+            file_name,
+            map_path,
+            bytes,
+        });
+    }
+    Ok(())
+}
+
+/// The map file's path relative to `repo_root`, posix-separated, or `None` when
+/// the map is not under the repo root or the result is not a safe relative path
+/// (issue #260). Only `Some` paths are sent as `mapPath`; the cloud falls back
+/// to root-anchored normalization when absent, so dropping it is always safe.
+fn repo_relative_map_path(repo_root: &Path, path: &Path) -> Option<String> {
+    let rel = path.strip_prefix(repo_root).ok()?;
+    let value = to_posix_string(rel);
+    validate_file_name(&value).ok().map(|()| value)
+}
+
+fn map_file_name(rel_path: &Path, strip_path: bool) -> Result<String, UploadSourceMapsError> {
+    let value = if strip_path {
+        rel_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_owned()
+    } else {
+        to_posix_string(rel_path)
+    };
+    validate_file_name(&value)?;
+    Ok(value)
+}
+
+fn validate_file_name(file_name: &str) -> Result<(), UploadSourceMapsError> {
+    if file_name.is_empty()
+        || file_name.len() > 255
+        || file_name.starts_with('/')
+        || file_name.contains('\\')
+        || file_name
+            .split('/')
+            .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+    {
+        return Err(UploadSourceMapsError::Validation(format!(
+            "invalid source map fileName '{file_name}'"
+        )));
+    }
+    Ok(())
+}
+
+fn to_posix_string(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+fn resolve_api_key() -> Result<String, UploadSourceMapsError> {
+    env_non_empty("FALLOW_API_KEY")
+        .ok_or_else(|| UploadSourceMapsError::Validation("FALLOW_API_KEY is required".to_owned()))
+}
+
+#[derive(Debug, Clone)]
+struct PreparedSourceMap {
+    candidate: SourceMapCandidate,
+    source_map: serde_json::Value,
+}
+
+fn prepare_source_map(candidate: &SourceMapCandidate) -> MapOutcome {
+    prepare_source_map_with_open(candidate, securely_open_source_map, MAX_MAP_BYTES)
+}
+
+fn prepare_source_map_with_open(
+    candidate: &SourceMapCandidate,
+    open: impl FnOnce(&SourceMapCandidate) -> std::io::Result<std::fs::File>,
+    max_bytes: u64,
+) -> MapOutcome {
+    if candidate.bytes > max_bytes {
+        return map_too_large(candidate, candidate.bytes, max_bytes);
+    }
+    let resolved_path = match std::fs::canonicalize(&candidate.path) {
+        Ok(path) => path,
+        Err(err) => {
+            return MapOutcome::failed(
+                candidate,
+                FailureKind::Validation,
+                format!("read failed: {err}"),
+            );
+        }
+    };
+    if !resolved_path.starts_with(&candidate.canonical_root) {
+        return MapOutcome::failed(
+            candidate,
+            FailureKind::Validation,
+            "source map target is outside selected build directory; skipping".to_owned(),
+        );
+    }
+    if resolved_path != candidate.resolved_path {
+        return MapOutcome::failed(
+            candidate,
+            FailureKind::Validation,
+            "source map target changed since collection; skipping".to_owned(),
+        );
+    }
+    let file = match open(candidate) {
+        Ok(file) => file,
+        Err(err) => {
+            return MapOutcome::failed(
+                candidate,
+                FailureKind::Validation,
+                format!("secure open failed: {err}"),
+            );
+        }
+    };
+    let opened_bytes = match file.metadata() {
+        Ok(metadata) if metadata.is_file() => metadata.len(),
+        Ok(_) => {
+            return MapOutcome::failed(
+                candidate,
+                FailureKind::Validation,
+                "source map target is not a regular file; skipping".to_owned(),
+            );
+        }
+        Err(err) => {
+            return MapOutcome::failed(
+                candidate,
+                FailureKind::Validation,
+                format!("read failed: {err}"),
+            );
+        }
+    };
+    if opened_bytes > max_bytes {
+        return map_too_large(candidate, opened_bytes, max_bytes);
+    }
+
+    let mut content = String::new();
+    if let Err(err) = file
+        .take(max_bytes.saturating_add(1))
+        .read_to_string(&mut content)
+    {
+        return MapOutcome::failed(
+            candidate,
+            FailureKind::Validation,
+            format!("read failed: {err}"),
+        );
+    }
+    if u64::try_from(content.len()).map_or(true, |bytes| bytes > max_bytes) {
+        return map_too_large(candidate, max_bytes.saturating_add(1), max_bytes);
+    }
+
+    match serde_json::from_str::<serde_json::Value>(&content) {
+        Ok(source_map) => MapOutcome::Ready(Box::new(PreparedSourceMap {
+            candidate: candidate.clone(),
+            source_map,
+        })),
+        Err(err) => MapOutcome::failed(
+            candidate,
+            FailureKind::Validation,
+            format!("not valid JSON ({err}); skipping"),
+        ),
+    }
+}
+
+fn map_too_large(candidate: &SourceMapCandidate, bytes: u64, max_bytes: u64) -> MapOutcome {
+    MapOutcome::failed(
+        candidate,
+        FailureKind::Validation,
+        format!(
+            "source map is too large ({}); maximum is {}",
+            format_bytes(bytes),
+            format_bytes(max_bytes)
+        ),
+    )
+}
+
+#[cfg(unix)]
+fn securely_open_source_map(candidate: &SourceMapCandidate) -> std::io::Result<std::fs::File> {
+    use rustix::fs::{Mode, OFlags, open, openat};
+
+    let relative = candidate
+        .resolved_path
+        .strip_prefix(&candidate.canonical_root)
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "source map target is outside selected build directory",
+            )
+        })?;
+    let mut components = relative.components().peekable();
+    let mut directory = open(
+        &candidate.canonical_root,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )?;
+
+    while let Some(component) = components.next() {
+        let std::path::Component::Normal(name) = component else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "source map target contains an invalid path component",
+            ));
+        };
+        if components.peek().is_some() {
+            directory = openat(
+                &directory,
+                name,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                Mode::empty(),
+            )?;
+        } else {
+            let file = openat(
+                &directory,
+                name,
+                OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+                Mode::empty(),
+            )?;
+            return Ok(file.into());
+        }
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        "source map target must name a file below the selected build directory",
+    ))
+}
+
+#[cfg(windows)]
+#[expect(
+    unsafe_code,
+    reason = "final-path canonicalization requires Win32 FFI calls"
+)]
+fn securely_open_source_map(candidate: &SourceMapCandidate) -> std::io::Result<std::fs::File> {
+    use std::os::windows::ffi::OsStrExt as _;
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Globalization::{CSTR_EQUAL, CompareStringOrdinal};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_NAME_NORMALIZED, GetFinalPathNameByHandleW, VOLUME_NAME_DOS,
+    };
+
+    let file = std::fs::File::open(&candidate.resolved_path)?;
+    let handle = file.as_raw_handle().cast();
+    let flags = FILE_NAME_NORMALIZED | VOLUME_NAME_DOS;
+    // SAFETY: the handle stays valid for both calls. The first call requests
+    // the required UTF-16 buffer length and writes no bytes through a null pointer.
+    let required = unsafe { GetFinalPathNameByHandleW(handle, std::ptr::null_mut(), 0, flags) };
+    if required == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let capacity = required.checked_add(1).ok_or_else(|| {
+        std::io::Error::other("opened source map final path is too long to validate")
+    })?;
+    let mut buffer = vec![
+        0_u16;
+        usize::try_from(capacity).map_err(|_| {
+            std::io::Error::other("opened source map final path exceeds platform limits")
+        })?
+    ];
+    // SAFETY: `buffer` is writable for the advertised length and `handle`
+    // remains owned by `file` for the duration of the call.
+    let written =
+        unsafe { GetFinalPathNameByHandleW(handle, buffer.as_mut_ptr(), capacity, flags) };
+    if written == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if written >= capacity {
+        return Err(std::io::Error::other(
+            "opened source map final path changed while it was being validated",
+        ));
+    }
+    buffer.truncate(usize::try_from(written).map_err(|_| {
+        std::io::Error::other("opened source map final path exceeds platform limits")
+    })?);
+    let expected: Vec<u16> = candidate.resolved_path.as_os_str().encode_wide().collect();
+    let expected_len = i32::try_from(expected.len())
+        .map_err(|_| std::io::Error::other("expected source map path exceeds platform limits"))?;
+    let final_len = i32::try_from(buffer.len()).map_err(|_| {
+        std::io::Error::other("opened source map final path exceeds platform limits")
+    })?;
+    // SAFETY: both UTF-16 buffers remain alive for the duration of the call,
+    // and their checked lengths describe the initialized contents exactly.
+    let comparison = unsafe {
+        CompareStringOrdinal(
+            buffer.as_ptr(),
+            final_len,
+            expected.as_ptr(),
+            expected_len,
+            1,
+        )
+    };
+    if comparison == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if comparison != CSTR_EQUAL {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "opened source map target changed or escaped the selected build directory",
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn securely_open_source_map(candidate: &SourceMapCandidate) -> std::io::Result<std::fs::File> {
+    std::fs::File::open(&candidate.resolved_path)
+}
+
+fn upload_maps(
+    args: &UploadSourceMapsArgs,
+    repo: &str,
+    git_sha: &str,
+    api_key: &str,
+    maps: &[SourceMapCandidate],
+) -> Result<(), UploadSourceMapsError> {
+    let (mut outcomes, ready) = prepare_source_maps_for_upload(args, maps)?;
+    if ready.is_empty() {
+        return Err(UploadSourceMapsError::Partial(outcomes));
+    }
+
+    print_upload_source_maps_summary(args, repo, git_sha, maps);
+
+    let agent = try_api_agent_with_timeout(CONNECT_TIMEOUT_SECS, TOTAL_TIMEOUT_SECS)
+        .map_err(|err| UploadSourceMapsError::Network(err.to_string()))?;
+    let mut uploaded = upload_ready_source_maps(args, repo, git_sha, api_key, &agent, &ready)?;
+    outcomes.append(&mut uploaded);
+    finish_source_map_upload(outcomes)
+}
+
+fn prepare_source_maps_for_upload(
+    args: &UploadSourceMapsArgs,
+    maps: &[SourceMapCandidate],
+) -> Result<(Vec<MapOutcome>, Vec<PreparedSourceMap>), UploadSourceMapsError> {
+    let mut outcomes = Vec::with_capacity(maps.len());
+    let mut ready = Vec::new();
+    for candidate in maps {
+        warn_large_source_map(candidate);
+        match prepare_source_map(candidate) {
+            MapOutcome::Ready(prepared) => ready.push(*prepared),
+            failed => {
+                outcomes.push(failed);
+                if args.fail_fast {
+                    return Err(UploadSourceMapsError::Partial(outcomes));
+                }
+            }
+        }
+    }
+    Ok((outcomes, ready))
+}
+
+fn warn_large_source_map(candidate: &SourceMapCandidate) {
+    if candidate.bytes > WARN_MAP_BYTES && candidate.bytes <= MAX_MAP_BYTES {
+        eprintln!(
+            "{LOG_PREFIX}: {}: {} is large ({})",
+            "warning".yellow().bold(),
+            candidate.rel_path.display(),
+            format_bytes(candidate.bytes),
+        );
+    }
+}
+
+fn print_upload_source_maps_summary(
+    args: &UploadSourceMapsArgs,
+    repo: &str,
+    git_sha: &str,
+    maps: &[SourceMapCandidate],
+) {
+    println!("{LOG_PREFIX}: repo={repo} sha={git_sha}");
+    println!(
+        "{LOG_PREFIX}: found {} maps ({})",
+        maps.len(),
+        format_bytes(maps.iter().map(|map| map.bytes).sum())
+    );
+    println!(
+        "{LOG_PREFIX}: uploading to {}",
+        display_endpoint_url(args.endpoint.as_deref(), repo)
+    );
+}
+
+fn upload_ready_source_maps(
+    args: &UploadSourceMapsArgs,
+    repo: &str,
+    git_sha: &str,
+    api_key: &str,
+    agent: &ureq::Agent,
+    ready: &[PreparedSourceMap],
+) -> Result<Vec<MapOutcome>, UploadSourceMapsError> {
+    if args.fail_fast {
+        return Ok(upload_ready_source_maps_fail_fast(
+            args, repo, git_sha, api_key, agent, ready,
+        ));
+    }
+
+    let pool = fallow_engine::thread_pool::worker_pool_builder(args.concurrency.max(1))
+        .build()
+        .map_err(|err| {
+            UploadSourceMapsError::Validation(format!("invalid --concurrency: {err}"))
+        })?;
+    Ok(pool.install(|| {
+        ready
+            .par_iter()
+            .map(|map| upload_one(agent, args.endpoint.as_deref(), repo, git_sha, api_key, map))
+            .collect()
+    }))
+}
+
+fn upload_ready_source_maps_fail_fast(
+    args: &UploadSourceMapsArgs,
+    repo: &str,
+    git_sha: &str,
+    api_key: &str,
+    agent: &ureq::Agent,
+    ready: &[PreparedSourceMap],
+) -> Vec<MapOutcome> {
+    let mut uploaded = Vec::new();
+    for map in ready {
+        let outcome = upload_one(agent, args.endpoint.as_deref(), repo, git_sha, api_key, map);
+        let failed = matches!(outcome, MapOutcome::Failed { .. });
+        uploaded.push(outcome);
+        if failed {
+            break;
+        }
+    }
+    uploaded
+}
+
+fn finish_source_map_upload(outcomes: Vec<MapOutcome>) -> Result<(), UploadSourceMapsError> {
+    let success_count = outcomes
+        .iter()
+        .filter(|outcome| outcome.is_success())
+        .count();
+    let failure_count = outcomes.len().saturating_sub(success_count);
+    if failure_count > 0 {
+        if success_count == 0
+            && outcomes
+                .iter()
+                .filter_map(MapOutcome::failure_kind)
+                .all(|kind| kind == FailureKind::Network)
+        {
+            let detail = outcomes
+                .iter()
+                .find_map(MapOutcome::failure_reason)
+                .unwrap_or("network error");
+            return Err(UploadSourceMapsError::Network(format!(
+                "all source map uploads failed with network errors: {detail}"
+            )));
+        }
+        return Err(UploadSourceMapsError::Partial(outcomes));
+    }
+
+    println!(
+        "{LOG_PREFIX}: {}/{} uploaded",
+        success_count,
+        outcomes.len()
+    );
+    Ok(())
+}
+
+fn upload_one(
+    agent: &ureq::Agent,
+    endpoint_override: Option<&str>,
+    repo: &str,
+    git_sha: &str,
+    api_key: &str,
+    map: &PreparedSourceMap,
+) -> MapOutcome {
+    for attempt in 1..=MAX_ATTEMPTS {
+        match send_source_map(agent, endpoint_override, repo, git_sha, api_key, map) {
+            Ok(response) => {
+                println!(
+                    "  {} {} ({})",
+                    "ok".green(),
+                    map.candidate.file_name,
+                    format_bytes(response.data.file_size),
+                );
+                return MapOutcome::Success;
+            }
+            Err(err) if err.retryable && attempt < MAX_ATTEMPTS => {
+                let retry_delay = retry_delay_for_status(
+                    err.status.unwrap_or(502),
+                    err.retry_after.as_deref(),
+                    attempt,
+                    SystemTime::now(),
+                );
+                eprintln!(
+                    "{LOG_PREFIX}: {} retrying {} in {}ms (attempt {}/{MAX_ATTEMPTS})",
+                    "warning".yellow().bold(),
+                    map.candidate.file_name,
+                    retry_delay.as_millis(),
+                    attempt + 1,
+                );
+                std::thread::sleep(retry_delay);
+            }
+            Err(err) => {
+                return MapOutcome::failed(&map.candidate, err.kind, err.message);
+            }
+        }
+    }
+    MapOutcome::failed(
+        &map.candidate,
+        FailureKind::Network,
+        "upload failed after retries".to_owned(),
+    )
+}
+
+#[derive(Debug, Serialize)]
+struct SourceMapRequest<'a> {
+    #[serde(rename = "gitSha")]
+    git_sha: &'a str,
+    #[serde(rename = "fileName")]
+    file_name: &'a str,
+    /// The map's repo-relative path, omitted when not resolvable (#260). The
+    /// cloud resolves `sources[]` against its directory for monorepo
+    /// sub-packages; an older cloud ignores the field.
+    #[serde(rename = "mapPath", skip_serializing_if = "Option::is_none")]
+    map_path: Option<&'a str>,
+    #[serde(rename = "sourceMap")]
+    source_map: &'a serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct SourceMapUploadEnvelope {
+    data: SourceMapUploadData,
+}
+
+#[derive(Debug, Deserialize)]
+struct SourceMapUploadData {
+    #[serde(rename = "fileSize")]
+    file_size: u64,
+}
+
+#[derive(Debug)]
+struct UploadAttemptError {
+    message: String,
+    retryable: bool,
+    status: Option<u16>,
+    retry_after: Option<String>,
+    kind: FailureKind,
+}
+
+fn send_source_map(
+    agent: &ureq::Agent,
+    endpoint_override: Option<&str>,
+    repo: &str,
+    git_sha: &str,
+    api_key: &str,
+    map: &PreparedSourceMap,
+) -> Result<SourceMapUploadEnvelope, UploadAttemptError> {
+    let url = upload_common::endpoint_url(endpoint_override, repo, "source-maps");
+    let payload = SourceMapRequest {
+        git_sha,
+        file_name: &map.candidate.file_name,
+        map_path: map.candidate.map_path.as_deref(),
+        source_map: &map.source_map,
+    };
+    let mut response = agent
+        .post(&url)
+        .header("Authorization", &format!("Bearer {api_key}"))
+        .send_json(&payload)
+        .map_err(|err| UploadAttemptError {
+            message: sanitize_network_error(&format!("network error: {err}")),
+            retryable: true,
+            status: Some(502),
+            retry_after: None,
+            kind: FailureKind::Network,
+        })?;
+
+    let status = response.status().as_u16();
+    if matches!(status, 200 | 201) {
+        return response
+            .read_json::<SourceMapUploadEnvelope>()
+            .map_err(|err| UploadAttemptError {
+                message: format!("malformed response body: {err}"),
+                retryable: false,
+                status: None,
+                retry_after: None,
+                kind: FailureKind::Http,
+            });
+    }
+
+    let retry_after = response
+        .headers()
+        .get("Retry-After")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let body = response.body_mut().read_to_string().unwrap_or_default();
+    Err(UploadAttemptError {
+        message: classify_http_error(status, &body),
+        retryable: should_retry_status(status),
+        status: Some(status),
+        retry_after,
+        kind: FailureKind::Http,
+    })
+}
+
+fn display_endpoint_url(override_endpoint: Option<&str>, repo: &str) -> String {
+    let base = override_endpoint.map_or_else(
+        || {
+            std::env::var("FALLOW_API_URL")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .map_or_else(
+                    || DEFAULT_ENDPOINT.to_owned(),
+                    |value| value.trim().trim_end_matches('/').to_owned(),
+                )
+        },
+        |value| value.trim().trim_end_matches('/').to_owned(),
+    );
+    format!(
+        "{base}/v1/coverage/{}/source-maps",
+        url_encode_path_segment(repo)
+    )
+}
+
+fn classify_http_error(status: u16, body: &str) -> String {
+    let envelope = parse_error_envelope(body);
+    match status {
+        401 | 403 => "authentication failed: invalid or expired API key".to_owned(),
+        429 => "rate limited; retry with fewer concurrent uploads via --concurrency".to_owned(),
+        500..=599 => {
+            let suffix = source_map_message_suffix(body, &envelope);
+            format!("server error: {status}{suffix}")
+        }
+        _ => {
+            let suffix = source_map_message_suffix(body, &envelope);
+            format!("server rejected: HTTP {status}{suffix}")
+        }
+    }
+}
+
+fn source_map_message_suffix(body: &str, envelope: &crate::api::ParsedErrorEnvelope) -> String {
+    response_message_suffix(body, envelope)
+        .strip_prefix(':')
+        .map_or_else(String::new, ToOwned::to_owned)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailureKind {
+    Validation,
+    Network,
+    Http,
+}
+
+#[derive(Debug, Clone)]
+enum MapOutcome {
+    Ready(Box<PreparedSourceMap>),
+    Success,
+    Failed {
+        file_name: String,
+        reason: String,
+        kind: FailureKind,
+    },
+}
+
+impl MapOutcome {
+    fn failed(candidate: &SourceMapCandidate, kind: FailureKind, reason: String) -> Self {
+        Self::Failed {
+            file_name: candidate.file_name.clone(),
+            reason,
+            kind,
+        }
+    }
+
+    const fn is_success(&self) -> bool {
+        matches!(self, Self::Success)
+    }
+
+    const fn failure_kind(&self) -> Option<FailureKind> {
+        match self {
+            Self::Failed { kind, .. } => Some(*kind),
+            Self::Ready(_) | Self::Success => None,
+        }
+    }
+
+    fn failure_reason(&self) -> Option<&str> {
+        match self {
+            Self::Failed { reason, .. } => Some(reason),
+            Self::Ready(_) | Self::Success => None,
+        }
+    }
+}
+
+fn print_failure_summary(outcomes: &[MapOutcome]) {
+    let total = outcomes.len();
+    let success_count = outcomes
+        .iter()
+        .filter(|outcome| outcome.is_success())
+        .count();
+    eprintln!("{LOG_PREFIX}: {success_count}/{total} uploaded");
+    eprintln!("{LOG_PREFIX}: failed:");
+    for outcome in outcomes {
+        if let MapOutcome::Failed {
+            file_name, reason, ..
+        } = outcome
+        {
+            eprintln!("  {} {file_name} ({reason})", "x".red());
+        }
+    }
+    eprintln!("{LOG_PREFIX}: re-run to retry failed uploads");
+}
+
+fn print_dry_run(
+    repo: &str,
+    git_sha: &str,
+    endpoint_override: Option<&str>,
+    maps: &[SourceMapCandidate],
+) {
+    let total_bytes: u64 = maps.iter().map(|map| map.bytes).sum();
+    println!("{LOG_PREFIX}: repo={repo} sha={git_sha}");
+    println!(
+        "{LOG_PREFIX}: would upload {} maps ({}) to {}",
+        maps.len(),
+        format_bytes(total_bytes),
+        display_endpoint_url(endpoint_override, repo)
+    );
+    for map in maps.iter().take(20) {
+        let map_path = map.map_path.as_deref().unwrap_or("-");
+        println!(
+            "  - {} ({}) -> fileName={} mapPath={}",
+            map.rel_path.display(),
+            format_bytes(map.bytes),
+            map.file_name,
+            map_path
+        );
+    }
+    if maps.len() > 20 {
+        println!("  ... and {} more", maps.len() - 20);
+    }
+    println!("{LOG_PREFIX}: dry run, no uploads performed");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn parses_repo_name_from_common_urls() {
+        assert_eq!(
+            parse_repo_name_from_url("https://github.com/acme/widgets.git"),
+            Some("acme/widgets".to_owned())
+        );
+        assert_eq!(
+            parse_repo_name_from_url("git@github.com:acme/widgets.git"),
+            Some("acme/widgets".to_owned())
+        );
+        assert_eq!(
+            parse_repo_name_from_url("ssh://git@gitlab.com/acme/team/widgets"),
+            Some("team/widgets".to_owned())
+        );
+        assert_eq!(
+            parse_repo_name_from_url("acme/widgets"),
+            Some("acme/widgets".to_owned())
+        );
+    }
+
+    #[test]
+    fn validates_git_sha_like_server_schema() {
+        assert!(validate_git_sha("abcdef1").is_ok());
+        assert!(validate_git_sha("abcdef1234567890abcdef1234567890abcdef12").is_ok());
+        assert!(validate_git_sha("abc").is_err());
+        assert!(validate_git_sha("xyz1234").is_err());
+        assert!(validate_git_sha("abcdef1234567890abcdef1234567890abcdef123").is_err());
+    }
+
+    #[test]
+    fn map_file_name_strips_path_by_default() {
+        assert_eq!(
+            map_file_name(Path::new("assets/bundle-a1b2.js.map"), true).unwrap(),
+            "bundle-a1b2.js.map"
+        );
+    }
+
+    #[test]
+    fn map_file_name_keeps_relative_path_when_requested() {
+        assert_eq!(
+            map_file_name(Path::new("assets/bundle.js.map"), false).unwrap(),
+            "assets/bundle.js.map"
+        );
+    }
+
+    #[test]
+    fn file_name_rejects_traversal_and_backslashes() {
+        assert!(validate_file_name("../bundle.js.map").is_err());
+        assert!(validate_file_name("assets/../bundle.js.map").is_err());
+        assert!(validate_file_name("assets\\bundle.js.map").is_err());
+    }
+
+    #[test]
+    fn collect_source_maps_applies_include_exclude_and_file_name_mode() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("assets")).expect("assets dir");
+        std::fs::create_dir_all(dir.path().join("node_modules/pkg")).expect("node_modules dir");
+        std::fs::write(dir.path().join("root.js.map"), "{}").expect("root map");
+        std::fs::write(dir.path().join("assets/app.js.map"), "{}").expect("asset map");
+        std::fs::write(dir.path().join("node_modules/pkg/vendor.js.map"), "{}")
+            .expect("vendor map");
+
+        let include = compile_glob_set(&["**/*.map".to_owned()], "--include").unwrap();
+        let exclude = compile_glob_set(&["**/node_modules/**".to_owned()], "--exclude").unwrap();
+        let maps = collect_source_maps(dir.path(), dir.path(), &include, &exclude, false).unwrap();
+
+        let file_names: Vec<&str> = maps.iter().map(|map| map.file_name.as_str()).collect();
+        assert_eq!(file_names, vec!["assets/app.js.map", "root.js.map"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn collect_source_maps_rejects_symlink_to_outside_root() {
+        use std::os::unix::fs::symlink;
+
+        let build_dir = tempdir().expect("build dir");
+        let outside_dir = tempdir().expect("outside dir");
+        let outside_map = outside_dir.path().join("outside.js.map");
+        std::fs::write(&outside_map, r#"{"version":3,"sources":[],"mappings":""}"#)
+            .expect("outside map");
+        symlink(&outside_map, build_dir.path().join("app.js.map")).expect("map symlink");
+
+        let include = compile_glob_set(&["**/*.map".to_owned()], "--include").unwrap();
+        let exclude = compile_glob_set(&[], "--exclude").unwrap();
+        let err = collect_source_maps(
+            build_dir.path(),
+            build_dir.path(),
+            &include,
+            &exclude,
+            false,
+        )
+        .expect_err("outside-root symlink must be rejected");
+
+        assert!(
+            matches!(err, UploadSourceMapsError::Validation(ref message) if message.contains("outside selected build directory"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn collect_source_maps_accepts_symlink_to_target_inside_root() {
+        use std::os::unix::fs::symlink;
+
+        let build_dir = tempdir().expect("build dir");
+        let target = build_dir.path().join("source-map.json");
+        std::fs::write(&target, r#"{"version":3,"sources":[],"mappings":""}"#).expect("target map");
+        symlink(&target, build_dir.path().join("app.js.map")).expect("map symlink");
+
+        let include = compile_glob_set(&["**/*.map".to_owned()], "--include").unwrap();
+        let exclude = compile_glob_set(&[], "--exclude").unwrap();
+        let maps = collect_source_maps(
+            build_dir.path(),
+            build_dir.path(),
+            &include,
+            &exclude,
+            false,
+        )
+        .expect("inside-root symlink must be accepted");
+
+        assert_eq!(maps.len(), 1);
+        assert_eq!(maps[0].file_name, "app.js.map");
+        assert!(matches!(prepare_source_map(&maps[0]), MapOutcome::Ready(_)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_source_map_rejects_symlink_retargeted_after_collection() {
+        use std::os::unix::fs::symlink;
+
+        let build_dir = tempdir().expect("build dir");
+        let original = build_dir.path().join("original.json");
+        let replacement = build_dir.path().join("replacement.json");
+        std::fs::write(
+            &original,
+            r#"{"version":3,"sources":["original"],"mappings":""}"#,
+        )
+        .expect("original map");
+        std::fs::write(
+            &replacement,
+            r#"{"version":3,"sources":["replacement"],"mappings":""}"#,
+        )
+        .expect("replacement map");
+        let link = build_dir.path().join("app.js.map");
+        symlink(&original, &link).expect("original symlink");
+
+        let include = compile_glob_set(&["**/*.map".to_owned()], "--include").unwrap();
+        let exclude = compile_glob_set(&[], "--exclude").unwrap();
+        let maps = collect_source_maps(
+            build_dir.path(),
+            build_dir.path(),
+            &include,
+            &exclude,
+            false,
+        )
+        .expect("initial collection");
+        std::fs::remove_file(&link).expect("remove original symlink");
+        symlink(&replacement, &link).expect("replacement symlink");
+
+        assert!(matches!(
+            prepare_source_map(&maps[0]),
+            MapOutcome::Failed {
+                kind: FailureKind::Validation,
+                ref reason,
+                ..
+            } if reason.contains("changed since collection")
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_source_map_rejects_final_symlink_swap_during_validation_open_gap() {
+        use std::os::unix::fs::symlink;
+
+        let build_dir = tempdir().expect("build dir");
+        let outside_dir = tempdir().expect("outside dir");
+        let map = build_dir.path().join("app.js.map");
+        let outside_map = outside_dir.path().join("outside.js.map");
+        std::fs::write(&map, r#"{"version":3,"sources":["inside"],"mappings":""}"#)
+            .expect("inside map");
+        std::fs::write(
+            &outside_map,
+            r#"{"version":3,"sources":["outside"],"mappings":""}"#,
+        )
+        .expect("outside map");
+        let candidate = candidate(48, map.clone());
+
+        let outcome = prepare_source_map_with_open(
+            &candidate,
+            |candidate| {
+                std::fs::remove_file(&map).expect("remove collected target");
+                symlink(&outside_map, &map).expect("swap final target to outside symlink");
+                securely_open_source_map(candidate)
+            },
+            MAX_MAP_BYTES,
+        );
+
+        assert!(matches!(
+            outcome,
+            MapOutcome::Failed {
+                kind: FailureKind::Validation,
+                ..
+            }
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_source_map_rejects_parent_symlink_swap_during_validation_open_gap() {
+        use std::os::unix::fs::symlink;
+
+        let build_dir = tempdir().expect("build dir");
+        let outside_dir = tempdir().expect("outside dir");
+        let assets = build_dir.path().join("assets");
+        let moved_assets = build_dir.path().join("assets-collected");
+        std::fs::create_dir(&assets).expect("assets dir");
+        let map = assets.join("app.js.map");
+        std::fs::write(&map, r#"{"version":3,"sources":["inside"],"mappings":""}"#)
+            .expect("inside map");
+        std::fs::write(
+            outside_dir.path().join("app.js.map"),
+            r#"{"version":3,"sources":["outside"],"mappings":""}"#,
+        )
+        .expect("outside map");
+        let candidate = candidate(48, map);
+
+        let outcome = prepare_source_map_with_open(
+            &candidate,
+            |candidate| {
+                std::fs::rename(&assets, &moved_assets).expect("move collected parent");
+                symlink(outside_dir.path(), &assets).expect("swap parent to outside symlink");
+                securely_open_source_map(candidate)
+            },
+            MAX_MAP_BYTES,
+        );
+
+        assert!(matches!(
+            outcome,
+            MapOutcome::Failed {
+                kind: FailureKind::Validation,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn prepare_source_map_enforces_limit_from_opened_file_metadata() {
+        let dir = tempdir().expect("tempdir");
+        let map = dir.path().join("app.js.map");
+        std::fs::write(&map, r#"{"version":3,"sources":[],"mappings":""}"#).expect("map");
+        let candidate = candidate(1, map);
+
+        assert!(matches!(
+            prepare_source_map_with_open(&candidate, securely_open_source_map, 10),
+            MapOutcome::Failed {
+                kind: FailureKind::Validation,
+                ref reason,
+                ..
+            } if reason.contains("too large")
+        ));
+    }
+
+    #[test]
+    fn resolve_build_dir_joins_relative_paths() {
+        let root = Path::new("/repo");
+        assert_eq!(
+            resolve_build_dir(root, Path::new("dist")),
+            PathBuf::from("/repo/dist")
+        );
+        assert_eq!(
+            resolve_build_dir(root, Path::new("/tmp/dist")),
+            PathBuf::from("/tmp/dist")
+        );
+    }
+
+    #[test]
+    fn map_path_is_repo_root_relative_when_build_dir_is_a_subdirectory() {
+        let repo_root = tempdir().expect("tempdir");
+        let build_dir = repo_root.path().join("dashboard/dist");
+        std::fs::create_dir_all(build_dir.join("assets")).expect("assets dir");
+        std::fs::write(build_dir.join("assets/app-a1b2.js.map"), "{}").expect("map");
+
+        let include = compile_glob_set(&["**/*.map".to_owned()], "--include").unwrap();
+        let exclude = compile_glob_set(&["**/node_modules/**".to_owned()], "--exclude").unwrap();
+        let maps =
+            collect_source_maps(repo_root.path(), &build_dir, &include, &exclude, true).unwrap();
+
+        assert_eq!(maps.len(), 1);
+        assert_eq!(maps[0].file_name, "app-a1b2.js.map");
+        assert_eq!(
+            maps[0].map_path.as_deref(),
+            Some("dashboard/dist/assets/app-a1b2.js.map")
+        );
+    }
+
+    #[test]
+    fn repo_relative_map_path_is_none_for_a_map_outside_the_repo_root() {
+        let repo_root = tempdir().expect("repo root");
+        let elsewhere = tempdir().expect("elsewhere");
+        let outside = elsewhere.path().join("app.js.map");
+        assert_eq!(repo_relative_map_path(repo_root.path(), &outside), None);
+    }
+
+    #[test]
+    fn request_serializes_map_path_and_omits_it_when_absent() {
+        let source_map = serde_json::json!({ "version": 3, "sources": [], "mappings": "" });
+        let with_path = SourceMapRequest {
+            git_sha: "abcdef1",
+            file_name: "app.js.map",
+            map_path: Some("dashboard/dist/assets/app.js.map"),
+            source_map: &source_map,
+        };
+        let json = serde_json::to_string(&with_path).unwrap();
+        assert!(json.contains(r#""mapPath":"dashboard/dist/assets/app.js.map""#));
+
+        let without_path = SourceMapRequest {
+            git_sha: "abcdef1",
+            file_name: "app.js.map",
+            map_path: None,
+            source_map: &source_map,
+        };
+        let json = serde_json::to_string(&without_path).unwrap();
+        assert!(!json.contains("mapPath"));
+    }
+
+    #[test]
+    fn classify_http_errors_matches_spec_messages() {
+        assert_eq!(
+            classify_http_error(401, ""),
+            "authentication failed: invalid or expired API key"
+        );
+        assert_eq!(
+            classify_http_error(429, ""),
+            "rate limited; retry with fewer concurrent uploads via --concurrency"
+        );
+        assert!(classify_http_error(500, "oops").starts_with("server error: 500"));
+    }
+
+    #[test]
+    fn classify_http_error_preserves_malformed_response_body() {
+        let message = classify_http_error(500, "<html>bad gateway</html>");
+        assert!(message.contains("<html>bad gateway</html>"));
+        assert!(message.contains("malformed error envelope"));
+    }
+
+    #[test]
+    fn all_network_failures_are_reported_as_network_exit() {
+        let candidate = candidate(10, PathBuf::from("dist/app.js.map"));
+        let outcomes = [MapOutcome::failed(
+            &candidate,
+            FailureKind::Network,
+            "network error: connection refused".to_owned(),
+        )];
+        let success_count = outcomes
+            .iter()
+            .filter(|outcome| outcome.is_success())
+            .count();
+        assert_eq!(success_count, 0);
+        assert!(
+            outcomes
+                .iter()
+                .filter_map(MapOutcome::failure_kind)
+                .all(|kind| kind == FailureKind::Network)
+        );
+        assert_eq!(
+            outcomes.iter().find_map(MapOutcome::failure_reason),
+            Some("network error: connection refused")
+        );
+    }
+
+    fn candidate(bytes: u64, path: PathBuf) -> SourceMapCandidate {
+        let resolved_path = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        let canonical_root = resolved_path
+            .parent()
+            .unwrap_or_else(|| Path::new(""))
+            .to_path_buf();
+        SourceMapCandidate {
+            rel_path: PathBuf::from("app.js.map"),
+            file_name: "app.js.map".to_owned(),
+            map_path: Some("app.js.map".to_owned()),
+            path,
+            canonical_root,
+            resolved_path,
+            bytes,
+        }
+    }
+
+    fn dry_run_args(dir: &Path) -> UploadSourceMapsArgs {
+        UploadSourceMapsArgs {
+            dir: dir.to_path_buf(),
+            include: "**/*.map".to_owned(),
+            exclude: Vec::new(),
+            repo: Some("acme/widgets".to_owned()),
+            git_sha: Some("abcdef1".to_owned()),
+            endpoint: Some("http://localhost:3000".to_owned()),
+            strip_path: true,
+            dry_run: true,
+            concurrency: 4,
+            fail_fast: false,
+        }
+    }
+
+    #[test]
+    fn into_exit_maps_each_variant_to_its_exit_code() {
+        assert_eq!(
+            UploadSourceMapsError::Validation("x".to_owned()).into_exit(),
+            ExitCode::from(2)
+        );
+        assert_eq!(
+            UploadSourceMapsError::Network("x".to_owned()).into_exit(),
+            ExitCode::from(NETWORK_EXIT_CODE)
+        );
+        let failed = MapOutcome::failed(
+            &candidate(10, PathBuf::from("app.js.map")),
+            FailureKind::Http,
+            "server rejected".to_owned(),
+        );
+        assert_eq!(
+            UploadSourceMapsError::Partial(vec![failed]).into_exit(),
+            ExitCode::from(1)
+        );
+    }
+
+    #[test]
+    fn run_dry_run_on_temp_build_dir_exits_zero() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("app.js.map"), "{}").expect("map");
+        // Explicit repo + git_sha + endpoint keep the dry run env- and git-free.
+        let code = run(&dry_run_args(dir.path()), dir.path());
+        assert_eq!(code, ExitCode::SUCCESS);
+    }
+
+    #[test]
+    fn run_reports_missing_directory_as_validation_exit_2() {
+        let dir = tempdir().expect("tempdir");
+        let missing = dir.path().join("does-not-exist");
+        let code = run(&dry_run_args(&missing), dir.path());
+        assert_eq!(code, ExitCode::from(2));
+    }
+
+    #[test]
+    fn run_reports_no_maps_as_validation_exit_2() {
+        let dir = tempdir().expect("tempdir");
+        // Directory exists but holds no .map files.
+        let code = run(&dry_run_args(dir.path()), dir.path());
+        assert_eq!(code, ExitCode::from(2));
+    }
+
+    #[test]
+    fn validate_repo_name_accepts_clean_and_rejects_unsafe() {
+        assert_eq!(validate_repo_name("acme/widgets").unwrap(), "acme/widgets");
+        assert!(validate_repo_name("").is_err());
+        assert!(validate_repo_name("acme/../widgets").is_err());
+        assert!(validate_repo_name("acme\\widgets").is_err());
+    }
+
+    #[test]
+    fn resolve_repo_name_reads_package_json_repository_url() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"name":"w","repository":{"url":"https://github.com/acme/widgets.git"}}"#,
+        )
+        .expect("package.json");
+        assert_eq!(resolve_repo_name(None, dir.path()).unwrap(), "acme/widgets");
+    }
+
+    #[test]
+    fn resolve_repo_name_reads_package_json_repository_string() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"name":"w","repository":"git@github.com:acme/widgets.git"}"#,
+        )
+        .expect("package.json");
+
+        assert_eq!(resolve_repo_name(None, dir.path()).unwrap(), "acme/widgets");
+    }
+
+    #[test]
+    fn resolve_repo_name_errors_when_no_source_is_available() {
+        let dir = tempdir().expect("tempdir");
+        let err = resolve_repo_name(None, dir.path()).expect_err("repo should be required");
+
+        assert!(matches!(err, UploadSourceMapsError::Validation(_)));
+    }
+
+    #[test]
+    fn prepare_source_map_classifies_size_json_and_read_failures() {
+        let dir = tempdir().expect("tempdir");
+
+        // Oversize is rejected before the file is even read.
+        let too_big = candidate(MAX_MAP_BYTES + 1, dir.path().join("big.js.map"));
+        assert!(matches!(
+            prepare_source_map(&too_big),
+            MapOutcome::Failed { kind: FailureKind::Validation, ref reason, .. } if reason.contains("too large")
+        ));
+
+        // Valid JSON parses into a Ready outcome.
+        let ok_path = dir.path().join("ok.js.map");
+        std::fs::write(&ok_path, r#"{"version":3,"sources":[],"mappings":""}"#).expect("ok map");
+        assert!(matches!(
+            prepare_source_map(&candidate(40, ok_path)),
+            MapOutcome::Ready(_)
+        ));
+
+        // Non-JSON content is a validation failure.
+        let bad_path = dir.path().join("bad.js.map");
+        std::fs::write(&bad_path, "not json at all").expect("bad map");
+        assert!(matches!(
+            prepare_source_map(&candidate(15, bad_path)),
+            MapOutcome::Failed { kind: FailureKind::Validation, ref reason, .. } if reason.contains("not valid JSON")
+        ));
+
+        // A missing file is a read failure (also a validation failure).
+        let missing = candidate(10, dir.path().join("missing.js.map"));
+        assert!(matches!(
+            prepare_source_map(&missing),
+            MapOutcome::Failed { kind: FailureKind::Validation, ref reason, .. } if reason.contains("read failed")
+        ));
+    }
+
+    #[test]
+    fn display_endpoint_url_uses_override_and_trims_trailing_slash() {
+        assert_eq!(
+            display_endpoint_url(Some("http://localhost:3000/"), "owner/repo"),
+            "http://localhost:3000/v1/coverage/owner%2Frepo/source-maps"
+        );
+    }
+
+    #[test]
+    fn to_posix_string_normalizes_separators() {
+        assert_eq!(to_posix_string(Path::new("a/b/c.map")), "a/b/c.map");
+    }
+
+    #[test]
+    fn compile_glob_set_rejects_an_invalid_pattern() {
+        let err = compile_glob_set(&["a[b".to_owned()], "--include")
+            .expect_err("an unterminated character class must be rejected");
+        assert!(matches!(err, UploadSourceMapsError::Validation(_)));
+    }
+}

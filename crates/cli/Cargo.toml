@@ -2,13 +2,14 @@
 name = "fallow-cli"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 documentation.workspace = true
 keywords.workspace = true
 categories.workspace = true
-description = "CLI for fallow, Rust-native codebase intelligence for TypeScript and JavaScript"
+description = "CLI for fallow, codebase intelligence for TypeScript and JavaScript"
 readme = "../../README.md"
 
 [[bin]]
@@ -20,44 +21,93 @@ name = "stub_sidecar"
 path = "src/bin/stub_sidecar.rs"
 required-features = ["test-sidecar-key"]
 
+[[bin]]
+name = "fallow-schema-emit"
+path = "src/bin/schema_emit.rs"
+required-features = ["schema-emit"]
+
 [features]
 default = []
 # Test-only feature that swaps the sidecar binary-signing verify key and the
 # license JWT verify key for deterministic keypairs derived from fixed seeds.
-# Used by the end-to-end production-coverage integration tests. MUST NOT be
+# Used by the end-to-end runtime-coverage integration tests. MUST NOT be
 # enabled in release builds; a compile_error! at
 # crates/cli/src/health/coverage.rs guards against that.
 test-sidecar-key = []
+# Library feature that enables `JsonSchema` derives across the API, output, and
+# base type crates so the schema-emit binary can derive one document covering
+# the complete output contract. Non-schema builds pay zero compile cost because
+# every derive is gated behind `#[cfg_attr(feature = "schema", ...)]`.
+schema = ["dep:schemars", "fallow-api/schema", "fallow-output/schema", "fallow-types/schema"]
+# Build-only feature that enables the `fallow-schema-emit` binary, which
+# regenerates `docs/output-schema.json` from the Rust source of truth. Pulls in
+# schemars across the workspace via the per-crate `schema` features. Not part
+# of the published CLI; used by the schema drift gate and contributors editing
+# result types.
+schema-emit = [
+    "schema",
+    "fallow-types/schema",
+]
 
 [dependencies]
-fallow-core = { workspace = true }
+fallow-api = { workspace = true }
+fallow-engine = { workspace = true }
 fallow-config = { workspace = true }
+fallow-output = { workspace = true }
+fallow-process = { workspace = true }
+fallow-security = { workspace = true }
 fallow-types = { workspace = true }
-fallow-v8-coverage = { version = "2.46.0", path = "../v8-coverage" }
-fallow-cov-protocol = "0.3"
-fallow-license = { version = "2.46.0", path = "../license" }
+fallow-v8-coverage = { version = "3.21.0", path = "../v8-coverage" }
+fallow-cov-protocol = "0.8"
+fallow-license = { version = "3.21.0", path = "../license" }
 ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
 clap = { workspace = true }
 dunce = { workspace = true }
+glob = { workspace = true }
 globset = { workspace = true }
+ignore = { workspace = true }
 colored = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-json_comments = { workspace = true }
+serde_yaml_ng = { workspace = true }
+toml = { workspace = true }
+toml_edit = { workspace = true }
+flate2 = { workspace = true }
+semver = { workspace = true }
+bitcode = { workspace = true }
+jsonc-parser = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 notify = { workspace = true }
 rayon = { workspace = true }
-notify-debouncer-mini = { workspace = true }
 tempfile = { workspace = true }
 miette = { workspace = true, features = ["fancy"] }
 rustc-hash = { workspace = true }
+open = { workspace = true }
 oxc_coverage_instrument = { workspace = true }
-srcmap-sourcemap = "0.3.5"
+srcmap-sourcemap = "=0.3.7"
+httpdate = { workspace = true }
 ureq = { workspace = true }
 url = "2"
 http = "1"
 xxhash-rust = { workspace = true }
+sha2 = { workspace = true }
+similar = { version = "3", default-features = false, features = ["text"] }
+
+# Schema-emit support: pulled in only when the `schema-emit` feature is active
+# (via the dedicated bin target above). Keeps schemars out of the default
+# release binary.
+schemars = { workspace = true, optional = true }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true }
+signal-hook = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }
+
+[build-dependencies]
+flate2 = { workspace = true }
 
 [lib]
 name = "fallow_cli"
@@ -65,17 +115,28 @@ path = "src/lib.rs"
 doctest = false
 
 [dev-dependencies]
-toml = { workspace = true }
 insta = { workspace = true }
+jsonschema = { workspace = true }
 fallow-types = { workspace = true }
-oxc_span = { workspace = true }
 proptest = { workspace = true }
-base64 = "0.22"
+proc-macro2 = { version = "1", features = ["span-locations"] }
+syn = { version = "3", features = ["full"] }
+base64 = "0.23"
 ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
-fallow-cov-protocol = "0.3"
+fallow-cov-protocol = "0.8"
+serde_yaml_ng = { workspace = true }
 
 [package.metadata.cargo-shear]
-ignored = ["miette"] # feature-only dep: activates fancy rendering for fallow-config's miette::Report
+ignored = [
+    "miette",       # feature-only dep: activates fancy rendering for fallow-config's miette::Report
+    "proc-macro2",  # feature-only dep: activates `span-locations` so syn-returned `.span().start().line` reports real source positions in the schema-drift gate (crates/cli/tests/schema_tests.rs); no explicit import
+]
+
+[package.metadata.cargo-machete]
+ignored = [
+    "miette", # feature-only dep: activates fancy rendering for fallow-config's miette::Report
+    "proc-macro2", # feature-only dev-dep: activates `span-locations` for schema drift source-position tests
+]
 
 [lints]
 workspace = true

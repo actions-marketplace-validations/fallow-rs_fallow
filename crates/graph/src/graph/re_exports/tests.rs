@@ -1,14 +1,35 @@
 use rustc_hash::FxHashSet;
 
-use crate::graph::ModuleGraph;
+use super::propagate::count_star_reference_set_rebuilds;
+use super::{
+    ReExportPropagationPlan, ReExportTuple, capture_propagation_visits,
+    with_re_export_differential_check,
+};
+use crate::graph::{EffectiveExportResolution, ExportNamespace, ModuleGraph};
 use crate::resolve::{ResolveResult, ResolvedImport, ResolvedModule, ResolvedReExport};
 use fallow_types::discover::{DiscoveredFile, EntryPoint, EntryPointSource, FileId};
 use fallow_types::extract::{ExportName, ImportInfo, ImportedName, VisibilityTag};
 use std::path::PathBuf;
 
+/// A `ResolvedReExport` with matching imported/exported names and default
+/// spans, for tests that do not exercise span geometry.
+fn plain_re_export(source: &str, name: &str, target: ResolveResult) -> ResolvedReExport {
+    ResolvedReExport {
+        info: fallow_types::extract::ReExportInfo {
+            source: source.to_string(),
+            imported_name: name.to_string(),
+            exported_name: name.to_string(),
+            is_type_only: false,
+            span: oxc_span::Span::default(),
+            statement_span: oxc_span::Span::default(),
+            source_span: oxc_span::Span::default(),
+        },
+        target,
+    }
+}
+
 #[test]
 fn graph_re_export_chain_propagates_references() {
-    // entry.ts -> barrel.ts -re-exports-> source.ts
     let files = vec![
         DiscoveredFile {
             id: FileId(0),
@@ -33,7 +54,6 @@ fn graph_re_export_chain_propagates_references() {
     }];
 
     let resolved_modules = vec![
-        // entry imports "foo" from barrel
         ResolvedModule {
             file_id: FileId(0),
             path: PathBuf::from("/project/entry.ts"),
@@ -43,6 +63,8 @@ fn graph_re_export_chain_propagates_references() {
                     imported_name: ImportedName::Named("foo".to_string()),
                     local_name: "foo".to_string(),
                     is_type_only: false,
+                    is_type_only_star: false,
+                    from_style: false,
                     span: oxc_span::Span::new(0, 10),
                     source_span: oxc_span::Span::default(),
                 },
@@ -50,19 +72,9 @@ fn graph_re_export_chain_propagates_references() {
             }],
             ..Default::default()
         },
-        // barrel re-exports "foo" from source
         ResolvedModule {
             file_id: FileId(1),
             path: PathBuf::from("/project/barrel.ts"),
-            exports: vec![fallow_types::extract::ExportInfo {
-                name: ExportName::Named("foo".to_string()),
-                local_name: Some("foo".to_string()),
-                is_type_only: false,
-                visibility: VisibilityTag::None,
-                span: oxc_span::Span::new(0, 20),
-                members: vec![],
-                super_class: None,
-            }],
             re_exports: vec![ResolvedReExport {
                 info: fallow_types::extract::ReExportInfo {
                     source: "./source".to_string(),
@@ -70,12 +82,13 @@ fn graph_re_export_chain_propagates_references() {
                     exported_name: "foo".to_string(),
                     is_type_only: false,
                     span: oxc_span::Span::default(),
+                    statement_span: oxc_span::Span::new(0, 0),
+                    source_span: oxc_span::Span::new(0, 0),
                 },
                 target: ResolveResult::InternalModule(FileId(2)),
             }],
             ..Default::default()
         },
-        // source has the actual export
         ResolvedModule {
             file_id: FileId(2),
             path: PathBuf::from("/project/source.ts"),
@@ -84,17 +97,19 @@ fn graph_re_export_chain_propagates_references() {
                 local_name: Some("foo".to_string()),
                 is_type_only: false,
                 visibility: VisibilityTag::None,
+                expected_unused_reason: None,
                 span: oxc_span::Span::new(0, 20),
                 members: vec![],
+                is_side_effect_used: false,
                 super_class: None,
-            }],
+            }]
+            .into(),
             ..Default::default()
         },
     ];
 
     let graph = ModuleGraph::build(&resolved_modules, &entry_points, &files);
 
-    // The source module's "foo" export should have references propagated through the barrel
     let source_module = &graph.modules[2];
     let foo_export = source_module
         .exports
@@ -142,6 +157,8 @@ fn barrel_re_export_creates_export_symbol() {
                     imported_name: ImportedName::Named("foo".to_string()),
                     local_name: "foo".to_string(),
                     is_type_only: false,
+                    is_type_only_star: false,
+                    from_style: false,
                     span: oxc_span::Span::new(0, 10),
                     source_span: oxc_span::Span::default(),
                 },
@@ -152,16 +169,11 @@ fn barrel_re_export_creates_export_symbol() {
         ResolvedModule {
             file_id: FileId(1),
             path: PathBuf::from("/project/barrel.ts"),
-            re_exports: vec![ResolvedReExport {
-                info: fallow_types::extract::ReExportInfo {
-                    source: "./source".to_string(),
-                    imported_name: "foo".to_string(),
-                    exported_name: "foo".to_string(),
-                    is_type_only: false,
-                    span: oxc_span::Span::default(),
-                },
-                target: ResolveResult::InternalModule(FileId(2)),
-            }],
+            re_exports: vec![plain_re_export(
+                "./source",
+                "foo",
+                ResolveResult::InternalModule(FileId(2)),
+            )],
             ..Default::default()
         },
         ResolvedModule {
@@ -172,10 +184,13 @@ fn barrel_re_export_creates_export_symbol() {
                 local_name: Some("foo".to_string()),
                 is_type_only: false,
                 visibility: VisibilityTag::None,
+                expected_unused_reason: None,
                 span: oxc_span::Span::new(0, 20),
                 members: vec![],
+                is_side_effect_used: false,
                 super_class: None,
-            }],
+            }]
+            .into(),
             ..Default::default()
         },
     ];
@@ -208,6 +223,10 @@ fn barrel_re_export_creates_export_symbol() {
 }
 
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "test fixture; linear setup/assert, length is not a maintainability concern"
+)]
 fn barrel_unused_re_export_has_no_references() {
     let files = vec![
         DiscoveredFile {
@@ -242,6 +261,8 @@ fn barrel_unused_re_export_has_no_references() {
                     imported_name: ImportedName::Named("foo".to_string()),
                     local_name: "foo".to_string(),
                     is_type_only: false,
+                    is_type_only_star: false,
+                    from_style: false,
                     span: oxc_span::Span::new(0, 10),
                     source_span: oxc_span::Span::default(),
                 },
@@ -260,6 +281,8 @@ fn barrel_unused_re_export_has_no_references() {
                         exported_name: "foo".to_string(),
                         is_type_only: false,
                         span: oxc_span::Span::default(),
+                        statement_span: oxc_span::Span::new(0, 0),
+                        source_span: oxc_span::Span::new(0, 0),
                     },
                     target: ResolveResult::InternalModule(FileId(2)),
                 },
@@ -270,6 +293,8 @@ fn barrel_unused_re_export_has_no_references() {
                         exported_name: "bar".to_string(),
                         is_type_only: false,
                         span: oxc_span::Span::default(),
+                        statement_span: oxc_span::Span::new(0, 0),
+                        source_span: oxc_span::Span::new(0, 0),
                     },
                     target: ResolveResult::InternalModule(FileId(2)),
                 },
@@ -285,8 +310,10 @@ fn barrel_unused_re_export_has_no_references() {
                     local_name: Some("foo".to_string()),
                     is_type_only: false,
                     visibility: VisibilityTag::None,
+                    expected_unused_reason: None,
                     span: oxc_span::Span::new(0, 20),
                     members: vec![],
+                    is_side_effect_used: false,
                     super_class: None,
                 },
                 fallow_types::extract::ExportInfo {
@@ -294,11 +321,14 @@ fn barrel_unused_re_export_has_no_references() {
                     local_name: Some("bar".to_string()),
                     is_type_only: false,
                     visibility: VisibilityTag::None,
+                    expected_unused_reason: None,
                     span: oxc_span::Span::new(25, 45),
                     members: vec![],
+                    is_side_effect_used: false,
                     super_class: None,
                 },
-            ],
+            ]
+            .into(),
             ..Default::default()
         },
     ];
@@ -325,6 +355,10 @@ fn barrel_unused_re_export_has_no_references() {
 }
 
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "test fixture; linear setup/assert, length is not a maintainability concern"
+)]
 fn type_only_re_export_creates_type_only_export_symbol() {
     let files = vec![
         DiscoveredFile {
@@ -359,6 +393,8 @@ fn type_only_re_export_creates_type_only_export_symbol() {
                     imported_name: ImportedName::Named("UsedType".to_string()),
                     local_name: "UsedType".to_string(),
                     is_type_only: true,
+                    is_type_only_star: false,
+                    from_style: false,
                     span: oxc_span::Span::new(0, 10),
                     source_span: oxc_span::Span::default(),
                 },
@@ -377,6 +413,8 @@ fn type_only_re_export_creates_type_only_export_symbol() {
                         exported_name: "UsedType".to_string(),
                         is_type_only: true,
                         span: oxc_span::Span::default(),
+                        statement_span: oxc_span::Span::new(0, 0),
+                        source_span: oxc_span::Span::new(0, 0),
                     },
                     target: ResolveResult::InternalModule(FileId(2)),
                 },
@@ -387,6 +425,8 @@ fn type_only_re_export_creates_type_only_export_symbol() {
                         exported_name: "UnusedType".to_string(),
                         is_type_only: true,
                         span: oxc_span::Span::default(),
+                        statement_span: oxc_span::Span::new(0, 0),
+                        source_span: oxc_span::Span::new(0, 0),
                     },
                     target: ResolveResult::InternalModule(FileId(2)),
                 },
@@ -402,8 +442,10 @@ fn type_only_re_export_creates_type_only_export_symbol() {
                     local_name: Some("UsedType".to_string()),
                     is_type_only: true,
                     visibility: VisibilityTag::None,
+                    expected_unused_reason: None,
                     span: oxc_span::Span::new(0, 20),
                     members: vec![],
+                    is_side_effect_used: false,
                     super_class: None,
                 },
                 fallow_types::extract::ExportInfo {
@@ -411,11 +453,14 @@ fn type_only_re_export_creates_type_only_export_symbol() {
                     local_name: Some("UnusedType".to_string()),
                     is_type_only: true,
                     visibility: VisibilityTag::None,
+                    expected_unused_reason: None,
                     span: oxc_span::Span::new(25, 45),
                     members: vec![],
+                    is_side_effect_used: false,
                     super_class: None,
                 },
-            ],
+            ]
+            .into(),
             ..Default::default()
         },
     ];
@@ -482,6 +527,8 @@ fn default_re_export_creates_default_export_symbol() {
                     imported_name: ImportedName::Named("Accordion".to_string()),
                     local_name: "Accordion".to_string(),
                     is_type_only: false,
+                    is_type_only_star: false,
+                    from_style: false,
                     span: oxc_span::Span::new(0, 10),
                     source_span: oxc_span::Span::default(),
                 },
@@ -499,6 +546,8 @@ fn default_re_export_creates_default_export_symbol() {
                     exported_name: "Accordion".to_string(),
                     is_type_only: false,
                     span: oxc_span::Span::default(),
+                    statement_span: oxc_span::Span::new(0, 0),
+                    source_span: oxc_span::Span::new(0, 0),
                 },
                 target: ResolveResult::InternalModule(FileId(2)),
             }],
@@ -512,10 +561,13 @@ fn default_re_export_creates_default_export_symbol() {
                 local_name: None,
                 is_type_only: false,
                 visibility: VisibilityTag::None,
+                expected_unused_reason: None,
                 span: oxc_span::Span::new(0, 20),
                 members: vec![],
+                is_side_effect_used: false,
                 super_class: None,
-            }],
+            }]
+            .into(),
             ..Default::default()
         },
     ];
@@ -546,6 +598,10 @@ fn default_re_export_creates_default_export_symbol() {
 }
 
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "test fixture; linear setup/assert, length is not a maintainability concern"
+)]
 fn multi_level_re_export_chain_propagation() {
     let files = vec![
         DiscoveredFile {
@@ -585,6 +641,8 @@ fn multi_level_re_export_chain_propagation() {
                     imported_name: ImportedName::Named("foo".to_string()),
                     local_name: "foo".to_string(),
                     is_type_only: false,
+                    is_type_only_star: false,
+                    from_style: false,
                     span: oxc_span::Span::new(0, 10),
                     source_span: oxc_span::Span::default(),
                 },
@@ -602,6 +660,8 @@ fn multi_level_re_export_chain_propagation() {
                     exported_name: "foo".to_string(),
                     is_type_only: false,
                     span: oxc_span::Span::default(),
+                    statement_span: oxc_span::Span::new(0, 0),
+                    source_span: oxc_span::Span::new(0, 0),
                 },
                 target: ResolveResult::InternalModule(FileId(2)),
             }],
@@ -617,6 +677,8 @@ fn multi_level_re_export_chain_propagation() {
                     exported_name: "foo".to_string(),
                     is_type_only: false,
                     span: oxc_span::Span::default(),
+                    statement_span: oxc_span::Span::new(0, 0),
+                    source_span: oxc_span::Span::new(0, 0),
                 },
                 target: ResolveResult::InternalModule(FileId(3)),
             }],
@@ -630,10 +692,13 @@ fn multi_level_re_export_chain_propagation() {
                 local_name: Some("foo".to_string()),
                 is_type_only: false,
                 visibility: VisibilityTag::None,
+                expected_unused_reason: None,
                 span: oxc_span::Span::new(0, 20),
                 members: vec![],
+                is_side_effect_used: false,
                 super_class: None,
-            }],
+            }]
+            .into(),
             ..Default::default()
         },
     ];
@@ -676,9 +741,6 @@ fn multi_level_re_export_chain_propagation() {
 
 #[test]
 fn entry_point_named_re_export_propagates_to_source() {
-    // Bug fix: entry point barrels that re-export from a source file should
-    // propagate "used" status to the source, even with zero in-graph consumers.
-    // The entry point's exports are consumed externally.
     let files = vec![
         DiscoveredFile {
             id: FileId(0),
@@ -698,7 +760,6 @@ fn entry_point_named_re_export_propagates_to_source() {
     }];
 
     let resolved_modules = vec![
-        // index.js (entry point) re-exports render and hydrate from ./render
         ResolvedModule {
             file_id: FileId(0),
             path: PathBuf::from("/project/src/index.js"),
@@ -710,6 +771,8 @@ fn entry_point_named_re_export_propagates_to_source() {
                         exported_name: "render".to_string(),
                         is_type_only: false,
                         span: oxc_span::Span::default(),
+                        statement_span: oxc_span::Span::new(0, 0),
+                        source_span: oxc_span::Span::new(0, 0),
                     },
                     target: ResolveResult::InternalModule(FileId(1)),
                 },
@@ -720,13 +783,14 @@ fn entry_point_named_re_export_propagates_to_source() {
                         exported_name: "hydrate".to_string(),
                         is_type_only: false,
                         span: oxc_span::Span::default(),
+                        statement_span: oxc_span::Span::new(0, 0),
+                        source_span: oxc_span::Span::new(0, 0),
                     },
                     target: ResolveResult::InternalModule(FileId(1)),
                 },
             ],
             ..Default::default()
         },
-        // render.js exports render and hydrate (no one imports them directly)
         ResolvedModule {
             file_id: FileId(1),
             path: PathBuf::from("/project/src/render.js"),
@@ -736,8 +800,10 @@ fn entry_point_named_re_export_propagates_to_source() {
                     local_name: Some("render".to_string()),
                     is_type_only: false,
                     visibility: VisibilityTag::None,
+                    expected_unused_reason: None,
                     span: oxc_span::Span::new(0, 30),
                     members: vec![],
+                    is_side_effect_used: false,
                     super_class: None,
                 },
                 fallow_types::extract::ExportInfo {
@@ -745,21 +811,22 @@ fn entry_point_named_re_export_propagates_to_source() {
                     local_name: Some("hydrate".to_string()),
                     is_type_only: false,
                     visibility: VisibilityTag::None,
+                    expected_unused_reason: None,
                     span: oxc_span::Span::new(35, 65),
                     members: vec![],
+                    is_side_effect_used: false,
                     super_class: None,
                 },
-            ],
+            ]
+            .into(),
             ..Default::default()
         },
     ];
 
     let graph = ModuleGraph::build(&resolved_modules, &entry_points, &files);
 
-    // The entry point itself should be marked as such
     assert!(graph.modules[0].is_entry_point());
 
-    // render.js exports should have synthetic references from the entry point
     let render_module = &graph.modules[1];
     let render_export = render_module
         .exports
@@ -784,7 +851,6 @@ fn entry_point_named_re_export_propagates_to_source() {
 
 #[test]
 fn entry_point_star_re_export_propagates_to_source() {
-    // Entry point with `export * from './source'` should mark all source exports as used.
     let files = vec![
         DiscoveredFile {
             id: FileId(0),
@@ -814,6 +880,8 @@ fn entry_point_star_re_export_propagates_to_source() {
                     exported_name: "*".to_string(),
                     is_type_only: false,
                     span: oxc_span::Span::default(),
+                    statement_span: oxc_span::Span::new(0, 0),
+                    source_span: oxc_span::Span::new(0, 0),
                 },
                 target: ResolveResult::InternalModule(FileId(1)),
             }],
@@ -828,8 +896,10 @@ fn entry_point_star_re_export_propagates_to_source() {
                     local_name: Some("foo".to_string()),
                     is_type_only: false,
                     visibility: VisibilityTag::None,
+                    expected_unused_reason: None,
                     span: oxc_span::Span::new(0, 20),
                     members: vec![],
+                    is_side_effect_used: false,
                     super_class: None,
                 },
                 fallow_types::extract::ExportInfo {
@@ -837,11 +907,14 @@ fn entry_point_star_re_export_propagates_to_source() {
                     local_name: Some("bar".to_string()),
                     is_type_only: false,
                     visibility: VisibilityTag::None,
+                    expected_unused_reason: None,
                     span: oxc_span::Span::new(25, 45),
                     members: vec![],
+                    is_side_effect_used: false,
                     super_class: None,
                 },
-            ],
+            ]
+            .into(),
             ..Default::default()
         },
     ];
@@ -871,8 +944,58 @@ fn entry_point_star_re_export_propagates_to_source() {
 }
 
 #[test]
+fn entry_point_type_star_credits_value_backed_type_binding() {
+    let files = vec![
+        discovered_file(0, "/project/index.ts"),
+        discovered_file(1, "/project/source.ts"),
+    ];
+    let resolved_modules = vec![
+        ResolvedModule {
+            file_id: FileId(0),
+            path: files[0].path.clone(),
+            re_exports: vec![ResolvedReExport {
+                info: fallow_types::extract::ReExportInfo {
+                    source: "./source".to_string(),
+                    imported_name: "*".to_string(),
+                    exported_name: "*".to_string(),
+                    is_type_only: true,
+                    span: oxc_span::Span::default(),
+                    statement_span: oxc_span::Span::default(),
+                    source_span: oxc_span::Span::default(),
+                },
+                target: ResolveResult::InternalModule(FileId(1)),
+            }],
+            ..Default::default()
+        },
+        ResolvedModule {
+            file_id: FileId(1),
+            path: files[1].path.clone(),
+            exports: vec![merged_export(false)].into(),
+            ..Default::default()
+        },
+    ];
+    let graph = ModuleGraph::build(
+        &resolved_modules,
+        &[EntryPoint {
+            path: files[0].path.clone(),
+            source: EntryPointSource::PackageJsonMain,
+        }],
+        &files,
+    );
+
+    assert!(matches!(
+        graph.resolve_export(FileId(0), "Merged", ExportNamespace::Type),
+        EffectiveExportResolution::Unique(_)
+    ));
+    assert_eq!(
+        graph.resolve_export(FileId(0), "Merged", ExportNamespace::Value),
+        EffectiveExportResolution::Missing
+    );
+    assert!(!graph.modules[1].exports[0].references.is_empty());
+}
+
+#[test]
 fn entry_point_star_re_export_does_not_mark_default_as_used() {
-    // `export *` does not re-export the default export per ES spec.
     let files = vec![
         DiscoveredFile {
             id: FileId(0),
@@ -902,6 +1025,8 @@ fn entry_point_star_re_export_does_not_mark_default_as_used() {
                     exported_name: "*".to_string(),
                     is_type_only: false,
                     span: oxc_span::Span::default(),
+                    statement_span: oxc_span::Span::new(0, 0),
+                    source_span: oxc_span::Span::new(0, 0),
                 },
                 target: ResolveResult::InternalModule(FileId(1)),
             }],
@@ -916,8 +1041,10 @@ fn entry_point_star_re_export_does_not_mark_default_as_used() {
                     local_name: Some("foo".to_string()),
                     is_type_only: false,
                     visibility: VisibilityTag::None,
+                    expected_unused_reason: None,
                     span: oxc_span::Span::new(0, 20),
                     members: vec![],
+                    is_side_effect_used: false,
                     super_class: None,
                 },
                 fallow_types::extract::ExportInfo {
@@ -925,11 +1052,14 @@ fn entry_point_star_re_export_does_not_mark_default_as_used() {
                     local_name: None,
                     is_type_only: false,
                     visibility: VisibilityTag::None,
+                    expected_unused_reason: None,
                     span: oxc_span::Span::new(25, 45),
                     members: vec![],
+                    is_side_effect_used: false,
                     super_class: None,
                 },
-            ],
+            ]
+            .into(),
             ..Default::default()
         },
     ];
@@ -960,8 +1090,6 @@ fn entry_point_star_re_export_does_not_mark_default_as_used() {
 
 #[test]
 fn entry_point_multi_level_named_re_export_chain() {
-    // entry.ts (entry point) re-exports from barrel.ts, which re-exports from source.ts.
-    // No internal consumer imports any of these — only the entry point exposes them.
     let files = vec![
         DiscoveredFile {
             id: FileId(0),
@@ -986,7 +1114,6 @@ fn entry_point_multi_level_named_re_export_chain() {
     }];
 
     let resolved_modules = vec![
-        // index.ts (entry point) re-exports foo from barrel.ts
         ResolvedModule {
             file_id: FileId(0),
             path: PathBuf::from("/project/src/index.ts"),
@@ -997,12 +1124,13 @@ fn entry_point_multi_level_named_re_export_chain() {
                     exported_name: "foo".to_string(),
                     is_type_only: false,
                     span: oxc_span::Span::default(),
+                    statement_span: oxc_span::Span::new(0, 0),
+                    source_span: oxc_span::Span::new(0, 0),
                 },
                 target: ResolveResult::InternalModule(FileId(1)),
             }],
             ..Default::default()
         },
-        // barrel.ts re-exports foo from source.ts (not an entry point)
         ResolvedModule {
             file_id: FileId(1),
             path: PathBuf::from("/project/src/barrel.ts"),
@@ -1013,12 +1141,13 @@ fn entry_point_multi_level_named_re_export_chain() {
                     exported_name: "foo".to_string(),
                     is_type_only: false,
                     span: oxc_span::Span::default(),
+                    statement_span: oxc_span::Span::new(0, 0),
+                    source_span: oxc_span::Span::new(0, 0),
                 },
                 target: ResolveResult::InternalModule(FileId(2)),
             }],
             ..Default::default()
         },
-        // source.ts has the actual export
         ResolvedModule {
             file_id: FileId(2),
             path: PathBuf::from("/project/src/source.ts"),
@@ -1027,17 +1156,19 @@ fn entry_point_multi_level_named_re_export_chain() {
                 local_name: Some("foo".to_string()),
                 is_type_only: false,
                 visibility: VisibilityTag::None,
+                expected_unused_reason: None,
                 span: oxc_span::Span::new(0, 20),
                 members: vec![],
+                is_side_effect_used: false,
                 super_class: None,
-            }],
+            }]
+            .into(),
             ..Default::default()
         },
     ];
 
     let graph = ModuleGraph::build(&resolved_modules, &entry_points, &files);
 
-    // barrel.ts should have a synthetic ExportSymbol for foo with a reference
     let barrel = &graph.modules[1];
     let barrel_foo = barrel
         .exports
@@ -1049,7 +1180,6 @@ fn entry_point_multi_level_named_re_export_chain() {
         "barrel's foo should be referenced (from entry point synthetic ref)"
     );
 
-    // source.ts's foo should be referenced through the 2-level chain
     let source = &graph.modules[2];
     let source_foo = source
         .exports
@@ -1063,11 +1193,11 @@ fn entry_point_multi_level_named_re_export_chain() {
 }
 
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "test fixture; linear setup/assert, length is not a maintainability concern"
+)]
 fn star_re_export_through_multiple_barrel_layers() {
-    // consumer.ts imports { foo } from barrel_a.ts
-    // barrel_a.ts: export * from './barrel_b'
-    // barrel_b.ts: export * from './source'
-    // source.ts: export const foo = 1; export const bar = 2;
     let files = vec![
         DiscoveredFile {
             id: FileId(0),
@@ -1097,7 +1227,6 @@ fn star_re_export_through_multiple_barrel_layers() {
     }];
 
     let resolved_modules = vec![
-        // consumer imports foo from barrel_a
         ResolvedModule {
             file_id: FileId(0),
             path: PathBuf::from("/project/consumer.ts"),
@@ -1107,6 +1236,8 @@ fn star_re_export_through_multiple_barrel_layers() {
                     imported_name: ImportedName::Named("foo".to_string()),
                     local_name: "foo".to_string(),
                     is_type_only: false,
+                    is_type_only_star: false,
+                    from_style: false,
                     span: oxc_span::Span::new(0, 10),
                     source_span: oxc_span::Span::default(),
                 },
@@ -1114,7 +1245,6 @@ fn star_re_export_through_multiple_barrel_layers() {
             }],
             ..Default::default()
         },
-        // barrel_a: export * from './barrel_b'
         ResolvedModule {
             file_id: FileId(1),
             path: PathBuf::from("/project/barrel_a.ts"),
@@ -1125,12 +1255,13 @@ fn star_re_export_through_multiple_barrel_layers() {
                     exported_name: "*".to_string(),
                     is_type_only: false,
                     span: oxc_span::Span::default(),
+                    statement_span: oxc_span::Span::new(0, 0),
+                    source_span: oxc_span::Span::new(0, 0),
                 },
                 target: ResolveResult::InternalModule(FileId(2)),
             }],
             ..Default::default()
         },
-        // barrel_b: export * from './source'
         ResolvedModule {
             file_id: FileId(2),
             path: PathBuf::from("/project/barrel_b.ts"),
@@ -1141,12 +1272,13 @@ fn star_re_export_through_multiple_barrel_layers() {
                     exported_name: "*".to_string(),
                     is_type_only: false,
                     span: oxc_span::Span::default(),
+                    statement_span: oxc_span::Span::new(0, 0),
+                    source_span: oxc_span::Span::new(0, 0),
                 },
                 target: ResolveResult::InternalModule(FileId(3)),
             }],
             ..Default::default()
         },
-        // source.ts: export const foo, bar
         ResolvedModule {
             file_id: FileId(3),
             path: PathBuf::from("/project/source.ts"),
@@ -1156,8 +1288,10 @@ fn star_re_export_through_multiple_barrel_layers() {
                     local_name: Some("foo".to_string()),
                     is_type_only: false,
                     visibility: VisibilityTag::None,
+                    expected_unused_reason: None,
                     span: oxc_span::Span::new(0, 20),
                     members: vec![],
+                    is_side_effect_used: false,
                     super_class: None,
                 },
                 fallow_types::extract::ExportInfo {
@@ -1165,18 +1299,20 @@ fn star_re_export_through_multiple_barrel_layers() {
                     local_name: Some("bar".to_string()),
                     is_type_only: false,
                     visibility: VisibilityTag::None,
+                    expected_unused_reason: None,
                     span: oxc_span::Span::new(25, 45),
                     members: vec![],
+                    is_side_effect_used: false,
                     super_class: None,
                 },
-            ],
+            ]
+            .into(),
             ..Default::default()
         },
     ];
 
     let graph = ModuleGraph::build(&resolved_modules, &entry_points, &files);
 
-    // source's foo should be referenced (propagated through 2 star-re-export layers)
     let source = &graph.modules[3];
     let foo = source
         .exports
@@ -1188,7 +1324,6 @@ fn star_re_export_through_multiple_barrel_layers() {
         "foo should be referenced through 2-level star re-export chain"
     );
 
-    // bar was not imported by anyone, so it should remain unreferenced
     let bar = source
         .exports
         .iter()
@@ -1201,10 +1336,100 @@ fn star_re_export_through_multiple_barrel_layers() {
 }
 
 #[test]
+fn entry_point_star_re_export_through_multiple_barrel_layers() {
+    let files = vec![
+        DiscoveredFile {
+            id: FileId(0),
+            path: PathBuf::from("/project/barrel_a.ts"),
+            size_bytes: 50,
+        },
+        DiscoveredFile {
+            id: FileId(1),
+            path: PathBuf::from("/project/barrel_b.ts"),
+            size_bytes: 50,
+        },
+        DiscoveredFile {
+            id: FileId(2),
+            path: PathBuf::from("/project/barrel_c.ts"),
+            size_bytes: 50,
+        },
+        DiscoveredFile {
+            id: FileId(3),
+            path: PathBuf::from("/project/source.ts"),
+            size_bytes: 50,
+        },
+    ];
+
+    let entry_points = vec![EntryPoint {
+        path: PathBuf::from("/project/barrel_a.ts"),
+        source: EntryPointSource::PackageJsonMain,
+    }];
+
+    let resolved_modules = vec![
+        ResolvedModule {
+            file_id: FileId(0),
+            path: PathBuf::from("/project/barrel_a.ts"),
+            re_exports: vec![plain_re_export(
+                "./barrel_b",
+                "*",
+                ResolveResult::InternalModule(FileId(1)),
+            )],
+            ..Default::default()
+        },
+        ResolvedModule {
+            file_id: FileId(1),
+            path: PathBuf::from("/project/barrel_b.ts"),
+            re_exports: vec![plain_re_export(
+                "./barrel_c",
+                "*",
+                ResolveResult::InternalModule(FileId(2)),
+            )],
+            ..Default::default()
+        },
+        ResolvedModule {
+            file_id: FileId(2),
+            path: PathBuf::from("/project/barrel_c.ts"),
+            re_exports: vec![plain_re_export(
+                "./source",
+                "*",
+                ResolveResult::InternalModule(FileId(3)),
+            )],
+            ..Default::default()
+        },
+        ResolvedModule {
+            file_id: FileId(3),
+            path: PathBuf::from("/project/source.ts"),
+            exports: vec![fallow_types::extract::ExportInfo {
+                name: ExportName::Named("foo".to_string()),
+                local_name: Some("foo".to_string()),
+                is_type_only: false,
+                visibility: VisibilityTag::None,
+                expected_unused_reason: None,
+                span: oxc_span::Span::new(0, 20),
+                members: vec![],
+                is_side_effect_used: false,
+                super_class: None,
+            }]
+            .into(),
+            ..Default::default()
+        },
+    ];
+
+    let graph = ModuleGraph::build(&resolved_modules, &entry_points, &files);
+    let source = &graph.modules[3];
+    let foo = source
+        .exports
+        .iter()
+        .find(|e| e.name.to_string() == "foo")
+        .expect("source should have foo export");
+    assert!(
+        !foo.references.is_empty(),
+        "foo should be referenced through entry-point star barrel chain"
+    );
+}
+
+#[test]
 fn named_re_export_with_rename() {
-    // consumer.ts: import { bar } from './barrel'
-    // barrel.ts: export { foo as bar } from './source'
-    // source.ts: export const foo = 1
     let files = vec![
         DiscoveredFile {
             id: FileId(0),
@@ -1229,7 +1454,6 @@ fn named_re_export_with_rename() {
     }];
 
     let resolved_modules = vec![
-        // consumer imports "bar" from barrel
         ResolvedModule {
             file_id: FileId(0),
             path: PathBuf::from("/project/consumer.ts"),
@@ -1239,6 +1463,8 @@ fn named_re_export_with_rename() {
                     imported_name: ImportedName::Named("bar".to_string()),
                     local_name: "bar".to_string(),
                     is_type_only: false,
+                    is_type_only_star: false,
+                    from_style: false,
                     span: oxc_span::Span::new(0, 10),
                     source_span: oxc_span::Span::default(),
                 },
@@ -1246,7 +1472,6 @@ fn named_re_export_with_rename() {
             }],
             ..Default::default()
         },
-        // barrel: export { foo as bar } from './source'
         ResolvedModule {
             file_id: FileId(1),
             path: PathBuf::from("/project/barrel.ts"),
@@ -1257,12 +1482,13 @@ fn named_re_export_with_rename() {
                     exported_name: "bar".to_string(),
                     is_type_only: false,
                     span: oxc_span::Span::default(),
+                    statement_span: oxc_span::Span::new(0, 0),
+                    source_span: oxc_span::Span::new(0, 0),
                 },
                 target: ResolveResult::InternalModule(FileId(2)),
             }],
             ..Default::default()
         },
-        // source: export const foo
         ResolvedModule {
             file_id: FileId(2),
             path: PathBuf::from("/project/source.ts"),
@@ -1271,17 +1497,19 @@ fn named_re_export_with_rename() {
                 local_name: Some("foo".to_string()),
                 is_type_only: false,
                 visibility: VisibilityTag::None,
+                expected_unused_reason: None,
                 span: oxc_span::Span::new(0, 20),
                 members: vec![],
+                is_side_effect_used: false,
                 super_class: None,
-            }],
+            }]
+            .into(),
             ..Default::default()
         },
     ];
 
     let graph = ModuleGraph::build(&resolved_modules, &entry_points, &files);
 
-    // barrel should have a synthetic ExportSymbol for "bar"
     let barrel = &graph.modules[1];
     let bar_export = barrel
         .exports
@@ -1293,7 +1521,6 @@ fn named_re_export_with_rename() {
         "barrel's bar should be referenced by consumer"
     );
 
-    // source's "foo" should be referenced (imported_name="foo" maps to source)
     let source = &graph.modules[2];
     let foo_export = source
         .exports
@@ -1308,8 +1535,6 @@ fn named_re_export_with_rename() {
 
 #[test]
 fn entry_point_star_re_export_source_has_only_default() {
-    // Entry point barrel with export * from './source' where source only has a default export.
-    // Per ES spec, export * does not re-export default, so nothing should be marked used.
     let files = vec![
         DiscoveredFile {
             id: FileId(0),
@@ -1339,12 +1564,13 @@ fn entry_point_star_re_export_source_has_only_default() {
                     exported_name: "*".to_string(),
                     is_type_only: false,
                     span: oxc_span::Span::default(),
+                    statement_span: oxc_span::Span::new(0, 0),
+                    source_span: oxc_span::Span::new(0, 0),
                 },
                 target: ResolveResult::InternalModule(FileId(1)),
             }],
             ..Default::default()
         },
-        // source only has a default export
         ResolvedModule {
             file_id: FileId(1),
             path: PathBuf::from("/project/src/source.js"),
@@ -1353,10 +1579,13 @@ fn entry_point_star_re_export_source_has_only_default() {
                 local_name: None,
                 is_type_only: false,
                 visibility: VisibilityTag::None,
+                expected_unused_reason: None,
                 span: oxc_span::Span::new(0, 20),
                 members: vec![],
+                is_side_effect_used: false,
                 super_class: None,
-            }],
+            }]
+            .into(),
             ..Default::default()
         },
     ];
@@ -1378,11 +1607,6 @@ fn entry_point_star_re_export_source_has_only_default() {
 
 #[test]
 fn cycle_detection_does_not_infinite_loop() {
-    // a.ts: export { foo } from './b'  (re-exports foo from b)
-    // b.ts: export { foo } from './a'  (re-exports foo from a)
-    // consumer.ts: import { foo } from './a'
-    // This creates a cycle. The loop should terminate (max_iterations guard)
-    // without panicking.
     let files = vec![
         DiscoveredFile {
             id: FileId(0),
@@ -1407,7 +1631,6 @@ fn cycle_detection_does_not_infinite_loop() {
     }];
 
     let resolved_modules = vec![
-        // a.ts: export { foo } from './b'
         ResolvedModule {
             file_id: FileId(0),
             path: PathBuf::from("/project/a.ts"),
@@ -1418,12 +1641,13 @@ fn cycle_detection_does_not_infinite_loop() {
                     exported_name: "foo".to_string(),
                     is_type_only: false,
                     span: oxc_span::Span::default(),
+                    statement_span: oxc_span::Span::new(0, 0),
+                    source_span: oxc_span::Span::new(0, 0),
                 },
                 target: ResolveResult::InternalModule(FileId(1)),
             }],
             ..Default::default()
         },
-        // b.ts: export { foo } from './a'
         ResolvedModule {
             file_id: FileId(1),
             path: PathBuf::from("/project/b.ts"),
@@ -1434,12 +1658,13 @@ fn cycle_detection_does_not_infinite_loop() {
                     exported_name: "foo".to_string(),
                     is_type_only: false,
                     span: oxc_span::Span::default(),
+                    statement_span: oxc_span::Span::new(0, 0),
+                    source_span: oxc_span::Span::new(0, 0),
                 },
                 target: ResolveResult::InternalModule(FileId(0)),
             }],
             ..Default::default()
         },
-        // consumer imports foo from a
         ResolvedModule {
             file_id: FileId(2),
             path: PathBuf::from("/project/consumer.ts"),
@@ -1449,6 +1674,8 @@ fn cycle_detection_does_not_infinite_loop() {
                     imported_name: ImportedName::Named("foo".to_string()),
                     local_name: "foo".to_string(),
                     is_type_only: false,
+                    is_type_only_star: false,
+                    from_style: false,
                     span: oxc_span::Span::new(0, 10),
                     source_span: oxc_span::Span::default(),
                 },
@@ -1458,16 +1685,11 @@ fn cycle_detection_does_not_infinite_loop() {
         },
     ];
 
-    // The key assertion: this should not hang or panic
     let _graph = ModuleGraph::build(&resolved_modules, &entry_points, &files);
 }
 
 #[test]
 fn star_re_export_cycle_terminates() {
-    // a.ts: export * from './b'
-    // b.ts: export * from './a'
-    // consumer.ts: import { x } from './a'
-    // Both have an actual export "x" to make propagation meaningful.
     let files = vec![
         DiscoveredFile {
             id: FileId(0),
@@ -1492,7 +1714,6 @@ fn star_re_export_cycle_terminates() {
     }];
 
     let resolved_modules = vec![
-        // a.ts: export * from './b', also exports x
         ResolvedModule {
             file_id: FileId(0),
             path: PathBuf::from("/project/a.ts"),
@@ -1501,10 +1722,13 @@ fn star_re_export_cycle_terminates() {
                 local_name: Some("x".to_string()),
                 is_type_only: false,
                 visibility: VisibilityTag::None,
+                expected_unused_reason: None,
                 span: oxc_span::Span::new(0, 10),
                 members: vec![],
+                is_side_effect_used: false,
                 super_class: None,
-            }],
+            }]
+            .into(),
             re_exports: vec![ResolvedReExport {
                 info: fallow_types::extract::ReExportInfo {
                     source: "./b".to_string(),
@@ -1512,12 +1736,13 @@ fn star_re_export_cycle_terminates() {
                     exported_name: "*".to_string(),
                     is_type_only: false,
                     span: oxc_span::Span::default(),
+                    statement_span: oxc_span::Span::new(0, 0),
+                    source_span: oxc_span::Span::new(0, 0),
                 },
                 target: ResolveResult::InternalModule(FileId(1)),
             }],
             ..Default::default()
         },
-        // b.ts: export * from './a'
         ResolvedModule {
             file_id: FileId(1),
             path: PathBuf::from("/project/b.ts"),
@@ -1528,12 +1753,13 @@ fn star_re_export_cycle_terminates() {
                     exported_name: "*".to_string(),
                     is_type_only: false,
                     span: oxc_span::Span::default(),
+                    statement_span: oxc_span::Span::new(0, 0),
+                    source_span: oxc_span::Span::new(0, 0),
                 },
                 target: ResolveResult::InternalModule(FileId(0)),
             }],
             ..Default::default()
         },
-        // consumer imports x from a
         ResolvedModule {
             file_id: FileId(2),
             path: PathBuf::from("/project/consumer.ts"),
@@ -1543,6 +1769,8 @@ fn star_re_export_cycle_terminates() {
                     imported_name: ImportedName::Named("x".to_string()),
                     local_name: "x".to_string(),
                     is_type_only: false,
+                    is_type_only_star: false,
+                    from_style: false,
                     span: oxc_span::Span::new(0, 10),
                     source_span: oxc_span::Span::default(),
                 },
@@ -1552,10 +1780,8 @@ fn star_re_export_cycle_terminates() {
         },
     ];
 
-    // Should not hang
     let graph = ModuleGraph::build(&resolved_modules, &entry_points, &files);
 
-    // a's x should still be referenced
     let a_module = &graph.modules[0];
     let x_export = a_module
         .exports
@@ -1569,10 +1795,11 @@ fn star_re_export_cycle_terminates() {
 }
 
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "test fixture; linear setup/assert, length is not a maintainability concern"
+)]
 fn mixed_star_and_named_re_exports_from_same_source() {
-    // consumer.ts: import { foo, bar } from './barrel'
-    // barrel.ts: export * from './source'; export { baz as bar } from './source'
-    // source.ts: export const foo, baz
     let files = vec![
         DiscoveredFile {
             id: FileId(0),
@@ -1597,7 +1824,6 @@ fn mixed_star_and_named_re_exports_from_same_source() {
     }];
 
     let resolved_modules = vec![
-        // consumer imports foo and bar from barrel
         ResolvedModule {
             file_id: FileId(0),
             path: PathBuf::from("/project/consumer.ts"),
@@ -1608,6 +1834,8 @@ fn mixed_star_and_named_re_exports_from_same_source() {
                         imported_name: ImportedName::Named("foo".to_string()),
                         local_name: "foo".to_string(),
                         is_type_only: false,
+                        is_type_only_star: false,
+                        from_style: false,
                         span: oxc_span::Span::new(0, 10),
                         source_span: oxc_span::Span::default(),
                     },
@@ -1619,6 +1847,8 @@ fn mixed_star_and_named_re_exports_from_same_source() {
                         imported_name: ImportedName::Named("bar".to_string()),
                         local_name: "bar".to_string(),
                         is_type_only: false,
+                        is_type_only_star: false,
+                        from_style: false,
                         span: oxc_span::Span::new(15, 25),
                         source_span: oxc_span::Span::default(),
                     },
@@ -1627,7 +1857,6 @@ fn mixed_star_and_named_re_exports_from_same_source() {
             ],
             ..Default::default()
         },
-        // barrel: export * from './source' AND export { baz as bar } from './source'
         ResolvedModule {
             file_id: FileId(1),
             path: PathBuf::from("/project/barrel.ts"),
@@ -1639,6 +1868,8 @@ fn mixed_star_and_named_re_exports_from_same_source() {
                         exported_name: "*".to_string(),
                         is_type_only: false,
                         span: oxc_span::Span::default(),
+                        statement_span: oxc_span::Span::new(0, 0),
+                        source_span: oxc_span::Span::new(0, 0),
                     },
                     target: ResolveResult::InternalModule(FileId(2)),
                 },
@@ -1649,13 +1880,14 @@ fn mixed_star_and_named_re_exports_from_same_source() {
                         exported_name: "bar".to_string(),
                         is_type_only: false,
                         span: oxc_span::Span::default(),
+                        statement_span: oxc_span::Span::new(0, 0),
+                        source_span: oxc_span::Span::new(0, 0),
                     },
                     target: ResolveResult::InternalModule(FileId(2)),
                 },
             ],
             ..Default::default()
         },
-        // source: export const foo, baz
         ResolvedModule {
             file_id: FileId(2),
             path: PathBuf::from("/project/source.ts"),
@@ -1665,8 +1897,10 @@ fn mixed_star_and_named_re_exports_from_same_source() {
                     local_name: Some("foo".to_string()),
                     is_type_only: false,
                     visibility: VisibilityTag::None,
+                    expected_unused_reason: None,
                     span: oxc_span::Span::new(0, 20),
                     members: vec![],
+                    is_side_effect_used: false,
                     super_class: None,
                 },
                 fallow_types::extract::ExportInfo {
@@ -1674,11 +1908,14 @@ fn mixed_star_and_named_re_exports_from_same_source() {
                     local_name: Some("baz".to_string()),
                     is_type_only: false,
                     visibility: VisibilityTag::None,
+                    expected_unused_reason: None,
                     span: oxc_span::Span::new(25, 45),
                     members: vec![],
+                    is_side_effect_used: false,
                     super_class: None,
                 },
-            ],
+            ]
+            .into(),
             ..Default::default()
         },
     ];
@@ -1687,7 +1924,6 @@ fn mixed_star_and_named_re_exports_from_same_source() {
 
     let source = &graph.modules[2];
 
-    // foo should be referenced via the star re-export path
     let foo = source
         .exports
         .iter()
@@ -1698,7 +1934,6 @@ fn mixed_star_and_named_re_exports_from_same_source() {
         "foo should be referenced through star re-export"
     );
 
-    // baz should be referenced via the named re-export (barrel exports it as "bar")
     let baz = source
         .exports
         .iter()
@@ -1711,10 +1946,11 @@ fn mixed_star_and_named_re_exports_from_same_source() {
 }
 
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "test fixture; linear setup/assert, length is not a maintainability concern"
+)]
 fn entry_point_named_re_export_no_in_graph_consumers_multiple_exports() {
-    // Entry point re-exports named symbols but nothing in the graph imports them.
-    // All re-exported source exports should still be marked as used.
-    // Additionally, source has an export NOT re-exported by the entry point.
     let files = vec![
         DiscoveredFile {
             id: FileId(0),
@@ -1734,7 +1970,6 @@ fn entry_point_named_re_export_no_in_graph_consumers_multiple_exports() {
     }];
 
     let resolved_modules = vec![
-        // index.ts (entry point) re-exports only "create" and "destroy" from lib
         ResolvedModule {
             file_id: FileId(0),
             path: PathBuf::from("/project/src/index.ts"),
@@ -1746,6 +1981,8 @@ fn entry_point_named_re_export_no_in_graph_consumers_multiple_exports() {
                         exported_name: "create".to_string(),
                         is_type_only: false,
                         span: oxc_span::Span::default(),
+                        statement_span: oxc_span::Span::new(0, 0),
+                        source_span: oxc_span::Span::new(0, 0),
                     },
                     target: ResolveResult::InternalModule(FileId(1)),
                 },
@@ -1756,13 +1993,14 @@ fn entry_point_named_re_export_no_in_graph_consumers_multiple_exports() {
                         exported_name: "destroy".to_string(),
                         is_type_only: false,
                         span: oxc_span::Span::default(),
+                        statement_span: oxc_span::Span::new(0, 0),
+                        source_span: oxc_span::Span::new(0, 0),
                     },
                     target: ResolveResult::InternalModule(FileId(1)),
                 },
             ],
             ..Default::default()
         },
-        // lib.ts: export create, destroy, internal_helper
         ResolvedModule {
             file_id: FileId(1),
             path: PathBuf::from("/project/src/lib.ts"),
@@ -1772,8 +2010,10 @@ fn entry_point_named_re_export_no_in_graph_consumers_multiple_exports() {
                     local_name: Some("create".to_string()),
                     is_type_only: false,
                     visibility: VisibilityTag::None,
+                    expected_unused_reason: None,
                     span: oxc_span::Span::new(0, 30),
                     members: vec![],
+                    is_side_effect_used: false,
                     super_class: None,
                 },
                 fallow_types::extract::ExportInfo {
@@ -1781,8 +2021,10 @@ fn entry_point_named_re_export_no_in_graph_consumers_multiple_exports() {
                     local_name: Some("destroy".to_string()),
                     is_type_only: false,
                     visibility: VisibilityTag::None,
+                    expected_unused_reason: None,
                     span: oxc_span::Span::new(35, 65),
                     members: vec![],
+                    is_side_effect_used: false,
                     super_class: None,
                 },
                 fallow_types::extract::ExportInfo {
@@ -1790,11 +2032,14 @@ fn entry_point_named_re_export_no_in_graph_consumers_multiple_exports() {
                     local_name: Some("internal_helper".to_string()),
                     is_type_only: false,
                     visibility: VisibilityTag::None,
+                    expected_unused_reason: None,
                     span: oxc_span::Span::new(70, 100),
                     members: vec![],
+                    is_side_effect_used: false,
                     super_class: None,
                 },
-            ],
+            ]
+            .into(),
             ..Default::default()
         },
     ];
@@ -1836,8 +2081,6 @@ fn entry_point_named_re_export_no_in_graph_consumers_multiple_exports() {
 
 #[test]
 fn entry_point_star_re_export_skips_default() {
-    // Per ES spec, `export * from './source'` does NOT re-export the default export.
-    // Verify that entry point star re-export does not mark the source's default as used.
     let files = vec![
         DiscoveredFile {
             id: FileId(0),
@@ -1855,7 +2098,6 @@ fn entry_point_star_re_export_skips_default() {
         source: EntryPointSource::PackageJsonMain,
     }];
     let resolved_modules = vec![
-        // index.ts: export * from './source'
         ResolvedModule {
             file_id: FileId(0),
             path: PathBuf::from("/project/index.ts"),
@@ -1866,12 +2108,13 @@ fn entry_point_star_re_export_skips_default() {
                     exported_name: "*".to_string(),
                     is_type_only: false,
                     span: oxc_span::Span::default(),
+                    statement_span: oxc_span::Span::new(0, 0),
+                    source_span: oxc_span::Span::new(0, 0),
                 },
                 target: ResolveResult::InternalModule(FileId(1)),
             }],
             ..Default::default()
         },
-        // source.ts: export default function() {} and export const named = 42
         ResolvedModule {
             file_id: FileId(1),
             path: PathBuf::from("/project/source.ts"),
@@ -1881,8 +2124,10 @@ fn entry_point_star_re_export_skips_default() {
                     local_name: None,
                     is_type_only: false,
                     visibility: VisibilityTag::None,
+                    expected_unused_reason: None,
                     span: oxc_span::Span::new(0, 20),
                     members: vec![],
+                    is_side_effect_used: false,
                     super_class: None,
                 },
                 fallow_types::extract::ExportInfo {
@@ -1890,11 +2135,14 @@ fn entry_point_star_re_export_skips_default() {
                     local_name: Some("named".to_string()),
                     is_type_only: false,
                     visibility: VisibilityTag::None,
+                    expected_unused_reason: None,
                     span: oxc_span::Span::new(25, 45),
                     members: vec![],
+                    is_side_effect_used: false,
                     super_class: None,
                 },
-            ],
+            ]
+            .into(),
             ..Default::default()
         },
     ];
@@ -1925,7 +2173,6 @@ fn entry_point_star_re_export_skips_default() {
 
 #[test]
 fn no_re_exports_skips_chain_resolution() {
-    // When there are no re-exports, chain resolution should be a no-op.
     let files = vec![
         DiscoveredFile {
             id: FileId(0),
@@ -1952,6 +2199,8 @@ fn no_re_exports_skips_chain_resolution() {
                     imported_name: ImportedName::Named("foo".to_string()),
                     local_name: "foo".to_string(),
                     is_type_only: false,
+                    is_type_only_star: false,
+                    from_style: false,
                     span: oxc_span::Span::new(0, 10),
                     source_span: oxc_span::Span::default(),
                 },
@@ -1967,10 +2216,13 @@ fn no_re_exports_skips_chain_resolution() {
                 local_name: Some("foo".to_string()),
                 is_type_only: false,
                 visibility: VisibilityTag::None,
+                expected_unused_reason: None,
                 span: oxc_span::Span::new(0, 20),
                 members: vec![],
+                is_side_effect_used: false,
                 super_class: None,
-            }],
+            }]
+            .into(),
             ..Default::default()
         },
     ];
@@ -1982,26 +2234,19 @@ fn no_re_exports_skips_chain_resolution() {
         .iter()
         .find(|e| e.name.to_string() == "foo")
         .unwrap();
-    // Direct import reference should still work
     assert_eq!(foo.references.len(), 1);
     assert_eq!(foo.references[0].from_file, FileId(0));
 }
 
-/// Regression test for quadratic duplicate detection in star re-export propagation.
-///
-/// When many consumers import the same named export through a star-re-exporting barrel,
-/// the reference list grows across iterations. The duplicate check must remain efficient
-/// (O(1) via HashSet, not O(n) via linear scan) to avoid quadratic blowup.
-///
-/// Layout:
-///   consumer_0..consumer_N each import { shared } from barrel
-///   barrel: export * from './source'
-///   source: export const shared = 1; export const other = 2;
 #[expect(
     clippy::cast_possible_truncation,
     reason = "test file/span counts are trivially small"
 )]
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "test fixture; linear setup/assert, length is not a maintainability concern"
+)]
 fn star_re_export_many_consumers_no_quadratic_blowup() {
     let consumer_count = 20;
     let barrel_id = FileId(consumer_count as u32);
@@ -2040,6 +2285,8 @@ fn star_re_export_many_consumers_no_quadratic_blowup() {
                     imported_name: ImportedName::Named("shared".to_string()),
                     local_name: "shared".to_string(),
                     is_type_only: false,
+                    is_type_only_star: false,
+                    from_style: false,
                     span: oxc_span::Span::new(0, 10),
                     source_span: oxc_span::Span::default(),
                 },
@@ -2049,7 +2296,6 @@ fn star_re_export_many_consumers_no_quadratic_blowup() {
         })
         .collect();
 
-    // barrel: export * from './source'
     resolved_modules.push(ResolvedModule {
         file_id: barrel_id,
         path: PathBuf::from("/project/barrel.ts"),
@@ -2060,13 +2306,14 @@ fn star_re_export_many_consumers_no_quadratic_blowup() {
                 exported_name: "*".to_string(),
                 is_type_only: false,
                 span: oxc_span::Span::default(),
+                statement_span: oxc_span::Span::new(0, 0),
+                source_span: oxc_span::Span::new(0, 0),
             },
             target: ResolveResult::InternalModule(source_id),
         }],
         ..Default::default()
     });
 
-    // source: export const shared = 1; export const other = 2;
     resolved_modules.push(ResolvedModule {
         file_id: source_id,
         path: PathBuf::from("/project/source.ts"),
@@ -2076,8 +2323,10 @@ fn star_re_export_many_consumers_no_quadratic_blowup() {
                 local_name: Some("shared".to_string()),
                 is_type_only: false,
                 visibility: VisibilityTag::None,
+                expected_unused_reason: None,
                 span: oxc_span::Span::new(0, 20),
                 members: vec![],
+                is_side_effect_used: false,
                 super_class: None,
             },
             fallow_types::extract::ExportInfo {
@@ -2085,17 +2334,26 @@ fn star_re_export_many_consumers_no_quadratic_blowup() {
                 local_name: Some("other".to_string()),
                 is_type_only: false,
                 visibility: VisibilityTag::None,
+                expected_unused_reason: None,
                 span: oxc_span::Span::new(25, 45),
                 members: vec![],
+                is_side_effect_used: false,
                 super_class: None,
             },
-        ],
+        ]
+        .into(),
         ..Default::default()
     });
 
-    let graph = ModuleGraph::build(&resolved_modules, &entry_points, &files);
+    let (graph, reference_set_rebuilds) = count_star_reference_set_rebuilds(|| {
+        ModuleGraph::build(&resolved_modules, &entry_points, &files)
+    });
 
-    // The source module's "shared" export should have references from all consumers
+    assert!(
+        (1..=2).contains(&reference_set_rebuilds),
+        "the reference set should be built at most once per fixpoint iteration"
+    );
+
     let source = &graph.modules[source_id.0 as usize];
     let shared = source
         .exports
@@ -2108,7 +2366,6 @@ fn star_re_export_many_consumers_no_quadratic_blowup() {
         "each consumer should add exactly one reference to the source export"
     );
 
-    // The "other" export should have no references (nobody imports it)
     let other = source
         .exports
         .iter()
@@ -2119,7 +2376,6 @@ fn star_re_export_many_consumers_no_quadratic_blowup() {
         "'other' should have no references since no consumer imports it"
     );
 
-    // Verify no duplicate references (the HashSet dedup must work correctly)
     let unique_from_files: FxHashSet<FileId> =
         shared.references.iter().map(|r| r.from_file).collect();
     assert_eq!(
@@ -2127,4 +2383,2076 @@ fn star_re_export_many_consumers_no_quadratic_blowup() {
         consumer_count,
         "all references should be from distinct consumers (no duplicates)"
     );
+}
+
+#[test]
+fn deep_named_re_export_chain_propagates_25_hops() {
+    fn run_chain(barrel_count: u32) {
+        let consumer_id = FileId(0);
+        let leaf_id = FileId(barrel_count + 1);
+
+        let mut files: Vec<DiscoveredFile> = (0..=barrel_count + 1)
+            .map(|i| DiscoveredFile {
+                id: FileId(i),
+                path: if i == 0 {
+                    PathBuf::from("/project/consumer.ts")
+                } else if i == barrel_count + 1 {
+                    PathBuf::from("/project/leaf.ts")
+                } else {
+                    PathBuf::from(format!("/project/barrel_{i}.ts"))
+                },
+                size_bytes: 50,
+            })
+            .collect();
+
+        let entry_points = vec![EntryPoint {
+            path: PathBuf::from("/project/consumer.ts"),
+            source: EntryPointSource::PackageJsonMain,
+        }];
+
+        let mut resolved_modules: Vec<ResolvedModule> = vec![ResolvedModule {
+            file_id: consumer_id,
+            path: PathBuf::from("/project/consumer.ts"),
+            resolved_imports: vec![ResolvedImport {
+                info: ImportInfo {
+                    source: "./barrel_1".to_string(),
+                    imported_name: ImportedName::Named("foo".to_string()),
+                    local_name: "foo".to_string(),
+                    is_type_only: false,
+                    is_type_only_star: false,
+                    from_style: false,
+                    span: oxc_span::Span::new(0, 10),
+                    source_span: oxc_span::Span::default(),
+                },
+                target: ResolveResult::InternalModule(FileId(1)),
+            }],
+            ..Default::default()
+        }];
+
+        for i in 1..=barrel_count {
+            let next_id = FileId(i + 1);
+            let next_source = if i == barrel_count {
+                "./leaf".to_string()
+            } else {
+                format!("./barrel_{}", i + 1)
+            };
+            resolved_modules.push(ResolvedModule {
+                file_id: FileId(i),
+                path: PathBuf::from(format!("/project/barrel_{i}.ts")),
+                re_exports: vec![ResolvedReExport {
+                    info: fallow_types::extract::ReExportInfo {
+                        source: next_source,
+                        imported_name: "foo".to_string(),
+                        exported_name: "foo".to_string(),
+                        is_type_only: false,
+                        span: oxc_span::Span::default(),
+                        statement_span: oxc_span::Span::new(0, 0),
+                        source_span: oxc_span::Span::new(0, 0),
+                    },
+                    target: ResolveResult::InternalModule(next_id),
+                }],
+                ..Default::default()
+            });
+        }
+
+        resolved_modules.push(ResolvedModule {
+            file_id: leaf_id,
+            path: PathBuf::from("/project/leaf.ts"),
+            exports: vec![fallow_types::extract::ExportInfo {
+                name: ExportName::Named("foo".to_string()),
+                local_name: Some("foo".to_string()),
+                is_type_only: false,
+                visibility: VisibilityTag::None,
+                expected_unused_reason: None,
+                span: oxc_span::Span::new(0, 20),
+                members: vec![],
+                is_side_effect_used: false,
+                super_class: None,
+            }]
+            .into(),
+            ..Default::default()
+        });
+
+        let _ = &mut files; // silence unused warning under expect
+        let graph = ModuleGraph::build(&resolved_modules, &entry_points, &files);
+
+        let leaf = &graph.modules[leaf_id.0 as usize];
+        let foo = leaf
+            .exports
+            .iter()
+            .find(|e| e.name.to_string() == "foo")
+            .unwrap_or_else(|| panic!("leaf should have foo export ({barrel_count}-hop chain)"));
+        assert!(
+            !foo.references.is_empty(),
+            "leaf's foo should be referenced through a {barrel_count}-hop chain"
+        );
+    }
+
+    run_chain(21);
+    run_chain(25);
+}
+
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "fixture construction makes the scheduling assertion self-contained"
+)]
+fn work_queue_does_not_revisit_unrelated_settled_edge() {
+    const CHAIN_LENGTH: u32 = 6;
+    let unrelated_barrel_id = FileId(CHAIN_LENGTH + 2);
+    let unrelated_source_id = FileId(CHAIN_LENGTH + 3);
+    let unrelated_consumer_id = FileId(CHAIN_LENGTH + 4);
+
+    let mut files = Vec::new();
+    let mut resolved_modules = Vec::new();
+
+    files.push(discovered_file(0, "/project/leaf.ts"));
+    resolved_modules.push(ResolvedModule {
+        file_id: FileId(0),
+        path: PathBuf::from("/project/leaf.ts"),
+        exports: vec![merged_export(false)].into(),
+        ..Default::default()
+    });
+
+    for idx in 1..=CHAIN_LENGTH {
+        let path = format!("/project/barrel_{idx}.ts");
+        files.push(discovered_file(idx, &path));
+        resolved_modules.push(ResolvedModule {
+            file_id: FileId(idx),
+            path: PathBuf::from(path),
+            re_exports: vec![ResolvedReExport {
+                info: fallow_types::extract::ReExportInfo {
+                    source: format!("./barrel_{}", idx - 1),
+                    imported_name: "Merged".to_string(),
+                    exported_name: "Merged".to_string(),
+                    is_type_only: false,
+                    span: oxc_span::Span::default(),
+                    statement_span: oxc_span::Span::new(0, 0),
+                    source_span: oxc_span::Span::new(0, 0),
+                },
+                target: ResolveResult::InternalModule(FileId(idx - 1)),
+            }],
+            ..Default::default()
+        });
+    }
+
+    let chain_consumer_id = FileId(CHAIN_LENGTH + 1);
+    files.push(discovered_file(
+        chain_consumer_id.0,
+        "/project/chain_consumer.ts",
+    ));
+    resolved_modules.push(ResolvedModule {
+        file_id: chain_consumer_id,
+        path: PathBuf::from("/project/chain_consumer.ts"),
+        resolved_imports: vec![ResolvedImport {
+            info: ImportInfo {
+                source: format!("./barrel_{CHAIN_LENGTH}"),
+                imported_name: ImportedName::Named("Merged".to_string()),
+                local_name: "Merged".to_string(),
+                is_type_only: false,
+                is_type_only_star: false,
+                from_style: false,
+                span: oxc_span::Span::new(0, 10),
+                source_span: oxc_span::Span::default(),
+            },
+            target: ResolveResult::InternalModule(FileId(CHAIN_LENGTH)),
+        }],
+        ..Default::default()
+    });
+
+    files.push(discovered_file(
+        unrelated_barrel_id.0,
+        "/project/unrelated_barrel.ts",
+    ));
+    resolved_modules.push(ResolvedModule {
+        file_id: unrelated_barrel_id,
+        path: PathBuf::from("/project/unrelated_barrel.ts"),
+        re_exports: vec![ResolvedReExport {
+            info: fallow_types::extract::ReExportInfo {
+                source: "./unrelated_source".to_string(),
+                imported_name: "Merged".to_string(),
+                exported_name: "Merged".to_string(),
+                is_type_only: false,
+                span: oxc_span::Span::default(),
+                statement_span: oxc_span::Span::new(0, 0),
+                source_span: oxc_span::Span::new(0, 0),
+            },
+            target: ResolveResult::InternalModule(unrelated_source_id),
+        }],
+        ..Default::default()
+    });
+
+    files.push(discovered_file(
+        unrelated_source_id.0,
+        "/project/unrelated_source.ts",
+    ));
+    resolved_modules.push(ResolvedModule {
+        file_id: unrelated_source_id,
+        path: PathBuf::from("/project/unrelated_source.ts"),
+        exports: vec![merged_export(false)].into(),
+        ..Default::default()
+    });
+
+    files.push(discovered_file(
+        unrelated_consumer_id.0,
+        "/project/unrelated_consumer.ts",
+    ));
+    resolved_modules.push(ResolvedModule {
+        file_id: unrelated_consumer_id,
+        path: PathBuf::from("/project/unrelated_consumer.ts"),
+        resolved_imports: vec![ResolvedImport {
+            info: ImportInfo {
+                source: "./unrelated_barrel".to_string(),
+                imported_name: ImportedName::Named("Merged".to_string()),
+                local_name: "Merged".to_string(),
+                is_type_only: false,
+                is_type_only_star: false,
+                from_style: false,
+                span: oxc_span::Span::new(0, 10),
+                source_span: oxc_span::Span::default(),
+            },
+            target: ResolveResult::InternalModule(unrelated_barrel_id),
+        }],
+        ..Default::default()
+    });
+
+    let entry_points = vec![
+        EntryPoint {
+            path: PathBuf::from("/project/chain_consumer.ts"),
+            source: EntryPointSource::PackageJsonMain,
+        },
+        EntryPoint {
+            path: PathBuf::from("/project/unrelated_consumer.ts"),
+            source: EntryPointSource::PackageJsonMain,
+        },
+    ];
+
+    let (_, visits) =
+        capture_propagation_visits(|| ModuleGraph::build(&resolved_modules, &entry_points, &files));
+    let unrelated_visits = visits
+        .iter()
+        .filter(|visit| **visit == (unrelated_barrel_id, unrelated_source_id))
+        .count();
+
+    assert_eq!(
+        unrelated_visits, 1,
+        "an unrelated settled edge should only run during the initial stable-order pass"
+    );
+}
+
+#[test]
+fn work_queue_matches_legacy_on_generated_small_graphs() {
+    with_re_export_differential_check(|| {
+        for barrel_count in 1..=8 {
+            let graph = graph_for_named_chain(barrel_count);
+            let leaf = &graph.modules[0];
+            assert!(
+                leaf.exports[0].references.iter().any(|reference| {
+                    reference.from_file == FileId(barrel_count.saturating_add(1))
+                }),
+                "generated {barrel_count}-barrel graph should reach the leaf"
+            );
+        }
+
+        graph_for_merged_star_import(
+            vec![
+                named_import("Merged", "MergedValue", false),
+                named_import("Merged", "MergedType", true),
+            ],
+            vec!["MergedType"],
+            vec!["MergedValue"],
+        );
+        graph_for_merged_star_chain_import(
+            vec![
+                named_import_with_span("Merged", "MergedType", false, 0, 10),
+                named_import_with_span("Merged", "MergedValue", false, 20, 30),
+            ],
+            vec!["MergedType"],
+            vec!["MergedValue"],
+        );
+    });
+}
+
+#[test]
+fn equivalent_re_export_declaration_orders_produce_identical_results() {
+    let forward = graph_for_parallel_named_re_exports(false);
+    let reversed = graph_for_parallel_named_re_exports(true);
+
+    assert_eq!(
+        serde_json::to_value(&forward.modules[2].exports).unwrap(),
+        serde_json::to_value(&reversed.modules[2].exports).unwrap(),
+    );
+    assert_eq!(
+        serde_json::to_value(&forward.modules[3].exports).unwrap(),
+        serde_json::to_value(&reversed.modules[3].exports).unwrap(),
+    );
+}
+
+#[test]
+fn propagation_plan_preserves_stable_fifo_order() {
+    let entries = [
+        re_export_tuple(2, 1),
+        re_export_tuple(1, 0),
+        re_export_tuple(4, 3),
+    ];
+    let mut plan = ReExportPropagationPlan::new(&entries);
+
+    assert_eq!(plan.pop_front(), Some(0));
+    assert_eq!(plan.pop_front(), Some(1));
+    assert_eq!(plan.pop_front(), Some(2));
+    assert_eq!(plan.pop_front(), None);
+}
+
+#[test]
+fn propagation_plan_requeues_only_affected_observers_once() {
+    let entries = [
+        re_export_tuple(2, 1),
+        re_export_tuple(1, 0),
+        re_export_tuple(2, 3),
+        re_export_tuple(4, 2),
+    ];
+    let mut plan = ReExportPropagationPlan::new(&entries);
+    while plan.pop_front().is_some() {}
+
+    plan.enqueue_observers(FileId(2));
+    plan.enqueue_observers(FileId(2));
+
+    assert_eq!(plan.pop_front(), Some(0));
+    assert_eq!(plan.pop_front(), Some(2));
+    assert_eq!(plan.pop_front(), None);
+}
+
+#[test]
+fn named_only_chain_safety_cap_excludes_synthetic_export_states() {
+    let graph = graph_for_named_chain(256);
+    let re_export_info = graph.collect_re_export_tuples();
+    let initial_exports = graph
+        .modules
+        .iter()
+        .map(|module| module.exports.len())
+        .sum::<usize>();
+    let expected = re_export_info.len().saturating_add(
+        initial_exports
+            .saturating_mul(graph.modules.len())
+            .saturating_mul(2)
+            .saturating_mul(re_export_info.len()),
+    );
+
+    assert_eq!(
+        graph.re_export_transition_safety_cap(&re_export_info),
+        expected,
+        "named-only chains cannot create synthetic exports"
+    );
+}
+
+fn re_export_tuple(barrel: u32, source: u32) -> ReExportTuple {
+    ReExportTuple {
+        barrel: FileId(barrel),
+        source: FileId(source),
+        imported_name: "Merged".to_string(),
+        exported_name: "Merged".to_string(),
+        is_type_only: false,
+    }
+}
+
+fn graph_for_named_chain(barrel_count: u32) -> ModuleGraph {
+    let consumer_id = FileId(barrel_count + 1);
+    let mut files = vec![discovered_file(0, "/project/leaf.ts")];
+    let mut resolved_modules = vec![ResolvedModule {
+        file_id: FileId(0),
+        path: PathBuf::from("/project/leaf.ts"),
+        exports: vec![merged_export(false)].into(),
+        ..Default::default()
+    }];
+
+    for idx in 1..=barrel_count {
+        let path = format!("/project/barrel_{idx}.ts");
+        files.push(discovered_file(idx, &path));
+        resolved_modules.push(ResolvedModule {
+            file_id: FileId(idx),
+            path: PathBuf::from(path),
+            re_exports: vec![ResolvedReExport {
+                info: fallow_types::extract::ReExportInfo {
+                    source: format!("./barrel_{}", idx - 1),
+                    imported_name: "Merged".to_string(),
+                    exported_name: "Merged".to_string(),
+                    is_type_only: false,
+                    span: oxc_span::Span::default(),
+                    statement_span: oxc_span::Span::new(0, 0),
+                    source_span: oxc_span::Span::new(0, 0),
+                },
+                target: ResolveResult::InternalModule(FileId(idx - 1)),
+            }],
+            ..Default::default()
+        });
+    }
+
+    files.push(discovered_file(consumer_id.0, "/project/consumer.ts"));
+    resolved_modules.push(ResolvedModule {
+        file_id: consumer_id,
+        path: PathBuf::from("/project/consumer.ts"),
+        resolved_imports: vec![ResolvedImport {
+            info: ImportInfo {
+                source: format!("./barrel_{barrel_count}"),
+                imported_name: ImportedName::Named("Merged".to_string()),
+                local_name: "Merged".to_string(),
+                is_type_only: false,
+                is_type_only_star: false,
+                from_style: false,
+                span: oxc_span::Span::new(0, 10),
+                source_span: oxc_span::Span::default(),
+            },
+            target: ResolveResult::InternalModule(FileId(barrel_count)),
+        }],
+        ..Default::default()
+    });
+
+    let entry_points = vec![EntryPoint {
+        path: PathBuf::from("/project/consumer.ts"),
+        source: EntryPointSource::PackageJsonMain,
+    }];
+    ModuleGraph::build(&resolved_modules, &entry_points, &files)
+}
+
+fn graph_for_parallel_named_re_exports(reverse: bool) -> ModuleGraph {
+    let files = vec![
+        discovered_file(0, "/project/consumer.ts"),
+        discovered_file(1, "/project/barrel.ts"),
+        discovered_file(2, "/project/a.ts"),
+        discovered_file(3, "/project/b.ts"),
+    ];
+    let entry_points = vec![EntryPoint {
+        path: PathBuf::from("/project/consumer.ts"),
+        source: EntryPointSource::PackageJsonMain,
+    }];
+    let mut re_exports = vec![
+        ResolvedReExport {
+            info: fallow_types::extract::ReExportInfo {
+                source: "./a".to_string(),
+                imported_name: "A".to_string(),
+                exported_name: "A".to_string(),
+                is_type_only: false,
+                span: oxc_span::Span::default(),
+                statement_span: oxc_span::Span::new(0, 0),
+                source_span: oxc_span::Span::new(0, 0),
+            },
+            target: ResolveResult::InternalModule(FileId(2)),
+        },
+        ResolvedReExport {
+            info: fallow_types::extract::ReExportInfo {
+                source: "./b".to_string(),
+                imported_name: "B".to_string(),
+                exported_name: "B".to_string(),
+                is_type_only: false,
+                span: oxc_span::Span::default(),
+                statement_span: oxc_span::Span::new(0, 0),
+                source_span: oxc_span::Span::new(0, 0),
+            },
+            target: ResolveResult::InternalModule(FileId(3)),
+        },
+    ];
+    if reverse {
+        re_exports.reverse();
+    }
+
+    let resolved_modules = vec![
+        ResolvedModule {
+            file_id: FileId(0),
+            path: PathBuf::from("/project/consumer.ts"),
+            resolved_imports: vec![
+                ResolvedImport {
+                    info: named_import("A", "A", false).info,
+                    target: ResolveResult::InternalModule(FileId(1)),
+                },
+                ResolvedImport {
+                    info: named_import("B", "B", false).info,
+                    target: ResolveResult::InternalModule(FileId(1)),
+                },
+            ],
+            ..Default::default()
+        },
+        ResolvedModule {
+            file_id: FileId(1),
+            path: PathBuf::from("/project/barrel.ts"),
+            re_exports,
+            ..Default::default()
+        },
+        ResolvedModule {
+            file_id: FileId(2),
+            path: PathBuf::from("/project/a.ts"),
+            exports: vec![named_export("A", false)].into(),
+            ..Default::default()
+        },
+        ResolvedModule {
+            file_id: FileId(3),
+            path: PathBuf::from("/project/b.ts"),
+            exports: vec![named_export("B", false)].into(),
+            ..Default::default()
+        },
+    ];
+
+    ModuleGraph::build(&resolved_modules, &entry_points, &files)
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "fixture construction dominates; assertions stay tight"
+)]
+#[test]
+fn re_export_cycle_terminates_and_does_not_block_unrelated_propagation() {
+    let files = vec![
+        DiscoveredFile {
+            id: FileId(0),
+            path: PathBuf::from("/project/a.ts"),
+            size_bytes: 50,
+        },
+        DiscoveredFile {
+            id: FileId(1),
+            path: PathBuf::from("/project/b.ts"),
+            size_bytes: 50,
+        },
+        DiscoveredFile {
+            id: FileId(2),
+            path: PathBuf::from("/project/c.ts"),
+            size_bytes: 50,
+        },
+        DiscoveredFile {
+            id: FileId(3),
+            path: PathBuf::from("/project/outside.ts"),
+            size_bytes: 50,
+        },
+        DiscoveredFile {
+            id: FileId(4),
+            path: PathBuf::from("/project/consumer.ts"),
+            size_bytes: 100,
+        },
+    ];
+
+    let entry_points = vec![EntryPoint {
+        path: PathBuf::from("/project/consumer.ts"),
+        source: EntryPointSource::PackageJsonMain,
+    }];
+
+    let resolved_modules = vec![
+        ResolvedModule {
+            file_id: FileId(0),
+            path: PathBuf::from("/project/a.ts"),
+            exports: vec![fallow_types::extract::ExportInfo {
+                name: ExportName::Named("x".to_string()),
+                local_name: Some("x".to_string()),
+                is_type_only: false,
+                visibility: VisibilityTag::None,
+                expected_unused_reason: None,
+                span: oxc_span::Span::new(0, 10),
+                members: vec![],
+                is_side_effect_used: false,
+                super_class: None,
+            }]
+            .into(),
+            re_exports: vec![ResolvedReExport {
+                info: fallow_types::extract::ReExportInfo {
+                    source: "./b".to_string(),
+                    imported_name: "*".to_string(),
+                    exported_name: "*".to_string(),
+                    is_type_only: false,
+                    span: oxc_span::Span::default(),
+                    statement_span: oxc_span::Span::new(0, 0),
+                    source_span: oxc_span::Span::new(0, 0),
+                },
+                target: ResolveResult::InternalModule(FileId(1)),
+            }],
+            ..Default::default()
+        },
+        ResolvedModule {
+            file_id: FileId(1),
+            path: PathBuf::from("/project/b.ts"),
+            re_exports: vec![
+                ResolvedReExport {
+                    info: fallow_types::extract::ReExportInfo {
+                        source: "./c".to_string(),
+                        imported_name: "*".to_string(),
+                        exported_name: "*".to_string(),
+                        is_type_only: false,
+                        span: oxc_span::Span::default(),
+                        statement_span: oxc_span::Span::new(0, 0),
+                        source_span: oxc_span::Span::new(0, 0),
+                    },
+                    target: ResolveResult::InternalModule(FileId(2)),
+                },
+                ResolvedReExport {
+                    info: fallow_types::extract::ReExportInfo {
+                        source: "./a".to_string(),
+                        imported_name: "*".to_string(),
+                        exported_name: "*".to_string(),
+                        is_type_only: false,
+                        span: oxc_span::Span::default(),
+                        statement_span: oxc_span::Span::new(0, 0),
+                        source_span: oxc_span::Span::new(0, 0),
+                    },
+                    target: ResolveResult::InternalModule(FileId(0)),
+                },
+            ],
+            ..Default::default()
+        },
+        ResolvedModule {
+            file_id: FileId(2),
+            path: PathBuf::from("/project/c.ts"),
+            re_exports: vec![ResolvedReExport {
+                info: fallow_types::extract::ReExportInfo {
+                    source: "./a".to_string(),
+                    imported_name: "*".to_string(),
+                    exported_name: "*".to_string(),
+                    is_type_only: false,
+                    span: oxc_span::Span::default(),
+                    statement_span: oxc_span::Span::new(0, 0),
+                    source_span: oxc_span::Span::new(0, 0),
+                },
+                target: ResolveResult::InternalModule(FileId(0)),
+            }],
+            ..Default::default()
+        },
+        ResolvedModule {
+            file_id: FileId(3),
+            path: PathBuf::from("/project/outside.ts"),
+            exports: vec![fallow_types::extract::ExportInfo {
+                name: ExportName::Named("y".to_string()),
+                local_name: Some("y".to_string()),
+                is_type_only: false,
+                visibility: VisibilityTag::None,
+                expected_unused_reason: None,
+                span: oxc_span::Span::new(0, 10),
+                members: vec![],
+                is_side_effect_used: false,
+                super_class: None,
+            }]
+            .into(),
+            ..Default::default()
+        },
+        ResolvedModule {
+            file_id: FileId(4),
+            path: PathBuf::from("/project/consumer.ts"),
+            resolved_imports: vec![
+                ResolvedImport {
+                    info: ImportInfo {
+                        source: "./a".to_string(),
+                        imported_name: ImportedName::Named("x".to_string()),
+                        local_name: "x".to_string(),
+                        is_type_only: false,
+                        is_type_only_star: false,
+                        from_style: false,
+                        span: oxc_span::Span::new(0, 10),
+                        source_span: oxc_span::Span::default(),
+                    },
+                    target: ResolveResult::InternalModule(FileId(0)),
+                },
+                ResolvedImport {
+                    info: ImportInfo {
+                        source: "./outside".to_string(),
+                        imported_name: ImportedName::Named("y".to_string()),
+                        local_name: "y".to_string(),
+                        is_type_only: false,
+                        is_type_only_star: false,
+                        from_style: false,
+                        span: oxc_span::Span::new(15, 25),
+                        source_span: oxc_span::Span::default(),
+                    },
+                    target: ResolveResult::InternalModule(FileId(3)),
+                },
+            ],
+            ..Default::default()
+        },
+    ];
+
+    let graph = ModuleGraph::build(&resolved_modules, &entry_points, &files);
+
+    let a = &graph.modules[0];
+    let x = a
+        .exports
+        .iter()
+        .find(|e| e.name.to_string() == "x")
+        .expect("a should have x export");
+    assert!(
+        !x.references.is_empty(),
+        "x should be referenced despite the cycle"
+    );
+
+    let outside = &graph.modules[3];
+    let y = outside
+        .exports
+        .iter()
+        .find(|e| e.name.to_string() == "y")
+        .expect("outside should have y export");
+    assert!(
+        !y.references.is_empty(),
+        "y should be referenced from consumer (cycle elsewhere must not block this)"
+    );
+}
+
+#[test]
+fn type_only_star_chain_synthesizes_type_only_stub() {
+    let files = vec![
+        DiscoveredFile {
+            id: FileId(0),
+            path: PathBuf::from("/project/barrel.ts"),
+            size_bytes: 50,
+        },
+        DiscoveredFile {
+            id: FileId(1),
+            path: PathBuf::from("/project/source.ts"),
+            size_bytes: 50,
+        },
+        DiscoveredFile {
+            id: FileId(2),
+            path: PathBuf::from("/project/leaf.ts"),
+            size_bytes: 50,
+        },
+    ];
+
+    let entry_points = vec![EntryPoint {
+        path: PathBuf::from("/project/barrel.ts"),
+        source: EntryPointSource::PackageJsonMain,
+    }];
+
+    let resolved_modules = vec![
+        ResolvedModule {
+            file_id: FileId(0),
+            path: PathBuf::from("/project/barrel.ts"),
+            re_exports: vec![ResolvedReExport {
+                info: fallow_types::extract::ReExportInfo {
+                    source: "./source".to_string(),
+                    imported_name: "*".to_string(),
+                    exported_name: "*".to_string(),
+                    is_type_only: true,
+                    span: oxc_span::Span::default(),
+                    statement_span: oxc_span::Span::new(0, 0),
+                    source_span: oxc_span::Span::new(0, 0),
+                },
+                target: ResolveResult::InternalModule(FileId(1)),
+            }],
+            ..Default::default()
+        },
+        ResolvedModule {
+            file_id: FileId(1),
+            path: PathBuf::from("/project/source.ts"),
+            re_exports: vec![ResolvedReExport {
+                info: fallow_types::extract::ReExportInfo {
+                    source: "./leaf".to_string(),
+                    imported_name: "*".to_string(),
+                    exported_name: "*".to_string(),
+                    is_type_only: false,
+                    span: oxc_span::Span::default(),
+                    statement_span: oxc_span::Span::new(0, 0),
+                    source_span: oxc_span::Span::new(0, 0),
+                },
+                target: ResolveResult::InternalModule(FileId(2)),
+            }],
+            ..Default::default()
+        },
+        ResolvedModule {
+            file_id: FileId(2),
+            path: PathBuf::from("/project/leaf.ts"),
+            exports: vec![fallow_types::extract::ExportInfo {
+                name: ExportName::Named("X".to_string()),
+                local_name: Some("X".to_string()),
+                is_type_only: true,
+                visibility: VisibilityTag::None,
+                expected_unused_reason: None,
+                span: oxc_span::Span::new(0, 20),
+                members: vec![],
+                is_side_effect_used: false,
+                super_class: None,
+            }]
+            .into(),
+            ..Default::default()
+        },
+    ];
+
+    let graph = ModuleGraph::build(&resolved_modules, &entry_points, &files);
+
+    let leaf = &graph.modules[2];
+    let x = leaf
+        .exports
+        .iter()
+        .find(|e| e.name.to_string() == "X")
+        .expect("leaf should have X export");
+    assert!(
+        !x.references.is_empty(),
+        "X should be referenced through the entry-point type-only star chain"
+    );
+
+    let source = &graph.modules[1];
+    if let Some(stub) = source.exports.iter().find(|e| e.name.to_string() == "X") {
+        assert!(
+            stub.is_type_only,
+            "synthetic stub on source for X must inherit is_type_only=true \
+             from the triggering `export type *` edge on barrel"
+        );
+    }
+}
+
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "test fixture; linear setup/assert, length is not a maintainability concern"
+)]
+fn type_only_star_chain_named_consumer_synthesizes_type_only_stub() {
+    let files = vec![
+        DiscoveredFile {
+            id: FileId(0),
+            path: PathBuf::from("/project/consumer.ts"),
+            size_bytes: 100,
+        },
+        DiscoveredFile {
+            id: FileId(1),
+            path: PathBuf::from("/project/barrel.ts"),
+            size_bytes: 50,
+        },
+        DiscoveredFile {
+            id: FileId(2),
+            path: PathBuf::from("/project/source.ts"),
+            size_bytes: 50,
+        },
+        DiscoveredFile {
+            id: FileId(3),
+            path: PathBuf::from("/project/leaf.ts"),
+            size_bytes: 50,
+        },
+    ];
+
+    let entry_points = vec![EntryPoint {
+        path: PathBuf::from("/project/consumer.ts"),
+        source: EntryPointSource::PackageJsonMain,
+    }];
+
+    let resolved_modules = vec![
+        ResolvedModule {
+            file_id: FileId(0),
+            path: PathBuf::from("/project/consumer.ts"),
+            resolved_imports: vec![ResolvedImport {
+                info: ImportInfo {
+                    source: "./barrel".to_string(),
+                    imported_name: ImportedName::Named("X".to_string()),
+                    local_name: "X".to_string(),
+                    is_type_only: true,
+                    is_type_only_star: false,
+                    from_style: false,
+                    span: oxc_span::Span::new(0, 10),
+                    source_span: oxc_span::Span::default(),
+                },
+                target: ResolveResult::InternalModule(FileId(1)),
+            }],
+            ..Default::default()
+        },
+        ResolvedModule {
+            file_id: FileId(1),
+            path: PathBuf::from("/project/barrel.ts"),
+            re_exports: vec![ResolvedReExport {
+                info: fallow_types::extract::ReExportInfo {
+                    source: "./source".to_string(),
+                    imported_name: "*".to_string(),
+                    exported_name: "*".to_string(),
+                    is_type_only: true,
+                    span: oxc_span::Span::default(),
+                    statement_span: oxc_span::Span::new(0, 0),
+                    source_span: oxc_span::Span::new(0, 0),
+                },
+                target: ResolveResult::InternalModule(FileId(2)),
+            }],
+            ..Default::default()
+        },
+        ResolvedModule {
+            file_id: FileId(2),
+            path: PathBuf::from("/project/source.ts"),
+            re_exports: vec![ResolvedReExport {
+                info: fallow_types::extract::ReExportInfo {
+                    source: "./leaf".to_string(),
+                    imported_name: "*".to_string(),
+                    exported_name: "*".to_string(),
+                    is_type_only: false,
+                    span: oxc_span::Span::default(),
+                    statement_span: oxc_span::Span::new(0, 0),
+                    source_span: oxc_span::Span::new(0, 0),
+                },
+                target: ResolveResult::InternalModule(FileId(3)),
+            }],
+            ..Default::default()
+        },
+        ResolvedModule {
+            file_id: FileId(3),
+            path: PathBuf::from("/project/leaf.ts"),
+            exports: vec![fallow_types::extract::ExportInfo {
+                name: ExportName::Named("X".to_string()),
+                local_name: Some("X".to_string()),
+                is_type_only: true,
+                visibility: VisibilityTag::None,
+                expected_unused_reason: None,
+                span: oxc_span::Span::new(0, 20),
+                members: vec![],
+                is_side_effect_used: false,
+                super_class: None,
+            }]
+            .into(),
+            ..Default::default()
+        },
+    ];
+
+    let graph = ModuleGraph::build(&resolved_modules, &entry_points, &files);
+
+    let source = &graph.modules[2];
+    let stub = source
+        .exports
+        .iter()
+        .find(|e| e.name.to_string() == "X")
+        .expect("source should have a synthetic stub for X");
+    assert!(
+        stub.is_type_only,
+        "synthetic stub on source for X must inherit is_type_only=true \
+         from the triggering `export type *` edge on barrel"
+    );
+}
+
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "fixture enumerates a mixed star-export graph across value and type paths"
+)]
+fn value_star_path_does_not_invent_a_value_binding_for_a_type_export() {
+    let files = vec![
+        DiscoveredFile {
+            id: FileId(0),
+            path: PathBuf::from("/project/consumer_type.ts"),
+            size_bytes: 100,
+        },
+        DiscoveredFile {
+            id: FileId(1),
+            path: PathBuf::from("/project/consumer_val.ts"),
+            size_bytes: 100,
+        },
+        DiscoveredFile {
+            id: FileId(2),
+            path: PathBuf::from("/project/barrel_type.ts"),
+            size_bytes: 50,
+        },
+        DiscoveredFile {
+            id: FileId(3),
+            path: PathBuf::from("/project/barrel_val.ts"),
+            size_bytes: 50,
+        },
+        DiscoveredFile {
+            id: FileId(4),
+            path: PathBuf::from("/project/source.ts"),
+            size_bytes: 50,
+        },
+        DiscoveredFile {
+            id: FileId(5),
+            path: PathBuf::from("/project/leaf.ts"),
+            size_bytes: 50,
+        },
+    ];
+
+    let entry_points = vec![
+        EntryPoint {
+            path: PathBuf::from("/project/consumer_type.ts"),
+            source: EntryPointSource::PackageJsonMain,
+        },
+        EntryPoint {
+            path: PathBuf::from("/project/consumer_val.ts"),
+            source: EntryPointSource::PackageJsonMain,
+        },
+    ];
+
+    let resolved_modules = vec![
+        ResolvedModule {
+            file_id: FileId(0),
+            path: PathBuf::from("/project/consumer_type.ts"),
+            resolved_imports: vec![ResolvedImport {
+                info: ImportInfo {
+                    source: "./barrel_type".to_string(),
+                    imported_name: ImportedName::Named("X".to_string()),
+                    local_name: "X".to_string(),
+                    is_type_only: true,
+                    is_type_only_star: false,
+                    from_style: false,
+                    span: oxc_span::Span::new(0, 10),
+                    source_span: oxc_span::Span::default(),
+                },
+                target: ResolveResult::InternalModule(FileId(2)),
+            }],
+            ..Default::default()
+        },
+        ResolvedModule {
+            file_id: FileId(1),
+            path: PathBuf::from("/project/consumer_val.ts"),
+            resolved_imports: vec![ResolvedImport {
+                info: ImportInfo {
+                    source: "./barrel_val".to_string(),
+                    imported_name: ImportedName::Named("X".to_string()),
+                    local_name: "X".to_string(),
+                    is_type_only: false,
+                    is_type_only_star: false,
+                    from_style: false,
+                    span: oxc_span::Span::new(0, 10),
+                    source_span: oxc_span::Span::default(),
+                },
+                target: ResolveResult::InternalModule(FileId(3)),
+            }],
+            ..Default::default()
+        },
+        ResolvedModule {
+            file_id: FileId(2),
+            path: PathBuf::from("/project/barrel_type.ts"),
+            re_exports: vec![ResolvedReExport {
+                info: fallow_types::extract::ReExportInfo {
+                    source: "./source".to_string(),
+                    imported_name: "*".to_string(),
+                    exported_name: "*".to_string(),
+                    is_type_only: true,
+                    span: oxc_span::Span::default(),
+                    statement_span: oxc_span::Span::new(0, 0),
+                    source_span: oxc_span::Span::new(0, 0),
+                },
+                target: ResolveResult::InternalModule(FileId(4)),
+            }],
+            ..Default::default()
+        },
+        ResolvedModule {
+            file_id: FileId(3),
+            path: PathBuf::from("/project/barrel_val.ts"),
+            re_exports: vec![ResolvedReExport {
+                info: fallow_types::extract::ReExportInfo {
+                    source: "./source".to_string(),
+                    imported_name: "*".to_string(),
+                    exported_name: "*".to_string(),
+                    is_type_only: false,
+                    span: oxc_span::Span::default(),
+                    statement_span: oxc_span::Span::new(0, 0),
+                    source_span: oxc_span::Span::new(0, 0),
+                },
+                target: ResolveResult::InternalModule(FileId(4)),
+            }],
+            ..Default::default()
+        },
+        ResolvedModule {
+            file_id: FileId(4),
+            path: PathBuf::from("/project/source.ts"),
+            re_exports: vec![ResolvedReExport {
+                info: fallow_types::extract::ReExportInfo {
+                    source: "./leaf".to_string(),
+                    imported_name: "*".to_string(),
+                    exported_name: "*".to_string(),
+                    is_type_only: false,
+                    span: oxc_span::Span::default(),
+                    statement_span: oxc_span::Span::new(0, 0),
+                    source_span: oxc_span::Span::new(0, 0),
+                },
+                target: ResolveResult::InternalModule(FileId(5)),
+            }],
+            ..Default::default()
+        },
+        ResolvedModule {
+            file_id: FileId(5),
+            path: PathBuf::from("/project/leaf.ts"),
+            exports: vec![fallow_types::extract::ExportInfo {
+                name: ExportName::Named("X".to_string()),
+                local_name: Some("X".to_string()),
+                is_type_only: true,
+                visibility: VisibilityTag::None,
+                expected_unused_reason: None,
+                span: oxc_span::Span::new(0, 20),
+                members: vec![],
+                is_side_effect_used: false,
+                super_class: None,
+            }]
+            .into(),
+            ..Default::default()
+        },
+    ];
+
+    let graph = ModuleGraph::build(&resolved_modules, &entry_points, &files);
+
+    let source = &graph.modules[4];
+    let type_stub = source
+        .exports
+        .iter()
+        .find(|e| e.name.to_string() == "X" && e.is_type_only)
+        .expect("source should have a synthetic type stub for X");
+    assert!(
+        !type_stub.references.is_empty(),
+        "type-only star edge should keep a type synthetic stub"
+    );
+    assert!(
+        !source
+            .exports
+            .iter()
+            .any(|export| export.name.to_string() == "X" && !export.is_type_only),
+        "a value star path must not synthesize a value binding for a type-only export"
+    );
+}
+
+#[test]
+fn self_re_export_does_not_panic() {
+    let files = vec![DiscoveredFile {
+        id: FileId(0),
+        path: PathBuf::from("/project/barrel.ts"),
+        size_bytes: 50,
+    }];
+
+    let entry_points = vec![EntryPoint {
+        path: PathBuf::from("/project/barrel.ts"),
+        source: EntryPointSource::PackageJsonMain,
+    }];
+
+    let resolved_modules = vec![ResolvedModule {
+        file_id: FileId(0),
+        path: PathBuf::from("/project/barrel.ts"),
+        re_exports: vec![ResolvedReExport {
+            info: fallow_types::extract::ReExportInfo {
+                source: "./barrel".to_string(),
+                imported_name: "*".to_string(),
+                exported_name: "*".to_string(),
+                is_type_only: false,
+                span: oxc_span::Span::default(),
+                statement_span: oxc_span::Span::new(0, 0),
+                source_span: oxc_span::Span::new(0, 0),
+            },
+            target: ResolveResult::InternalModule(FileId(0)),
+        }],
+        ..Default::default()
+    }];
+
+    let _graph = ModuleGraph::build(&resolved_modules, &entry_points, &files);
+}
+
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "test fixture; linear setup/assert, length is not a maintainability concern"
+)]
+fn re_export_cycle_payload_lists_member_paths() {
+    let files = vec![
+        DiscoveredFile {
+            id: FileId(0),
+            path: PathBuf::from("/project/cycle_a.ts"),
+            size_bytes: 50,
+        },
+        DiscoveredFile {
+            id: FileId(1),
+            path: PathBuf::from("/project/cycle_b.ts"),
+            size_bytes: 50,
+        },
+        DiscoveredFile {
+            id: FileId(2),
+            path: PathBuf::from("/project/cycle_c.ts"),
+            size_bytes: 50,
+        },
+        DiscoveredFile {
+            id: FileId(3),
+            path: PathBuf::from("/project/consumer.ts"),
+            size_bytes: 100,
+        },
+    ];
+
+    let entry_points = vec![EntryPoint {
+        path: PathBuf::from("/project/consumer.ts"),
+        source: EntryPointSource::PackageJsonMain,
+    }];
+
+    let resolved_modules = vec![
+        ResolvedModule {
+            file_id: FileId(0),
+            path: PathBuf::from("/project/cycle_a.ts"),
+            re_exports: vec![ResolvedReExport {
+                info: fallow_types::extract::ReExportInfo {
+                    source: "./cycle_b".to_string(),
+                    imported_name: "*".to_string(),
+                    exported_name: "*".to_string(),
+                    is_type_only: false,
+                    span: oxc_span::Span::default(),
+                    statement_span: oxc_span::Span::new(0, 0),
+                    source_span: oxc_span::Span::new(0, 0),
+                },
+                target: ResolveResult::InternalModule(FileId(1)),
+            }],
+            ..Default::default()
+        },
+        ResolvedModule {
+            file_id: FileId(1),
+            path: PathBuf::from("/project/cycle_b.ts"),
+            re_exports: vec![ResolvedReExport {
+                info: fallow_types::extract::ReExportInfo {
+                    source: "./cycle_c".to_string(),
+                    imported_name: "*".to_string(),
+                    exported_name: "*".to_string(),
+                    is_type_only: false,
+                    span: oxc_span::Span::default(),
+                    statement_span: oxc_span::Span::new(0, 0),
+                    source_span: oxc_span::Span::new(0, 0),
+                },
+                target: ResolveResult::InternalModule(FileId(2)),
+            }],
+            ..Default::default()
+        },
+        ResolvedModule {
+            file_id: FileId(2),
+            path: PathBuf::from("/project/cycle_c.ts"),
+            re_exports: vec![ResolvedReExport {
+                info: fallow_types::extract::ReExportInfo {
+                    source: "./cycle_a".to_string(),
+                    imported_name: "*".to_string(),
+                    exported_name: "*".to_string(),
+                    is_type_only: false,
+                    span: oxc_span::Span::default(),
+                    statement_span: oxc_span::Span::new(0, 0),
+                    source_span: oxc_span::Span::new(0, 0),
+                },
+                target: ResolveResult::InternalModule(FileId(0)),
+            }],
+            ..Default::default()
+        },
+        ResolvedModule {
+            file_id: FileId(3),
+            path: PathBuf::from("/project/consumer.ts"),
+            ..Default::default()
+        },
+    ];
+
+    let graph = ModuleGraph::build(&resolved_modules, &entry_points, &files);
+
+    let cycle = graph
+        .re_export_cycles
+        .iter()
+        .find(|cycle| !cycle.is_self_loop)
+        .expect("expected a multi-file re-export cycle");
+    let members = cycle
+        .files
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        members,
+        vec![
+            "/project/cycle_a.ts",
+            "/project/cycle_b.ts",
+            "/project/cycle_c.ts",
+        ]
+    );
+    assert_eq!(
+        cycle.file_ids,
+        vec![FileId(0), FileId(1), FileId(2)],
+        "expected file ids to stay parallel to the sorted paths"
+    );
+}
+
+#[test]
+fn self_re_export_payload_names_file() {
+    let files = vec![DiscoveredFile {
+        id: FileId(0),
+        path: PathBuf::from("/project/self_barrel.ts"),
+        size_bytes: 50,
+    }];
+
+    let entry_points = vec![EntryPoint {
+        path: PathBuf::from("/project/self_barrel.ts"),
+        source: EntryPointSource::PackageJsonMain,
+    }];
+
+    let resolved_modules = vec![ResolvedModule {
+        file_id: FileId(0),
+        path: PathBuf::from("/project/self_barrel.ts"),
+        re_exports: vec![ResolvedReExport {
+            info: fallow_types::extract::ReExportInfo {
+                source: "./self_barrel".to_string(),
+                imported_name: "*".to_string(),
+                exported_name: "*".to_string(),
+                is_type_only: false,
+                span: oxc_span::Span::default(),
+                statement_span: oxc_span::Span::new(0, 0),
+                source_span: oxc_span::Span::new(0, 0),
+            },
+            target: ResolveResult::InternalModule(FileId(0)),
+        }],
+        ..Default::default()
+    }];
+
+    let graph = ModuleGraph::build(&resolved_modules, &entry_points, &files);
+
+    assert_eq!(graph.re_export_cycles.len(), 1);
+    let cycle = &graph.re_export_cycles[0];
+    assert!(cycle.is_self_loop, "expected self-loop cycle payload");
+    assert_eq!(cycle.files, vec![PathBuf::from("/project/self_barrel.ts")]);
+    assert_eq!(cycle.file_ids, vec![FileId(0)]);
+}
+
+#[test]
+fn star_re_export_duplicate_name_value_import_credits_value_export() {
+    let graph = graph_for_merged_star_import(
+        vec![named_import("Merged", "Local", false)],
+        vec![],
+        vec!["Local"],
+    );
+
+    let (type_export, value_export) = merged_exports(&graph);
+    assert!(
+        type_export.references.is_empty(),
+        "value use through a star barrel must not credit the type-only namespace"
+    );
+    assert_eq!(
+        reference_namespaces(value_export),
+        vec![ExportNamespace::Value],
+        "value use through a star barrel should retain the value namespace"
+    );
+}
+
+#[test]
+fn star_re_export_duplicate_name_type_import_credits_type_export() {
+    let graph = graph_for_merged_star_import(
+        vec![named_import("Merged", "MergedType", true)],
+        vec!["MergedType"],
+        vec![],
+    );
+
+    let (type_export, value_export) = merged_exports(&graph);
+    assert_eq!(
+        reference_namespaces(type_export),
+        vec![ExportNamespace::Type],
+        "type-only use through a star barrel should retain the type namespace"
+    );
+    assert!(
+        value_export.references.is_empty(),
+        "type-only use through a star barrel must not credit the value export"
+    );
+}
+
+#[test]
+fn named_type_re_export_does_not_credit_same_named_value_export() {
+    let files = vec![
+        discovered_file(0, "/project/consumer.ts"),
+        discovered_file(1, "/project/barrel.ts"),
+        discovered_file(2, "/project/merged.ts"),
+    ];
+    let entry_points = vec![EntryPoint {
+        path: PathBuf::from("/project/consumer.ts"),
+        source: EntryPointSource::PackageJsonMain,
+    }];
+    let resolved_modules = vec![
+        ResolvedModule {
+            file_id: FileId(0),
+            path: files[0].path.clone(),
+            resolved_imports: vec![named_import("Merged", "MergedType", true)],
+            type_referenced_import_bindings: vec!["MergedType".to_string()],
+            ..Default::default()
+        },
+        ResolvedModule {
+            file_id: FileId(1),
+            path: files[1].path.clone(),
+            re_exports: vec![ResolvedReExport {
+                info: fallow_types::extract::ReExportInfo {
+                    source: "./merged".to_string(),
+                    imported_name: "Merged".to_string(),
+                    exported_name: "Merged".to_string(),
+                    is_type_only: true,
+                    span: oxc_span::Span::default(),
+                    statement_span: oxc_span::Span::default(),
+                    source_span: oxc_span::Span::default(),
+                },
+                target: ResolveResult::InternalModule(FileId(2)),
+            }],
+            ..Default::default()
+        },
+        ResolvedModule {
+            file_id: FileId(2),
+            path: files[2].path.clone(),
+            exports: vec![merged_export(true), merged_export(false)].into(),
+            ..Default::default()
+        },
+    ];
+
+    let graph = ModuleGraph::build(&resolved_modules, &entry_points, &files);
+    let (type_export, value_export) = merged_exports(&graph);
+
+    assert!(!type_export.references.is_empty());
+    assert!(
+        value_export.references.is_empty(),
+        "a named type-only route must not credit the same-named value binding"
+    );
+}
+
+#[test]
+fn named_re_export_value_use_credits_only_value_namespace() {
+    let graph = graph_for_merged_named_import(
+        vec![named_import("Merged", "MergedValue", false)],
+        vec![],
+        vec!["MergedValue"],
+    );
+    let (type_export, value_export) = merged_exports(&graph);
+    assert!(type_export.references.is_empty());
+    assert_eq!(
+        reference_namespaces(value_export),
+        vec![ExportNamespace::Value]
+    );
+    assert_single_merged_barrel_stub(&graph, &[ExportNamespace::Value]);
+}
+
+#[test]
+fn named_re_export_type_use_credits_only_type_namespace() {
+    let graph = graph_for_merged_named_import(
+        vec![named_import("Merged", "MergedType", true)],
+        vec!["MergedType"],
+        vec![],
+    );
+    let (type_export, value_export) = merged_exports(&graph);
+    assert_eq!(
+        reference_namespaces(type_export),
+        vec![ExportNamespace::Type]
+    );
+    assert!(value_export.references.is_empty());
+    assert_single_merged_barrel_stub(&graph, &[ExportNamespace::Type]);
+}
+
+#[test]
+fn named_re_export_mixed_use_credits_both_namespaces() {
+    let graph = graph_for_merged_named_import(
+        vec![
+            named_import("Merged", "MergedValue", false),
+            named_import("Merged", "MergedType", true),
+        ],
+        vec!["MergedType"],
+        vec!["MergedValue"],
+    );
+    let (type_export, value_export) = merged_exports(&graph);
+    assert_eq!(
+        reference_namespaces(type_export),
+        vec![ExportNamespace::Type]
+    );
+    assert_eq!(
+        reference_namespaces(value_export),
+        vec![ExportNamespace::Value]
+    );
+    assert_single_merged_barrel_stub(&graph, &[ExportNamespace::Type, ExportNamespace::Value]);
+    assert_eq!(graph.modules[1].exports[0].physical_reference_count(), 1);
+}
+
+#[test]
+fn named_re_export_namespace_references_survive_cache_roundtrip() {
+    let graph = graph_for_merged_named_import(
+        vec![
+            named_import("Merged", "MergedValue", false),
+            named_import("Merged", "MergedType", true),
+        ],
+        vec!["MergedType"],
+        vec!["MergedValue"],
+    );
+    let encoded = postcard::to_allocvec(&graph).expect("encode graph");
+    let decoded: ModuleGraph = postcard::from_bytes(&encoded).expect("decode graph");
+
+    assert_single_merged_barrel_stub(&decoded, &[ExportNamespace::Type, ExportNamespace::Value]);
+}
+
+#[test]
+fn named_type_re_export_credits_value_backed_type_binding() {
+    let graph = graph_for_named_import(
+        vec![named_import("Merged", "MergedType", true)],
+        vec!["MergedType"],
+        vec![],
+        vec![merged_export(false)],
+        true,
+    );
+    let source = &graph.modules[2];
+    assert_eq!(source.exports.len(), 1);
+    assert_eq!(
+        reference_namespaces(&source.exports[0]),
+        vec![ExportNamespace::Type]
+    );
+    assert_single_merged_barrel_stub(&graph, &[ExportNamespace::Type]);
+}
+
+fn reference_namespaces(export: &crate::graph::ExportSymbol) -> Vec<ExportNamespace> {
+    let mut namespaces: Vec<_> = export
+        .references
+        .iter()
+        .map(|reference| reference.namespace)
+        .collect();
+    namespaces.sort_unstable_by_key(|namespace| match namespace {
+        ExportNamespace::Type => 0,
+        ExportNamespace::Value => 1,
+    });
+    namespaces
+}
+
+fn assert_single_merged_barrel_stub(graph: &ModuleGraph, namespaces: &[ExportNamespace]) {
+    let stubs: Vec<_> = graph.modules[1]
+        .exports
+        .iter()
+        .filter(|export| export.name.matches_str("Merged"))
+        .collect();
+    assert_eq!(stubs.len(), 1);
+    assert_eq!(reference_namespaces(stubs[0]), namespaces);
+    assert!(stubs[0].reference_paths.is_empty());
+}
+
+#[test]
+fn star_re_export_single_import_mixed_use_credits_both_exports() {
+    let graph = graph_for_merged_star_import(
+        vec![named_import("Merged", "MergedBoth", false)],
+        vec!["MergedBoth"],
+        vec!["MergedBoth"],
+    );
+
+    let (type_export, value_export) = merged_exports(&graph);
+    assert_eq!(
+        reference_namespaces(type_export),
+        vec![ExportNamespace::Type],
+        "type use through a star barrel should retain the type namespace"
+    );
+    assert_eq!(
+        reference_namespaces(value_export),
+        vec![ExportNamespace::Value],
+        "value use through a star barrel should retain the value namespace"
+    );
+}
+
+/// An import binding the extractor could not classify (no recorded type or
+/// value usage) must still credit a name that only exists as a type, instead of
+/// resolving in the value namespace and attaching nothing.
+#[test]
+fn star_re_export_unclassified_import_credits_a_type_only_export() {
+    let graph = graph_for_star_import(
+        vec![named_import("Merged", "Merged", false)],
+        vec![],
+        vec![],
+        vec![merged_export(true)],
+    );
+
+    let source = graph
+        .modules
+        .iter()
+        .find(|module| module.path.ends_with("merged.ts"))
+        .expect("source module should exist");
+    let type_export = source
+        .exports
+        .iter()
+        .find(|export| export.name.to_string() == "Merged" && export.is_type_only)
+        .expect("type export should exist");
+
+    assert_eq!(
+        reference_namespaces(type_export),
+        vec![ExportNamespace::Type],
+        "an unclassified binding through a star barrel must credit the type-only export"
+    );
+}
+
+#[test]
+fn named_re_export_unclassified_import_credits_a_type_only_export() {
+    let graph = graph_for_named_import(
+        vec![named_import("Merged", "Merged", false)],
+        vec![],
+        vec![],
+        vec![merged_export(true)],
+        false,
+    );
+
+    let source = graph
+        .modules
+        .iter()
+        .find(|module| module.path.ends_with("merged.ts"))
+        .expect("source module should exist");
+    let type_export = source
+        .exports
+        .iter()
+        .find(|export| export.name.to_string() == "Merged" && export.is_type_only)
+        .expect("type export should exist");
+
+    assert_eq!(
+        reference_namespaces(type_export),
+        vec![ExportNamespace::Type],
+        "an unclassified binding through a named re-export must credit the type-only export"
+    );
+}
+
+#[test]
+fn star_re_export_duplicate_name_multi_hop_type_usage_credits_type_export() {
+    let graph = graph_for_merged_star_chain_import(
+        vec![named_import("Merged", "MergedType", false)],
+        vec!["MergedType"],
+        vec![],
+    );
+
+    let (type_export, value_export) = merged_exports(&graph);
+    assert_eq!(
+        reference_namespaces(type_export),
+        vec![ExportNamespace::Type],
+        "normal import used only as a type through a multi-hop star barrel should retain the type namespace"
+    );
+    assert!(
+        value_export.references.is_empty(),
+        "normal import used only as a type through a multi-hop star barrel must not credit the value export"
+    );
+}
+
+#[test]
+fn star_re_export_duplicate_name_multi_hop_mixed_usage_credits_both_exports() {
+    let graph = graph_for_merged_star_chain_import(
+        vec![
+            named_import_with_span("Merged", "MergedType", false, 0, 10),
+            named_import_with_span("Merged", "MergedValue", false, 20, 30),
+        ],
+        vec!["MergedType"],
+        vec!["MergedValue"],
+    );
+
+    let (type_export, value_export) = merged_exports(&graph);
+    assert_eq!(
+        reference_namespaces(type_export),
+        vec![ExportNamespace::Type],
+        "type use forwarded through an intermediate star stub should retain the type namespace"
+    );
+    assert_eq!(
+        reference_namespaces(value_export),
+        vec![ExportNamespace::Value],
+        "value use forwarded through an intermediate star stub should retain the value namespace"
+    );
+}
+
+fn graph_for_merged_star_import(
+    imports: Vec<ResolvedImport>,
+    type_usages: Vec<&str>,
+    value_usages: Vec<&str>,
+) -> ModuleGraph {
+    graph_for_star_import(
+        imports,
+        type_usages,
+        value_usages,
+        vec![merged_export(true), merged_export(false)],
+    )
+}
+
+fn graph_for_star_import(
+    imports: Vec<ResolvedImport>,
+    type_usages: Vec<&str>,
+    value_usages: Vec<&str>,
+    source_exports: Vec<fallow_types::extract::ExportInfo>,
+) -> ModuleGraph {
+    let files = vec![
+        discovered_file(0, "/project/consumer.ts"),
+        discovered_file(1, "/project/barrel.ts"),
+        discovered_file(2, "/project/merged.ts"),
+    ];
+
+    let entry_points = vec![EntryPoint {
+        path: PathBuf::from("/project/consumer.ts"),
+        source: EntryPointSource::PackageJsonMain,
+    }];
+
+    let resolved_modules = vec![
+        ResolvedModule {
+            file_id: FileId(0),
+            path: PathBuf::from("/project/consumer.ts"),
+            resolved_imports: imports,
+            type_referenced_import_bindings: type_usages.into_iter().map(str::to_string).collect(),
+            value_referenced_import_bindings: value_usages
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            ..Default::default()
+        },
+        ResolvedModule {
+            file_id: FileId(1),
+            path: PathBuf::from("/project/barrel.ts"),
+            re_exports: vec![ResolvedReExport {
+                info: fallow_types::extract::ReExportInfo {
+                    source: "./merged".to_string(),
+                    imported_name: "*".to_string(),
+                    exported_name: "*".to_string(),
+                    is_type_only: false,
+                    span: oxc_span::Span::default(),
+                    statement_span: oxc_span::Span::new(0, 0),
+                    source_span: oxc_span::Span::new(0, 0),
+                },
+                target: ResolveResult::InternalModule(FileId(2)),
+            }],
+            ..Default::default()
+        },
+        ResolvedModule {
+            file_id: FileId(2),
+            path: PathBuf::from("/project/merged.ts"),
+            exports: source_exports.into(),
+            ..Default::default()
+        },
+    ];
+
+    ModuleGraph::build(&resolved_modules, &entry_points, &files)
+}
+
+fn graph_for_merged_named_import(
+    imports: Vec<ResolvedImport>,
+    type_usages: Vec<&str>,
+    value_usages: Vec<&str>,
+) -> ModuleGraph {
+    graph_for_named_import(
+        imports,
+        type_usages,
+        value_usages,
+        vec![merged_export(true), merged_export(false)],
+        false,
+    )
+}
+
+fn graph_for_named_import(
+    imports: Vec<ResolvedImport>,
+    type_usages: Vec<&str>,
+    value_usages: Vec<&str>,
+    source_exports: Vec<fallow_types::extract::ExportInfo>,
+    is_type_only_re_export: bool,
+) -> ModuleGraph {
+    let files = vec![
+        discovered_file(0, "/project/consumer.ts"),
+        discovered_file(1, "/project/barrel.ts"),
+        discovered_file(2, "/project/merged.ts"),
+    ];
+    let entry_points = vec![EntryPoint {
+        path: files[0].path.clone(),
+        source: EntryPointSource::PackageJsonMain,
+    }];
+    let resolved_modules = vec![
+        ResolvedModule {
+            file_id: FileId(0),
+            path: files[0].path.clone(),
+            resolved_imports: imports,
+            type_referenced_import_bindings: type_usages.into_iter().map(str::to_string).collect(),
+            value_referenced_import_bindings: value_usages
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            ..Default::default()
+        },
+        ResolvedModule {
+            file_id: FileId(1),
+            path: files[1].path.clone(),
+            re_exports: vec![ResolvedReExport {
+                info: fallow_types::extract::ReExportInfo {
+                    source: "./merged".to_string(),
+                    imported_name: "Merged".to_string(),
+                    exported_name: "Merged".to_string(),
+                    is_type_only: is_type_only_re_export,
+                    span: oxc_span::Span::default(),
+                    statement_span: oxc_span::Span::default(),
+                    source_span: oxc_span::Span::default(),
+                },
+                target: ResolveResult::InternalModule(FileId(2)),
+            }],
+            ..Default::default()
+        },
+        ResolvedModule {
+            file_id: FileId(2),
+            path: files[2].path.clone(),
+            exports: source_exports.into(),
+            ..Default::default()
+        },
+    ];
+    ModuleGraph::build(&resolved_modules, &entry_points, &files)
+}
+
+fn graph_for_merged_star_chain_import(
+    imports: Vec<ResolvedImport>,
+    type_usages: Vec<&str>,
+    value_usages: Vec<&str>,
+) -> ModuleGraph {
+    let files = vec![
+        discovered_file(0, "/project/consumer.ts"),
+        discovered_file(1, "/project/barrel.ts"),
+        discovered_file(2, "/project/intermediate.ts"),
+        discovered_file(3, "/project/merged.ts"),
+    ];
+
+    let entry_points = vec![EntryPoint {
+        path: PathBuf::from("/project/consumer.ts"),
+        source: EntryPointSource::PackageJsonMain,
+    }];
+
+    let resolved_modules = vec![
+        ResolvedModule {
+            file_id: FileId(0),
+            path: PathBuf::from("/project/consumer.ts"),
+            resolved_imports: imports,
+            type_referenced_import_bindings: type_usages.into_iter().map(str::to_string).collect(),
+            value_referenced_import_bindings: value_usages
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            ..Default::default()
+        },
+        ResolvedModule {
+            file_id: FileId(1),
+            path: PathBuf::from("/project/barrel.ts"),
+            re_exports: vec![ResolvedReExport {
+                info: fallow_types::extract::ReExportInfo {
+                    source: "./intermediate".to_string(),
+                    imported_name: "*".to_string(),
+                    exported_name: "*".to_string(),
+                    is_type_only: false,
+                    span: oxc_span::Span::default(),
+                    statement_span: oxc_span::Span::new(0, 0),
+                    source_span: oxc_span::Span::new(0, 0),
+                },
+                target: ResolveResult::InternalModule(FileId(2)),
+            }],
+            ..Default::default()
+        },
+        ResolvedModule {
+            file_id: FileId(2),
+            path: PathBuf::from("/project/intermediate.ts"),
+            re_exports: vec![ResolvedReExport {
+                info: fallow_types::extract::ReExportInfo {
+                    source: "./merged".to_string(),
+                    imported_name: "*".to_string(),
+                    exported_name: "*".to_string(),
+                    is_type_only: false,
+                    span: oxc_span::Span::default(),
+                    statement_span: oxc_span::Span::new(0, 0),
+                    source_span: oxc_span::Span::new(0, 0),
+                },
+                target: ResolveResult::InternalModule(FileId(3)),
+            }],
+            ..Default::default()
+        },
+        ResolvedModule {
+            file_id: FileId(3),
+            path: PathBuf::from("/project/merged.ts"),
+            exports: vec![merged_export(true), merged_export(false)].into(),
+            ..Default::default()
+        },
+    ];
+
+    ModuleGraph::build(&resolved_modules, &entry_points, &files)
+}
+
+fn discovered_file(id: u32, path: &str) -> DiscoveredFile {
+    DiscoveredFile {
+        id: FileId(id),
+        path: PathBuf::from(path),
+        size_bytes: 100,
+    }
+}
+
+fn named_import(imported_name: &str, local_name: &str, is_type_only: bool) -> ResolvedImport {
+    named_import_with_span(imported_name, local_name, is_type_only, 0, 10)
+}
+
+fn named_import_with_span(
+    imported_name: &str,
+    local_name: &str,
+    is_type_only: bool,
+    span_start: u32,
+    span_end: u32,
+) -> ResolvedImport {
+    ResolvedImport {
+        info: ImportInfo {
+            source: "./barrel".to_string(),
+            imported_name: ImportedName::Named(imported_name.to_string()),
+            local_name: local_name.to_string(),
+            is_type_only,
+            is_type_only_star: false,
+            from_style: false,
+            span: oxc_span::Span::new(span_start, span_end),
+            source_span: oxc_span::Span::default(),
+        },
+        target: ResolveResult::InternalModule(FileId(1)),
+    }
+}
+
+fn merged_export(is_type_only: bool) -> fallow_types::extract::ExportInfo {
+    named_export("Merged", is_type_only)
+}
+
+fn named_export(name: &str, is_type_only: bool) -> fallow_types::extract::ExportInfo {
+    fallow_types::extract::ExportInfo {
+        name: ExportName::Named(name.to_string()),
+        local_name: Some(name.to_string()),
+        is_type_only,
+        visibility: VisibilityTag::None,
+        expected_unused_reason: None,
+        span: oxc_span::Span::new(0, 20),
+        members: vec![],
+        is_side_effect_used: false,
+        super_class: None,
+    }
+}
+
+fn merged_exports(
+    graph: &ModuleGraph,
+) -> (
+    &crate::graph::types::ExportSymbol,
+    &crate::graph::types::ExportSymbol,
+) {
+    let source = graph
+        .modules
+        .iter()
+        .find(|module| module.path.ends_with("merged.ts"))
+        .expect("source module should exist");
+    let type_export = source
+        .exports
+        .iter()
+        .find(|export| export.name.to_string() == "Merged" && export.is_type_only)
+        .expect("type export should exist");
+    let value_export = source
+        .exports
+        .iter()
+        .find(|export| export.name.to_string() == "Merged" && !export.is_type_only)
+        .expect("value export should exist");
+    (type_export, value_export)
+}
+
+/// A `ResolvedReExport` that renames the binding on the way out.
+fn renaming_re_export(
+    source: &str,
+    imported_name: &str,
+    exported_name: &str,
+    target: ResolveResult,
+) -> ResolvedReExport {
+    ResolvedReExport {
+        info: fallow_types::extract::ReExportInfo {
+            source: source.to_string(),
+            imported_name: imported_name.to_string(),
+            exported_name: exported_name.to_string(),
+            is_type_only: false,
+            span: oxc_span::Span::default(),
+            statement_span: oxc_span::Span::default(),
+            source_span: oxc_span::Span::default(),
+        },
+        target,
+    }
+}
+
+fn star_re_export(source: &str, target: ResolveResult) -> ResolvedReExport {
+    plain_re_export(source, "*", target)
+}
+
+/// leaf/other declare `one`; the three barrels forward it, shadow it and
+/// receive it twice.
+fn graph_for_forwarding_shapes() -> ModuleGraph {
+    let files = vec![
+        discovered_file(0, "/project/leaf.ts"),
+        discovered_file(1, "/project/other.ts"),
+        discovered_file(2, "/project/rename.ts"),
+        discovered_file(3, "/project/shadow.ts"),
+        discovered_file(4, "/project/ambiguous.ts"),
+        discovered_file(5, "/project/consumer.ts"),
+    ];
+    let resolved_modules = vec![
+        ResolvedModule {
+            file_id: FileId(0),
+            path: PathBuf::from("/project/leaf.ts"),
+            exports: vec![named_export("one", false)].into(),
+            ..Default::default()
+        },
+        ResolvedModule {
+            file_id: FileId(1),
+            path: PathBuf::from("/project/other.ts"),
+            exports: vec![named_export("one", false)].into(),
+            ..Default::default()
+        },
+        ResolvedModule {
+            file_id: FileId(2),
+            path: PathBuf::from("/project/rename.ts"),
+            re_exports: vec![renaming_re_export(
+                "./leaf",
+                "one",
+                "renamed",
+                ResolveResult::InternalModule(FileId(0)),
+            )],
+            ..Default::default()
+        },
+        ResolvedModule {
+            file_id: FileId(3),
+            path: PathBuf::from("/project/shadow.ts"),
+            exports: vec![named_export("one", false)].into(),
+            re_exports: vec![star_re_export(
+                "./leaf",
+                ResolveResult::InternalModule(FileId(0)),
+            )],
+            ..Default::default()
+        },
+        ResolvedModule {
+            file_id: FileId(4),
+            path: PathBuf::from("/project/ambiguous.ts"),
+            re_exports: vec![
+                star_re_export("./leaf", ResolveResult::InternalModule(FileId(0))),
+                star_re_export("./other", ResolveResult::InternalModule(FileId(1))),
+            ],
+            ..Default::default()
+        },
+        ResolvedModule {
+            file_id: FileId(5),
+            path: PathBuf::from("/project/consumer.ts"),
+            ..Default::default()
+        },
+    ];
+    let entry_points = vec![EntryPoint {
+        path: PathBuf::from("/project/consumer.ts"),
+        source: EntryPointSource::PackageJsonMain,
+    }];
+    ModuleGraph::build(&resolved_modules, &entry_points, &files)
+}
+
+#[test]
+fn forwards_binding_agrees_with_phase_2c_on_rename_shadow_and_ambiguity() {
+    let graph = graph_for_forwarding_shapes();
+    let (leaf, other) = (FileId(0), FileId(1));
+    let (rename, shadow, ambiguous) = (FileId(2), FileId(3), FileId(4));
+
+    // A rename hop forwards the leaf binding; a local declaration on the
+    // barrel and the same name arriving from two stars both stop the chain.
+    for (source, source_name, barrel, barrel_name, expected, why) in [
+        (
+            leaf,
+            "one",
+            rename,
+            "renamed",
+            true,
+            "a rename hop forwards",
+        ),
+        (
+            leaf,
+            "one",
+            shadow,
+            "one",
+            false,
+            "a local declaration shadows",
+        ),
+        (
+            leaf,
+            "one",
+            ambiguous,
+            "one",
+            false,
+            "two stars carry the name at once",
+        ),
+        (
+            other,
+            "one",
+            ambiguous,
+            "one",
+            false,
+            "the second star is ambiguous too",
+        ),
+    ] {
+        assert_eq!(
+            graph.forwards_binding(source, source_name, barrel, barrel_name),
+            expected,
+            "the closure search must agree that {why}"
+        );
+        assert_eq!(
+            crate::graph::namespace_indexes::uniquely_forwards_binding(
+                &graph,
+                source,
+                source_name,
+                barrel,
+                barrel_name,
+                ExportNamespace::Value,
+            ),
+            expected,
+            "Phase 2c's own walk must agree that {why}"
+        );
+    }
 }

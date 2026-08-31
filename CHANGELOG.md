@@ -7,9 +7,5676 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.21.0] - 2026-08-31
+
 ### Added
 
-- **Native Node.js bindings package (`@fallow-cli/fallow-node`).** New async NAPI-RS bindings expose the main one-shot analyses directly inside Node without spawning the CLI: `detectDeadCode`, `detectCircularDependencies`, `detectBoundaryViolations`, `detectDuplication`, `computeComplexity`, and `computeHealth`. The bindings reuse the CLI orchestration layer and return the same JSON report envelopes the CLI emits, including `schema_version`, `summary`, relative paths, and injected `actions`. The Rust-side programmatic facade lives in `fallow-cli::programmatic`, and the repo now includes a temp-project Node smoke test plus CI/release wiring for the addon package. The JS API accepts lowercase CLI-style enum literals (`"mild"`, `"cyclomatic"`, `"low"`, `"handle"`) and rejected promises now expose structured fallow fields like `exitCode`, `help`, and `context`.
+- **A conformance corpus of real coverage-producer geometry**
+  (Closes [#2457](https://github.com/fallow-rs/fallow/issues/2457)). Fallow maps
+  every function it extracts onto a record in an Istanbul coverage map, and the
+  matcher rests on where each producer anchors that record. Every geometry
+  expectation lived in hand-written JSON inside Rust tests, so nothing would
+  notice a producer moving an anchor in a minor release, and a hand-written
+  fixture could assert geometry no producer emits. A new corpus under
+  `tests/coverage-producer-corpus/` commits machine-recorded maps from four
+  pinned producers across five profiles (`istanbul-lib-instrument`,
+  `v8-to-istanbul`, `ast-v8-to-istanbul`, and `oxc-coverage-instrument` in both
+  its default and `compat: "istanbul"` shapes) over seven probes chosen by
+  measured divergence. `npm run check:coverage-producers` runs the real binary
+  against those maps and asserts the per-unit coverage provenance, with probe
+  functions carrying distinct coverage percentages so a match proves which
+  record resolved wherever a producer can tell two records apart. Geometry
+  itself is a reviewed map diff rather than an assertion, so a producer move the
+  matcher absorbs does not manufacture a chore. Every run proves the gate can
+  still fail: each row that resolves a unit is perturbed once with a record
+  moved past the matcher's line-drift window and once with every recorded column
+  moved past the end of every line in the probe, and the census must fail both
+  times. The producers install under their own prefix and add nothing to the
+  root `npm ci`.
+
+- **The health summary reports how much of a coverage file joined**
+  (Closes [#2455](https://github.com/fallow-rs/fallow/issues/2455)). A coverage
+  file written for a different root, a container path prefix, or an older
+  checkout used to read exactly like code with no tests: every function fell
+  back to its estimate and nothing said why. `istanbul_files_matched` and
+  `istanbul_files_total` now report how many files the coverage file describes
+  and how many an analyzed file matched, and the human report says so when the
+  two differ. A run whose coverage joins completely is unchanged.
+
+- **A skipped hidden directory that holds source files is now reported**
+  ([#461](https://github.com/fallow-rs/fallow/issues/461)). Discovery does not
+  traverse dot-prefixed directories outside a small convention allowlist, and
+  that skip used to be silent, so first-party code under a directory such as
+  `.claude/hooks/` was invisible with no explanation. A new
+  `skipped-source-dotdir` workspace diagnostic and one aggregated stderr note
+  now name the directory, state that its imports and exports are not analyzed,
+  and give the two real remedies: analyze it on its own with `fallow --root
+  <dir>`, or add it to `ignorePatterns` to silence the advisory. Traversal is
+  unchanged. The advisory only fires for code the run would otherwise have
+  analyzed, so a directory whose contents are gitignored (including through a
+  global gitignore, which commonly covers `.claude/`), matched by
+  `ignorePatterns`, or excluded by `--production` stays silent, as do generated
+  tool output directories and non-git VCS metadata.
+
+### Fixed
+
+- **The CI summary points at `--coverage-root` only when the coverage file
+  failed to join.** The audit summary warned about a low match rate whenever
+  fewer than half the analyzed functions matched a record, which is ordinary:
+  a coverage file covers the files its test run touched, so a project whose
+  suite exercises part of its modules matched part of its functions and was
+  told its paths were probably wrong. The note now keys on files in the
+  coverage file that no analyzed file matched, and says how many.
+
+- **Coverage maps written by `v8-to-istanbul` are no longer rejected**
+  (Closes [#2454](https://github.com/fallow-rs/fallow/issues/2454)). c8, nyc in
+  v8 mode, and older vitest versions write a map in which the implicit else of
+  a bare `if` carries `column: -1`. Positions are unsigned, so a single
+  unplaceable coordinate in `branchMap`, a section fallow never reads, aborted
+  the run with exit 2. Such coordinates are now clamped on a retry, which only
+  runs after the strict parse has failed.
+
+- **An accessor keeps its coverage whichever way the producer named it**
+  (Closes [#2456](https://github.com/fallow-rs/fallow/issues/2456)). Raw V8
+  coverage and `oxc-coverage-instrument` record `get area` and `set area` where
+  istanbul-lib-instrument leaves the record anonymous, and fallow extracts the
+  unit as `area`. A covered accessor was reported as unmeasured under the first
+  two. A record now answers to its property name as well as to the spelling the
+  producer recorded.
+
+
+
+- **A coverage map that attributes nothing to a function no longer lowers its
+  CRAP** (Closes [#2453](https://github.com/fallow-rs/fallow/issues/2453)). A
+  function whose file tests reach, but which no record in the map could be
+  attributed to, was scored as though it were fully covered, while the same
+  function without a coverage map kept the static estimate. Passing real
+  coverage data could therefore take a function under `--max-crap` that failed
+  the gate without it. Both paths now use the same estimate, so a map only ever
+  changes a score for a function it actually measured.
+
+
+
+- **A telemetry spool lock that cannot be opened is no longer reported as
+  contention.** `SpoolLock::try_acquire` mapped a lock file it could not open
+  (a read-only or missing directory, a permissions denial, a descriptor limit)
+  onto the same "no lock" outcome as another `fallow` process legitimately
+  holding it, and discarded the error. The two mean opposite things: contention
+  is normal and self-correcting, while an unopenable lock file skips every
+  spool drain and trim on every run, silently and permanently. The unopenable
+  case now carries the underlying error into the existing debug diagnostic, so
+  the condition is observable instead of invisible. No behavior change on the
+  contended path, and no telemetry is sent that was not sent before.
+
+- **Istanbul coverage now matches functions whose extracted position falls
+  between the producer's declaration and its body**
+  (Closes [#2448](https://github.com/fallow-rs/fallow/issues/2448),
+  [#2449](https://github.com/fallow-rs/fallow/pull/2449)). A class member
+  carrying a decorator and a wrapped parameter list is recorded with a
+  declaration on the decorator and a body below the signature, so neither
+  position identifies the member, and the innermost arrow of a curried chain
+  formatted one per line has the same shape. Fallow now reads that header span
+  when no established matcher resolves the position. Established matches keep
+  priority, and the span is read only when exactly one anonymous record covers
+  the position and no other function is declared inside it. Thanks to
+  [@PrinceD96](https://github.com/PrinceD96) for the report and the
+  implementation.
+
+- **A member whose parameter list holds a function no longer reports that
+  function's coverage** (Closes [#2448](https://github.com/fallow-rs/fallow/issues/2448)).
+  A default value, a decorator argument, or a class expression written in a
+  signature is a function of its own, a line or two from the member that holds
+  it, and the nearest-record fallback could credit either to the other. Inside
+  a signature a record now has to sit on the position or contain it, and where
+  neither does the member keeps the static estimate instead of a measured
+  number that belongs to different code.
+
+- **A coverage map with project-relative keys now joins from any working
+  directory** (Closes [#2448](https://github.com/fallow-rs/fallow/issues/2448)).
+  nyc and some Jest setups record keys relative to the project. Fallow resolved
+  them against the process directory, so a run from anywhere but the project
+  root lost the whole map at once and every function silently fell back to its
+  static estimate. They now resolve against the project root, the way the
+  coverage file path already does.
+
+- **Private class members no longer take coverage from the function that
+  encloses them** (Closes [#2448](https://github.com/fallow-rs/fallow/issues/2448)).
+  No instrumenter records a `#member` in its function map, so every candidate
+  one could reach belongs to some enclosing function. Such a member could be
+  reported as fully covered while it never ran. It now uses the static estimate
+  instead, and it is recorded under its own `#name` rather than `<anonymous>`,
+  so it is identifiable in complexity output. Private-member provenance is
+  stored separately from that display name, so a public string-named method
+  whose name begins with `#` remains eligible for exact coverage matching. The
+  rule sits at the one lookup entry point every consumer goes through, so the
+  test-covered check honours it as well.
+
+- **A `package.json` script reference now scopes the directory it names, not
+  every directory of that name in the tree**
+  ([#461](https://github.com/fallow-rs/fallow/issues/461)). A script argument
+  such as `node .tools/.private/build.mjs` made `.tools` and `.private`
+  traversable wherever either name appeared, so an unrelated
+  `packages/web/.private` was pulled into discovery by a script that never
+  referenced it. The inferred scope is now the exact root-relative path the
+  script named. Plugin-contributed conventions are unaffected: a framework's
+  `.client` and `.server` still match at any depth under the package that
+  activates the plugin, because the plugin declares a convention rather than a
+  location.
+
+- **More generated-output and VCS directories stay out of script scoping**
+  ([#461](https://github.com/fallow-rs/fallow/issues/461)). The script-scope
+  denylist covered the build caches of one framework generation. It now also
+  covers `.angular`, `.astro`, `.contentlayer`, `.expo`, `.react-router`,
+  `.rollup.cache`, `.sst`, `.swc`, `.tanstack`, `.velite`, `.vinxi`,
+  `.wrangler`, `.wxt`, `.yalc`, and the `.hg`, `.jj`, and `.svn` metadata
+  trees, so a script argument pointing into machine-written output or a VCS
+  object store no longer pulls it into source discovery.
+
+- **`.pnpm` can no longer be auto-scoped into discovery from a `package.json`
+  script.** `.pnpm` was missing from the script-scope denylist while
+  `.pnpm-store` was present, so a script argument such as
+  `node .pnpm/tool/bin.mjs` pulled pnpm's store layout into source discovery on
+  a repository that tracks it. Both the core and engine copies of the denylist
+  now carry it, with a boundary test that keeps them in sync. The
+  `node_modules/.pnpm` shape was already covered by the built-in `node_modules`
+  exclusion.
+
+### Performance
+
+- **Coverage matching no longer rescans a file for every unmatched function.**
+  Aliases and header spans are now indexed by line, which bounds each fallback
+  to the records that can reach the target position.
+
+## [3.20.0] - 2026-08-28
+
+### Added
+
+- **Yarn Plug'n'Play projects now resolve bare specifiers through the PnP
+  manifest** (Closes [#2444](https://github.com/fallow-rs/fallow/issues/2444),
+  [#2435](https://github.com/fallow-rs/fallow/pull/2435)). A PnP install has no
+  populated `node_modules`, so every bare import used to miss and fall through
+  to the much slower tsconfig fallback. fallow now detects `.pnp.cjs` at the
+  analyzed root or one of its ancestors, enables oxc's PnP resolution, and
+  anchors manifest discovery to that directory, so runs started outside the
+  project and editor sessions resolve the same way. Manifests that are not
+  inlined (`pnpEnableInlining: false`) are not supported and stay on the
+  fallback path. The generated `.pnp.cjs` and `.pnp.loader.mjs` files are no
+  longer discovered as project source, so they drop out of file counts and
+  never produce findings of their own. Thanks to
+  [@PatrickShaw](https://github.com/PatrickShaw) for the contribution.
+
+- **`fallow review` judgments carry an author-action label, and the guide
+  publishes the vocabularies.** A judgment returned through
+  `--walkthrough-file` may set `action` to `block`, `address`, `consider`, or
+  `fyi`; fallow validates it on reentry (`invalid-action` rejects anything
+  else) and passes it through fenced on the accepted judgment, so the author
+  receiving a note knows what is required and what is optional. The
+  walkthrough guide's `agent_schema` now lists `action_vocabulary` and a
+  recommended `concern_vocabulary` (the trade-off lenses). Review-brief
+  schema 7 -> 8.
+
+- **Direction units report test adjacency.** Each `direction.units[]` entry
+  in the walkthrough guide carries `test_adjacency` (`none`, `untouched`, or
+  `changed`): whether a test file imports the changed unit directly, and
+  whether that test moved with the change. The human and markdown tours
+  badge `NO-DIRECT-TEST` units; a project with no test files gets no claims. A graph fact, not a coverage claim; absent when the graph was not
+  retained or the unit is itself a test file.
+
+- **The review partition reports independent slices.** `partition` now
+  carries `independent_slices`: the connected components of the inter-unit
+  dependency graph. Two or more slices mean the change splits along a
+  graph-proven seam into pieces that can be reviewed and merged on their own;
+  the human brief names them. An orientation fact, never a demand to split.
+
+- **The decision surface's dependency arm now fires.** A changed
+  `package.json` that adds third-party entries, or moves a declared entry
+  across a major version (or a `0.x` minor), yields one batched `dependency`
+  decision per manifest per kind, weighted by the graph's in-repo importers
+  of the affected packages. The brief's `deltas` carry the same keys as
+  `dependency_added` (`<manifest>::<name>`) and `dependency_major_bumped`
+  (`<manifest>::<name>@<from>-><to>`). Minor and patch bumps and non-numeric
+  ranges (workspace, file, git, tags) are never candidates.
+
+### Changed
+
+- **Import resolution on large project-reference monorepos is faster.** The
+  per-run tsconfig and canonicalize caches no longer serialize every lookup
+  behind a single lock or deep-copy the parsed document on every hit
+  ([#2437](https://github.com/fallow-rs/fallow/pull/2437)). Thanks to
+  [@PatrickShaw](https://github.com/PatrickShaw) for the contribution.
+
+- **`--fail-on-issues` and `--ci` now fail on boundary violations and on
+  warn-severity findings when per-path `overrides` exist** (Closes
+  [#2445](https://github.com/fallow-rs/fallow/issues/2445)). With any
+  `overrides` entry configured, the exit-code check switched to per-file
+  severity resolution, and that path never consulted import-direction
+  boundary violations, so an error-severity `boundary-violation` was reported
+  but the run exited 0. The same path also skipped the warn-to-error
+  promotion of `--fail-on-issues`, so a `warn` rule plus any override exited 0
+  as well. Both now resolve per file and promote after override resolution.
+  Because the override path handles every file once any `overrides` entry
+  exists, this affects all `warn`-severity rules in a project that configures
+  overrides, not only the rules set inside the override block: a strict run
+  that previously exited 0 now exits 1 on those findings. To keep the previous
+  outcome, set the rule to `off` rather than `warn`, or drop
+  `--fail-on-issues` and `--ci` for that job. Thanks to
+  [@DeLuke84](https://github.com/DeLuke84) for the report.
+
+### Fixed
+
+- **A tsconfig without `include` or `files` now applies only to files under
+  its own directory when fallow follows `references`**
+  ([#2436](https://github.com/fallow-rs/fallow/pull/2436)). This matches tsc's
+  `**/*` default project scope. Previously such a referenced config matched
+  every file in the repository, so its `paths` leaked to files outside that
+  directory and every referenced project was walked for every import. Aliases
+  from a referenced package no longer resolve from a sibling package, and
+  monorepos with many `references` and no `include` resolve imports noticeably
+  faster. Imports that only resolved through that leak are now reported as
+  `unresolved-import` findings, which are error severity by default and will
+  fail `--fail-on-issues`, and a file that was only reachable through such an
+  import may now be reported as unused. If a subdirectory `tsconfig.json`
+  intentionally holds shared `paths`, give it an explicit `include`, or move
+  those aliases to a config whose directory contains the importing files.
+  Thanks to [@PatrickShaw](https://github.com/PatrickShaw) for the
+  contribution.
+
+- **Overload signatures, abstract members, and `declare function`
+  declarations no longer count as functions, and Istanbul coverage now matches
+  functions through their body location** (Closes
+  [#2442](https://github.com/fallow-rs/fallow/issues/2442),
+  [#2443](https://github.com/fallow-rs/fallow/pull/2443)). Function counts
+  drop for every file that carries those declarations, so its file score and
+  the project health score can move without any code change, and a file whose
+  declarations are all bodyless (an ambient `declare` module, for instance)
+  leaves the file-score table entirely. Coverage matching improves at the same
+  time: a function whose only structural match in the coverage map was its
+  body location now scores against real coverage instead of a static estimate.
+  Each removed declaration was a complexity-1 unit, so metrics averaged over
+  the function population can change on unchanged runtime code (average
+  cyclomatic complexity, its 90th percentile, and the share of functions over
+  60 lines). Per-file maintainability can also improve because a file's
+  complexity density is its total complexity divided by its lines, and the
+  combined project health score can move in either direction. Regression
+  baselines (`--regression-baseline`) compare
+  dead-code and dependency counts and are unaffected; re-save health baselines
+  (`--save-baseline`) if you run with `--coverage`, because a newly matched
+  function can cross the CRAP ceiling, changing the total tracked by `count`
+  mode or the set tracked by `identity` mode.
+
+  Mechanically, each `fnMap` entry contributes up to three candidate positions:
+  the producer's own, the declaration start, and the body start.
+  istanbul-lib-instrument records an expression-bodied arrow's body as the
+  next arrow in a curried chain, so a body-start alias yields to a declaration
+  at the same position, which keeps every arrow of a redux middleware, a
+  higher-order component, or a curried class property matchable. When two
+  nested anonymous candidates sit equally far from the target, the uniquely
+  strictly innermost body wins; when no such body exists, the function stays on
+  the estimate rather than being credited to a guess. Thanks to
+  [@PrinceD96](https://github.com/PrinceD96) for the report and the
+  contribution.
+
+## [3.19.0] - 2026-08-26
+
+### Added
+
+- **`fallow similar-code` adds opt-in semantic function discovery through a
+  pinned, verified local model.** It complements deterministic clone detection
+  with explicitly unverified candidates for functions that may share intent
+  despite different syntax. The separate workflow includes explicit local
+  setup, provider and model provenance, bounded completion accounting, a
+  persistent source-digest vector cache, source-grounded candidate inspection,
+  a fail-closed external verdict join, read-only MCP tools, and a Node API. It
+  is advisory and does not participate in bare analysis, audit gates, SARIF,
+  editor diagnostics, or auto-fix.
+
+- **`fallow agent install` wires a project's coding-agent harnesses in one
+  pass.** Onboarding an agent previously meant `fallow init --agents`,
+  `fallow hooks install --target agent`, hand-copying the MCP snippet from the
+  README, and knowing that a skill ships under `node_modules/fallow/skills`.
+  The new `agent` command detects Claude Code, Codex, and Cursor from the
+  project, the home directory, and the session environment (or takes
+  `--harness`), then writes what each one reads: an `AGENTS.md` task map (plus
+  an `@AGENTS.md` import in `CLAUDE.md` for Claude Code), the fallow skill
+  under `.claude/skills/` or `.agents/skills/` (a small pointer to the
+  project's own `node_modules/fallow` copy when it exists, otherwise a
+  version-matched copy embedded in the binary), the MCP server registration
+  in `.mcp.json`, `.codex/config.toml`, or `.cursor/mcp.json` (only after
+  probing that a `fallow-mcp` launcher exists), and the commit/push gate. Every
+  file or block carries a versioned `fallow:agent-install` marker, re-running
+  is byte-stable, `--dry-run` prints the plan, the human summary groups paths
+  into "shared with your team" and "local to you", and JSON output lists every
+  step with a `status` and `reason`. `fallow agent status` reports installed,
+  stale, absent, and foreign surfaces; `fallow agent uninstall` removes managed
+  content and deletes a file fallow authored only while it still matches what
+  fallow wrote. Pre-approving the project MCP server for Claude Code stays
+  opt-in through `--approve` and is refused when `.claude/settings.local.json`
+  is tracked by git. `init --agents` and `hooks install --target agent` are
+  unchanged and remain the single-piece commands underneath.
+
+- **The MCP server exposes reference material as resources.** `fallow-mcp`
+  now declares the `resources` capability next to `tools`. Agents can list and
+  read `fallow://tools` (the tool manifest with CLI fallbacks),
+  `fallow://issue-types` (every issue type with its zero-config default
+  severity, opt-in and fixable flags, and docs URL), `fallow://explain` (an
+  index) plus the `fallow://explain/{issue_type}` template (the same document
+  `fallow explain <issue-type> --format json` prints), `fallow://task-matrix`
+  (which read-only command to run before a task), and
+  `fallow://schema/config`, `fallow://schema/plugin`, and
+  `fallow://schema/rule-pack` (the JSON Schemas, byte-identical to the CLI
+  documents). Everything is rendered in-process and is JSON; the server
+  version travels in each content item's `_meta.fallow_version`, so a client
+  can cache by URI and invalidate on server version; unknown URIs and issue types return a
+  structured `resource_not_found` error with the known URIs or the nearest
+  issue types. `fallow schema` gains a matching `mcp_resources` block and the
+  shipped skill reference gains a generated resource table.
+- **size-limit presets, plugins, and config files are recognized**
+  ([#2413](https://github.com/fallow-rs/fallow/pull/2413)). size-limit loads
+  `@size-limit/*` and `size-limit-*` packages from `package.json` by convention
+  rather than by import, so a project that declared `@size-limit/preset-small-lib`
+  next to `size-limit` previously needed `ignoreDependencies` entries. A new
+  built-in `size-limit` plugin activates from the `size-limit` dependency,
+  credits every declared `@size-limit/*` and `size-limit-*` package, treats
+  `size-limit` itself as a tooling dependency, and keeps every config form
+  size-limit searches reachable (`.size-limit` and the `.json`, `.js`, `.cjs`,
+  `.mjs`, `.ts`, `.cts`, and `.mts` variants), including a config inside a
+  workspace package when the tool is hoisted to the monorepo root. A
+  `"size-limit"` array in `package.json` needs no config file. Thanks to
+  [@robinvdvleuten](https://github.com/robinvdvleuten) for the contribution.
+
+### Deprecated
+
+- **`fallow setup-hooks`.** `fallow agent install` (every harness in one pass)
+  and `fallow hooks install --target agent` (the gate alone) cover it. The
+  command keeps working throughout fallow 3 and prints a one-line warning on
+  stderr; it is removed in the next major.
+
+### Changed
+
+- **Fallow is listed in the official MCP Registry.** The repository ships the
+  registry's `server.json` next to an `mcpName` in the npm package, both
+  pinned to the released version by a policy test, so MCP clients that browse
+  the registry find `fallow-mcp` with its stdio launcher.
+- **`fallow impact statusline` now says when the Impact store was written by a
+  newer Fallow.** An older binary reading a newer store printed the generic
+  `data unavailable` line, which read as lost history. It now prints
+  `data from newer fallow · upgrade this fallow`, so the fix is visible in the
+  status bar and a statusline wrapper can retry with a current binary. Corrupt
+  or unreadable stores keep the `data unavailable` line.
+
+### Fixed
+
+- **StyleX theme variables now preserve the framework's real token shape and
+  theme application semantics.** Stable `defineVars` condition maps remain one
+  flat token instead of producing phantom `.default` leaves, while
+  `unstable_defineVarsNested` exposes its nested token paths. The CSS health
+  reverse index now includes same-file reads and treats `createTheme` plus
+  `unstable_createThemeNested` as full variable-group consumers, including
+  partial overrides and empty reset themes. Named aliases and namespace/default
+  imports of the StyleX API, the `stylex` package name, local static token
+  objects, and StyleX in a workspace package without a root dependency are
+  supported. Cross-file token contracts require direct named imports; barrel,
+  default, and namespace token-contract imports conservatively abstain, as do
+  custom `importSources`, CommonJS, `stylex.env`, and dynamic token structure.
+
+- **React Native and Expo platform-extension families are no longer reported
+  as duplicate exports** (Closes
+  [#2407](https://github.com/fallow-rs/fallow/issues/2407)). Since 3.11.0 an
+  import of `./UserMenu` credits every member of a Metro family
+  (`UserMenu.tsx`, `UserMenu.ios.tsx`, `UserMenu.web.tsx`, ...), which made
+  the siblings share an importer and surface in `duplicate-exports` as a pair.
+  With the `react-native` or `expo` plugin active, `dead-code` now folds each
+  family into one representative (the base file when present, otherwise the
+  lowest path) before duplicate detection. A genuine duplicate in an unrelated
+  file is still reported and names that file next to the family
+  representative. Projects without those plugins keep the previous output.
+
+## [3.18.0] - 2026-08-25
+
+### Added
+
+- **A repo whose root `package.json` declares overrides next to bun's legacy
+  binary `bun.lockb` now explains why no unused-override findings are
+  reported** (Closes [#2358](https://github.com/fallow-rs/fallow/issues/2358)).
+  Since the bun.lock support the `unused-dependency-overrides` check skips
+  silently when `bun.lockb` sits next to the root `package.json` and no
+  parseable text lockfile (`bun.lock`, `pnpm-lock.yaml`, `package-lock.json`,
+  or `npm-shrinkwrap.json`) is there to use instead (a `yarn.lock` is never
+  consulted), because resolution ground truth is unreadable and
+  declaration-only analysis would flag every transitive-only pin. The skip
+  now records a `bun-lockb-override-resolution-skipped` workspace diagnostic
+  anchored at the root `package.json` (in the `dead-code`, `check`, and
+  `health` `workspace_diagnostics[]` JSON envelopes plus one deduplicated
+  stderr warning) with the hint to run `bun install --save-text-lockfile`
+  (bun 1.2 or newer) so a text `bun.lock` exists, or to delete the stale
+  `bun.lockb` in a repo that no longer uses bun. Manifests without overrides,
+  repos with a parseable text lockfile next to the `bun.lockb`, and repos
+  without any lockfile are unaffected. The bare combined `fallow` JSON
+  envelope carries it at the envelope root, in the top-level
+  `workspace_diagnostics[]`; no section of the combined envelope repeats it
+  (see the [#2366](https://github.com/fallow-rs/fallow/issues/2366) fix
+  below). The diagnostic kind is additive on the
+  `workspace_diagnostics[].kind` union; consumers that exhaustively match on
+  `kind` should treat unknown kinds as informational.
+
+- **bun repositories that pin transitive versions under Yarn-style
+  `resolutions` now get `unused-dependency-overrides` and
+  `misconfigured-dependency-overrides` findings for those entries** (Closes
+  [#2367](https://github.com/fallow-rs/fallow/issues/2367)). bun reads
+  `resolutions` as an alias of `overrides`, but the override analyzer only
+  parsed the top-level `overrides` object and `pnpm.overrides`, so a bun
+  repository whose root `package.json` used `resolutions` was never
+  analyzed: no findings with any lockfile, and next to a `bun.lockb` no
+  `bun-lockb-override-resolution-skipped` diagnostic either, because no
+  override state was gathered. When the root `packageManager` names bun, or
+  no recognised `packageManager` is declared and a `bun.lock` or `bun.lockb`
+  sits at the root, the `resolutions` entries now run through the same
+  analysis as `overrides`: resolved against the text `bun.lock`, reported
+  with `source: "package.json"` and the entry's line, and carrying the bun
+  hint, which names `resolutions` so the entry is easy to locate. bun's key
+  dialect is honoured: `pkg`, `@scope/pkg`, `pkg@<2`, the yarn paths
+  `parent/child`, `**/child`, and `parent/**/child`, and the pnpm
+  `parent>child` form all parse; paths deeper than one parent and non-string
+  values, which bun warns about and skips, are reported as misconfigured.
+  bun consults `resolutions` only when the manifest has no `overrides` key,
+  so a manifest carrying both is analyzed for `overrides` alone. A
+  `resolutions`-only manifest next to a `bun.lockb` without a parseable text
+  lockfile now records the skip diagnostic. yarn, npm, and pnpm repositories
+  are unchanged: `resolutions` is not an override source there, and the yarn
+  hint for inert `overrides` entries stays as it was. Suppress an entry with
+  `ignoreDependencyOverrides: [{ "package": "...", "source": "package.json"
+  }]`. The JSON contract is unchanged; only the `source` field description
+  mentions the new origin.
+
+- **The VS Code extension now publishes platform-specific packages for macOS,
+  Linux, and Windows.** Each targeted VSIX carries only its matching semantic
+  backend, reducing normal extension downloads by roughly 82 to 84 percent.
+  The existing universal package remains available as a compatibility fallback.
+
+### Changed
+
+- **Machine-readable capability metadata now derives supported output formats,
+  aliases, and public exit codes from the CLI definitions.** `fallow schema`,
+  the packaged capability manifest, public adapters, and agent guidance now
+  share the same contract and are guarded against drift.
+
+- **Trace JSON now omits redundant per-namespace reference evidence when only
+  one namespace has consumers.** The existing `namespace` and
+  `direct_references` fields retain their meaning, while
+  `direct_references_by_namespace` remains available when both the type and
+  value lanes carry distinct evidence. This reduces serialization work and
+  made the stable trace graph benchmark roughly 46 percent faster in local
+  WallTime measurements, with the matching CodSpeed simulation also improving.
+
+- **Extension publication now verifies every public target before a release can
+  complete.** Visual Studio Marketplace and Open VSX use isolated publisher
+  jobs, while a credential-free gate downloads and validates the exact
+  universal and platform-specific payloads from both registries.
+
+- **Re-exports from a bare specifier inside a `declare module '...'` body are
+  classified as type-only package usage.** An ambient body is erased at
+  runtime, so `declare module 'shim' { export { A } from 'some-dep' }` and
+  `declare module 'shim' { export * from 'some-dep' }` reference `some-dep`
+  in type space only. A production dependency referenced solely through such a
+  re-export now yields the existing type-only-dependency finding in
+  `--production` mode (the named form has done so since
+  [#2349](https://github.com/fallow-rs/fallow/issues/2349); the star form
+  previously counted as runtime usage). Move the package to
+  `devDependencies`, or add it to `ignoreDependencies` when the ambient
+  declaration intentionally describes a runtime package.
+
+### Fixed
+
+- **The Convex plugin now honors a custom `convex.json#functions` directory**
+  (Closes [#2387](https://github.com/fallow-rs/fallow/issues/2387)). A valid
+  in-project path replaces the default `convex/` entry root, including the
+  matching `_generated` exclusions and special Convex entry files. Missing,
+  malformed, empty, or escaping values keep the safe default. Projects using a
+  custom root will no longer report those runtime modules as unused files;
+  files outside that root remain eligible for unused-file findings. Thanks to
+  [@pierre-H](https://github.com/pierre-H) for reporting the gap.
+
+- **Inline GitHub and GitLab review findings now follow explicit discussion
+  lifecycles** ([#2370](https://github.com/fallow-rs/fallow/pull/2370)). Clean
+  reruns do not repeat resolution replies, while a genuine recurrence opens a
+  fresh reviewable lifecycle. Provider identity, pagination, and mutation
+  mismatches fail closed. Thanks to [@Jerc92](https://github.com/Jerc92) for
+  the contribution.
+
+- **Windows npm launcher verification now covers every production path**
+  ([#2289](https://github.com/fallow-rs/fallow/pull/2289)). Host-independent
+  fixtures exercise lazy verification and sentinel cache behavior in regular
+  CI and release validation. Thanks to
+  [@NgoQuocViet2001](https://github.com/NgoQuocViet2001) for the groundwork in
+  [#2288](https://github.com/fallow-rs/fallow/pull/2288).
+
+- **Dead-code traces, symbol impact, and type-aware proof now agree on
+  namespace, reachability, and ambiguity** (Closes
+  [#2390](https://github.com/fallow-rs/fallow/issues/2390)). Declaration merges
+  and dual-lane references use declaration-safe evidence, unreachable or
+  re-export-only checker evidence cannot suppress a finding, and star collisions
+  return an additive ambiguity payload plus human `AMBIGUOUS` status instead of
+  ordinary unused or not-found output. Valid alias, import-type, and qualified
+  namespace reads now remove false unused findings, while unread imports,
+  dangling re-exports, and type references to a distinct same-name declaration
+  no longer remove valid findings.
+
+- **Namespace and star-re-export crediting now covers the remaining equivalent
+  binding shapes** (Closes
+  [#2391](https://github.com/fallow-rs/fallow/issues/2391)). Require and dynamic
+  import bindings, re-exported type namespaces, nested ambient bindings, Vue
+  template handovers, and whole-object member-detector abstention now match
+  static namespace imports. Dotted-only reads stay narrow, so genuinely unused
+  siblings continue to report, while exports reachable through a whole-object
+  handover no longer report falsely. Warm extraction and graph caches
+  invalidate.
+
+- **MCP and typed programmatic routes now share CLI option, error, and
+  diagnostics semantics** (Closes
+  [#2392](https://github.com/fallow-rs/fallow/issues/2392)). Explicit coverage
+  and production options retain precedence over environment and config values,
+  `FALLOW_MAX_FILE_SIZE` reaches typed analysis, health preserves its structured
+  engine error, and project/list/dupe routes no longer inherit analysis-stage
+  diagnostics from earlier calls in the same process. The generated Code Mode
+  description now identifies the actual subprocess-backed tools.
+
+- **Typed MCP analysis no longer stalls while assembling next-step facts on
+  Windows.** Engine-owned Git probes now detach from protocol stdin instead of
+  retaining the long-lived MCP input handle. Analyze and health keep their
+  existing thread selection and output contracts while fresh MCP processes can
+  return the first response normally.
+
+- **MDX statement extraction now shares one source-mapped TSX stream across
+  dead-code and duplication analysis** (Closes
+  [#2393](https://github.com/fallow-rs/fallow/issues/2393)). Multiline imports
+  and exports, JSX initializers, dynamic imports, comments, strings, and later
+  valid statements after rejected prose retain their original spans. Valid
+  dependencies and clone groups that were previously dropped now appear, while
+  import-looking prose and compacted cross-line token artifacts no longer
+  create false findings. Warm extraction and duplication token caches
+  invalidate.
+
+- **Dependency-override analysis now parses selectors and lockfile failure
+  states without unsafe removal advice** (Closes
+  [#2394](https://github.com/fallow-rs/fallow/issues/2394)). Qualified npm and
+  pnpm selectors plus JSON-escaped keys keep correct source locations, corrupt
+  text `bun.lock` files emit a diagnostic and fail closed, and Bun resolutions
+  shadowed by overrides are diagnostic-only. Human and integration output now
+  counts misconfigured overrides and uses package-manager-neutral guidance.
+
+- **CSS Module crediting now treats supported extensions and default-import
+  spellings consistently** (Closes
+  [#2395](https://github.com/fallow-rs/fallow/issues/2395)). CSS, SCSS, Sass,
+  and Less modules share one narrowing rule; `import { default as styles }`
+  matches a default import; whole-object handovers credit the full class map;
+  and equal class names in different modules no longer form cross-file
+  duplicate-export findings. Precise member reads still leave unused classes
+  reportable, including an ordinary class named `default`.
+
+- **Standalone analysis envelopes now carry the diagnostics produced by their
+  own workspace run** (Closes
+  [#2396](https://github.com/fallow-rs/fallow/issues/2396)). Dead-code, check,
+  health, dupes, and applicable security routes use root-relative, deterministic
+  run-owned diagnostics instead of a stale process registry. Listing and
+  project-info surfaces remain call-order independent and omit analysis-stage
+  diagnostics they did not produce.
+
+- **Equivalent default-export spellings now share crediting and duplicate
+  rules** (Closes
+  [#2397](https://github.com/fallow-rs/fallow/issues/2397)). Ambient plain stars
+  expose only the star surface, named `default` specifiers are excluded from
+  cross-module duplicate grouping like `export default`, and a default import
+  from one provable static `module.exports = { ... }` map narrows to the members
+  the consumer reads. Transpiled, mixed, reordered, spread, and computed
+  CommonJS forms retain their conservative behavior. This can add valid unused
+  data-key findings and remove false findings for accessed keys. Warm extraction
+  and graph caches invalidate.
+
+- **`export type *` inside a `declare module '...'` body no longer creates a
+  file-level star re-export on the declaring file** (Closes
+  [#2375](https://github.com/fallow-rs/fallow/issues/2375)). The
+  [#2357](https://github.com/fallow-rs/fallow/issues/2357) fix routed
+  `export *` and `export * as ns` inside an ambient body through a bindingless
+  whole-module import, but the `export type *` and `export type * as ns`
+  spellings kept the pre-existing type-only star re-export because that shape
+  carried no type modifier. Both spellings now take the same shape, flagged
+  type-only, and the graph credits the target's star surface in the type
+  namespace alone. The movement runs in both directions. On a reachable
+  non-entry shim (`declare module 'pkg' { export type * from './impl' }` in a
+  `.ts` file) nothing credited the target before, so the type half of a
+  same-name type and value pair reported even though the star forwards it:
+  **that false positive is gone, and so are the rows for the target's
+  value-only exports**, which the star forwards as well and which a consumer
+  can still reach through `typeof`, the same credit the ambient
+  `export type { x }` form has given since
+  [#2349](https://github.com/fallow-rs/fallow/issues/2349). On an entry-point
+  `.d.ts` the star laundered every target export into the entry's public
+  surface, so **the value half of a same-name pair reported nowhere and now
+  reports**. `export type *` forwards no `default`, exactly like the plain
+  star; `export type * as ns` exposes the namespace object in type space, so
+  it forwards `ns.default`. Plain `export *` and `export * as ns` inside an
+  ambient body are unchanged, and so are the ambient named re-export forms and
+  `import()` type references. Two more findings move into line with the plain
+  ambient star: a file whose ambient body only carries `export type *` no
+  longer takes part in a re-export cycle finding, and when the declaring file
+  is unreachable the target's own export rows report alongside the
+  unused-file rows. Known limitation: the value-meaning erasure reaches the
+  target's own exports only. Names the target re-exports through its own
+  `export *` or `export * as sub` chain are still credited in both
+  namespaces, exactly as the plain star credits them, so the value half of a
+  same-name type and value pair one hop behind the target stops reporting
+  while the same pair on the target keeps reporting. Warm caches invalidate
+  (`CACHE_VERSION` 279 to 280, `GRAPH_CACHE_VERSION` 43 to 44).
+
+- **A namespace import handed over whole (a call argument, a JSX attribute
+  value, an alias, an initializer) now credits every export of its target**
+  (Closes [#2377](https://github.com/fallow-rs/fallow/issues/2377)). The
+  visitor recorded a whole-object use for an allow-list of positions only:
+  `Object.keys/values/entries/getOwnPropertyNames(NS)`, a spread, `for ... in`,
+  a computed non-string access, a rest destructure, and a few type positions.
+  Every other reference to an `import * as NS` local left no trace, so a
+  consumer that also wrote one dotted access narrowed to that member alone and
+  reported every sibling the receiver can still reach: `register(NS)`,
+  `<Callout icons={NS} />`, `const alias = NS`, `[NS]`, `{ icons: NS }` handed
+  to a callee, `export const all = NS`, `slot = NS`, `return NS`, and
+  `typeof NS`. A reference the parser resolves to one member is unchanged and
+  keeps narrowing: `NS.member`, `NS?.member`, `NS['member']`, a JSX member tag
+  `<NS.Card />`, a dotted type name `NS.Type`, a destructure, and a namespace
+  placed in an object literal bound to a local whose path is read
+  (`const api = { NS }` plus `api.NS.member`, the shape the namespace-object
+  alias phase follows precisely). A bare reference to that local
+  (`hand(api)`) now hands the namespace on as well. `export { NS }` is
+  unchanged: the graph already credits every export there. This initial rule
+  is scoped to `import * as` locals; the later namespace-equivalence fix in
+  this release extends the same whole-object credit to namespace objects bound
+  by `require` or a dynamic import. Named imports remain unchanged. Since
+  Astro and MDX consumers got this guarantee from their whole-file
+  completeness guard, only `.ts` / `.tsx` / `.js` / `.jsx` consumers change.
+  **Repositories using
+  any of these shapes will see fewer unused-export findings**, and an export
+  credited for the first time also becomes reachable, so member-level
+  detectors can report on it where the unused-export finding used to stand in
+  its place. The record is also deduplicated now: a name recorded opaquely
+  many times is one entry. Warm caches invalidate (`CACHE_VERSION` 277 to 278,
+  `GRAPH_CACHE_VERSION` 41 to 42).
+
+- **`import X = require('./x')` now records an import edge** (Closes
+  [#2365](https://github.com/fallow-rs/fallow/issues/2365)). The extractor had
+  no arm for a `TSImportEqualsDeclaration` with an external module reference,
+  so the TypeScript spelling of a CommonJS require produced no import at all:
+  the target was reported as an unused file and nothing reached through the
+  binding was credited. The declaration now records exactly what a
+  `const X = require('./x')` declaration records, so the target resolves
+  through the CommonJS mechanism, member accesses through `X` narrow the
+  target's exports the way a namespace import does, and a binding used as a
+  whole object (`Object.values(X)`) credits the full namespace object,
+  including the names the target only exposes through its own `export *`
+  chain. Narrowing covers both semantic spaces: the binding is classified for
+  type and value usage like a namespace import, so `X.SomeType` in an
+  annotation credits the target's type export instead of leaving it reported
+  as an unused type. `import type X = require('pkg')` is the one spelling
+  TypeScript erases completely, so it keeps the type-space edge but is never
+  read as a runtime import: a type-only devDependency stays out of
+  `dev-dependency-in-production`, matching `import type * as X from 'pkg'`.
+  A bare reference that hands the module object on (`register(X)`,
+  `const alias = X`, `return X`) credits every export the receiver can reach,
+  matching the namespace-import rule added in
+  [#2377](https://github.com/fallow-rs/fallow/issues/2377).
+  `export import X = require('./x')` additionally hands the module object to
+  consumers the graph cannot enumerate, so every export of the target keeps
+  its credit exactly as it does behind `import * as X from './x';
+  export { X }`, including on an entry point with no local member access
+  ([#2373](https://github.com/fallow-rs/fallow/issues/2373)) and whatever else
+  the file happens to bind under that name. The two spellings still differ in
+  one place, in the conservative direction: `export { X }` is an export row, so
+  a re-export nothing imports reports as an unused export, while the
+  import-equals binding records no export row and never does.
+  In the other direction a binding nothing references credits
+  nothing at all: TypeScript elides such a declaration, so the target keeps
+  every unused-export and unused-type row it earns, exactly as it does behind
+  an unreferenced `import * as X from './x'`. The edge still resolves, so the
+  target is a reachable file either way.
+  Repositories that use the form will see fewer unused-file and
+  unused-export findings, and the exports of a file that becomes reachable for
+  the first time are narrowed against the members the consumer writes, so a
+  sibling nothing accesses surfaces as an unused export where the unused-file
+  row used to stand in its place. Total finding count is not guaranteed to
+  decrease: the edge is visible to every check that reads imports, so an
+  import-equals whose specifier does not resolve now reports
+  `unresolved-import`, and a bare specifier no manifest lists reports
+  `unlisted-dependency`, exactly as the equivalent `import X from './x'`
+  already did. `import X = Some.Namespace` is deliberately unchanged: an
+  entity-name reference aliases a binding declared in the same file, not a
+  module, so it records no edge. Warm caches invalidate (extract
+  `CACHE_VERSION` 278 to 279, `GRAPH_CACHE_VERSION` 42 to 43); the first run
+  after upgrading performs one cold re-analysis.
+
+- **A `default` import or re-export specifier now credits the target's default
+  export** (Closes
+  [#2374](https://github.com/fallow-rs/fallow/issues/2374)). `default` is one
+  importable name that either side may spell two ways, and the graph's
+  per-module export-name index keyed on the spelling instead of the name, so
+  no pairing that mixed the two spellings ever met and the target's default
+  export kept reporting as unused. Every producer that records `default` under
+  its written name is affected, including `import { default as X } from
+  './impl'`, an ambient `declare module 'pkg' { export { default } from
+  './impl' }` (and the mixed `export { default as Impl, Y as Z } from './impl'`,
+  where `Y` was credited and the default was not), a JSDoc
+  `import('./impl').default` type reference, a destructured
+  `const { default: X } = require('./impl')`, and a plain
+  `import x from './impl'` against a module whose default is written
+  `export { x as default }` or `exports.default = x`. A `export { default }
+  from` chain lost the credit at every hop when a `default` specifier consumed
+  it. The index now reads and writes a single default slot however each side
+  spells the name. Two shapes are deliberately unchanged: a plain
+  `export * from './impl'` still does not forward `default`, however the target
+  spells it, and a class spelled `.default` in a CSS Module (`.module.css`,
+  `.module.scss`, `.module.sass` or `.module.less`) is still an ordinary class,
+  credited only by the member accesses the consumer writes. One shape moves the
+  other way: a CommonJS `default` property is the binding a default import
+  reads, so a plain data key named `default` on a `module.exports` object
+  literal now stops reporting once anything default-imports that module.
+  Repositories using any of these shapes will see fewer unused-export findings.
+  A default export credited for the first time also becomes reachable, so
+  member-level detectors such as unused class members can now report on it
+  where the unused-export finding used to stand in its place. Warm graph caches
+  invalidate (`GRAPH_CACHE_VERSION` 39 to 40); the extract cache is untouched.
+
+- **An MDX prose sentence that opens with the word "import" no longer drops
+  every import of the file** (Closes
+  [#2376](https://github.com/fallow-rs/fallow/issues/2376)). The MDX line scan
+  classified any line starting with `import ` / `import{` / `export ` /
+  `export{` as JavaScript, so a sentence such as `import the thing and render
+  <NS.Moon /> here.` joined the statement lines the parser reads as one
+  program. The parser aborts on the first fatal error and returns an empty
+  program, so the whole file lost its imports: the imported modules were
+  reported as unused files, and nothing the body rendered was credited. A line
+  is now a statement only when it carries a shape a real statement has, a
+  source clause (`from` followed by its specifier quote, with any whitespace
+  JavaScript accepts in between and before the keyword), a brace specifier
+  list, a star specifier, a string-literal
+  side-effect import, or, after `export`, a brace list, a star, or a
+  declaration keyword (`const`, `let`, `var`, `function`, `class`, `async`,
+  `default`, plus the TypeScript heads `type`, `interface`, `enum`,
+  `namespace`, `declare`, and `abstract`, which are recognised as statement
+  shapes and then handled by the fallback below rather than surviving as
+  statements), or when the line parses as JavaScript on its own, which keeps
+  valid heads no specifier pattern names (`import /* c */ './x'`, a top-level
+  dynamic `import ('./x')`) out of prose while a prose sentence, which does
+  not parse, stays there. As a safety net, a statement block the parser rejects on its own is
+  demoted to prose and the remaining blocks are re-parsed, so the file keeps
+  the imports the rejected block used to take with it (a TS-only `import type`
+  clause, which the JSX source type the MDX statement body is parsed with does
+  not accept, now costs only itself). Demotion works per block, so a
+  multi-line specifier list is never split, and a demoted line still feeds the
+  prose scan, so a namespace or CSS-module binding mentioned on it keeps its
+  mark-all crediting instead of narrowing. Behavior change: MDX documents with
+  such a line now resolve their imports, so their targets leave the unused-file
+  list, the members their bodies render are credited, and their genuinely
+  unused siblings surface as unused exports. The affected document's own
+  exports are read too, so an `export const` nothing consumes now reports as an
+  unused export on the `.mdx` file itself. A multi-line MDX declaration whose
+  continuation line carries the word `from` inside a string (`summary:
+  'Written from scratch'`) is collected whole rather than cut one line short,
+  so that declaration parses and its unconsumed export reports as well.
+  Duplication reads the same statement
+  body, so clones inside an affected document, and the duplication share of its
+  health score, now surface where the file previously tokenized to nothing.
+  The extraction, graph, and duplication token cache versions were bumped; the
+  first run after upgrading performs one cold re-analysis.
+
+- **The MCP `audit` and `check_health` tools now honor `health.coverage`,
+  `health.coverageRoot`, `FALLOW_COVERAGE`, and `FALLOW_COVERAGE_ROOT` on
+  their typed route** (Closes
+  [#2368](https://github.com/fallow-rs/fallow/issues/2368)). Both tools run
+  in-process through the programmatic API whenever their parameters map
+  cleanly to it, and that route built its options from the explicit
+  `coverage` / `coverage_root` parameters only, so an agent calling them on a
+  repository that configured coverage for `fallow health` got estimate-based
+  CRAP attribution (`coverage_source: estimated`) while the same call with a
+  parameter that forces the CLI fallback (`explain_skipped`, a baseline,
+  `group_by`, runtime coverage, type-aware) honored the keys since
+  [#2359](https://github.com/fallow-rs/fallow/issues/2359). The precedence
+  now has one pure owner, `fallow_api::coverage::resolve_coverage_inputs`
+  (parameter or flag, then environment, then config, then engine
+  auto-detection, each input independently), which the CLI and both MCP
+  tools delegate to; the tools read the env vars at the adapter boundary and
+  load the config's `health` section only when a higher layer leaves an
+  input unset. A relative `health.coverage` is resolved against the analysis
+  root before the programmatic existence check, so the documented
+  project-relative form works when the MCP server's working directory is not
+  the project. A configured map that does not exist and a relative
+  `coverage_root` from any layer keep the structured
+  `FALLOW_INVALID_COVERAGE_PATH` / `FALLOW_INVALID_COVERAGE_ROOT` errors; the
+  root error's `context` now names the layer that supplied the value
+  (`health.coverageRoot`, `FALLOW_COVERAGE_ROOT`, or the tool's own
+  parameter), and a CLI run that scores health rejects a relative winning
+  root before analysis starts with the same exit 2 and message as before (a
+  bare run that excludes health, `--only check` or `--skip health`, never
+  reads the coverage inputs). Repositories that configured coverage will see
+  MCP finding counts and verdicts move in both directions, because real
+  coverage replaces the reachability estimate: a well-covered hotspot drops
+  out of the findings and an uncovered one can rise above `max_crap`. The
+  Node-API bindings still take `coverage` / `coverageRoot` as explicit
+  options and read neither the env vars nor the config fields; their
+  relative-path validation now follows the analysis root like every other
+  programmatic caller. The env manifest
+  (`capabilities.json`), the MCP parameter descriptions, the
+  `health.coverage` / `health.coverageRoot` field docs (`schema.json`), and
+  the environment-variable docs no longer tell MCP callers to pass the inputs
+  explicitly.
+
+- **Whole-module consumers of a barrel now credit the exports the barrel only
+  exposes through its own `export *` and `export * as` chains** (Closes
+  [#2372](https://github.com/fallow-rs/fallow/issues/2372)). Five consumer
+  shapes credited the target's direct exports only: a namespace import the
+  graph cannot narrow to member accesses (`import * as ns from './barrel'`
+  used as a whole object in `Object.values(ns)`, a spread, or a destructure
+  with rest, or handed on without any member access), a namespace binding
+  exported under its own name (`export { ns }`, on an entry point as much as
+  on any other module), an `export * as sub` binding imported by name and used
+  as a whole object (`import { sub } from './barrel'` plus
+  `Object.values(sub)`), a dynamic-import pattern match (`import()` with a
+  template, `import.meta.glob`, `require.context`), and a bare side-effect
+  `require('./barrel')` with no binding. A name that reached the barrel
+  through `export * from './deep'` or `export * as sub from './sub'` was
+  reported as unused even though the consumer observes every name on the
+  namespace object. These consumers now seed the same closure the
+  ambient-module star form from
+  [#2357](https://github.com/fallow-rs/fallow/issues/2357) uses: the barrel's
+  `export *` sources credit their named exports (never `default`, which a
+  plain `export *` does not forward), its `export * as sub` sources credit
+  every export (`default` included, because `sub.default` is on the object),
+  and both rules recurse through sub's own chains. A member-narrowed namespace
+  import (`ns.one()`) keeps narrowing to the accessed members and credits
+  nothing else, and a binding placed in an exported object literal
+  (`export const API = { ns }`) keeps the precise `API.ns.<member>` crediting
+  of the alias phase unless it is also used as a whole object or exported
+  under its own name. A barrel no entry point reaches keeps reporting when one
+  of these five consumers is what observes it: that consumer is unreachable
+  too, the barrel is already an unused file, and crediting its chain would
+  only stack unused-export rows underneath that row. The ambient-module star
+  form is deliberately not gated that way, because the module id it declares
+  is imported from outside the graph: an unreachable `declare module` shim
+  keeps crediting its chain, which routinely runs back into modules an entry
+  point imports directly. A whole-object use inside an unreachable file still
+  suppresses the reachable target's chain, exactly as it already suppressed
+  that target's direct exports, so deleting the unused file the report names
+  brings the chain back on the next run.
+
+  Two properties of the seed are worth naming. `export type { ns }` seeds the
+  closure exactly like `export { ns }` and credits the chain in the value
+  namespace as well, because `typeof ns.member` keeps a value declaration
+  reachable through a type-only re-export. And a namespace binding exported
+  under its own name seeds the closure whether or not that export has a
+  consumer, so a report can call `m.ts:ns` unused while crediting the whole
+  chain behind it, the same self-inconsistency the unreachable-observer case
+  has. Fewer unused-export findings for star barrels consumed as whole
+  objects, through a named namespace binding, or through dynamic-import
+  patterns. The graph cache version was bumped, so the first run after
+  upgrading performs one cold re-analysis.
+
+- **`export * as sub` on the entry-point surface now credits sub's own
+  `export *` and `export * as` chains** (Closes
+  [#2373](https://github.com/fallow-rs/fallow/issues/2373)). For
+  `export * as sub from './sub'` on an entry point, on a barrel the entry
+  reaches through plain `export *`, or named by the entry through a chain of
+  named re-exports (`export { sub } from './barrel'`, renames included), every
+  direct export of `sub.ts` was credited but neither its
+  `export * from './deep'` sources nor its `export * as sub2` sources were:
+  the entry star closure walked plain `export *` edges only, and only entry
+  points counted as exposing a namespace object. Every name on sub's namespace
+  object is reachable through the entry, so sub now joins the same closure:
+  deep's named exports are credited (never deep's `default`), every export of
+  sub2 is credited (`default` included), and the rules recurse through any
+  further level. The entry surface is tracked by name, so a barrel the entry
+  reaches only through `export { one } from './barrel'` still exposes `one`
+  and nothing else; a barrel that declares its own `sub`, or that receives
+  `sub` from two `export *` sources at once, exports a different binding under
+  that name and stops the chain there, whether the entry names the barrel or
+  reaches it through a plain `export *`; a namespace re-export on a reachable
+  non-entry barrel that is off the entry surface and has no consumer still
+  exposes nothing; and the entry's plain `export *` still never forwards the
+  barrel's own `default`, so `export * as default` on such a barrel keeps
+  reporting while the same declaration on the entry point itself is credited.
+  Fewer unused-export findings for nested namespace re-exports behind an entry
+  point.
+
+  One shape reports one finding more. A plain `export *` hop inside a chain no
+  longer carries a downstream `export * as default` onward, because that star
+  never forwards `default`, so an
+  `export * from './barrel'` whose barrel does `export * from './mid'` over a
+  `mid` that does `export * as default from './target'` now reports target's
+  exports. That includes the ambient form from
+  [#2357](https://github.com/fallow-rs/fallow/issues/2357), where an
+  `export * as default` declared directly on the ambient star's own target
+  still credits its chain. Nothing else in the issue-2357 behaviour moves: an
+  ambient chain is seeded and walked at any reachability, exactly as it was.
+
+- **`dead-code --trace` no longer reports a value export as unused when its
+  only credit is a bound `import type` of that export** (Closes
+  [#2371](https://github.com/fallow-rs/fallow/issues/2371)). `dead-code`
+  credits `export const helper` referenced through `import type { helper }`:
+  the graph's type lane falls back to the value declaration when no type
+  declaration of that name exists, and the unused-export analyzer counts the
+  reference regardless of namespace. The trace selected the value namespace
+  for the value export, read only value-lane references, and printed
+  `is_used: false` with an empty `direct_references`, so an agent following
+  the "trace before deleting" guidance got two contradictory answers. The
+  trace now reports the references that credit the traced declaration: when
+  the preferred namespace carries none and the other namespace resolves to
+  the same declaration, it reports that lane's references and sets
+  `namespace` to the lane that carries them, so the repro returns
+  `namespace: "type"`, `is_used: true`, and the `import type` consumer in
+  `direct_references` (human output prints `USED` and `Namespace: type`).
+  When both lanes carry references the value namespace still wins; an
+  unreferenced export still reports `is_used: false`; and a same-name
+  `export type Foo` next to `export const Foo` keeps the value export on
+  `value` and unused under a type-only import, because the import credits the
+  type declaration and `dead-code` reports the value one. Declaration merges
+  across lanes now resolve through declaration-safe evidence, so trace and
+  dead-code agree while distinct same-name declarations remain isolated. The
+  `namespace` field may therefore now be `type` for a value export. `is_used`
+  follows reachable references only, so consumers in unreachable files no
+  longer make trace disagree with dead-code. Every consumer of the export trace
+  inherits the correction: the `trace_export` MCP tool, the typed API, the
+  `trace_symbol` root trace, and `fallow inspect --symbol` (both its
+  `identity.is_used` / `identity.reason` and its `evidence.trace_export`
+  section, in the CLI and in the `inspect` MCP tool); the LSP reference lens
+  already counted the type-only use. The class-member trace
+  (`--trace FILE:MEMBER`) is built from the same export trace, so a member of
+  an export credited only through the type lane inherits it too:
+  `owner_is_used`, `owner_direct_references` and the reason string describe
+  the crediting lane, the payload gains an additive `owner_namespace` naming
+  that lane, and the human trace prints an `Owner namespace:` line. Under
+  `--type-aware`, checker proof follows declaration-safe lanes and rejects
+  unreachable or re-export-only evidence, so it no longer contradicts the
+  dead-code verdict. `semantic.target.namespace` continues to name the lane
+  covered by the proof.
+  No cache version changed: the trace is a read-only query over the graph, so
+  a warm `.fallow` directory written by a previous release returns the
+  corrected trace.
+
+- **The bare combined `fallow --format json` envelope now carries the
+  analysis-stage workspace diagnostics that `dead-code`, `check`, and
+  `health` already carry** (Closes
+  [#2366](https://github.com/fallow-rs/fallow/issues/2366)). A malformed
+  `pnpm-workspace.yaml` (`malformed-pnpm-workspace-yaml`) and the bun.lockb
+  override-resolution skip (`bun-lockb-override-resolution-skipped`) reached
+  `workspace_diagnostics[]` on every standalone JSON envelope, but the bare
+  combined run (dead code plus duplication plus health) printed neither at
+  the root nor under `check`, while the stderr warning still appeared. Two
+  causes: the combined envelope had no diagnostics field at all, and every
+  per-analysis config reload inside the combined run replaced the diagnostics
+  registry while preserving only the source-discovery kinds, so the entries
+  the analyze pass had recorded were wiped before the envelope was built. The
+  combined envelope now carries a top-level `workspace_diagnostics[]` with the
+  same root-relative paths the standalone envelopes use, deduplicated on the
+  whole `kind` (typed payload included) plus `path`, and omitted when empty.
+  Keying on the payload is what keeps two overlapping workspace globs
+  (`["packages/*", "packages/*/*"]`) reporting the same package-less directory
+  once per `pattern`, the way the standalone envelopes do. It is the union of
+  what every analysis in the run recorded, which matters because a combined
+  run walks the project once per analysis and a per-analysis `production` mode
+  (`production: { deadCode, health, dupes }`, `--production-health`) can give
+  those walks different file sets: reporting only what the last walk saw would
+  drop, for example, a `skipped-large-file` that the dead-code walk recorded
+  for a test file the production health walk never looks at. For the
+  source-discovery and analysis-stage kinds on a run whose analyses share one
+  mode, the array is exactly what the standalone `dead-code` envelope carries,
+  in the same order. For workspace-discovery kinds, each analysis contributes
+  the run-owned list produced by its config load. Standalone envelopes now use
+  their own run-owned list too, while the combined array can remain broader
+  when its analyses intentionally use different production modes because it is
+  their union. The carrier is the envelope root
+  rather than a section, so a run that drops a section (`--skip check`,
+  `--only health`, `--only dupes`) reports every diagnostic its analyses
+  recorded instead of dropping them while stderr warns. The `check`, `dupes`,
+  and `health` sections stay report bodies and never repeat the array. Config
+  reloads preserve analysis-stage entries the way they preserve
+  source-discovery entries, and each dead-code analyze pass clears its
+  previous analysis-stage entries before re-recording, so a watch-mode rerun
+  or a long-lived engine session (MCP, LSP) drops the diagnostic once the YAML
+  is fixed or a text `bun.lock` exists instead of keeping a stale entry. Two
+  audit-family envelopes gain kinds too: `fallow audit --format json` under
+  `dead_code.workspace_diagnostics[]`, and the `audit-brief` envelope shared
+  by `fallow review --format json` and `fallow audit --brief --format json`,
+  also under `dead_code`. Those two arrays already carried the config-load
+  workspace-discovery kinds and the source-discovery kinds, so the change
+  there is three additional kinds, not a field that was previously always
+  empty: the two analysis-stage ones plus `undeclared-workspace`, which the
+  analyze pipeline appends after the config-load stash and a later
+  per-analysis reload used to wipe before the envelope was built. Only the
+  combined root is a genuinely new field. Both sections are already typed as
+  the `dead-code` envelope body, so the widening is additive; the MCP `audit`
+  tool and the programmatic combined route (MCP code mode, NAPI, embedders)
+  answer the same as the CLI, including when per-analysis `production` modes
+  make the run's walks disagree. Each analysis now carries the diagnostics its
+  own walk produced instead of reading the shared registry back after the
+  fact, so a combined run whose `production` split makes it walk the project
+  twice in parallel reports the same union, in the same order, on every run:
+  the array no longer depends on which of the two parallel walks wrote to the
+  shared registry last. Each of those folds closes with a process-registry
+  read for the kinds an analysis records after its list was captured (a
+  parse-stage `source-read-failure`, or the analysis-stage kinds the health
+  run's own dead-code precompute records), and that read now drops the
+  walk-recorded kinds, so a split can no longer make an envelope report a
+  `skipped-large-file` for a file the analysis it belongs to never walked:
+  `fallow audit --format json` under `production: { deadCode: true }` reported
+  the test file the non-production health walk skipped while the MCP `audit`
+  tool reported none, and they now agree. The combined envelope's new root
+  field is optional and absent when there are no diagnostics, so no
+  `schema_version` moves. The carrier work does not touch the standalone
+  `dead-code`, `check`, `health`, and `dupes` envelopes or any non-JSON
+  format; the three envelopes named above change whenever the run records a
+  diagnostic. Two of the changes described next do reach those four standalone
+  envelopes, and either one alone is enough to move them: the recorded
+  `pattern`, `path`, and `message` change on a repository whose manifests spell
+  any workspace glob with a leading `./`, and the entry count drops on a
+  repository that declares one glob, or reaches one workspace member, through
+  two sources. A repository with neither shape reports the same bytes on those
+  four envelopes as before. Two further shapes move for a shared reason: the
+  fold is deduplicated on the whole typed `kind` rather than its id, so bare
+  `fallow list --format json` and the envelopes built from an engine session's
+  snapshot (the MCP `project_info`, `find_dupes`, and `check_health` tools,
+  and the programmatic dead-code and combined routes) now report a
+  package-less directory matched by two workspace globs once per `pattern`
+  instead of once in total, matching what `fallow list --workspaces --format
+  json` already reported. Because the payload now decides identity, the
+  recorded `pattern` drops the no-op `./` prefix a `package.json` `workspaces`
+  entry may carry (`"./apps/**"` is reported as `apps/**`, in the JSON field
+  and in the warning text; a glob spelled exactly `"./"`, the project root
+  itself, keeps its spelling), and the recorded `path` drops the matching no-op
+  `.` component, so one directory has one spelling everywhere instead of
+  `./pkgs/aaa` on the analysis envelopes next to `pkgs/aaa` on the workspace
+  listing, decided by which manifest happened to be read first. Workspace
+  discovery deduplicates before it returns, not only the process registry:
+  `package.json` `workspaces`, `pnpm-workspace.yaml` `packages`, `deno.json`
+  `workspace`, and the root `tsconfig.json` references are additive sources,
+  so one glob declared in two of them is walked twice. A repository that
+  declares one glob in both `package.json` and `pnpm-workspace.yaml`, which is
+  the conventional pnpm layout, reported every package-less directory under
+  that glob TWICE, once per spelling, on `fallow dead-code`, `check`, `dupes`,
+  `health`, `list --workspaces`, and `workspaces --format json`, through the
+  MCP `project_info` tool, and under `dead_code` in `fallow audit` and `fallow
+  review --format json`; it now reports each once, so such a repository sees a
+  finding-count decrease on those surfaces. The human surfaces render the same
+  list, so three of them move with it: the aggregated stderr warning names the
+  directory count the repository actually has and each example directory once
+  instead of counting the duplicates, the `N workspace discovery diagnostics`
+  summary line every human-format command prints names the deduplicated
+  count, and so does the per-entry block `fallow workspaces` and `fallow list
+  --workspaces` print. SARIF, markdown, compact, badge, CodeClimate, and the
+  cache format carry no workspace diagnostic and are unchanged. The repair
+  covers the case where both manifests spell the glob identically too, which
+  produced byte-identical duplicates before this change as well. A second
+  shape folds with it, on the same surfaces: a
+  malformed workspace member reached through BOTH an npm glob and a root
+  `tsconfig.json` `references[]` entry reported one `malformed-package-json`
+  diagnostic per source and now reports one in total. Two overlapping globs
+  declared in ONE manifest
+  (`["packages/*", "packages/a*"]`) still report the same directory once per
+  `pattern`, because the payload is part of the key. No kind is new on those
+  envelopes and no field changes type, so no `schema_version` moves.
+
+- **The `list-workspaces` envelope now emits a project-relative
+  `workspace_diagnostics[].path`** on `fallow workspaces --format json`,
+  `fallow list --workspaces --format json`, and bare `fallow list --format
+  json`. Every
+  other envelope that carries the array reports the path relative to the
+  project root, and so does the `workspaces[].path` field right next to it in
+  the same envelope, but the list envelope emitted the absolute path because
+  it is the one envelope with no post-serialization root-prefix strip. A
+  diagnostic for `packages/inner` now reads `"path": "packages/inner"` instead
+  of `"path": "/Users/you/project/packages/inner"`, so the output no longer
+  leaks the checkout location and no longer differs between two checkouts of
+  the same repository. The MCP `project_info` tool, which shares the same
+  builder, is fixed with it. A diagnostic path outside the project root
+  (canonicalisation crossed a symlink) stays absolute, matching how the
+  human-readable `message` renders it. Consumers that joined the emitted path
+  onto the project root already got the right answer for every other envelope
+  and now get it here too; a consumer that treated this one field as absolute
+  needs to join it onto the root. Joining onto the project root is the
+  portable comparison, and the two envelope families now agree on the spelling
+  as well: a workspace glob written as `"./apps/**"` no longer leaves a `./`
+  prefix on the analysis envelopes' copy of the same diagnostic, so the same
+  directory reads the same on both. The typed
+  `workspace_diagnostics[]`
+  schema description also said the kinds are "surfaced during config load",
+  which has been wrong since source-discovery diagnostics joined the array
+  in [#1086](https://github.com/fallow-rs/fallow/issues/1086); it now names
+  all three recording stages and which envelopes each kind can reach.
+
+- **Star re-exports inside `declare module '...'` bodies credit the full ES
+  star surface of their target without adding to the declaring file's export
+  surface** (Closes [#2357](https://github.com/fallow-rs/fallow/issues/2357)).
+  `declare module 'pkg' { export * from './impl' }` and the
+  `export * as ns from './impl'` form were still recorded as file-level star
+  re-exports, so when the declaring `.d.ts` was an entry point every export of
+  `./impl` was laundered into that entry's public surface, and when it was
+  not, nothing in `./impl` was credited at all. The ambient declaration states
+  that all of `./impl` is reachable through `pkg`, so the two star forms now
+  credit `./impl`'s full ES star surface directly. That surface is every
+  named export of `./impl` in both the type and the value namespace (so
+  `interface User` plus `const User`, or a zod-style `const User` plus
+  `type User`, keep both halves), including names `./impl` only exposes
+  through its own `export *` and `export * as sub` chains, recursively, and
+  every export of such a `sub` namespace, `default` included, because
+  `sub.default` is reachable. Plain `export *` never forwards `default`, so an
+  otherwise unused default export of `./impl` or of one of its `export *`
+  sources keeps reporting, while `export * as ns` exposes `ns.default` and
+  credits it. The declaring file exposes no star re-export (visible in
+  `inspect --file` and `dead-code --trace`), and genuinely unused exports in
+  unrelated modules keep reporting. Every other ambient form is unchanged:
+  the named re-export from
+  [#2349](https://github.com/fallow-rs/fallow/issues/2349)
+  (`export { User } from './impl'`), explicitly type-only re-exports
+  (`export type { User } from`, `export { type User } from`,
+  `export type * from`), and `import('./impl').User` type references in
+  TypeScript and JSDoc keep crediting type space only. An unreferenced `.ts`
+  file whose only content is an ambient star declaration is now reported as
+  an unused file while its ambient star still credits the target's exports
+  (the laundered star re-export edge previously kept such a shim off the
+  unused-file list; the named ambient form already reported this way). Both
+  the extraction and graph cache versions were bumped, so the first run after
+  upgrading performs one cold re-analysis.
+
+- **Member-expression component tags in Astro markup and MDX bodies
+  (`<SC.Card />`) now credit the referenced export** (Closes
+  [#2355](https://github.com/fallow-rs/fallow/issues/2355)). The Astro
+  template scan credited only the tag root, and the MDX extractor read only
+  `import` / `export` lines, so a namespace import rendered exclusively through
+  a dotted tag in `.astro` or `.mdx` markup kept its exports reported as
+  unused, and in entry-point pages every sibling export of the namespace
+  target was falsely flagged. Astro now records dotted tags from the markup
+  and runs every `{ ... }` expression region the parser accepts through the
+  same member-recording visitor `.tsx` uses (`icon={SC.Moon}`,
+  `{SC.helper()}`, `Object.keys(SC)`); MDX records dotted tags and dotted
+  chains from prose lines. Narrowing then applies under one structural
+  guarantee for Astro and MDX consumers: a namespace import (or a CSS module
+  default import, the other binding whose exports the graph narrows by member
+  access) narrows to the recorded members only when every mention of the
+  binding in the whole file was structurally understood: in Astro markup a
+  component tag root or a parsed `{ ... }` expression region, in MDX a prose
+  line outside code, and in the Astro frontmatter or on an MDX `import` /
+  `export` line a static dotted access the visitor recorded or a JSX tag root.
+  Every other mention records a whole-object use that keeps every export
+  credited, for entry-point pages as well: a `define:vars` or `set:html`
+  directive on a `<style>` / `<script>` tag, an HTML comment, text content, an
+  attribute string, an expression the parser rejects, an MDX fenced code block
+  or inline code span, a template literal the MDX line scanner cannot tell
+  apart from a code span, and a script-side alias, cast, call argument,
+  `Object.assign`, array or object literal element, or JSX attribute value
+  (`const N = NS`, `pick(NS)`, `export const all = NS`,
+  `<Callout all={NS} />`). Behavior change: a namespace import in a non-entry
+  Astro or MDX consumer whose every mention is a dotted tag, a parsed
+  expression, or a recorded dotted script access now narrows to the members
+  actually accessed instead of marking every export used, so genuinely unused
+  siblings surface for the first time; every other shape keeps the previous
+  mark-all crediting, which can hide an unused sibling but never reports a
+  used one. Astro expression accesses also reach the consumers that already
+  read frontmatter accesses (CSS module default-import narrowing, enum and
+  class member crediting), matching what `.tsx` records; the markup guard
+  covers those bindings too, so an enum or class mentioned in an HTML comment,
+  text content, or an attribute string of an Astro or MDX template credits
+  every member. MDX prose records dotted chains only for import locals of the
+  file, so a documentation sentence naming `process.env.API_KEY` never makes
+  the MDX module a secret source for `fallow security`. Both the extraction
+  and graph cache versions were bumped; the first run after upgrading performs
+  one cold re-analysis.
+
+- **JSX member-expression tags (`<SC.Wrapper />`) now credit the referenced
+  export** (Closes
+  [#2348](https://github.com/fallow-rs/fallow/issues/2348)). The syntactic
+  scan only recorded plain-expression member accesses, so a namespace import
+  rendered exclusively through JSX kept its exports reported as unused, and in
+  entry-point files every sibling export of the namespace target was falsely
+  flagged. Behavior change: namespace imports in non-entry consumers now
+  narrow to the members actually used instead of marking every export used, so
+  genuinely unused siblings surface for the first time. Both the extraction
+  and graph cache versions were bumped; the first run after upgrading performs
+  one cold re-analysis.
+
+- **Declarations inside `declare module '...'` augmentation and ambient-module
+  bodies are no longer reported as unused exports of the containing file**
+  (Closes [#2349](https://github.com/fallow-rs/fallow/issues/2349)). An
+  `export interface` inside a module augmentation describes the augmented
+  module, so following the previous remove-export advice broke type checking.
+  Named re-exports inside ambient bodies still credit their target symbols and
+  keep the source file reachable. The extraction cache version was bumped, so
+  the first run after upgrading performs one cold re-extract (relevant to CI
+  cache sizing). Existing `fallow-ignore` suppressions placed above
+  augmentation-scoped declarations as a workaround now surface as
+  stale-suppression findings (warn by default) and can be removed.
+
+- **`fallow audit` now honors `health.coverage` and `health.coverageRoot` from
+  config** (Closes
+  [#2359](https://github.com/fallow-rs/fallow/issues/2359)). Audit resolved
+  Istanbul coverage only from `--coverage`, `FALLOW_COVERAGE`, and the
+  auto-detected `coverage/coverage-final.json`, so a repository that
+  configured coverage once for `fallow health` still got estimate-based CRAP
+  attribution in audit while its health score used real coverage. Audit now
+  shares the health resolution order (CLI flag, then `FALLOW_COVERAGE` /
+  `FALLOW_COVERAGE_ROOT`, then the config keys, then auto-detection), and the
+  resolved map feeds both the head pass and the rebased base attribution
+  pass; its path and content participate in the base-snapshot cache key, so a
+  config change invalidates cached base snapshots. Behavior change:
+  `FALLOW_COVERAGE_ROOT` now applies to audit as well, an empty
+  `FALLOW_COVERAGE` is ignored instead of being read as a path, a
+  configured coverage file that does not exist fails audit with the same
+  structured exit 2 as `fallow health`, and a relative `health.coverageRoot`
+  is rejected with the same `--coverage-root expects an absolute path`
+  exit 2. The MCP `audit` and `check_health` typed routes now apply the same
+  explicit, environment, and config precedence through the programmatic parity
+  fix later in this release.
+
+- **Inner `export` declarations of a namespace declared without the `export`
+  keyword are no longer reported as unused exports of the containing file**
+  (Closes [#2356](https://github.com/fallow-rs/fallow/issues/2356)). A
+  top-level `namespace Foo { export const inner = 1 }` (also
+  `declare namespace`, legacy `module Foo {}`, dotted `namespace A.B.C {}`,
+  and namespaces nested inside those or inside `declare global`) is a local
+  binding, so `inner` is a member of `Foo` rather than a file export, and
+  following the previous remove-export advice broke consumers of `Foo.inner`.
+  Imports referenced inside such a body keep their credit, and exported
+  namespaces keep their existing member extraction. Both the extraction and
+  graph cache versions were bumped; the first run after upgrading performs one
+  cold re-analysis. Existing `fallow-ignore` suppressions placed above these
+  declarations as a workaround now surface as stale-suppression findings (warn
+  by default) and can be removed.
+
+- **`fallow audit` now scores the base attribution pass with the same Istanbul
+  coverage map as the head pass.** The base worktree pass previously matched no
+  coverage entry (the map records head-checkout paths), silently fell back to
+  the reachability estimate, and flipped unchanged high-CRAP functions to
+  `introduced` (#2347). The rebase applies to `--coverage`, `FALLOW_COVERAGE`,
+  and auto-detected `coverage/coverage-final.json` maps; base functions shifted
+  by unrelated edits still match their coverage entry when the function name is
+  unambiguous in its file. Attribution can shift after upgrading: both sides
+  now score from the head-generated map, so complexity findings in files the
+  map reports as untested attribute as inherited once the base function also
+  exceeded the threshold, and coverage regressions surface through
+  `rules.coverage-gaps` and health trends rather than `introduced` complexity
+  findings.
+
+- **`unused_dependency_overrides` no longer flags transitive-only overrides in
+  bun repositories.** bun declares overrides through the same top-level
+  `overrides` key as npm, but override resolution only consulted
+  `pnpm-lock.yaml` and `package-lock.json`, so every override targeting a
+  transitive dependency in a bun repo was reported as unused even though the
+  target resolved in `bun.lock`. These are commonly CVE-fix pins, so acting on
+  the finding would have been a security downgrade. `bun.lock` (a JSONC file)
+  is now parsed into the resolved-package set, and `npm-shrinkwrap.json` is
+  read alongside `package-lock.json` so shrinkwrap repos get the same
+  transitive crediting. When the only lockfile is bun's legacy binary
+  `bun.lockb`, resolution ground truth is unreadable and the check emits
+  nothing instead of degrading to declaration-only analysis; a stale
+  `bun.lockb` next to a parseable pnpm or npm lockfile does not disable the
+  check. The transitive hint now follows the root `package.json`
+  `packageManager` field first and the lockfiles present as fallback
+  (`bun install --frozen-lockfile` / `npm ci`), yarn repos are told that
+  `overrides` is inert and `resolutions` is the yarn mechanism, and the
+  finding's suggested actions no longer hardcode pnpm file names or commands.
+  (Closes [#2341](https://github.com/fallow-rs/fallow/issues/2341).)
+
+## [3.17.0] - 2026-08-16
+
+### Added
+
+- **Type-aware `check` and `audit` results now render directly as GitHub or
+  GitLab PR comments and inline-review envelopes.** The four CI presentation
+  formats consume the final semantically refined findings, while JSON remains
+  the provenance-bearing artifact. Required incomplete semantic analysis fails
+  closed instead of producing an apparently clean comment.
+- **`fallow report --from <results.json>` now renders
+  `pr-comment-github`, `pr-comment-gitlab`, `review-github`, and
+  `review-gitlab`.** Saved audit pass/warn/fail conclusions, diff positions,
+  ownership grouping, and repository path prefixes survive the round trip.
+  The bundled GitHub Action and GitLab CI helpers now analyze once and render
+  comment/review surfaces from the saved JSON artifact.
+
+### Fixed
+
+- **Type-aware analysis now starts reliably from npm and VS Code on Windows**
+  (Closes [#2284](https://github.com/fallow-rs/fallow/issues/2284)). The npm
+  launcher invokes the companion through Node instead of asking Windows to
+  execute its `.mjs` file directly. The VS Code package now includes every
+  supported TypeScript-Go backend, and Windows child processes stay hidden
+  while preserving the existing process-tree controls.
+- **Type-aware public-signature scans no longer expand every property behind an
+  external generic constraint**
+  (Closes [#2269](https://github.com/fallow-rs/fallow/issues/2269)). A public
+  generic such as `T extends z.ZodTypeAny` made the checker walk the constraint's
+  complete structural graph even when it contained no project-local coupling.
+  Type parameters now follow only their explicit constraint, preserving local
+  constraint edges while keeping external named types bounded.
+- **Type-aware analysis no longer claims complete evidence when the raw
+  TypeScript-Go host cannot resolve named Svelte virtual-module exports**
+  (Closes [#2270](https://github.com/fallow-rs/fallow/issues/2270)). Named
+  imports, named re-exports, and wildcard re-exports from `.svelte` modules now
+  return the stable `svelte-virtual-module-exports` gap reason with guidance to
+  validate framework diagnostics through `svelte-check`. Default-only imports
+  and declaration-backed named exports remain supported.
+- **Ambiguous `export *` collisions no longer create misleading findings
+  against their contributing source files**
+  ([#2268](https://github.com/fallow-rs/fallow/pull/2268),
+  [#2283](https://github.com/fallow-rs/fallow/pull/2283)). Fallow suppresses
+  ambiguity-attributable unused declaration, unused member, unrendered
+  component, and unprovided injection findings. `fallow trace` exposes the
+  additive `star_export_ambiguity` field with the contributing origins and
+  namespaces.
+- **The bundled GitHub Action now bounds installed-binary verification with a
+  hard deadline** (Closes
+  [#2273](https://github.com/fallow-rs/fallow/issues/2273)). Verification runs
+  from a file under a supervising process, preserves normal verifier exit
+  statuses, and exits with status 124 plus one focused workflow error on
+  timeout.
+
+### Changed
+
+- **Type-aware wire protocol 7 and semantic schema 3 add the closed
+  `svelte-virtual-module-exports` reason.** Every versioned JSON root that can
+  embed this contract advances its schema version. Strict machine-readable
+  consumers should regenerate validators from the current output schema;
+  unversioned trace and inspect roots are unchanged.
+
+### Performance
+
+- **Named-export propagation reserves its transient index up front**, avoiding
+  repeated hash-table growth in re-export-heavy graphs.
+- **Root JSON discriminators are inserted in place**, avoiding a temporary
+  rebuild of the complete object for explain and related envelopes.
+- **Clone spread calculation uses one-pass insertion-ordered bucketing**
+  instead of sorting every occurrence path while preserving report order and
+  spread semantics.
+- **Local TypeScript and Vue declaration deduplication happens once at module
+  emission**, preserving first-declaration spans and source order without a
+  second owned name per declaration.
+
+## [3.16.0] - 2026-08-13
+
+### Fixed
+
+- **Windows: `--gate new-only` no longer reports pre-existing findings as
+  introduced.** The base-snapshot focus set is built from
+  `git rev-parse --show-toplevel`, whose spelling can differ from the
+  canonicalized project root (8.3 path components, drive-letter case), so no
+  path mapped into the base worktree and the base dead-code results were
+  filtered away entirely. Every inherited finding then looked introduced and
+  failed the gate. Path matching now compares simplified and canonicalized
+  forms, and a base run whose focus set cannot be expressed leaves its results
+  unfiltered instead of filtering them against an empty set.
+- **`thresholdOverrides` and `maxCrap` now reach file scores and refactoring
+  targets** (Closes [#2228](https://github.com/fallow-rs/fallow/issues/2228)).
+  File scoring and the target rules previously compared CRAP against a fixed
+  30.0, so a file whose findings were fully exempted by an active override (or
+  a raised global `maxCrap` / `--max-crap`) still counted
+  `crap_above_threshold`, was tagged `risk` at the top of triage ordering, and
+  surfaced as an `add_test_coverage` target suggesting a suppression for a
+  finding that no longer exists. Threshold-relative signals now honor the same
+  effective per-function ceilings the findings honor, in both directions: a
+  raised ceiling removes the tag, count, and target, while a lowered ceiling
+  (for example `--max-crap 10`) raises the count and can add the target. The
+  count also uses the rounded per-function CRAP value, so boundary functions
+  agree exactly with the findings list. Measured values (`crap_max`) stay raw,
+  and affected rows disclose the exemption: `file_scores[]` gains additive
+  optional `crap_exempted` (breaches at the canonical 30 baseline let through
+  by configuration) and `crap_effective_threshold` (the file's lowest
+  effective ceiling, present only when it differs from
+  `summary.max_crap_threshold`), the human report marks exempt rows with a
+  dimmed `exempt (override)` / `exempt (raised threshold)` token and states
+  the risk bands relative to the configured ceiling, and the `crap_max` target
+  factor reports the effective ceiling instead of a hardcoded 30.0. Global
+  `maxCrap: 0` (CRAP enforcement disabled) now also clears the scoring
+  surfaces and is called out in the section note. Default-configuration output
+  is unchanged apart from the rounded boundary alignment; hotspots and the
+  overall health score are unaffected.
+- **GitLab inline-review jobs now warn when posting only partially succeeds.**
+  The shell wrapper's jq condition previously failed on every valid error-array
+  payload, silently hiding both reconciliation and comment-posting failures.
+  Its temporary API files are now tracked by the existing exit cleanup, and an
+  unused shell pagination helper has been removed now that provider pagination
+  is owned by the typed Rust posting path.
+- **Build and tooling scripts no longer make devDependencies look like
+  production dependencies.** Files referenced from package.json scripts stay
+  reachable for dead-code analysis, but only npm's
+  `start`/`prestart`/`poststart` lifecycle and scripts invoked from it contribute
+  production reachability. This prevents `dev-dependencies-in-production`
+  false positives from build pipelines such as Style Dictionary and SVGO while
+  preserving the rule for start-only services.
+
+- **Factory-less `jest.mock`/`vi.mock` of a scoped package no longer fabricates
+  a phantom `unlisted-dependency` finding**
+  (Closes [#2213](https://github.com/fallow-rs/fallow/issues/2213)). The
+  speculative `__mocks__` sibling candidate synthesized for automock calls
+  (`@scope/__mocks__/pkg`) could classify as an npm package and surface as an
+  unlisted dependency named `@scope/__mocks__`, blocking gated CI runs in Jest
+  projects. Speculative mock candidates that resolve to package space are now
+  dropped in the resolver; manual-mock discovery through relative and aliased
+  specifiers is unchanged.
+
+### Added
+
+- **Top-level Svelte `{#snippet}` blocks are scored as their own complexity
+  units** (Closes [#2227](https://github.com/fallow-rs/fallow/issues/2227)).
+  Each `{#snippet name(params)}` opened at logic-block nesting 0, including a
+  snippet declared as a component-tag child, becomes a `<snippet:name>` unit:
+  its body is scored with nesting rebased to zero and no longer accumulates
+  into the parent `<template>` unit, so Svelte's idiomatic in-file
+  decomposition now moves the score exactly like the equivalent file split
+  (previously it changed nothing and even carried a nesting surcharge).
+  `<snippet:name>` is an exact-match key for
+  `health.thresholdOverrides[].functions`; on `.svelte` files snippet findings
+  suppress with `<!-- fallow-ignore-next-line complexity -->` above the
+  reported anchor line, and the `.svelte` refactor advice names the snippet
+  lever before a file split. Snippets nested inside `{#if}`/`{#each}`/other
+  snippets stay folded into the enclosing unit for now. Unit counts and the
+  unit-level aggregates (`avg_cyclomatic`, `p90_cyclomatic`,
+  `unit_size_profile`, `unit_interfacing_profile`,
+  `functions_over_60_loc_per_k`) move on snippet-using Svelte projects, and
+  through them the health score can move. A snippet unit's `line_count` is
+  its `{#snippet}`..`{/snippet}` block span, while the parent `<template>`
+  unit keeps its whole-file line count, so those lines are intentionally
+  counted in both units: the `<template>` unit already counts every script
+  function's lines the same way, and region-accurate line counts for all
+  template dialects remain a named follow-up. **Action required for baselined
+  CI**: new `<snippet:name>` unit names create new health-baseline buckets in
+  both `identity` and `count` modes, so a baseline saved before this release
+  overflows (the gate flips red, not merely stale) on snippet-using Svelte
+  code; re-save the baseline as part of the upgrade, before the next gated
+  run.
+
+### Changed
+
+- **Synthetic template-family units no longer participate in the CRAP
+  dimension** (Closes [#2235](https://github.com/fallow-rs/fallow/issues/2235)).
+  A `<template>` unit (Angular `.html` and inline decorator templates, Vue,
+  Svelte, and Astro markup) and the new Svelte `<snippet:name>` units are
+  exercised only through their component, so their CRAP coverage term could
+  never be measured: with the default `maxCrap` of 30, the dimension acted as
+  a hidden second cyclomatic gate at 5 (untested file), 10 (test-reachable or
+  Angular-inherited), or 28 (directly test-referenced). This release removes
+  that unsubstantiated coverage claim, not a check: the cyclomatic and
+  cognitive gates on templates are unchanged. Template findings no longer
+  carry `crap`, `coverage_pct`, `coverage_tier`, `coverage_source`, or
+  `inherited_from`; a template that breached only on CRAP emits no finding;
+  surviving template findings can drop in severity without the CRAP
+  escalation; and template units no longer count toward `crap_max`,
+  `crap_above_threshold`, refactoring-target coverage factors, or the
+  Istanbul match statistics, so file scores for template-dominant files lose
+  their CRAP risk axis and can re-order. A `maxCrap` ceiling scoped to a
+  template unit (the shape v3.15.0's remediation advice suggested) now
+  reports a matched crap-dimension row reading `stale` with no CRAP value and
+  copy saying the entry can be removed, never a `no_match` typo warning.
+  Existing health baselines absorb the severity downgrades (a baselined
+  `critical` covers the finding's new lower tier), so this change alone does
+  not flip a baselined CI red; the snippet-unit change above is the one that
+  requires a baseline re-save. Rendering a pre-3.16 saved JSON envelope
+  through `fallow report --from` still works; legacy template rows with
+  `exceeded: "crap"` render against the updated rule text.
+- **`<component>` rollups are built from extracted template complexity, not
+  from the findings list.** An Angular component keeps its rollup even when
+  its template produces no finding of its own (previously the rollup vanished
+  with the template finding, which after the CRAP change would have silently
+  dropped every rollup whose template breached only on CRAP). A component
+  whose class fires while its template sits below the ceilings can now emit a
+  rollup that previously required a template finding; rollup totals and
+  anchors are unchanged, and suppressing the template or the worst class
+  method still hides it.
+
+- **Threshold override rows carry the measured span and read `stale` on
+  suppressed units.** `threshold_overrides[]` metrics gain an additive
+  `line_count` field on complexity rows (absent on CRAP and `<component>`
+  rollup rows, which never score unit size), so a
+  `still breaches: complexity` claim sits next to the number it was scored
+  on; human and compact output render it as `lines=N`, markdown as
+  `N lines`. A unit
+  hidden by an inline `fallow-ignore` comment now reports its matching
+  override as `stale` with position and metrics instead of `no_match`,
+  matching the existing CRAP-side behavior; a `maxUnitSize` ceiling still
+  scores suppressed units because suppression covers the finding, not the
+  large-function list. The human threshold-override section is now capped
+  like file scores: rows are prioritized by actionability (`no_match`,
+  `insufficient`, `active`, then `stale`), at most 10 are printed, and an
+  overflow line names what was hidden; JSON stays uncapped. No schema
+  version bump: the new field is additive.
+## [3.15.0] - 2026-08-11
+
+### Added
+
+- **Near-miss clone detection, spread-aware ranking, and a reviewed-clones
+  ignore list** (Closes [#2155](https://github.com/fallow-rs/fallow/issues/2155)).
+  `fallow dupes --near` (config `duplicates.near`) additionally detects
+  function-scoped clones with small structural edits; near matching always
+  uses semantic shingles while exact matching keeps the selected mode, and
+  near groups carry a `similarity` score. Every clone-group finding now
+  includes a `spread` field, and `--top` ranking multiplies token count and
+  occurrences with a capped spread boost, so clones scattered across distant
+  files rank above local ones. A new `duplicates.ignoredClones` config list
+  (`"dup:<fingerprint>:<instance_count>"` entries) silences clone groups a
+  reviewer has accepted; fingerprints hash the normalized token sequence, so
+  formatting-only edits keep a reviewed clone recognized.
+
+### Changed
+
+- **The complexity contribution kind is now non-exhaustive.** Rust workspace
+  consumers should keep a wildcard arm when matching
+  `ComplexityContributionKind`, so later analyzer vocabulary can grow without
+  another exhaustive-match break. Rust crate APIs are workspace integration
+  surfaces and are not part of Fallow's semver-stable consumer contract.
+- **TypeScript output versions are envelope-specific.** Each output field now
+  references its own exact literal alias, so version-gated consumers should use
+  `CheckSchemaVersion`, `HealthSchemaVersion`, or the corresponding envelope
+  type. The legacy `SchemaVersion` export remains an alias of
+  `CheckSchemaVersion` for source compatibility.
+- **Health JSON schema version 10: `threshold_overrides[]` rows carry a
+  `dimension`.** One configured `health.thresholdOverrides` entry now emits one
+  row per threshold dimension it participates in (`complexity` for the
+  cyclomatic and cognitive ceilings, `crap` for the CRAP ceiling), because
+  raising `maxCyclomatic` says nothing about whether the unit still breaches
+  `maxCrap`. `dimension` is required and always present, so the rows are not
+  byte-identical for an unchanged consumer path and the health
+  `schema_version` moves from 9 to 10. The bare combined envelope embeds the
+  same health report, so combined `schema_version` moves from 9 to 10 with it;
+  the audit envelope does not embed the health contract and stays at 9.
+  `status` gains a fourth value,
+  `insufficient`, for an override that raises a ceiling the code still exceeds;
+  such an override previously emitted no row at all. A new optional
+  `outstanding[]` lists the dimensions a matched unit still breaches after the
+  override applied. Matched rows also carry the unit's optional `line` and
+  `col`, because a file can hold several units sharing a name and those rows
+  must stay distinct. Migration: group rows on `override_index` to count
+  configured overrides, and treat `insufficient` as "override in force, finding
+  survives".
+- **Two `--format compact` health line grammars gained fields.** The
+  `high-complexity:` line gained a trailing `exceeded=<dimension>` field
+  between `severity=` and `crap=`, and the `threshold-override:` line gained a
+  dimension segment after the override index plus an optional trailing
+  `outstanding=` field. A matched `threshold-override:` target is now
+  `<path>:<line>:<function>` rather than `<path>:<function>`, matching the
+  `high-complexity:` target grammar. Consumers that split these lines
+  positionally past `severity` or past the index need to adapt; consumers that
+  parse `key=value` pairs are unaffected.
+- **The human override row's surviving-dimension suffix reads `(still
+  breaches: ...)`.** It used to read `(finding still fires on: ...)`, which
+  overstates the `maxUnitSize` case: unit size is part of the `complexity`
+  dimension but keeps a unit in the large-function list without emitting a
+  finding of its own. The JSON `outstanding[]` field is unchanged.
+- **Malformed config shapes now fail loud instead of being silently
+  dropped.** Three previously-tolerated shapes are rejected at config load:
+  a malformed `extends` value (must be a string or an array of strings), an
+  unknown key inside an `overrides` entry, and an unknown key inside an
+  `ignoreExports` rule (`schema.json` mirrors this with
+  `additionalProperties: false`). These shapes were never applied; they were
+  discarded without a word, so a typo like `pattern` vs `patterns` silently
+  disabled the rule it was meant to configure. Migration: remove or correct
+  the offending key or value named in the error. This extends the strictness
+  the top-level config already enforced to the nested rule objects. Before
+  upgrading, run `fallow config` against the repo: it exits non-zero with the
+  same load error, so rejected shapes surface ahead of CI.
+
+### Fixed
+
+- **An explicit `"private-type-leaks": "off"` now survives enabling type-aware
+  analysis** (Closes [#2170](https://github.com/fallow-rs/fallow/issues/2170)).
+  Type-aware analysis force-enabled the opt-in `private-type-leaks` rule
+  regardless of config, which also made the api-surface sidecar capability
+  mandatory. The config layer now records whether the rule was configured
+  explicitly (JSON, JSONC, TOML, the singular alias, and `extends` chains all
+  count), and the type-aware default applies only when it was not. Unset
+  configs keep the default-on behavior.
+- **`cacheMaxAgeDays` and `FALLOW_AUDIT_CACHE_MAX_AGE_DAYS` now actually
+  reclaim audit base-snapshot caches**
+  (Closes [#2169](https://github.com/fallow-rs/fallow/issues/2169)). The
+  cache GC only visited entries under the current repo's hash prefix, while
+  every linked git worktree hashes to its own prefix, so abandoned caches
+  accumulated forever. The GC now ages out abandoned entries from other repo
+  identities, skips entries whose recorded owner root still exists (a repo's
+  own `0` = never-reclaim cannot be defeated from outside), and logs a warning
+  for invalid env values instead of silently falling back.
+- **`--gate new-only` no longer fails a clone-removal refactor**
+  (Closes [#2164](https://github.com/fallow-rs/fallow/issues/2164)). The
+  duplication attribution key changes whenever a clone group's membership or
+  extent shifts, so extracting a shared helper and deleting instances made the
+  surviving group look introduced. Clone groups whose instance ranges contain
+  no added line from the diff are now demoted to inherited; a genuinely pasted
+  clone still gates with `duplication_introduced >= 1` and a failing verdict.
+- **Windows: added-line attribution now sees untracked files.** The
+  untracked-file diff passed native backslash paths to
+  `git diff --no-index`, so the resulting diff keys never matched the
+  forward-slashed lookup paths and every added-line check on an untracked
+  file silently missed on Windows, including the new-only duplication gate
+  above.
+- **Svelte await-block complexity labels now match the source.** `{#await}`
+  and `{:then}` contributions previously appeared as `if` in health JSON and
+  the VS Code inline breakdown. They now use the explicit `await` and `then`
+  kinds, while `{:catch}` remains `catch`. Inline continuations such as
+  `{#await load() then value}` and `{#await load() catch error}` now count and
+  label both the await frame and its continuation, including when both labels
+  share one VS Code decoration and hover; explicit continuation totals are
+  unchanged. Standalone Svelte, Vue, and Astro template findings now also emit
+  a valid HTML-comment suppression anchored at the reported line instead of
+  an Angular decorator hint.
+  Regex literals inside template expressions no longer hide the selected await
+  state or logical operators that follow the regex.
+  Audit output is version 9; standalone health and combined output moved on
+  to version 10 in this same release (see the threshold-override entry under
+  Changed). Dead-code and unrelated output formats keep their existing
+  versions. JSON consumers must handle the two new values.
+- **A complexity finding now names the dimension that fired, so a
+  `thresholdOverrides` entry that did not silence it is diagnosable**
+  ([#2163](https://github.com/fallow-rs/fallow/issues/2163)). Raising
+  `maxCyclomatic` and `maxCognitive` on a framework `<template>` left the
+  finding in place because it fired on CRAP, and nothing in the output said
+  so: the human report printed the cyclomatic and cognitive numbers with no
+  marker, and the override section reported the entry as `active` next to the
+  surviving finding. Human output now marks the breaching metric, prints the
+  ceilings in force under an override-affected finding, and labels each
+  override row with its dimension, its status (including the new
+  `insufficient`), and the dimensions the unit still breaches. `--format
+  compact` and `--format markdown` carry the same information, and every
+  format that prints or compares a ceiling now interpolates the finding's own
+  resolved one instead of the run's global one: SARIF, human, markdown,
+  CodeClimate (and the `pr-comment-*` and `review-*` formats derived from it),
+  GitHub annotations from both the native renderer and the Action's jq filter,
+  and a `fallow report --from` re-render of a saved envelope, which previously
+  dropped `effective_thresholds` on the way back in. A single run no longer
+  contradicts itself across formats. The synthetic `<component>` rollup is
+  measured against the owning file's resolved ceilings too, and publishes them,
+  so an override that raises `maxCognitive` for the file both stops the rollup
+  reporting a cognitive breach and stops every renderer describing it against
+  the global ceiling. An entry that reaches the rollup now emits a matched
+  `threshold_overrides[]` row for the `<component>` unit, so an entry scoped
+  with `functions: ["<component>"]`, the documented way to address the rollup,
+  is no longer reported `no_match` while it silently removes the rollup
+  finding; a file-scoped entry on a component file gains that row alongside its
+  per-method and `<template>` rows. An
+  entry that configures only `maxUnitSize` now emits a
+  `complexity` row when it matches, instead of being silent when in force and
+  loud (`no_match`) only when its glob was a typo; when the raised unit-size
+  ceiling is still breached, that row names `complexity` in `outstanding`,
+  since a unit-size breach keeps the unit in the large-function list without
+  emitting a finding of its own. An override row's `status`
+  and `outstanding` are now derived from one dimension predicate, so a row can
+  no longer read `active` next to "still breaches: complexity", and a
+  row on a unit whose finding is already hidden by a `fallow-ignore` comment
+  reads `stale` rather than `insufficient` with nothing outstanding. Rows are
+  keyed on the matched unit's position as well as its name, so two units that
+  share a name in one file keep their own metrics and their own surviving
+  dimensions instead of collapsing into one row and trading answers.
+- **Suppression advice for `<template>` findings matches the file's
+  framework.** Every synthetic template finding recommended
+  `// fallow-ignore-next-line complexity` above an `@Component` decorator,
+  including in `.svelte`, `.vue`, and `.astro` files that have no decorator.
+  Single-file components now get `<!-- fallow-ignore-next-line complexity -->`
+  on the line above the reported line (`placement` value
+  `above-template-anchor-line`), `.html` templates get the HTML comment form,
+  and only inline templates in a component class keep the Angular decorator
+  wording. A template finding no longer suggests adding tests to lower its
+  CRAP score: a template carries no direct coverage, so its CRAP is driven by
+  branching alone. `fallow explain` for the complexity metrics describes all
+  four template dialects instead of Angular only.
+- **`thresholdOverrides` entries whose glob matches nothing are reported
+  again.** The `no_match` row was gated on a flag that is set on every CLI
+  entry point, so a typo in an override path produced silence rather than a
+  row saying it matched nothing.
+- **Complexity findings in framework templates now show which conditions
+  caused them** (Closes [#2150](https://github.com/fallow-rs/fallow/issues/2150)).
+  A `<template>` finding in Vue, Angular, Svelte, or Astro
+  reported a cyclomatic and cognitive number with nothing behind it, so the
+  VS Code inline breakdown and `health --complexity-breakdown` had nothing to
+  display, while the same finding in a script block listed its contributing
+  conditions. Each decision point is now reported at its own line and column
+  with the weight it added: the structural directives (`v-if`, `v-else-if`,
+  `v-for`, `@if`, `@for`, `{#if}`, `{#each}`, and their continuations) plus
+  the logical, ternary, nullish, and optional-chaining operators inside a
+  bound expression, which are attributed at their own columns rather than
+  folded into the directive containing them. Metric totals are unchanged. Two
+  notes: a Svelte block whose condition sits away from the block open can
+  report a different finding line and column than before, and the first
+  analysis after upgrading re-extracts, because caches written by earlier
+  versions hold no breakdown.
+- **One unresolved-import finding per specifier per file, anchored on the
+  specifier.** A multi-binding re-export statement
+  (`export type { A, B, C } from "./missing.js"`) previously produced one
+  finding per binding, inflating issue totals for what is a single import
+  problem. The deduped finding now anchors on the source specifier (the
+  string the user must edit) instead of a binding line, and a single
+  `fallow-ignore-next-line unresolved-import` comment above the statement
+  suppresses it, for multi-line statements too. Suppression crediting agrees
+  with the anchor, so a consumed suppression is never also reported stale.
+- **`.js` specifiers now resolve to declaration-only `.d.ts` modules.** The
+  resolver's extension alias for `.js` (and `.mjs`/`.cjs`) omitted the
+  matching declaration extension, so an import like
+  `./generated/contract.js` backed only by `contract.d.ts` was reported as
+  an unresolved import even though TypeScript resolves it. Declaration
+  extensions are tried last, so runtime files keep priority.
+- **`ignoreUnresolvedImports` entries with a leading `./` match again.**
+  Pattern compilation strips a single leading `./` (since v2.103.0), but the
+  matcher still compared against the raw import specifier, which keeps its
+  `./` prefix, so exact entries such as `./generated/output-contract.js`
+  never silenced anything. The specifier is now normalized the same way
+  before matching, so both the `./`-prefixed and bare spellings work.
+- **`fallow --help` now lists every subcommand.** The curated cheat sheet
+  replaces clap's auto-generated subcommand list, and `trace`, `type-aware`,
+  `rule-pack`, `decision-surface`, and `guard` had never been added to it, so
+  five documented commands were invisible from the root help. A test now
+  iterates the visible subcommands and asserts each one leads a cheat-sheet
+  line, so future commands cannot silently drop out.
+- **The `fallow schema` environment-variable manifest matches the documented
+  table again.** `FALLOW_COVERAGE_ROOT` and `FALLOW_TYPE_AWARE_BIN` were
+  missing from the manifest, and its `FALLOW_FORMAT` entry lagged behind the
+  current format list. Both variables are listed, the format list is synced,
+  and `FALLOW_MAX_COMMENTS` is documented as CI-integration plumbing so its
+  deliberate manifest exclusion no longer contradicts the parity claim.
+- **`fallow setup-hooks` can no longer corrupt a hand-edited `AGENTS.md`.**
+  The managed block was located by finding each marker anywhere in the file,
+  so an end marker before the start marker (a bad merge or hand edit) made
+  every rerun duplicate the content between them, while removal reported
+  success without removing anything. The block is now matched only as a
+  start-then-end pair; stray or inverted markers preserve the file, print a
+  repair hint, and surface as user-edited in `setup-hooks status`.
+- **Library and Node-API embedders get the same 16 MiB worker stack as the
+  CLI.** The api crate's per-call rayon pool omitted the worker stack size the
+  CLI global pool configures, so embedders could overflow on the same deeply
+  nested sources the CLI handles fine. Pool construction is now shared across
+  the CLI global pool, the programmatic per-call pool, and the source-map
+  upload pool.
+- **Audit read failures no longer fabricate weakening signals.** The
+  weakening-signal scan treated any base or head read failure as an empty
+  file, inventing added-suppression and removed-test signals for content it
+  never saw. Missing base objects are now distinguished from pipe errors
+  (which abort the remaining scan), unreadable head files are skipped, and an
+  unreadable `--walkthrough-file` path names the read error and failing path
+  on stderr instead of only claiming a stale graph snapshot.
+- **A malformed `pnpm-workspace.yaml` now warns instead of silently disabling
+  catalog and override resolution.** The parsers previously swallowed YAML
+  errors, so catalog references stopped resolving with no indication why. The
+  analysis now records a `malformed-pnpm-workspace-yaml` workspace diagnostic
+  (in JSON output plus one deduplicated stderr warning) and continues
+  degraded.
+- **MCP workspace comma lists work on API-backed tool paths.** The documented
+  `workspace: "a,b,c"` syntax was wrapped as one literal glob unless an
+  unrelated parameter happened to force the CLI fallback; all option mappings
+  now split comma lists the same way the CLI does. The `guard` tool also
+  validates its file entries, returning the structured validation error
+  instead of letting a flag-like entry such as `--allow-remote-extends` be
+  parsed as a CLI flag, and the `get_info` licensing text now matches the
+  tool descriptions (a single local runtime-coverage capture is free).
+- **Untrusted values are escaped in `github-summary` and report markdown
+  tables.** Envelope strings (paths, export names, suppression kinds, zone
+  names) were interpolated into `GITHUB_STEP_SUMMARY` tables unescaped, so
+  backticks and pipes from source comments could inject markdown, and CRLF
+  input could split a table row mid-cell. The code-span and table-cell
+  escapers are now shared by the api markdown renderer and the CLI summary
+  renderer.
+- **`fallow-ignore-next-line` inside a multi-line block comment now suppresses
+  the intended line.** The suppression anchored to the line after the comment
+  start, which is still inside the comment, so the marker silently never
+  matched; it now anchors after the comment end, and prose lines after the
+  marker are no longer tokenized into unknown-kind diagnostics. The same pass
+  also stops re-encoding the full line prefix per function when computing
+  UTF-16 columns, removing quadratic behavior on single-line minified files.
+- **VS Code: binary downloads can no longer hang LSP startup forever.**
+  Downloads gain a socket-inactivity timeout, a redirect-depth cap, and a
+  cancellable progress notification; user cancellation is treated as silent
+  instead of surfacing an error. Workspace-scope and config changes now force
+  re-analysis instead of latching onto an in-flight run spawned with the old
+  scope or config, and the license prompt guards its stdin write so a child
+  process that exits early no longer crashes the extension host with an
+  uncaught EPIPE.
+- **LSP: analysis no longer blocks the dispatch loop, and push and pull
+  diagnostics no longer double.** Save, configuration, and watched-file
+  handlers awaited the full workspace analysis inline, so a burst of events
+  froze `didChange`, hover, and shutdown behind serialized runs; they now
+  spawn the analysis, and a completion-epoch check coalesces a burst into one
+  run. Push publishing also re-checks per-URI pull state mid-run, so clients
+  that render both namespaces no longer show duplicated diagnostics after a
+  first pull races an in-flight analysis.
+
+### Performance
+
+- **Faster module resolution and graph build.** Resolve fallback and
+  specifier paths now reuse the session canonicalize cache instead of issuing
+  a realpath syscall per import of the same target; dynamic-import pattern
+  matching stops allocating a prefixed string per candidate file and memoizes
+  compiled glob matchers across modules; and reference attachment on
+  high-fan-in modules replaces two quadratic rescans (duplicate detection per
+  attach, export-name lookup per imported symbol) with a lazily seeded dedup
+  set and a per-target export-name index. Dedup semantics, first-seen
+  reference order, and the cache format are unchanged.
+
+## [3.14.0] - 2026-08-04
+
+### Added
+
+- **`vi.doMock` / `jest.doMock` targets and their manual mocks now receive
+  coverage credit.** The unhoisted `doMock` registration credits the mocked
+  target and its speculative `__mocks__` sibling as dynamic-import edges
+  (behind the same import-provenance proof as `vi.mock` for aliased and
+  namespace receivers), so a manual mock referenced only through `doMock` no
+  longer surfaces as an unused file. Credit is scoped to static, path-shaped
+  specifiers: the argument must be a string literal (or expressionless
+  template literal), and the speculative `__mocks__` sibling is synthesized
+  only when the specifier contains a `/`, so `vi.doMock('./services/api')`
+  credits `./services/__mocks__/api` but a bare package specifier such as
+  `vi.doMock('axios')` credits only the package, not a root
+  `__mocks__/axios.ts`. By decision, `doMock` never masks
+  test-reachability coverage: it is order-sensitive and may run conditionally
+  inside a test callback, so masking could produce false uncovered findings.
+  Automock (`vi.mock` without a factory) keeps coverage credit by explicit
+  decision as well, since Vitest evaluates the original module to derive the
+  mocked shape. Both decisions are documented in
+  `docs/reference/detection-internals.md`.
+  ([#2082](https://github.com/fallow-rs/fallow/issues/2082))
+
+### Fixed
+
+- **The config schema now states that the four health `max*` thresholds never
+  move `health_score`.** Raising `health.maxUnitSize` (or `maxCyclomatic`,
+  `maxCognitive`, `maxCrap`) filters findings only, while the score's
+  penalties keep fixed calibration so grades stay comparable across projects;
+  the previous section text ("raise thresholds to relax which functions are
+  flagged") invited the inference that the score would follow. The schema
+  descriptions for the section, the three complexity thresholds, and the
+  `penalties.unit_size` output field now spell out the decoupling and point at
+  `health.ignore` as the lever that does remove files from the score, and a
+  regression test locks the byte-identical-score contract for a raised global
+  `maxUnitSize`. (Closes
+  [#2116](https://github.com/fallow-rs/fallow/issues/2116).)
+
+- **`fallow type-aware status` no longer reports a wrapper-wired sidecar as
+  `environment-override`.** The npm launcher, the Node-API loader, and the
+  GitHub Action resolve a version-matched `fallow-type-aware` themselves and
+  pass it to the binary through `FALLOW_TYPE_AWARE_BIN`, so a plain
+  `npx fallow type-aware status` against a project-local `node_modules`
+  install claimed the user had set an environment override. Those launchers
+  now mark their wiring (internal `FALLOW_TYPE_AWARE_BIN_SOURCE` variable) and
+  `discovery_source` reports `npm-wrapper` or `github-action` for
+  tooling-provided wiring, keeping `environment-override` for a genuinely
+  user-set `FALLOW_TYPE_AWARE_BIN` and `installed-sibling` for a sidecar found
+  next to the executable. Failed discovery through wrapper wiring now also
+  gets the actionable npm install remediation instead of the raw override
+  error.
+
+### Performance
+
+- **Workspace discovery loads each member manifest once per run.** Directories
+  matched by more than one workspace source (identical globs in `package.json`
+  and `pnpm-workspace.yaml`, tsconfig references overlapping npm workspaces)
+  previously re-read and re-parsed `package.json` and re-probed
+  `deno.json` / `deno.jsonc` on every visit; a per-discovery memo now replays
+  the first outcome. Module resolution also probes each package's Deno config
+  once instead of twice (manifest load plus import-map load). Local criterion
+  runs of `component_config_workspace_discovery` and
+  `component_config_workspace_diagnostics` improved by about 7% and 12%.
+
+### Changed
+
+- **Faster namespace-alias propagation during graph build.** The
+  cross-package namespace alias pass no longer formats a lookup string per
+  consumer import or builds the chained re-export state machine when the
+  alias target has no `export * as` edge, cutting allocations in the hot
+  loop. The `namespace_object_alias_propagation` benchmark improves by about
+  11% locally (883 us to 780 us), recovering the regression introduced by the
+  provenance side table in 3.13.0. Analysis output is unchanged.
+
+## [3.13.0] - 2026-08-03
+
+### Fixed
+
+- **The GitHub Action now provisions the `fallow-type-aware` sidecar for
+  typeAware-enabled projects.** The Action previously installed only the CLI,
+  so projects with `typeAware.enabled` (or `audit.typeAware`) hard-failed on
+  fallow 3.11.0+ and silently fell back to syntactic analysis before that. The
+  install step now reads the project's fallow config
+  (`.fallowrc.json`/`.fallowrc.jsonc`/`fallow.toml`/`.fallow.toml`, or the
+  `config` input path) and, when type-aware is enabled, installs
+  `fallow-type-aware` at exactly the CLI version the Action resolved (the
+  `version` input, then the `package.json` pin, then latest) into a tool
+  directory and exports `FALLOW_TYPE_AWARE_BIN`. The `type-aware` input gains
+  an `auto` default alongside `true` and `false`: `true` forces provisioning
+  and still passes `--type-aware`, and `false` skips provisioning and passes
+  `--no-type-aware` on CLIs that support it, keeping the run syntactic even
+  when the config opts in. (Closes
+  [#2107](https://github.com/fallow-rs/fallow/issues/2107).)
+
+### Fixed
+
+- **The generated agent gate now audits `git commit`/`git push` invocations
+  that pass git-level options before the subcommand.** The
+  `fallow hooks install --target agent` gate script previously only recognized
+  the subcommand when it immediately followed `git`, so forms like
+  `git -c user.name=x commit`, `git --no-pager commit`, `git -C dir push`, and
+  `git --git-dir=/x push` silently skipped the audit. Command recognition now
+  tokenizes the command line and steps over git-level flags, including options
+  whose value arrives as a separate word (`-c k v`, `-C path`,
+  `--work-tree path`), while subcommand lookalikes in arguments
+  (`git log commit-message.txt`) still skip. Setting `FALLOW_GATE_DEBUG=1`
+  makes the previously silent not-a-commit/push skip visible on stderr.
+  Reinstall the hook with `fallow hooks install --target agent` to pick up the
+  new script. (Closes
+  [#2106](https://github.com/fallow-rs/fallow/issues/2106).)
+
+## [3.12.0] - 2026-08-03
+
+### Fixed
+
+- **`fallow audit` with `typeAware.enabled` no longer degrades to syntactic
+  attribution on every diff that adds or removes a file.** The type-aware
+  comparison now decides base/head identity compatibility with
+  `incompatible_fields()` instead of raw equality: the deferred project-config
+  hash of a side that ran no semantic queries is compatible with any concrete
+  hash, a side that produced no semantic identity at all made no semantic
+  claims and no longer forces the fallback, and the semantic project-config
+  hash no longer includes the project's root file listing (base and head of a
+  diff naturally differ in file membership). The same compatibility check
+  applies to warm runs that rehydrate the cached base snapshot. Genuinely
+  incompatible identities, such as a tsconfig or compiler-options change
+  between base and head, still degrade with the existing warning. (Closes
+  [#2102](https://github.com/fallow-rs/fallow/issues/2102).)
+
+- **`fallow audit` attribution is now rename-aware.** New-vs-inherited
+  attribution follows git rename detection when joining head findings against
+  the base snapshot, so a pure `git mv` (a route rename, a directory
+  restructure) no longer reports every pre-existing complexity, duplication,
+  dead-code, or styling finding on the moved files as introduced and no
+  longer flips `--gate new-only` from pass to fail. Renames with content
+  changes only relocate the baseline: debt a changeset genuinely adds to a
+  moved file still attributes as introduced and still gates. (Closes
+  [#2093](https://github.com/fallow-rs/fallow/issues/2093).)
+
+### Fixed
+
+- **`typeAware.enabled` now works with `fallow audit --gate new-only` instead
+  of failing the gate.** When base and head cannot be compared under one
+  semantic identity (changed tsconfigs, a sidecar available on only one side,
+  or differing incomplete-query omissions), the audit no longer exits 2 with
+  "semantic analysis identities differ". It falls back to syntactic attribution
+  for the base/head diff with a warning naming the cause: type-aware refinement
+  still applies to head findings, semantic-only findings stay advisory for that
+  run, and a genuinely new syntactic finding still fails the gate. For teams
+  that want the audit gate fully syntactic while type-aware stays on for
+  cleanup commands, the new `audit.typeAware: false` config field scopes the
+  opt-out to audit, and the new global `--no-type-aware` flag forces any single
+  run syntactic (CLI flags win over `FALLOW_TYPE_AWARE`, which wins over
+  `audit.typeAware`, which wins over `typeAware.enabled`). On macOS, type-aware
+  paths reported through symlinked temp roots (`/var` versus `/private/var`)
+  are canonicalized before the project-root containment check, so they no
+  longer abort the audit as "outside project root". (Closes
+  [#2092](https://github.com/fallow-rs/fallow/issues/2092).)
+
+### Added
+
+- **MCP agents can set and preserve the health baseline mode.** The
+  `check_health` tool accepts `baseline_mode` ("count" or "identity") and the
+  `audit` tool accepts `health_baseline_mode`, both forwarded to the CLI's
+  `--baseline-mode` flag, so an agent can refresh an identity baseline
+  without downgrading it and run strict identity comparisons. (Closes
+  [#2062](https://github.com/fallow-rs/fallow/issues/2062).)
+
+### Fixed
+
+- **A defaulted count save no longer clobbers an identity health baseline.**
+  `--save-baseline` without `--baseline-mode` now refuses to overwrite a
+  baseline file that carries per-function identity buckets, because the
+  count-mode rewrite would silently drop them and only fail later, in CI, on
+  the next `--baseline-mode identity` run. Re-save with `--baseline-mode
+  identity` to keep the buckets, or pass `--baseline-mode count` explicitly
+  to downgrade the baseline on purpose. (Closes
+  [#2062](https://github.com/fallow-rs/fallow/issues/2062).)
+
+### Added
+
+- **A partially stale health baseline now says so instead of rotting
+  silently.** When a quarter or more of a loaded baseline's complexity and
+  CRAP entries match no current finding, human output prints a warning naming
+  how many of the saved entries went stale and how to re-save, instead of only
+  warning at zero overlap. JSON output gains a `summary.baseline_staleness`
+  object (`baseline_entries`, `matched_entries`, `stale_entries`,
+  `moved_entries`, `change_scoped`, `stale`) whenever a baseline is loaded, so
+  CI can watch a baseline degrade without parsing stderr. The `stale` bool
+  mirrors the human warning exactly: change-scoped runs (`--changed-since`,
+  diff, or workspace scoping) and runs with no current findings report their
+  counts with `stale: false` and print no re-save advice, since re-saving from
+  a scoped run would gut the gate. Entries matched through a followed file
+  move are reported in `moved_entries` and noted on stderr. Exit codes are
+  unchanged. (Closes
+  [#2065](https://github.com/fallow-rs/fallow/issues/2065).)
+
+### Fixed
+
+- **Identity-mode health baselines now survive file moves.** A baseline
+  entry whose saved path no longer exists on disk follows its function name to
+  the new path when exactly one unclaimed current finding carries that name,
+  so moving or renaming a file no longer reports every finding it carried as
+  new. The match is deliberately conservative: ambiguous candidates, anonymous
+  functions, and files that still exist at their saved path are never
+  remapped, and count-mode baselines are unchanged because a per-file count
+  bucket has no identity component left to re-match once its path is gone.
+  (Closes [#2066](https://github.com/fallow-rs/fallow/issues/2066).)
+
+### Fixed
+
+- **Test-reachability profiles are capped to keep huge monorepos fast.** When
+  test-root mock replacements produce more than 1024 distinct mask profiles,
+  analysis now falls back to the coarse test-reachability pass instead of
+  letting index storage and propagation cost grow without bound. The fallback
+  is fail-open (mocked modules stay test-reachable, matching pre-profile
+  behavior) and logs a warning so the degradation is visible. The persisted
+  graph cache version is bumped so warm caches written before this change are
+  rebuilt under the new semantics instead of replaying stale profiled results.
+  (Closes
+  [#2084](https://github.com/fallow-rs/fallow/issues/2084).)
+
+### Added
+
+- **CLI flag values that name packages by convention now credit the
+  dependency.** The eslint `--format` shorthand from
+  [#2006](https://github.com/fallow-rs/fallow/issues/2006) is now one row in
+  an embedded convention catalogue that also covers eslint `--plugin`, jest
+  `--testEnvironment` / `--runner` / `--reporters` / `--preset`, preload and
+  loader flags on node, tsx and ts-node (`-r`, `--require`, `--loader`,
+  `--experimental-loader`, `--import`, including subpaths like
+  `dotenv/config`), mocha `--reporter` and `--require`, prettier `--plugin`,
+  stylelint `--custom-syntax` and postcss `--use`. A package used only through
+  such a flag in a script or CI command is no longer reported as an unused
+  dependency; built-in values, paths and unlisted flags keep abstaining, and a
+  malformed catalogue row fails the parse loudly. (Closes
+  [#2019](https://github.com/fallow-rs/fallow/issues/2019).)
+
+### Changed
+
+- **Per-reference memory is back to its pre-3.11 size for projects without
+  replacement mocks.** The reference provenance introduced for mock-aware
+  test reachability now lives in a per-export side table that is only
+  populated when a `vi.mock`-style replacement exists, restoring the compact
+  16-byte symbol reference for every other project in RAM and in the graph
+  cache. Masked-reachability behavior is unchanged, and the graph cache
+  version is bumped so older caches are rebuilt. (Closes
+  [#2083](https://github.com/fallow-rs/fallow/issues/2083).)
+
+### Added
+
+- **Mock-aware test reachability covers aliased `vi` imports, `vitest`
+  namespace imports, and `jest.mock`.** The mock masking that shipped for the
+  literal `import { vi } from "vitest"` binding now also proves
+  `import { vi as v }` aliases, `import * as vitest` namespace access
+  (`vitest.vi.mock`), and `jest.mock` through the `jest` global or a
+  `@jest/globals` import (any alias), so a module whose only test-side use is
+  a proven complete replacement no longer keeps test-coverage credit in Jest
+  projects or under the wider Vitest idioms. Provenance stays span-exact and
+  factories abstain toward the old covered behavior unless they are
+  statically closed; `vi.doMock` and automock remain out of scope. (Refs
+  [#2082](https://github.com/fallow-rs/fallow/issues/2082).)
+
+## [3.11.0] - 2026-08-02
+
+### Added
+
+- **Deno workspaces are discovered and analyzed natively.** A root `deno.json`
+  or `deno.jsonc` now drives workspace discovery: member globs, member names
+  and `exports` are read like their `package.json` equivalents, scoped import
+  maps resolve per package with exact-then-longest-prefix matching, Deno
+  workspace names count as listed dependencies, and pure Deno roots no longer
+  warn about a missing `node_modules`. A malformed root manifest fails
+  analysis explicitly instead of degrading to an empty workspace list. Thanks
+  [@shanepadgett](https://github.com/shanepadgett) for the contribution in
+  [#2080](https://github.com/fallow-rs/fallow/pull/2080).
+
+- **Config-value dependency credits are catalogue-driven.** The hardcoded
+  rules that credited packages named by a config value (jsdom's optional
+  `canvas` peer, vitest's `edge-runtime` peer, vite's `lightningcss`) now
+  live in an embedded data catalogue, so covering a new tool is a one-entry
+  data change and malformed rows fail the parse loudly. Behavior for the
+  migrated cases is unchanged. (Closes
+  [#2018](https://github.com/fallow-rs/fallow/issues/2018).)
+
+- **Package-manager indirection in scripts is followed into script bodies.**
+  `npm run <script> -- --flag` and `yarn <script> --flag` now resolve to the
+  script's body and are rescanned for flag-value dependency credits, bounded
+  by a depth limit and an expansion budget. A script name declared with
+  different bodies across packages is never followed, and workspace script
+  bodies no longer seed root-relative entry patterns. (Refs
+  [#2016](https://github.com/fallow-rs/fallow/issues/2016).)
+
+- **`ignoreFindings` covers the remaining source-owned result families and
+  reports patterns that match nothing.** Prop-drilling chains, thin wrappers,
+  and duplicate prop shapes now honour `ignoreFindings` (security findings
+  stay visible regardless), and human output prints a note listing patterns
+  that matched no finding so a typo is no longer a silent no-op. (Refs
+  [#2017](https://github.com/fallow-rs/fallow/issues/2017).)
+
+- **Deno workspaces accept the object form of the `workspace` key.** A root
+  `deno.json` using `"workspace": {"members": [...]}` now discovers its members
+  the same way the bare array form does, instead of failing analysis as a
+  malformed root manifest.
+
+- **npm dependency overrides are now checked for unused and misconfigured entries.** The top-level `overrides` object in a root `package.json` (npm's equivalent of `pnpm.overrides`) runs through the same unused-dependency-override and misconfigured-dependency-override analysis as pnpm overrides. Nested override objects are flattened into `parent>child` entries and credited when the outermost parent is declared, the npm `"."` self-pin key targets its enclosing parent, and `"$package"` reference values are credited rather than reported because their resolution is indirect. Resolved packages in `package-lock.json` now also credit override targets, so pins that only exist for transitive dependencies stay green. yarn `resolutions` and bun overrides remain out of scope. (Closes [#2069](https://github.com/fallow-rs/fallow/issues/2069).)
+
+- **Parallel inline-review jobs can be isolated with a stable review id.** Set `FALLOW_REVIEW_ID` (or GitHub Action `review-id`) to a 1-64 character identifier so GitHub and GitLab reconciliation only deduplicates and resolves comments from that review scope. Unscoped jobs continue to see only unscoped comments. As part of this isolation, all runs, including unscoped ones, now read finding fingerprints only from the root comment of each GitHub review thread and from the first note of each GitLab discussion. A fingerprint that only appears in a reply is no longer treated as an existing comment, so the next run posts a fresh comment for that finding instead of deduplicating against the reply. Comments posted by fallow itself always carry the fingerprint in the root comment, so typical existing reviews are unaffected; resolution replies are still recognized anywhere in a thread. (Refs [#2076](https://github.com/fallow-rs/fallow/issues/2076).)
+
+- **`--baseline-mode identity` gates health baselines on finding identity.**
+  The default count baseline matches per file and category, so a new hotspot
+  that replaced an old hotspot in the same file consumed the existing allowance
+  and `health --baseline ... --fail-on-issues` stayed green. Save a baseline
+  with `fallow health --save-baseline baseline.json --baseline-mode identity`
+  and compare with `--baseline baseline.json --baseline-mode identity` to match
+  per function identity instead: a replacement hotspot is reported, line shifts
+  and severity improvements stay suppressed, and resolved findings still
+  disappear without a refresh. The default stays `count`, identity baselines
+  keep their count buckets so both modes read them, and comparing in identity
+  mode against a count-only baseline is an input error instead of a silent
+  fallback. (Refs
+  [#2010](https://github.com/fallow-rs/fallow/issues/2010).)
+
+- **`ignoreFindings` hides source-owned dead-code findings without removing
+  matching files from analysis.** Project-root-relative globs support `!`
+  exceptions with gitignore-style set semantics. Matching files remain in
+  discovery, parsing, resolution, and the module graph, so their imports and
+  exports still contribute to analysis. Findings with multiple source owners
+  stay visible unless every owner matches, a conservative extension of the
+  single-owner filtering found in migrated configs. `fallow migrate` now maps
+  root `ignore` patterns to this field, preserves negation, and warns rather
+  than guessing
+  for workspace-relative ignores. Use `ignorePatterns` only when a file must
+  be excluded from analysis entirely. (Closes
+  [#1991](https://github.com/fallow-rs/fallow/issues/1991).)
+
+### Fixed
+
+- **Every command now fails explicitly on a malformed root manifest.** Commands
+  built on the shared analysis session (`list`, `dupes`, `security`, `watch`,
+  `viz`, `inspect`, `flags`, suppressions, and rule-pack tests) previously
+  continued with zero workspaces when the root `package.json` or `deno.json`
+  could not be parsed, while `dead-code` exited with an error. All commands now
+  exit 2 with the same malformed-root message, so a broken manifest can no
+  longer produce silently empty results.
+
+- **Playwright fixtures typed with an indexed access over a class getter no
+  longer produce `unused-class-members` false positives.** A fixture whose
+  declared type is `Factory["getter"]` (for example
+  `assert: TaskAsserterFactory["taskAsserter"]`) now resolves through the
+  factory's public getter to the getter's declared return-type class, so
+  members called on the fixture in tests are credited to that class.
+  Resolution is conservative: only literal string indices over a plain named
+  type participate, the index must match a public instance binding on the
+  resolved class, and the terminal type must resolve to a class with members;
+  computed keys and other shapes abstain, and genuinely unused members on the
+  same class are still reported. Warm caches are invalidated once to pick up
+  the new extraction data. (Closes
+  [#2070](https://github.com/fallow-rs/fallow/issues/2070).)
+
+- **React Native platform-extension siblings are no longer reported as unused
+  files.** With the `react-native` or `expo` plugin active, an import such as
+  `./UserMenu` resolved only to the first platform variant in Metro's
+  extension order (for example `UserMenu.ios.tsx`), so the base `UserMenu.tsx`
+  and other platform siblings surfaced as unused files even though Metro loads
+  them on other platforms. A specifier that resolves into a platform family
+  now credits every member (`.ios`, `.android`, `.native`, `.web`, and the
+  base file) across static imports, dynamic imports, `require` calls, and
+  re-exports, and the imported names stay credited on each member's exports.
+  Imports that explicitly name a platform variant, such as `./UserMenu.ios`,
+  keep their single edge, and unrelated orphan files are still reported.
+  (Closes [#2073](https://github.com/fallow-rs/fallow/issues/2073).)
+
+- **CI scanning keeps the continuation lines of plain multi-line `run:`
+  scalars.** A GitHub Actions step such as `run: npx eslint .` followed by
+  indented continuation lines, the shape of GitHub's own ESLint starter
+  workflow, dropped every continuation, so flags and file arguments on those
+  lines never reached dependency and entry-file analysis. Continuations now
+  fold into the same command, anchored at the `run` key column so sibling step
+  keys like `env:` and `with:` still terminate the scalar and their values do
+  not leak into entry files. (Closes
+  [#2016](https://github.com/fallow-rs/fallow/issues/2016).)
+
+- **Importing a Server Action from a client component is no longer flagged as
+  a server-only import.** The `server-only-import` category of the
+  `client-server-leak` rule treated a `"use server"` directive as a server-only
+  marker, so every Server Action call site in a Next.js App Router project was
+  reported as a leak even though the bundler replaces that import with an
+  action reference and the action body never enters the client bundle. A
+  `"use server"` module now becomes a sink only through what it imports:
+  reaching `server-only`, `next/headers`, `next/server`, or Node server
+  modules such as `node:fs` / `node:child_process` (directly or through
+  re-export chains) is still reported, including from a `"use server"` file.
+  The sink predicate stays module-level: it does not tell action exports apart
+  from value exports, so a `"use server"` module that imports server-only code
+  is still reported even when every export is an async action. For that shape
+  the evidence, human remediation hint, and SARIF rule text now carry the
+  deciding question: only a non-action export (a top-level const, a re-export,
+  or a default value) carries the server-only import into the client bundle,
+  and a module whose exports are all async actions is a false positive. The
+  texts no longer name `"use server"` as a server-only marker.
+  (Closes [#2074](https://github.com/fallow-rs/fallow/issues/2074).)
+
+- **Tests that mock a module no longer count as statically covering the real
+  module.** A test root with a proven `vi.mock` replacement executes the mock,
+  yet the replaced module and everything reached only through it were still
+  credited as test-covered, hiding coverage gaps and lowering estimated CRAP.
+  Modules reached only through such mocked imports are now reported as
+  uncovered; a final `vi.unmock` restores the real path, another test root
+  without the mock still provides coverage, and CommonJS `require` paths remain
+  covered. Expect health results to shift on upgrade: files and exports that
+  were only covered through mocked imports surface as new coverage gaps, health
+  scores and estimated CRAP move accordingly, and a health baseline saved
+  before the upgrade does not suppress these findings, so
+  `--baseline ... --fail-on-issues` runs can start failing until the baseline
+  is refreshed. Uncertain factories, aliased or dynamic mock targets,
+  `vi.importActual`, and `jest.mock` are unaffected and keep their previous
+  coverage. (Closes
+  [#2031](https://github.com/fallow-rs/fallow/issues/2031).)
+
+- **Tsconfig aliases in Sass imports now resolve partial files after alias
+  expansion.** Imports such as `@use "@/styles/tokens"`, where `@/*` maps to
+  `src/*`, now probe `_tokens.scss`, `_tokens.sass`, and Sass directory-index
+  conventions at the expanded path. This also applies to style imports
+  extracted from SFCs, while JavaScript and TypeScript imports keep their
+  existing resolution behavior. (Closes
+  [#2075](https://github.com/fallow-rs/fallow/issues/2075).)
+
+- **A saved duplication baseline keeps matching after unrelated line shifts.**
+  Baselines stored `path:start-end` pairs per clone group, so inserting a line
+  above a clone made every instance in that group look new and the accepted
+  duplication reappeared as a finding. New baselines also store a content
+  fingerprint plus the number of instances in the group, which survives line
+  shifts while still reporting a clone that gains a fresh copy in another file.
+  The location keys are still written and still read, so baselines saved by
+  earlier versions keep working unchanged and no baseline needs to be
+  re-saved. (Closes
+  [#2029](https://github.com/fallow-rs/fallow/issues/2029).)
+
+- **`fallow audit --base` now labels empty-boundary-zone warnings that come
+  from the base revision.** The base revision is analyzed in its own worktree,
+  so a zone whose files only exist in the working tree matched nothing there
+  and produced the same unqualified `boundary zone ... matched 0 reachable
+  files` warning used for the working tree. That read as a broken current
+  configuration even though `fallow dead-code --boundary-violations` stayed
+  silent. The base pass now prefixes the warning with
+  `base revision snapshot (audit --base)` and says the finding is about the
+  base revision only. The working-tree warning, all output formats, and exit
+  codes are unchanged; `--quiet` still shows the warning, since suppressing it
+  would hide a real problem in the recommended agent mode. (Closes
+  [#2013](https://github.com/fallow-rs/fallow/issues/2013).)
+
+- **`fallow dupes` again fails when duplication exceeds the configured
+  threshold.** Standalone runs rendered through a code path that returned the
+  renderer's exit code without ever consulting the threshold, so
+  `fallow dupes --threshold 1` exited 0 at 100% duplication and printed no
+  diagnostic. Both the `--threshold` flag and a `duplicates.threshold` config
+  value were affected, in every output format. Combined mode (bare `fallow`)
+  rendered through a second, near-identical function that did gate, so the two
+  entry points disagreed. Both now share one gated renderer. Projects that set
+  a duplication threshold and were silently passing will start failing as
+  documented; runs that set no threshold are unaffected, since the default
+  (`0`) still means "no limit". (Closes
+  [#2009](https://github.com/fallow-rs/fallow/issues/2009).)
+
+### Documentation
+
+- **The README and the Action's `version` input now state that the Action ref
+  and the fallow CLI version are independent.** `uses: fallow-rs/fallow@v3`
+  selects the Action wrapper code, not the scanner, and the installed CLI
+  resolves from the `version` input, then the project's `package.json` `fallow`
+  dependency, then `latest`. The README CI example now pins the Action major
+  while letting the CLI come from the project pin, so patch and minor CLI
+  upgrades no longer suggest a lockstep Action bump. Thanks
+  [@hckhanh](https://github.com/hckhanh) for the report. (Closes
+  [#2079](https://github.com/fallow-rs/fallow/issues/2079).)
+
+## [3.10.0] - 2026-07-27
+
+### Changed
+
+- **Type-aware class-member refinement now covers string-literal element access
+  and cross-project consumers.** Explicit TypeScript projects are scanned
+  together, so a use in an application project can confirm a declaration in a
+  referenced library project. Dynamic computed access, decorators, dependency
+  injection, and runtime registration still retain the finding when exact
+  symbol evidence is unavailable. Explicit solution configs without source
+  files now fail closed with per-candidate abstention instead of invalid project
+  metadata. The release corpus enforces pinned clean sources, repeated
+  deterministic output, independent source review, and accuracy, resource, and
+  abstention limits. Corpus evidence is now produced by the exact hashed
+  sidecar artifact recorded during discovery instead of importing workspace
+  implementation modules.
+
+### Fixed
+
+- **Type-aware API and project metadata now reflect checker-backed facts.**
+  Public API analysis no longer treats parameter names or generic type
+  parameters as private types, complete semantic API results remove unmatched
+  syntactic leak guesses, and overlapping TypeScript projects no longer
+  duplicate API entries or coupling edges. Per-project candidate, confirmed,
+  unresolved, and abstained counts are populated instead of remaining zero,
+  including in the programmatic API. Unavailable API queries retain syntactic
+  leak findings, and a missing entry point keeps mixed-entry results partial.
+  Corpus artifacts now record and verify the approved ancestor dependency
+  environment, including its lockfile and installed type-declaration tree,
+  rather than claiming that fixtures resolve with no dependencies. The
+  semantic protocol is now version 6, the first stable type-aware wire
+  contract. A canonical manifest now keeps Rust, the sidecar, corpus tooling,
+  and editor packaging aligned. Pre-stable protocol variants are rejected.
+  Private leak confirmation is
+  request-scoped and bounded, incomplete entry-point coverage retains
+  syntactic candidates, and unexpected checker failures surface as errors
+  instead of being mislabeled as unsupported syntax. Requests above the
+  private-leak candidate cap retain the unrequested tail and report partial
+  capacity instead of failing or pruning it. The Rust semantic client
+  and reconciliation logic now have one owner in `fallow-api`; CLI, editor,
+  runtime, and programmatic paths share it. Cross-platform child-process
+  lifecycle behavior is shared through `fallow-process`.
+
+## [3.9.1] - 2026-07-24
+
+### Added
+
+- **`fallow impact statusline` exposes a compact, read-only Impact summary for
+  agent status lines.** It reports the latest whole-project issue count, its
+  trend from the prior full scan, and the number of findings cleared while
+  Impact was tracking. The single-line output is path-free, skips normal CLI
+  notices and telemetry, and stays useful in narrow terminals. Legacy
+  changed-file snapshots remain visible but are explicitly labelled and never
+  produce a misleading project-wide trend. ([#2000](https://github.com/fallow-rs/fallow/pull/2000))
+
+### Fixed
+
+- **Cloud `never_called` evidence now keeps its confidence provenance.**
+  Runtime-observed functions can retain the existing high-confidence deletion
+  recommendation, while inventory-backed, missing, and future provenance stays
+  conservative.
+
+## [3.8.1] - 2026-07-23
+
+### Fixed
+
+- **Cloud runtime analysis now preserves the server's evidence floor and
+  provenance.** `fallow coverage analyze --cloud` previously treated any
+  tracked function as actionable, even when fallow.cloud explicitly reported
+  that the active deployment had not collected enough isolated runtime
+  observations. The CLI now carries through the cloud's actionability verdict,
+  reason, production classification, freshness, staleness, and source-resolution
+  quality. Older cloud responses keep the existing tracked-function fallback.
+
+## [3.8.0] - 2026-07-22
+
+### Added
+
+- **Experimental TypeScript semantic refinement for unused class members.**
+  `fallow dead-code --type-aware` can pass remaining
+  `unused-class-members` candidates to the repository reference sidecar backed
+  by TypeScript-Go 7.0.2. Only exact symbol matches are removed, unresolved
+  candidates remain visible, and `_meta.type_aware` records bounded execution
+  provenance. This proof is explicit opt-in and is not yet production
+  packaged. See [the type-aware analysis guide](docs/type-aware-analysis.md).
+
+- **`fallow viz` renders your codebase as an interactive map.** A new command that runs one project analysis and writes a single self-contained HTML file (no server, no external assets) styled like the rest of fallow: a nested treemap of files sized by bytes, plus a force-directed import graph with directory and import-community clustering. Both views share four lenses that recolor the same map: dead code (unused files, unused exports, entry points), duplication (share of duplicated lines per file, with clone previews), boundaries (architecture zones from your `boundaries` config, with violating imports drawn in red), and complexity hotspots (per-function cyclomatic and cognitive scores, including React context such as hook counts and JSX depth). Clicking any file opens a detail panel with the evidence: unused export names, clone groups and their other locations, boundary crossings, cycle membership, importers and imports as click-through navigation, and a runnable `fallow ... --trace` command to verify each finding. Search, breadcrumb drill-down, keyboard shortcuts, shareable URL deep links, and dark/light themes are built in; findings carry a hatch texture and `[E]`/`[W]` prefixes so color is never the only signal, and all motion honors `prefers-reduced-motion`. The HTML opens in your browser by default (`--no-open` to skip, `--out <path>` to choose the file); `--viz-format dot` and `--viz-format mermaid` emit the import graph as text for piping into other tools. Read-only, and respects `--production`, `--config`, and `--no-cache` like the analysis commands.
+
+### Fixed
+
+- **Next.js fallback metadata exports are no longer reported as unused.** App
+  Router `not-found`, `default`, `forbidden`, `unauthorized`, and experimental
+  `global-not-found` files now credit `metadata`, `generateMetadata`,
+  `viewport`, and `generateViewport`, matching the modules Next.js reads while
+  resolving fallback head content. Arbitrary helper and route segment config
+  exports remain reportable. Thanks
+  [@BartWaardenburg](https://github.com/BartWaardenburg) for the report. (Closes
+  [#1987](https://github.com/fallow-rs/fallow/issues/1987).)
+
+- **Audit and dead-code results stay accurate across deeper class hierarchies
+  and materialized project context.** Multi-hop generic inheritance and
+  class-scoped `this` references now credit the correct members, nested
+  production TypeScript configs activate alias resolution, audit snapshots
+  invalidate when relevant install or generated-framework state changes, and
+  GitHub Action fallback annotations safely encode workflow-command paths.
+  Audit JSON now also attributes every styling finding as introduced or
+  inherited and reports matching styling totals in the attribution block.
+
+## [3.7.1] - 2026-07-20
+
+### Changed
+
+- **Faster star re-export analysis on wide barrel files.** Synthesizing star
+  re-exports scanned every source export once per re-exported name, which grew
+  quadratically on wide value-plus-type merge barrels. Each freshly synthesized
+  export is now located directly instead of by a repeated positional scan.
+  Analysis output is byte-identical. (Closes
+  [#1916](https://github.com/fallow-rs/fallow/issues/1916).)
+
+### Fixed
+
+- **`unused-class-members` no longer flags a method reached through an inherited
+  generic base-class property.** A derived client method called via a property
+  whose type is declared on a generic base class was reported as unused; those
+  calls are now credited, so the member is retained. (Closes
+  [#1910](https://github.com/fallow-rs/fallow/issues/1910); thanks
+  [@vethman](https://github.com/vethman) for the report.)
+
+- **`unlisted-dependencies` no longer reports a TypeScript `paths` alias as an
+  npm package.** With a `tsconfig.json` present, the TypeScript plugin now
+  activates so `paths` aliases resolve as internal imports instead of being
+  misread as missing dependencies. (Closes
+  [#1911](https://github.com/fallow-rs/fallow/issues/1911); thanks
+  [@vethman](https://github.com/vethman) for the report.)
+
+## [3.7.0] - 2026-07-20
+
+### Added
+
+- **VS Code can set a changed-code baseline at HEAD in one command.** The new
+  `Fallow: Set Baseline at HEAD` palette command creates the local lightweight
+  `fallow-baseline` tag, writes `fallow.changedSince` to a single-folder
+  workspace, and refreshes analysis. It confirms before mutation, never pushes
+  a remote ref, refuses to move an existing tag, and leaves multi-root
+  workspaces unchanged until per-root baseline semantics exist.
+
+### Fixed
+
+- **`audit-cache remove --format json` is compact by default and honors
+  `--pretty`.** The command previously routed through an always-pretty JSON
+  path; it now uses the standard JSON emitter, matching every other
+  `--format json` command. Values, fields, and exit codes are unchanged.
+
+- **`audit-cache remove --dry-run` no longer leaves `.lock` sidecars behind.** A
+  preview acquired the per-entry lock before the dry-run guard, and lock
+  acquisition creates a `.lock` sidecar for entries without one, so a preview
+  left a permanent artifact despite documenting that it touches nothing.
+  Dry-run now skips locking entirely.
+
+- **Imported churn history is bounded and validated before analysis.** Churn
+  files now enforce a serialized size limit, reject paths outside the project,
+  and report line-total overflow as an input error instead of panicking or
+  wrapping.
+
+- **Unified diffs read from stdin enforce the same size cap as diff files.**
+  Oversized or invalid stdin now disables line filtering and reports all
+  findings instead of allocating an unbounded buffer or parsing a truncated
+  diff.
+
+- **Source and plugin-manifest symlinks stay inside the project root.** Broken
+  links, directory targets, and links to outside files are skipped before
+  content is read, while links to regular files inside the project remain
+  supported under their visible paths.
+
+- **Large minified bundles no longer exhaust memory during analysis.** Dense
+  single-line bundles (precompiled editor assets such as ProseMirror) could
+  drive taint-tracking memory up without bound, so `fallow dead-code` climbed
+  to tens of GiB and produced no output on repos that ship them. Per-module
+  taint recording is now capped, so these repos analyze in normal time and
+  memory. (Closes [#1843](https://github.com/fallow-rs/fallow/issues/1843);
+  thanks [@zirodev23](https://github.com/zirodev23) for the report.)
+
+- **Analysis is more robust on large, generated, and minified codebases.** A
+  follow-up hardening pass to the taint-memory fix bounds or linearizes several
+  other paths that could grow super-linearly on adversarial input: duplicate
+  export and class heritage grouping, star re-export propagation, object-binding
+  and factory-return candidate resolution, JSDoc import scanning, template and
+  CSS-in-JS expression scanning (now depth-guarded against stack overflow on
+  pathologically nested input), and the health-time line-number and mask
+  scanners. Analysis output is unchanged on ordinary code. (#1843)
+
+- **A real minified vendor bundle no longer stalls analysis for minutes.** The
+  object-binding member-resolution pass could grow super-linearly on a large
+  minified bundle full of nested object maps (a 2 MB bundle stalled the parse
+  for over a minute). It is now bounded by a prefix index plus size and pass
+  caps, so such files analyze in a fraction of a second. Output is unchanged on
+  ordinary code. (#1843)
+
+## [3.6.0] - 2026-07-15
+
+### Changed
+
+- **`--format json` now emits compact JSON by default.** Machine consumers get
+  the same schema and values with less output. Use the global `--pretty` flag
+  when indented JSON is useful for manual inspection. JSON success and error
+  documents still end with exactly one line feed. Schema commands follow the
+  same compact-by-default behavior, while generated schema artifacts remain
+  indented. SARIF, Code Climate, saved baselines, snapshots, caches, and other
+  persisted JSON keep their existing presentation. (Closes
+  [#1861](https://github.com/fallow-rs/fallow/issues/1861))
+
+- **Reusable audit base snapshots are root-owned and safe to clean while audits run.** Each requested project root now has one base-worktree cache that is rebuilt in place when the full resolved base SHA changes. The reuse lock stays held for the audit lifetime, old SHA-keyed caches remain reclaimable, and `fallow audit-cache remove --root <PATH>` provides explicit preview and confirmation controls. Temporary source snapshots are private on Unix, predictable sidecars reject symlinks, and Git administration cleanup is restricted to the current repository's verified worktree entry. Thanks [@ryolambert](https://github.com/ryolambert) for the contribution ([#1893](https://github.com/fallow-rs/fallow/pull/1893)).
+
+### Fixed
+
+- **Windows editor diagnostics use valid file URIs.** LSP paths no longer retain
+  the Windows verbatim path prefix that prevented diagnostics from rendering.
+  (Closes [#1899](https://github.com/fallow-rs/fallow/issues/1899))
+
+- **Package-less TypeScript project references keep dependency ownership at the
+  parent package.** Unused-dependency attribution now credits each imported
+  package to the deepest workspace root that actually declares a `package.json`,
+  so a `tsconfig` project reference without its own manifest no longer captures
+  (and then misreports) dependencies that belong to its parent package.
+
+## [3.5.1] - 2026-07-14
+
+### Fixed
+
+- **Next.js metadata route config exports are no longer reported as unused.**
+  App Router `sitemap`, `robots`, `manifest`, icon, and social image route files
+  now credit the framework-consumed `dynamic`, `revalidate`, `fetchCache`,
+  `runtime`, `preferredRegion`, and `maxDuration` exports. `dynamicParams` and
+  arbitrary helper exports remain reportable because Next.js does not re-export
+  them from generated metadata route handlers.
+
+- **`fallow migrate` suggestions use recognized suppression issue kinds.** When
+  migrating an `ignoreUnresolved` entry, the generated warning now suggests the
+  singular `unresolved-import` token, and a regression test validates every
+  concrete suppression token in the migration table against fallow's parser.
+
+- **Regression baseline help explains the existing config update flow.**
+  Running `--save-regression-baseline` without a path updates
+  `regression.baseline` in the discovered fallow config, or creates
+  `.fallowrc.json` when none exists. Supplying a path still writes a standalone
+  baseline file.
+
+- **`unused-class-members` no longer false-flags a method dispatched through an interface-typed property (ports-and-adapters / hexagonal DI).** A method reached through a property whose declared type is an interface, on a class that `implements` that interface (`useIt(deps: Deps) { deps.greeter.greet() }` where `Deps.greeter: GreeterPort` and `class GreeterAdapter implements GreeterPort`), now credits `GreeterAdapter.greet`. The interface dispatch already worked through a direct parameter or variable (`useIt(g: GreeterPort) { g.greet() }`); this closes the remaining gap where the receiver is reached via an interface property hop, which dominates hexagonal-architecture findings. A genuinely-unused method on the implementing class still reports. Thanks [@lukeramsden](https://github.com/lukeramsden) for the clean minimal reduction. (Closes [#1863](https://github.com/fallow-rs/fallow/issues/1863))
+
+- **`unused-class-members` no longer false-flags a method reached through a factory that returns an object literal.** A factory function returning an inferred object literal whose property values are class instances (`export function createUi() { const factory = new InvokerFactory(); return { orders: factory.ordersPage } }`), consumed cross-module as `const ui = createUi(); ui.orders.placeOrder()`, now credits `OrdersPage.placeOrder`. Every property-value shape resolves: a direct `new Class()`, a local `const` alias to one, and a member read of a separately-constructed instance (`factory.ordersPage`, whether a typed field or a getter). Nested object literals (`ui.invoke.dashboard.method()`), the assigned-then-returned form (`const ui = {...}; return ui`), and same-file consumption are all covered. A genuinely-unused method on the returned class still reports. This is the general root cause behind the Playwright page-object-factory pattern; it is not Playwright-specific. Thanks [@committedpazz](https://github.com/committedpazz) for the precise bisection. (Closes [#1858](https://github.com/fallow-rs/fallow/issues/1858))
+
+- **Star re-exports no longer make a source module's default export appear
+  used.** ECMAScript `export *` excludes `default`, so fallow now keeps an
+  unused source default visible unless it is explicitly re-exported.
+  ([#1864](https://github.com/fallow-rs/fallow/pull/1864))
+
+- **Stored license tokens are private from the moment they are created.**
+  License activation and refresh now write through an owner-only temporary
+  file and atomically replace the destination instead of briefly creating a
+  broadly readable bearer-token file before restricting it.
+  ([#1864](https://github.com/fallow-rs/fallow/pull/1864))
+
+### Performance
+
+- **Named re-export stub creation and workspace plugin bucketing now use
+  indexed lookups at scale.** Repeated named exports retain their original
+  metadata and ordering, while nested and duplicate workspace roots retain the
+  existing first-declaration-wins behavior.
+  ([#1864](https://github.com/fallow-rs/fallow/pull/1864))
+
+## [3.5.0] - 2026-07-14
+
+### Added
+
+- **The structured `--format json` error envelope is now part of the published
+  output schema.** When a command fails under `--format json`, fallow emits
+  `{"error": true, "message": ..., "exit_code": ...}` on stdout. This shape was
+  documented in prose but had no schema definition, so agents validating fallow
+  output against `docs/output-schema.json` could not validate error responses.
+  It is now a typed `ErrorOutput` document-root branch (alongside the
+  `kind`-tagged success envelopes and the bare-array Code Climate output),
+  exported from `fallow/types`. The wire output is unchanged.
+
+### Changed
+
+- **The bundled GitHub Action renders inline annotations and the job summary
+  natively when the installed fallow supports it.** The annotate and summary
+  steps previously rendered both surfaces through the action's bundled jq. On
+  fallow >= 3.4.2 they now call `fallow report --from <results> --format
+  github-annotations|github-summary`, re-rendering the same saved analysis JSON
+  the run already produced (no extra analysis cost) and making the binary the
+  single source of truth for GitHub presentation. Older binaries without
+  `fallow report` stay on the jq renderers automatically via a capability probe
+  (there is no version floor), so nothing changes for them, and `version:
+  latest` users flip to the native path silently. A step log line names which
+  renderer ran. Two behavior deltas on the native path: the annotation stream
+  ends with a `fallow emitted N annotation(s)` budget notice that counts toward
+  `max-annotations`, and the job summary uses fallow's purpose-built
+  step-summary rendering instead of the comment-shaped body. The `fix` command
+  keeps the jq summary (there is no native fix rendering yet), and the jq
+  renderers remain in place as the fallback.
+
+- **npm platform packages now carry a single `fallow` binary instead of
+  three.** Since the MCP server gained in-process analysis, every
+  `@fallow-cli/<platform>` package bundled three binaries (`fallow`,
+  `fallow-lsp`, `fallow-mcp`) that each statically linked the full analysis
+  engine, roughly 50 MB unpacked per platform. Each package now contains one
+  multicall `fallow` binary that serves the CLI, the LSP (`fallow lsp-server`),
+  and the MCP server (`fallow mcp-server`) from a single linked engine, roughly
+  halving the install to about 25 MB per platform. Nothing changes for
+  consumers: `npx fallow-mcp` and the `fallow-lsp` launcher keep working (they
+  now spawn the bundled binary), and the standalone `fallow` / `fallow-lsp` /
+  `fallow-mcp` GitHub release assets, `cargo install fallow-cli`, Homebrew, the
+  GitHub Action, and the GitLab template are unchanged. Editors that
+  auto-download the standalone `fallow-lsp` from GitHub releases, including an
+  older VS Code extension paired with a newer npm package, keep working via
+  that path.
+
+### Fixed
+
+- **The `--format github-summary` auto-fix headline uses the singular noun for a
+  single fix.** It read "would apply **1 fixes**" for one fix; it now reads
+  "1 fix". Same wording via `fallow fix --format github-summary` and
+  `fallow report --from`.
+
+- **Dead-code analysis no longer repeats quadratic allocation work across deep
+  `export *` barrel chains.** Star re-export propagation now builds its
+  named-import origin index once per graph and batches reference deduplication
+  per export instead of rebuilding a growing set for every incoming reference.
+  This bounds memory churn and materially reduces graph-build time on projects
+  with deep barrels and wide named-import fan-in. Thanks @zirodev23 for the
+  report in #1843.
+
+- **`fallow flags --format json` now conforms to the published output schema.**
+  The default (no `--explain`) feature-flags document injects a
+  `_meta.telemetry` block for run correlation, but the schema modeled
+  `_meta` as requiring the explain-only `feature_flags` field and did not model
+  `telemetry`, so the emitted document failed validation against
+  `docs/output-schema.json`. This affected the MCP `feature_flags` tool and Code
+  Mode, which emit the same shape. `FeatureFlagsMeta` now models both fields as
+  optional, mirroring the `Meta` and `CombinedMeta` envelopes. The wire output
+  is unchanged (this is a schema-correctness fix); no `schema_version` bump.
+
+## [3.4.2] - 2026-07-13
+
+### Added
+
+- **`fallow suppressions`: a read-only inventory of every active suppression
+  marker.** Teams governing tech debt (and agents that need to distrust a
+  "clean" verdict) previously had to grep for `fallow-ignore` by hand; fallow
+  materialized every active suppression on each full run but exposed no way to
+  list them. The new command groups markers per file with line, kind, level
+  (`file` or `line`), origin, and reason, plus project totals (count by kind,
+  markers without a reason) and a stale count cross-referenced from this run's
+  stale-suppression findings (a join, not a new detection). Human and
+  `--format json` renderers (new `suppression-inventory` envelope, schema
+  version 1; blanket markers keep `kind: null` in JSON while human output
+  reads "blanket"), with `--workspace`, `--changed-workspaces`,
+  `--changed-since`, and `--file` scoping. Read-only governance surface:
+  always exits 0.
+
+- **MCP tool `list_suppressions`: the suppression inventory, now reachable by
+  agents.** The `fallow suppressions` inventory was CLI-only, so agents on the
+  MCP surface had to shell out to see what a "clean" verdict was hiding. The
+  new read-only `list_suppressions` tool wraps `fallow suppressions --format
+  json` and returns the `suppression-inventory` envelope verbatim (no new wire
+  contract), forwarding `workspace`, `changed_since`, and repeated `file`
+  scoping (plus `production` and the cache knobs). It runs a full analysis, so
+  raise `FALLOW_TIMEOUT_SECS` on large repos; a governance surface, not a gate,
+  so it always exits 0 even when suppressions exist.
+
+- **Native GitHub workflow output: `--format github-annotations` and
+  `--format github-summary`.** Workflows that run fallow directly (without the
+  bundled action) previously got no inline PR annotations or job summary; that
+  rendering lived only in the action's jq layer. `github-annotations` emits
+  GitHub workflow-command lines (`::error` / `::warning` / `::notice`) for
+  dead-code, dupes, health, audit, security (net-new, at `::notice`), fix, and
+  the bare combined run, sorted most-severe-first with a trailing
+  `::notice` total so GitHub's 10-per-type display cap never hides the worst
+  findings silently. `file=` paths are rebased onto the git repository root
+  when the analysis root is a subdirectory (override with
+  `--report-path-prefix`), and dependency fix commands honor
+  `PKG_MANAGER` before lockfile sniffing (npm, pnpm, yarn, bun).
+  `github-summary` renders the job-summary markdown for
+  `>> "$GITHUB_STEP_SUMMARY"`. Both are log-based, so they render on fork PRs
+  without a write token, unlike the PR-comment/review formats.
+- **`fallow report --from <results.json>`: render a saved JSON envelope
+  without re-running analysis.** Analyze once with
+  `fallow --format json -o results.json`, then render annotations and the job
+  summary from the same file; output is byte-identical to the direct
+  `--format` run. v1 renders the two GitHub formats and dispatches on the
+  envelope's `kind` (dead-code, dupes, health, audit, security, combined).
+
+### Changed
+
+- **The `fallow` npm launcher and Node bindings now require Node.js 22 or
+  later.** Both published manifests use the same supported runtime floor, and
+  the GitHub Action smoke workflow now validates them on Node.js 22.
+
+- **Contract regeneration now updates committed outputs as a transaction.**
+  Schema, editor, agent-doc, and NAPI artifacts are generated under one
+  temporary root and validated as a complete set before promotion. A failed
+  phase or promotion restores the original files, and check mode remains
+  destination-read-only.
+
+- **Reusable analysis sessions share immutable parsed-module storage across
+  warm queries.** Internal dead-code, feature-flag, and trace paths can retain
+  parser artifacts through an `Arc`-backed contract instead of deep-cloning
+  every `ModuleInfo`. Existing owned APIs remain compatible, and detector facts
+  are prepared before modules become immutable.
+
+- **Behavior change (subdirectory roots): CI-facing formats now emit
+  repository-root-relative paths when `--root` is a subdirectory.**
+  `codeclimate`, `review-github`, and `review-gitlab` addressed files
+  relative to `--root`, while `github-annotations` already rebased onto the
+  git toplevel. CI platforms address files from the repository root, so
+  GitLab's Code Quality widget matched nothing and every inline review
+  discussion was rejected when the analyzed project lived in a package
+  subdirectory. All CI formats now share one namespace, detected via the git
+  toplevel. Consumers that post-process these paths themselves (prepending
+  the offset in a wrapper script) should drop that step or pass
+  `--report-path-prefix ''` to restore the old output. Single-package
+  repositories, where `--root` is the toplevel, are unaffected. Classified
+  as a behavior-correcting fix rather than a semver major: for the affected
+  cohort the old paths were rejected by their only consumers, and one flag
+  restores the previous shape.
+
+- **The repository Dockerfile's pinned `FALLOW_VERSION` and checksums now
+  track releases automatically.** A post-release job downloads the published
+  musl binaries, refreshes the pins, sanity-builds the image, and opens a PR,
+  so `docker build` from the repo defaults to the current release instead of
+  drifting. (Closes [#1817](https://github.com/fallow-rs/fallow/issues/1817))
+
+- **`--annotations-path-prefix` is now `--report-path-prefix`.** It governs
+  every CI-facing format rather than only the GitHub-native ones. The old name
+  keeps working as an alias. An explicit empty value disables rebasing.
+
+### Fixed
+
+- **`unused-class-members` no longer reports members reached through
+  `#`-private class fields, same-named fields on sibling classes, local
+  subclasses, or unbound factory results.** Four extraction gaps produced
+  false positives on dependency-injection-style code: a `this.#dep.method()`
+  receiver recorded no member access at all; two classes in one module with a
+  same-named field collided on a module-flat binding key (last-write-wins), so
+  only the class declared last credited its dependency's members and reversing
+  declaration order flipped the flagging; members reached only through a local
+  (non-exported) subclass went uncredited; and a factory result read without a
+  named binding (`f().member`, `const { member } = f()`) or through an opaque
+  destructure dropped its accesses. Thanks
+  [@Jerc92](https://github.com/Jerc92) for the subclass and factory fixes in
+  [#1811](https://github.com/fallow-rs/fallow/pull/1811) and
+  [@martijnwalraven](https://github.com/martijnwalraven) for the private-field
+  report with its isolation matrix.
+  (Closes [#1821](https://github.com/fallow-rs/fallow/issues/1821))
+
+- **Playwright page-object methods used through a `mergeTests(...)`-wrapping
+  helper are credited.** A helper returning `mergeTests(...)`, wrapping an
+  imported `<base>.extend(...)` const, or returning a locally-bound
+  `const merged = mergeTests(...)` never emitted fixture-alias facts, so POM
+  methods consumed only through such a helper were reported as
+  `unused-class-member`. Thanks
+  [@committedpazz](https://github.com/committedpazz) for the follow-up report.
+  (Closes [#1795](https://github.com/fallow-rs/fallow/issues/1795))
+
+- **Iteration over array-typed parameters and `Promise.all` results credits
+  class members.** An array-typed formal parameter (`items: Item[]`) and a
+  `const xs = await Promise.all(arr.map(cb))` declarator did not type their
+  iteration variable, so `for...of` and `.map`/`.forEach` member accesses on
+  the element never credited the class. Thanks
+  [@vethman](https://github.com/vethman) for the report.
+  (Closes [#1793](https://github.com/fallow-rs/fallow/issues/1793))
+
+- **`fallow audit`'s base-snapshot cache no longer appears in
+  `git worktree list` or IDE repo views.** The persistent cache registered one
+  detached-HEAD git worktree per (worktree, base) pair for up to 30 days,
+  cluttering repo views in exactly the workflows fallow promotes (pre-commit
+  hooks, agent gates). Snapshots are now unregistered immediately after
+  materialization, with reuse and age-based sweeping intact; entries
+  registered by earlier fallow versions deregister automatically on the next
+  audit with warm caches preserved. Thanks
+  [@AlonMiz](https://github.com/AlonMiz) for the report.
+  (Closes [#1815](https://github.com/fallow-rs/fallow/issues/1815))
+
+- **Every suppress hint in the human footer names a token fallow actually
+  parses.** The "To suppress:" hints for eight sections printed tokens the
+  suppression parser does not recognize (config keys or plurals such as
+  `unused-exports`), so following the printed hint suppressed nothing and then
+  surfaced a stale-suppression finding on top. Hint tokens now derive from the
+  issue registry, the dependency sections print no hint (their findings live
+  in `package.json`, where inline comments cannot exist), and a roundtrip
+  guard test keeps every emitted token parseable. Thanks
+  [@slyeargin](https://github.com/slyeargin) for catching the unused-files
+  case in [#1820](https://github.com/fallow-rs/fallow/pull/1820).
+  (Closes [#1828](https://github.com/fallow-rs/fallow/issues/1828))
+
+- **`fallow init`, `fallow recommend`, and `fallow migrate` no longer point
+  `$schema` at a domain that fails to resolve, or a URL VS Code refuses to
+  load without a manual trust grant.** The generated config's `$schema`
+  previously hardcoded the remote `raw.githubusercontent.com` URL, which VS
+  Code treats as an untrusted remote schema location and silently declines to
+  load, and the schema's own doc comment separately recommended
+  `https://fallow.dev/schema.json`, a domain that has never resolved in DNS.
+  When a local, version-aligned `node_modules/fallow/schema.json` is present
+  (any npm install), generated configs now point `$schema` at it: offline, no
+  trust prompt, and always in sync with the installed version. Non-npm
+  installs (cargo, homebrew, a bare binary) keep falling back to the remote
+  URL. Thanks [@vethman](https://github.com/vethman) for the report.
+  (Closes [#1794](https://github.com/fallow-rs/fallow/issues/1794))
+
+- **`--diff-file` no longer silently discards every source-anchored finding
+  when `--root` is a subdirectory.** `git diff` names paths relative to the
+  repository toplevel, but findings were keyed relative to `--root` before the
+  lookup, so in a monorepo package the two namespaces never met: every
+  source-anchored finding was dropped and the run reported a clean diff, exit
+  0, with nothing on stderr. A unified diff does not declare its own base, and
+  both conventions are real (`git diff --relative` writes `--root`-relative
+  paths), so fallow now resolves the base from the diff's paths themselves:
+  whichever candidate directory they actually name files under wins. Both
+  conventions work; when `--root` is the repository toplevel they coincide and
+  output is byte-identical to before.
+
+- **`--diff-file` now scopes inline review comments, not only analysis results.**
+  That filter was gated on `FALLOW_DIFF_FILE`, so the flag rendered every comment
+  while appearing to have applied the diff.
+
+- **A `--diff-file` whose paths name no file under the repository toplevel or
+  the analysis root now warns.** This class of mismatch previously produced a
+  plausible-looking empty report rather than an error. A diff whose paths name
+  real files under *both* candidates is likewise reported as ambiguous rather
+  than silently guessed, since existence alone cannot place it. In both cases the
+  diff is discarded and findings are reported at full scope: a path that cannot be
+  expressed in the diff's namespace is retained, never silently dropped.
+
+- **Renamed files keep their `old_path` in `review-gitlab`.** The rename map is
+  keyed in the diff's namespace, but the lookup used the rendered path, so below
+  the repository toplevel (or under any `--report-path-prefix`) it missed and
+  `old_path` silently fell back to `new_path` -- telling GitLab a moved file had
+  not moved, and getting the discussion rejected.
+
+- **`--report-path-prefix` no longer decides which inline review comments
+  survive the diff filter.** The review and sticky-summary filters keyed issues
+  by their rendered path, so a custom or empty prefix silently stopped matching
+  the diff and dropped every comment. They now key by the analysis-root-relative
+  path and the diff's own base; the prefix only affects how paths are rendered.
+
+## [3.3.0] - 2026-07-09
+
+### Added
+
+- **`fallow plugin-check`: a read-only dry-run that makes external-plugin
+  authoring verifiable for agents.** Authoring a `fallow-plugin-*.jsonc` (and
+  especially a `manifestEntries` rule) previously gave feedback only as
+  `tracing::warn!` on stderr, invisible to anything parsing `--format json`.
+  `fallow plugin-check [--format json]` now reports, per external plugin,
+  whether it ACTIVATED (with the unmet `detection`/`enabler` requirement when it
+  did not, so a plugin that never activates is no longer silent), and for active
+  plugins with `manifestEntries` the per-rule result: the manifests it matched,
+  each manifest's `when`-gate pass/fail, the entries it seeded (each with a
+  `path_exists` flag), and typed `warnings[]` (`manifests-matched-none`,
+  `when-excluded-all`, `field-path-unresolved`, `entries-empty`,
+  `manifest-parse-failed`, `entry-outside-root`, `seeded-paths-missing`). Output
+  is deterministic (sorted) and the command always exits 0 (advisory, never a
+  gate). A `dead-code --format json` run with active external plugins and unused
+  files now surfaces a `verify-plugins` next step pointing at it, and the
+  `fallow schema` manifest's `related_schemas` gained `plugin_schema_command` /
+  `plugin_check_command` pointers, so agents discover the authoring + verify
+  loop without a full analysis.
+- **External plugins can now seed entry points derived from framework manifest
+  files (`manifestEntries`).** Static `entryPoints` globs cannot read a
+  framework manifest and derive entries from its fields, so monorepos whose
+  plugins are loaded at runtime through per-package manifests (rather than a
+  single app entry or `package.json` `main`/`exports`) had no entry points into
+  their plugin trees and reported that source as unused. A `fallow-plugin-*.jsonc`
+  can now declare `manifestEntries`: each rule finds manifest files by a
+  recursive glob, parses them (JSON / JSONC), and for every manifest that passes
+  a dotted-field `when` gate resolves each `entries[].path` relative to that
+  manifest's directory (with `${dotted.field}` interpolation that fans out over
+  string / array fields) into an entry point under the plugin's `entryPointRole`.
+  `when` uses strict equality; manifest discovery respects `.gitignore` and skips
+  `node_modules`; and a warning fires when a `manifests` glob matches nothing, a
+  `when` gate excludes every manifest, or a field path resolves in no matched
+  manifest (a likely typo). This makes manifest-driven frameworks self-serviceable
+  in a config file instead of requiring a built-in plugin. See
+  [custom plugins](https://docs.fallow.tools/frameworks/custom-plugins#manifest-derived-entries).
+
+- **`fallow schema` now enumerates the security-candidate categories, so an
+  agent can author `security.categories.include` / `exclude` without guessing.**
+  The config surface documented the include/exclude mechanism but not the valid
+  category ids (they live in the embedded catalogue), so an agent had to scrape
+  them from `fallow security --help` and a typo was silently accepted. The
+  capability manifest gains a `security_categories` block listing every category
+  id with its title, CWE, and an `include_required` flag (true for
+  `hardcoded-secret` and `secret-to-network`, which run only when explicitly
+  listed in `categories.include`). The config-schema `security` description now
+  points at it. Backed by `fallow_security::security_categories()`, deduped from
+  the compile-time-embedded catalogue.
+
+- **`fallow config-schema` is now self-documenting: every config key carries an
+  agent-facing description.** Previously the config schema listed key names and
+  types but almost no descriptions (1 of 36 top-level keys), so an agent
+  authoring an advanced config could produce structurally-valid JSON but had to
+  guess the semantics of keys like `boundaries`, `overrides`, `security`,
+  `publicPackages`, `includeEntryExports`, `sealed`, or `dynamicallyLoaded`.
+  Every top-level `FallowConfig` key (36 of 36) and the previously-undocumented
+  user-authored nested structs (`AuditConfig`, `ConfigOverride`, the `ignore*`
+  rule structs, `PerAnalysisProductionConfig`, `FixConfig`, `RegressionConfig`)
+  now carry a description that states exactly what the key controls, its valid
+  values and shape, and when to set it, including caveats (e.g. per-file
+  `overrides` cannot re-severity inter-file rules; `publicPackages` is a no-op
+  without workspaces; the `hardcoded-secret` and `secret-to-network` security
+  categories are include-required). Descriptions were written and adversarially
+  validated against the source by a panel of agents so every factual claim is
+  code-accurate.
+
+- **New read-only `fallow recommend` command: a project-tailored config
+  recommendation for an agent to author.** An agent onboarding a project cold no
+  longer has to guess a config. `fallow recommend` inspects the project
+  (frameworks, workspace layout, tooling) and emits, as JSON or a human summary,
+  three things: what fallow `detected`, a safe `proposed_config` it can write
+  (entry points, workspace packages, Storybook ignore), and a `decisions` list
+  split into three tiers, `auto` (decided from detection), `default` (a disclosed
+  overridable default), and `taste` (a genuinely subjective choice surfaced to
+  the user as an open question with no baked-in answer). Framework rule
+  severities are deliberately never written into the proposed config: fallow's
+  detectors self-gate on the framework, so those rules auto-activate at their
+  defaults, and not writing them avoids wrongly assuming one framework's rules on
+  a heterogeneous monorepo. The command is read-only, always exits 0, is
+  byte-deterministic, and states that zero config is a valid stop. Its
+  `proposed_config` is validated to load through fallow's real config loader.
+
+- **The `fallow schema` capability manifest now publishes each rule's default
+  severity and opt-in status, plus catalogs of boundary presets and taste
+  choices.** Previously an agent reading the manifest to author a config could
+  see every rule's id, category, and suppression comment, but NOT whether a rule
+  defaults to error, warn, or off, nor whether it is opt-in (detects nothing
+  until enabled). That information lived only in Rust, so an agent had to guess
+  or reverse-engineer it, and the most common way to flood a repo with findings
+  was enabling an opt-in rule (`private-type-leak`, security checks) blindly.
+  Each `issue_types` row now carries `default_severity` (`error`/`warn`/`off`,
+  guaranteed for every real rule), `opt_in` (a first-class boolean), and
+  `frameworks` (a framework label only where the detector genuinely self-gates
+  on that framework, so a framework-agnostic rule like `unused-server-action` is
+  never mislabeled and wrongly disabled). Two new top-level manifest sections,
+  `boundary_presets` (the built-in architecture presets with a one-line intent
+  each) and `taste_choices` (a curated catalog of the subjective config knobs an
+  agent should surface to the user rather than guess), round out the discovery
+  surface. All additive; the default-severity table has a single source of truth
+  shared with the analyzer's suppression gating, so the manifest can never drift
+  from the real defaults.
+- **`impact_closure` MCP tool: the pre-edit blast radius as a one-call
+  primitive.** "What breaks if I change this file?" was computable only by
+  paying for the full `inspect_target` bundle (dead code, duplication,
+  complexity, security, trace in sequence). The new read-only tool wraps
+  `fallow dead-code --impact-closure <path> --format json` (reverse
+  dependencies, re-export chains, and coordination gaps for one file), takes
+  the same scoping parameters as the other trace tools, and is registered in
+  the tool manifest, Code Mode, and the agent docs. It reports review-planning
+  evidence for a file's contract, not proof that affected files are wrong; the
+  existing `impact` tool (the local value report) is unrelated.
+- **React Router and Remix route loaders now feed `unused-load-data-key`.**
+  Route-loader data key harvesting is framework-scoped for React Router and
+  Remix while SvelteKit load data stays isolated: the extractor records the
+  correct producer mode per framework, and a SvelteKit whole-object abstain no
+  longer suppresses route-loader findings from the other frameworks.
+- **CSS-in-JS near-duplicate token reporting.** `fallow health --css` now
+  surfaces `near_duplicate_css_in_js_tokens` alongside the existing
+  `near_duplicate_theme_tokens` in the CSS analytics contract, human health
+  output, schema, and generated TypeScript contracts. Partial-scope scans
+  (changed files, workspace) abstain from the whole-project comparison so
+  scoped output stays conservative.
+
+### Changed
+
+- **The incomplete-tsconfig-chain warning no longer implies your path aliases
+  are broken.** When a file's `tsconfig` `extends` / `references` chain cannot
+  be fully loaded (most commonly a base config in `node_modules` that has not
+  been installed yet, e.g. analyzing a large monorepo before `npm install`),
+  fallow falls back to resolver-less resolution for the affected files and
+  emits one warning. The old wording ("Broken tsconfig chain ... tsconfig path
+  aliases from missing inherited configs will not [work]") read as if all path
+  aliases were unresolved, which alarmed users of large monorepos whose
+  `@scope/*` aliases actually resolve fine. In practice, aliases declared in a
+  discovered root or workspace `tsconfig.json` / `tsconfig.*.json` (including a
+  root `tsconfig.base.json`) are applied project-wide by fallow's TypeScript
+  plugin independently of the per-file chain, so they still resolve. The
+  warning now says so ("tsconfig chain not fully loaded ... path aliases
+  declared in a discovered root or workspace tsconfig still resolve") and only
+  flags aliases declared solely in the unreadable inherited config. Wording and
+  documentation only; resolution behavior is unchanged.
+
+- **`fallow config` now prints clean, pipeable JSON to stdout.** The
+  `loaded config: <path>` provenance line was printed to stdout ahead of the
+  config JSON, so `fallow config | jq` (and `fallow config --format json | jq`)
+  failed to parse. That provenance line, and the `no config file found` notice,
+  now go to stderr (suppressed by `--quiet`), leaving stdout as just the resolved
+  config JSON (or, with `--path`, just the path). Exit codes are unchanged.
+
+- **fallow now warns on an unknown `security.categories.include` / `exclude`
+  id.** A typo'd category id was silently ignored, quietly disabling the
+  category the config author meant to enable or exclude, with no signal. fallow
+  now emits a `tracing::warn!` naming the unknown id, its closest valid match
+  ("did you mean ...?"), and where to find the full list (`fallow schema`
+  `security_categories` / `fallow security --help`), mirroring the existing
+  unknown-rule-key warning. The check runs at the CLI config-load layer (the
+  config crate cannot depend on the security catalogue) for both the analysis
+  commands and `fallow config`, deduped process-wide.
+
+- **`fallow schema` now reports the opt-in status and default severity of the
+  security and coverage findings, matching every other rule.** Previously every
+  `fallow security` row (and the coverage findings) showed
+  `default_severity: null, opt_in: null`, so an agent scanning the manifest for
+  opt-in rules (the signal that most guards against flooding a repo with
+  findings) could not tell that security and coverage are off by default, even
+  though the sibling opt-in command `feature-flag` reported `off / true`. These
+  findings are gated by a shared rule (`security-sink`,
+  `security-client-server-leak`, `coverage-gaps`) rather than a 1:1 config key,
+  so the manifest now resolves their `default_severity` / `opt_in` from that
+  gating rule. `config_key` stays null for them (they are not individually
+  configurable), but they now read `off / true` consistently.
+- **`fallow audit` computes its focus-map signals in one graph pass.** The
+  dynamic-import and re-export participation signals were re-scanning the
+  whole module graph per changed file; they are now precomputed alongside the
+  existing target-direction sets, removing an O(changed files x references)
+  hot-path cost on large PRs. Output is unchanged.
+- **`fallow health --css` parses each CSS-in-JS consumer once per run.** The
+  design-token blast-radius scan re-parsed every consumer file once per token
+  definer; a single-parse multi-query scan now collects all definers' consumers
+  in one pass.
+- **The MCP server migrated to rmcp 2.x.** Internal dependency migration; tool
+  contracts and wire behavior are unchanged. (Closes [#1773](https://github.com/fallow-rs/fallow/issues/1773))
+- **The duplication detector, trace, churn, and cross-reference engines are now
+  owned solely by `fallow-engine`.** The transitional copies inside
+  `fallow-core` were deleted (about 20k lines across two cleanups); their tests
+  and benchmarks moved to the engine crate. This only affects direct consumers
+  of the `fallow-core` crate API; the CLI, JSON contracts, LSP, and MCP
+  surfaces are unchanged.
+
+### Fixed
+
+- **Playwright Page Object methods used through a function-wrapped fixture are
+  no longer reported as unused.** A fixture exported as a function that wraps a
+  local `base.extend<T>({...})` fixture const via `<const>.extend(...)` and is
+  called in specs as `myTest()("title", cb)` (instead of the direct
+  `export const myTest = base.extend(...)` form called as `myTest("title", cb)`)
+  left every Page Object method reported as `unused-class-member`. The wrapping
+  helper now inherits the fixture bindings of the const it wraps, so methods
+  used only through it are credited. Warm caches invalidate automatically on
+  upgrade. Thanks [@committedpazz](https://github.com/committedpazz) for the
+  precise minimal repro. (Closes
+  [#1791](https://github.com/fallow-rs/fallow/issues/1791))
+
+- **An options object typed by a local, unexported class now credits the
+  members of its imported property types.** Follow-up to the interface/alias
+  property-hop fix below: `class Opts { constructor(public c: ImportedDep) {} }`
+  declared in the consumer file (without `export`) never resolves through the
+  export-based instance-binding chain, so `this.opts.c.optM()` still reported
+  `ImportedDep.optM` as an `unused-class-member`. The typed-property-hop
+  expansion now also walks a locally-declared class's own typed-property
+  bindings, closing the last receiver shape from the #1785 investigation.
+  Warm caches invalidate automatically on upgrade. (Closes
+  [#1788](https://github.com/fallow-rs/fallow/issues/1788))
+
+- **Class members reached through an interface- or type-alias-typed property no
+  longer report as `unused-class-member`, same-file and cross-module.** The
+  dominant constructor-injected DI pattern (`interface Opts { c: OptDep }`,
+  `constructor(private opts: Opts)`, `this.opts.c.optM()`) previously flagged
+  `OptDep.optM` as unused whenever the receiver's type hop went through a named
+  interface or type-literal alias: directly-typed params, locals, and class
+  properties were already credited, but the named-type property hop was never
+  resolved. Codebases wiring classes through typed options objects saw
+  near-100% false-positive rates on the rule and had to disable it. The
+  extraction layer now expands those hops through the file's own
+  interface/alias property types, and when the type is imported (a shared
+  options interface in another module, including through barrel re-exports) a
+  new cross-module fact joins consumer, declaring module, and class at analyze
+  time, gated on the resolved export actually being a class with members, so a
+  wrong annotation can only under-report, never flag. The same gap existed for
+  Playwright fixture maps declared as an interface (`base.extend<MyFixtures>`
+  where `MyFixtures` is an `interface` rather than a `type` alias): those now
+  resolve identically to the alias form, so POM members consumed only through
+  interface-declared fixtures are credited. Vue and Svelte `<script>` blocks
+  previously dropped ALL typed extraction facts during the SFC merge, so the
+  cross-module member-crediting joins (factory returns, fluent chains, and the
+  new typed-property hop) never saw SFC consumers; those facts now survive the
+  merge and SFC files participate like plain TS files. Warm caches invalidate
+  automatically on upgrade. Thanks [@martijnwalraven](https://github.com/martijnwalraven)
+  for the report with the receiver-shape matrix. (Closes
+  [#1785](https://github.com/fallow-rs/fallow/issues/1785))
+
+- **`fallow config` now prints the effective defaults and exits 0 on a
+  zero-config project, instead of exiting 3 with no output.** fallow fully
+  supports running with no config file, but `fallow config` (the "what am I
+  running with?" command) treated the no-config case as a non-zero "not found"
+  and printed nothing usable, so an agent could misread it as an error. It now
+  writes the resolved default config as clean JSON to stdout (the `no config
+  file found, using defaults` note stays on stderr) and exits 0. `fallow config
+  --path`, which answers "which file", still exits 3 when there is no file.
+
+- **`fallow recommend`'s human output now points to `--format json` for the full
+  decision set.** The concise human summary intentionally omits the detected
+  project block, per-decision rationale, and taste-option tradeoffs; it now ends
+  with a one-line tip so a reader knows the full structured output (which an
+  agent consumes) is one flag away.
+
+- **`fallow recommend` and `fallow init` now detect frameworks that live in
+  workspace packages, not just the root `package.json`.** In a monorepo where the
+  framework sits in a member package (the common shape, e.g. Next.js in
+  `apps/web`), `recommend` previously reported `frameworks_present: []` and
+  `ui_framework: null` even though the analysis engine already activated the
+  right plugins, an onboarding signal that undersold the project and could
+  mislead an agent into hand-configuring what the framework plugin already
+  handles. Detection now aggregates dependency names across the root plus every
+  discovered workspace member, so the onboarding signal matches what analysis
+  sees. Non-monorepo projects are unaffected.
+
+- **`fallow init` now writes the workspace config under the key the loader
+  actually reads, in both JSON and TOML output.** The generated config emitted
+  `workspaces.packages`, but the loader's `WorkspaceConfig` field is `patterns`,
+  and unknown keys are silently dropped, so a generated monorepo config lost its
+  workspace scoping without any error. The `.fallowrc.json` scaffold was
+  corrected earlier; the `--toml` scaffold now emits `workspaces.patterns` too.
+  `fallow init` also derives its detection-based config (entry points, workspace
+  patterns, Storybook ignore) from the same core as `fallow recommend`, so the
+  two stay in lock-step. For configs already written with the old key,
+  `workspaces.packages` is now accepted as a back-compat alias for `patterns`, so
+  an existing `fallow.toml` keeps scoping correctly without a manual edit.
+- **The npm wrapper now exits non-zero when the fallow binary dies by a
+  signal.** A SIGSEGV, OOM kill, or abort previously fell through
+  `process.exit(null)` and read as exit 0 to CI gates, git hooks, and scripts;
+  the wrapper now maps signal deaths to the shell convention (128 plus the
+  signal number) and prints the signal name to stderr. The Linux fallback also
+  now prefers the statically linked musl build when the libc family cannot be
+  detected, matching the existing missing-detector fallback.
+- **A panic inside the `@fallow/node` addon no longer aborts the host Node
+  process.** The shipped cdylib previously inherited `panic = "abort"` from the
+  release profile, so any engine panic killed the embedding process outright.
+  It now builds with a dedicated `napi-release` profile (unwinding enabled) and
+  catches panics at the FFI boundary, surfacing them as a structured
+  `FallowNodeError` with code `FALLOW_PANIC`.
+- **The LSP emits UTF-16 column positions, as the protocol negotiates.**
+  Diagnostics, hover ranges, and code lenses were publishing byte columns, so
+  squiggles landed on the wrong characters on any line containing non-ASCII
+  text; columns now convert at the protocol boundary and the server advertises
+  `positionEncoding: utf-16`. The remove-export quick fix also no longer
+  corrupts lines that use Unicode whitespace indentation.
+- **`fallow health --hotspots` reports a churn-fetch failure on stderr instead
+  of emitting a second JSON document.** A failing `git log` under `--format
+  json` no longer breaks JSON consumers with two concatenated documents.
+- **Iteration bindings credit class members in three more shapes.** Vue `v-for`
+  over a `ref.value` or `store.<field>` source, Angular `@for` / `*ngFor`
+  blocks in an external `templateUrl`, and iteration over a function-local
+  array receiver no longer produce `unused-class-member` false positives.
+  (Fixes [#1716](https://github.com/fallow-rs/fallow/issues/1716),
+  [#1717](https://github.com/fallow-rs/fallow/issues/1717),
+  [#1718](https://github.com/fallow-rs/fallow/issues/1718))
+
+## [3.2.0] - 2026-07-05
+
+### Added
+
+- **The `fallow health` JSON summary now reports the effective unit-size
+  threshold.** `summary` on `fallow health --format json` already carried
+  `max_cyclomatic_threshold`, `max_cognitive_threshold`, and
+  `max_crap_threshold`, but not a unit-size sibling, so a consumer reading the
+  summary to learn which thresholds a run uses saw only three of the four. It
+  now also carries `max_unit_size_threshold` (the effective global
+  `health.maxUnitSize`, default 60), and the human report's "Large functions"
+  section reflects the configured global instead of a static "60" when
+  `health.maxUnitSize` is raised project-wide. Additive-required field matching
+  the existing `max*Threshold` siblings; no change to the unit-size check
+  itself. (Closes
+  [#1750](https://github.com/fallow-rs/fallow/issues/1750))
+
+- **New `health.maxUnitSize` threshold for the "function too big" (unit-size)
+  check, configurable globally and per file.** Previously the line-count at
+  which a function is reported as an oversized "large function" was hardcoded to
+  60 LOC with no way to change it, so test suites reported many large functions:
+  a `describe()` block's callback spans hundreds of lines, and each big `it()`
+  body trips the threshold too. The only workaround was `health.ignore`, which
+  drops every health signal (complexity, CRAP, hotspots) for those files, so you
+  also lost complexity checking on your test code. You can now raise the bar
+  instead of switching it off: set a global `health.maxUnitSize` (default 60),
+  or scope it to a glob with a per-file `thresholdOverrides` entry, e.g.
+  `{ "files": ["**/*.test.*"], "maxUnitSize": 500 }`. Leave `functions` empty so
+  the override covers both the `describe()` wrapper and the individual `it()`
+  blocks. Complexity, cognitive, and CRAP findings on those files are unchanged.
+  Like the existing `maxCyclomatic` / `maxCognitive` / `maxCrap` overrides, this
+  filters the reported "large functions" list; the descriptive unit-size profile
+  and the health score still reflect raw sizes (use `health.ignore` to remove a
+  file from the score entirely). Functions within their effective ceiling are
+  simply omitted from the `large_functions` JSON array; the resolved thresholds
+  are inspectable via `fallow config`. Thanks
+  [@digulla](https://github.com/digulla) for the request. (Closes
+  [#1731](https://github.com/fallow-rs/fallow/issues/1731))
+
+## [3.1.0] - 2026-07-05
+
+### Added
+
+- **New `dev-dependency-in-production` rule (promote-side dependency drift).**
+  Fallow already flagged production dependencies that belong in
+  `devDependencies` (`test-only-dependency`, `type-only-dependency`); the new
+  rule is the mirror that catches the opposite drift. A package in
+  `devDependencies` that is imported by production (non-test, non-config) source
+  code via a runtime/value import is flagged so it can be promoted to
+  `dependencies`: a production-only install (`pnpm install --prod`) omits
+  devDependencies, so such an import breaks at runtime. Type-only production
+  imports are not flagged (types are erased at build time), and a package also
+  listed in `dependencies`, `peerDependencies`, or `optionalDependencies` is
+  left alone because another manifest section provides it at runtime. Only
+  imports from files reachable from a runtime entry point count as production
+  evidence, so repo tooling (`scripts/`, benchmarks, rollup-config chains) does
+  not trigger the rule, and imports from workspace-owned files are governed by
+  the workspace's own manifest and skipped (per-workspace detection is a
+  follow-up). Known limitation: a file referenced from a package.json `scripts`
+  command counts as a runtime entry, so a dev-only helper script value-importing
+  a devDependency can still be flagged; suppress via `ignoreDependencies`.
+  Defaults to `warn`; configure via the `dev-dependencies-in-production` rule
+  key or suppress a package with `ignoreDependencies`. Surfaces in human, JSON, SARIF,
+  Code Climate, compact, and markdown output, in `fallow explain`, and as an LSP
+  diagnostic. Thanks [@CallumHoward](https://github.com/CallumHoward) for the
+  implementation. (Closes [#1738](https://github.com/fallow-rs/fallow/issues/1738))
+
+- **`fallow dead-code --trace FILE:MEMBER` now traces class, enum, and store members.** Previously tracing a class member (e.g. `--trace src/foo.ts:createEstimate`) errored `export 'createEstimate' not found`, so a member finding could not be debugged from the trace tool. On an export miss the trace now falls back to a member trace that names the owning class, reports its reachability and usage (the precondition that gates member crediting), lists who imports it, and points at `fallow dead-code --unused-class-members --file <file>` to inspect the finding. Available in human and `--format json`. (Refs [#1744](https://github.com/fallow-rs/fallow/issues/1744))
+
+- **The MCP `trace_export` tool and Code Mode now return the same class-member trace on an export miss.** They call the typed API in-process, which previously returned a hard `FALLOW_TRACE_TARGET_NOT_FOUND` on a member name, so AI agents (the primary consumers of member-crediting debugging) got worse behavior than the CLI. `fallow_api::run_trace_export` now falls back to the member trace, so both surfaces return either an export trace (`export_name`) or a member trace (`member_name` + `owner_export`); the tool description documents both shapes. (Refs [#1744](https://github.com/fallow-rs/fallow/issues/1744))
+
+- **Trace tools' not-found errors now carry an actionable next-step pointer.** The `trace_export`, `trace_file`, and `trace_clone` MCP tools (and the typed API) previously returned a `FALLOW_TRACE_TARGET_NOT_FOUND` error with a null `help` field, leaving an agent that mistyped a symbol, path, or fingerprint with no recovery hint. Each not-found error now populates `help` pointing at the right discovery tool (`trace_file` / `project_info` for a symbol, `project_info` for a file, `find_dupes` for a clone fingerprint). (Refs [#1744](https://github.com/fallow-rs/fallow/issues/1744))
+
+### Fixed
+
+- **Conditional and logical dynamic imports are now traced.** (#1742, contributed
+  by @Jerc92) `import(cond ? './a' : './b')` and `import(x || './b')` previously
+  produced no module-graph edge, so every file reachable only through such an
+  import (and its whole transitive subtree) was falsely reported as
+  `unused-files` / `unused-exports`. Extraction now emits one edge per
+  statically-resolvable branch, including parenthesized and no-substitution
+  template forms, across all dynamic-import shapes: bare expressions,
+  `const x = await import(...)` declarations, `.then()` callbacks,
+  `React.lazy` / `next/dynamic` arrow wrappers, and Angular/Vue route
+  `loadComponent` / `component` callbacks. Genuinely runtime arguments
+  (`import(someVar)`) still yield no edge, and repeated literals across branches
+  deduplicate to a single edge. Note: branches that were previously invisible are
+  now resolved like plain literal imports, so a conditional branch pointing at a
+  missing relative file surfaces as `unresolved-imports` (silence it via a
+  plugin's generated-file patterns, as with plain imports). A conditional that
+  mixes a literal with a pattern branch (a substitution template or path
+  concatenation) credits only the literal branch for now.
+
+- **`fallow health` no longer exits 1 when the config contains a `rules` key.** A bare `#[serde(default)]` on a rule-severity field resolved to `error` when a `rules` object was present (even `{"rules": {}}`), diverging from the documented default. `coverage-gaps` was promoted to `error`, tripping the standalone-health coverage-gap gate on any untested runtime file, so `fallow health` exited 1 with an otherwise-clean report; eight `warn`-default component / store / inject / server-action rules were likewise promoted to `error`, wrongly gating CI on Vue / Svelte / Angular projects. The nine affected defaults are now pinned to their documented values. Thanks [@lightsound](https://github.com/lightsound) for the report. (Closes [#1745](https://github.com/fallow-rs/fallow/issues/1745))
+
+- **Fixed `unused-class-member` false positives on public methods reached through a return-type-annotated factory.** A factory or hook whose body has no `new` value proof but is explicitly typed `: SomeController` (`function useController(): ReadyAppController { return registry.get() as ReadyAppController }`) now credits member reads on `const c = useController(); c.method()` across the module boundary, for both the function-declaration and arrow forms. A genuinely-unused method on the returned class still reports. Thanks [@prosky](https://github.com/prosky) for the report. (Closes [#1744](https://github.com/fallow-rs/fallow/issues/1744))
+
+
+## [3.0.0] - 2026-07-04
+
+
+### Added
+
+- **`unused-load-data-key` now covers React Router and Remix route loaders.**
+  Conventional route modules under `app/root.*`, `app/routes/**`,
+  `src/root.*`, and `src/routes/**` now report unused object keys returned by
+  exported `loader` or `clientLoader` functions when no same-route
+  `useLoaderData()` or `loaderData` consumer reads them. The existing rule kind,
+  suppress token, severity, and output contract are reused, and unsafe shapes
+  such as rest destructures or whole route-data forwarding abstain instead of
+  reporting.
+
+- **Rule-pack authoring commands for repo-wide policy linting.** `fallow rule-pack`
+  now exposes `init`, `list`, `test`, and `schema` as one command family. `init`
+  can scaffold starter and architecture-oriented packs, wire them into the local
+  config when possible, and print a manual snippet otherwise. `list` shows the
+  loaded packs, source files, effective severities, matcher patterns, and rule
+  messages in human or JSON form, giving teams a clearer path to project-specific
+  guardrails without hand-authoring every file from scratch.
+
+- **Pre-edit architecture guard reports for agents and humans.** `fallow guard`
+  reports the boundary zone, allowed import zones, forbidden call patterns,
+  rule-pack policy rules, effective severities, suppression tokens, and notes
+  for one or more files before code is written. It is config-only, works for
+  files that do not exist yet, and is also exposed as the read-only MCP `guard`
+  tool so agents can ask which repo-wide rules apply before editing.
+
+- **Rule-pack V2 matchers for architecture policy.** Rule-pack rules can now be
+  scoped to boundary `zones`, ban direct exports via `banned-export`, and use a
+  trailing `/*` banned-import specifier for subpath-only deep-import bans. These
+  all continue to report as `policy-violation`, so existing suppressions and CI
+  integrations keep one stable issue family.
+
+- **Richer PR and MR reporting for GitHub Actions and GitLab CI.** The bundled
+  CI integrations now render sticky summary comments from typed Rust output,
+  with a gate table, an attention banner, top fixes, and sidecar artifacts for
+  full drilldown. Clean runs no longer create a new sticky comment; if an older
+  Fallow comment already exists, the integration updates it so stale warnings
+  disappear. GitHub Actions also posts a native Fallow Check Run from the same
+  decision artifact when `checks: write` is available, while workflow
+  annotations and job summaries prefer the typed sidecars before falling back to
+  the legacy jq summaries. Inline GitHub review comments and GitLab MR
+  discussions skip clean zero-comment envelopes, so dead-code-only jobs no
+  longer leave "0 inline findings" timeline noise.
+
+- **`fallow audit` now includes styling findings by default.**
+  Audit now runs CSS and CSS-in-JS analytics in the normal PR gate and emits
+  verdict-neutral styling findings for design-system drift, duplicate CSS
+  blocks, selector complexity, dead styling surface, broken references,
+  near-duplicate theme tokens, and raw one-off values. The default deep pass
+  scans the project-wide styling surface and narrows cross-file results back to
+  changed anchors, so agents see styling consistency feedback in the same JSON
+  stream as JS/TS findings. Use `--no-css` / `audit.css: false` to disable
+  styling entirely, or `--no-css-deep` / `audit.cssDeep: false` to keep local
+  styling checks while skipping project-wide reachability. Styling actions stay
+  report-only (`auto_fixable: false`); agents must verify and edit manually.
+
+- **Audit can now flag introduced raw CSS values on design-system axes.**
+  `fallow audit` now turns located raw CSS declaration values for colors,
+  font sizes, line heights, radii, and shadows into
+  `css-token-drift` / `raw-style-value` styling findings when CSS audit
+  evidence is enabled. These findings are low-confidence and `verify-first`:
+  they can gate when `rules.css-token-drift` is set to `error`, but they tell
+  agents to confirm intent before replacing a value with an existing token or
+  custom property.
+
+- **Inventory names callback arguments from the callee.** A function passed as a
+  call or `new` argument was previously surfaced as anonymous; inventory now
+  derives its name from the callee (identifier, member property, or computed
+  string-literal key), matching the runtime instrumenter so static inventory and
+  runtime coverage agree on the same callback name (`arr.map(cb)`, route
+  handlers, `.references(() => ...)`)
+  ([#1719](https://github.com/fallow-rs/fallow/pull/1719)).
+
+- **Repo-scoped agent skills.** Added `.agents/` skill definitions for the
+  CI-format, CLI-output, and JSON-output reviewers so agents working in the
+  repository get scoped review guidance. Thanks
+  [@revazi](https://github.com/revazi) for the patch in
+  [#1727](https://github.com/fallow-rs/fallow/pull/1727).
+
+### Changed
+
+- **New fallow f-wing brand mark.** The three-bar logo is replaced by the new
+  f-wing mark across the icon, the light and dark wordmark lockups, the VS Code
+  sidebar icon, and the GitHub Pages favicon
+  ([#1733](https://github.com/fallow-rs/fallow/pull/1733)).
+
+- **Engine and registry architecture split completed.** Command, API, MCP, and
+  editor flows now route through typed engine and API boundaries, and combined
+  and audit reuse retained project artifacts instead of repeating discovery,
+  parse, and graph work. Output and issue metadata ownership moved into
+  generated contracts, and the security catalogue moved into a dedicated
+  `fallow-security` crate. CLI wire contracts, config, and output formats are
+  unchanged.
+
+## [2.104.0] - 2026-07-01
+
+### Added
+
+- **The GitLab CI template can reuse a pre-installed fallow binary.** Set
+  `FALLOW_SKIP_INSTALL: "true"` to skip `npm install -g fallow` and run the
+  `fallow` already resolvable on `PATH`, for example a version pinned through
+  a pnpm catalog and exposed on `PATH`, so CI runs the same binary as your
+  local lint gate. The job fails fast with a clear error when no `fallow` is
+  found. Default behavior is unchanged. Thanks
+  [@Jerc92](https://github.com/Jerc92) for the patch in
+  [#1662](https://github.com/fallow-rs/fallow/pull/1662).
+
+- **Design-token blast-radius for CSS-in-JS tokens (CSS program Phase 3d).** The
+  Phase 2 token blast-radius (`css_analytics.token_consumers` + the
+  `get_token_blast_radius` MCP tool) covered only Tailwind v4 `@theme` tokens. It
+  now also covers CSS-in-JS token DEFINITIONS, so changing a StyleX `defineVars` or
+  vanilla-extract `createTheme` / `createThemeContract` / `createGlobalTheme` token
+  shows its blast radius (a `consumer_count` plus located `consumers[]`) the same
+  way an `@theme` token does. Because CSS-in-JS tokens are defined in JS objects and
+  consumed via cross-module member access (`import { vars } from './tokens';
+  vars.color.primary`, including bracket access `vars.color['gray-100']`) or Panda
+  `token('colors.brand')` calls, the consumer scan resolves relative imports,
+  tsconfig path aliases, and workspace package imports to their defining files and
+  matches the member-access or call chain against the defined leaf token paths, so
+  an unrelated same-named binding is never counted. Entries reuse the existing
+  `token_consumers` shape with `consumers[].kind` set to `js-member` for StyleX /
+  vanilla-extract member access and `js-call` for Panda `token(...)` calls. Dep-gated
+  on a declared CSS-in-JS library (`@stylexjs/stylex`, `@vanilla-extract/css`, or
+  `@pandacss/dev`), descriptive-only (no `actions`, no exit-code effect), no new wire
+  field, and no `CACHE_VERSION` bump; a non-CSS-in-JS project and a plain
+  `fallow health` run (no `--css`) are byte-unchanged, and the Tailwind
+  `token_consumers` output is untouched. `consumer_count` is still a static lower
+  bound for dynamic import strings, unresolved aliases, generated package state, and
+  computed token access, and unlike Tailwind there is no corroborating dead-token
+  finding, so a CSS-in-JS `consumer_count` of 0 is a weaker signal.
+
+- **Fuzzy CSS clones via CSS-aware value canonicalization (CSS program Phase 4).**
+  `fallow dupes` already tokenized CSS, but the lexer was character-naive, so
+  near-miss / value-drifted CSS clones (the same shadow / gradient / transition
+  recipe re-implemented with `0px` vs `0` or `#fff` vs `#ffffff` drift, the shape
+  of design-system erosion) never matched. The duplicate-detection tokenizer now
+  canonicalizes CSS values on the stylesheet path: a zero-with-unit collapses to a
+  bare `0` (`0px`/`0em`/`0%`) and a hex color expands to its long lowercased form
+  (`#fff` -> `#ffffff`, `#abcd` -> `#aabbccdd`), so semantically-equal CSS hashes
+  equal and the clone engine surfaces the fuzzy duplicates. Scoped to CSS-family
+  files and SFC/Astro `<style>` regions only; JS/TS clone detection is unchanged.
+  (PR #1669)
+
+- **CSS-in-JS first-class in `fallow health --css` (CSS program Phase 3).**
+  styled-components / emotion / linaria apps previously got `null` `css_analytics`
+  because their CSS lives in `styled`/`css`/`keyframes` tagged templates. A new
+  lexical lifter (`css_in_js_virtual_stylesheet`, the tagged-template analogue of
+  the SFC `<style>` lifter) extracts the CSS body from each template literal,
+  masks `${}` interpolations to a CSS-valid placeholder, and feeds it through the
+  existing structural analytics + styling-health, so a CSS-in-JS app now gets real
+  `css_analytics` + `styling_health` (duplicate styled blocks, structural metrics,
+  design-token sprawl) instead of `null`. Dep-gated on a declared CSS-in-JS library
+  (`styled-components` / `@emotion/styled` / `@emotion/react` / `@emotion/css` /
+  `@linaria/core` / `@linaria/react`), so a non-CSS-in-JS project is byte-unchanged.
+  Template-literal form only (the object form `css({...})` ships in Phase 3c);
+  descriptive-only, no `CACHE_VERSION` bump, no new wire field. (PR #1668)
+
+- **Object-notation CSS-in-JS in `fallow health --css` (CSS program Phase 3c).**
+  The growing zero-runtime camp writes its CSS as an object (`style({...})`,
+  `stylex.create({...})`, `css({...})`, `styled.div({...})`), which the
+  template-literal lifter could not reach, so vanilla-extract / StyleX / Panda /
+  emotion-object apps still got `null` `css_analytics`. A new AST object-to-CSS
+  serializer lifts those style objects into the same virtual-stylesheet pipeline,
+  so both CSS-in-JS forms now converge on one analyzer. Recognition is gated on
+  import binding (a call only fires when its name was imported from a recognized
+  CSS-in-JS module), so a local `style`/`css` helper or an unrelated `cva` never
+  fires; static values only (camelCase to kebab-case, implicit-px outside the
+  unitless set and custom properties, one level of selector nesting), with dynamic / spread /
+  computed-key values dropped rather than guessed (no false positives).
+  Flat-by-construction atomic CSS (StyleX, Panda) is kept out of the
+  styling-health structural grade and duplicate-block detection and its grade is
+  marked low-confidence, so atomic CSS-in-JS never inflates the grade, while
+  token sprawl and duplicate blocks are surfaced for every library. Dep-gated
+  (adds `@vanilla-extract/css`, `@pandacss/dev`, `@stylexjs/stylex`), so a project
+  with none of the object deps is byte-identical; descriptive-only, no
+  `CACHE_VERSION` bump, no new wire field. The CSS-in-JS design-token graph
+  (StyleX `defineVars`, vanilla-extract `createTheme`) ships in Phase 3d.
+
+- **`get_token_blast_radius` MCP tool: query a design token's blast radius
+  directly.** A focused, read-only MCP tool that runs `fallow health --css
+  --format json` and surfaces `css_analytics.token_consumers` (the Tailwind v4
+  token blast-radius reverse index) without the agent needing to set `css=true` on
+  `check_health` or know the data hides inside `css_analytics`. Per `@theme` token:
+  the defining site, a `consumer_count`, and a capped located `consumers` sample
+  tagged `theme-var` / `css-var` / `utility` / `apply`. Annotated read-only and
+  closed-world (deterministic static analysis); free, no runtime layer. It is a
+  scoping aid, not a deletion gate: `consumer_count` is a static lower bound and
+  the dead-token verdict stays on `unused_theme_tokens`.
+
+- **`token_consumers`: design-token blast-radius in `fallow health --css --format
+  json`.** For a Tailwind v4 project, `css_analytics` now carries a reverse index of
+  where each `@theme` token is consumed, so an agent (or human) changing
+  `--color-brand` can see what it affects before touching it. Per token: the defining
+  `(path, line)`, a `consumer_count`, and a capped, located `consumers` sample tagged
+  by `kind`: `theme-var` (a `@theme`-interior `var()` reference), `css-var` (a
+  regular-CSS `var()` read), `utility` (a markup/className token ending in `-<name>`
+  such as `bg-brand`), or `apply` (a class inside an `@apply` body). Built from the
+  same gated candidate set as `unused_theme_tokens` (Tailwind v4, non-plugin,
+  non-published, whole-scope), so it inherits the same abstain behavior and a
+  `consumer_count` of 0 mirrors the dead-token signal. `consumer_count` is a STATIC
+  lower bound (a computed class name like `bg-${c}` is not counted), so it is
+  descriptive context, not a deletion proof; the authoritative dead-token finding
+  stays `unused_theme_tokens`. Additive and gated like `css_analytics`: a plain
+  `fallow health --format json` run is byte-unchanged, no schema-version bump.
+  Reachable over MCP via `check_health` with `css=true`.
+
+- **Styling health: a second CSS-quality health axis under `fallow health --css`,
+  now confidence-aware.** `fallow health --css` reports a `styling_health` score
+  (0-100) and A-F grade derived from the structural CSS analytics, scored
+  SEPARATELY from the code health score (which is byte-unchanged). It is
+  descriptive-only: no exit code, badge, or CI gating. Five capped penalty
+  categories (duplication, dead surface, broken references, token erosion,
+  structural), each shown in a `Deductions:` breakdown mirroring the code score.
+  To keep the grade honest on thin CSS, it carries a `confidence` marker (`high`
+  or `low`) plus a `confidence_reason`: `low` means the grade was computed from a
+  small authored-CSS surface (below 50 declarations, e.g. a utility-first Tailwind
+  app), where the penalty ratios are too sensitive to be authoritative. A
+  low-confidence grade renders dimmed (prefixed `~`) with a plain-text caveat
+  naming the declaration and stylesheet counts; agents reading `--format json`
+  get the `confidence` flag plus the raw `css_analytics.summary.total_declarations`
+  to apply their own threshold. When no stylesheet is import-reachable, the axis
+  is withheld entirely with an explanatory note. The rubric was calibrated against
+  a real-project corpus (government design systems grade A, the worst app a B from
+  a genuine high `!important` density). Reach this over MCP via `check_health`
+  with `css=true`.
+
+- **`unusedComponentProps.ignorePattern`: opt-in regex to treat
+  leading-underscore (or any pattern-matched) destructured props as
+  intentionally unused.** Component frameworks often accept a prop for public-API
+  stability while not consuming it internally, aliasing the destructure with a
+  leading underscore (`let { stage: _stage } = $props()`), the convention TS
+  `noUnusedParameters` and ESLint `varsIgnorePattern` / `argsIgnorePattern`
+  honor. Set `"unusedComponentProps": { "ignorePattern": "^_" }` to exempt any
+  prop whose LOCAL destructure binding name matches the regex from
+  `unused-component-props`. Applies to Vue, Svelte, Astro, and React/Preact
+  props. Default behavior is unchanged (opt-in only). Notes: the match is on the
+  local binding name (`_stage`), not the public prop name the finding reports
+  (`stage`); matching is unanchored like ESLint's `RegExp.test`, so anchor with
+  `^_`; an invalid regex fails config load with a clear error. A human-output
+  note reports how many props were exempted so a typo'd pattern that matches
+  nothing is not silently inert. Thanks
+  [@hniedner](https://github.com/hniedner) for the request.
+  (Closes [#1648](https://github.com/fallow-rs/fallow/issues/1648))
+
+- **`fallow review --walkthrough`: render the review walkthrough as a staged
+  terminal tour.** Turns the existing walkthrough guide into an ordered,
+  human-readable tour: a Review Focus header, staged sections, ordered files
+  each with a one-line fact and grounded badges, and a "cleared" panel collapsed
+  by default with an expand hint. `--format markdown` emits a paste-into-PR
+  artifact (no ANSI); `--format json` is byte-identical to `--walkthrough-guide`
+  (the same agent-contract envelope, no new schema). Per-file viewed state
+  persists locally under the project cache (`--mark-viewed`) and is tolerant of a
+  moved tree (a changed graph snapshot reads as not-viewed without discarding
+  marks). The renderer is pure presentation over the in-memory guide; it never
+  re-derives ordering or facts, and the review path still always exits 0.
+
+### Changed
+
+- **Styling-health now weights CSS value DRIFT over byte-identical repetition
+  (formula v3).** Research is clear that exact CSS duplication is the
+  least-harmful CSS pattern (repeated declarations gzip away, graphical properties
+  are loosely coupled, CSS has no native abstraction so some repetition is
+  unavoidable), while the real maintenance harm is design-token inconsistency. So
+  the styling-health grade's `duplication` exact-block penalty is down-weighted to
+  a soft hint (scale `200` -> `80`, the 20pt cap unchanged, the detector kept), and
+  the `token_erosion` penalty gains a hardcoded-value-sprawl drift sub-term sourced
+  from the count of distinct un-tokenized `box-shadow` / `border-radius` /
+  `line-height` values (per-axis baselines 10/8/6, gently saturating, sub-capped at
+  5pt inside the unchanged 10pt category). A system that tokenizes its scales via
+  `var(--*)` scores 0 sprawl regardless of how many tokens it defines (var-
+  referenced and `@theme`-defined values are not counted); only hardcoded literals
+  contribute. `STYLING_HEALTH_FORMULA_VERSION` bumps `2` -> `3`. This is
+  descriptive-only: no exit code, badge, gate, regression baseline, or trend
+  snapshot consumes the styling score, and the JS/TS code `health_score` is
+  byte-unchanged. **Consumers diffing `styling_health.score`/`grade` over time**
+  (raw `--format json` snapshot CIs, styling-grade trend dashboards): grades move
+  for some projects at the version boundary, so re-baseline or gate on
+  `formula_version`; the one-time step-change is expected, not a regression.
+
+- **Typed architecture boundaries across engine, output, and API callers.**
+  `fallow-engine`, `fallow-output`, and `fallow-api` now own the command-neutral
+  analysis runners, output contracts, and programmatic Rust boundary instead of
+  treating `fallow-cli` as the implicit API surface. LSP, MCP, NAPI, and Rust
+  callers consume typed engine/API results and serialize JSON only at protocol
+  boundaries; the old `fallow-programmatic-cli` compatibility crate has been
+  removed. The extraction pipeline now exposes typed semantic facts while
+  domain-specific adapters remain where the analysis still needs them.
+
+### Removed
+
+- **The `--legacy-envelope` compatibility flag is gone, along with the NAPI
+  `legacyEnvelope` option.** Both were introduced next to the top-level `kind`
+  discriminator as a one-cycle migration escape hatch that stripped only the
+  document-root `kind` field from JSON output. That cycle is over: every
+  object-shaped JSON root now carries `kind`, and the published schema,
+  generated TypeScript contracts, MCP tools, and Node bindings speak tagged
+  envelopes only. Consumers still passing `--legacy-envelope` get a CLI
+  argument error; drop the flag and select on the root `kind` field instead.
+
+### Fixed
+
+- **Astro template `.map()` callbacks over a typed class array no longer report
+  the class members as unused.** An iteration variable in an Astro template
+  `{...}` expression (`{utils.map((util) => <li>{util.getter}</li>)}`) whose
+  receiver is a frontmatter binding typed as an array of a class (`Util[]`)
+  previously flagged the element class members as `unused-class-member`. Astro
+  frontmatter is visitor-parsed (so a frontmatter `.map` was already credited),
+  but the template body `{...}` expressions were only scanned for bare
+  identifiers, never run through the member-recording visitor. fallow now
+  re-parses each template expression region and runs it through the same
+  iteration-binding visitor pass, seeded with the frontmatter's element types, so
+  a template `.map` / `.forEach` / `for...of` callback credits the element class
+  the same as the frontmatter and `.tsx`. Over-credit only: a member accessed
+  nowhere still reports. (Closes
+  [#1713](https://github.com/fallow-rs/fallow/issues/1713))
+
+- **Angular `@for` / `*ngFor` loop variables over a class array no longer report
+  the class members as unused.** An Angular component with an inline `template:`
+  that iterates a component field typed as an array of a class (`utils: Util[]`)
+  via `@for (util of utils; track util)` or legacy `*ngFor="let util of utils"`
+  and reads members on the loop item (`{{ util.getName() }}`) previously flagged
+  those members as `unused-class-member`. The loop variable is a template local,
+  not a class field, and nothing typed it to the iterated field's element class.
+  The Angular template scanner now types a bare-identifier `@for` / `*ngFor` loop
+  variable to the element class of the matching component field and remaps
+  `util.member` onto that class. Over-credit only: the iterated field is still
+  credited, a builtin-array field (`number[]`) types nothing, and a genuinely
+  unused member still reports. External `templateUrl` templates are a known
+  remaining case. (Closes
+  [#1712](https://github.com/fallow-rs/fallow/issues/1712))
+
+- **Vue `v-for` over a `props.<field>` array no longer reports the element
+  class members as unused.** A Vue `<script setup>` component that iterates a
+  prop typed as an array of a class and reads members on the loop item, for
+  example `v-for="(util, i) of props.items"` with `{{ util.getter }}` /
+  `{{ util.hello() }}` where `props` comes from
+  `defineProps<{ items: Util[] }>()`, previously flagged `Util.getter` /
+  `Util.hello` as `unused-class-member`. The element-type crediting only matched
+  a bare module-scope iterable, not a `props.<field>` member-expression source.
+  The `defineProps` inline-type harvest now records each array-typed prop field's
+  element class as `props.<field>`, which the existing `v-for` scanner matches, so
+  member accesses on the loop item credit the class. Over-credit only: a
+  genuinely unused member on the same class still reports, and a non-class array
+  prop (`number[]`) types nothing. (Closes
+  [#1711](https://github.com/fallow-rs/fallow/issues/1711))
+
+- **Iterating a typed class array no longer reports the class members as
+  unused.** Extending the Vue `v-for` fix below to the general iteration case: an
+  iteration variable whose type is the element class of a typed array or reactive
+  array is now credited when you read members on it. This covers array-method
+  callbacks (`utils.map(u => u.getter)`, `.forEach`, `.filter`, `.find`,
+  `.flatMap`, and friends; `reduce` / `reduceRight` are excluded because their
+  first callback argument is the accumulator, not an element), `for (const u of
+  utils)` loops, React and Preact JSX `.map`, and Svelte `{#each utils as util}`
+  blocks. Previously all of these false-reported the class members as
+  `unused-class-member`. Explicitly annotated callback parameters
+  (`(u: Util) => ...`) already worked; this adds the implicitly-typed case. The
+  change only removes false positives; a genuinely unused member on the same
+  class still reports. The deferred sibling cases are now fixed above: Angular
+  `@for` / `*ngFor`
+  ([#1712](https://github.com/fallow-rs/fallow/issues/1712)), Astro `.map`
+  ([#1713](https://github.com/fallow-rs/fallow/issues/1713)), and Vue `v-for`
+  over a member-expression `props.<field>` source
+  ([#1711](https://github.com/fallow-rs/fallow/issues/1711)). (Refs
+  [#1707](https://github.com/fallow-rs/fallow/issues/1707))
+
+- **Vue `v-for` loop variables iterating over a class array no longer report the
+  class members as unused.** A Vue template that iterates a typed array or
+  reactive array of a class and reads members on the loop item, for example
+  `v-for="(util, index) of utils"` with `{{ util.getter }}` / `{{ util.property }}`
+  / `{{ util.hello() }}` where `utils` is `Util[]` or
+  `computed(() => Util[])`, previously flagged `Util.getter` / `Util.property` /
+  `Util.hello` as `unused-class-member`. Previously fallow had no way to type a
+  `v-for` loop variable to its source iterable's element class, so member accesses
+  on the item were dropped. fallow now infers the element class of a Vue
+  `<script setup>` array or reactive-array binding (from the type annotation, a
+  `ref` / `computed` / `reactive` generic argument, a reactivity callback returning
+  a typed array, or a `new Class()` array literal) and credits member accesses on
+  the loop item. The change only removes false positives: a genuinely unused member
+  on the same class is still reported. Thanks [@Ericlm](https://github.com/Ericlm)
+  for the report and the minimal reproduction. (Closes
+  [#1707](https://github.com/fallow-rs/fallow/issues/1707))
+
+- **Telemetry: `fallow flags` and `fallow watch` now record `findings_present`,
+  and a guard prevents the whole class of regression.** Both commands emit a
+  `code_quality_review` telemetry event (the same workflow as combined `fallow`,
+  which does populate the field) but never noted their find-state, so
+  `findings_present` serialized as null, the same gap fixed for the `security`
+  subcommands. `flags` now notes its feature-flag count and `watch` notes each
+  cycle's issue count. Focused `dead-code` / `dupes` trace and impact-closure
+  views also record their underlying analysis count, so `findings_present`
+  reflects what the analysis surfaced independent of the output view. A
+  debug-build invariant at the single telemetry event-emission point now fails
+  fast if any finding-surfacing workflow records a non-failing event without
+  noting find-state, so a future analysis command cannot silently reintroduce
+  the gap. No change to the telemetry payload shape.
+  (Refs [#1650](https://github.com/fallow-rs/fallow/issues/1650))
+
+- **Telemetry: the `security` workflow once again records `findings_present` for
+  the `survivors` and `blind-spots` subcommands.** Both subcommands emit a
+  `security` telemetry event but never noted their find-state, so the
+  process-global accumulator stayed unset and `findings_present` serialized as
+  null. Because `fallow security` exits non-zero only when findings exist and the
+  rule is raised to `error`, `findings_present` is the field that distinguishes
+  "found candidates" from "errored," and a null value lost that signal for these
+  modes. `survivors` now notes its retained (non-dismissed) candidate count and
+  `blind-spots` notes its unresolved-callee-site count before exit, matching the
+  default / `--file` / `--gate` paths. No change to the telemetry payload shape.
+  (Closes [#1650](https://github.com/fallow-rs/fallow/issues/1650))
+- **`unused-files` no longer false-flags a custom version-bump `updater` script
+  referenced under the package.json `commit-and-tag-version` key.** A custom
+  updater module (`app/scripts/gradle-updater.cjs`) is loaded by
+  commit-and-tag-version at runtime and has no static importer, so fallow
+  reported it as unused. fallow only scanned an allowlist of package.json keys
+  (`main`, `bin`, `exports`, `scripts`, ...) for file references and had no
+  plugin for this tool. A new `commit-and-tag-version` plugin (legacy enabler
+  `standard-version`) now credits each `bumpFiles[]` / `packageFiles[]` entry's
+  `updater` module and `filename` target, from both the package.json key and
+  standalone `.versionrc` / `.versionrc.{json,js,cjs}` configs. Crediting is
+  gated on the file existing on disk, so non-source targets (gradle, plist,
+  version.txt) and phantom paths are never over-credited. Thanks
+  [@rbalet](https://github.com/rbalet) for the report.
+  (Closes [#1640](https://github.com/fallow-rs/fallow/issues/1640))
+- **`unused-files` no longer false-flags Next.js `page.mdx` (and other entries)
+  when `next.config` wraps its config object.** fallow resolved a bare
+  `export default config`, but not a config passed as a named const to a wrapper
+  call, so `export default withMDX(nextConfig)` (the official `@next/mdx` docs
+  idiom), `module.exports = createJestConfig(customConfig)`, nested wrappers, and
+  `compose(...)(nextConfig)` all read as an empty config. The Next.js plugin
+  never saw `pageExtensions`, so MDX App Router pages were reported as unused.
+  The shared config resolver now follows the named const (including through
+  nested wrapper calls), which also fixes the same class for any wrapped Vite /
+  Webpack / Jest config. Thanks [@AlonMiz](https://github.com/AlonMiz) for the
+  report.
+  (Closes [#1642](https://github.com/fallow-rs/fallow/issues/1642))
+
+- **`unused-class-members` no longer false-flags framework-dispatched OpenLayers
+  interaction methods.** A `handleEvent` (or the `PointerInteraction`
+  `handle*Event` / `stopDown` protocol) on a subclass of an `ol/interaction/*`
+  base is invoked by OpenLayers per browser event, never through an explicit
+  call site, so it was reported as an unused class member. fallow now credits
+  these dispatched methods, gated on the `super_class` resolving through the
+  file's imports to an `ol/interaction/*` specifier (so a same-named local base
+  does not credit) and walked down `extends` chains so transitive subclasses are
+  covered. Genuinely-unused non-dispatched members on the same class still
+  report.
+  (Closes [#1638](https://github.com/fallow-rs/fallow/issues/1638))
+
+- **`unused-class-members` no longer false-flags a `toString` invoked only
+  through implicit string coercion.** A `toString` used solely via a
+  template-literal interpolation (`` `${new Money(5)}` ``), `String(...)`, or `+`
+  with a string operand has no explicit `.toString()` call site, so it was
+  reported as unused. fallow now credits a class's `toString` when a
+  `new Class()` flows directly into one of those coercion positions. The scope is
+  tight to the direct `new Class()` form: a numeric `+` (`new Num() + 5`) and a
+  `new Class()` outside a coercion position do not credit, so a genuinely-unused
+  `toString` still reports.
+  (Closes [#1638](https://github.com/fallow-rs/fallow/issues/1638))
+
+## [2.103.0] - 2026-06-28
+
+### Added
+
+- **`coverage analyze --format json` now emits the runtime trust-output contract
+  on the local report.** Each report carries `actionable`,
+  `actionability_reason`, and `actionability_verdict` (a capture with no tracked
+  functions is a first-class `insufficient_evidence` verdict, never silently read
+  as cold), plus a `provenance` block (`data_source`, `freshness_days`,
+  `untracked_ratio`, `unresolved_ratio`, `stale`, `stale_after_days`). The block
+  is context only: it never gates a positive verdict or a confidence score.
+  Additive, JSON-only.
+
+- **`coverage analyze` findings now carry a `discriminators` block.** Alongside
+  each verdict, the inputs that produced it are now legible instead of needing to
+  be re-derived: `tracking_state` (called / never_called / untracked),
+  `invocation_ratio`, the `low_traffic_threshold` and `min_observation_volume`
+  in effect, and `trace_count` with `meets_observation_volume`. It makes the
+  existing signals visible and gates nothing. Additive and backwards-compatible
+  (omitted when absent).
+
+- **`get_blast_radius` and `get_importance` MCP tools now state the
+  augment-not-gate rule in their descriptions.** Both return review context
+  (caller counts, risk bands, importance scores); the descriptions now make
+  explicit that these signals must not gate a `safe_to_delete` decision or a
+  confidence score. Only the three-state runtime tracking signal (called /
+  never_called / untracked) can issue a deletion verdict, matching the
+  server-side enforcement.
+
+- **`coverage analyze --cloud` now hints the source-map upload command when
+  coverage is unresolved.** When the cloud cannot map runtime positions to source
+  (almost always because no source maps were uploaded for the commit) and built
+  source maps exist on disk, fallow prints the exact
+  `fallow coverage upload-source-maps --dir <dir>` command and build directory.
+  Human output only; JSON consumers already get the structured
+  `coverage_unresolved` warning in `report.warnings`.
+
+### Changed
+
+- **Typed output contracts across every consumer.** Engine results now feed the
+  CLI, LSP, NAPI, MCP, and programmatic callers through shared typed contracts
+  instead of CLI rendering being the implicit API surface. As part of this,
+  `workspace_diagnostics` is now a typed `WorkspaceDiagnostic` array on
+  `CheckOutput` and `DupesOutput` (and the combined and audit envelopes),
+  matching `WorkspacesOutput`, so `docs/output-schema.json` and the generated
+  npm / VS Code `.d.ts` describe it precisely instead of as an opaque value.
+  Thanks [@riker-wamf](https://github.com/riker-wamf) for flagging it.
+  (Closes [#1635](https://github.com/fallow-rs/fallow/issues/1635))
+
+- **`fallow dupes` now ignores test and mock files by default.** Duplicate-code
+  analysis skips `*.test.*`, `*.spec.*`, `__tests__`, and `__mocks__` paths out
+  of the box, reducing first-run noise from intentionally repetitive tests.
+  Set `duplicates.ignoreDefaults: false` to restore the previous corpus.
+  (Closes [#1386](https://github.com/fallow-rs/fallow/issues/1386))
+
+### Fixed
+
+- **`unused-component-props` no longer false-flags a Svelte prop used only
+  through a `bind:`/`style:`/`class:` directive shorthand.** A value-less
+  directive such as `bind:open`, `style:height`, or `class:active` is shorthand
+  for `directive:NAME={NAME}`, so the directive name itself references the prop.
+  Template-usage extraction now credits these, alongside the existing
+  `use:`/`transition:`/`in:`/`out:`/`animate:` handling. Directives written with
+  an explicit value (`style:height={h}`) are unchanged: the value names the
+  reference, and the bare target (CSS property, class name, child prop) does
+  not. Thanks [@hniedner](https://github.com/hniedner) for the report.
+  (Closes [#1641](https://github.com/fallow-rs/fallow/issues/1641))
+
+- **`unused-component-props` no longer false-flags a Vue prop used only through
+  a value-less `v-bind` same-name shorthand.** Vue 3.4+ lets `:open` stand for
+  `:open="open"` and `:some-prop` for `:some-prop="someProp"`, so the argument
+  itself references the prop. Template-usage extraction now credits the
+  camelCase argument of a value-less `v-bind`. A `v-bind` written with an
+  explicit value (`:label="text"`) is unchanged: the value names the reference,
+  not the bare argument.
+  (Refs [#1641](https://github.com/fallow-rs/fallow/issues/1641))
+
+- **`unused-component-props` no longer false-flags a Vue prop used only through
+  a `<style> v-bind()` reference.** Vue SFC CSS `v-bind(accent)`,
+  `v-bind(props.accent)`, and the string form `v-bind('a.b')` bind a script or
+  prop value into CSS. Template-usage extraction now scans `<style>` blocks for
+  these references, so a prop consumed only by CSS `v-bind()` is credited
+  instead of reported as unused.
+
+- **`unused-store-members` no longer false-flags a Pinia store member reached
+  through indirection.** A member used inline on a store-factory call
+  (`useFooStore().member`), or through a store passed as a param typed
+  `ReturnType<typeof useFooStore>` (inline or via a local `type` alias) and read
+  as `store.member`, `props.store.member`, or `const { member } = props.store`,
+  is now credited instead of reported as unused. Resolution is gated on the
+  `use<Name>Store` naming convention, so a non-store call or
+  `ReturnType<typeof ...>` param never masks a genuinely unused member.
+  Member usage in `.ts` files is credited alongside `.vue` SFCs. Thanks
+  [@Jerc92](https://github.com/Jerc92) and [@Ericlm](https://github.com/Ericlm)
+  for the reports.
+  (Closes [#1489](https://github.com/fallow-rs/fallow/issues/1489) and
+  [#1488](https://github.com/fallow-rs/fallow/issues/1488))
+
+- **`unused-class-members` no longer false-flags a member reached through a
+  factory or composable return value.** When a class instance reaches a call
+  site only through a function that returns it (a `useApi()` composable, a
+  singleton getter), `const api = useApi(); api.Member()` now credits
+  `Class.Member`, including when the factory's return type is inferred rather
+  than annotated. Previously the member was reported as unused unless the
+  instance was reached through a directly-typed reference. Thanks
+  [@Jerc92](https://github.com/Jerc92) for the report.
+  (Closes [#1441](https://github.com/fallow-rs/fallow/issues/1441))
+
+- **`unused-component-props` no longer aborts on a spaced `</template >` closing
+  tag.** Whitespace inside a Vue SFC closing template tag previously aborted
+  template-usage extraction for the entire component, so every prop and emit in
+  that SFC was reported as unused. The closing tag is now matched regardless of
+  internal whitespace. Thanks [@Jerc92](https://github.com/Jerc92) for the
+  report.
+  (Closes [#1439](https://github.com/fallow-rs/fallow/issues/1439))
+
+- **`ignorePatterns` now accepts a leading `./`.** Entries such as
+  `./src/generated/**` now match the same project-root-relative files as
+  `src/generated/**`, instead of silently leaving those files in the analysis.
+  The same normalization applies to `ignoreUnresolvedImports`. (Closes
+  [#1385](https://github.com/fallow-rs/fallow/issues/1385))
+
+## [2.102.0] - 2026-06-23
+
+### Added
+
+- **Code review brief (`fallow review`, or `fallow audit --brief`).** A new advisory
+  orientation mode over changed code. It runs the same dead-code + complexity +
+  duplication analysis as `fallow audit` but answers "where do I look?" instead of
+  "will CI block this?": it ALWAYS exits 0 (the verdict is carried informationally),
+  so a reviewer or agent can read it regardless of the gate outcome. The brief renders
+  a ranked decision surface, a weighted focus map, and change-impact context. `--format`
+  is orthogonal to `--brief`. `fallow review` is an alias for `fallow audit --brief`.
+
+- **`fallow decision-surface` command and `decision_surface` MCP tool.** Surfaces the
+  consequential structural decisions a change embeds (the apex of the review brief):
+  a ranked, capped (3-5) set of coupling/boundary, public-API/contract, and dependency
+  decisions, each framed as a judgment question with the routed expert to ask. Each
+  decision carries an honest count of how many internal consumers it affects plus an
+  explicit trade-off clause, so the reader sees the cost as well as the call. Separable
+  and cheap, advisory (always exits 0), and every decision is suppressible with
+  `// fallow-ignore`. Use `--base` / `--changed-since` to pick the comparison point,
+  exactly like `fallow audit`.
+
+- **`fallow trace <FILE:SYMBOL>` symbol-level call chains.** Walks callers UP (modules
+  that import the symbol) and callees DOWN (import-symbol edges plus intra-module call
+  sites) through the module graph, bounded by `--depth` (default 2). `--callers` /
+  `--callees` scope the direction; both are walked by default. Best-effort and syntactic
+  per ADR-001: resolved-vs-unresolved callees are reported honestly, never silently
+  dropped. It is its own surface, never folded into the ranked review brief.
+
+- **Agent-contract walkthrough loop (`--walkthrough-guide` / `--walkthrough-file`).**
+  `--walkthrough-guide` emits a deterministic digest (the brief, the decision surface,
+  the review direction, the JSON schema the agent must return, and a graph-snapshot hash)
+  built from the graph only, so PR prose is never folded in and the digest is
+  injection-resistant. `--walkthrough-file` ingests an agent's judgment JSON and
+  post-validates it against the LIVE graph: it rejects any judgment whose `signal_id`
+  fallow did not emit (anti-hallucination) and refuses the whole payload as stale when
+  the echoed graph-snapshot hash no longer matches. The verifier is the graph, not a
+  second model. Both imply the brief and always exit 0.
+
+- **Weighted focus map with a de-prioritized escape hatch.** The review brief ranks
+  changed units by review weight and collapses the de-prioritized tail by default;
+  `--show-deprioritized` re-expands the human render. The `deprioritized` list is always
+  present in `--format json` regardless of the flag.
+
+- **LLM-call prompt-injection candidate (`fallow security`).** A new `llm-call-injection`
+  category (CWE-1427) in the tainted-sink catalogue. It fires only when an untrusted
+  source flows into the prompt/messages argument of a known LLM-call sink (a taint PATH
+  into the call, not every LLM call), pinned to the distinctive LLM SDK call shapes. Like
+  all `fallow security` output it is a CANDIDATE for verification, not a verified
+  vulnerability, and never appears under bare `fallow` or the `audit` gate.
+
+- **React component intelligence in the editor.** The LSP now surfaces ambient React/Preact
+  context with no new rule, finding, severity, or gating. A code lens above each component
+  summarizes it (`rendered 12x (8 parents), 5 props, 9 hooks (4 state, 3 effect, 1 memo, 1
+  callback)`), and a per-prop hover shows `read in body, passed from 3 call sites` (or `not read
+  in body` for a prop the component ignores); a forwarded prop adds `forwarded 4 levels: Page >
+  Layout > Sidebar > Profile`. Descriptive editor-only context: `fallow` / `audit` / `--format
+  json` output is unchanged (the data is an in-process LSP carrier computed only on the editor
+  path). Render counts exclude test/spec/story files and headline distinct parents, not in-file
+  repetition.
+
+- **Astro framework-health detection.** `.astro` components now participate in the same
+  health suite as Vue/Svelte/Angular/React. The frontmatter is semantic-analyzed (imports
+  used only as `<Header/>` tags or `{expr}` markup are credited; a genuinely-dead
+  frontmatter import now refines `unused-export`). A reachable `.astro` component kept alive
+  only by a barrel re-export but rendered in no template surfaces as `unrendered-component`
+  (framework `astro`). An `interface Props` field read nowhere via `Astro.props`
+  (destructure / member access) or the template surfaces as `unused-component-prop`, with a
+  zero-false-positive abstain ladder (`interface Props extends X` / `type Props = Imported`,
+  rest destructure, whole-object `Astro.props` use, and `{...Astro.props}` template spread
+  all abstain the component). No new rules or severities: `.astro` reuses the existing
+  `unrendered-component` and `unused-component-prop` rules.
+
+- **Lit / web-component framework-health detection.** A custom element registered via
+  `@customElement('x-foo')` or `customElements.define('x-foo', C)` but rendered as a tag in no
+  `html` template anywhere in the project surfaces as `unrendered-component` (framework `lit`,
+  the finding names the tag). The zero-false-positive ladder wholesale-abstains published
+  elements (re-exported from a package entry, the dominant design-system shape), credits
+  imperative renders (`document.createElement` / `customElements.get` / `whenDefined`), and
+  abstains the whole project when any `html` template renders a dynamic tag. A Lit `@state()`
+  reactive property read nowhere in its element (neither a method nor the `html` template) now
+  surfaces as `unused-class-member`; `@property` (the public attribute API, settable via HTML
+  attribute / parent binding / `setAttribute` / CSS) is never flagged. Gated on a `lit` /
+  `lit-element` / `@lit/reactive-element` dependency; reuses the existing `unrendered-component`
+  and `unused-class-member` rules (no new rules).
+
+### Changed
+
+- **Deeper React prop coverage for `unused-component-prop`.** The React arm now harvests props
+  from same-file typed interfaces (`(props: Props) => props.x`) and generic `forwardRef<Ref,
+  Props>` components, not only inline destructure, so a prop a non-exported component declares
+  but never reads is caught on more component shapes. Imported prop interfaces, `extends` /
+  generic / intersection types, and any whole-object props use still abstain, so exported
+  public-API components and library surfaces are never flagged (validated zero false positives
+  on a real-project corpus).
+
+- **`fallow health` now scores `.astro` complexity.** Astro frontmatter functions are scored
+  like a Vue/Svelte `<script>`, and a synthetic `<template>` entry scores the markup
+  `{ ... }` expression and iteration (`.map` / `.flatMap` / `.forEach`) complexity, mirroring
+  the existing Vue/Svelte synthetic `<template>` entries. This is a health SIGNAL only (it
+  never appears under bare `fallow`, `audit`, or `dead-code`), but it is a one-time
+  discontinuity in baselined health trends for projects with `.astro` files: a previously
+  unscored `.astro` frontmatter/template now contributes to the complexity aggregate.
+
+- **VS Code: clearer tree badges, hardened health spawn, and de-duplicated diagnostics.**
+  The sidebar tree badges are tightened, the background `fallow health` spawn is more
+  resilient, and overlapping diagnostics for the same location are de-duplicated so the
+  Problems panel no longer double-reports.
+
+- **Faster command-only surfaces.** Commands that do not run a full analysis (schema and
+  template printers, and similar metadata surfaces) start up faster.
+
+### Fixed
+
+- **Merged namespace values imported through star barrels are no longer falsely reported as unused.**
+  A value export that shares its name with an `export declare namespace` and is consumed through
+  `export *` now receives the same named-import credit as a direct import. The type-only namespace
+  side stays governed by type usage, so unrelated unused type findings and sibling value exports
+  remain reportable. Thanks [@TeoVezza95](https://github.com/TeoVezza95) for the report.
+  (Closes [#1373](https://github.com/fallow-rs/fallow/issues/1373))
+
+- **VS Code now resolves the native fallow binary from platform packages.** When the
+  binary is reached through a `.cmd` / `.ps1` launcher shim on `PATH`, the extension
+  re-resolves it to the sibling native executable so LSP-backed diagnostics start
+  reliably. Thanks [@ivan-palatov](https://github.com/ivan-palatov) for the report.
+  (Closes [#1359](https://github.com/fallow-rs/fallow/issues/1359))
+
+- **TanStack Router: custom `routeFileIgnorePrefix` is honored.** Files using a project's
+  configured ignore prefix are no longer flagged as dead code. Thanks
+  [@Spiralis](https://github.com/Spiralis) for the report.
+  (Closes [#1358](https://github.com/fallow-rs/fallow/issues/1358))
+
+- **`fallow audit` base-snapshot worktree paths are unique per call.** Non-reusable
+  base-worktree directory names can no longer collide across concurrent audit runs, which
+  could intermittently fail an audit with exit 2.
+
+- **More precise telemetry failure classification.** When telemetry is enabled, a failed
+  run now records a specific failure reason (validation, config, network, and the like)
+  instead of a generic bucket.
+
+- **Review direction no longer routes through ownership for the current reviewer**, and
+  story/test-only coordination-gap noise is dropped from the review brief.
+
+- **Vendored GitLab CI now bundles `gitlab_common.sh`.** `fallow ci-template gitlab --vendor`
+  writes the shared helper both `comment.sh` and `review.sh` source, so vendored pipelines
+  run without reaching out to `raw.githubusercontent.com`.
+
+## [2.101.0] - 2026-06-21
+
+### Changed
+
+- **Faster duplicate detection on large repositories.** Clone detection now builds its
+  suffix array with a linear-time SA-IS construction instead of the previous
+  prefix-doubling approach, cutting the duplication stage of `fallow dupes` (and of
+  bare `fallow` and `fallow audit`) on large codebases. Reported clones are unchanged.
+
+- **Faster repeated stylesheet resolution.** Resolving external (`node_modules`)
+  stylesheet `@import` / `@use` chains now reuses a single resolver session across
+  lookups instead of rebuilding the resolver and re-reading every workspace
+  `package.json` for each stylesheet. On a 41-workspace monorepo this removes roughly
+  80 manifest reads and 80 path-canonicalization calls per external stylesheet.
+  Resolution results are unchanged.
+
+- **Faster plugin and config detection on large repositories.** Plugin config files
+  (`tsconfig.json`, `.eslintrc.json`, `bunfig.toml`, and the like) are now collected
+  during the existing project file scan instead of a second filesystem walk of every
+  directory, and workspace file bucketing runs in parallel. The same in-memory listing
+  also drives filesystem-based plugin activation, so the browser-extension and Obsidian
+  plugins no longer read every candidate directory's `manifest.json` to decide whether
+  to activate. On a 21k-file, 41-workspace project this roughly halves the plugin
+  detection stage (about 340ms). Analysis output is unchanged: byte-identical results
+  across the benchmark suite.
+
+  One deliberate behavior refinement comes with it: outside production mode, config
+  files and activation manifests are now discovered with the same traversal rules as
+  source files, so one that is gitignored, excluded by an `ignorePatterns` entry, or
+  inside a hidden directory fallow does not traverse is no longer parsed or used to
+  activate a plugin. Committed files in normal locations are unaffected. Production
+  mode keeps the previous filesystem discovery.
+
+### Fixed
+
+- **Vue components exposed as namespaces are no longer falsely reported as unused.**
+  A design system that re-exports compound components through namespace barrels
+  (`export * as List from "./components/List"`) and renders their members via dotted
+  tags had every such member reported by the `unrendered-component` check as
+  "reachable but rendered nowhere". The render-usage walk now follows namespace
+  re-export edges back to the underlying `.vue` files and credits them, for both the
+  named-import form (`import { List } from "@/design-system"`; `<List.Root>`) and the
+  whole-namespace-import form (`import * as DS from "@/design-system"`;
+  `<DS.List.Root>`), including barrels nested through further `export *` /
+  `export * as` re-exports. This removes those false positives; a component
+  re-exported through a namespace that nothing renders is still reported.
+  Thanks [@Smrtnyk](https://github.com/Smrtnyk) for the report.
+  (Closes [#1351](https://github.com/fallow-rs/fallow/issues/1351))
+
+- **Varlock now activates from a nested `.env.schema`, not just a root-level one.**
+  A project with a `.env.schema` in a subdirectory (for example `apps/web/.env.schema`)
+  and no `varlock` dependency previously left the plugin inactive, so packages declared
+  via `@plugin(...)` inside that schema were reported as unused dependencies. They are
+  now credited. This removes those false positives; expect a small drop in
+  unused-dependency findings for affected projects. Production mode is unchanged
+  (activation there still requires the `varlock` dependency or a root-level
+  `.env.schema`).
+
+- **`fallow ci-template gitlab` now bundles the shared `gitlab_common.sh` helper.**
+  The vendored GitLab CI template sources a shared `gitlab_common.sh` script from its
+  comment and review steps, but the file was missing from the vendored output, so a
+  generated pipeline failed at runtime trying to source a file that was not there. The
+  template now includes it.
+
+## [2.100.0] - 2026-06-19
+
+### Added
+
+- **Rule packs can now ban catalogue-derived effect classes.** `banned-effect` rules let teams forbid calls whose callee matches an internal security-catalogue effect such as `network`, `storage`, `shell`, `crypto`, `randomness`, `dom`, or `database`. The effect is stored on each `security_matchers.toml` row and resolved through the same written plus import-resolved callee matching used by `banned-call`, including framework dependency gates. Findings continue to report as `policy-violation` with scoped suppression via `<pack>/<rule-id>`. (Closes [#1143](https://github.com/fallow-rs/fallow/issues/1143).)
+
+- **`fallow dupes` now scans authored web-format code outside JS and TS.** Duplicate detection now tokenizes `.css`, `.scss`, `.sass`, and `.less` files, plus Vue and Svelte template and style regions and Astro template and style regions. SFC and Astro regions keep section boundaries, so a clone candidate cannot be formed by stitching script, markup, and style tokens together. Warm duplicate-token caches refresh on upgrade because older caches stored these files as empty or script-only streams.
+
+- **`unused-component-prop` now covers Svelte 5 `$props()` destructures.** Svelte components that declare a prop through `$props()` and never read it in their script or markup now report through the existing `unused-component-prop` rule. The finding keeps the same output shape, severity, manual action, and suppression token as Vue and React component-prop findings. It stays conservative by requiring a declared `svelte` or `@sveltejs/kit` dependency and abstaining when a `$props()` destructure contains rest, computed, nested, or whole-object shapes that could hide a use.
+
+- **`fallow inspect` bundles every evidence query for one file or exported symbol.** The new read-only `inspect` command exposes on the CLI (and in the editor) the same evidence bundle the MCP `inspect_target` tool returns: it composes existing trace, dead-code, duplication, complexity, and security evidence into one typed JSON result without adding a new analyzer pass. Target a file with `fallow inspect --file src/foo.ts` or a symbol with `fallow inspect --symbol src/foo.ts:Foo`; symbol targets add precise `trace_export` identity plus file-scoped evidence for the analyses that do not yet map to an enclosing symbol. The VS Code inspect command saves dirty files before running and consumes the typed output.
+
+- **`fallow health --format json` can now report framework detector coverage.** When a health run already has the dead-code analysis output it needs, health JSON gains an optional `framework_health` block listing the detected framework ids and the scoped status of each framework detector (active, disabled, abstained, or not-checked). This makes it visible why a framework-specific finding did or did not surface in a given run. The block is omitted when the run did not need analysis data, so default health output stays lean.
+
+- **`fallow security` gains verifier-workflow outputs for CI and agents.** Two read-only subcommands close the loop between fallow's security candidates and an external verifier. `fallow security survivors` joins raw `fallow security --format json` candidates with a verdict file so confirmed survivors are reported without rewriting the candidate output; it surfaces `summary.unverdicted`, separates verifier dispositions from unreviewed candidates in human output, and offers `--require-verdict-for-each-candidate` as a strict complete-verdict CI gate (structured exit 2 on an incomplete verdict file). `fallow security blind-spots` groups unresolved security callees and accepts `--file` before or after the subcommand. The new output contracts are wired through schema generation and the generated TypeScript types, and the unverified-candidate framing is preserved throughout.
+
+### Changed
+
+- **SARIF file output now streams to disk.** Writing SARIF with `--output-file` / `-o` (or `--sarif-file`) streams the report to the file instead of building the whole document in memory first, lowering peak memory on large result sets. Output content is unchanged.
+
+### Fixed
+
+- **Local-only value exports now report consistently as unused exports.** A value export that is only referenced by another export in the same file is again treated as unused public surface by default, so `dead-code`, `trace`, and stale suppression detection agree. The fix action still removes only the export modifier, leaving the local declaration available to same-file consumers. Teams that intentionally export this pattern can keep using `@public`, `ignoreExports`, or `ignoreExportsUsedInFile`.
+
+- **`fallow dupes` avoids cross-format clone groups for web-format tokens.** Duplicate token hashes now include the active source namespace, so JS, style, and markup regions do not form clone groups with each other just because their punctuation or identifier shapes match. Large-corpus duplicate detection also prefilters files with no repeated `minTokens` shingle before suffix-array analysis, and the real-world benchmark watchdog now allows the expanded Next.js combined-analysis surface to complete on CI while streaming progress, preserving diagnostics through a script-local timeout, and avoiding unused full-report serialization.
+
+- **`fallow dupes --format compact` now emits traceable clone lines.** Duplication compact output uses the `code-duplication` issue tag and includes the stable `dup:<id>` fingerprint plus group, token, line, and instance metadata on each clone instance line, so agents can jump straight to `fallow dupes --trace dup:<id>` without scraping human output.
+
+- **`audit --gate new-only` no longer reports pre-existing clones as introduced when edits only shift line numbers.** Editing a large file in a way that moved an unchanged duplicate block to different line numbers could make the audit gate attribute that inherited clone as newly introduced and fail the gate. Clone attribution now matches inherited clones by their content fingerprint independent of line position, so a line-shift alone keeps the clone inherited. A regression test covers the shifted-duplicate case across platforms. Thanks [@dotmaster](https://github.com/dotmaster) for the report. (Closes [#1340](https://github.com/fallow-rs/fallow/issues/1340).)
+
+### Documentation
+
+- **MCP server setup now covers project devDependency installs.** The MCP config snippets previously assumed `fallow-mcp` was on your `PATH` (a global install). When fallow is installed as a project devDependency, the binary lives in `node_modules/.bin/` and the server fails to start with `ENOENT`. The MCP integration guide, quickstart, and npm README now show the package-manager runner variants (`npx` / `pnpm exec` / `yarn` / `bunx`) alongside the global form. Thanks [@wouterkroes](https://github.com/wouterkroes) for flagging it. (Closes [#1343](https://github.com/fallow-rs/fallow/issues/1343).)
+
+- **Refreshed the duplicate-detection benchmark comparison numbers.** The README and comparison docs benchmark figures were re-measured against current upstream releases so the published comparison reflects today's numbers. Thanks [@kucherenko](https://github.com/kucherenko) for flagging the staleness. (Closes [#1316](https://github.com/fallow-rs/fallow/issues/1316).)
+
+## [2.99.0] - 2026-06-18
+
+### Added
+
+- **A new opt-in `require-suppression-reason` rule lets teams require a documented reason on every suppression.** Suppression comments and `@expected-unused` JSDoc tags can now carry a trailing `-- <reason>`, for example `// fallow-ignore-next-line unused-export -- public compatibility export` or `// fallow-ignore-file -- generated route map`. The reason text is parsed, cached, and carried through to stale-suppression reporting. With the rule enabled (set `rules.require-suppression-reason` to `warn` or `error`; the default is `off`, so existing suppressions are unaffected), a suppression that has no reason surfaces as a `missing-suppression-reason` finding so the team can backfill it. Reported across human, JSON, SARIF, CodeClimate, audit, and baseline output plus the LSP and editors. Thanks [@codingthat](https://github.com/codingthat) for the request. (Closes [#1302](https://github.com/fallow-rs/fallow/issues/1302).)
+
+### Fixed
+
+- **Nested same-file schema values no longer report as unused when a reachable exported value depends on them.** Effect Schema projects commonly pair `export const Foo = Schema...` with `export type Foo = Schema.Schema.Type<typeof Foo>`, then compose that value into another exported schema through `Schema.Array(Foo)`. Fallow now walks reachable same-file exported value initializers so the child schema value is credited through the parent schema, while unrelated unused sibling schemas still report. Thanks [@danielo515](https://github.com/danielo515) for the report. (Closes [#1304](https://github.com/fallow-rs/fallow/issues/1304).)
+
+- **The VS Code / VS Codium extension no longer shows inflated totals on startup.** On a cold editor start the extension could consume the LSP's first workspace analysis before any document had opened, rendering a stale, too-high issue count until the next edit. Startup analysis now waits for the first opened document, and a save-triggered analysis queues behind an in-flight startup run instead of being dropped. Thanks [@codingthat](https://github.com/codingthat) for the report. (Closes [#1303](https://github.com/fallow-rs/fallow/issues/1303).)
+
+- **Catalog rules now read Bun catalogs from root `package.json`.** Bun workspaces that declare catalog entries under `workspaces.catalog` / `workspaces.catalogs` (or Bun's accepted top-level `catalog` / `catalogs` form) now get the same `unresolved-catalog-references`, `unused-catalog-entries`, and `empty-catalog-groups` coverage as pnpm workspaces with `pnpm-workspace.yaml`. Fallow still prefers `pnpm-workspace.yaml` when it exists, preserving existing pnpm behavior. Thanks [@codingthat](https://github.com/codingthat) for the report. (Closes [#1301](https://github.com/fallow-rs/fallow/issues/1301).)
+
+## [2.98.0] - 2026-06-17
+
+### Added
+
+- **Framework dead-code findings now lead with manual fix actions.** `unused-server-action`, `unprovided-inject`, `unused-load-data-key`, `unrendered-component`, `unused-component-prop`, `unused-component-emit`, and `unused-svelte-event` now put a domain-specific manual fix action first in JSON `actions[]` instead of leading with suppression only. The actions stay non-auto-fixable and preserve the existing suppress action as the second option, so agents get clearer next steps while public API and dynamic-wiring caveats stay explicit. Human and markdown health output also labels synthetic `<template>` rows as template-complexity entries and switches the section wording to "complexity findings" when template or component rollup rows are present. Machine-readable complexity formats keep the canonical `<template>` name for compatibility.
+
+- **The `misplaced-directive` and `mixed-client-server-barrel` rules now cover React Server Components frameworks beyond Next.js.** Both rules encode universal RSC semantics, a body-position `"use client"` / `"use server"` string is silently ignored by every RSC bundler (not just Next), and a barrel that re-exports both a client module and a server-only module drags directive context across the boundary in any RSC framework. They previously activated only when `next` was a declared dependency; they now activate for any RSC bundler: `next`, `waku`, `@lazarv/react-server`, `react-server-dom-webpack`, `react-server-dom-vite`, `react-server-dom-parcel`, or `@vitejs/plugin-rsc`. The two Next-specific rules stay Next-gated on purpose: `invalid-client-export` keys on Next route-segment config names (`getServerSideProps`, the route HTTP-method exports) and `unused-server-action` keys on Next Server Action registration. No config or output change.
+
+- **The `unused-server-action` rule now covers inline `"use server"` body directives.** It previously reclassified only unused exports of a whole `"use server"` file; an `export async function deleteUser() { "use server"; ... }` whose action is dead surfaced as a plain `unused-export`. Such a dead inline Server Action is now reclassified to `unused-server-action` for precise categorization. The extract layer records the export names of exported functions and `const` arrows whose body carries an inline `"use server"` directive, and the reclassifier moves an unused export whose name matches. It inherits every `unused-export` abstain (entry-point, public-API re-export, whole-object, reachable-reference), so a wired-up action (`action={fn}`, `<form action={fn}>`, import-and-call) is never flagged; the marginal surface over `unused-export` is just the inline directive gate. Stays Next-gated and `warn`-level, like the file-level case. Validated at zero false positives on real Next App Router projects (vercel ai-chatbot, commerce). Warm extraction caches refresh on upgrade.
+
+- **Vue and Svelte template control flow now counts toward complexity health.** `fallow health --complexity` (and the complexity signal in the overall health score and hotspots) now includes a synthetic `<template>` entry per `.vue` / `.svelte` file, computed from the template's control flow and bound expressions, the same way it already does for Angular templates. Previously only an SFC's `<script>` functions were scored, so a component with heavy `v-if` / `v-for` (Vue) or `{#if}` / `{#each}` / `{#await}` (Svelte) branching, deeply nested logic, or complex bound expressions and `{{ }}` / `{ }` interpolations read as artificially simple. The template scan masks the `<script>` and `<style>` blocks, so script complexity is never double-counted, and nesting depth follows the template's tag/block structure so nested branches weigh more, matching the cyclomatic/cognitive model used everywhere else. This reuses the existing `maxCyclomatic` / `maxCognitive` thresholds and the `complexity` suppression token; there is no new rule, finding type, or flag. Warm extraction caches refresh on upgrade to pick up the new entry.
+
+- **The `unrendered-component` rule now covers Angular.** Previously Vue/Svelte only, it now also flags an Angular `@Component` whose element selector is used in no template anywhere in the project and that is not routed, bootstrapped, or dynamically rendered. This is the project-wide direction `@angular-eslint` does not cover (its `NG8113` is single-component only). It harvests each component's `selector`, the element-selector tags used across every inline and external (`templateUrl`) template, route `component:` / `loadComponent` references, and `bootstrap` references, then flags a component whose selector is rendered nowhere. It stays false-positive-safe by abstaining when the component is rendered via its tag, routed (including the bare `loadComponent: () => import('./x')` default-export lazy form and `loadChildren`, credited because the lazy target's default export is referenced), bootstrapped, public-API exported, or when the project uses any dynamic component-render API (`ViewContainerRef.createComponent` / `*ngComponentOutlet`), which abstains project-wide. Attribute and class selectors and `@Directive` classes are out of the first cut (element-selector components only). Reuses the existing `unrendered-component` rule and all its surfaces; no new rule or flag. Validated at zero false positives on the angular-realworld example app.
+
+- **`fallow` now flags Svelte component events that are dispatched but listened to nowhere.** A new `unused-svelte-event` rule (default severity `warn`) reports a Svelte component that fires a custom event through a `createEventDispatcher` binding (`const dispatch = createEventDispatcher(); dispatch('save')`) whose event name is listened to by no component in the project: no `<Child on:save>` (or event-forwarding `on:save`) on any rendered instance. This is the cross-file dead-output direction that no Svelte tool covers: the compiler and `svelte-check` are single-file or type-only, and `eslint-plugin-svelte` has no project-wide listener check. It reuses fallow's whole-project graph the same way `unprovided-inject` does: a project-wide set of listened event names (every `on:<name>` on a component tag, with event forwarding counting as a listen) is built first, then a dispatched event absent from it is flagged. It stays false-positive-safe by over-crediting toward "listened" (a listener on any component credits the name) and by abstaining on the whole component when it cannot see the event name: a dynamic `dispatch(<expr>)` or a `dispatch` reference passed elsewhere as a value. `on:click` and other listeners on lowercase DOM elements are native DOM events, not component events, and are ignored. The rule activates only when `svelte` is a declared dependency, and reports in human, JSON, SARIF, CodeClimate, compact, and markdown output plus the LSP and MCP. There is no auto-fix (wire a listener or remove the dispatch, a human decision); suppress with `// fallow-ignore-next-line unused-svelte-event` or set the rule to `off`. Validated at zero false positives on the Budibase monorepo (215 `createEventDispatcher` components). The Svelte 5 callback-prop direction (a callback prop the parent never passes) is caller-side and not yet covered.
+
+- **`unused-component-prop` and `unused-component-emit` now cover the Vue Options API.** The two rules previously only inspected `<script setup>` components; they now also harvest `props:` and `emits:` (array and object forms) from `export default { ... }` and `defineComponent({ ... })` in a non-setup `<script>` block, so a declared Options-API prop read nowhere in its own component, or a declared emit fired nowhere, is flagged the same way. Usage is credited from `this.<prop>` reads and template references for props, and from `this.$emit('<name>')` calls and template `$emit` for emits. It stays false-positive-safe by abstaining on the whole component when a member could be read or fired invisibly to the per-component scan: a `mixins:` or `extends:` option (a mixin or base can read a prop or fire an emit), a dynamic `this[expr]` access, a `props`/`emits` value that is an identifier, a spread, or a `defineComponent<Type>()` type generic, and a `setup(props, { emit })` method (its `props` param and context `emit` are consumed opaquely). Reported through the same surfaces as the `<script setup>` rules; no new rule or flag. `.vue` files only (a `defineComponent` in a plain `.ts` file is not yet in scope).
+
+- **`fallow` now flags Angular component inputs that are read nowhere in their component.** A new `unused-component-input` rule (default severity `warn`) reports an Angular `@Input()`, signal `input()` / `input.required()`, or `model()` declared on a component (or directive) class that is read by no code in its own component: not in the inline or external `templateUrl` template, and not anywhere in the class body. This is the in-component dead-input direction that no tool in the Angular ecosystem covers: there is no `@angular-eslint` rule for it, and the Angular compiler never flags a declared-but-unread `@Input` (it only checks caller-side binding correctness). A declared input consumed only by a parent binding but never read in its own component IS flagged, because binding it does nothing in-component (it is wired to a dead end). Input names are harvested onto the extraction IR from the decorator form (`@Input() foo`, `@Input({ required: true }) bar`), the signal form (`input()`, `input.required()`), and `model()`; usage is credited from every angle so only a genuinely-unread input is flagged: a template reference (inline or external template, the latter through the side-effect edge to the `.html`), any `this.<member>` read in the class body, a member-by-name access (which covers the `ngOnChanges` `changes['foo']` pattern), and the `inputs: [...]` / `host: {...}` decorator-metadata forms (already credited at extraction). It stays false-positive-safe by abstaining on the whole component when it cannot see all reads: any `extends` heritage clause (a base class in another file may read the member), a `{ ...this }` spread, and JS-reserved-word names; accessor inputs (`@Input() set foo(v)` / getters) are skipped per-input since a setter body runs on binding, and an observable-stream output shape is left to the output rule. The rule activates only when `@angular/core` is a declared dependency, and reports in human, JSON, SARIF, CodeClimate, compact, and markdown output plus the LSP and MCP. There is no auto-fix (wire the input to a real read or remove it, a human decision); suppress with `// fallow-ignore-next-line unused-component-input` or set the rule to `off`. Validated at zero false positives on the angular/components monorepo.
+
+- **`fallow` now flags Angular component outputs that are emitted nowhere in their component.** A new `unused-component-output` rule (default severity `warn`) reports an Angular `@Output()` or signal `output()` declared on a component (or directive) class that is `.emit()`-ed by no code in its own component. This is the output-side sibling of `unused-component-input` and the in-component dead-output direction that no Angular tooling covers: there is no `@angular-eslint` rule for a never-emitted output, and the compiler only checks caller-side listener correctness. Output names are harvested onto the extraction IR from the decorator form (only `@Output() bar = new EventEmitter()`-style initializers are harvested; an observable-stream `@Output` is treated as an abstain shape) and the signal `output()` form; usage is credited from a `this.<out>.emit(...)` call site, a template `(event)="x.emit()"` handler, and any forwarded `this.<out>` value read (passed to a function that may emit it), so over-crediting can only suppress a finding, never create one. It abstains on the whole component for any `extends` heritage clause and for `{ ...this }` spreads; `model()` outputs are excluded entirely from the output side, since their implicit `update:` emit is framework-driven. The rule activates only when `@angular/core` is a declared dependency, and reports in human, JSON, SARIF, CodeClimate, compact, and markdown output plus the LSP and MCP. There is no auto-fix (emit the output or remove it, a human decision); suppress with `// fallow-ignore-next-line unused-component-output` or set the rule to `off`. Validated at zero false positives on the angular/components monorepo.
+
+- **The `unprovided-inject` rule now covers Angular.** Previously Vue/Svelte only, it now also flags an Angular `InjectionToken` injected through `inject(TOKEN)` or an `@Inject(TOKEN)` constructor parameter that is supplied by no provider anywhere in the project: no `{ provide: TOKEN, useClass | useValue | useFactory | useExisting }` recipe in any `providers` array, and no self-providing `new InjectionToken(..., { factory })` / `{ providedIn }`. At runtime such an inject throws `NullInjectorError`, which no static tool in the Angular ecosystem catches (there is no `@angular-eslint` rule, and the compiler does not flag it for non-root tokens). It scopes to user `InjectionToken` symbols only: a class token (`inject(MyService)`) is out of scope because it self-provides via `providedIn: 'root'` and third-party `provideX()` providers, which would make it false-positive-prone. It stays false-positive-safe by abstaining on an `inject(TOKEN, { optional: true })` / `@Optional()` inject (designed to be unprovided), a token imported from an npm package (the provider may live in the package), a token that is public API of this package (a consumer provides it), and project-wide whenever the provider graph becomes opaque: any `importProvidersFrom(...)`, `makeEnvironmentProviders(...)`, a `...spread` in a `providers` array, or a computed `provide:` key. The rule activates only when `@angular/core` is a declared dependency, reuses the existing `unprovided-inject` rule and all its surfaces (human, JSON, SARIF, CodeClimate, compact, markdown, LSP, MCP), and has no auto-fix (provide the token or remove the inject, a human decision); suppress with `// fallow-ignore-next-line unprovided-inject` or set the rule to `off`. Tokens of any type-argument shape are covered, including a primitive-typed (`new InjectionToken<string>('FLAG')`) or untyped (`new InjectionToken('FLAG')`) token; a bare string-literal inject key and the provided-never-injected direction are not yet covered. Validated at zero false positives on the angular/components monorepo.
+
+### Fixed
+
+- **Pinia store members consumed through inline `storeToRefs(useStore())` calls are now credited.** `unused-store-member` now treats `storeToRefs(usePermissionsStore())` and `toRefs(usePermissionsStore())` object destructures the same way as the existing store-local form, including aliased destructures such as `const { canCreateEvents: canCreate } = storeToRefs(usePermissionsStore())`. The credit stays limited to bare store-factory identifiers or tracked store locals, so unrelated helper calls are not treated as store consumption. Thanks [@Smrtnyk](https://github.com/Smrtnyk) for the report. (Closes [#1282](https://github.com/fallow-rs/fallow/issues/1282).)
+
+- **`unused-class-members` no longer misses Playwright fixture methods reached through branch-selected aliases.** Fallow now credits fixture object aliases selected by ternaries, `if/else`, and `switch` branches inside Playwright test callbacks, and same-file local fixture tests passed into `mergeTests(...)` now feed the merged wrapper. The alias tracking is Playwright-only, order-sensitive, and conservative on shadowing or unknown reassignment, so genuinely unused page-object methods still report. Thanks [@vethman](https://github.com/vethman) for the report. (Closes [#1270](https://github.com/fallow-rs/fallow/issues/1270).)
+
+- **React JSX depth is now descriptive context, not cognitive complexity.** Deeply nested presentational React and Preact components, such as skeleton tables or layout wrappers with no control flow, no longer surface as high cognitive complexity solely because their JSX tree is deep. Fallow still records `react_jsx_max_depth` for hotspot context, while hook density and wide prop interfaces continue to contribute to cognitive complexity through `hook-density` and `prop-count`. The public `jsx-depth` contribution kind remains in the schema for compatibility, but current extraction no longer emits it for layout depth. Thanks [@pavle99](https://github.com/pavle99) for the report. (Closes [#1281](https://github.com/fallow-rs/fallow/issues/1281).)
+
+- **Svelte 5's bare `<script module>` is now recognized as module context.** Fallow previously recognized only the Svelte 4 `<script context="module">` form, so a Svelte 5 bare `<script module>` block was treated as the instance script and its imports were wrongly credited as template-visible, which could mask a genuinely unused import or export in a Svelte 5 component. The bare `module` attribute is now matched (with the same standalone-attribute anchoring as the `setup` attribute, so a `lang` or `generics` attribute containing the substring "module" cannot false-match), and its declarations are scoped as module context like the Svelte 4 form. The extraction cache version is bumped so warm caches refresh on upgrade.
+
+## [2.97.0] - 2026-06-16
+
+### Added
+
+- **`fallow health --css` now flags unused Tailwind v4 `@theme` design tokens.** A Tailwind v4 `@theme` token (`--color-brand`, `--radius-card`) defines a design token that generates a utility (`bg-brand`, `rounded-card`); a token whose utility, `var()` reads, and `@apply` uses appear nowhere is a dead design token, the `unused-export` of the token era, which single-surface tools (the Tailwind compiler, eslint-plugin-tailwindcss) do not catch. The check credits usage from every angle (a `*-<name>` utility in markup, a `clsx` / CSS-in-JS string, an `@apply` body, an arbitrary `[--ns-name]` value, or a `var()` read including one `@theme` token backing another) and is false-negative-leaning by design, so a live token is never flagged. The non-CSS-source search is namespace-qualified (it matches a real `-<name>` utility suffix, never a bare dictionary word), so a token named `brand` or `card` is not credited just because the word appears in a `.tsx` file. To stay near-zero-false-positive (validated across the Next.js bundle-analyzer, the `next-saas-starter`, the Tailwind docs site, and shadcn/ui, where it surfaces genuinely-dead shadcn `chart-*` / `sidebar-*` tokens at zero false positives), it is heavily gated: it emits only on a Tailwind v4 project (a `tailwindcss` dependency plus at least one `@theme` block), abstains entirely on a Tailwind plugin project (`@plugin` or a config `plugins[]`, whose tokens a plugin can consume invisibly), abstains on a published-library stylesheet (a `@theme` exported as a package surface is a public token API consumed downstream), and abstains on a partial-scope run. The `--breakpoint-*` / `--container-*` variant namespaces and the `--<token>--<property>` modifier form are excluded from candidacy. These are candidates, never gated findings, each with a read-only, namespace-qualified verify command. Reported in human, markdown, and JSON (`css_analytics.unused_theme_tokens`).
+
+- **`fallow health --css` now flags unused `@font-face` web fonts.** A font family declared by an `@font-face` rule (so its font files are downloaded) but applied by no `font-family` anywhere surfaces as a cleanup candidate, located at the declaring stylesheet. A dead web font is real shipped weight that no per-rule linter catches. To stay near-zero-false-positive (validated against Bootstrap, Excalidraw, reveal.js, Svelte, where it now reports zero false positives), a family is only flagged if its name appears in no CSS `font-family` AND in no other source either: a font applied from JavaScript or a canvas `fontFamily` assignment, or referenced from a `.scss`/`.sass` theme the parser does not expand, is correctly left alone. Font-family names are matched case-insensitively, per the CSS spec. These are candidates, never gated findings (the family could be set from an inline style or JS), each with a read-only verify command. Reported in human, markdown, and JSON (`css_analytics.unused_font_faces`).
+
+- **`fallow health --css` now flags a `font-size` scale authored in mixed length units.** When a project's `font-size` values are split across several units (for example `px` and `rem`), the new `font_size_unit_mix` candidate reports the per-unit breakdown, because mixing fixed `px` with root-relative `rem` for type works against user-zoom accessibility. It is advisory and conservatively floored: it stays silent on a consistent scale and on small stylesheets, and only fires once the project plainly has a type scale spread across two or more units, so a single outlier is not flagged. The candidate names the dominant unit to standardize on, framed as "unless this is an intentional migration". Color-notation mixing (hex vs rgb vs hsl) is deliberately not surfaced: the CSS parser canonicalizes every legacy sRGB notation to hex before fallow sees the value, so the authored distinction is already gone. Reported in human, markdown, and JSON (`css_analytics.font_size_unit_mix`).
+
+- **`fallow health --css` now flags global CSS classes referenced by no in-project markup.** A class defined in a plain `.css`/`.scss` rule whose literal name appears in no `class`/`className` across the project (the CSS analogue of an unused export) surfaces as a cleanup candidate, located at its definition. Dead-CSS detection is notoriously false-positive-prone, so this is heavily gated (validated against Bootstrap, Svelte, Excalidraw, and other real projects, where it produces zero false positives): a class counts as referenced if it is a whole static `class` token OR a substring of any dynamic class expression (so a class assembled from a `${...}` or `clsx(...)` fragment is never flagged); a stylesheet abstains entirely if it is a published package entry (`package.json` `style`/`main`/`sass`/`exports`) or none of its classes are used in-project (a design-system surface consumed elsewhere); and the whole check abstains on preprocessor-dominant projects and on partial-scope runs (`--changed-since`/`--workspace`), where a class cannot be proven dead. These are candidates, never gated findings: the class may be applied from an HTML email, server template, CMS, or Markdown the parser never scans, so each carries that disclosure plus a read-only verify command. Reported in human, markdown, and JSON (`css_analytics.unreferenced_css_classes`).
+
+- **`fallow health --css` now flags likely CSS class-name typos in markup.** A static `class` / `className` token in JSX/TSX, HTML, or a Vue/Svelte/Astro template that matches no CSS class defined anywhere in the project, but is one edit away from a class that IS defined (`className="card-tite"` where `.card-title` exists), surfaces as a candidate with the suggested class. This is the CSS analogue of an unresolved import, applied across the CSS-to-markup boundary that single-file linters and CSS-analytics tools cannot see. The near-miss restriction plus several false-positive guards (validated against Bootstrap, Svelte, Excalidraw, and other real projects) keep it near-zero-false-positive: Tailwind utility classes and unrelated tokens are not one edit from an authored class; numeric-scale families (`col-lg-6` vs `col-lg-4`) and singular/plural pairs (`button` vs `buttons`) are excluded because a one-digit or trailing-`s` difference is a deliberate variation, not a typo; and the check abstains entirely on preprocessor-dominant projects (`.scss`/`.sass`/`.less` outnumbering plain CSS), where generated classes are invisible to the parser and would otherwise look unresolved. CSS Module classes are out of scope (already covered by unused-export detection). These are candidates, never gated findings, and only appear under `--css`: a token could still be defined in CSS-in-JS or an external stylesheet the parser never sees, so each carries a read-only verify command. Reported in human, markdown, and JSON (`css_analytics.unresolved_class_references`).
+
+- **`fallow` now flags SvelteKit `load()` return-object keys that no consumer reads.** A new `unused-load-data-key` rule (default severity `warn`) reports a key returned from a route `load()` (in `+page.ts` / `+page.server.ts` and the `.js` variants) that is read by no code: not the sibling `+page.svelte`'s `data.<key>`, and not any project-wide `page.data.<key>` (Svelte 5 `$app/state`) or `$page.data.<key>` (Svelte 4 `$app/stores`). A dead returned key still runs its real server-side fetch / DB cost on every request for data nothing renders, and no other static tool catches it: `svelte-check` types `data` through the generated `$types` but never flags an unread returned key (the unused-input direction). It stays false-positive-safe by abstaining whenever it cannot see all consumption: an unharvestable `load` body (a spread return, a non-literal or multi-branch return, a computed key, a wrapped / re-exported `load`), a sibling component that passes the whole `data` object opaquely (`data={data}`, `{...data}`, `fn(data)`, `const x = data`), a `+page.server.ts` whose universal `+page.ts` sibling reads or forwards its `data` param, and any project-wide reflective whole-object read of the page-data store (`Object.values(page.data)`), which abstains every route. The rule activates only when `@sveltejs/kit` is a declared dependency, and reports in human, JSON, SARIF, CodeClimate, compact, and markdown output plus the LSP and MCP. There is no auto-fix (a load fetch can have side effects, so removing a key is a human decision); suppress with `// fallow-ignore-next-line unused-load-data-key` or set the rule to `off`. Layout loads (`+layout.{ts,server.ts}`) are not covered yet.
+
+- **`fallow` now flags Next.js Server Actions that no code in the project calls.** A new `unused-server-action` rule (default severity `warn`) reports an exported function in a Next.js `"use server"` file that is referenced by no consumer anywhere: no import-and-call, no `action={fn}` binding, and no `<form action={fn}>`. This is the cross-graph "exported but wired to nothing" direction that eslint-plugin-next cannot see (it is single-file), and it is exactly where dead server actions accumulate as a page is refactored. It reuses fallow's whole-project reference graph: the `action={fn}` and `<form action={fn}>` bindings, plain import-and-call, and component-prop forwarding are all credited as real uses, and wrapped action factories (`authenticatedActionClient.action(...)`, `withAuditLogging(...)`) are credited by the wrapped const's references, so only a genuinely orphaned action is flagged. The finding is a more specific re-classification of `unused-export` for `"use server"` files (the endpoint is not "unreachable", Next still registers its action id, but no project code calls it, so it is a strong delete candidate and a smaller surface area). The rule activates only when `next` is a declared dependency, and reports in human, JSON, SARIF, CodeClimate, compact, and markdown output plus the LSP and MCP. There is no auto-fix (wire the action to a consumer or delete it, a human decision); suppress with `// fallow-ignore-next-line unused-server-action` or set the rule to `off`. Inline `"use server"` body directives (`export async function f() { "use server" }` in a non-`"use server"` file) are not covered yet; such dead actions still surface as `unused-export`. **Upgrade note for strict CI gates:** when this rule is active, a dead server action that previously failed CI as an `unused-export` (default `error`) now reports as `unused-server-action` (default `warn`), so the exit code for that finding relaxes from non-zero to zero. If you gate CI on dead server actions, set `unused-server-action` to `error` in your config to keep failing on them, and re-save any `--save-baseline` snapshot once (the finding moves between baseline categories on the first run after upgrade).
+
+- **`fallow` now flags Vue `defineProps` props that are used nowhere in their component.** A new `unused-component-prop` rule (default severity `warn`) reports a Vue `<script setup>` `defineProps` declared prop that is referenced by no code in its own single-file component, neither in `<script>` nor in `<template>`. This is the in-component dead-input direction that vue-tsc / Volar do not cover (they check caller-side prop correctness, not "this declared prop is wired to nothing"); eslint's `vue/no-unused-properties` is opt-in, off by default, and historically unreliable on `<script setup>` reactive destructure. Real examples from open-source: a media component declaring an `alt` prop never passed to its `<img>`, a layout declaring `noOverflowHidden` it never reads, a chart declaring an `options` prop while building its own. Prop names are harvested from the inline TS form (`defineProps<{ foo: T }>()`), the runtime object form (`defineProps({ foo: {...} })`), and `withDefaults(...)`; usage is credited from both script (the destructured binding or `props.foo`) and template (`{{ foo }}`, `:x="foo"`, `props.foo`, `$props.foo`). It stays false-positive-safe by abstaining on the whole component when it cannot see all consumption: a `v-bind="$attrs"` / `v-bind="props"` fallthrough, a whole-object props use (`toRefs(props)`, `{...props}`), a `defineExpose` or `defineModel` call, or a prop type from an imported alias (`defineProps<ImportedProps>()`, names not statically resolvable). The rule activates only when `vue` / `@vue/runtime-core` / `nuxt` is a declared dependency and is Vue `<script setup>` only (Options-API `props:`, non-setup `<script>`, and Svelte `$props` are not covered yet), and reports in human, JSON, SARIF, CodeClimate, compact, and markdown output plus the LSP and MCP. There is no auto-fix (the fix, wire the prop or remove it, is a human decision); suppress with `// fallow-ignore-next-line unused-component-prop` or set the rule to `off`. `unused-component-emit` and `unused-named-slot` are planned follow-ups.
+
+- **`fallow` now flags Vue `defineEmits` events that are emitted nowhere in their component.** A new `unused-component-emit` rule (default severity `warn`) reports a Vue `<script setup>` `defineEmits` declared event that is emitted by no code in its own single-file component, neither through `emit('name')` in `<script>` nor `emit('name')` / `$emit('name')` in `<template>`. This is the emit-side sibling of `unused-component-prop`: the in-component dead-output direction that vue-tsc / Volar do not cover (they check caller-side listener correctness, not "this declared event is never emitted"). Real examples from open-source: a JSON viewer declaring `click` / `keyClick` / `toggle` / `valueClick` while only ever emitting `copied`, a date-picker trigger declaring `focus` / `blur` that it only exposes through `defineExpose`. Event names are harvested from the array form (`defineEmits(['save', 'close'])`), the type / object form (`defineEmits<{ save: [] }>()`), and the bound form (`const emit = defineEmits(...)`, tracking the actual local binding name so a renamed `const notify = defineEmits(...)` is still credited); usage is credited from both the script call walk and the template (`@click="$emit('save')"`). It stays false-positive-safe by abstaining on the whole component when it cannot see all emission: a dynamic `emit(eventName)` whose event name is not a literal, the emit function passed or returned or spread elsewhere, a `defineModel` call (which generates implicit `update:x` emits), or an emit type from an imported alias (`defineEmits<ImportedEmits>()`, names not statically resolvable). The rule activates only when `vue` / `@vue/runtime-core` / `nuxt` is a declared dependency and is Vue `<script setup>` only (Options-API `emits:` and Svelte event dispatchers are not covered yet), and reports in human, JSON, SARIF, CodeClimate, compact, and markdown output plus the LSP and MCP. There is no auto-fix (the fix, emit the event or remove it, is a human decision); suppress with `// fallow-ignore-next-line unused-component-emit` or set the rule to `off`. `unused-named-slot` is a planned follow-up.
+
+- **`fallow` now flags Vue / Svelte components that are reachable but rendered nowhere.** A new `unrendered-component` rule (default severity `warn`) reports a single-file component (the default export of a `.vue` / `.svelte` file) that is kept reachable by a barrel re-export but instantiated by no file in the project: no `<Tag>`, no `:is` / `this=` binding, no `components` / `app.component` registration, no `h()` / Nuxt auto-import, and no script value-read. This is the common rot where a component is refactored out of every template but its barrel re-export keeps it alive, so `unused-file` (the file is reachable) and `unused-export` (the re-export counts as a use) both miss it; eslint `vue/no-unused-components` is single-file and cannot see a barrel-reexported component imported by a sibling. The render set is built liberally across barrel chains, Nuxt auto-imports, dynamic and side-effect imports, so over-crediting only suppresses a finding (never creates one). A component that is itself an entry point (route page, layout, `App.vue`, Nuxt `app.vue` / `error.vue`) and a component re-exported through any chain from a non-private package entry point (a library exporting components for its consumers to render) are both abstained, so component libraries are not false-flagged. The rule activates only when `vue` / `@vue/runtime-core` / `nuxt` (for `.vue`) or `svelte` / `@sveltejs/kit` (for `.svelte`) is a declared dependency, and reports in human, JSON, SARIF, CodeClimate, compact, and markdown output plus the LSP and MCP. There is no auto-fix (a component can be rendered reflectively through a dynamic `<component :is>` resolved from a non-literal value); suppress with `// fallow-ignore-next-line unrendered-component` or set the rule to `off`.
+
+- **`fallow` now flags missing static asset references in Vue / Svelte templates.** A relative `<img src="./logo.png">` (or `<source>` / `<video poster>` / `audio` / `track` / `embed` `src`) in `.vue` / `.svelte` markup that points to no file on disk now surfaces as `unresolved-import`, the same way a broken JS import does. A broken template asset is a shipped-to-production 404 that no other static tool catches (vue-tsc / Volar do not resolve asset URLs, and eslint has no asset-existence rule). The check is conservative to stay false-positive-safe: only plain relative literals (`./` / `../`) on genuine asset elements are checked, so dynamic bindings (`:src`, `bind:src`, `src={...}`), alias-prefixed (`@/`), root-relative (`/foo`), remote, interpolated, and query-suffixed values are all skipped, a custom component's `src` prop is never read as an asset, and an existing asset resolves cleanly with no finding. There is no new rule or flag: missing template assets join the existing `unresolved-import` category. `srcset` lists and CSS `url()` in `<style>` are not covered yet.
+
+- **`fallow` now flags Vue / Svelte injects that have no provider.** A new `unprovided-inject` rule (default severity `warn`) reports a Vue `inject(KEY)` or Svelte `getContext(KEY)` whose symbol key is `provide()`/`setContext()`'d nowhere in the project. At runtime a dead inject silently returns `undefined`, surfaced only when the affected path renders; no static tool in the Vue/Svelte/Nuxt ecosystems catches it (Vue and Nuxt emit a runtime-only warning, Svelte's eslint proposal is unimplemented). The key must be a symbol with cross-file identity (an imported const or a module-local symbol), so the check is false-positive-safe by construction: a key imported from a package abstains (the provider may live inside that package), a key bound to a string literal abstains (string identity, a literal provider matches it), a key that is part of your package's public API abstains (a "bring-your-own-provider" library exports the key for the consumer to provide), and any dynamic-keyed provide (`keys.forEach(k => provide(k))`) abstains project-wide. App-level `app.provide(KEY, value)` is credited, and a provide imported directly while the inject reaches the same key through a barrel re-export are matched. The rule activates only when `vue`, `@vue/runtime-core`, or `svelte` is a declared dependency, and reports in human, JSON, SARIF, CodeClimate, compact, and markdown output plus the LSP and MCP. There is no auto-fix (the fix, provide the key or remove the inject, is a human decision); suppress with `// fallow-ignore-next-line unprovided-inject` or set the rule to `off`. Nuxt's string-keyed `nuxtApp.provide` / `$x` API and the inverse provided-never-injected direction are not covered yet.
+
+- **`fallow` now flags unused Pinia store members.** A new `unused-store-member` rule (default severity `warn`) reports a Pinia store member (an option-store `state` / `getters` / `actions` key, or a setup-store returned key) that is declared but accessed by no consumer anywhere in the project. This is the cross-graph "declared but never used by any file" direction that single-file linters (eslint-plugin-vue / -svelte / -pinia) and type-checkers (vue-tsc, svelte-check) do not cover: the store binding is imported so the module looks alive, yet a specific state property, getter, or action is dead. Consumption is credited across the idiomatic patterns: `const s = useStore(); s.member`, destructures (`const { m } = useStore()`, `const { m } = storeToRefs(store)`), template `store.member` in `.vue` / `.svelte` files, and intra-store `this.member` use between getters and actions. Whole-object usage (`{...store}`, `Object.keys(store)`, `store[dynamicKey]`) and the Options-API `mapState` / `mapGetters` / `mapActions` helpers conservatively abstain (no member is flagged) to stay false-positive-safe, and the Pinia `$`-prefixed API is never reported. The rule activates only when `pinia` or `@pinia/nuxt` is a declared dependency, and reports in human, JSON, SARIF, CodeClimate, compact, and markdown output plus the LSP and MCP. There is no auto-fix (a store member can be accessed reflectively through a Pinia plugin or dynamic dispatch); suppress with `// fallow-ignore-next-line unused-store-member` or set the rule to `off`.
+
+- **`fallow security` now flags a `"use client"` file that reaches server-only code (Next.js).** The opt-in `security-client-server-leak` rule gains a second candidate category, `server-only-import`, alongside the existing secret-leak candidate. It reports a `"use client"` file whose transitive static-import cone reaches a server-only module: one carrying a `"use server"` directive, or importing the `server-only` package, `next/server`, `node:fs` / `node:child_process` (the `node:` and bare forms both count), or a server-only `next/headers` API (`cookies`, `headers`, `draftMode`). The sink set is intentionally narrow to avoid false positives, and a module pulled in only through `next/dynamic(() => import('./x'), { ssr: false })` (the sanctioned client-only escape hatch) is excluded. These are unverified candidates for review, not confirmed vulnerabilities, and surface only under `fallow security` (never bare `fallow` or `audit`); the rule still defaults to `off`. Human and SARIF output label the new category distinctly from the secret-leak candidate. Suppress with `// fallow-ignore-file security-client-server-leak`.
+
+- **`fallow` now flags server-only exports placed in a `"use client"` file (Next.js).** A new `invalid-client-export` rule (default severity `warn`) reports a file carrying the `"use client"` directive that also exports a Next.js server-only or route-segment-config name (`metadata`, `generateMetadata`, `generateStaticParams`, `getServerSideProps`, route HTTP methods, `revalidate`, `dynamic`, and friends). Next.js rejects this at build time; fallow catches it statically in the same pass as the rest of dead-code analysis, before a build, and reports it in human, JSON, SARIF, CodeClimate, compact, and markdown output plus the LSP. The client component's `default` export is never flagged, and the rule only runs when `next` is a declared dependency so it cannot false-positive on non-Next projects. Suppress with `// fallow-ignore-next-line invalid-client-export` or set the rule to `off`.
+
+- **`fallow` now flags barrel files that mix client and server-only modules (Next.js).** A new `mixed-client-server-barrel` rule (default severity `warn`) reports a barrel (`export ... from`) that re-exports both a `"use client"` module and a server-only module (one carrying `"use server"`, importing `server-only` / `next/server` / `node:fs` / `node:child_process`, or a server-only `next/headers` API). Importing one name from such a barrel drags the other's directive context across the React Server Components boundary. The check only classifies direct re-export origins, skips type-only re-exports (which carry no runtime directive context), and never flags a barrel that mixes a client module with an ordinary utility, so it stays false-positive-safe. It runs only when `next` is a declared dependency, and reports in human, JSON, SARIF, CodeClimate, compact, and markdown output plus the LSP. Suppress with `// fallow-ignore-next-line mixed-client-server-barrel` or set the rule to `off`.
+
+- **`fallow` now flags a `"use client"` / `"use server"` directive placed below an import (Next.js).** A new `misplaced-directive` rule (default severity `warn`) reports a directive string written as an expression statement after an import (or any other statement) instead of in the file's leading prologue. The parser only honors a directive in the leading position, so a misplaced one is silently ignored and the file is treated as a server module, a quiet footgun. The fix is to move the directive above every import. It runs only when `next` is a declared dependency, and reports in human, JSON, SARIF, CodeClimate, compact, and markdown output plus the LSP. There is no auto-fix; suppress with `// fallow-ignore-next-line misplaced-directive` or set the rule to `off`.
+
+- **`fallow` now flags Next.js App Router route collisions and dynamic-segment name conflicts.** Two new rules catch App Router routing errors statically, in your editor and CI, with no build. `route-collision` (default severity `error`) reports two or more route files (`page` or `route` handler) that resolve to the same URL within one app-root: route groups `(name)` and parallel slots `@name` do not change the URL, so `app/(marketing)/about/page.tsx` and `app/(shop)/about/page.tsx` both own `/about`, which `next build` rejects ("You cannot have two parallel pages that resolve to the same path"; a `page.tsx` and a `route.ts` in the same segment collide the same way). fallow surfaces every colliding file at once, where the build error names only one. `dynamic-segment-name-conflict` (default severity `error`) reports sibling dynamic segments at one position using different slug names (`[id]` vs `[slug]`, or `[...x]` vs `[[...x]]`). Next.js throws "You cannot use different slug names for the same dynamic path" at dev / production runtime, but `next build` does NOT catch it, so CI passes while the route crashes the first time it is hit; fallow's static catch closes that gap. Both run only when `next` is a declared dependency and report in human, JSON, SARIF, CodeClimate, compact, and markdown output plus the LSP and CI summaries. Collision buckets are scoped per app-root using your workspace package roots, so a monorepo with several independent Next apps that happen to share a path is not flagged; files under a private `_folder` or an intercepting marker `(.)`/`(..)`/`(...)` are excluded. The primary suggested action is to move or merge a file (a build error is not something to suppress); `// fallow-ignore-file route-collision` / `dynamic-segment-name-conflict` remain as escape hatches. Both default to `error` but for two distinct reasons: `route-collision` is already a `next build` failure (a project hitting it was red before fallow ran), while `dynamic-segment-name-conflict` is a deterministic runtime crash on first request that `next build` lets through, so fallow is the only gate that fails on it. The detector is pure path arithmetic on the same primitive as `route-collision` (no AST, no heuristic to misfire), and the false-positive surface (route groups, parallel slots, per-app-root monorepo scoping) is exercised false-positive-free across a 22-project real-world corpus. Note one upgrade case: a monorepo whose `next` dependency lives only in a bundled demo / example app arms both rules at `error` there, so a deliberately-divergent example route now fails CI; suppress it with `// fallow-ignore-file dynamic-segment-name-conflict` or set the rule to `warn` / `off`.
+
+- **Route-internal unused exports in Next.js app-router files are reported where other tools suppress them.** A stray helper export or a typo'd `metadata` (for example `meatdata`) inside `app/page.tsx` / `layout.tsx` surfaces as an unused export, because fallow credits a precise per-route-file export allowlist rather than treating the whole route file as an opaque entry point. Valid framework exports (`metadata`, `default`, segment config) stay credited.
+
+- **`fallow impact --all` shows what fallow has done for you across every repo.** A read-only roll-up that aggregates the per-project histories in your user config dir into one ranked table plus grand totals (findings resolved, commits contained), so you can see your impact across all your projects in one view. Sort with `--sort {recent,resolved,contained,name}` (default `recent`) and cap printed rows with `--limit N` (grand totals always reflect every project). `--format json` emits a new `impact-cross-repo` envelope whose `projects[]` each embed the same per-project report as `fallow impact`, carry a stable `project_key` for cross-run correlation, and a repo `label`; the single-project `fallow impact` output is unchanged. JSON and markdown never include any filesystem path. Repos are labeled by their folder basename, captured at record time (a new optional store field; old histories show a short key until their next recorded run). Recording stays off in CI, so this reflects local-developer work, never a CI metric.
+
+- **New `impact_all` MCP tool.** Agents can read the cross-repo roll-up over MCP, the same view as `fallow impact --all`. It takes `sort` and `limit`, returns the `impact-cross-repo` shape (hashed project keys plus basename labels, never filesystem paths), and is read-only like the single-project `impact` tool.
+
+- **Reclaim stale `fallow impact` stores with `FALLOW_IMPACT_STORE_MAX_AGE_DAYS`.** Set it to a number of days and a recorded run prunes per-project histories that have not been touched in that long (for example, stores left behind by repos you have since deleted). Unset (the default) keeps every store forever; the project you are currently recording is never reclaimed.
+
+- **`fallow health --css` reports structural CSS analytics.** A new opt-in section surfaces the codebase-scale CSS slop that per-rule linters do not aggregate: specificity hotspots (id selectors, deep compound selectors), `!important` density, over-complex selectors, deep nesting, empty rules, design-token sprawl (the count of distinct color, `font-size`, `z-index`, `box-shadow`, `border-radius`, and `line-height` values across the whole codebase, so an uncontrolled palette or scale stands out), cleanup candidates for custom properties (`--x`) and `@keyframes` that are defined but never referenced in any stylesheet, and dead Vue `<style scoped>` classes (a scoped class used nowhere else in its component) (all reported conservatively as candidates, since a token can still be used from JavaScript or inline HTML). It also flags the inverse, references that resolve to nothing: an `animation` / `animation-name` whose `@keyframes` is defined in no stylesheet anywhere (a likely typo or a removed animation, listed by name and file with a verify step), plus a count of `var()` references with no CSS definition (kept a count rather than located, because these are dominated by JavaScript-set design tokens). It also flags duplicate declaration blocks: rules across the project whose declaration set (4 or more declarations, compared order-insensitively and `!important`-aware) is identical are grouped as copy-paste consolidation candidates, listed by location with an estimated number of declarations you could remove. On Tailwind projects it surfaces arbitrary-value bypasses: utilities like `w-[13px]` or `text-[11px]` that hardcode a one-off value in markup instead of a configured scale token, aggregated by token with a use count and first location (the scan runs only when the project declares a `tailwindcss` dependency). It also flags unused CSS at-rule entities: an `@property` registered but never read via `var()`, and an `@layer` declared but never populated, both listed by name and file as cleanup candidates. Unreferenced `@keyframes` and dead scoped classes are listed by name and file, each carrying a read-only verification step so the candidate can be confirmed before removal; Vue/Svelte SFC `<style>` blocks are analyzed alongside `.css` files. Each notable rule carries a location, and a project summary reports stylesheet, rule, declaration, `!important`, empty-rule, max-nesting, value-sprawl, unreferenced-token, and scoped-unused-class totals. Present in JSON, the human report, and a `## CSS Health` markdown summary; opt-in because it reads and parses every project stylesheet. Standard CSS only (SCSS is skipped). (Refs [#550](https://github.com/fallow-rs/fallow/issues/550).)
+
+### Changed
+
+- **CSS Module class extraction now uses a real CSS parser.** Standard `.module.css` class names are read from a parsed CSS syntax tree instead of a stack of regular expressions, removing a class of edge-case bugs around cascade layers, `@scope`, and CSS Modules `:global()` / `:local()` selectors. Output is unchanged on existing projects; warm caches re-parse CSS Module files once after upgrading. (Refs [#550](https://github.com/fallow-rs/fallow/issues/550).)
+
+### Fixed
+
+- **The analysis findings added this cycle now surface correctly in CI summaries, the VS Code sidebar, and editor severity.** The new IssueKinds (unused server actions, the Vue component-prop / -emit rules, unrendered components, unprovided injects, unused store members, the Next.js RSC checks, and route collisions / dynamic-segment name conflicts) were complete in the Rust output but under-wired in three secondary surfaces. They now appear in the GitHub Action and GitLab CI pull-request / merge-request summaries, annotations, and combined / audit breakdowns; they are counted, shown, and filterable in the VS Code Issues sidebar (previously the editor squiggles appeared but the tree and badge ignored them); and `route-collision` and `dynamic-segment-name-conflict` diagnostics now render at error severity in the editor to match their CLI default (they were shown as warnings). Drift gates across every CI summary and annotation surface, the VS Code sidebar registries, and the LSP severity map now fail the moment a future dead-code finding is missing from any of them (the CI gate derives its expected set from `fallow schema`; the VS Code and LSP gates use compile-time exhaustiveness), so this class of gap cannot silently recur. The same pass also closed the remaining inconsistencies: a test-only dependency now gets a CI annotation and a correct `--changed-since` count, an empty pnpm catalog group is filterable in the editor, and the new SvelteKit `unused-load-data-key` finding surfaces across all of these instead of only the dead-code summary. A follow-up extended the same guards to the VS Code diagnostic-code catalog itself (so a future kind cannot be emitted as an editor squiggle yet stay missing from the sidebar count and filter), which immediately surfaced and fixed one more: rule-pack policy violations are now counted, rendered, and filterable in the editor sidebar.
+
+- **`fallow dupes` now excludes re-export barrels and top-level static `require()` binding blocks when `ignoreImports` is enabled.** The default duplicate filter already removed ES import declarations; it now also strips `export ... from`, `export * from`, and top-level `const` / `let` / `var` declarations whose bindings are all static `require("...")` calls. Local exports, side-effect `require()` calls, nested `require()` calls, dynamic require arguments, and mixed declarations still count as code. Teams using `duplicates.threshold` gates or duplication baselines may see another measured percentage drop; set `"ignoreImports": false`, pass `--no-ignore-imports`, or pass `--dupes-no-ignore-imports` to keep module wiring counted. (Closes [#1225](https://github.com/fallow-rs/fallow/issues/1225).)
+
+- **GitHub Action and GitLab combined-mode runs no longer fail on hidden duplicate stats.** When filtered duplication output has `dupes.clone_groups: []`, combined CI now gates and renders duplication from that actionable array instead of the raw stats counter, so a run with no visible clone groups stays clean instead of reporting duplicate issues with no annotations. Thanks @pavle99 for the report.
+
+- **Vue components rendered after a `<template #slot>` are no longer falsely reported as unused.** The Vue single-file-component template scanner matched the root `<template>` against the FIRST `</template>`, so in a component whose template contains a nested slot template (`<template #header>...</template>`) followed by more components, every component rendered after that nested slot was dropped from usage tracking. Its export could then surface as a false `unused-export` (and its import as unused) even though it is rendered. The scanner now locates the root `</template>` with nesting depth tracking, so all rendered components are credited. Byte-safe scanning also fixes a crash on templates containing multi-byte (for example CJK) text. This is common in real component libraries and design systems, where layout/shell components pass slots to children.
+
+- **Un-hiding VS Code findings reliably brings the squiggles back.** After "Toggle Hide All Findings", showing findings again now re-renders open files immediately instead of leaving them blank until the next edit. The editor asks the language server to re-drive its diagnostic refresh (the same path used after analysis and when a file is reopened) rather than relying only on a client-side re-pull that could match nothing. A new command, **Fallow: Reset Hidden Findings (Restart Server)**, is the guaranteed escape hatch: it clears every editor-side hide and restarts the server so all open files re-render. Because the hidden state is stored per workspace (it survives uninstalling the extension and deleting the `.fallow` folder), the extension now also tells you once on startup when everything is hidden, with a one-click "Show all findings". CI and the CLI are unaffected by these editor-only filters.
+
+- **Concurrent `fallow impact` recordings no longer lose data.** When the pre-commit gate fires in two worktrees of the same repo at once, both runs now serialize their update through an advisory lock instead of overwriting each other, so neither run's record is dropped.
+
+- **The VS Code extension is more robust around LSP restarts and binary downloads.** Five hardening fixes from an extension audit: (1) the status bar no longer freezes after a config-change LSP restart (the analysis-complete handler is re-registered on every client, not just the first); (2) rapid config changes no longer race two language-server processes (restarts are serialized); (3) a language server that is slow to start or whose shutdown times out no longer orphans a process or wedges the LSP in a permanently-dead state; (4) a dropped binary download no longer crashes the extension host (the download response stream is error-guarded); and (5) a CLI version mismatch no longer deletes the already-verified LSP binary (only the mismatched binary is purged, not the whole managed set).
+
+- **More VS Code extension hardening across diagnostics, binary probing, and the sidebar.** A follow-up pass from the same extension audit: the binary version check now runs off the activation/restart thread, so a slow `--version` no longer stalls the editor; a corrupt stored "hidden findings" state recovers to nothing-hidden instead of disabling the extension for that workspace; toggling categories from the manage view applies in a single step (one refresh, not two); the final hide/show toggle is no longer dropped when a window closes mid-write; empty pnpm catalog groups now appear in the Issues tree (and are counted in the issue total) instead of being counted but unnavigable; an invalid `fallow.duplication.mode` value falls back to the default instead of failing the whole analysis; and the tree and status views clean up correctly on reload so a late background result can no longer touch a disposed view.
+
+- **Next.js RSC findings carry a fix action and show up in the combined-mode CI summary.** The three RSC checks (invalid client exports, mixed client/server barrels, misplaced directives) now emit a structured fix action in JSON output (move the export to a server module, split the barrel, hoist the directive) next to the suppress action, so agents and CI integrations see the remediation, not just "ignore this". They also list by name in the GitHub Action and GitLab CI combined-mode "Code issues" breakdown table, where a combined run previously surfaced them only in the headline count. The `fallow dead-code --explain` output now also prints a description for the misplaced-directive section.
+
+- **`fallow coverage analyze --cloud` no longer fails to parse the runtime-context response.** When the caller-graph (blast-radius) or complexity / CODEOWNERS inputs are unavailable, the response now returns `null` for `caller_count`, `caller_count_weighted_by_traffic`, `cyclomatic`, and `owner_count` rather than a placeholder, and the client rejected those nulls, breaking the command outright. The client now tolerates `null`, absent, and legacy numeric values for those fields and renders them unchanged. (Closes [#1263](https://github.com/fallow-rs/fallow/issues/1263).)
+
+## [2.96.0] - 2026-06-13
+
+### Changed
+
+- **`fallow dupes` now ignores import declarations by default.** Token-identical sorted import blocks are a structural property of well-formatted code, not copy-paste, so they no longer surface as clone groups. `ignoreImports` (shipped opt-in in 2.33.0) now defaults to `true`. Opt out with `"ignoreImports": false` in config, `--no-ignore-imports` on `fallow dupes`, or `--dupes-no-ignore-imports` on bare `fallow`; the MCP `find_dupes` / `trace_clone` tools accept `ignore_imports: false`, and the VS Code `fallow.duplication.ignoreImports` setting now controls both directions. Scope: ES `import` declarations only; CommonJS `require()` calls and `export ... from` re-export blocks are still counted (extending coverage to those is queued as [#1225](https://github.com/fallow-rs/fallow/issues/1225)).
+
+  Operational notes for upgraders:
+  - **`duplicates.threshold` gate users:** the measured duplication percentage drops, so a threshold tuned against import-inclusive counts is now effectively looser. Re-baseline against the new numbers, or set `"ignoreImports": false` to keep the old behavior.
+  - **Baseline / trend users:** import-block clone groups disappear from the next run, so a saved duplication baseline (`--save-baseline` / `--save-regression-baseline`) should be re-saved after upgrading, and a one-time step-down in `fallow impact` / duplication trend at the upgrade boundary is expected, not a real regression.
+
+  Thanks [@danielo515](https://github.com/danielo515) for the report. (Closes [#1224](https://github.com/fallow-rs/fallow/issues/1224).)
+
+- **Fallow Impact history now lives in your user config dir, not in each repo.** Enabling Impact (or recording a run) no longer creates a `.fallow/` directory or edits the repo's `.gitignore`; the per-project store moved to `<config-dir>/fallow/impact/<key>.json` (the same base as `telemetry.json`: `~/Library/Application Support/fallow/` on macOS, `$XDG_CONFIG_HOME/fallow/` on Linux, `%APPDATA%\fallow\` on Windows). The store is keyed by repo identity (`git rev-parse --git-common-dir`), so running `fallow impact` from any subdirectory or any git worktree of a repo resolves to one shared history, and nothing is ever written into the working tree. Per-finding attribution baselines are namespaced per worktree internally, so concurrent worktrees of one repo no longer prune each other's baseline. An existing in-repo `.fallow/impact.json` is imported once on first run (the old file is left untouched); a multi-package monorepo with several subdir stores imports whichever subdir runs first. After that one-time import the in-repo file is no longer read, so running an OLDER fallow binary on the same repo after upgrading writes to the legacy file and does not feed the new user store (a transient mixed-version condition). Impact is now also explicitly forced off in CI (previously it was only off because a fresh CI checkout had no store file), so a user-global default cannot start recording on a CI runner.
+
+### Added
+
+- **`fallow impact default on|off` turns Impact on once for every project.** A single user-global opt-in (stored at `<config-dir>/fallow/impact.json`) so new projects record without re-enabling each one; a per-project `fallow impact enable` / `disable` always wins over the default. The `fallow impact --format json` report and the `impact` MCP tool gain an `enabled_source` field (`project` / `user` / `default`) explaining why tracking is on, and pair with `explicit_decision` so an agent can tell a never-asked project (offer to enable) from one you deliberately disabled (stay quiet).
+
+- **`fallow impact reset [--all]` deletes stored history.** Removes this project's history, or with `--all` clears every project's history; the user-global default toggle is left untouched so a data wipe does not silently re-disable Impact. `fallow impact` (human output) now also prints the resolved store path and project key so you can find, inspect, or remove the file directly.
+
+### Fixed
+
+- **Undoing "Fallow: Toggle Hide All Findings" in VS Code now brings diagnostics back immediately.** After the extension moved open-file diagnostics to the LSP 3.17 pull path, toggling a mute (or per-category hide, or "Show All Findings") only re-published the push diagnostic collection, which the language server keeps empty for open files once the editor starts pulling. So hiding took effect only on the next edit, and un-hiding did nothing visible, leaving findings stuck hidden through reinstalls and restarts because the muted state persists per workspace. Mute toggles now also ask VS Code to re-pull open documents, so squiggles and Problems entries hide and show instantly again. Thanks [@VariableVince](https://github.com/VariableVince) for the report. (Refs [discussion #287](https://github.com/fallow-rs/fallow/discussions/287).)
+
+- **VS Code no longer renders Fallow squiggles twice after a mute toggle.** The pull diagnostic provider owns its own collection, distinct from the push collection the mute filter re-publishes into. Because open-file pull results were cached and then re-published into the push collection on every mute, severity, or baseline change, each open-file finding could render twice (once per collection). Pull results are no longer cached (they are re-fetched on every re-pull), so open files render once.
+
+- **Unchecking "All Fallow Findings" in the Manage Hidden Findings picker now reveals findings.** While hide-all was active the picker auto-checked every category row, so unchecking the global row and accepting silently re-hid every category individually and findings stayed hidden. Category rows now reflect their real per-category state, so unchecking the global row shows everything (and any genuine per-category hide is preserved).
+
+## [2.95.0] - 2026-06-12
+
+### Added
+
+- **Docker users now have a first-party CLI image recipe.** The repo ships a checksum-verified Dockerfile for the pinned Linux musl release binary, a source-built contributor Dockerfile, and a copyable Compose example that mounts projects at `/workspace` with host UID/GID mapping so `.fallow/` caches and reports stay host-owned. The runtime includes git for `audit` base detection plus Node.js, npm, and Corepack for project dependency installs, and CI now builds the Docker image on Docker-file changes. Thanks [@nic0michael](https://github.com/nic0michael) for the Docker Compose starting point. (Closes [#1205](https://github.com/fallow-rs/fallow/issues/1205).)
+
+- **Rule-pack policy findings can now be suppressed per rule.** Suppression comments accept `policy-violation:<pack>/<rule-id>` for both `fallow-ignore-next-line` and `fallow-ignore-file`, so a waiver can target one rule-pack finding without hiding every policy violation at the same scope. Bare `policy-violation` remains supported as the family-wide token. Rule-pack names and rule ids now reject ambiguous characters so scoped tokens do not need escaping, stale-suppression output preserves the scoped token, and generated suppress actions prefer the scoped form. (Closes [#1180](https://github.com/fallow-rs/fallow/issues/1180).)
+
+- **`fallow health` now supports per-file threshold overrides for complexity and CRAP.** Configure `health.thresholdOverrides[]` with `files` globs, optional exact `functions`, and any of `maxCyclomatic`, `maxCognitive`, or `maxCrap` to raise local ceilings for intentional legacy hotspots while keeping global gates strict. The resolved thresholds flow through `health` and `audit`, finding actions use the effective ceiling, and JSON, human, markdown, and compact output report active, stale, and full-run no-match override state so temporary exceptions remain visible. Thanks [@velios](https://github.com/velios) for the report. (Closes [#1206](https://github.com/fallow-rs/fallow/issues/1206).)
+
+### Fixed
+
+- **`unused-class-members` no longer fires on Playwright page-object methods reached through fixture wrappers.** `mergeTests(...)` wrappers and chained wrapper `.extend(...)` calls now inherit the fixture definitions from their wrapped Playwright test objects before callback-side member uses are correlated. The extractor records conservative wrapper-alias sentinels for Playwright's named `mergeTests` import, including aliased named imports, and for `.extend(...)` calls on fixture wrappers. The analyzer expands those aliases transitively with cycle protection, so page-object methods used through merged or extended fixtures are credited while genuinely unused decorated methods still report. Local functions named `mergeTests` and unmatched wrapper aliases do not create credit. Thanks [@vethman](https://github.com/vethman) for the report. (Closes [#1210](https://github.com/fallow-rs/fallow/issues/1210).)
+
+## [2.94.0] - 2026-06-12
+
+### Added
+
+- **Bare `fallow` now accepts Istanbul coverage inputs for the embedded health pass.** The combined default command can now read `--coverage` / `--coverage-root`, `FALLOW_COVERAGE` / `FALLOW_COVERAGE_ROOT`, and `health.coverage` / `health.coverageRoot` so `fallow --format json` uses the same exact CRAP scoring path as `fallow health`. Standalone health and bare combined mode resolve each coverage input independently with CLI, then env, then config, then auto-detection precedence. The GitHub Action and GitLab CI default combined runs now forward their coverage inputs to the bare command too. Thanks [@stieglma](https://github.com/stieglma) for the follow-up. (Refs [#300](https://github.com/fallow-rs/fallow/issues/300#issuecomment-4682836599).)
+
+- **Opt-in telemetry can now count installs instead of runs.** When telemetry is enabled, Fallow keeps one anonymous install grouping token in `telemetry.json`: a freshly random value (never derived from machine, user, repository, project, path, or environment data) minted on `fallow telemetry enable` or the first upload after `FALLOW_TELEMETRY=on`, reused unchanged across runs, and deleted by `fallow telemetry disable`. It is sent only as a private `X-Fallow-Install` transport header for server-side grouping, never as an event property, so the events Fallow serializes and spools still carry no identifiers. An env-only opt-in stays scoped to the invocation: the lazy mint persists only the token, never a config-level enable. `fallow telemetry status` reports only whether the token is present (never the token itself); `fallow telemetry inspect --example` now lists the private transport headers alongside the example payload.
+
+- **A task-to-command matrix routes agent intents to the right fallow command.** One canonical cheat sheet ("when the agent is about to X, run Y") now renders from a single source into four surfaces: a `task_matrix` block in the `fallow schema` capability manifest, the `AGENTS.md` scaffolded by `fallow init --agents`, the managed block written by `fallow hooks install --target agent` (refreshed in place on every reinstall), and the root `fallow --help` output; the bundled agent skill regenerates the same table from the manifest. Rows route common intents (deleting "unused" code, committing or opening a PR, prioritizing refactors, consolidating duplication, scoping a monorepo) to the matching read-only command. The matrix never names a mutating command, and drift tests parse every row through the live CLI so a row can never reference a flag or subcommand that does not exist.
+
+- **The bundled agent CLI reference now regenerates flag tables from `fallow schema`.** The agent-doc generator now owns the marker-wrapped flag tables in `references/cli-reference.md`, including global flags, bare `fallow` combined-mode flags, command-local flags, and the dead-code issue filter table. Existing curated descriptions survive regeneration, aliases such as `-o, --output-file` stay visible, and the release workflow checks both the canonical fallow-skills copy and the vendored npm copy for drift. (Closes [#1189](https://github.com/fallow-rs/fallow/issues/1189).)
+
+- **The agent commit gate now feeds Fallow Impact.** The Claude Code gate installed by `fallow hooks install --target agent` marks its audit runs, so a commit that the gate blocks and a later retry clears lands in `fallow impact` as a containment event (with Impact tracking enabled). The gate script's version floor moves to 2.85.0 to match: an older `fallow` on `PATH` does not understand the marker and would otherwise skip every audit, so it now gets the explicit upgrade block instead of a silent pass-through. Override the floor with `FALLOW_GATE_MIN_VERSION` as before.
+
+- **`fallow hooks status` shows installed hook state without touching anything.** A read-only view (human and `--format json`) of all three hook surfaces: the Git pre-commit hook, the Claude Code gate, and the Codex `AGENTS.md` managed block. Per surface it reports installed, managed-block presence, user-edited detection, the file path, and for the gate script the installer version and minimum-version floor, so agents and scripts can inspect setup before proposing changes.
+
+- **First-run output now points at guided setup.** When a project has no fallow config and a run surfaces findings, JSON output leads `next_steps[]` with a `setup` step (command: `fallow schema`, whose manifest lists the agent-guide and commit-gate commands to offer), and bare `fallow` prints a one-line `Setup:` hint after the failure summary. The pointer is deliberately quiet everywhere else: it never appears in CI, on configured projects, on clean runs, with `FALLOW_SUGGESTIONS=off`, or after `fallow init --decline`, the new flag that records "this project deliberately stays unconfigured" without writing a config file.
+
+- **Fallow Impact reports its value once a week.** With Impact tracking enabled and non-zero results, `next_steps[]` carries an at-most-weekly `impact-report` step with the real counters (commits contained at the gate, findings resolved), and bare `fallow` prints a matching one-line `Impact:` summary. The cadence stamp lives in the project's Impact store, so the digest stays weekly across agents, sessions, and surfaces; zero results never surface, and CI never sees it.
+
+- **Opt-in prompts can now tell "asked and declined" from "never asked".** `fallow telemetry status` and `fallow impact status` expose an `explicit_decision` field that is set only by an explicit enable or disable, never by fallow's own one-time notices. Agents use it to offer each opt-in exactly once and respect a "no" permanently.
+
+### Fixed
+
+- **Angular template scanning no longer panics on a backslash before a multi-byte character.** The quoted-attribute scanner advanced a fixed byte count after a backslash, which could leave the cursor inside a multi-byte escaped character and panic with "byte index N is not a char boundary". It now advances past the backslash and over one full UTF-8 character, matching the rest of the scanner. Thanks [@shawnrice](https://github.com/shawnrice) for the report and the patch in [#1202](https://github.com/fallow-rs/fallow/pull/1202). (Closes [#1201](https://github.com/fallow-rs/fallow/issues/1201).)
+
+## [2.93.0] - 2026-06-11
+
+### Added
+
+- **JSON output now carries a top-level `next_steps[]` array of read-only follow-up commands.** `fallow dead-code`, `health`, `dupes`, bare `fallow`, and `audit` add a `next_steps` array to their `--format json` output (and a one-line `Next:` hint to bare `fallow`'s human output on a TTY), computed from the run's actual findings. Each entry is `{ id, command, reason }`: a stable kebab-case `id` for machine dispatch, a runnable command string, and a short reason. The commands point at fallow's own verification surface that agents and humans rarely discover from the output alone, for example tracing an export before deleting it (`fallow dead-code --trace <file>:<name>`), drilling into a clone (`fallow dupes --trace dup:<fp>`), seeing per-decision-point complexity contributions (`fallow health --complexity-breakdown`), scoping a monorepo to the packages a branch touched, or gating only changed files (`fallow audit`). Two guarantees hold for every entry: the command is never a fix or any other mutating command (fallow surfaces evidence; deciding and applying the change is yours), and the command is runnable as-is with no placeholders. The array is deduplicated, priority-ordered, capped at three, and omitted when empty; it never contributes to `total_issues`. Set `FALLOW_SUGGESTIONS=off` to suppress it (useful for CI that snapshot-diffs raw JSON). Additive-optional field, no schema-version bump; the field rides through the MCP tools unchanged.
+
+- **The bundled agent skill's command, issue-type, and MCP-tool tables now regenerate from the capability manifest.** The SKILL.md tables shipped in the npm package previously drifted behind the CLI by hand-maintenance; they are now marker-wrapped and rendered from `fallow schema` at release time by a new generator with merge semantics: the row set, filter flags, parse-verified suppression comments, and MCP kind/license/key-param columns always regenerate, while the curated explanation cells stay hand-owned and survive regeneration. The first generation adds 9 previously undocumented commands and 14 issue-type rows, each with its exact copy-pasteable suppression comment. (Refs [#1188](https://github.com/fallow-rs/fallow/issues/1188).)
+
+- **`fallow schema` is now a complete capability manifest for agents.** The introspection JSON previously listed 13 hand-maintained issue types; it now derives one `issue_types` row per registered rule across every analysis (dead-code including re-export cycles, boundary and policy violations, stale suppressions, pnpm catalog and dependency-override hygiene; health including complexity, coverage gaps, refactoring targets, and runtime-coverage verdicts; duplication; feature flags; and all security categories). Each row carries the bare rule id as `id`, the SARIF `rule_id`, the owning `command`, `category`, `filter_flag`, `fixable`, `suppressible`, a copy-pasteable `suppress_comment` that is verified to round-trip through the suppression parser (several rows share one token, e.g. all complexity rules suppress via `complexity` and all security categories via `security-sink`), a `note` for caveats, `license` (`free` or `freemium`) with a nuance note on runtime-coverage rows, and a `docs_url`. New top-level blocks: `manifest_version` (`"1"`), `mcp_tools` (all MCP server tools with kind grouping, key params, read-only and license markings, backed by a shared manifest that drift tests keep in sync with the live server), `plugins` (built-in framework plugin count and names derived live from the registry), and a completed `environment_variables` set covering every user-facing `FALLOW_*` variable. `fallow explain feature-flag` now works too: the flags analysis gained its own explain rule.
+
+### Fixed
+
+- **Issue-type filter flags no longer leak `test-only-dependency` findings.** `IssueFilters::apply()` clears every category that was not selected by a single-type filter flag, but the `--unused-deps` clear arm was missing `test_only_dependencies`, so a focused run like `fallow dead-code --unused-files` on a project with a production dependency imported only from test files reported that test-only finding alongside the requested issue type. `--unused-deps` now groups `test-only-dependency` with the other dependency kinds (matching how `type-only-dependency` is handled and how the `--file` scope already cleared all five categories), and the `fallow schema` capability manifest reports `--unused-deps` as the filter flag for the `test-only-dependency` row. (Closes [#1192](https://github.com/fallow-rs/fallow/issues/1192).)
+
+- **The GitLab CI template now runs Bash-only setup blocks through Bash explicitly.** GitLab Runner jobs on Alpine can start `before_script` entries with `/bin/sh`, but the fallow template validated versions, prepared MR scripts, and wrote the analysis runner with Bash-specific syntax. Those blocks now invoke `bash -eo pipefail` explicitly after the dependency-install block installs Bash, so the template no longer depends on the runner's default shell. Thanks [@KudrinOleg](https://github.com/KudrinOleg) for the report. (Closes [#1182](https://github.com/fallow-rs/fallow/issues/1182).)
+
+- **`unused-class-members` no longer fires on Playwright page-object methods reached through an imported fixture-type alias.** When a class instance is exposed lazily behind a getter on a factory class, surfaced through a nested `base.extend(...)` fixture, and the fixture shape is declared via an imported object type alias, methods on the target page-object class were still reported as unused, because callback-side fixture uses were correlated only with locally collected fixture-map aliases. Extraction now emits fixture-type sentinel accesses for imported alias bindings and expands those aliases before correlating Playwright fixture definitions with uses, so a used chain is credited while an actually-unused decorated method on the same class still reports. Recursive expansion across multiple imported alias hops stays conservative. Thanks [@vethman](https://github.com/vethman) for the report. (Closes [#1190](https://github.com/fallow-rs/fallow/issues/1190).)
+
+- **`tsconfig` path aliases no longer surface as unlisted dependencies.** When a bare specifier matched `compilerOptions.paths` but its local alias target was missing, resolution fell through to a package lookup and reported the import (for example `@app/foo`) as an unlisted `package.json` dependency even though it was a project-local alias. Local tsconfig path aliases now resolve before the package fallback, and an alias is marked unresolved only after package imports and workspace-package fallbacks have had a chance to resolve it, so a genuine unlisted scoped package in the same tsconfig-path project still reports.
+
+## [2.92.1] - 2026-06-10
+
+### Added
+
+- **Declarative rule packs encode project policy as pure data.** The new `rulePacks` config key lists standalone JSON/JSONC pack files of `banned-call` and `banned-import` rules; loading a pack never executes project code. Matches report as `policy-violation` findings identified by `<pack>/<rule-id>` across human, JSON, SARIF, CodeClimate, compact, and markdown output, LSP diagnostics, baselines, audit attribution, regression counts, and the GitHub Action / GitLab CI summaries. `banned-call` matching is segment-aware and import-resolved (one `child_process.*` pattern covers `child_process` / `node:child_process` named, namespace, and default imports, and fires on literal-only and zero-argument calls); `banned-import` matches raw specifiers segment-aware (`moment` covers `moment/locale/nl`, never `moment-timezone`) over imports and re-exports, with `ignoreTypeOnly` to admit type-only imports. Rules scope via `files` / `exclude` globs and carry an optional per-rule `severity` that overrides the new `rules."policy-violation"` master (default `warn` for a safe first rollout; the exit-code gate reads the effective per-finding severity, so one `error` rule fails the run even under a warn master, and `off` on the master is a kill switch). Suppress with `// fallow-ignore-next-line policy-violation` (one token covers every pack rule). The new `fallow rule-pack-schema` command prints the pack JSON Schema for editor autocomplete, and invalid packs (unknown kind, missing file, inert callee pattern, glob traversal, duplicate ids) fail config load loudly. (Closes [#1148](https://github.com/fallow-rs/fallow/issues/1148).)
+- **Boundary zones can now forbid specific calls.** The new `boundaries.calls.forbidden` section bans callee patterns per zone (`{ "from": "domain", "callee": "child_process.*" }`, with `callee` accepting a string or an array). Matching is segment-aware and import-resolved, so one pattern covers `child_process` and `node:child_process` named, namespace, and default imports as well as globals like `console.*`. Violations report as `boundary_call_violations` across human, JSON, SARIF, CodeClimate, compact, and markdown output, LSP diagnostics, baselines, audit attribution, and CI summaries, sharing the `boundary-violation` severity and suppression token (the rule-id-shaped `boundary-call-violation` token is accepted as an alias for the boundary family). Optional-chaining call sites (`cp?.exec()`) match like their non-optional form. Forbidden-call rules apply only to files classified into a zone; a rule pointing at a zone that matches no files warns at analysis time, and inert patterns such as a bare `*` are rejected at config load. (Refs [#1147](https://github.com/fallow-rs/fallow/issues/1147).)
+- **Boundary zones can now require full file coverage.** The new `boundaries.coverage` section adds `requireAllFiles` and `allowUnmatched`, so teams can require every analyzed source file to fall into a configured boundary zone. Files matching no zone report as boundary coverage findings across human, JSON, SARIF, CodeClimate, compact, and markdown output, LSP diagnostics, baselines, regression counts, the GitHub Action / GitLab CI summaries, and the generated schemas. Coverage findings honor per-file `boundary-violation` severity overrides and the shared boundary suppression token, and render in human output even when they are the only structure finding. (Refs [#1147](https://github.com/fallow-rs/fallow/issues/1147).)
+- **`fallow init --agents` now scaffolds a starter `AGENTS.md`.** The new opt-in init mode writes a short project guidance template for coding agents, including entry-point, architecture, command, and fallow workflow prompts. When the project shape is reliably detectable, the scaffold prefills the install, test, and typecheck commands and the monorepo module-boundary line from `package.json` (including the `packageManager` field) and `pnpm-workspace.yaml`, marks prefilled commands with a provenance comment, and leaves anything ambiguous blank rather than guessing (no lockfile-sniffed package managers, no test framework when several are present). It refuses to overwrite an existing `AGENTS.md` and does not compute or imply a project readiness score. (Closes [#1124](https://github.com/fallow-rs/fallow/issues/1124).)
+- **The GitHub Action and GitLab CI template now expose the security delta gate.** Use `command: security` with `security-gate: new` or `security-gate: newly-reachable` in the Action, or `FALLOW_COMMAND: "security"` with `FALLOW_SECURITY_GATE` in GitLab. The wrappers forward to the existing `fallow security --gate` modes, count only matching gate candidates for the `issues` output, keep exit code 8 for gated security failures, and skip typed PR/MR comment renderers that do not support security envelopes yet. (Closes [#886](https://github.com/fallow-rs/fallow/issues/886).)
+- **MCP now includes `inspect_target` for one evidence bundle per file or exported symbol.** The new read-only tool accepts a tagged file or symbol target and composes existing trace, dead-code, duplication, complexity, and security evidence into one typed JSON bundle. Symbol targets include precise `trace_export` identity plus explicit file-scoped evidence sections for the analyses that do not yet expose enclosing-symbol mapping. (Closes [#1144](https://github.com/fallow-rs/fallow/issues/1144).)
+- **MCP adds `code_execute`, a read-only Code Mode sandbox.** Agents can compose several fallow analysis calls in one bounded JavaScript run instead of shelling out repeatedly. The tool exposes a frozen, allowlisted fallow host API, injects a default root, rejects mutating fix tools, and returns a stable `mcp-code-execute/v1` envelope with call metadata and limits. It runs QuickJS under memory, stack, timeout, host-call, code-size, and output limits, redirects fallow subprocess output through temporary files so large JSON cannot deadlock pipes, and fails oversized or timed-out runs with structured errors. Mutating fixes remain available only through the existing standalone MCP tools.
+- **`fallow security --summary --format json` now carries scan metadata.** Summary JSON now includes the same `version`, `elapsed_ms`, and privacy-safe `config` block as full security JSON, carries security `_meta` when `--explain` is set, and adds fixed reachability and runtime-state aggregate buckets while still omitting candidate arrays. (Closes [#1139](https://github.com/fallow-rs/fallow/issues/1139).)
+- **`fallow health --targets --format json` now includes relation evidence for agents.** Refactoring target evidence can now include direct importers with imported symbols and duplicate-code siblings with stable clone fingerprints, reusing existing graph and duplicate analysis data. Human target output shows the extra caller and clone lines only when that evidence is present, and generated schema and TypeScript output contracts are updated. (Closes [#1145](https://github.com/fallow-rs/fallow/issues/1145).)
+- **`fallow security --format json` now samples unresolved callee blind spots.** Security JSON now includes an optional `unresolved_callee_diagnostics` block with deterministic sample locations, top files, and reason counts for dynamic or computed callees the sink catalogue could not flatten. This bumps the independent security JSON schema version, and the diagnostics follow `--file`, `--workspace`, `--changed-since`, and `--gate new` scoping. (Closes [#1134](https://github.com/fallow-rs/fallow/issues/1134).)
+- **`fallow security --summary --format json` now emits a compact aggregate payload.** Summary JSON keeps `kind: "security"`, `schema_version`, and an optional `gate` block, but replaces candidate arrays with `summary` counts by severity, category, unresolved static-analysis limits, and attack-surface entry count. The generated schema documents both the full and summary security JSON shapes. (Closes [#1132](https://github.com/fallow-rs/fallow/issues/1132).)
+- **`fallow security --format json` now includes scan metadata.** Security JSON now emits the CLI `version`, `elapsed_ms`, and a privacy-safe `config` block with configured and effective security rule severities plus category include/exclude filters. `--explain` is now valid for security JSON and adds a security-specific `_meta` block. This bumps the independent security JSON schema version, and the generated schema and TypeScript output contracts are updated. (Closes [#1135](https://github.com/fallow-rs/fallow/issues/1135).)
+- **`fallow security --gate newly-reachable` now catches existing sinks newly exposed from entry points.** The gate compares head security candidates against a base-tree reachability snapshot from `--changed-since <ref>`, then exits 8 only when a matching candidate was not runtime-reachable in base but is runtime-reachable in head. Diff-only inputs still exit 2 because this mode needs a materialized base tree. JSON and SARIF reuse the existing additive `gate` block with `mode: "newly-reachable"`, and MCP `security_candidates` accepts the same gate value. (Closes [#1056](https://github.com/fallow-rs/fallow/issues/1056).)
+- **`fallow security` can extend HTTP request receiver detection from config.** `security.requestReceivers` now adds project-local request object names to the built-in `req` / `request` / `ctx` / `context` / `event` allowlist for `*.query`, `*.params`, and `*.body` source reads. Values are trimmed, case-normalized, and additive only, while ORM receivers remain excluded and `*.searchParams` stays ungated. (Closes [#1125](https://github.com/fallow-rs/fallow/issues/1125).)
+
+### Changed
+
+- **Invalid plugin config regexes now fail with exit code 2.** Regex values from plugin path-rule exclusions are validated after config parsing and aggregated into one invalid-config error instead of being dropped with a warning. This covers entry-pattern and used-export rules from built-in and external plugins, including TanStack Router route ignore patterns. External plugin `config_patterns` collisions and enabler typo diagnostics remain warnings. (Closes [#513](https://github.com/fallow-rs/fallow/issues/513).)
+- **`fallow security` human output now leads with candidate framing.** The human renderer's first lines explain that findings are items to check, not confirmed vulnerabilities, and evidence, code paths, import traces, and blind spots now use plain-language labels. JSON, SARIF, MCP, and downstream verifier output keep the detailed candidate framing unchanged.
+
+### Fixed
+
+- **`fallow security survivors` now makes incomplete verifier reviews visible.** Survivor output now reports `summary.unverdicted` and the human renderer prints an unreviewed-candidate line when the verdict file does not cover every candidate. CI can opt into `--require-verdict-for-each-candidate` to fail incomplete verdict files with a structured exit-2 error, `security survivors --help` now shows the verdict shape, and `security blind-spots --file` is accepted after the subcommand instead of being a help-text trap.
+- **VS Code tooltips now escape names taken from analyzed code.** The complexity hover interpolated function names into tooltip markdown unescaped, so a crafted function name in the analyzed project could spoof tooltip content. All extension tooltips now share one canonical pair of markdown escape helpers (an inline variant that normalizes whitespace and a multiline variant that preserves it), and normal names render unchanged in the editor.
+- **`fallow security` now traces untrusted input through chained local bindings.** Source-backing follows up to three chained same-module local bindings (`const a = req.query.id; const b = \`x-${a}\`; execSync(\`run ${b}\`)`), so common injection shapes that route a request value through one or two intermediate variables are upgraded to arg-level confidence with the trace anchored at the original read instead of staying module-level. Chains stay conservative: only plain aliases and template / string-concat / object-literal initializers chain (call, conditional, and property-read initializers do not), and a flow past the chain limit degrades to module-level rather than claiming arg-level. Set `RUST_LOG=debug` to see when a chain is dropped for exceeding the limit. (Closes [#1146](https://github.com/fallow-rs/fallow/issues/1146).)
+- **`fallow audit` no longer diffs against a stale local default branch.** With no `--base`, audit auto-detected the comparison base by discovering the default branch via `origin/HEAD` but returning the bare name `main`, which git resolves to the local `refs/heads/main`. On long-lived worktree checkouts cut from `origin/main` whose local `main` is never updated, this diffed every branch against an ancient base, surfaced the whole already-merged delta as changed, and could fail the agent gate on a one-line change. Auto-detection now resolves the base to the `git merge-base` (fork point) against the branch's upstream or the remote default (`origin/HEAD`, then `origin/main`, then `origin/master`), mirroring the `fallow hooks install --target git` pre-commit hook. The merge-base is also immune to an unfetched `origin/main` in the false-fail direction. Repositories with no `origin` remote still fall back to the local `main` / `master` branch, so offline checkouts are unaffected. A new `FALLOW_AUDIT_BASE` environment variable pins the base without editing the generated agent gate script (for example `FALLOW_AUDIT_BASE=upstream/main` on a fork), taking effect when no `--base` / `--changed-since` is passed. The human audit scope line now shows the resolved base with its provenance, for example `vs a1b2c3d4e5f6 (merge-base with origin/main)`. Thanks [@Zain-Bin-Arshad](https://github.com/Zain-Bin-Arshad) for the detailed report. (Closes [#1168](https://github.com/fallow-rs/fallow/issues/1168).)
+- **napi-rs prebuilt platform packages no longer report as unused optional dependencies.** Fallow now reads current `package.json#napi` metadata, derives platform package names from `napi.packageName` or package.json `name`, and credits only matching entries already present in `optionalDependencies`. Unrelated optional packages still report. Thanks [@BartWaardenburg](https://github.com/BartWaardenburg) for the report. (Closes [#1164](https://github.com/fallow-rs/fallow/issues/1164).)
+- **VS Code sidebar clicks now recover encoded dynamic route brackets before opening files.** If a tree item receives an already encoded Next.js route segment such as `%5BactivityId%5D`, the extension decodes the route brackets before handing the filesystem path to VS Code or Cursor. This prevents the editor URI from double-encoding those segments to `%255B...%255D` and opening a nonexistent file. Thanks [@Ados12](https://github.com/Ados12) for the report. (Closes [#1160](https://github.com/fallow-rs/fallow/issues/1160).)
+- **`fallow security` now suppresses trusted local sanitizer flows.** The tainted-sink detector recognizes syntax-proven local HTML escape helpers, renderer helpers whose dynamic HTML text fragments are fully sanitizer-backed, and SQL identifier quoting helpers used in identifier positions. Mixed HTML or SQL templates with unsanitized dynamic fragments still report as candidates, and SQL identifier quoting is not treated as value parameterization. (Closes [#1136](https://github.com/fallow-rs/fallow/issues/1136).)
+- **`fallow security` now classifies fixed-origin dynamic URL candidates separately.** SSRF and open-redirect candidates whose URL expression has a fixed origin with dynamic path or query now carry `candidate.sink.url_shape: "fixed-origin-dynamic-path"` and lower-alarm evidence, while dynamic-origin expressions carry `url_shape: "dynamic-origin"` when statically visible. Existing security categories and suppressions are unchanged, and the independent security JSON schema version is now `"6"` (up from `"2"` in v2.91.0). (Closes [#1137](https://github.com/fallow-rs/fallow/issues/1137).)
+- **`fallow security` now preserves source-backed ranking inside each severity tier.** The final CLI ordering still groups candidates by high, medium, then low severity, but same-tier ties now keep the existing runtime, arg-level/source-backed, module-level source reachability, blast-radius, boundary, and dead-code ranking signals before falling back to path order. This keeps stronger candidates ahead of weaker same-severity candidates without changing schema shape or treating any candidate as a proven vulnerability. (Closes [#1133](https://github.com/fallow-rs/fallow/issues/1133).)
+- **`fallow security` no longer fires sink rules on statically known constant values.** Simple module-scope constant expressions are now classified before security sink matching, with literal metadata carried through const identifiers, `String(...)` coercion, unary numeric constants, and constant-only templates, so non-literal catalogue rows do not match a value that is statically constant. Public CI metadata env names (build refs, SHAs) are treated as non-secret sources unless the name is secret-shaped, keeping them out of source-backed logging candidates while still flagging tokens and keys. (Closes [#1138](https://github.com/fallow-rs/fallow/issues/1138).)
+- **`fallow security --help` no longer lists global flags the command rejects.** Inherited global flags that `fallow security` rejects through its structured validation path are now hidden from both `security --help` and `help security`, keeping the help surface aligned with runtime behavior without changing how unsupported flags are parsed or reported. `--explain` stays visible and supported after the metadata work. (Closes [#1131](https://github.com/fallow-rs/fallow/issues/1131).)
+- **A single huge minified bundle no longer exhausts memory during discovery.** Vite-style generated assets can sit under the per-file byte limit while still expanding into very large parser and extraction payloads. While the max-file-size guard is enabled, source discovery now treats large one-line JS assets as generated output and skips them, recording each as a `skipped-minified-file` diagnostic on stderr and in `--format json`. `--max-file-size 0` opts out, declaration files and large multiline JS stay in the analyzed set, and the output schema, generated TypeScript contracts, and CLI reference document the new diagnostic kind. (Closes [#1086](https://github.com/fallow-rs/fallow/issues/1086).)
+- **JSON output now carries the telemetry analysis run id when telemetry is enabled.** With opt-in telemetry active, `--format json` adds an `analysis_run_id` so a run's JSON output can be correlated with its uploaded usage event. The field is omitted when telemetry is disabled or in inspect mode.
+
+## [2.91.0] - 2026-06-09
+
+### Added
+
+- **`fallow security --surface` now recognizes declarative validation boundaries.** Route-level validation declarations in Elysia, Fastify, tRPC, Hono, NestJS, and express-validator are now surfaced as validation controls in defensive-boundary context when the framework package is imported or required. The annotation changes the verification prompt from the zero-control variant to the existing "are they sufficient" question, but it does not suppress candidates, prove exploitability, or add a new output schema field. (Closes [#1094](https://github.com/fallow-rs/fallow/issues/1094).)
+- **`fallow explain` now documents security candidate categories.** The standalone explain command now accepts `tainted-sink`, `client-server-leak`, `hardcoded-secret`, and every surfaced `security/<category>` tainted-sink rule id from the security catalogue, with candidate-focused rationale and fix guidance. This is documentation and lookup coverage only: `fallow security` detection, output, and candidate framing are unchanged. (Closes [#1098](https://github.com/fallow-rs/fallow/issues/1098).)
+- **`fallow security` now recognizes source-backed local expression bindings.** Tainted-sink candidates now keep the source-backed ranking signal when a local binding embeds request input or another known source inside a template literal, string concatenation, or object literal before reaching a sink. This improves evidence for common injection shapes such as command or regex construction without adding new finding categories, changing gates, or treating candidates as verified vulnerabilities. (Closes [#1095](https://github.com/fallow-rs/fallow/issues/1095).)
+- **`fallow security` now has an end-to-end agent verification recipe.** The new guide shows how to combine `fallow security --format json --surface`, candidate evidence, source windows gathered by the caller, and MCP `security_candidates` output into a verifier-filtered survivor list. The recipe keeps model calls outside fallow core and treats fallow output as deterministic candidate evidence, not verified vulnerabilities. (Closes [#1099](https://github.com/fallow-rs/fallow/issues/1099).)
+- **`fallow security` now derives per-candidate severity tiers.** Security findings now carry a required `severity` field (`high`, `medium`, or `low`) based on existing reachability, boundary, source-backed, and runtime-hot signals. Human output prefixes candidates with the tier, JSON bumps the independent security schema version to `"2"`, and SARIF maps high/medium candidates to `warning` while leaving low candidates at `note`. The tier is review priority only: it does not mark candidates as verified vulnerabilities and does not change gate or exit semantics. (Closes [#1096](https://github.com/fallow-rs/fallow/issues/1096).)
+- **Opt-in telemetry now includes coarse analysis-scale buckets for slow workflow triage.** `file_count_bucket`, `function_count_bucket`, and `avg_fan_out_bucket` segment eligible analysis runs into allowlisted size ranges while keeping exact counts, paths, package names, exact dependency graph shape, and expensive structural metrics out of the payload. The fields are optional and are emitted only from counts or graph counters already computed by the workflow. Combined and audit workflows keep the largest bucket reported by their sub-analyses. (Closes [#1064](https://github.com/fallow-rs/fallow/issues/1064).)
+- **Telemetry now separates admin workflow buckets.** Opt-in CLI telemetry now records coarse `project_inventory`, `setup`, and `license` workflow labels for admin and setup commands that previously collapsed into `unknown`. The payload remains allowlisted and still does not include raw commands, paths, config values, repository identifiers, or license identifiers. (Closes [#1061](https://github.com/fallow-rs/fallow/issues/1061).)
+- **Telemetry now describes parent-run follow-ups with safe dimensions.** Inspect-mode and uploaded workflow events use `has_parent_run`, `run_role`, and `followup_kind` instead of exposing raw parent-run tokens as event properties. Valid `--parent-run` values can still be used as private upload correlation metadata, while paths and free-form values are dropped. (Closes [#1078](https://github.com/fallow-rs/fallow/issues/1078).)
+- **Telemetry now segments code quality review duration by cache state.** Opt-in CLI telemetry for combined `code_quality_review` runs can now include an allowlisted `cache_state` value of `cold`, `warm`, `partial`, or `unknown`, so slow duration buckets can be interpreted without exact timings, raw cache counts, paths, repository identifiers, or cache directories. (Closes [#1062](https://github.com/fallow-rs/fallow/issues/1062).)
+- **Telemetry now records coarse run-context dimensions for workflow triage.** Opt-in CLI telemetry can now include `run_scope`, `config_shape`, `output_destination`, and `analysis_mode`, derived only from parsed arguments and already-loaded config state using fixed enum buckets. The payload stays allowlisted and still excludes raw paths, workspace names, config file names, rule names, package names, command lines, and repository identifiers. (Closes [#1079](https://github.com/fallow-rs/fallow/issues/1079).)
+- **Telemetry now records coarse outcome buckets.** Workflow events can now carry a `result_count_bucket` plus `report_truncated` and `truncation_reason` fields, so result volume and review/report truncation are observable without exposing exact counts, paths, rule ids, finding names, or snippets. The existing `findings_present` and `failure_reason` contracts are preserved. (Closes [#1080](https://github.com/fallow-rs/fallow/issues/1080).)
+- **Telemetry now records a coarse `failure_reason` on failed workflow events.** Known post-parse validation, diff-setup, and unsupported-format failures are tagged at explicit failure boundaries with an allowlisted reason, while unclassified failures stay `unknown` instead of parsing error text. Successful events continue to omit the field. (Closes [#1063](https://github.com/fallow-rs/fallow/issues/1063).)
+
+### Fixed
+
+- **Security SARIF now carries traced code flows and CWE rule metadata.** `fallow security --format sarif` previously collapsed each candidate to a sink location plus related locations, so code-scanning users could not follow the source-to-sink path and SARIF consumers only saw CWE as a compatibility tag. SARIF results with trace data now include `codeFlows` / `threadFlows`, security rules carry `name` and `help`, and CWE-backed rules are linked to a run-level CWE taxonomy while keeping the existing `external/cwe/cwe-NN` tags for compatibility. Candidate framing remains unchanged. (Closes [#1097](https://github.com/fallow-rs/fallow/issues/1097).)
+- **`fallow security` no longer treats ORM query builders as untrusted HTTP input.** The HTTP request-input source patterns (`*.query`, `*.params`, `*.body`) matched any receiver, so `db.query` (Drizzle), `prisma.query`, and similar data-access accessors classified their whole module as an untrusted source. The cross-module reachability ranking then marked `reachable_from_untrusted_source: true` on every candidate in every module that imported it, which on a real Drizzle/Elysia backend inflated the headline column to almost every candidate. Those patterns now fire only when the receiver is a recognized request object (`req`, `request`, `ctx`, `context`, `event`), so a genuine `req.query.id` in a handler still strengthens a candidate while `db.query` does not. `new URL(...).searchParams` reads are unaffected. (Closes [#1092](https://github.com/fallow-rs/fallow/issues/1092).)
+- **`fallow security` now distinguishes a sink whose argument traces to a source from one that merely shares a module, and points the trace at the real source read.** Tainted-sink candidates carry a structured `reachability.taint_confidence` of `arg-level` (the sink argument traces back to a source read in the same statement, the strong case) or `module-level` (the sink only lives in a module reachable from a source, the weak case), so JSON, SARIF, and MCP consumers can tier candidates without parsing the human evidence text. The source node in `taint_flow.source` and the trace now points at the line of the actual source read for arg-level candidates instead of the file's top-of-file import line, and module-level source nodes are labeled `module-source` so a reachability hop is never read as a proven value path. Ranking and gating behavior are unchanged. (Closes [#1093](https://github.com/fallow-rs/fallow/issues/1093).)
+- **VS Code no longer fails to install Fallow binaries when several windows open at once.** Opening multiple VS Code (or Cursor) windows together right after a new Fallow release made every window race to download `fallow-lsp` and `fallow` into the same shared storage directory; on Windows one window won and the others failed with a permission error because the file was already in use. Fallow now serializes the install across windows with a lock, so the first window downloads and the rest reuse the result instead of downloading again, and each binary is written to a temporary file and atomically moved into place so a concurrent or interrupted install can never corrupt or collide on the target file. A crashed window's stale lock is reclaimed automatically, and an already-correct binary that is locked by a running window is treated as success. Thanks [@XCanG](https://github.com/XCanG) for the report. (Closes [#1091](https://github.com/fallow-rs/fallow/issues/1091).)
+- **A single huge generated file no longer runs fallow out of memory.** Running `fallow` at a large repository root previously read and parsed every discovered source file at once, so one multi-megabyte generated, vendored, or bundled file (an API client, an i18n or route manifest, a non-`.min` bundle) could exhaust all available memory and hang before producing output. Fallow now skips source files larger than a per-file limit (default 5 MB) at discovery, so they are never read, parsed, or analyzed. Declaration files (`.d.ts`) are always analyzed regardless of size. Tune the limit with `--max-file-size <MB>` or `FALLOW_MAX_FILE_SIZE` (`0` disables the limit). Skipped files are reported on stderr and in `--format json` (under `workspace_diagnostics`, `kind: "skipped-large-file"`), so a skip is never silent. When the discovered set or a single file is unusually large, fallow now also prints the largest files before parsing begins, so a stall is diagnosable rather than a silent hang. `*.bundle.js` and `*.min.cjs` join the default ignore list alongside the existing `*.min.js` / `*.min.mjs`. The skipped-file size is measured on disk, so a value left a couple percent under the limit can cross it under CRLF line endings; keep margin or pin the limit if you gate CI on exact findings. (Refs [#1086](https://github.com/fallow-rs/fallow/issues/1086).)
+- **Telemetry no longer adds latency to your command.** With telemetry enabled, every run previously waited at exit (up to 200ms, around 50ms on a healthy network and longer on a slow one) for the usage event to upload, which could more than double the wall time of a fast command and contradicted telemetry's own "never add meaningful latency" promise. Fallow now appends the event to a small local spool file (`telemetry-spool.jsonl`, in your config directory next to `telemetry.json`) at exit, which is sub-millisecond and never touches the network, and a later telemetry-enabled run uploads the spooled events on a background thread while it works, so the upload is never on your command's critical path. Telemetry stays opt-in and best-effort: a fast run now defers its event instead of dropping it, the spool is bounded so a machine that stays offline cannot grow it without limit, and disabled and inspect modes write and upload nothing.
+- **Large repositories use less peak memory during analysis.** The per-file extraction payloads (token and AST-derived vectors) that module resolution and graph construction have already consumed are now released after that phase, while the module data still needed by analysis, health, security, LSP, coverage, and fix drift checks is retained and compacted. This lowers peak memory on large repositories with no change to analysis output, line offsets, or complexity data. (Closes [#1104](https://github.com/fallow-rs/fallow/issues/1104).)
+- **VS Code no longer re-spawns analysis in a tight loop when it keeps failing.** Automatic on-save and on-open analysis now backs off, keyed by workspace input, so repeated failures pause before spawning more CLI work; a manual analysis command forces a retry and clears the paused state, and a successful run resets the failure count. Extension-triggered analysis also passes a default per-file size ceiling through `FALLOW_MAX_FILE_SIZE` (preserving an explicit user value when set), so a single huge file cannot drive the editor's analysis process out of memory. (Closes [#1105](https://github.com/fallow-rs/fallow/issues/1105).)
+- **Telemetry now reports findings presence for audit and security.** Inspect-mode telemetry events for `fallow audit` and `fallow security` now include `findings_present` after analysis, matching the existing contract for other analysis workflows. Admin commands that do not run analysis continue to omit the field. (Closes [#1060](https://github.com/fallow-rs/fallow/issues/1060).)
+- **VS Code sidebar clicks now open Next.js dynamic route files on Windows.** Sidebar tree items now pass decoded filesystem paths through an internal extension command before opening the editor, so paths such as `src/app/[productId]/page.tsx` no longer arrive as `%5BproductId%5D` and fail to open from VS Code or Cursor. Thanks [@Dev-CleverMath](https://github.com/Dev-CleverMath) for the report. (Closes [#1071](https://github.com/fallow-rs/fallow/issues/1071).)
+
+## [2.90.0] - 2026-06-08
+
+### Added
+
+- **`fallow security` now recognizes more source-backed entry-point inputs.** GraphQL resolver `args`, tRPC procedure `input`, webhook raw request bodies, and DOM-XSS browser reads such as `document.referrer`, `window.name`, and `document.cookie` can now strengthen tainted-sink candidates when they reach a dangerous sink. GraphQL and tRPC callback sources are dependency-gated, existing Next.js, queue, MCP, and HTTP handler sources are unchanged, and findings remain opt-in candidates for verification. (Closes [#899](https://github.com/fallow-rs/fallow/issues/899).)
+- **`--output-file` / `-o` writes the report to a file instead of stdout.** On large projects the report can be long enough that the terminal scrollback drops the top. Pass `fallow -o report.txt` (or `--output-file report.txt`) to write the rendered report to a file for any `--format` (human, JSON, SARIF, compact, markdown, CodeClimate, badge, PR/MR comment and review envelopes), including bare/combined mode. The file never contains ANSI color codes, even when run attached to a terminal. Progress and a `Report written to <path>` confirmation stay on stderr (the confirmation is suppressed by `--quiet`). The flag is valid with `dead-code`, `dupes`, `health`, `security`, and bare invocation, and composes with `--sarif-file` (which still writes its SARIF sidecar). Shell redirection (`fallow > report.txt`) already produced clean output; this adds an ergonomic, discoverable flag that keeps progress on the terminal. (Closes [#1037](https://github.com/fallow-rs/fallow/issues/1037).)
+- **The persistent analysis cache can now be relocated before the first run.** Set `cache.dir` in `.fallowrc.json` or `FALLOW_CACHE_DIR` in the environment to keep extraction and audit base-snapshot caches outside the default `.fallow/` directory. Relative paths resolve from the project root, the environment variable wins over config, and the default human first-run path now prints one concise cache-location note. Machine formats, quiet runs, CI, non-TTY agent paths, and `--no-cache` remain silent. (Closes [#1036](https://github.com/fallow-rs/fallow/issues/1036).)
+- **Security candidates can now be scoped to just-edited paths through MCP.** The existing `security_candidates` tool accepts a `paths` parameter for agent edit loops, forwarding to `fallow security --file` and returning only candidates whose anchor or trace touches those files. Whole-project security scans stay unchanged when `paths` is omitted. (Closes [#889](https://github.com/fallow-rs/fallow/issues/889).)
+- **`fallow security --gate new` fails a PR only on NEWLY-introduced security candidates.** Pass `fallow security --gate new --changed-since <ref>` (or pipe a diff: `git diff --cached --unified=0 | fallow security --gate new --diff-stdin`) to gate a change on the exposure it INTRODUCES, not on the whole candidate backlog. The gate reports only candidates whose sink lands on a CHANGED line (or that wire a new untrusted source into an existing sink on a changed line) and exits **8** when any exist, so a refactor that merely touches a file already containing a sink passes. A diff the gate cannot compute (an unfetched ref on a shallow clone, a bad ref) is a loud exit 2, never a green gate. Output stays framed as unverified candidates: human output says "REVIEW REQUIRED" (not "FAIL"), SARIF keeps every result at `level: note` with the verdict in `run.properties.fallowGate`, and `--format json` carries an additive `gate` block (`mode` / `verdict` / `new_count`). Exit code 8 is dedicated, so CI can soft-gate it (GitLab `allow_failure: exit_codes: [8]`) without allow-listing real errors. Findings remain unverified candidates for agent or human verification. (Refs [#886](https://github.com/fallow-rs/fallow/issues/886).)
+- **VS Code complexity breakdown is now progressive disclosure.** A compact lens (`<name>: N cyc, N cog`) sits above each function that exceeds Fallow Health thresholds (`fallow.health.inlineComplexity`, now on by default), and the dense per-line `+N` breakdown is revealed per function instead of all at once. Three ways to show a function's breakdown, all sharing one state the lens reflects: select its finding in the Health view (the breakdown shows and that function's lens reads `hide breakdown` while selected), click the lens to expand or collapse it (the title flips `show` / `hide breakdown`), or hover the function or a decision-point line to peek the breakdown in a popup. `fallow.complexity.afterText` now defaults to `false` (it forces the per-line text on for every function when you want the old always-on behavior). The lens is rendered by the extension so it can toggle; the editor-agnostic LSP complexity lens stays available to other editors (Neovim, Zed, Helix) and is unchanged. (Refs [#992](https://github.com/fallow-rs/fallow/issues/992).)
+- **VS Code diagnostics can now render at a quieter severity.** Set `fallow.diagnostics.severity` to `information` or `hint` to keep Fallow findings available in the editor with less visual weight. `hint` removes squiggles while preserving Problems-panel entries and quick-fix context. The default remains `warning`, and this editor-only setting does not change CLI output, CI, `fallow dead-code`, or `fallow audit`. (Closes [#1038](https://github.com/fallow-rs/fallow/issues/1038).)
+- **VS Code now has a one-click status-bar button to hide or show Fallow squiggles.** A new `$(eye) Fallow` item in the status bar hides every Fallow diagnostic in the editor with one click (it then reads `$(eye-closed) Fallow: hidden`) and shows them again on the next click. Previously the only on/off control became visible after you had already muted something, so a first-time user staring at squiggles had no obvious way to turn them off. The button reuses the existing toggle command and stays in sync with the right-gutter status item and the **Manage Hidden Findings** quick pick. It only affects the editor: CI and `fallow check` still report every finding. Hide the button itself with `fallow.diagnostics.statusBar: false`; the **Fallow: Toggle Hide All Findings** command keeps working and can be bound to a key. The diagnostic visibility commands and quick pick now use consistent "hide / show" wording. (Closes [#1035](https://github.com/fallow-rs/fallow/issues/1035).)
+- **VS Code teams can now commit a diagnostic mute baseline.** Set `fallow.diagnostics.mutedCategories` in `.vscode/settings.json` to hide noisy Fallow categories, such as `code-duplication`, for everyone who opens the workspace. The baseline is editor-only: CI, audit, and `fallow check` still report every finding. Per-machine mutes still compose, so developers can hide more categories or locally show a category the team baseline hides. (Closes [#1039](https://github.com/fallow-rs/fallow/issues/1039).)
+- **Security candidates now surface as opt-in editor diagnostics.** When you raise the `security-sink` or `security-client-server-leak` rule to `warn` or `error` in your fallow config, the fallow LSP server reports each security candidate as an `information`-level diagnostic in any LSP editor (VS Code, Neovim, Helix, Zed). The severity is deliberately advisory, not a red error, matching the "unverified candidate, verify before acting" framing. The hover leads with the confidence signals (source-backed, reachable from a runtime entry point), the evidence, and a pointer to `fallow security --file` for the full trace; a quick-fix dismisses the candidate on the line or for the whole file. Each diagnostic also carries structured `data` (kind, category, CWE, source-backed, entry-reachable, blast radius, boundary-crossing) so agents reading editor diagnostics can triage without re-running the CLI. Security stays default-off and never appears under bare `fallow` or `fallow audit`. (Closes [#891](https://github.com/fallow-rs/fallow/issues/891).)
+- **`fallow security --format json` now structures each candidate as an agent-actionable record.** Every finding carries a `candidate` object with three slots an AI agent can act on directly: `source_kind` (the kind of untrusted input that reaches the sink, as a stable catalogue id such as `http-request-input` or `process-env`, or absent when no source matched), a self-contained `sink` (path, line, column, category, CWE, and the captured callee), and a `boundary` (whether the flow crosses a client/server or module boundary, plus the architecture zone crossed when one applies). The exploitability verdict is the agent's job and is documented in the schema rather than emitted as a perpetually-null field. Findings that have a traced untrusted-source-to-sink flow also carry a `taint_flow` triple (`source`, `sink`, and a compact `path` with the cross-module hop count); the full ordered hops stay in `reachability.untrusted_source_trace` and are not duplicated. Every finding now has a stable `finding_id` (identical to its SARIF `partialFingerprints` value) so an agent can correlate a candidate across runs after a rebase. All additions are additive and output-only; the schema version is unchanged, and human and SARIF output are unchanged. (Closes [#900](https://github.com/fallow-rs/fallow/issues/900).)
+- **`fallow security` can now flag a secret reaching a network request (`secret-to-network`).** A new opt-in catalogue category detects a non-public `process.env` / `import.meta.env` secret reaching the body or options argument of a network call (`fetch`, `axios`, `got`, `http.request`, ...) when the SAME identifier flows from the secret read into the request, the classic data-exfiltration shape. Because legitimate auth (sending a bearer token to its own provider) is also "secret to a network call", the category is opt-in: enable it with `security.categories.include: ["secret-to-network"]`. Each candidate carries the destination as `candidate.network.destination` (the request URL when it is a literal, or absent when the URL is dynamic, the higher-signal case) so a reviewing agent can tell exfil from intended auth without re-reading the code. The same change stops treating public-by-convention env vars (`NEXT_PUBLIC_`, `VITE_`, `REACT_APP_`, ...) as secrets across the security catalogue, which also removes a false positive from the existing secret-or-PII-in-logs check, and adds Vite's `import.meta.env` as a recognized secret source. Findings remain unverified candidates for agent or human verification. (Closes [#890](https://github.com/fallow-rs/fallow/issues/890).)
+- **The fallow LSP server now supports LSP 3.17 pull diagnostics, and Neovim, Zed, and Helix get first-class setup docs.** The server moved from the unmaintained `tower-lsp` / `lsp-types` stack to the maintained `tower-lsp-server` + `ls-types`, which unlocks pull diagnostics with `workspace/diagnostic/refresh`. Diagnostic delivery keys on whether a client actually pulls, so push-only clients such as the VS Code extension keep receiving open-file diagnostics while pull clients (Neovim, Zed, Helix) avoid duplicate push and pull namespaces. Diagnostic and code-lens refreshes are fire-and-forget so a slow client cannot stall analysis. Thanks [@tris203](https://github.com/tris203) for the patch in [#1033](https://github.com/fallow-rs/fallow/pull/1033).
+
+### Fixed
+
+- **The VS Code sidebar and editor diagnostics now agree on production mode.** `fallow.production` was forwarded to the CLI-driven sidebar (Unused Code / Duplicates / Health) but never to the `fallow-lsp` server, so the editor squiggles and the sidebar tree disagreed on dead-code findings whenever production mode was on. The setting is now forwarded to both surfaces. It also becomes a tri-state `auto` / `on` / `off` (default `auto`): `auto` defers to the project `.fallowrc.json`, `on` forces production mode on both surfaces, and `off` forces it off on both, even when the project config enables it. To make `off` work on the sidebar, `fallow` gains a global `--no-production` flag (the inverse of `--production`; conflicts with it). `fallow.production` and the `fallow.duplication.*` settings now use `resource` scope, so a stale global value no longer silently overrides every project's committed config in the editor. A previously stored boolean value still works (it maps to `on` / `off`). Editor-only: CI, `fallow dead-code`, and `fallow audit` are unchanged, and `--no-production` is a no-op for any analysis whose production mode is already off. (Closes [#1055](https://github.com/fallow-rs/fallow/issues/1055).)
+- **`fallow security` now detects source-backed resource amplification candidates.** Untrusted request input that reaches `new Array(n)`, `Array(n)`, `Buffer.alloc` / `allocUnsafe` / `allocUnsafeSlow`, or `String.prototype.repeat` / `padStart` / `padEnd` now surfaces as a `resource-amplification` CWE-400 candidate, so an attacker-controlled size that drives an unbounded allocation does not look clean. Sizes that are directly clamped with `Math.min(input, limit)` and arguments that never trace to a request source stay quiet, and findings remain opt-in candidates for agent verification. (Closes [#929](https://github.com/fallow-rs/fallow/issues/929).)
+- **`fallow security` now ranks one-hop helper-return sink flows as source-backed.** Same-module functions, const arrow helpers, and const function-expression helpers that return request-sourced member paths now let a local bound from one helper call inherit the source-backed ranking signal. Helper aliases, cross-module calls, multi-hop chains, and shadowed helper names stay unbacked, and the signal still only changes ordering and evidence rather than candidate generation. (Closes [#878](https://github.com/fallow-rs/fallow/issues/878).)
+- **`fallow security` now detects source-backed ReDoS regex candidates.** Risky literal regex structures such as nested unbounded quantifiers now surface as `redos-regex` CWE-1333 candidates when they are applied to request-backed input through regex methods or string regex methods. Linear patterns, mutable regex bindings, and risky literals applied only to source-free values stay quiet. (Closes [#928](https://github.com/fallow-rs/fallow/issues/928).)
+- **`fallow security` now covers the remaining literal-tier #901 candidates.** Literal `http://` / `ftp://` request URLs, `new WebSocket("ws://...")`, AES ECB cipher algorithms, Electron `BrowserWindow` options that enable unsafe `webPreferences`, `fs.chmod(..., 0o777)`, literal `/tmp/...` file writes, and mysql or mysql2 `multipleStatements: true` options now surface as security candidates for agent verification. Safe encrypted transports, safe Electron options, safer chmod modes, and same-named local helpers without provenance stay quiet. (Closes [#901](https://github.com/fallow-rs/fallow/issues/901).)
+- **`fallow security` now cross-links tainted sink candidates with dead-code findings.** Sinks in unused files or on unused exports now carry a `dead_code` JSON context, surface delete/remove guidance in human and SARIF output, and sort behind active-code candidates when other ranking signals tie. (Closes [#884](https://github.com/fallow-rs/fallow/issues/884).)
+- **`fallow security` now detects dynamic regular expression construction.** Non-literal `RegExp(pattern)` and `new RegExp(pattern)` calls now surface as `dynamic-regex` security candidates with CWE-1333 metadata, while literal patterns stay quiet and regex-pattern complexity analysis remains separate. (Closes [#896](https://github.com/fallow-rs/fallow/issues/896).)
+- **`fallow security` now detects source-backed secrets or PII reaching logs.** The tainted-sink catalogue now treats `console.log` / `console.error` / `console.warn` / `console.info` / `console.debug` and common `logger.*` / `log.*` calls as CWE-532 candidates only when the logged argument traces to a known source such as `process.env` or HTTP request body, query, or params data. Plain literal logs and source-free variables stay quiet, and redaction-library awareness remains out of scope for agent verification. (Closes [#876](https://github.com/fallow-rs/fallow/issues/876).)
+- **`fallow security` now flags `jsonwebtoken` verification calls without an explicit algorithm allowlist.** `jwt.verify(token, key)` and options objects missing `algorithms` now produce the `jwt-verify-missing-algorithms` candidate, gated to proven `jsonwebtoken` imports. Static TypeScript wrappers such as `as const` preserve object-key detection; calls with `{ algorithms: [...] }`, local lookalike `verify` functions, and object options with spread or non-static keys stay quiet unless the extractor can prove the key is absent. (Closes [#898](https://github.com/fallow-rs/fallow/issues/898).)
+- **`fallow security` now flags disabled TLS certificate validation.** The security catalogue now reports CWE-295 candidates for Node HTTPS/TLS option objects and HTTPS agents that set `rejectUnauthorized: false`, plus the exact `process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0"` assignment. Same-named local helpers without Node provenance and safe values such as `rejectUnauthorized: true` stay quiet, and findings remain opt-in candidates for agent verification. (Closes [#895](https://github.com/fallow-rs/fallow/issues/895).)
+- **`fallow security` now detects literal-backed sink candidates for deterministic security smells.** The security catalogue can now opt into literal capture for high-signal rows, including wildcard `postMessage` origins, permissive CORS credentials, insecure cookie options, weak crypto algorithms, string-code execution, JWT `alg: "none"`, token-context `Math.random()`, and cloud metadata host literals. Existing non-literal sink rows keep their conservative default behavior, and findings remain opt-in candidates for agent verification. (Closes [#875](https://github.com/fallow-rs/fallow/issues/875).)
+- **`fallow security` now detects Vite `import.meta.env` secret reads in client bundles.** The existing `client-server-leak` candidate rule previously modeled non-public `process.env` reads but missed equivalent static `import.meta.env.SECRET` reads, so Vite client-boundary paths could look clean. Static `import.meta.env.<NAME>` reads now feed the same opt-in candidate flow, while public-by-convention names such as `VITE_*` remain quiet. Computed env reads stay out of scope, and findings remain candidates for agent verification. (Closes [#877](https://github.com/fallow-rs/fallow/issues/877).)
+- **The VS Code Security Candidates view now groups candidates and shows blind-spot counts.** Security candidates now appear under collapsible kind / CWE category groups with per-group counts, so large scans are easier to scan. Non-zero unresolved import-edge and sink-site counters now render as an informational row in the populated view, preserving the unverified-candidate framing instead of implying a clean result. (Closes [#993](https://github.com/fallow-rs/fallow/issues/993).)
+- **pnpm workspace dependencies imported through symlinked workspace packages are now credited when analyzing a package directly.** Running `fallow dead-code --root packages/consumer` on a pnpm monorepo could report an imported `workspace:*` dependency as unused when the package export resolved to TypeScript source in a sibling workspace. Fallow now preserves dependency usage for valid bare package imports even when resolver canonicalization follows the `node_modules` symlink outside the selected root, while unrelated unused dependencies still report. Thanks [@alvis](https://github.com/alvis) for the report. (Closes [#1008](https://github.com/fallow-rs/fallow/issues/1008).)
+- **Prose `import("...")` examples inside JSDoc comments no longer create false unresolved-import findings.** JSDoc import-type extraction now only follows `import("...")` references inside type-bearing brace groups, so a documentation example such as `@example import("./foo")` in a comment is left alone, while real annotations (`@type`, `@returns`, `@satisfies`, `@template`, `@enum`) keep resolving. Thanks [@jsgoldman](https://github.com/jsgoldman) for the patch in [#1010](https://github.com/fallow-rs/fallow/pull/1010).
+
+- **`fallow workspaces --format json` is now part of the generated output contract.** The VS Code workspace picker previously relied on hand-maintained TypeScript interfaces for the workspaces JSON shape, so the Rust output and extension expectations could drift silently. The workspaces output now has Rust-owned schema definitions, participates in `docs/output-schema.json`, and regenerates through the same VS Code and npm `fallow/types` contract pipeline as the other editor-consumed outputs. (Closes [#991](https://github.com/fallow-rs/fallow/issues/991).)
+- **User-facing messages now name the canonical `fallow dead-code` command instead of the deprecated `check` alias.** The `fallow fix` content-changed and low-confidence skip notes, the `fallow migrate` glob-engine caveat, the regression-baseline regenerate hint, and the `fix_preview` / `fix_apply` MCP tool descriptions previously told you to run `fallow check`, which already prints a deprecation warning. They now consistently reference `fallow dead-code`. The `check` alias keeps working unchanged.
+
+## [2.89.0] - 2026-06-05
+
+### Fixed
+
+- **JSDoc prose examples no longer create false unresolved imports.** JSDoc import-type extraction now only follows `import("...")` expressions inside type-bearing braces, so examples such as `await import("./x")` or object-literal loader snippets in `@example` comments are treated as documentation rather than real type imports. Real annotations such as `@type {import("./types").Foo}` and multiline `@returns { import("./types").Foo }` keep working. Thanks [@jsgoldman](https://github.com/jsgoldman) for the patch. (Refs [#1010](https://github.com/fallow-rs/fallow/pull/1010).)
+- **Framework template HTML injection sinks now appear in `fallow security`.** Non-literal Svelte `{@html ...}`, Vue `v-html="..."`, and Angular `[innerHTML]="..."` bindings now feed the existing `dangerous-html` security candidate flow with source spans on the template or component file. Literal bindings stay quiet, and no new output schema is introduced. Thanks [@BartWaardenburg](https://github.com/BartWaardenburg) for the report. (Closes [#883](https://github.com/fallow-rs/fallow/issues/883).)
+- **Pino transport targets now credit their runtime dependency packages.** Projects using `pino({ transport: { target: 'pino-pretty' } })` or the same target inside a simple conditional no longer see the transport package reported as an unused dependency. Fallow now records statically visible Pino transport `target` strings as runtime package references while keeping unrelated unused dependencies reportable. Thanks [@MathieuSchaff](https://github.com/MathieuSchaff) for the report. (Closes [#954](https://github.com/fallow-rs/fallow/issues/954).)
+- **Package path resolution now credits the referenced dependency packages.** Build scripts that resolve package roots or package manifests, such as `resolveModuleDir("ffmpeg-static")` or ``require.resolve(`${packageName}/package.json`)`` with static package values, no longer report those packages as unused dependencies. Fallow keeps the detection conservative: arbitrary dynamic strings and unrelated package subpaths are still ignored, and unrelated unused dependencies still report. Thanks [@BartWaardenburg](https://github.com/BartWaardenburg) for the report. (Closes [#952](https://github.com/fallow-rs/fallow/issues/952).)
+- **Constructor-rooted fluent chains now treat `: this` methods as self-returning.** Previously `unused-class-members` could report later methods in a chain such as `new OptionBuilder().addDefault().addFromConfig().addFromCli().build()` when the intermediate methods declared TypeScript's polymorphic `this` return type and returned through a helper call. Fallow now honors the declared `this` return contract when validating constructor-rooted fluent chains, while still requiring every intermediate method to be proven self-returning. Thanks [@BartWaardenburg](https://github.com/BartWaardenburg) for the report. (Closes [#953](https://github.com/fallow-rs/fallow/issues/953).)
+- **The VS Code extension now gives clean analysis runs a clearer all-clear.** Previously `Fallow: Run Analysis` ended with only `Fallow: no issues found`, even when users wanted to know what was actually checked, and the existing diagnostic mute manager was only discoverable if they knew the command name. Clean runs now say the all-clear applies to analyzed JS/TS files, record a short dead-code and duplication summary in the Fallow output channel, and offer to open that channel. Duplicate-code-only findings no longer collapse into the all-clear path, and the Fallow sidebar now exposes the diagnostic mute manager from the analysis view title bars.
+- **The VS Code status-bar license indicator no longer shows on machines without a license.** Previously the Fallow license badge appeared for everyone by default (a neutral `Fallow License` placeholder, or `Fallow: no license` once a check ran), surfacing license UI to users who never had a license. The indicator is now created only when license material is actually present (an active, in-grace, or expired license found via `$FALLOW_LICENSE`, `$FALLOW_LICENSE_PATH`, or `~/.fallow/license.jwt`, checked locally with no `fallow` call on startup); a machine that never had a license shows nothing at all. Activating a license makes the badge appear without a reload, and deactivating it hides the badge. `fallow.license.showStatusBar` still turns the indicator off entirely. The `expired` badge was already limited to machines that had a license, so it is unchanged.
+- **Bun test files discovered by `bun test` are now treated as test entry points.** The Bun plugin previously kept `bunfig.toml` preloads reachable but did not model Bun's default test filename discovery, so projects had to add manual `entry` workarounds for files such as `test/**/*.test.ts`. Fallow now marks Bun's documented `*.test`, `*_test`, `*.spec`, and `*_spec` js/jsx/ts/tsx patterns as test entry points when the Bun plugin is active, and `[test].root` scopes those defaults when present. Existing top-level and `[test] preload` handling is unchanged. Thanks [@BartWaardenburg](https://github.com/BartWaardenburg) for the report. (Closes [#951](https://github.com/fallow-rs/fallow/issues/951).)
+- **TanStack Router route files no longer appear as duplicate `Route` exports.** Route modules are required to export framework contract names such as `Route`, including custom route directories, lazy route files, route-file ignore settings, virtual route config, and nested route dirs referenced by `routeTree.gen.*`. `duplicate-exports` now skips those contract exports only when the file matches TanStack Router's route rules or is referenced by the generated route tree, while ordinary duplicate `Route` exports outside route files still report. Thanks [@BartWaardenburg](https://github.com/BartWaardenburg) for the report. (Closes [#947](https://github.com/fallow-rs/fallow/issues/947).)
+- **Nuxt UI script-side icon strings now credit their declared Iconify collection packages.** Previously a package such as `@iconify-json/simple-icons` could be reported as unused when the only static reference was in Vue script navigation data like `icon: 'i-simple-icons-github'`; users had to suppress the dependency even though Nuxt UI resolves it at build time. Fallow now extracts static Vue SFC `icon` object properties with Nuxt UI `i-<collection>-<icon>` values and resolves them against declared `@iconify-json/*` packages with longest-prefix matching, so the intended collection is credited without broad arbitrary string matching. Template-style Iconify strings such as `name="jam:github"` continue to work as before. Thanks [@BartWaardenburg](https://github.com/BartWaardenburg) for the report. (Closes [#955](https://github.com/fallow-rs/fallow/issues/955).)
+- **Playwright `webServer.command` template literals now credit `pnpm exec` CLI packages.** Before, command strings such as ``pnpm build && pnpm exec srvx --port ${PORT}`` were skipped when written as template literals, so `srvx` could still report as an unused dev dependency even though Playwright starts it for e2e tests. After, the Playwright plugin recovers static command text from template literals when it can preserve shell token boundaries, then sends the command through the existing script parser, so `pnpm exec srvx` credits `srvx` without changing direct command handling or package-manager script delegation. (Closes [#956](https://github.com/fallow-rs/fallow/issues/956).)
+- **Opt-in telemetry now measures whether an analysis actually found anything, which workflow ran, and whether a run came through the MCP server.** Three accuracy gaps in the coarse, allowlisted telemetry payload are closed. (1) A new optional `findings_present` field reports whether an analysis surfaced any findings, decoupled from the exit-code gate; previously `fallow dupes` always reported `outcome: "success"` under its default config (the default duplication threshold never gates), so duplication was invisible in aggregate even at 100%. (2) `fallow impact`, `fallow security`, `fallow fix`, and `fallow explain` each now emit a distinct `workflow` value instead of collapsing into the `unknown` catch-all, so per-command usage is answerable. (3) MCP tool calls are now attributed to the `mcp` integration surface with a per-tool `mcp_tool` dimension instead of looking like any other `cli_json` run; the MCP server tags the spawned CLI process (`FALLOW_INTEGRATION_SURFACE`, `FALLOW_MCP_TOOL`), so a single, correctly-labeled event is emitted with the same privacy posture and consent model as the CLI. The new fields are optional and additive (telemetry stays off by default and allowlisted; no paths, names, or source). In-process surfaces (LSP, VS Code, N-API, programmatic) still emit no telemetry and are documented as such. (Closes [#972](https://github.com/fallow-rs/fallow/issues/972), [#973](https://github.com/fallow-rs/fallow/issues/973), [#974](https://github.com/fallow-rs/fallow/issues/974).)
+- **The language server no longer balloons in memory on projects that use dynamic-import patterns.** When a file contained `` import(`./${x}`) `` or `` require(`./${x}`) `` style dynamic imports, the module-graph builder credited every matched target file once per pattern. A file holding many such patterns over a large source tree accumulated a number of internal graph symbols (and their references) proportional to patterns times files, which on large React Native / Expo codebases could drive `fallow-lsp` into tens of GB of RAM. Each distinct target is now credited at most once per importing file. Reachability and analysis output are unchanged (the duplicate symbols were redundant), and recursive cross-directory matching is preserved. Thanks [@ReallyFloppyPenguin](https://github.com/ReallyFloppyPenguin) for the detailed report. (Closes [#963](https://github.com/fallow-rs/fallow/issues/963).)
+- **The language server now analyzes a monorepo once instead of once per workspace package.** Previously `fallow-lsp` re-ran the full analysis pipeline for the workspace root and again for every discovered sub-package, so overlapping source files were walked once per package and the per-package results accumulated before being deduplicated. The single root pass already walks the whole tree and is workspace-aware (it applies each package's plugin and script configuration), so total analysis work no longer scales with the number of packages. This also brings the editor in line with the CLI: a sub-package analyzed in isolation cannot see cross-package usage and could surface false-positive `unused-export` findings, which the single-root pass resolves. A sub-package's own `.fallowrc.json` still applies when that package folder is opened directly as the editor workspace. (Closes [#971](https://github.com/fallow-rs/fallow/issues/971).)
+- **`fallow audit` now reclaims base-snapshot worktree caches whose directory was deleted out from under git.** When an external cleanup process (a `$TMPDIR` reaper, a container restart, a CI cache eviction) removed a reusable base-snapshot worktree directory but left git's admin entry behind, that entry lingered indefinitely as a `prunable` row in `git worktree list`. The age-based sweep keyed only on the `.last-used` sidecar (which survives next to the deleted directory), so it never reclaimed these orphans. The sweep now also detects entries whose directory is gone and reclaims them eagerly, lock-guarded against a concurrent rebuild, on every audit run. This reclaim runs even when age-based GC is disabled (`audit.cacheMaxAgeDays = 0` / `FALLOW_AUDIT_CACHE_MAX_AGE_DAYS=0`), so dead admin entries no longer accumulate.
+- **Clicking a "N references" Code Lens in VS Code no longer throws an error.** The lens routed to the built-in `editor.action.showReferences` with the language server's JSON arguments (a string URI, a plain position, plain locations), which VS Code rejects with "argument does not match one of these constraints" because that command validates its arguments by type. The lens now routes through a `fallow.showReferences` command in the extension that converts the arguments into the expected `Uri` / `Position` / `Location` values before delegating to the built-in, so the references panel opens as expected. Requires the matching `fallow-lsp` build.
+- **Every file in a circular dependency now gets its own squiggly, anchored under the import that closes the cycle.** Previously the language server placed a single diagnostic on the first file of the cycle, and its "related" links pointed at line 0 of the other members, so standing in a file that was part of a cycle showed nothing and the one marker that did appear did not point at any real import. Now each participating file is marked at the exact import statement that points to the next file, the message rotates to read from the file you are in (standing in `b` of `a → b → c → a` reads `Circular dependency (3 files): b → c → a → b`), and the related links jump to each other hop's real location. Every per-file marker carries a shared cycle id in `Diagnostic.data` so editors and agents can fold the N markers back into one cycle, and suppressing the cycle on any one member (`// fallow-ignore-file circular-dependency`) still clears all of them. The JSON output gains an additive, optional `edges[]` array on each `circular_dependencies[]` entry (one `{ path, line, col }` per hop); it is always emitted by this version but is not required in the schema, so existing consumers and historical baseline files are unaffected. Requires the matching `fallow-lsp` build.
+
+### Added
+
+- **`fallow health` can now explain WHY a function is complex, line by line, and the VS Code extension shows it inline in the editor.** Previously fallow reported only the aggregate cyclomatic, cognitive, and CRAP numbers; you could see that a function scored high but not which constructs drove it. A new `fallow health --complexity-breakdown` flag adds a `contributions[]` array to each complexity finding in `--format json`, with one entry per decision point (each `else if`, nested `if`, `&&` / `||` / `??`, loop, `case`, `catch`, ternary, optional-chain, ...) carrying its source line, the metric it adds to (cyclomatic or cognitive), its weight, and the nesting depth. The VS Code extension renders this inline: a dim `+N` marker after each contributing line, a hover listing the per-kind breakdown, and a CRAP explanation on the function signature line (for example `CRAP 420: cyclomatic 20, untested (0% covered). Full test coverage would bring CRAP down to 20.`). New settings: `fallow.complexity.breakdownEnabled` (default on), `fallow.complexity.afterText` (the inline tier, default on, hover-only when off), and `fallow.complexity.decorationCap` (how many findings to decorate, default 200, decoupled from the Health tree's `topFindings`). The MCP `check_health` tool gains a matching `complexity_breakdown` param so agents can pinpoint refactor targets. The breakdown is off by default in CLI/CI output (existing JSON, SARIF, and markdown are unchanged) and is computed during the existing single complexity pass at no measurable analysis cost. One-time note: the incremental cache is invalidated on upgrade (cache version bump), so the first run after upgrading re-parses the project once.
+- **`fallow health` can now import change history from a file, so hotspots, ownership, and bus-factor work without git.** Projects on a non-git VCS (Yandex Arc, Mercurial, Perforce) previously saw "hotspot analysis skipped: no git repository found". A new global `--churn-file <path>` flag accepts a normalized `fallow-churn/v1` JSON document (`{ "schema": "fallow-churn/v1", "events": [{ "path", "timestamp", "author", "added", "deleted" }] }`), one entry per changed file per commit, which a small wrapper produces from your VCS log. fallow then runs all the usual recency-weighting, trend, and ownership logic on the imported events unchanged, so `--hotspots`, `--ownership`, and `--targets` light up. The flag resolves relative to `--root`, wins over git when both are present, and is exposed on the MCP `check_health` tool as `churn_file`. The import is authoritative for the analysis window, so `--since` only labels output and does not filter imported events; the header reads "since imported churn". Timestamps are unix seconds (a millisecond value is rejected with exit 2), and a malformed file is a loud hard error rather than a silent skip. Scope: this powers the churn-backed health signals only; `audit`, `impact`, and `--changed-since` still require git because they need the base revision's tree, not just history. Thanks [@albion9919](https://github.com/albion9919) for the request. (Closes [#980](https://github.com/fallow-rs/fallow/issues/980).)
+- **Local human runs can now nudge stale fallow installs toward the changelog.** On successful human output with both stdout and stderr attached to a TTY, fallow reads a user-global cached latest-version answer and prints one concise stderr hint when the running stable version is behind. The hint names its own opt-out inline (`silence: FALLOW_UPDATE_CHECK=off`) since, unlike the one-time telemetry note, it repeats until you upgrade. Machine formats, quiet runs, CI, and non-TTY agent paths stay byte-identical. The background refresh is best-effort, uses `api.fallow.cloud`, is throttled, and is suppressed by `DO_NOT_TRACK`, `FALLOW_TELEMETRY_DISABLED`, or `FALLOW_UPDATE_CHECK=off`. (Refs [#978](https://github.com/fallow-rs/fallow/issues/978).)
+- **The VS Code extension now exposes every duplication knob used by sidebar analysis.** The settings page now includes `fallow.duplication.minTokens`, `minLines`, `skipLocal`, `crossLanguage`, and `ignoreImports`, alongside the existing mode, threshold, and minOccurrences controls. The bare `fallow` command gains matching combined-mode flags (`--dupes-min-tokens`, `--dupes-min-lines`, `--dupes-skip-local`, `--dupes-cross-language`, and `--dupes-ignore-imports`) so the extension can apply those settings without requiring a config-file edit. Older resolved CLIs still degrade through the existing version-gated retry path instead of failing the whole sidebar run. Thanks [@BartWaardenburg](https://github.com/BartWaardenburg) for the report. (Closes [#909](https://github.com/fallow-rs/fallow/issues/909).)
+- **`fallow security` recognizes more dangerous-sink categories.** The `tainted-sink` catalogue gained candidate categories surfaced only under `fallow security`: dynamic module loading (`require(nonLiteral)`), file-system path traversal, HTTP response header injection, more raw-SQL escape hatches (Prisma unsafe raw, Knex raw methods, `sequelize.literal` / `Sequelize.literal`), DOM navigation, source-backed mass assignment, additional SSRF clients, insecure randomness (`crypto.pseudoRandomBytes`), deprecated cipher constructors (`createCipher` / `createDecipher`), template escape bypass (`SafeString`), XPath injection (`xpath.select`), unsafe `Buffer.allocUnsafe` allocation, and react-native-webview injected scripts (`injectJavaScript` / `injectedJavaScript`). Each fires only on a non-literal argument, so fully-literal calls never fire, and every finding remains a candidate for verification, not a proven vulnerability. (Closes [#882](https://github.com/fallow-rs/fallow/issues/882), [#897](https://github.com/fallow-rs/fallow/issues/897).)
+- **Clone groups now carry an optional `suggested_name`.** `fallow dupes --format json` (and the `dupes` block in `fallow` / `fallow audit`) adds a best-effort `suggested_name` to each `clone_groups[]` entry: the dominant repeated identifier across the duplicated fragment (e.g. a shared `parseCsv` function), or absent when the clone has no clear dominant name. It is additive and optional, so existing consumers are unaffected; editors and agents can use it to label a clone by what it is rather than an ordinal.
+
+### Changed
+
+- **The VS Code sidebar is easier to scan.** Several rendering improvements across the Fallow views: (1) duplicate clones are now ordered by impact (total duplicated lines, i.e. size times instance count) so the largest, most-worth-extracting clone is first, and each is labeled by its dominant repeated identifier (e.g. a shared `parseCsv` function), or the representative file's basename when there is no clear name, instead of an opaque `Clone #N` ordinal; (2) every Health row now leads with the file for a consistent, scannable file column, complexity rows show `<file>:<line>` then the offending function and its metrics (`parseArgs · 24 cyc · 18 cog · CRAP 31`, full metrics on hover), hotspots and refactoring candidates lead with the file too; (3) the complexity `critical` glyph is the section's own flame icon with a per-severity color rather than an alarming red error `X`, since these are heuristic candidates, not errors; (4) file paths in every tree view middle-truncate (keeping the leading directory and the `basename:line`) instead of end-truncating away the most identifying part, with the full path always available on hover.
+
+## [2.88.3] - 2026-06-04
+
+### Fixed
+
+- **`fallow -v` through the npm package now prints the `verified:` integrity line like `--version` and `-V`.** The native binaries answer `-v` (added in 2.88.0), but the npm launcher's version-query detection only matched `--version` and `-V`, so `fallow -v` skipped the appended `verified:` status line. All three version flags now behave identically.
+- **The VS Code extension self-heals when the resolved `fallow` CLI predates the extension.** The extension and the CLI are versioned and distributed independently, so a stale global `fallow` on PATH (npm, Homebrew, cargo) could predate flags the extension emits, turning settings like `duplication.minOccurrences` into silent no-ops. Analysis and fix runs now resolve the CLI through a path that switches a too-old resolved binary to the managed download (pinned to the extension version, reused from disk when present) when auto-download is enabled, and the probed version belongs to the binary actually spawned. It never downgrades; with auto-download off the stale binary is kept and the run degrades loudly as before. (Follow-up to [#894](https://github.com/fallow-rs/fallow/issues/894).)
+- **Angular inline templates now credit members reached through `inject(InjectionToken<Interface>)` fields.** The #920 token bridge covered external `templateUrl` files, but inline `template:` strings still kept calls such as `{{ greeter.inlineGreet() }}` on the component module's extraction path and left the implementing class member reported as unused. Inline template chains now feed the same token to interface to implementer bridge as external templates, while genuinely unused members on the same implementing class still report. (Closes [#923](https://github.com/fallow-rs/fallow/issues/923).)
+- **Binary verification now gives a version-aware error instead of a bare `signature not found`.** Signed platform binaries ship in fallow 2.77.0 and later, so the GitHub Action installer and the npm wrapper can hard-fail when they verify an older resolved CLI (for example a project pinned to 2.76.0 or earlier) that has no signature and never will. The missing-signature error now distinguishes the two cases: for a version below 2.77.0 it explains the version predates signed binaries and tells you to bump the `fallow` dependency in your project's package.json to >=2.77.0 (`npm install fallow@latest`); for a 2.77.0-or-newer package whose signature is unexpectedly absent it flags possible tampering and advises reinstalling. The bypass escape hatch is no longer surfaced inline (it stays documented in SECURITY.md) so a possible-tampering case never nudges you to bypass. Verification still fails closed in both cases. Thanks [@hc-12](https://github.com/hc-12) for the report. (Closes [#944](https://github.com/fallow-rs/fallow/issues/944).)
+- **The GitHub Action's verification failure now names which version knob to turn.** A common confusion is conflating the Action ref (`uses: fallow-rs/fallow@v2.83.0`) with the resolved CLI version, which actually comes from your project's `fallow` pin, the action `version:` input, or the latest release. On a verification failure the installer now reports the installed CLI version and exactly where that version was resolved from, clarifying that the Action ref selects the Action code, not the CLI version. Refs [#944](https://github.com/fallow-rs/fallow/issues/944).
+- **`fallow --version` now reports the resolved version's signing status.** The trailing `verified:` line gains a `fallow <version> signed` / `fallow <version> unsigned (predates 2.77.0)` annotation. This is most useful when verification is skipped (`FALLOW_SKIP_BINARY_VERIFY`): a fleet can confirm in one command whether a pinned version is even signable, without triggering a failure. Refs [#944](https://github.com/fallow-rs/fallow/issues/944).
+
+### Changed
+
+- **The release now fails if any platform npm tarball is missing a file it declares, or ships an unsigned binary.** npm silently drops a `files` whitelist entry that has no matching file on disk, so a broken signature-staging step could publish a `@fallow-cli/<platform>` package without its `fallow.sig` siblings (the exact shape that breaks the Action installer). A new release-time gate inspects each packed tarball against its own declared `files`, and independently requires every binary in a CLI platform package to have a `.sig` sibling, aborting the publish if either check fails. Refs [#944](https://github.com/fallow-rs/fallow/issues/944).
+
+## [2.88.2] - 2026-06-03
+
+### Fixed
+
+- **The VS Code extension's "binary in PATH is vX" version-mismatch warning no longer reports a bogus version.** `fallow-lsp` (and `fallow-mcp`) did not handle `--version`: they started their stdio server, hit end-of-input, and exited with no output. The extension's version probe therefore got nothing back from the language server, and its parser then accepted any number-shaped token from the surrounding output, so an unrelated value (a Node banner such as `Node.js v22.22.1`, a digit in a sentinel path, or the npm launcher's appended `verified:` line) could surface as a warning like "binary in PATH is v22.22.1". The language server and MCP server now answer `--version` / `-V` / `-v` with their real version, and the extension only accepts a version in fallow's own `<binary> <version>` format (otherwise it treats the version as unknown rather than guessing). Thanks [@melroy89](https://github.com/melroy89) for the screenshot that surfaced it.
+
+## [2.88.1] - 2026-06-03
+
+### Fixed
+
+- **Angular external templates now credit members reached through `inject(InjectionToken<Interface>)` fields.** A component field `readonly greeter = inject(GREETER)`, where `GREETER` is a `new InjectionToken<Greeter>(...)` and a project class `implements Greeter`, previously left that class's methods reported as unused when their only reference was a template call like `{{ greeter.greet() }}`. The previous fix only covered injecting a concrete class. Fallow now records the token's interface type argument and credits the accessed member on every class implementing that interface, covering both the untyped (`inject(GREETER)`) and interface-typed (`greeter: Greeter = inject(GREETER)`) field forms. The extraction cache version is bumped so warm caches re-extract affected files once. Thanks [@OmerGronich](https://github.com/OmerGronich) for the report. (Closes [#920](https://github.com/fallow-rs/fallow/issues/920).)
+- **The VS Code extension no longer fails its analysis against an older resolved `fallow` CLI.** The extension and the CLI it runs are versioned and resolved independently (PATH, `node_modules/.bin`, the managed download, or a deliberately pinned binary), so a freshly updated extension could drive an older CLI. The sidebar passed `--dupes-min-occurrences` unconditionally, which only exists in CLI v2.88.0+, so an older binary aborted the whole run with an "unexpected argument" error. The extension default for that setting (`2`) is also the CLI default, so it was a no-op that broke older binaries for no benefit. The extension now omits the flag at the default, probes the resolved CLI version once and drops version-gated flags an older CLI cannot accept, and as a backstop strips a rejected known flag and retries instead of failing. A single warning per session (shared with the existing language-server version-mismatch notice) points at the skew, with per-run detail in the Fallow output channel. Thanks [@melroy89](https://github.com/melroy89) for the report. (Regression from [#894](https://github.com/fallow-rs/fallow/issues/894).)
+
+## [2.88.0] - 2026-06-03
+
+### Added
+
+- **The duplication `minOccurrences` threshold is now reachable from the bare `fallow` command and the VS Code extension.** Raising the rule-of-three threshold previously required editing the config file or running the standalone `fallow dupes` subcommand. A new global `--dupes-min-occurrences N` flag now applies in combined mode (validated `>= 2`, falling back to the config value), and the VS Code extension gains a `fallow.duplication.minOccurrences` setting that forwards it. The neighbouring `fallow.duplication.threshold` extension setting was also mislabeled: it is a duplication-percentage failure cap where `0` means no limit, not a minimum line count, and it defaulted to `5`. Its description is corrected and its default aligned to `0` to match the CLI. (Closes [#894](https://github.com/fallow-rs/fallow/issues/894). Thanks [@rbalet](https://github.com/rbalet) for the report.)
+- **Lowercase `-v` now prints the version.** `fallow -v`, `fallow -V`, and `fallow --version` all print the version string. Previously only `-V` and `--version` worked (clap's default). Lowercase `-v` is what the TS/JS toolchain uses for the version (node, npm, pnpm, yarn, bun, tsc), so it is now the primary short form, with `-V` kept for back-compat. (Closes [#916](https://github.com/fallow-rs/fallow/issues/916). Thanks [@rbalet](https://github.com/rbalet) for the report.)
+
+### Fixed
+
+- **Root-relative HTML assets under `public/` no longer report as unresolved or unused.** When a real HTML entry references browser-root assets such as `/js/key.pressed.js` or `/style/index.css`, resolution now tries the existing document-root candidates first, then falls back to `<root>/public/...` for HTML importers only. JS/TS root-relative imports keep their existing behavior, and genuinely missing public assets still report as unresolved. Thanks [@cope](https://github.com/cope) for the report. (Closes [#915](https://github.com/fallow-rs/fallow/issues/915).)
+- **The VS Code extension now backfills its managed `fallow` CLI binary.** First-run binary acquisition now targets the GitHub release tag matching the extension version, downloads both `fallow-lsp` and `fallow` when needed, and lets sidebar analysis or fix commands download only the missing CLI if an LSP binary is already available. Failed managed downloads offer retry, settings, and output-channel actions, and changing `fallow.autoDownload` restarts binary resolution. Thanks [@rbalet](https://github.com/rbalet) for the report. (Closes [#917](https://github.com/fallow-rs/fallow/issues/917).)
+- **Angular external templates now credit service members reached through untyped `inject()` component fields.** Exported Angular component classes now carry `ClassHeritageInfo.instance_bindings` for properties initialized with named-import `inject(Service)` or an alias such as `inject as ngInject`, so external templates like `{{ exampleService.onValueChange() }}` mark the target service member as used. Same-named `inject` functions from non-Angular modules stay ignored. Thanks [@OmerGronich](https://github.com/OmerGronich) for the report. (Closes [#911](https://github.com/fallow-rs/fallow/issues/911).)
+- **Bare `pnpm <binary>` script invocations now credit declared dependencies.** Scripts and CI commands such as `pnpm envinfo --system` now mark the matching declared package as used, while local script shorthands (`pnpm build`) and pnpm built-ins (`pnpm install`, `pnpm audit`, `pnpm add`, `pnpm test`, `pnpm start`) remain ignored. Thanks [@cope](https://github.com/cope) for the report. (Closes [#914](https://github.com/fallow-rs/fallow/issues/914).)
+- **Class members used through local structurally typed function parameters are no longer reported as unused.** When a concrete class instance is passed directly as `new Class()` or via a constructor-bound local into a same-file function whose typed parameter reads specific members, fallow now credits only those concrete class members. The fix stays scoped to local callees and exact argument positions, so unrelated class members still report. The extraction cache version is bumped so warm caches re-extract affected files once. Thanks [@palisarbaro](https://github.com/palisarbaro) for the report. (Closes [#910](https://github.com/fallow-rs/fallow/issues/910).)
+
+## [2.87.0] - 2026-06-03
+
+### Added
+
+- **`fallow security` now models untrusted sources to sharpen tainted-sink candidates.** Beyond the non-literal-argument trigger, the analyzer recognizes a catalogue of untrusted sources (`req.query` / `req.params` / `req.body`, route parameters, `process.argv`, `message`-event / WebSocket / worker payloads via `event.data`, and `fetch()` responses) and performs a lightweight backward walk from a sink argument to a source within the same function. A candidate whose sink argument traces back to an untrusted source is a stronger candidate, while values derived only from constants or config no longer fire on the source axis. This approximates taint without a full inter-procedural data-flow engine: detection stays deterministic and syntactic, and findings remain candidates for downstream verification, not proven exploits. (Closes [#859](https://github.com/fallow-rs/fallow/issues/859).)
+- **Security candidates are now ranked by reachability from entry points.** `fallow security` reuses the module graph to weight candidates that sit on a path reachable from an entry point (HTTP route handlers, request entry points) above candidates in one-off scripts or isolated helpers, turning a flat list into a prioritized one. Dependency / advisory concerns and authorization-logic reasoning stay out of scope. (Closes [#860](https://github.com/fallow-rs/fallow/issues/860).)
+- **Framework-aware security sinks now feed the catalogue via the plugin system.** Per-framework sink idioms are recognized with higher precision: React `dangerouslySetInnerHTML`, Angular `bypassSecurityTrust*` (`Html`, `Script`, `Style`, `Url`, `ResourceUrl`), and DOM sinks such as `document.write` and jQuery-style `.html()`. The active framework plugin contributes its sink rows, so framework-specific shapes are covered without over-firing generic patterns. Framework authorization logic remains out of scope. (Closes [#861](https://github.com/fallow-rs/fallow/issues/861).)
+- **The data-driven CWE catalogue gains five deterministic categories.** `fallow security` adds prototype pollution (CWE-1321, recursive merge or computed write into `__proto__`), zip-slip / tar path traversal on archive extraction (CWE-22), NoSQL injection (CWE-943, a user object flowing into a query operator), server-side template injection (CWE-1336), and XML external entity expansion (CWE-611). Each is a single catalogue row with a conservative non-literal trigger; fallow continues to prefer false-negatives over false-positives. SCA / advisory feeds remain out of scope. (Closes [#862](https://github.com/fallow-rs/fallow/issues/862).)
+- **`fallow-mcp` now exposes `security_candidates` for agent-readable local security candidates.** The read-only tool wraps `fallow security --format json --quiet` and returns the existing security JSON envelope, including `kind: "security"`, `security_findings`, category, CWE, evidence, structural trace, and blind-spot counters. It deliberately frames results as unverified candidates, not confirmed vulnerabilities, and tells agents to verify trace and evidence before editing code. The MCP params expose only scope and performance knobs: `root`, `config`, `workspace`, `changed_since`, `changed_workspaces`, `no_cache`, and `threads`; SARIF, CI, baseline, summary, failure, and fix behavior stay on the CLI. (Closes [#864](https://github.com/fallow-rs/fallow/issues/864).)
+
+### Fixed
+
+- **`fallow security` now suppresses more sanitized sink candidates without weakening the candidate framing.** DOMPurify-backed HTML suppression now shares a domain-scoped sanitizer model with new literal-allowlist URL guards and `path.relative` containment guards, so allowlisted redirects, allowlisted outbound URLs, and contained path values no longer report as tainted-sink candidates. Near misses still report: mutable allowlists, helper predicates, guards after route file use, plain `startsWith(base)` path checks, and sanitizer use in the wrong domain remain candidates. The extraction cache version is bumped so warm caches re-extract affected files once. (Closes [#863](https://github.com/fallow-rs/fallow/issues/863).)
+- **Security sink candidates in Vue and Svelte single-file components now point at the real source line.** Sink extraction reused parser-local byte offsets after the surrounding SFC source had been restored for line lookup, so reports pointed at a line inside the isolated script body instead of the component file. Captured sink spans are now remapped through the same SFC offset translation used for imports, exports, and other extracted references, with a Vue `script setup` regression test pinning the resolved span.
+- **Firebase Messaging service workers are no longer reported as unused files.** The Firebase plugin activates on the exact `firebase` dependency and keeps both root and nested `public/firebase-messaging-sw.js` files reachable, while unrelated public files still report normally. Thanks [@rbalet](https://github.com/rbalet) for the report. (Closes [#873](https://github.com/fallow-rs/fallow/issues/873).)
+- **Ionic Angular page lifecycle methods are no longer reported as unused class members.** The new Ionic plugin activates on `@ionic/angular`, keeps `ionic.config.json` reachable, treats common Ionic CLI packages as tooling dependencies, and credits the documented Angular page lifecycle methods `ionViewWillEnter`, `ionViewDidEnter`, `ionViewWillLeave`, and `ionViewDidLeave`. Ionic invokes these methods by name through its Angular router outlet, with or without the optional TypeScript lifecycle interfaces. Other `ionView*` typos still report as unused. Thanks [@rbalet](https://github.com/rbalet) for the report. (Closes [#868](https://github.com/fallow-rs/fallow/issues/868).)
+- **Angular Material Sass entrypoints no longer report as unresolved or unused.** External Sass package entrypoints such as `@use "@angular/material" as mat;` can resolve through the package `sass` export and then follow package-local relative `@use` / `@forward` imports with Sass partial, extension, and index lookup. Thanks [@rbalet](https://github.com/rbalet) for the report. (Closes [#871](https://github.com/fallow-rs/fallow/issues/871).)
+- **The VS Code sidebar now switches from a search icon to a reload icon after analysis has loaded.** The initial sidebar action still uses the search icon for first-run analysis, but once results exist the title action becomes `Fallow: Reload Analysis` with the refresh icon, making it clearer that the button reruns the analysis instead of searching within findings. Thanks [@rbalet](https://github.com/rbalet) for the report. (Closes [#869](https://github.com/fallow-rs/fallow/issues/869).)
+- **Methods on a `useMemo`-bound class instance are no longer reported as unused.** A service instantiated through React's `useMemo` factory (`const svc = useMemo(() => new ClipsService(), [deps]); svc.analyze()`) left `ClipsService.analyze` reported as an `unused-class-member`, because the non-destructured binding was not tracked (only the array-destructured `useState` form was). `useMemo` returns the factory's product directly, so fallow now binds the identifier to the constructed class and credits method calls on it. Scoped to `useMemo` / `React.useMemo`: tuple-returning hooks like `useState` and arbitrary wrappers are intentionally not bound from the non-destructured form, and genuinely-unused members on the same class still report. The extraction cache version is bumped, so warm caches re-extract affected files once on upgrade. (Closes [#844](https://github.com/fallow-rs/fallow/issues/844).)
+- **Packages nested under a bare grouping directory are now discovered as workspaces.** When a root `package.json` declares a single-level workspace glob such as `"workspaces": ["packages/*"]` but a real package lives two levels deep (`packages/themes/my-theme/package.json`, where `packages/themes` itself has no `package.json`), the glob matched only the bare `packages/themes` directory, so the deep package was never discovered. Its source files fell back to the root manifest and every dependency it correctly declared (for example `react`) was reported as an `unlisted-dependency`. Workspace discovery now descends one level into a glob-matched directory that has no `package.json` of its own and recovers any immediate child that is a real, named package, so its files are attributed to its own manifest. Recovery is conservative: children in the conventional skip list (`node_modules`, build output, caches, hidden directories), paths matched by your `ignorePatterns` (a reliable opt-out), and manifests without a `name` are ignored, so fixtures, build artifacts, and `__mocks__` manifests are not treated as workspaces. Descent is one level only; deeper `packages/<group>/<sub>/<pkg>` layouts should use a recursive (`**`) glob. Note this is a behavior change beyond `unlisted-dependencies`: a nested package previously attributed to the root manifest is now its own workspace, so its files also participate in `unused-files`, `unused-exports`, architecture-boundary checks, and internal-dependency crediting. (Closes [#842](https://github.com/fallow-rs/fallow/issues/842).)
+
+## [2.86.0] - 2026-06-02
+
+### Added
+
+- **`fallow security` now ships local code-level security candidates across 9 CWE categories via a data-driven matcher catalogue.** Beyond the original `client-server-leak` class, fallow now flags syntactic sink-site candidates for dangerous HTML (CWE-79), OS command injection (CWE-78), code injection (CWE-94), SQL injection (CWE-89), server-side request forgery (CWE-918), path traversal (CWE-22), open redirect (CWE-601), runtime-selectable crypto algorithms (CWE-327), and unsafe deserialization (CWE-502). These are candidates for downstream agent verification, not verified vulnerabilities: detection is deterministic and syntactic, never taint-proof. A candidate fires only when the relevant argument is non-literal, so a fully-literal value (`el.innerHTML = "<b>x</b>"`, `child_process.exec("ls")`) is never flagged; fallow prefers false-negatives over false-positives. Node-specific sinks are provenance-gated to their import source (command injection to `node:child_process`, code injection's `vm` form to `node:vm`, path traversal to `node:path`, runtime crypto to `node:crypto`, deserialization to `js-yaml` / `node-serialize`). The category set is a single data file with no regen step; the rule (`security-sink`) defaults to `off` and is surfaced only by `fallow security`, never under bare `fallow` or the `audit` gate. Each candidate carries its category, CWE, and a file-level suppress hint (`// fallow-ignore-file security-sink`). Sink-shaped calls fallow cannot resolve to a static callee are counted in-band, so an empty result with a non-zero count is not a clean bill. Scope which categories run with `security.categories` include / exclude lists.
+- **`fallow security`: an opt-in command that surfaces local security candidates for agent verification.** The first rule, `client-server-leak`, flags a `"use client"` file (React Server Components / Next.js client boundary) that transitively imports a module reading a non-public `process.env` secret, plus the direct case where the client file reads such a secret itself. fallow emits a structural import-hop trace to the candidate secret source; it does not prove the secret reaches the client bundle. Findings are candidates for verification, not confirmed vulnerabilities, so there is no severity-style `confidence` score, only the trace. Reads of public-by-convention env vars (`NODE_ENV`, `NEXT_PUBLIC_*`, `VITE_*`, `NUXT_PUBLIC_*`, `REACT_APP_*`, `PUBLIC_*`, `GATSBY_*`, `EXPO_PUBLIC_*`, `STORYBOOK_*`) are not treated as secrets. The command is opt-in and entirely separate from the rest of fallow: the `security-client-server-leak` rule defaults to `off`, the findings never appear under bare `fallow` or the `audit` gate, and `fallow security` is the only surface. Output is available as human, JSON, and SARIF (SARIF emits at the `note` level with no CWE so the candidate framing survives into the GitHub Security tab). Honors `--changed-since`, `--diff-file`, `--diff-stdin`, `--workspace`, `--changed-workspaces`, `--ci`, `--fail-on-issues`, `--sarif-file`, and `--summary`. Suppress a file with `// fallow-ignore-file security-client-server-leak`. Dynamic `import()` patterns the reachability scan cannot follow are reported as a counted in-band note, so an empty result with a non-zero unresolved-edge count is not a clean bill.
+
+### Changed
+
+- **JSON envelope outputs now include a top-level `kind` discriminator.** Typed `FallowOutput` roots such as `dead-code`, `dead-code-grouped`, `health`, `dupes`, `combined`, `audit`, `explain`, `impact`, coverage setup/analyze, list boundaries, and CI review envelopes can now be identified by `kind` instead of field-presence heuristics. `schema_version` is bumped to 7, and `--legacy-envelope` keeps the previous root shape for one migration cycle. `CodeClimateOutput` remains a bare array to preserve the Code Climate / GitLab Code Quality contract. The CLI `check` subcommand remains a legacy alias for `dead-code`; new JSON discriminators use the canonical `dead-code` name. (Closes [#413](https://github.com/fallow-rs/fallow/issues/413).)
+
+### Fixed
+
+- **A bare `"@"` plugin alias no longer swallows `@scope/*` npm packages.** When a config registered a path alias keyed on a bare `"@"` (e.g. `"@" -> "src"`), fallow matched the alias with a plain `starts_with("@")`, so every scoped dependency import such as `@radix-ui/react-checkbox` was routed into the alias branch, failed alias resolution, and surfaced as `unresolved-import`, which then cascaded into `unused-dependency` for the real package. The plugin-alias gate is now segment-aware (mirroring the existing `fallbacks.rs` alias matcher): a bare prefix matches only on an exact hit or a `/`-delimited continuation, so `@/foo` still resolves through the alias while `@scope/pkg` resolves as a normal npm package. (Closes [#838](https://github.com/fallow-rs/fallow/issues/838).)
+- **`declare` ambient class properties are no longer reported as unused class members.** A TypeScript class field declared with `declare` (`declare readonly __input?: I`) is a type-only annotation that emits no JavaScript and cannot be value-referenced, so it can never be a real `unused-class-member`. Fallow previously extracted these ambient properties as ordinary members, so a class that only annotated injected or framework-provided state with `declare` surfaced false unused-member findings. Ambient `declare` property definitions are now skipped during class-member extraction, while normal methods and fields on the same class are still reported when genuinely unused. (Closes [#839](https://github.com/fallow-rs/fallow/issues/839).)
+- **`new URL('./dir', import.meta.url)` directory targets no longer surface as unresolved imports.** Extending the #399 fix, an extensionless relative specifier such as `new URL('./services', import.meta.url)` or `new URL('./bin', import.meta.url)` is the standard ESM idiom for referencing an on-disk directory of assets, worker scripts, or binaries relative to a module. A bare directory has no module entry, so resolution failed and fallow reported `unresolved-import`. Extensionless `new URL(..., import.meta.url)` specifiers are now treated as speculative: when the resolver finds no module, the finding is silently dropped instead of reported. File-pointing specifiers with an extension (`./worker.js`, `./assets/foo.svg`) keep their existing behavior, so a genuinely missing file is still reported. The extraction cache version is bumped, so users on warm caches see a one-time re-extract on first run after upgrading. (Closes [#840](https://github.com/fallow-rs/fallow/issues/840).)
+- **Quoted globs in package.json scripts are now registered as entry points.** A test script using the idiomatic `node --test --import tsx 'src/**/*.test.ts'` form captured its argument as the literal `'src/**/*.test.ts'` with the surrounding single quotes intact, so the compiled entry pattern matched zero files and the test files (and their test-only helper modules) surfaced as false `unused-file` / `unused-export` findings. The script tokenizer now strips a matching pair of surrounding single or double quotes from each token, while leaving tokens with internal quotes (such as `can't`) unchanged. Unquoted globs continue to work as before. (Closes [#841](https://github.com/fallow-rs/fallow/issues/841).)
+- **NestJS lifecycle and handler methods are no longer reported as unused class members.** The `nestjs` plugin now credits the methods Nest invokes reflectively on consumer classes: `configure` on `NestModule`, the guard/interceptor/pipe/filter/middleware dispatch methods (`canActivate`, `intercept`, `transform`, `catch`, `use`) on their respective interfaces, and the five module lifecycle hooks (`onModuleInit`, `onModuleDestroy`, `onApplicationBootstrap`, `beforeApplicationShutdown`, `onApplicationShutdown`). Each rule is heritage-scoped to its Nest interface via `implements`, so an ordinary class that implements none of these interfaces still reports a genuinely unused method, and non-lifecycle methods on a Nest class are still flagged. A class that implements one lifecycle interface also has its sibling lifecycle hooks credited, matching Nest's duck-typed lifecycle dispatch. (Closes [#843](https://github.com/fallow-rs/fallow/issues/843).)
+- **A method called on a value narrowed by `instanceof` is now credited as a use of that class's member.** Code such as `if (e instanceof BaseException) { e.getMessage(); }` previously left `BaseException.getMessage` reported as an `unused-class-member`, because the call was attributed to the local `e` rather than the narrowed class. Fallow now records `instanceof <Class>` guards (including `&&`-chained guards) so method calls on the narrowed local inside the body are attributed to the class. Genuinely-unused members on the same class still report. Files are re-extracted on upgrade (cache version bump). (Closes [#845](https://github.com/fallow-rs/fallow/issues/845).)
+- **Oxlint config packages referenced through the `extends` array are no longer reported as unused dependencies.** The Oxlint plugin previously parsed top-level config imports and the `jsPlugins` array but ignored the `extends` field, so a config such as `"extends": ["@nkzw/oxlint-config"]` left its declared devDependency flagged as `unused-dev-dependency`. Package-style `extends` entries are now credited as referenced dependencies and relative/absolute entries are recorded as setup files, mirroring the existing `jsPlugins` path handling. (Closes [#846](https://github.com/fallow-rs/fallow/issues/846).)
+- **Bun `bunfig.toml` preload files are no longer reported as unused, and the Bun plugin now activates on `@types/bun`.** Two gaps combined to flag a Bun test preload file as `unused-file`: the plugin's enabler set was `bun-types` only, so a project declaring the canonical `@types/bun` types package never activated the plugin (activation reads declared `package.json` deps, not transitive `node_modules`), and even when active the plugin only marked `bunfig.toml` itself as always-used without parsing its preload arrays. The plugin now also activates on `@types/bun`, and when `bunfig.toml` is present it parses both the top-level `preload = [...]` array and the `[test] preload = [...]` array, seeding each referenced file as an entry point (normalized relative to the config file) so the files Bun loads before every run / test stay reachable. Invalid TOML and non-string entries are skipped. (Closes [#847](https://github.com/fallow-rs/fallow/issues/847).)
+- **`duplicate-export` no longer over-reports when a name-group spans unrelated packages.** A same-named export shared across packages (for example a backend `class Label` alongside a frontend `Label` value and a `type Label` alias) was previously emitted as one flat group whenever any pair in the group shared a common importer. The cross-package backend member, which shares no importer with the frontend pair, inflated the value-module count and defeated the value/type self-suppression that should have hidden the frontend pair. fallow now partitions a name-group into connected components by shared importer (two exports are connected when a third file imports both, or one imports the other) and applies value/type self-suppression and the unrelated-leaf drop per component. An isolated cross-package member is dropped as its own singleton instead of polluting a sibling component, so groups that previously surfaced only because an unrelated member crossed the suppression threshold are now correctly suppressed, while genuine within-component duplicates still report with only their connected locations. (Closes [#848](https://github.com/fallow-rs/fallow/issues/848).)
+- **Svelte markup `<script src>` tags no longer surface as unresolved imports.** Svelte treats tags such as `<svelte:head><script src="/some-lib.min.js" async></script></svelte:head>` as runtime HTML, not bundled SFC script modules. Fallow now keeps parsing the `src` metadata for span fidelity but no longer emits synthetic imports for Svelte `script src` references, so root-relative browser assets do not become false `unresolved-imports`. Vue external scripts keep their existing graph edges. Thanks [@codingthat](https://github.com/codingthat) for the report. (Closes [#835](https://github.com/fallow-rs/fallow/issues/835).)
+- **Pinia stores auto-imported by `@pinia/nuxt` are now tracked in the module graph.** Fallow now activates a Pinia plugin on `@pinia/nuxt`, scans direct store files in `stores/` and Nuxt 4 `app/stores/`, and maps value exports named `use<Name>Store` to the file that provides them. Pages that call `useUserStore()` without an import now keep `stores/user.ts` reachable and credit the matching export, while sibling helper exports can still report as unused. Nested stores and custom `storesDirs` remain out of scope for the default detector. (Closes [#740](https://github.com/fallow-rs/fallow/issues/740).)
+- **TanStack Router `routeFileIgnorePattern` warnings now call out JavaScript regex compatibility instead of treating every unsupported pattern as a user typo.** TanStack accepts JavaScript regular expressions, while fallow validates route ignore patterns with Rust's regex engine before matching route file segments. Patterns that use JavaScript-only syntax such as lookahead are still ignored during analysis so the run can continue, but the warning now names `routeFileIgnorePattern`, points at the source config file when known, and explains that the syntax is unsupported by fallow's Rust regex engine. (Refs [#513](https://github.com/fallow-rs/fallow/issues/513).)
+- **Nuxt composables and utils referenced only through script auto-imports are now tracked in the module graph.** Fallow now records unresolved value identifiers in JS/TS and Vue/Svelte script blocks, then resolves Nuxt convention exports from top-level `composables/`, `app/composables/`, `utils/`, and `app/utils/`, plus recursive `shared/utils/` and `shared/types/`, during graph build. This keeps files like `composables/useCounter.ts`, `utils/format-price.ts`, and named exports from `composables/index.ts` reachable when a page calls `useCounter()` or `formatPrice()` without an import. Local declarations, explicit imports, type-only references, and known JS/Web/Vue/Nuxt built-ins do not synthesize edges. With `autoImports: true`, component entry-pattern removal remains guarded by `components:` config, while composable/util pattern removal is separately guarded by `imports:` config. (Closes [#739](https://github.com/fallow-rs/fallow/issues/739).)
+- **`fallow health` now surfaces CRAP coverage-source consistency in JSON and lets teams tune the secondary CRAP refactor band.** CRAP source precedence is explicit (`template` inheritance first, then Istanbul data including unmatched files, then static estimates), health JSON emits `summary.coverage_source_consistency` and grouped health emits `groups[].coverage_source_consistency` whenever CRAP findings carry source data, and `health.crapRefactorBand` configures the old fixed 5-point window that adds a secondary `refactor-function` action to near-threshold CRAP-only findings. This closes the remaining JSON/config contract work from issue #474 after the human-output clarification below. (Closes [#474](https://github.com/fallow-rs/fallow/issues/474).)
+- **`fallow health` now explains whether CRAP scores are estimated or sourced from Istanbul coverage in the high-complexity output.** Previously the main human section showed values like `650.0 CRAP` without saying whether they came from real coverage or the static export-reference estimate, and the file-score hint told users to pass a bare `--coverage` flag. The complexity section now includes a short coverage-source note, mixed Istanbul runs call out that unmatched functions fall back to estimates, and the hint spells out `fallow health --coverage <coverage-final.json>`. A top-level `fallow --coverage` typo now gets a targeted health-command hint instead of clap suggesting unrelated flags such as `--tolerance`. (Refs [#474](https://github.com/fallow-rs/fallow/issues/474).)
+- **Two built-in plugins sharing a config file no longer emit an un-actionable collision warning.** Projects using both Vite and TanStack Router (with `@tanstack/router-plugin/vite` configured in `vite.config.ts`) saw a `plugin config_patterns collision` warning on every run, because both the `vite` and `tanstack-router` built-in plugins legitimately claim `vite.config.{ts,js,mts,mjs}` (tanstack-router parses the `tanstackRouter({...})` call there to find a custom `generatedRouteTree` path). The collision is benign: config matching runs each matching plugin's parser independently, so there is no data loss. The warning's own advice ("rename one of the patterns or remove the duplicate plugin") is impossible to follow for a built-in. The collision detector now suppresses built-in-only collisions and warns only when at least one owner is an external (user-authored) plugin, matching its documented intent. (Closes [#808](https://github.com/fallow-rs/fallow/issues/808))
+- **The GitHub Action now uploads SARIF on public repositories.** Setting `sarif: true` on a public repo previously skipped the upload with a warning that Code Scanning (GitHub Advanced Security) was not enabled. That was a false negative: public repositories get GitHub Code Scanning for free without Advanced Security, and the first SARIF upload is what initializes it. The action's availability check probed the `code-scanning/alerts` endpoint, which returns 404 on a public repo that has never run Code Scanning, so it concluded the feature was unavailable and never attempted the upload that would have enabled it. The check now treats a public repository (`visibility == "public"`) as available and attempts the upload directly; private and internal repositories still fall back to the alerts probe, since Code Scanning there genuinely requires Advanced Security (internal enterprise repos report `private: false` but still need it, so the check keys on `visibility`, not `private`). One consequence to note: on a public repo the upload step now runs unconditionally, so a workflow that set `sarif: true` without granting `permissions: security-events: write` will see the `github/codeql-action/upload-sarif` step fail rather than skip silently. Add that permission alongside `sarif: true`. Thanks [@cloud-walker](https://github.com/cloud-walker) for the detailed report. (Closes [#817](https://github.com/fallow-rs/fallow/issues/817).)
+- **The GitHub Action no longer logs a spurious `SARIF generation failed` warning when the analyzed project has issues.** The action's fallback SARIF step gated its warning on the `fallow` exit code, but exit 1 means "issues found" (normal), not a generation failure (only exit code 2 and above is an error). So `command: health` on any repo with complexity findings logged `::warning::SARIF generation failed` on every run even though a valid SARIF file was written. The step now validates the produced file (non-empty and valid JSON) instead of the exit code, matching the step's own entry condition. The job already passed; this removes the misleading warning from the logs. (Closes [#813](https://github.com/fallow-rs/fallow/issues/813).)
+- **`resolve.alias` shared via an imported identifier or built with spreads is no longer ignored.** When a config set `resolve.alias` (or Webpack `resolve.alias`, Nuxt `alias`, SvelteKit `kit.alias`, AdonisJS `aliases`, or Vitest `test.alias`) to an imported binding (`alias: sharedAliases`) or an array/object assembled with spreads (`alias: [...a, ...b]`), fallow recovered zero aliases, so every aliased import surfaced as `unresolved-import` and cascaded into `unused-file` / `unused-export`. The alias extractor now follows an identifier to its local `const` or one-hop relative import and expands array/object spreads, so the common pattern of sharing one alias module across `vite.config` / `vitest.config` / Storybook resolves correctly. Thanks [@michaljuris](https://github.com/michaljuris) for the report. (Closes [#811](https://github.com/fallow-rs/fallow/issues/811))
+
+## [2.85.0] - 2026-05-30
+
+### Added
+
+- **`fallow coverage upload-source-maps` now uploads each map's repo-relative path, so the source-evidence viewer can resolve monorepo sub-package source.** A bundled map under a sub-package (e.g. `dashboard/dist/assets/X.js.map`) lists its sources relative to the map file (`../../src/components/X.tsx`); the cloud previously had only the basename and collapsed that to `src/components/X.tsx`, which never matched the package-prefixed runtime path `dashboard/src/components/X.tsx`, so the viewer reported "source not in maps" even though the file was in an uploaded map. The CLI now sends the map's path relative to the repo root alongside the existing `fileName`, letting the cloud resolve each source against the map's directory and recover `dashboard/src/components/X.tsx`. The field is omitted when a map is not under the repo root (an absolute `--dir` outside it), in which case the cloud falls back to its previous behavior. Run `upload-source-maps` from the repo root so the prefix is correct. No change for single-package projects. (Closes [#260](https://github.com/fallow-rs/fallow-cloud/issues/260).)
+
+- **`fallow flags` now surfaces the configuration surface when it finds nothing.** The empty-result line (`No feature flags detected`) is no longer byte-identical whether a project truly has no flags or just uses an SDK fallow does not recognize. On full defaults, the human output now lists the built-in env-var prefixes and SDK providers it scanned for, then points at `flags.sdkPatterns`, `flags.configObjectHeuristics`, and the configuration docs, so you can tell a true negative from a missing detector and add your own SDK (PostHog, in-house, anything not listed). Projects that already configured custom `flags.*` patterns get a single terse line acknowledging their config instead of the discovery block. The enumerated detectors are derived from fallow's built-in tables, so the hint stays in sync as defaults grow. JSON, SARIF, compact, markdown, and CodeClimate output are unchanged, and `--quiet` suppresses the hint. (Closes [#562](https://github.com/fallow-rs/fallow/issues/562).)
+- **`fallow impact` reports what fallow has done for you, opt-in and local-only.** A new `fallow impact` command shows how many issues fallow is currently surfacing, the trend since the previous recorded run, and how many commits its pre-commit gate blocked then cleared. Enable it with `fallow impact enable` (with `disable` and `status` siblings); once enabled, each `fallow audit` run appends a small record to a single rolling `.fallow/impact.json` (gitignored, never uploaded). The generated `fallow init --hooks` pre-commit hook now tags gate runs so a blocked-then-fixed commit is recorded as contained. Writes are best-effort and never change a command's exit code or output. Human, `--format json`, and `--format markdown` output are available, and the JSON shape ships in the published output schema. `fallow impact` now also credits per-finding **resolutions**: when a finding you previously saw goes away because you fixed the code, it counts as resolved, and when it goes away because you added a `fallow-ignore`, it is reported separately as intentionally managed and never counted as a win. It distinguishes the two by capturing which suppressions are present each run, and it ignores findings that merely moved rather than being removed (within a file, or relocated to another file, including across separate commits). Resolution attribution covers dead code, complexity, and duplication, accrues from your local runs (it is a local-developer signal, not a CI metric, since it lives in `.fallow/impact.json`), and adds `resolved_total`, `suppressed_total`, and a recent-resolutions list to all three output formats and the published schema.
+- **`fallow impact` now tracks a whole-project view and credits cleanups you make outside a changed-file audit.** Previously every recorded run came from `fallow audit`, which is scoped to the files changed against your base, so a duplication or whole-repo cleanup you verified with `fallow dupes` (or any full `fallow` run) was never credited. Now a full `fallow` run (dead code + duplication + complexity, with no `--changed-since` / `--workspace` / `--diff` / `--production` narrowing) records a separate whole-project entry, and its resolution pass credits any finding that has gone away anywhere in the repo, including a clone group you removed without touching it in the current commit. The report gains an understated whole-project section (`project_surfacing` and `project_trend` in `--format json`) kept separate from the changed-file trend so the two scopes never mix into one misleading number; it advances only on your local full `fallow` runs, not in CI, and the report says so. A clone that is merely reshaped (one of several identical copies removed while the rest still duplicate) is not counted as resolved. The report's JSON shape stays at schema version 1 (the new fields are additive and optional).
+- **The Fallow Impact value report is now available over MCP.** A new read-only `impact` MCP tool wraps `fallow impact --format json`, so AI agents can read the local report (current surfacing, trend since the last recorded run, pre-commit gate containment, and, on impact v1.5+, resolved/suppressed attribution) the same way they call `check_health` or `audit`. It runs no analysis, so it takes only a `root`; the mutating `enable`/`disable` lifecycle is intentionally not exposed, and on a never-enabled project it returns a populated `{"enabled": false, ...}` report (never `{}`) so an agent can tell "not set up" from "set up, no history yet" and recommend `fallow impact enable` rather than toggling it. Because impact is a local-developer signal, the tool surfaces an empty report in ephemeral CI runners and should not be used as a CI metric.
+- **Opt-in product telemetry for improving agent, CI, MCP, and editor workflows, off by default.** `fallow telemetry status|enable|disable|inspect` manages it, and `FALLOW_TELEMETRY=inspect fallow <command>` prints the exact payload a real run would send without sending it. When enabled, Fallow sends one small, allowlisted, workflow-level event per run (which workflow ran, the integration surface, the invocation context, output format, OS and architecture, and coarse duration and exit-code buckets) and never repository names, file paths, package or dependency names, source code, config values, environment variable names or values, raw command lines, or errors. `DO_NOT_TRACK` and `FALLOW_TELEMETRY_DISABLED` are honored as top-precedence kill switches, and CI stays off unless telemetry is explicitly enabled in that environment. Agents and wrappers can declare their integration with an allowlisted `FALLOW_AGENT_SOURCE` (`codex`, `claude_code`, `cursor`, `copilot`, `opencode`, `aider`, `roo`, `windsurf`, `gemini`, `cline`, `continue`, `zed`, `goose`); setting it never enables telemetry and uploads no codebase content. The upload is best-effort on a background thread and never blocks the command or changes its output or exit code. See [`docs/telemetry.md`](docs/telemetry.md).
+- **`fallow health` now emits a `coverage_intelligence` verdict when coverage, runtime, complexity, and change-scope evidence combine into an actionable recommendation.** The additive JSON block carries its own schema version, headline verdict, summary counts, stable `fallow:coverage-intel:<hash>` finding IDs, ordered signals, compact evidence, related runtime IDs, and agent-ready actions. It currently surfaces risky changed hot paths, high-confidence delete candidates, owner-review-required cold code, and hot covered code that still needs careful refactoring. Human, markdown, compact, SARIF, and CodeClimate output render actionable findings; audit receives the block through its nested health payload without changing the default audit verdict or exit behavior. (Closes [#507](https://github.com/fallow-rs/fallow/issues/507).)
+- **Clone groups now have a stable fingerprint, and `fallow dupes --trace` can deep-dive one by id.** Every clone group in `fallow dupes` now carries a content-derived fingerprint, usually `dup:<8hex>` and widened only on rare report collisions, shown beside each group in the human listing and emitted on every `clone_groups[]` entry (plus nested `clone_families[].groups[]` and the per-bucket `--group-by` output) in `--format json`. `fallow dupes --trace` now accepts that fingerprint (`fallow dupes --trace dup:7f3a2c1e`) in addition to the existing `FILE:LINE` form, so you can deep-dive a specific group without hunting for one of its line numbers. The trace output now also shows, per group, an extract-function suggestion with estimated line savings, a best-effort proposed function name (derived from the dominant identifier; omitted when it would be generic), and a docs link. The fingerprint is derived from the group's source content, so it is stable across runs and editing one clone group never changes another's id; collision handling is report-scoped, so a short collision widens only the colliding groups and ambiguous short ids do not resolve to the wrong group. The MCP `trace_clone` tool gained an optional `fingerprint` parameter (`file`/`line` are now optional, exactly one addressing form required), so an AI agent can read a fingerprint from `find_dupes` and deep-dive that group in a single follow-up call. (Closes [#759](https://github.com/fallow-rs/fallow/issues/759).)
+- **fallow's static analysis is now guaranteed, at compile time, never to execute the analyzed project's code.** The analysis crates (`fallow-core`, `fallow-extract`, `fallow-graph`) ban raw process spawning with a clippy lint (`std::process::Command::new` is denied at each crate root); the only external program the analysis path can run is `git` (for `--changed-since`, churn history, and repository-state queries), routed through a single `fallow_core::spawn::git` wrapper. A `package.json` lifecycle script such as `postinstall` is read as data and never run, now backed by a regression test that asserts a sentinel-writing script never fires during analysis. On the build-time supply-chain surface (Cargo `build.rs` and proc-macros, which run arbitrary code while compiling fallow), `deny.toml` now also rejects yanked crates (`yanked = "deny"`), and `SECURITY.md` documents the build-time trust boundary alongside the existing runtime one. No user-facing behavior change.
+
+### Changed
+
+- **Declared-but-unused framework plugins (`vite-plugin-*`, `prettier-plugin-*`) are now reported as unused devDependencies.** Fallow carried a hardcoded list of known dev tooling that exempted a package from the unused-dependency report by exact name. Several entries on that list were framework plugins (`vite-plugin-svgr`, `vite-plugin-eslint`, `prettier-plugin-tailwindcss`, `prettier-plugin-organize-imports`, `@ianvs/prettier-plugin-sort-imports`), which meant a plugin you listed in `devDependencies` but never wired into your `vite.config.*` or prettier config was silently treated as used. Those entries are gone: such a plugin is now credited only when it actually appears in the config (vite plugins through the import graph that already reads your config file, prettier plugins through the Prettier config parser, which now also reads the `plugins` array from `.prettierrc.{yml,yaml,toml}`), so a genuinely-unused one correctly surfaces. If a plugin you do use is flagged, fallow could not see it referenced in a config it parses; add it to `ignoreDependencies` and please open an issue with the config form. (Closes [#462](https://github.com/fallow-rs/fallow/issues/462).)
+- **The known-tooling list is now a community-maintainable catalogue.** The prefix and exact tool names that exempt a devDependency from the unused report moved out of Rust source into `crates/core/data/tooling.toml`. Adding a tool is a one-line entry with no code change and no regeneration step; see [CONTRIBUTING.md](CONTRIBUTING.md). No behavior change for the tools that stayed on the list. (Refs [#462](https://github.com/fallow-rs/fallow/issues/462).)
+- **The `fallow-v8-coverage` crate's ownership boundary with `oxc_coverage_v8` is now documented.** The two crates solve inverse problems (fallow maps real Node V8 dumps in UTF-16-code-unit space; `oxc_coverage_v8` fills an AST-built Istanbul `FileCoverage` in byte space) and are intentionally not consolidated, recorded in ADR-010. The UTF-16 offset invariant is now pinned by a conformance test. No change to the `fallow` CLI's behavior, output, or the runtime-coverage wire format. (Closes [#509](https://github.com/fallow-rs/fallow/issues/509).)
+
+### Removed
+
+- **`fallow-v8-coverage` dropped its never-consumed forward Istanbul emitter** (`normalize_script` and its `IstanbulFileCoverage` / `IstanbulFunction` / `IstanbulRange` output types), leaving the V8 dump parser plus the UTF-16 `LineOffsetTable` the `fallow` CLI actually uses. This is a breaking change to the `fallow-v8-coverage` crate's public API; the crate is an internal building block of the `fallow` CLI (the only consumer) published under the lockstep workspace version, with no supported external consumers, so there is no `fallow` CLI behavior change.
+
+### Fixed
+
+- **Clone fingerprints (`dup:<id>`) are now stable across Windows and Unix line endings.** The fingerprint hashes a clone group's representative source fragment, which previously included the raw `\r` from CRLF checkouts, so the same code produced a different `dup:` handle on a Windows dev machine than on a Linux CI runner. That broke `fallow dupes --trace dup:<id>` and any duplication baseline keyed on the fingerprint when the two ran on different platforms. The fragment is now CRLF-normalized before hashing, so a clone group gets the same fingerprint regardless of checkout line endings. Fingerprints on Unix-checkout sources are unchanged. (Test fixtures are also pinned to LF via `.gitattributes` so snapshot output is byte-identical across platforms.)
+- **`fallow dupes` human output now shows forward-slash paths on Windows.** The clone-group, clone-family, and grouped-bucket listings rendered file paths via the raw OS separator, so on Windows they printed backslashes (`src\copy1.ts`) instead of the forward slashes used everywhere else in fallow's output, and the directory/filename split (which keys on `/`) misfired on those paths. The dupes renderer now routes every path through the same `format_display_path` normalization the rest of the report already uses, so Windows output matches Linux and macOS. No change on Unix, where paths were already forward-slash.
+
+- **ESLint plugins pulled in transitively by a meta-preset such as `@antfu/eslint-config` are no longer reported as unused.** A flat config that calls a preset factory (`export default antfu({...})`) names no individual plugins, so the plugins the preset enables (declared as its own optional `peerDependencies`) surfaced as `unused-dev-dependency` and had to be silenced with `ignoreDependencies`. When the config imports a package whose name matches a preset shape (`eslint-config-*` or `@scope/eslint-config[-*]`), fallow now reads that preset's own `package.json` and credits the eslint-ecosystem entries (`eslint-plugin-*`, scoped plugins, shareable configs, parsers, import resolvers) it declares in `dependencies` / `peerDependencies` / `optionalDependencies`. This covers the optional framework-plugin peers that the generic peer-dependency closure intentionally skips. General-purpose runtime dependencies the preset also declares (such as `globals`) are excluded, so a genuinely-unused general dependency you declared independently is still reported, and a plain plugin import does not pull in its own dependency fan. Plugins a preset does not declare (or that an older preset version pulled but the installed one no longer does) remain reported. Thanks [@Noktomezo](https://github.com/Noktomezo) for the report. (Closes [#754](https://github.com/fallow-rs/fallow/issues/754).)
+- **The churn-hotspot analysis window now travels with the count in `fallow health`, including when there are zero hotspots.** Before, the window (default `6m`, set via `--since`) appeared only in the `● Hotspots (N files, since 6 months)` section header, which is omitted entirely when a repo has no hotspots. So the orientation `■ Metrics:` line read `0 churn hotspots` with no anchor, leaving you unable to tell "zero in the last 6 months" from "zero ever," and the window vanished completely on healthy repos. After, the metrics line reads `0 churn hotspots (since 6 months)` and the `--format markdown` Vital Signs row reads `| Hotspots (since 6 months) | 0 |`, so the window is visible even when the Hotspots section is suppressed. When the churn pipeline did not run (non-git repo, shallow clone), the suffix is omitted rather than rendering an empty window. JSON, SARIF, compact, and CodeClimate output are unchanged (the window string was already serialized on `hotspot_summary`). (Closes [#552](https://github.com/fallow-rs/fallow/issues/552).)
+- **SvelteKit layout-reset routes (`+page@.svelte`, `+layout@named.svelte`) are no longer reported as unused files.** SvelteKit's [layout-reset](https://svelte.dev/docs/kit/advanced-routing#Advanced-layouts-Breaking-out-of-layouts) convention appends an `@` suffix to a page or layout component to break it out of its parent layout chain (`+page@.svelte` resets to the root layout, `+page@named.svelte` resets to a named layout). The SvelteKit plugin only matched the non-`@` filenames as entry points, so any route using layout-reset surfaced as `unused-file`. The plugin now also marks `src/routes/**/+page@*.svelte` and `src/routes/**/+layout@*.svelte` as entry points and credits their `default` export, covering both the empty (`@.svelte`) and named (`@named.svelte`) forms. Only the `.svelte` component files take the `@` suffix; SvelteKit itself rejects `@` in `.ts`/`.js` route files, so the co-located load files are unaffected. Thanks [@codingthat](https://github.com/codingthat) for the report. (Closes [#791](https://github.com/fallow-rs/fallow/issues/791).)
+- **`@nuxt/content`'s `content.config.ts` is no longer reported as unused.** [@nuxt/content](https://content.nuxt.com) v3 defines collections in a root `content.config.ts` (`export default defineContentConfig({...})`) that the module reads at build time; nothing in app source imports it, so fallow surfaced it as `unused-file` plus an unused `default` export and users had to add a manual `entry` or ignore. When `@nuxt/content` is registered in the nuxt.config `modules:` array, fallow now credits `content.config.{ts,js,mts,mjs,cts,cjs}` (resolved relative to the nuxt.config directory, so nested/monorepo configs credit the adjacent file) as a default-export entry point. The credit is gated on module registration rather than mere package.json presence, so an installed-but-unregistered `@nuxt/content` still correctly flags a genuinely-orphan `content.config`. Scoped to the first-party `@nuxt/content` only; third-party Nuxt module config files are deliberately not hardcoded (per [#138](https://github.com/fallow-rs/fallow/issues/138)). (Closes [#792](https://github.com/fallow-rs/fallow/issues/792).)
+- **`oxlint-tsgolint` is no longer reported as an unused dependency.** oxlint loads its type-aware companion package `oxlint-tsgolint` at runtime (via `--type-aware` or `options.typeAware`); it is never imported in source and never listed in an `.oxlintrc.json` `jsPlugins` array, so the existing `jsPlugins` crediting did not cover it. fallow already silenced it in `devDependencies` through a general `oxlint` tooling prefix, but a project that declares it in prod `dependencies` (for example via a pnpm `catalog:` entry) still saw `unused-dependency` and had to silence it with `ignoreDependencies`. The oxlint plugin now credits `oxlint-tsgolint` as a tooling dependency in both prod and dev categories whenever oxlint is active. The credit is by exact name, not an `oxlint-*` prefix, so an unrelated `oxlint-`-prefixed prod dependency that is genuinely unused still reports. Thanks [@kevinmichaelchen](https://github.com/kevinmichaelchen) whose effect-coffee-shop repo surfaced this. (Closes [#753](https://github.com/fallow-rs/fallow/issues/753).)
+- **rspress `@theme` virtual-module imports are no longer reported as unlisted dependencies.** rspress (the Rsbuild/Rspack documentation framework) exposes its theme layer through the build-time `@theme` virtual module, the same way Docusaurus does, but fallow had no rspress plugin, so importing `@theme` (or a `@theme/<component>` subpath) from docs or source surfaced as an `unlisted-dependency` and had to be silenced with `ignoreDependencies`. A new `rspress` plugin activates on `rspress` or any `@rspress/`-scoped dependency (such as `@rspress/core`) and contributes `@theme/` and `@theme-original/` as framework virtual-module prefixes, so both the bare `@theme` import and its subpaths are recognized as build-time virtual modules across `unlisted-dependency` and `unresolved-import` reporting. Real scoped packages such as `@theme-ui/core` are not affected. Docusaurus projects already handled the bare `@theme` import; this closes the equivalent gap for rspress. Thanks [@callstackincubator](https://github.com/callstackincubator) whose `agent-device` docs site surfaced this. (Closes [#756](https://github.com/fallow-rs/fallow/issues/756).)
+- **`fallow health` can now be a real CI gate: `--min-score` is authoritative and `--min-score 0` exits 0.** Before, the exit code failed (1) whenever any above-threshold function existed, regardless of the health score, so `--min-score` only ever added a second way to fail and `fallow health --min-score 0` still exited 1, the clearest tell that the score never drove the exit code. Health could only ever be advisory. After, when `--min-score N` is set it is the authoritative complexity gate: the run exits 0 when the score is at or above `N` (so `--min-score 0` always passes) and complexity findings are demoted to informational while still printed. `--min-severity` is unchanged and now composes with `--min-score` (the run fails if either gate trips). Plain `fallow health` with no gate flag keeps the back-compatible behavior of exiting 1 on any finding. A new `--report-only` flag prints the score and findings but never fails CI (always exit 0), for surfacing health in logs without blocking; it is mutually exclusive with `--min-score` / `--min-severity`. The runtime-coverage and coverage-gap gates remain independent explicit opt-ins. For gating on newly-introduced complexity only, `fallow audit --gate new-only` stays the right tool, and `fallow health --help` now signposts it. (Closes [#786](https://github.com/fallow-rs/fallow/issues/786).)
+- **Coexisting config files no longer pick a winner silently.** Fallow loads the first of `.fallowrc.json` > `.fallowrc.jsonc` > `fallow.toml` > `.fallow.toml` found per directory. Before, if two of these coexisted (for example a `fallow.toml` you maintain plus a stale `.fallowrc.json` left over from a migration or a partial `fallow init`), fallow loaded the higher-precedence one with no signal, so you could see correct-looking output produced from the wrong source. After, config discovery emits a `tracing::warn!` (visible on stderr at the default level) naming the file it loaded and the lower-precedence file(s) it ignored, and pointing at the precedence order; it fires once per directory per run. Passing an explicit `--config <path>` performs no discovery and never warns. The docs and the `fallow config` help text now also state that `.fallowrc.json` accepts JSONC (comments and trailing commas) and that `.fallowrc.jsonc` is identical in behavior, with the extension serving only as an editor hint. (Closes [#458](https://github.com/fallow-rs/fallow/issues/458).)
+- **In a monorepo, a workspace package's framework class-member allowlist and SCSS include paths are no longer dropped during plugin-result merging.** When a framework is active only in a workspace package (Lit, Lexical, Ember, or Angular in `packages/<name>`, not at the repo root), the package's plugin contributions to two fields were silently discarded while the root project's results were merged. A package's heritage-scoped class-member allowlist (for example Lit's `firstUpdated` / `willUpdate` on a `LitElement` subclass) was dropped, so those framework-invoked methods surfaced as false `unused-class-member` findings, and a package's Angular `stylePreprocessorOptions.includePaths` was dropped, so SCSS `@use` / `@import` resolving against those directories surfaced as `unresolved-import`. Both fields now flow through the merge. Single-package (non-monorepo) projects were never affected. (Closes [#772](https://github.com/fallow-rs/fallow/issues/772).)
+- **Velite config, content, and generated `.velite` output are no longer reported as unused.** Projects using [Velite](https://velite.js.org) had to manually mark `velite.config.ts` as an `entry` and ignore `content/**` plus `**/.velite/**`, because fallow did not model Velite's build-time content pipeline. A new Velite plugin activates on the `velite` dependency or a `velite.config.{ts,mts,cts,js,mjs,cjs}` file. It keeps the config and generated `.velite/**` output reachable (traversing the hidden `.velite` directory so app imports of generated collections resolve), credits packages imported by the config and `velite` itself as a tooling dependency, and parses `defineConfig` / `defineCollection` to mark each collection `pattern` (joined to the top-level `root`, default `content`) as a content entry point so Velite-managed Markdown / MDX is not flagged. Patterns are scoped to the config file's package, so a monorepo app's content does not leak project-wide. (Closes [#609](https://github.com/fallow-rs/fallow/issues/609).)
+- **Container-format diagnostics now point back to the original source lines.** MDX import/export extraction now keeps a byte mapping from extracted statements back to the `.mdx` file, so imports after prose report their real line instead of the synthetic extracted-buffer line. Astro frontmatter and processed template scripts, plus Vue/Svelte `<script>` blocks, now remap parsed import/export spans back to their container files. CSS/SCSS directive imports now carry source spans when the directive has a real specifier, while intentionally synthetic Tailwind reachability edges stay unpositioned. Svelte 5 `$derived(new Class())` bindings now also credit template member usage on the derived instance. (Closes [#445](https://github.com/fallow-rs/fallow/issues/445).)
+- **A root `dangerfile.js` run from CI is no longer reported as an unused file.** Danger is commonly invoked straight from CI (`npx danger ci`, an Earthfile, a GitHub Action) without `danger` ever being listed in package.json, so the Danger plugin's dependency enabler never fired and the dangerfile surfaced as `unused-file`, forcing a manual `entry` workaround. The plugin now also activates when a `dangerfile.{js,ts,mjs,cjs}` is discovered at the repo root or in a workspace, mirroring how the k6 plugin activates on its convention files. The `.js` extension was always covered by the existing allowlist; the gap was activation, not the extension. Exact-filename matching keeps lookalikes such as `predangerfile.js` and `dangerfile.json` inert. (Closes [#758](https://github.com/fallow-rs/fallow/issues/758).)
+- **A package whose binary runs via `bun --bun <bin>` in a script is no longer reported as unused.** Before, a `package.json` script like `"prepare": "is-ci || bun --bun prek install"` left the providing package flagged as an unused dependency: the script parser treated `bun --bun ...` as a bare `bun <script>` invocation (like `yarn build`) and dropped the whole command before the `prek` binary could be resolved to its package. After, `bun`'s runtime flags (`--bun`, `--watch`, `--hot`, `--smol`, `--no-clear-screen`) are skipped so the executed binary is extracted and credited through the existing bin-to-package map (`prek` to `@j178/prek`), while `bun --watch run dev` and bare `bun <script>` still correctly resolve to script delegations. `bun x <pkg>` (the bun-native alias of `bunx`) is now recognized too. An unrecognized leading flag is conservatively treated as a script delegation rather than guessed at. Thanks [@Noktomezo](https://github.com/Noktomezo) for the report. (Closes [#755](https://github.com/fallow-rs/fallow/issues/755).)
+- **Workspace packages whose tsconfig `paths` point at unbuilt `dist` no longer report `unresolved-import` plus `unused-dependency` pre-build.** A common monorepo convention maps a sibling-package specifier to compiled output in tsconfig (`"@scope/*": ["../*/dist/index.d.ts"]`). When the project is analyzed before a build, that `dist` target does not exist, and fallow stopped at the path-alias step: every consumer of `@scope/pkg` reported `unresolved-import`, and the package itself reported `unused-dependency`. After, when a path-alias-shaped specifier is also a valid workspace package name and the alias target cannot be resolved, fallow falls through to the workspace-package fallback and resolves the import against the package's own source tree (reusing the existing `dist`-to-`src` mapping). On a pre-build clone of `graphql-markdown/graphql-markdown` this clears 264 false `unresolved-import` findings and the matching `unused-dependency` reports. (Closes [#757](https://github.com/fallow-rs/fallow/issues/757).)
+- **Class members called only through a typed `$props()` / destructured binding are no longer reported as unused.** A Svelte component that receives a class instance as a typed prop (`let { resultState }: Props = $props()` where `Props` declares `resultState: ResultState`) and calls `resultState.pin(...)` from markup or script previously surfaced those methods as `unused-class-member`, because fallow only tracked instance bindings created with `new`. Typed destructured bindings (from `let`/`const` and from destructured function parameters) now resolve their members onto the referenced class, so the calls are credited. The resolution is type-driven, so it also covers plain TypeScript and Vue (`function render({ resultState }: Props) { resultState.pin() }`). Genuinely unused members are still reported. Thanks [@asciimoo](https://github.com/asciimoo) for the report. (Closes [#752](https://github.com/fallow-rs/fallow/issues/752).)
+- **GitHub Action baseline checks now catch config-only baseline drift.** Before, pull request runs using the default `auto-changed-since: true` plus a generic dead-code baseline could hide baseline membership changes when the PR only changed fallow config, then fail later on the unscoped default-branch run. After, baseline-active dead-code/check action runs disable auto-derived PR scoping when a fallow config file changes, while preserving explicit `changed-since` and `diff-file` overrides. Saved generic baselines also keep pretty JSON and now end with a trailing newline. (Closes [#746](https://github.com/fallow-rs/fallow/issues/746).)
+- **`babel-plugin-react-compiler` is no longer reported as unused when React Compiler is enabled via `reactCompilerPreset()`.** The #623 detection only recognised React Compiler wired through a Babel `plugins` array. The current documented `@vitejs/plugin-react` 6.x setup feeds the compiler through the `reactCompilerPreset()` preset helper instead (`babel({ presets: [reactCompilerPreset()] })` via `@rolldown/plugin-babel`), so the dependency was being flagged and projects worked around it with `ignoreDependencies`. Fallow now credits `babel-plugin-react-compiler` for the preset form, in both Vite `vite.config.*` and electron-vite `electron.vite.config.*` (where the preset commonly lives in `renderer.plugins`). The credit is provenance-checked: `reactCompilerPreset` must be a named import from `@vitejs/plugin-react`. The namespace-import form (`import * as vr`) and the variable-indirection form (`const p = reactCompilerPreset()`) remain reportable. Thanks to the maintainers of [nicotsx/zerobyte](https://github.com/nicotsx/zerobyte) and [OpenWaggle/OpenWaggle](https://github.com/OpenWaggle/OpenWaggle) whose configs surfaced this. (Closes [#751](https://github.com/fallow-rs/fallow/issues/751).)
+
+## [2.84.0] - 2026-05-28
+
+### Fixed
+
+- **`@sanity/pkg-utils` build configs no longer report as unused.** Projects built with [`@sanity/pkg-utils`](https://github.com/sanity-io/pkg-utils) keep their `package.config.{ts,js,mts,mjs,cts,cjs}` and `package.bundle.{ts,js,mts,mjs,cts,cjs}` build configs reachable automatically, at the repo root and in every workspace package. The tool discovers these files by filename rather than importing them from source, so previously each one surfaced as an `unused-file` and had to be listed manually in `entry`. A new `pkg-utils` plugin (activated only by an exact `@sanity/pkg-utils` dependency, so plain `@sanity/client` consumers are unaffected) marks them always-used and credits `@sanity/pkg-utils` as a tooling dependency. pkg-utils monorepos can now drop the `package.config.ts` / `package.bundle.ts` lines from their `entry` config.
+
+## [2.83.0] - 2026-05-27
+
+### Added
+
+- **GitHub Action artifacts can now be written outside the workspace root.** The action now accepts `artifacts-dir`, a workspace-relative directory for generated files such as `fallow-results.json`, `fallow-results.sarif`, `fallow-stderr.log`, and `fallow-analysis-args.sh`. Before, those files always appeared at the repository root and could be picked up by later formatter or linter steps. After, workflows can use a generated directory such as `.var/fallow`, while `outputs.results` and `outputs.sarif` continue to expose the resolved paths for downstream steps. Thanks [@Guria](https://github.com/Guria) for the report. (Closes [#735](https://github.com/fallow-rs/fallow/issues/735).)
+
+- **Runtime coverage now uses a cross-surface function identity to join evidence and key baselines.** Fallow adopts the `fallow-cov-protocol` v2 `FunctionIdentity` (a `fallow:fn:<hash>` join key derived from file, name, and start line). The static inventory uploaded by `fallow coverage upload-inventory` and the sidecar request now carry this identity; `fallow coverage analyze --cloud` and runtime-coverage ingestion prefer it over `(path, name, line)` when joining runtime evidence to local analysis; and runtime-coverage JSON exposes a `stable_id` field on findings, hot paths, blast-radius, and importance entries (alongside the existing per-finding `id`). The same function shares ONE `stable_id` across findings, hot paths, blast-radius, and importance entries (the per-finding `id` uses a per-surface salt and differs), and across V8, Istanbul, and oxc producers (columns are excluded from the hash). The identity hash is computed over the repo-relative path, so `--path-prefix` (used for containerized runtime paths) does not affect the join. Old coverage artifacts without an identity continue to work via the existing path/name/line fallback, and `fallow ... --explain` documents the fallback order plus the suppression-key vs join-key distinction. Baselines prefer `stable_id` when present and the grace-window reader accepts both the new `fallow:fn:` and the legacy `fallow:prod:` keys, so existing baselines keep suppressing. Like the legacy `id`, `stable_id` hashes the function's start line, so a function that moves to a different line gets a new key under either; the value of `stable_id` is cross-surface and cross-producer joinability, not line-move immunity (the new `source_hash` content digest provides line-move-tolerant matching separately, see below). (Closes [#506](https://github.com/fallow-rs/fallow/issues/506).)
+
+- **Runtime-coverage baselines now survive line moves.** Each function identity can carry an optional `source_hash`: a content digest of the function body that excludes position, so a function that moves to a different line but is otherwise unedited keeps the same `source_hash`. The static analyzer computes it during extraction, the `fallow-cov` sidecar carries it through from the uploaded static index, and runtime-coverage baselines match on `(file, name, source_hash)` in addition to `stable_id` and the legacy `fallow:prod:` id. A baselined finding therefore stays suppressed across a pure line shift, while editing the function body re-surfaces it for review. Findings with no `source_hash` fall back to the existing keys, so behavior is unchanged where it is absent. (Closes [#742](https://github.com/fallow-rs/fallow/issues/742).)
+
+- **Nuxt components referenced only by template tag are now tracked in the module graph.** Frameworks like Nuxt expose components to templates by filesystem convention (`<Card001 />` resolving to `components/Card001.vue`) with no `import` statement, so fallow previously kept whole convention directories alive as entry points and could never report a genuinely-unreferenced component as unused. A new first-class `auto_imports` plugin capability now synthesizes a real graph edge from each `<Card001 />`-style template tag to its component file, covering Nuxt's directory-prefixed PascalCase naming (`components/base/Button.vue` to `<BaseButton>`), the implicit `<Lazy...>` variant, and `.client` / `.server` / `.global` paired files. By default this is additive: components stay registered as entry points (no new `unused-file` reports) while their default export is credited when consumed via a tag under `--include-entry-exports`. Opt into the new `autoImports: true` config field to drop the Nuxt component entry patterns so a genuinely-unreferenced component is reported as `unused-file`; the flag is conservative (a `components:` key in `nuxt.config` keeps the entry patterns, since custom `prefix` / `pathPrefix` / `dirs` are not yet modeled) and stays off by default. Composable, util, and Pinia store auto-imports are tracked separately ([#739](https://github.com/fallow-rs/fallow/issues/739), [#740](https://github.com/fallow-rs/fallow/issues/740)). Thanks [@Hal-Spidernight](https://github.com/Hal-Spidernight) for the detailed proposal. (Closes [#704](https://github.com/fallow-rs/fallow/issues/704).)
+
+- **Public Fallow config corpus tooling makes recurring workaround mining repeatable.** Maintainers can now run `scripts/public-config-corpus.py` to search public `.fallowrc.json`, `.fallowrc.jsonc`, and `fallow.toml` files with `gh`, cache pinned config snapshots under `.fallow/public-config-corpus/`, and write a deterministic markdown report plus manifest. The manifest records repo/path identity, blob URL, raw URL, blob SHA, URL ref fallback, byte count, `sha256`, parse status, search query, cap, fetch time, `gh` version, and fetch failures, so a report can be reviewed instead of trusted as an ad hoc scrape. `docs/public-config-corpus.md` documents the maintainer workflow, privacy boundaries, and the first seeded public-config research pass that led to #546, #586, #588, #589, #590, #600, #601, and #602. The fixture harness `scripts/test-public-config-corpus.sh` verifies deterministic offline output without GitHub access. (Closes [#603](https://github.com/fallow-rs/fallow/issues/603).)
+
+### Fixed
+
+- **tsdown `.mts` and `.cts` config files are now treated as entry points.** Before, projects using `tsdown.config.mts` or `tsdown.config.cts` could see the config file reported as unused even though tsdown loads those extensions. After, the tsdown plugin recognizes the same config extension family as neighboring bundler plugins, keeps those config files alive, and still extracts their `entry` arrays as source entry points. Thanks [@eojoel](https://github.com/eojoel) for the report. (Closes [#744](https://github.com/fallow-rs/fallow/issues/744).)
+
+- **Expected unresolved import specifiers can now be ignored from config.** Before, generated or runtime-provided imports such as `@example/icons`, `@example/icons/metadata`, or `../generated/client` required line comments because `ignoreDependencies` intentionally does not apply to `unresolved-import`. After, `ignoreUnresolvedImports` accepts raw import-specifier glob patterns, validates glob syntax without filesystem traversal checks, and suppresses only matching `unresolved-import` findings. Exact specifiers and subpath globs stay explicit (`["@example/icons", "@example/icons/**"]`), and JSON actions now suggest adding the reported specifier to this config field. Thanks [@OmerGronich](https://github.com/OmerGronich) for the report. (Closes [#726](https://github.com/fallow-rs/fallow/issues/726).)
+
+- **`fallow audit` no longer emits spurious Nuxt/Astro prerequisite warnings on its base pass.** Before, the audit base worktree was created with `git worktree add --detach`, which omits the gitignored `.nuxt/` and `.astro/` generated directories, so meta-framework projects saw `missing .nuxt/tsconfig.json` / `missing .astro/ types` warnings and a broken tsconfig `references` chain that dropped affected files into resolver-less resolution on the baseline comparison. After, the base worktree symlinks `.nuxt/` and `.astro/` from the host checkout alongside the existing `node_modules` symlink, driven by a shared `MATERIALIZED_CONTEXT_DIRS` constant that stays aligned with the plugin registry's meta-framework prerequisite list. ([#705](https://github.com/fallow-rs/fallow/pull/705).)
+
+- **Workspace packages without `exports` now resolve missing prebuild output back to source.** Before, a sibling workspace package that omitted `exports` but pointed `module` or `types` at missing `dist/` files could surface as both an unresolved import and an unused dependency before the package was built. After, bare workspace package imports without an `exports` map use the same source fallback as prebuild package-map targets, so `@example/lib` resolves to `packages/lib/src/index.ts` and dependency usage is credited. (Closes [#725](https://github.com/fallow-rs/fallow/issues/725).)
+
+- **Contentlayer configs, content roots, and generated output are no longer reported as unused.** Before, Contentlayer and Contentlayer2 projects commonly needed manual entries for `contentlayer.config.*`, `data/**/*.mdx`, generated `.contentlayer/**` files, and remark or rehype packages loaded only through the config. After, a built-in Contentlayer plugin activates from `contentlayer`, `contentlayer2`, `next-contentlayer`, `next-contentlayer2`, or a root config file; keeps `contentlayer.config.{ts,js,mts,mjs}` and generated `.contentlayer/**/*.{ts,tsx,js,jsx,mts,mjs,cts,cjs}` files reachable; traverses `.contentlayer` only for active projects; credits packages imported by the config; and extracts static `contentDirPath` plus same-file `defineDocumentType` `filePathPattern` literals as content roots. Dynamic config and cross-file document type evaluation remain out of scope. (Closes [#610](https://github.com/fallow-rs/fallow/issues/610).)
+
+- **File health scores now surface high CRAP-risk files even when their Maintainability Index is not the lowest.** Before, `--file-scores` sorted only by Maintainability Index, so an untested, very high-CRAP file could appear below a lower-MI file whose tested complexity made it less urgent. After, file scores are sorted by risk-aware triage concern: the larger of low-MI concern and a CRAP risk curve aligned to the low/moderate/high CRAP bands, with equal-concern ties broken by raw CRAP so the displayed Risk column reads top-down. The human table tags each row `risk` or `structure` to show which signal placed it. JSON, markdown, compact, MCP, grouped health, and API consumers receive the same order. (Closes [#554](https://github.com/fallow-rs/fallow/issues/554).)
+
+- **Obsidian plugin entry files and lifecycle overrides are no longer reported as unused.** Before, Obsidian plugins commonly needed manual config for `src/main.ts`, `styles.css`, `cdp.js`, and framework-called lifecycle methods such as `Plugin.onload`, `Plugin.onunload`, `Modal.onOpen`, and `ItemView.onOpen`. After, a built-in `obsidian` plugin activates from the `obsidian` dependency or a conservative Obsidian-shaped `manifest.json`, treats `src/main.{ts,js}`, `main.{ts,js}`, and root `cdp.js` as runtime entrypoints, keeps `manifest.json` and `styles.css` reachable, and credits documented lifecycle overrides only on direct `Plugin`, `Modal`, `ItemView`, and `View` subclasses. Ordinary classes and aliased or transitive local base classes still report unused methods. (Closes [#617](https://github.com/fallow-rs/fallow/issues/617).)
+
+- **POSIX-rooted paths from Linux tooling stay absolute on Windows.** Before, several path resolvers used host-specific `Path::is_absolute`, so values such as `/ci/workspace/...` from Linux-generated coverage data, config inheritance, or plugin setup-file paths could be treated as relative on Windows and joined under the project root. After, the shared cross-platform absolute-path helper lives in `fallow-types`, remains re-exported for CLI callers, and the high-risk config `extends`, plugin setup-file, and health coverage path resolvers use it consistently. (Closes [#614](https://github.com/fallow-rs/fallow/issues/614).)
+
+- **WXT config modules and extension entrypoints are no longer reported as unused.** Before, WXT browser-extension projects often needed manual entries for `entrypoints/` files and dependency ignores for packages loaded only through `wxt.config.*` `modules`. After, a built-in `wxt` plugin activates from `wxt`, `@wxt-dev/*`, or `wxt.config.*`; keeps WXT config files reachable; credits the config default export under entry-export validation; marks documented single-file entrypoints and directory `index.*` entrypoints as runtime roots; and credits static `modules: [...]` package specifiers, including subpaths such as `@wxt-dev/i18n/module`. Helper files under entrypoint directories remain reportable unless imported. (Closes [#612](https://github.com/fallow-rs/fallow/issues/612).)
+
+- **Browser extension manifest entrypoints are no longer reported as unused.** Before, WebExtension and Chrome Extension projects that declared their runtime files only in `manifest.json` could report background service workers, content scripts, popup/options page scripts, and manifest-exposed local resources as `unused-files` because there was no import edge from the app graph. After, a built-in `browser-extension` plugin activates from conservative extension-shaped manifests (`manifest_version` 2 or 3 plus extension runtime keys), discovers root and nested extension manifests, and seeds MV3 service workers, MV2 background scripts, content script JS/CSS, popup/options/devtools/side-panel HTML, and MV2/MV3 `web_accessible_resources` entries as runtime entrypoints. Ordinary PWA web manifests remain ignored. (Closes [#616](https://github.com/fallow-rs/fallow/issues/616).)
+
+- **Varlock schema plugins and Vite integration packages no longer report as unused.** Before, projects that loaded provider packages from `.env.schema` decorators or used `@varlock/vite-integration` only through Vite config needed manual `ignoreDependencies` entries because fallow had no Varlock-aware plugin. After, the built-in Varlock plugin activates from `varlock`, `@varlock/*`, or `.env.schema`, keeps schema files reachable, credits package-like `@plugin(...)` schema references, and treats `varlock` plus `@varlock/vite-integration` as tooling dependencies while leaving local paths and URL/protocol plugin references ignored. (Closes [#622](https://github.com/fallow-rs/fallow/issues/622).)
+
+- **OpenNext Cloudflare config files no longer report as unused in adapter projects.** Before, `open-next.config.*` files consumed by `opennextjs-cloudflare build` could surface as unused files because the Next.js and Wrangler plugins do not own that adapter config surface. After, a built-in OpenNext Cloudflare plugin activates from `@opennextjs/cloudflare` or package scripts invoking `opennextjs-cloudflare`, keeps root and nested `open-next.config.{ts,js,mjs,cjs}` files reachable, and credits packages imported only from those configs while leaving plain Next.js projects unchanged. (Closes [#613](https://github.com/fallow-rs/fallow/issues/613).)
+
+- **Serialized `PathBuf` fields are now covered by a drift gate and normalized consistently.** A new schema test walks CLI/core/types `Serialize` structs and enum struct variants to require `serde_path` serializers for `PathBuf`, `Option<PathBuf>`, and `Vec<PathBuf>` fields, with support for skipped serde fields and custom scalar/option serializers. Existing health/runtime-coverage/setup path fields now use those serializers, including optional component-inherited coverage paths, so Windows paths stay slash-normalized in JSON output. (Closes [#615](https://github.com/fallow-rs/fallow/issues/615).)
+
+- **React Compiler's Babel plugin is no longer reported as unused when consumed through explicit Next.js or Vite compiler config.** Before, projects that followed the documented Next.js `reactCompiler` option or Vite `@vitejs/plugin-react` Babel plugin configuration still saw `babel-plugin-react-compiler` as an unused dependency because the package is consumed by the framework/compiler pipeline rather than by app imports. After, the Next plugin credits `babel-plugin-react-compiler` for `reactCompiler: true` and object-valued `reactCompiler` config, and the Vite plugin credits explicit React Compiler Babel plugin strings inside provenance-checked `@vitejs/plugin-react` / documented Babel integration calls. Disabled, missing, unrelated, and arbitrary nested string shapes still report the dependency as unused. (Closes [#623](https://github.com/fallow-rs/fallow/issues/623).)
+
+- **Babel plugins configured through `@vitejs/plugin-react` no longer report as unused dependencies.** Before, packages loaded only from `react({ babel: { plugins, presets } })` in `vite.config.*` or `vitest.config.*`, such as `@preact/signals-react-transform`, had no static import edge and could surface as unused. After, the Vite and Vitest plugins parse static React plugin option objects, credit plain string and tuple-form Babel plugin and preset entries, and normalize `module:` specifiers before dependency matching. Dynamic option variables and spreads remain out of scope. (Closes [#619](https://github.com/fallow-rs/fallow/issues/619).)
+
+- **Storybook `staticDirs` assets and manager-runtime imports no longer report as false positives.** Before, assets referenced from `.storybook/preview-head.html` or `.storybook/preview-body.html` through Storybook `staticDirs` could surface as `unresolved-imports`, `unused-files`, or static-asset package `unlisted-dependencies`, and `.storybook/manager.*` imports provided by Storybook's manager runtime could surface as `unlisted-dependencies` unless projects declared transitive packages directly. After, the Storybook plugin reads static string and `{ from, to }` `staticDirs` entries from `.storybook/main.*`, resolves preview HTML URL paths through those mounts before the generic root-relative fallback, keeps the mapped files reachable, and avoids converting mapped `node_modules` static assets into dependency findings. It also scopes manager-runtime dependency credit to `.storybook/manager.{ts,tsx,js,jsx}` using the original import specifier, so ordinary source imports of the same packages still report when undeclared. (Closes [#546](https://github.com/fallow-rs/fallow/issues/546).)
+
+## [2.82.0] - 2026-05-26
+
+### Fixed
+
+- **Vite entry points declared with `resolve(__dirname, ...)` path helpers are no longer reported as unused.** Before, `build.rollupOptions.input` and `build.lib.entry` values written as path-helper calls (`resolve(__dirname, "src/app.ts")`, `path.resolve(...)`, `join(...)`, and the `import.meta.dirname` equivalents) were not evaluated by the config parser, so multi-entry Vite apps that declare their Rollup inputs this way surfaced those source files as `unused-files` until the user duplicated the entry list into a `.fallowrc` `entry` array. After, the shared config extractor evaluates these path-helper calls to project-relative entry patterns, dropping the leading `__dirname` / `import.meta.dirname` anchor; CSS entry inputs (`styles: resolve(__dirname, "src/index.css")`) are preserved like any other entry. The same path evaluation also lets `resolve.alias` replacements that use `import.meta.dirname` resolve. Because the extractor is shared, Webpack/Rspack/Rsbuild/Rolldown `entry`, Rollup `input`, Vitest `setupFiles`/`globalSetup`, and Drizzle `schema` benefit from the same evaluation. (Closes [#604](https://github.com/fallow-rs/fallow/issues/604).)
+
+- **CLI dependencies and local scripts invoked by Playwright's `webServer.command` are no longer reported as unused.** Before, fallow read a Playwright config's imports and `globalSetup` / `globalTeardown` but not `webServer.command`, so a CLI-only dev server such as `srvx --port 3000` reported `srvx` as an unused dependency, and a server script launched via `tsx scripts/e2e-server.ts` reported `scripts/e2e-server.ts` as an unused file, forcing manual `ignoreDependencies` entries. After, the Playwright plugin parses `webServer.command` in both the object form (`webServer: { command, cwd }`) and the array form (`webServer: [{ command, cwd }, ...]`) through the same shell-command parser used for `package.json` scripts: invoked npm binaries are credited as referenced dependencies, and local file arguments are seeded as reachable setup files. File paths resolve relative to the config file's directory (matching Playwright's `webServer.cwd` default), so a nested `apps/web/playwright.config.ts` resolves its scripts under `apps/web`; an explicit `webServer.cwd` overrides that base. Commands that delegate to a package manager (`npm run start`, `yarn dev`) credit nothing, since the underlying script's own dependencies are analyzed separately. Existing `globalSetup` / `globalTeardown` behavior is unchanged. (Closes [#621](https://github.com/fallow-rs/fallow/issues/621).)
+
+- **electron-vite renderer, preload, and main entries declared in `electron.vite.config.*` `build.rollupOptions.input` are now treated as entry points.** Before, the Electron plugin activated for `electron-vite` and kept `electron.vite.config.{ts,js,mjs}` alive but never parsed it, so multi-window renderer HTML entries (commonly `index: resolve(__dirname, 'src/renderer/index.html')`) were missed and the `<script src>` source trees behind them reported as `unused-files`, forcing projects to hand-list each renderer HTML file as an entry. After, the plugin reads `main` / `preload` / `renderer` `build.rollupOptions.input` (string, array, and object forms) through the shared config extractor, which evaluates path-helper calls (`resolve(__dirname, ...)`, `join(...)`, `fileURLToPath(...)`, `new URL(..., import.meta.url)`) as well as plain string literals, and seeds each value as an entry point relative to the config file (correct for monorepo subpackage configs). The static main/preload fallback globs also widen to include `.tsx`, `.jsx`, `.mts`, and `.mjs`. Crediting is scoped to declared inputs, so a renderer source file linked from no entry is still reported. (Closes [#600](https://github.com/fallow-rs/fallow/issues/600).)
+
+- **The public API of an Angular library built with ng-packagr is no longer reported as unused.** Before, a library package whose entry point is declared in `ng-package.json` (`{ "lib": { "entryFile": "src/public-api.ts" } }`) had no import edge fallow could see, because ng-packagr, not the app graph, consumes that file. So `src/public-api.ts` surfaced as an `unused-file` and the symbols it re-exports (`export { useHead } from './composables'`) as `unused-export`, forcing projects to suppress or hand-configure entries. After, the Angular plugin reads `lib.entryFile` from `ng-package.json` / `ng-package.prod.json` (defaulting to ng-packagr's documented `src/public_api.ts` when omitted), resolves it relative to the config directory, and treats it as a package entry point, so the entry file and everything reachable through its re-export chain stay alive as public API while unreachable internal files are still reported. Nested secondary-entry-point configs in the package subtree (`packages/lib/client/ng-package.json`) are scanned too. The plugin now also activates on a `ng-packagr` dependency in addition to `@angular/core`. (Closes [#606](https://github.com/fallow-rs/fallow/issues/606).)
+
+- **A `name` member declared on a native `Error` subclass is no longer reported as an unused class member.** Before, `class DomainError extends Error { name = "DomainError" }` surfaced `DomainError.name` as `unused-class-member`, because the override is consumed by the runtime and by string comparisons on caught errors (`err.name === "DomainError"`) rather than by a static member access fallow can see; adopters worked around it with `usedClassMembers: [{ extends: "Error", members: ["name"] }]`. After, fallow treats `name` as runtime-used on any class whose heritage reaches a native ECMAScript error constructor (`Error`, `TypeError`, `RangeError`, `SyntaxError`, `ReferenceError`, `EvalError`, `URIError`, `AggregateError`), directly or transitively through a local/imported subclass, reusing the existing heritage resolution. The rule is heritage-scoped: an ordinary `class Person { name = "x" }` still reports an unused `name`, and non-`name` members on error subclasses still report. (Closes [#620](https://github.com/fallow-rs/fallow/issues/620).)
+
+- **SvelteKit `.remote.ts` / `.remote.js` files and their remote functions no longer report as unused.** Before, SvelteKit 2.27+ remote functions (`export const getPosts = query(...)`, plus `command` / `form` / `prerender`) are invoked through framework-generated client/server bindings that fallow's import graph cannot see, so a remote file reached only through those bindings surfaced as an `unused-file` and its exported functions as `unused-export`, forcing projects to add manual entry config or `fallow-ignore` suppressions. After, the SvelteKit plugin treats `src/**/*.remote.{ts,js}` as an entry surface and credits all of their exports, so the files and their user-named remote functions stay reachable (including under `--include-entry-exports`), while import edges for dependencies used inside remote files are preserved. Scoping is by the `.remote.` double-extension, so ordinary modules and a genuinely-unused non-remote file are still reported. (Closes [#611](https://github.com/fallow-rs/fallow/issues/611).)
+
+- **Repeated workspace and plugin diagnostics on stderr are now aggregated instead of printed once per directory.** Before, a monorepo with a broad workspace glob (such as `playground/**` or `packages/**/__tests__/**`) emitted one warning line for every matched directory that lacked a `package.json`, producing hundreds to thousands of near-identical lines that dwarfed the actual JSON result under `--format json --quiet` in agent and CI workflows. After, those `Glob '<pattern>' matched ... no package.json` warnings collapse to one summary line per glob pattern with a count and a few example paths, missing `tsconfig.json` `references[]` entries collapse to one summary line, the "run `astro sync` / `nuxt prepare`" prerequisite hints emit once per framework per run, and the "skipped entry point outside project root" summary no longer repeats the same out-of-root binary once per workspace package. The structured `workspace_diagnostics[]` array in JSON output is unchanged and still lists every diagnostic; only the stderr surface is bounded. Thanks for the report. (Closes [#637](https://github.com/fallow-rs/fallow/issues/637).)
+
+
+
+- **Vitest `test.alias` / `resolve.alias` are now recognized in `vite.config.*`, in `test.projects[*]`, and in `vitest.workspace.*` files.** Before, fallow parsed `test.alias` only from a top-level `vitest.config.*` (and `test.projects[*].test.alias`), so three common shapes still produced false `unresolved-import` / `unlisted-dependency` / `unused-export` findings: the Vitest config embedded in `vite.config.ts` (`defineConfig({ test, resolve })`), project-level `resolve.alias` mocks, and the `defineWorkspace([...])` array file. After, both the Vitest and Vite plugins share one extraction path that covers `test.alias` and `resolve.alias` at the top level and per `test.projects[*]`, plus each element of a `vitest.workspace.{ts,js}` array file. A directory alias such as `@` -> `path.resolve(__dirname, 'src')` is distinguished from a package-to-package alias (`'lodash-es'` -> `'lodash'`) by a deterministic, filesystem-free check (a path-builder or `./`-prefixed replacement is a path; a bare string literal is a package), so results are identical across sparse checkouts, Docker layers, and published tarballs. Top-level `resolve.alias` in `vite.config.*` keeps its existing path-alias-only behavior to avoid changing non-test Vite projects, and config shapes that cannot be read statically (`mergeConfig(...)`, imported-and-spread base configs) are reported under `RUST_LOG=debug`. (Refs [#601](https://github.com/fallow-rs/fallow/issues/601).)
+
+- **Iconify icon-set packages used through static icon strings are no longer reported as unused dependencies.** Before, an `@iconify-json/<prefix>` package (e.g. `@iconify-json/jam`) consumed only through a build-time icon name like `<Icon name="jam:github" />` or `<List icon="ic:round-home" />` had no JavaScript import, so it surfaced as an unused dependency and projects had to add it to `ignoreDependencies`. After, fallow scans markup (`.astro`, `.tsx`, `.jsx`, `.svelte`, `.vue`, `.html`, `.mdx`) for static `icon=` / `name=` props whose value is a `<prefix>:<name>` icon string, maps each prefix to `@iconify-json/<prefix>`, and credits it as referenced. Crediting is gated on the project declaring an Iconify-ecosystem dependency (`astro-icon`, `unplugin-icons`, `@iconify/*`, `@iconify-json/*`, `@iconify-icons/*`), and only ever exempts a declared package from the unused report, so it can never introduce a finding. Dynamic bindings (`:name=`, `name={expr}`) and icon names referenced only from plain JavaScript/TypeScript data objects (`icon: "mdi:home"`) remain out of scope. Thanks [@nicolas-deyros](https://github.com/nicolas-deyros) for the report. (Closes [#608](https://github.com/fallow-rs/fallow/issues/608).)
+
+- **k6 load-test scripts now act as runtime entry surfaces without manual config.** Before, a project with `load/smoke.k6.js` could report the load-test script as an unused file and imports such as `k6/http` as dependency noise unless users hand-wrote entry and ignore rules. After, a built-in k6 plugin activates from the `k6` package or discovered `*.k6.{js,ts,mjs,cjs,mts,cts}` files, treats those scripts as test entry points, credits the `k6` CLI dependency when package scripts invoke `k6 run`, and classifies the exact `k6` / `k6/*` runtime namespace as provided by k6 while leaving similar packages such as `k6-tools` untouched. (Closes [#625](https://github.com/fallow-rs/fallow/issues/625).)
+
+- **Supabase Edge Function files and Deno `jsr:` / `npm:` imports no longer report as false unused, unresolved, or unlisted findings.** Before, Deno-runtime imports inside `supabase/functions/**` (`jsr:@std/path`, `npm:@supabase/supabase-js`, `https://esm.sh/...`) surfaced as unresolved imports or bogus unlisted dependencies such as `jsr:@std`, and each function's `index.ts` reported as an unused file because the Node app graph never imports it, so projects resorted to ignoring the whole functions directory. After, `jsr:` and URL specifiers resolve as external runtime imports, `npm:<pkg>@version` normalizes to its npm package (crediting a declared dependency, and never reported as unlisted when a package is used only via `npm:`), and a built-in Supabase plugin marks `supabase/functions/*/index.{ts,tsx,js,jsx,mts,mjs,cts,cjs}` as runtime entry roots while crediting the `supabase` CLI as a tooling dependency. Shared `_shared` code stays reachable through relative imports, so genuinely-orphaned files still report. (Closes [#624](https://github.com/fallow-rs/fallow/issues/624).)
+
+- **Class methods reached through a `new Class().method()` receiver no longer report as unused class members.** Before, a method called on a freshly-constructed instance, either directly (`new Repo(client).search(data)`) or through a fluent chain (`new OptionBuilder().addDefault(x).addFromCli(y).build()`), was not traced, so the method surfaced as `unused-class-member` and adopters had to add inline `fallow-ignore` comments or hand-maintain `usedClassMembers`. After, fallow credits the method on the constructed class for both shapes, extending the static-factory chain credit from #387 to constructor roots. The #387 safety check still applies: a method reached only after a non-self-returning chain step is not credited, and genuinely-unused members on the same class are still reported. (Closes [#605](https://github.com/fallow-rs/fallow/issues/605).)
+
+- **Vitest `test.alias` mock and virtual-module consumers are no longer false positives.** Before, the Vitest plugin ignored `test.alias` (which Vitest merges with Vite's `resolve.alias` when running tests), so imports that only resolve through a test alias (a virtual module such as `vscode` mapped to a local mock) surfaced as `unresolved-import` / `unlisted-dependency`, and `__mocks__` files aliased to mock a real package had their exports reported `unused-export` and removed by `fallow fix`. After, the plugin extracts `test.alias` (object and array forms, including `test.projects[*].test.alias`, and `resolve(...)` / `new URL(...)` / `new URL(...).pathname` / `fileURLToPath(...)` replacements): the alias is registered so virtual-module imports resolve, the local mock file is kept reachable with its exports credited even when the real package resolves through `node_modules`, and a bare-package alias key stays credited as a referenced dependency so redirecting its import does not regress into a false `unused-dependency`. Package-to-package aliases (`'lodash-es'` to `'lodash'`) credit both packages without emitting a path alias. RegExp keys and function replacements are not supported (a syntactic analyzer cannot evaluate them). (Closes [#601](https://github.com/fallow-rs/fallow/issues/601).)
+
+### Changed
+
+- **Security posture unchanged. Binary verification moved from `npm install`'s `postinstall` hook to first-run inside `fallow`, `fallow-lsp`, and `fallow-mcp`.** The Ed25519 signature check + SHA-256 digest cross-check that fallow has shipped since v2.65 is preserved bit-for-bit: same hardcoded public key, same offline `fallowDigests` lookup, same fail-closed behavior on tamper. What changed is the trigger. A small JSON sentinel next to the platform binary (or under `$XDG_CACHE_HOME/fallow/sentinels/` when the platform pkg dir is read-only) caches the verified state so subsequent invocations skip verification on a cache hit. The sentinel binds to the resolved install dir AND records a SHA-256 of each binary's bytes, so two installs of the same package version sharing the fallback cache cannot ride each other's verified state, and a tampered binary that happens to preserve the recorded mtime is still caught on cache hit. `fallow --version` now emits a trailing `verified: yes (<sentinel-path>)` line so vendor questionnaires can confirm the integrity posture in one command. The change removes the dependency on npm install scripts ahead of [npm RFC 868](https://github.com/npm/rfcs/pull/868) ([npm/cli#9360](https://github.com/npm/cli/pull/9360)) Phase 2, which will block postinstall hooks by default unless consumers add fallow to their `package.json#allowScripts`. The GitHub Action installer runs its own independent verification step that is unaffected. The lazy first-run model is stronger than the npm-tarball-shasum-only baseline used by most Rust/Go npm wrappers (esbuild verifies SHA-256 only on its HTTP fallback path; biome, oxlint, rolldown, turbo, rspack, swc, and tailwindcss-oxide ship no in-package binary verification at all). `FALLOW_SKIP_BINARY_VERIFY=1` remains the documented operator escape and now emits a warn-once stderr line on every invocation where the skip is active, so the bypass stays visible in CI logs and vendor audits independent of `fallow --version`. New `FALLOW_VERIFY_LOG=1` opt-in emits one structured stderr line per outcome for CI debugging; new `FALLOW_VERIFY_CACHE_DIR=<path>` lets read-only-platform-pkg-dir consumers (yarn PnP, Docker layered images, pnpm verify-store) redirect the sentinel to a writable location. See SECURITY.md for the updated verification-surfaces table.
+
+- **`--performance` now annotates the parallel parse stage and stops showing misleading `0.0ms` for reused stages.** Before, the `parse/extract` line showed only wall-clock time, so a stage that finished in 380ms could be hiding far more CPU spent parsing in parallel across cores, and in combined mode (`fallow` with no subcommand) the health breakdown printed `discover files: 0.0ms` / `parse/extract: 0.0ms` because those stages were reused from the dead-code pass, leaving a table whose rows did not reconcile with `TOTAL`. After, the `parse/extract` line gains a `(parallel: ~Nms CPU)` suffix reporting the summed parse CPU across rayon workers (shown only when the stage cleared a small floor and the parse work was genuinely parallel, so warm or trivial runs stay quiet), the reused health stages read `(measured above)` pointing at the Pipeline Performance box, and both breakdowns gain an `(other)` row so the sequential stages sum to `TOTAL`. In combined mode (`fallow` with no subcommand) the `duplication` stage runs concurrently with the rest of the pipeline, so it is marked `(concurrent)` and shown for reference rather than folded into `TOTAL`. The `--performance --format json` output gains `parse_cpu_ms` (on the pipeline and health timings) and `shared_parse` (on the health timings); both are observational and vary run to run, so do not gate CI on them. (Closes [#481](https://github.com/fallow-rs/fallow/issues/481).)
+
+### Fixed
+
+- **`fallow fix` no longer auto-removes unused exports inside mock, e2e, and fixture directories, where consumers are often invisible to static analysis.** Before, `fallow fix --yes` stripped the `export` keyword from every export reported as unused, including symbols consumed only through paths fallow's graph cannot see (Vitest mock aliases, off-workspace e2e suites, generated or fixture build steps). That turned an analysis false positive into a source-level break: the export was real, so removing it broke `tsc` and the build. After, `fallow fix` withholds export removals in two low-confidence cases: files under an off-graph consumer directory (`__mocks__`, `__fixtures__`, `fixtures`, `e2e`, `e2e-tests`, `cypress`, `playwright`, `examples`, `evals`, `golden`), and files that themselves have an unresolved import (their local usage graph is incomplete). The exports are still reported by `fallow check`, so you can review and remove them by hand. High-confidence exports in normal source files continue to be removed exactly as before. JSON output gains a `skipped_low_confidence_exports` count plus per-entry `skip_reason` values (`low_confidence_off_graph`, `low_confidence_unresolved_imports`); because the skip is intentional, it does not change the exit code. (Closes [#602](https://github.com/fallow-rs/fallow/issues/602).)
+
+- **Mintlify docs content and the `mint` CLI no longer report as unused.** Before, Mintlify documentation sites (driven by `docs.json` / `mint.json` and rendered by the `mint` / `mintlify` CLI) had no plugin, so MDX pages surfaced as unused files and the CLI dependency needed manual `dynamicallyLoaded` / `ignoreDependencies` config. After, a built-in Mintlify plugin activates from the `mint` / `mintlify` dependency or the presence of `docs.json` / `mint.json`, keeps those config files reachable, credits `mint` and `mintlify` as tooling dependencies, and marks `{md,mdx}` under the config file's directory as runtime-used. The content pattern is scoped to the docs root (workspace packages are prefixed from the monorepo root), so non-Mintlify MDX elsewhere stays governed by other plugins. (Closes [#626](https://github.com/fallow-rs/fallow/issues/626).)
+
+## [2.81.0] - 2026-05-26
+### Fixed
+
+- **`node:sqlite` and other mandatory-`node:`-prefix builtins are no longer reported as unlisted dependencies or unresolved imports.** Before, fallow stripped the `node:` prefix and checked the remainder against a fixed builtin list that omitted `sqlite` and `sea`, so `import 'node:sqlite'` could surface as an unlisted dependency, forcing projects to add it to `ignoreDependencies`. After, the mandatory-`node:`-prefix family (`node:sqlite`, `node:sea`, `node:test`, `node:test/reporters`) is recognized as a platform builtin only when written with the `node:` prefix. The bare forms (`sqlite`, `sea`, `test`, `test/reporters`) are now treated as ordinary npm packages, because Node refuses to resolve these modules without the prefix and real npm packages share those names. This means a bare `import 'test'` is no longer classified as a builtin. (Closes [#627](https://github.com/fallow-rs/fallow/issues/627).)
+
+- **Lexical custom node lifecycle methods no longer report as unused class members.** Before, classes extending `DecoratorNode`, `ElementNode`, or `TextNode` surfaced their framework-invoked methods (`getType`, `clone`, `createDOM`, `updateDOM`, `decorate`, and the rest of the serialization and DOM lifecycle) as `unused-class-member`, because Lexical calls them reflectively at runtime and local code never references them directly. After, a built-in `lexical` plugin (active when `lexical` or any `@lexical/`-scoped package is a dependency) credits these methods via heritage-scoped rules: the shared lifecycle set on all three node bases, `isInline` on `ElementNode` and `DecoratorNode`, and `decorate` on `DecoratorNode`. Non-lifecycle methods on a node subclass are still reported, so genuinely dead members continue to surface. This removes the need for the manual scoped `usedClassMembers` allowlist. (Closes [#628](https://github.com/fallow-rs/fallow/issues/628).)
+- **Scaffold template package assets no longer report as unused files.** Packages that publish runtime-copied template or scaffold directories through `package.json#files` now treat conservative entries such as `template-*`, `templates/**`, and `scaffolds/*` as support entry points, including workspace packages in monorepos. Generic publish entries such as `dist`, `index.js`, and `README.md` remain ignored so unrelated orphan source still reports normally. (Closes [#635](https://github.com/fallow-rs/fallow/issues/635).)
+
+- **RedwoodSDK worker entrypoints no longer require broad dynamic-load suppressions.** Before, `rwsdk/vite` apps could report `src/worker.tsx` and files only imported through that worker as unused unless users marked the whole app dynamically loaded. After, a built-in RedwoodSDK plugin activates from the `rwsdk` dependency and keeps `src/worker.{ts,tsx,js,jsx,mts,mjs}` reachable within that workspace while leaving Vite config parsing to the existing Vite plugin. Plain Vite sibling workspaces do not inherit the worker convention. (Closes [#632](https://github.com/fallow-rs/fallow/issues/632).)
+
+- **Wuchale config files no longer report as unused in active Wuchale projects.** Before, `wuchale.config.js`, adapter packages imported only from that config, and custom JavaScript config files referenced through `@wuchale/vite-plugin`'s static `configFile` option could surface as unused. After, the Wuchale plugin activates from `wuchale`, `@wuchale/vite-plugin`, or a documented `wuchale.config.js`; keeps those config files reachable at the root or inside workspaces; credits config imports/requires such as `wuchale` and `@wuchale/svelte`; treats `wuchale` and `@wuchale/vite-plugin` as tooling dependencies; and follows static Vite `configFile` references only when they point at JavaScript modules. Unsupported `wuchale.config.ts` files and dynamic `configFile` values remain reportable. (Closes [#631](https://github.com/fallow-rs/fallow/issues/631).)
+
+- **`fallow ci reconcile-review` now applies stale review cleanup coherently and fail-fast.** Before, reconcile plans and provider apply state were passed separately, and GitHub / GitLab mutation failures could leave later stale fingerprints partially attempted after an earlier deletion race, 403, or GraphQL resolve error. After, the apply path borrows the loaded provider state through a typed `PlannedReconcile`, stages and preflights provider targets before mutation, stops on the first apply failure, and reports `apply_hint`, `failed_fingerprints`, and `unapplied_fingerprints` in the JSON output while preserving the existing `apply_errors` array. (Closes [#459](https://github.com/fallow-rs/fallow/issues/459).)
+
+- **`fallow watch` now debounces directly and recovers when the watched root disappears.** Before, the watcher delegated debouncing to `notify-debouncer-mini`; when a project directory was moved, deleted, or recreated, the watch loop could keep stale handles and stop reacting reliably. After, fallow uses raw `notify` events with an internal quiet-window debouncer, filters events through the same source/config, production, `ignorePatterns`, nested `.gitignore`, and `.git/info/exclude` rules as discovery, drops ignored config files, and explicitly detaches until the root comes back before reloading config and reattaching. Root lifecycle notices are suppressed under `--quiet`. (Closes [#456](https://github.com/fallow-rs/fallow/issues/456).)
+
+- **`fallow coverage setup` now resumes safely after interruption.** Human setup runs persist step progress in `.fallow/setup.json`, guard concurrent runs with `.fallow/setup.lock`, validate recorded license, sidecar, and recipe state against the current project before skipping work, and write both state and `docs/collect-coverage.md` atomically. JSON planning mode remains read-only and does not create `.fallow/`, locks, or recipe files. (Closes [#460](https://github.com/fallow-rs/fallow/issues/460).)
+
+- **Ownership-aware health hotspots now emit coherent ownership state and collision-safe handles.** Before, a CODEOWNERS-covered hotspot could report both `unowned: false` and `drift: true`, leaving humans, dashboards, and agents to guess whether to update CODEOWNERS or route review to the declared owner. Default handle mode could also collapse different authors such as `alice@contractor.io` and `alice@company.com` into the same `alice` identifier. After, ownership metrics include a required `ownership_state` discriminator (`active`, `unowned`, `declared_inactive`, or `drifting`), declared owners suppress vague git-history drift only when fallow can match them to an active contributor offline, and same-handle author collisions gain deterministic domain suffixes. The new `--ownership-emails anonymized` spelling mirrors the privacy intent of stable `xxh3:` pseudonyms while the existing `hash` spelling remains accepted for compatibility. (Closes [#478](https://github.com/fallow-rs/fallow/issues/478).)
+
+- **Programmatic and Node analyses now keep per-call thread and diff scope.** Before, Rust API and N-API callers could drift behind CLI globals such as `--diff-file`, and embedded analyses configured Rayon through the process-wide pool, so the first call could pin thread count for later concurrent requests. After, programmatic options expose `diff_file`, N-API exposes `diffFile`, each call builds its own Rayon pool with the same 16 MiB worker stack, and `check`, `dupes`, and `health` can receive an explicit per-call diff index instead of relying on the CLI startup cache. (Closes [#469](https://github.com/fallow-rs/fallow/issues/469).)
+
+- **Fallow cloud API calls now honor server rate-limit backoff, parse error envelopes consistently, and support custom CA bundles.** `fallow coverage upload-source-maps` now retries only network failures, HTTP 429, and HTTP 502/503/504; 429 responses honor `Retry-After` delta seconds and HTTP-date values, capped at 60 seconds. Malformed JSON error bodies are reported with the raw response snippet plus a parse-failure note instead of being silently treated as an empty envelope. Set `FALLOW_CA_BUNDLE=/path/to/bundle.pem` to replace the default WebPKI trust roots for fallow cloud HTTP calls with one or more PEM certificates from that file; relative paths are resolved from the current working directory. Because ureq's stable custom-root API uses the provided certificate set as the full trust store, corporate proxy setups should pass a complete bundle containing public roots plus the private CA, not only the private CA. `coverage upload-source-maps` now exits 7 for setup or transport failures that prevent every upload, while mixed per-map failures still exit 1. (Closes [#464](https://github.com/fallow-rs/fallow/issues/464).)
+
+- **Oxlint `jsPlugins` packages no longer report as unused dependencies.** Before, packages loaded only through Oxlint's `jsPlugins` config, such as `eslint-plugin-testing-library`, `eslint-plugin-playwright`, and `eslint-plugin-sonarjs`, could surface as unused devDependencies because fallow only treated `oxlint` itself as tooling. After, the Oxlint plugin parses `jsPlugins` from `.oxlintrc.json`, `oxlint.json`, and `oxlint.config.ts`, credits string entries and alias-object `specifier` values as referenced package dependencies, and treats relative plugin files as support entry files. Built-in Oxlint `plugins` names such as `typescript`, `vitest`, and `unicorn` are still ignored for npm dependency credit. Thanks [@pasTa4667](https://github.com/pasTa4667) for the patch. (Closes [#607](https://github.com/fallow-rs/fallow/issues/607).)
+
+- **OpenCode project plugins no longer report as unused files or dependencies.** Before, projects that load automation through OpenCode could see `.opencode/plugins/*` modules, `@opencode-ai/plugin`, and npm plugins declared only in `opencode.json` reported as unused because those files are loaded by OpenCode instead of application imports. After, a built-in OpenCode plugin activates from `opencode.json`, `.opencode/`, or `@opencode-ai/*`; traverses `.opencode`; treats `.opencode/plugins/**/*.{js,ts,mjs,cjs,mts,cts}` as support entry files; keeps `opencode.json` and `.opencode/package.json` reachable; and credits string or tuple npm plugin entries from `opencode.json#plugin` as referenced dependencies. Local, absolute, protocol-like, and backslash-containing plugin specifiers are ignored for package credit so unrelated control dependencies still report normally. (Closes [#629](https://github.com/fallow-rs/fallow/issues/629).)
+
+- **Re-export source edges now participate in resolver dependency diagnostics.** Before, unresolved `export { x } from "./missing"` and `export * from "./missing"` sources were skipped by `unresolved-import`, and package re-exports such as `export { default as pad } from "left-pad"` could fall back to `package.json:1` style locations in unlisted-dependency reporting. After, re-export sources share the same resolved source-edge path as static and literal dynamic imports, so missing re-export sources report as unresolved imports and package re-exports report their actual source line. Package `imports` / `exports` array targets also preserve fallback order, and package `imports` entries that target external packages credit the target dependency. Thanks [@M-Hassan-Raza](https://github.com/M-Hassan-Raza) for the patch. (PR [#666](https://github.com/fallow-rs/fallow/pull/666).)
+
+### Internal
+
+- **MCP tool descriptions now have a default-value drift gate.** The MCP server tests runtime-coverage defaults mentioned in tool descriptions against the CLI-side source of truth, including clap defaults and sidecar spec defaults, so `tools/list` prose used by AI agents fails CI when those values drift. (Closes [#455](https://github.com/fallow-rs/fallow/issues/455).)
+
+- **Fallow now dogfoods its shipped JavaScript and TypeScript surfaces in CI.** The main CI workflow builds the fallow binary and runs `fallow dead-code --format json --quiet` against `editors/vscode` and `npm/fallow` on relevant pull requests and every push to `main`. Per-surface configs mark VS Code's public generated type re-export surface and npm's platform-package wrapper shape explicitly, and the previously exported but unused `fetchReleaseDigest` helper is no longer part of the npm wrapper's CommonJS surface. The README now advertises that fallow self-analyzes its JS/TS code. (Closes [#483](https://github.com/fallow-rs/fallow/issues/483).)
+
+- **Extraction cache structs now fail loudly when their size changes without review.** `CachedModule`, its nested cache structs, and external extract element types persisted inside the cache have compile-time size assertions next to the cache type definitions. A future cache-shape edit that changes type sizes now fails the build until the contributor decides whether `CACHE_VERSION` must be bumped and updates the assertion values. (Closes [#443](https://github.com/fallow-rs/fallow/issues/443).)
+
+## [2.80.0] - 2026-05-24
+
+### Added
+
+- **Inline review comments can include optional rule guidance.** Set `FALLOW_REVIEW_GUIDANCE=true` (or GitHub Action `review-guidance: true`) to append collapsed "What to do" blocks to `review-github` / `review-gitlab` comments using the existing rule guides from `fallow explain`. The default remains off so existing review bodies stay stable. `fallow/unused-type` review comments now also get the same safe one-line export-stripping suggestions as `unused-export` when the source line is directly fixable. (Closes [#659](https://github.com/fallow-rs/fallow/issues/659).)
+
+- **Sticky PR/MR summary comments can scope project-level dependency findings to the diff.** Set `FALLOW_SUMMARY_SCOPE=diff` (or GitHub Action `summary-scope: diff`) to apply the diff filter to dependency/catalog/override findings in `pr-comment-github` and `pr-comment-gitlab`. The default `all` preserves the existing behavior where sticky summaries include those project-level findings even when their fixed `package.json` or workspace-manifest anchor line is outside the diff. Inline review comments are unaffected. (Closes [#661](https://github.com/fallow-rs/fallow/issues/661).)
+
+### Fixed
+
+- **Danger and Stryker tooling config files no longer report as unused.** Before, active Danger projects could report `dangerfile.ts` as an `unused-file`, and active Stryker projects could report root or workspace `stryker.conf.mjs`, `@stryker-mutator/core`, and config-only runner/plugin packages as unused. After, the Danger plugin keeps `dangerfile.{js,ts,mjs,cjs}` reachable and credits `danger`, while the Stryker plugin keeps documented `stryker.conf.*` / `stryker.config.*` defaults (plus fallow-compatible `ts` and `jsonc` variants) reachable, credits static config imports/requires, known runner/checker short names, and explicit package-looking plugin entries, and still leaves unrelated dev dependencies reportable. (Closes [#618](https://github.com/fallow-rs/fallow/issues/618).)
+
+- **Platform builtins no longer surface as unresolved imports.** Before, imports accepted by fallow's builtin-module predicate, such as `node:url`, `node:process`, `node:fs/promises`, `bun:sqlite`, `cloudflare:workers`, `sass:math`, and `std/path`, could still report as `unresolved-import` when the resolver produced an unresolvable filesystem target. After, unresolved-import detection skips every specifier accepted by the same `is_builtin_module` predicate used by dependency checks, while builtin-like packages such as `url-parse`, `path-browserify`, and fake `node:` subpaths still report normally. (Closes [#634](https://github.com/fallow-rs/fallow/issues/634).)
+
+- **Fumadocs MDX projects no longer report configured docs content as unused.** Before, projects that load Markdown and MDX through `source.config.*`, generated `.source` modules, and `fumadocs-mdx:*` virtual imports could surface `source.config.ts`, generated source modules, and configured docs pages as `unused-file` or report generated virtual imports as dependency noise. After, a built-in Fumadocs plugin activates from `fumadocs-mdx`, `fumadocs-core`, `fumadocs-ui`, or `source.config.*`; keeps `source.config.*` and `.source/**/*.{ts,tsx,js,jsx,mts,mjs,cts,cjs}` reachable; traverses the hidden `.source` directory; suppresses `fumadocs-mdx:*` virtual imports; credits packages imported by the source config; and extracts literal `dir` values from `defineCollections`, `defineDocs`, and direct `defineConfig({ collections })` object entries as Markdown/MDX/JSON/YAML content roots. The plugin deliberately avoids a blanket `content/**` fallback so unrelated orphan content still reports. (Closes [#633](https://github.com/fallow-rs/fallow/issues/633).)
+
+- **Wrangler config precedence now matches Wrangler's selected config file.** Before, projects with multiple sibling `wrangler.*` config files could have every `main` value credited as an entry point, so stale migration leftovers such as `wrangler.toml` could keep dead worker files alive even when Wrangler would run `wrangler.json` or `wrangler.jsonc` instead. After, fallow keeps all sibling Wrangler config files themselves used, but only reads `main` entries from the highest-precedence sibling selected by Wrangler's current order: `wrangler.json`, then `wrangler.jsonc`, then `wrangler.toml`. (Closes [#630](https://github.com/fallow-rs/fallow/issues/630).)
+
+- **MDX documentation code fences no longer create unresolved imports.** Before, `import` and `export` lines inside fenced TypeScript examples in `.mdx` files were extracted like executable top-level MDX statements, so docs snippets with virtual `// file:` boundaries could report false `unresolved-import` findings. After, fenced Markdown code blocks are skipped during MDX import/export extraction, while real top-level MDX imports continue to be analyzed. The extraction cache version is bumped so warm `.mdx` entries are re-extracted on upgrade. (Closes [#639](https://github.com/fallow-rs/fallow/issues/639).)
+
+- **Bun's bare `bun` runtime module is no longer reported as an unlisted dependency.** Before, fallow recognized `bun:*` specifiers such as `bun:sqlite` as Bun platform builtins, but still treated `import { SQL } from "bun"` and type-only imports from `"bun"` as an npm package named `bun` that had to be listed in `package.json`. After, the exact bare `bun` specifier is recognized as a Bun runtime builtin, while real packages such as `bun-types`, `@types/bun`, `bunyan`, and `bun/*` subpaths remain normal dependencies. (Closes [#642](https://github.com/fallow-rs/fallow/issues/642).)
+
+- **TanStack Start `:v` virtual modules no longer surface as unlisted dependencies.** Before, imports such as `tanstack-start-manifest:v` and `tanstack-start-injected-head-scripts:v` were treated as package names in TanStack Start projects. After, the TanStack Router / Start plugin registers those colon-prefixed runtime modules as framework virtual modules, so they are skipped by unlisted-dependency and unresolved-import reporting only when the TanStack plugin is active. Thanks [@BartWaardenburg](https://github.com/BartWaardenburg) for the report. (Closes [#636](https://github.com/fallow-rs/fallow/issues/636).)
+
+- **Node package-script and forked runner entrypoints no longer report as unused.** Package scripts such as `node scripts/process-messages` now resolve extensionless directory paths to `scripts/process-messages/index.*` after exact-file and source-extension probing. Statically resolvable local `child_process.fork()` targets from proven `node:child_process` / `child_process` imports or requires are also credited as dynamic entrypoints, including the `const runner = path.resolve(filename, "../runner.js"); fork(runner)` shape where `filename` comes from `fileURLToPath(import.meta.url)`. The extractor cache version is bumped so warm caches re-extract files with forked runner targets. (Closes [#638](https://github.com/fallow-rs/fallow/issues/638).)
+
+- **Windows CI is green again.** The Fumadocs integration test now normalizes `\\` to `/` on the `unused_files` paths it asserts against, restoring the Windows leg of `ci.yml`. No user-visible behavior change.
+
+## [2.79.0] - 2026-05-22
+
+### Added
+
+- **Ember.js / Glimmer / Embroider plugin.** New built-in plugin activates on `ember-source`, `ember-cli`, `@embroider/core`, `@embroider/compat`, or `@glimmer/component`. Whitelists the build- / CLI- / runtime-resolved tooling that no source file imports (`ember-source` itself, `ember-cli`, `ember-cli-htmlbars`, etc.) so those packages do not surface as `unused-dependency`. Packages that a modern Ember app imports directly (`@glimmer/component`, `@glimmer/tracking`, etc.) are deliberately omitted; the normal import graph credits them, and listing them in the tooling allowlist would mask real removals when a user drops the dependency. Declares scoped used-class-member rules for `Component`, `Route`, `Controller`, `Service`, `Helper`, `Modifier`, `Application`, and `Router` so framework-invoked lifecycle methods (`model`, `setupController`, etc.) are not flagged as unused on subclasses. Declares the specific `@ember/*` paths that `ember-source` exposes through the AMD loader (classic) and the Embroider rewriter (`@ember/application`, `@ember/array`, etc.) as virtual-module prefixes so they no longer surface as `unresolved-import` or `unlisted-dependency`. The list is deliberately enumerated rather than a blanket `@ember/` because parts of the `@ember/*` namespace *are* real npm packages users install explicitly (`@ember/test-helpers`, `@ember/render-modifiers`, etc.); a blanket prefix would mask legitimate missing-dep bugs when one of those is removed from `package.json`. The source of truth for the enumeration is `ember-source`'s `package.json#exports` field. Because matching is prefix-based, new subpaths under existing roots (e.g. future `@ember/object/...` additions) are covered automatically. Known gaps: bare `import Ember from 'ember'` and v1 addon subpaths like `ember-in-viewport/modifiers/in-viewport` still need `ignoreDependencies` or an inline suppression until addon-shape resolution is added (not planned). Exposes Ember's classic-layout filesystem conventions (`app/components/**`, `app/routes/**`, `app/services/**`, `tests/**/*-test.{js,ts,gjs,gts}`, `config/`, `ember-cli-build.js`, `testem.js`) as entry-point globs since the Ember resolver loads those modules by convention rather than via static `import`. Scoped to strict-mode Ember apps and v2 addons: classic v1 addon layouts (`addon/`, `addon-test-support/`) are intentionally out of scope because they predate strict-mode `.gts` / `.gjs` and gain nothing from the plugin's value-adds; v1-addon maintainers can declare those paths via `entry` in their fallow config. `.gts` / `.gjs` single-file components were already parseable thanks to the existing `<template>`-stripping helper; tracking imports referenced only inside `<template>` blocks (and inside co-located `.hbs` templates) is intentionally deferred, which will extend the same scaffolding with `sfc_template`-style scanning. Thanks [@mike-engel](https://github.com/mike-engel) for the plugin (PR [#369](https://github.com/fallow-rs/fallow/pull/369)).
+- **Glimmer `<template>` blocks credit imported-binding usage in `.gts` / `.gjs`.** Imports referenced only inside a `<template>...</template>` block are no longer flagged as `unused-import`: PascalCase tag invocation (`<HelloWorld />`), mustache helper (`{{capitalize x}}`), triple-stash helper (`{{{formatHtml body}}}`), sub-expression helper (`{{if (and a b) "y" "n"}}`), element modifier (`{{on "click" handle}}`), and dotted reference (`{{utils.formatDate value}}`) are all credited. Handlebars/Glimmer built-in keywords (`if`, `unless`, `each`, `let`, `yield`, etc.), `this.*` chains, `@arg` references, and named-argument keys are never resolved as imports. Block-parameter introductions (`as |item index|`) are accumulated as template-scope locals so they shadow same-named imports. Co-located `.hbs` templates remain a known limitation: imports referenced only inside a sibling `.hbs` file still surface as unused on the sibling `.js`/`.ts`; the plugin's `entry_patterns` keep the JS sibling reachable as a file, and migrating to `.gts` removes the limitation entirely. The extraction cache (`CACHE_VERSION` bumped to 95) invalidates automatically on upgrade so warm `.gts` / `.gjs` entries are re-extracted with template-visible import usage.
+
+### Fixed
+
+- **React Router v7 and Remix generated `./+types/*` route modules no longer surface as unresolved imports when the generated files are absent from a clean checkout.** Before, route modules using `import type { Route } from "./+types/root"` reported false-positive `unresolved-import` findings because those modules are produced by the framework's typegen step and are often gitignored. After, the React Router and Remix plugins declare `./+types/` as a generated type-import prefix. The suppression is plugin-gated and type-only, so runtime imports under the same prefix still report normally. (Closes [#645](https://github.com/fallow-rs/fallow/issues/645).)
+
+- **JSX resource attributes no longer report as unresolved imports.** Before, generic TSX metadata such as `<link rel="stylesheet" href="style-a.css" />`, `<link rel="modulepreload" href="/vendor.js" />`, and `<script src="./script-a.js" />` emitted synthetic side-effect imports, so serializer tests in projects like Hono produced large false `unresolved-imports` clusters for runtime HTML literals. After, generic JSX resource attributes are ignored by default, while HTML files and bare `html` tagged-template asset scanning keep their existing graph edges. The extraction cache version is bumped so warm caches drop stale JSX resource edges. (Closes [#640](https://github.com/fallow-rs/fallow/issues/640).)
+
+- **Combined human summaries are less repetitive, and `fallow explain` accepts issue labels with spaces.** Before, `fallow --summary` in human mode could print both a section header and the summary renderer's own title for the same analysis, and combined runs could repeat the `loaded config:` notice once per analysis phase. After, combined summary sections keep their high-level headers without duplicating titles, config-load notices are deduped per config file, and `fallow explain unused files` / `fallow explain code duplication` work the same as the existing hyphenated spellings.
+
+- **Public class members exposed through non-private package entry points are no longer reported as removable internals.** Library-style packages that re-export builder or database classes from `package.json` entry points (`main`, root `exports`, or subpath `exports`) previously reported every uncalled public method as `unused-class-member`, even though those methods are part of the consumer API. `find_unused_members` now treats classes reached from an actual non-private package entry point re-export, from the transitive `export *` closure rooted at one, or from `src/**/index.*` source subpath indexes in packages with no `exports` map as public API and skips class member findings for those exports. The skip is limited to class methods/properties, so enum member behavior, private app packages, and internal reachable classes are unchanged. Covers renamed re-exports, default-as-named re-exports, source-first root `index.js` fallbacks, package subpath exports, exportless source subpath indexes, and multi-hop star barrels. (Closes [#643](https://github.com/fallow-rs/fallow/issues/643).)
+
+- **Workspace and self package imports that point at missing prebuild output now resolve back to source.** Before, packages such as Nitro and Redux Toolkit could report false `unresolved-imports`, `unlisted-dependencies`, `unused-dependencies`, and `unused-files` when `package.json` `imports` or `exports` selected `dist` targets before a build had run. After, fallow uses the nearest package manifest for `#...` imports and known root/workspace package manifests for self or workspace package specifiers, maps project-relative output targets back to tracked `src` candidates, and preserves dependency usage metadata when those package imports resolve to internal source files. Unmatched hash aliases, missing source targets, undeclared workspace imports, and unrelated unused files still report. (Closes [#641](https://github.com/fallow-rs/fallow/issues/641).)
+
+- **Cloudflare Workers, Content Collections, and Node `module.register()` loaders no longer surface as false positives.** Three convention-driven shapes were previously reported as `unused-file` / `unused-export` because fallow had no static way to follow them. After: (1) Cloudflare Workers projects with `"main": "src/worker.tsx"` (or any `env.<name>.main` override) in `wrangler.{toml,json,jsonc}` keep that worker entry alive; the static glob also widens to `src/{index,worker}.{ts,tsx,js,jsx,mts,mjs}` so JSX worker entries from rwsdk, React Router worker, and Hono on Workers stay reachable without reading the config. (2) Content Collections projects (`@content-collections/{core,vite,next,solid-start,remix-vite,qwik,vinxi}`) keep their root `content-collections.{ts,tsx,js,jsx,mts,mjs,cts,cjs}` config alive, and the `@content-collections/*` packages stay credited as tooling deps. The plugin activates when any framework integration is a direct dep, so the common case of installing only `@content-collections/vite` (with `core` arriving transitively) still works. (3) Node `module.register('./hooks/loader.ts', import.meta.url)` calls (or the `register(url)` form where `url` is bound to `new URL('./loader.ts', import.meta.url)`, including the conditional `condition ? srcUrl : distUrl` shape) now credit the loader file's hook exports: the current `initialize` / `resolve` / `load` / `globalPreload` set plus the legacy `getFormat` / `getSource` / `transformSource` for projects still on older Node. The extraction cache version is bumped, so users on warm caches will see a one-time re-extract on first run after upgrading. Thanks [@M-Hassan-Raza](https://github.com/M-Hassan-Raza) for the patch. (Closes [#588](https://github.com/fallow-rs/fallow/issues/588), [#589](https://github.com/fallow-rs/fallow/issues/589), [#590](https://github.com/fallow-rs/fallow/issues/590).)
+
+- **Playwright `extend()` fixture helpers are credited as used class members.** Before, helper classes referenced only as Playwright fixtures (`test.extend({ helper: async ({}, use) => use(new MyHelper(page)) })`) had every public method reported as `unused-class-member` because the visitor only tracked direct call expressions, not the property-access shape that fixture consumers use (`await helper.click('button')`). After, the AST visitor's class-member usage tracker credits identifier references to fixture-bound helper classes the same way it credits direct invocations, so Playwright Page Object Model patterns no longer surface false-positive removable-internal findings.
+
+- **HTML asset scanner skips build-time template-placeholder specifiers.** `<script src="{{rootURL}}assets/app.js">` (Ember's `app/index.html`), `<script src="###APPNAME###/...">` (ember-cli blueprint scaffolds), and the equivalent shapes from any other framework that embeds Handlebars / Mustache / Jinja2 / pre-compiled Vue or Angular template syntax inside checked-in HTML are filtered at extraction time instead of being seeded as unresolvable specifiers that surface as `unresolved-import`. `{{` and `###` are never valid characters in a real `<script src>` / `<link href>` path, so the filter is generic across template engines rather than gated on a plugin. Applies to `<script src>`, `<link rel="stylesheet" href>`, and `<link rel="modulepreload" href>`.
+
+## [2.78.1] - 2026-05-22
+
+### Fixed
+
+- **Windows clippy on `main` is green again.** The pre-existing `#[expect(dead_code)]` annotation on `ScopedChild::id` was unfulfilled on Windows because the function is `pub` in a `pub mod`, so rustc never flags it as dead under `-D warnings`. Switched to `#[allow]` which tolerates the lint not firing, restoring the Windows leg of `ci.yml`. No user-visible behavior change.
+
+- **`npm install fallow` postinstall no longer fails on shared-IP CI runners with `digest-unavailable`.** Before, the postinstall verifier fetched each platform binary's expected SHA-256 from the unauthenticated GitHub release API (`api.github.com/repos/fallow-rs/fallow/releases/tags/v<version>`), so pooled CI IPs (Buildkite, GHA shared runners, internal build clusters) routinely exceeded the 60 req/hr unauthenticated limit and `pnpm install --frozen-lockfile` aborted with `fallow: binary verification failed ... (digest-unavailable): GitHub release API returned HTTP 403: API rate limit exceeded`. After, the release workflow's `npm-prep` job computes the SHA-256 of every binary inside each `@fallow-cli/<platform>` package and writes it into the platform package's `package.json` under `fallowDigests`. `verify-binary.js` reads that embedded value first and only falls back to the GitHub API for platform packages published before v2.78.1 that do not yet carry the field, so steady-state installs perform zero network calls during digest verification. The Ed25519 signature layer and the `FALLOW_SKIP_BINARY_VERIFY` escape hatch are unchanged. (Closes [#597](https://github.com/fallow-rs/fallow/issues/597).)
+
+## [2.78.0] - 2026-05-22
+
+### Added
+
+- **`fallow flags` default SDK detector list expanded to PostHog, Vercel Flags, ConfigCat, Optimizely, and Eppo.** Before, the built-in detector set covered LaunchDarkly, Statsig, Unleash, and GrowthBook only; teams using any of the five additional providers had to wire up `flags.sdkPatterns` manually in `.fallowrc.json` or accept zero detections. After, every project running `fallow flags` (or the bare `fallow` combined pipeline with the flags rule on) picks up flag usage from those five SDKs out of the box, matching the call-shape conventions each library publishes (`posthog.isFeatureEnabled('flag-name')`, `useFlag('flag-name')` and `getFlag('flag-name')` for `@vercel/flags`, `configcatClient.getValueAsync('flag-name', default)`, `optimizely.isFeatureEnabled('flag-name')`, `eppoClient.getStringAssignment('flag-name', subject, default)`). User-authored `flags.sdkPatterns` still apply on top of the expanded built-in set, so existing custom detectors continue to win when they overlap. (Closes [#563](https://github.com/fallow-rs/fallow/issues/563).)
+
+- **`--explain` now works in human output and in combined-mode JSON, not just subcommand JSON.** Before, `--explain` was a documented top-level flag promising "Include metric definitions and rule descriptions in output" but it only fired on the subcommand+JSON path (`fallow dead-code --explain --format json`, etc.); every other invocation (`fallow --explain`, `fallow --explain --format json`, `fallow dead-code --explain` human, `fallow health --explain` human, `fallow dupes --explain` human, plus the combined-mode variants) produced output byte-identical to the same invocation without the flag. After, the human renderers each gain a `Description:` line under each rule / metric with the prose pulled from `crates/cli/src/explain.rs::{CHECK_RULES, HEALTH_RULES, DUPES_RULES}`, and combined-mode JSON gains a top-level `_meta` field aggregating the per-analysis `_meta` blocks so a single `fallow --explain --format json` call surfaces the full rule + metric description set. Subcommand+JSON behaviour is unchanged. (Closes [#559](https://github.com/fallow-rs/fallow/issues/559).)
+
+- **License verification rejects JWTs whose `iat` claim is more than 24h in the future relative to the local clock, surfacing clock-skew problems loudly instead of silently letting expired licenses pass.** Before, the verifier in `fallow-license` compared the JWT's `exp` claim against `SystemTime::now()` with no skew bound on either side: a laptop with the clock set to 2020 would treat a 2025-expired license as `Valid` for years; a JWT with `iat` in the future (an out-of-sync signing server, or a replayed token from a forward-shifted clock) was accepted without question. After, `verify_jwt_with_skew` runs an explicit `claims.iat > now + tolerance` check after signature verification and before the grace ladder. The same inequality catches both directions of skew (a forward-signed JWT and a clock-behind-reality), since `now < iat - tolerance` is equivalent to `iat > now + tolerance`. Rejection surfaces as a new `LicenseError::ClockSkew` variant whose `Display` message names CI containers without NTP, dead BIOS batteries, and clock drift as common non-user causes, and renders the magnitude as a human-friendly duration (e.g. `2 days`) rather than raw seconds. The existing `verify_jwt(raw, key, now, hard_fail_days)` signature is preserved as a thin shim that delegates with the default tolerance, so out-of-tree embedders of the `fallow-license` crate see no breaking change. The default tolerance (24h, matching `jsonwebtoken`/`pyjwt`/`jjwt` leeway conventions) is overridable via the new `FALLOW_LICENSE_SKEW_TOLERANCE_SECONDS` env var for CI environments with predictable drift; lenient parsing (unset / empty / unparsable / negative all fall back to the default) keeps a typo in a runner env block from failing license verification. The `iat`-only check is deliberately asymmetric to `exp`: the existing 7/30/hard-fail grace ladder already absorbs sub-day `exp` skew, so layering tolerance on `exp` would duplicate coverage. (Closes [#453](https://github.com/fallow-rs/fallow/issues/453).)
+
+### Changed
+
+- **Per-stage progress spinners replaced with a single persistent process-wide spinner.** Before, every analysis stage (discovery, extract, graph, analyze, dupes, health) created and tore down its own spinner; on fast machines the per-stage spinners flickered so quickly that no spinner was ever visibly painted, and a user running `fallow` on a moderately-sized project saw nothing between command issue and the final summary, with no indication that the process was alive. After, `fallow_core` holds one persistent indicatif spinner spawned at the start of the run and reused across every stage, with the stage label updated in place as the pipeline advances ("Discovering files", "Extracting AST", "Building graph", "Detecting dead code", etc.). The spinner draws on stderr regardless of `--format`, respects `FALLOW_QUIET=1` / `--quiet` / non-TTY stderr (suppressed in those cases for clean piped output), and is mutually exclusive with `--trace`-style stderr emission. No JSON / SARIF / CodeClimate output change. (Closes [#560](https://github.com/fallow-rs/fallow/issues/560).)
+
+### Fixed
+
+- **TanStack Router `./routeTree.gen` imports no longer surface as unresolved when the generated route tree is absent from a clean checkout.** Before, projects using TanStack Router or Start could import `./routeTree.gen` from `src/router.tsx` and get a false-positive `unresolved-import` because `src/routeTree.gen.ts` is generated by TanStack tooling and is often gitignored until codegen runs. The TanStack Router plugin now declares `/routeTree.gen` as a generated import suffix, so active TanStack projects suppress that framework artifact while ordinary missing relative imports still report. (Closes [#646](https://github.com/fallow-rs/fallow/issues/646).)
+
+- **`fallow --score` and `fallow --trend` now render the health score and trend in human terminal output.** Before, the bare combined-mode invocations computed the score and serialized it to JSON / SARIF / CodeClimate, but `crates/cli/src/combined.rs::print_orientation_header` never called the existing `render_health_score` / `render_health_trend` helpers in `crates/cli/src/report/human/health.rs`. A user running `fallow --score` to read the project score in the terminal saw the same orientation header as a plain `fallow` run, while `fallow --score --format json | jq .health.health_score` returned the populated object. After, `print_orientation_header` collects score + trend lines via those helpers (now exported through `crate::report`) and emits them on stderr above the vital signs block, matching the visual treatment of `fallow health --score` (`● Health score: <score> <grade>` plus the per-penalty deductions line). A new `skip_score_and_trend` field on `ReportContext` tells the downstream Complexity section's `print_health_human` to skip the score / trend block so the line is rendered exactly once (combined-mode call site sets `true`, standalone `fallow health` and `fallow audit` keep `false` so their renderers stay inline). When `--trend` is set the trend table also renders; vital signs continue to be suppressed in that case as before. `--min-score` exit-code gating, JSON / SARIF / CodeClimate output, and the no-flag bare `fallow` human output are unchanged. (Closes [#557](https://github.com/fallow-rs/fallow/issues/557).)
+
+- **`fallow check --format codeclimate --production` no longer panics with `internal error: entered unreachable code` when a `--production`-suppressed dep / export / member rule resolves to `Severity::Off`.** Three generic-iterator helpers in `crates/cli/src/report/codeclimate.rs` (`push_dep_cc_issues`, `push_unused_export_issues`, `push_unused_member_issues`) eagerly called `severity_to_codeclimate(severity)` BEFORE iterating their findings, so a call with `severity = Off` and an empty (or filtered-down) findings vec hit the `Off => unreachable!()` arm and exited 101. The fix moves the severity mapping inside each helper's loop body, so the call only fires when there is a finding to emit; behaviour for non-empty findings is byte-identical and a new `build_codeclimate_with_off_severity_and_empty_findings_does_not_panic` regression test locks it in. Slice-based helpers were already safe via their existing `is_empty()` early-return guards. The same PR also centralised `severity_to_codeclimate` next to the SARIF and review-label mappers in `crates/cli/src/report/ci/severity.rs::codeclimate_severity`, so adding a future `Severity` variant now compile-fails at all three CI-format mappers simultaneously. Wire shape unchanged: existing CodeClimate snapshot tests pass byte-identically. (Closes [#452](https://github.com/fallow-rs/fallow/issues/452).)
+
+- **`fallow list --files` and `fallow list --entry-points` now emit forward-slashed paths in both `--format json` and the default plain-text output.** Before, the per-path projection skipped the `.replace('\\', "/")` normalisation that the sibling workspaces array already applied via `format_display_path`, so Windows consumers received `src\index.ts`-shaped paths via JSON (breaking CI glob filters, MCP agents, and downstream pipelines that assume POSIX-style separators) and via stdout when piping to `xargs` / `grep`. The plain-text `--files` and `--entry-points` sites are now routed through `format_display_path` so the four list emission paths share one canonical helper. Sibling regression tests `list_json_files_are_relative_paths` and `list_json_entry_point_paths_are_relative` were tightened with `assert!(!path.contains('\\'))` and a strict `starts_with("src/")` clause so a backslashed path now fails CI on the Windows leg pre-fix and passes post-fix. Refs [#561](https://github.com/fallow-rs/fallow/issues/561); follow-up to [#575](https://github.com/fallow-rs/fallow/pull/575).
+
+- **Focused duplicate analysis (`fallow audit --gate new-only`, `fallow dupes --changed-since`) no longer drops every clone group on Windows when `opts.root` and the changed-files set disagree on Windows verbatim-prefix shape.** `crates/core/src/duplicates/shingle_filter.rs::filter_to_focus_candidates` and `crates/core/src/duplicates/detect/mod.rs::detect_inner` both compared `focus_files.contains(&file.path)` directly. On Windows, `focus_files` enters with non-verbatim paths (joined onto a `dunce::canonicalize`d toplevel from `try_get_changed_files`), while `file.path` may carry the `\\?\` verbatim prefix when the caller pre-canonicalised `opts.root` with `std::fs::canonicalize` (the audit test fixtures do this to exercise the macOS `/var/folders/...` -> `/private/var/folders/...` symlink case). Byte-level `FxHashSet::contains` mismatched on the prefix component, every file landed as non-focus, and the dupes detector materialised zero clone groups. After, both sites normalise the focus set's entries via `dunce::simplified` once at function entry, then look up via `normalized_focus.contains(dunce::simplified(&file.path))`. `dunce::simplified` is a no-op string-level operation on POSIX and on non-verbatim Windows paths, so the fix is zero-cost off the bug's hot path. Closes the last 2 Windows-only audit test failures: `audit_dupes_only_materializes_groups_touching_changed_files` and `audit_gate_new_only_inherits_pre_existing_duplicates_in_focused_files`. Refs [#561](https://github.com/fallow-rs/fallow/issues/561).
+
+- **`try_get_changed_files` now normalises forward-slash segments to backslash on Windows so the `FxHashSet::contains` check against discovery-emitted paths actually matches.** `git diff --name-only` emits paths shaped `src/legacy.ts` regardless of host OS. `PathBuf::join` on Windows appends with the native backslash separator without converting separators inside the appended segment, so the resulting buffer landed as `C:\Users\...\Temp\test\src/legacy.ts` (mixed separators). File discovery via walkdir produces all-backslash paths (`C:\Users\...\Temp\test\src\legacy.ts`). `FxHashSet::contains` compares bytes, not components; the two forms mismatched and the focused duplicates / changed-since filters silently dropped every finding. On POSIX the segment is already in native form so the new `#[cfg(windows)]`-guarded replace is a no-op. Closes the last two Windows-only audit test failures: `audit_dupes_only_materializes_groups_touching_changed_files` and `audit_gate_new_only_inherits_pre_existing_duplicates_in_focused_files`. Also fixes `path_is_inside_temp_dir` to use `dunce::simplified` (no I/O) so it accepts both verbatim and non-verbatim input shapes including synthetic test paths. Refs [#561](https://github.com/fallow-rs/fallow/issues/561).
+
+- **`fallow audit`'s docs-only fast path, reusable-worktree cache hash, worktree-identity comparison, and `path_is_inside_temp_dir` filter all use `dunce::canonicalize` instead of `std::fs::canonicalize` to keep Windows path-prefix comparisons consistent.** Follow-up sweep to the CHANGELOG entry below (which only fixed `resolve_git_toplevel`'s canonicalisation). Four additional production sites in `crates/cli/src/audit.rs` still used `std::fs::canonicalize`, each producing a `\\?\C:\...` verbatim path on Windows that mismatched against non-verbatim paths flowing in through other code paths (`opts.root`, `std::env::temp_dir()`, etc.). The mismatch broke three audit unit tests (`audit_dupes_only_materializes_groups_touching_changed_files`, `audit_gate_new_only_inherits_pre_existing_duplicates_in_focused_files`, `audit_gate_new_only_skips_base_snapshot_for_docs_only_diff`) which surfaced after the prior fix closed the changed_files mismatch. Sites switched: `can_reuse_current_as_base::canonical_cache_dir`, `reusable_audit_worktree_path::repo_root`, `paths_equal`, and `path_is_inside_temp_dir`. `dunce::canonicalize` is identical to `std::fs::canonicalize` on POSIX. Refs [#561](https://github.com/fallow-rs/fallow/issues/561).
+
+- **`fallow`'s nudge, refactoring-targets, Angular rollup, and inherited-from human-output lines now render workspace-relative paths instead of bare basenames.** Before, the combined-mode failure footer rendered `Failed: dead-code (...), health (...) ... start with index.ts`, the orientation header's refactoring-targets nudge rendered `3 refactoring targets ... start with index.ts (complexity)`, the Angular component rollup line rendered `rolled up: ... on MyComponent.method + ... on template.html`, and the CRAP-coverage suffix rendered `(inherited from app.component.ts)`. In Nx / Angular / Rust workspaces where many files share conventionally overloaded basenames (`index.ts`, `mod.rs`, `*.component.ts`, `template.html`), the bare basename gave users no way to identify which file fallow was pointing at. After, all four sites render the project-relative path (e.g. `start with apps/server/src/index.ts`, `inherited from apps/admin/src/auth/permissions/permissions.component.ts`), matching the convention every comparable tool already uses for human output. A new shared `format_display_path` helper in `crates/cli/src/report/mod.rs` normalises Windows backslashes to forward slashes and falls back to the full display when `strip_prefix(root)` fails. JSON, SARIF, CodeClimate, and MCP output already serialised full paths and are unchanged. (Closes [#547](https://github.com/fallow-rs/fallow/issues/547).)
+
+- **CSS Modules unused-export findings now report the real source line and column instead of `line: 1, col: 0`.** Before, every export emitted by `extract_css_module_exports` carried `Span::default()` (start=0, end=0); after `compute_line_offsets` ran downstream, every `.module.css` and `.module.scss` finding rendered at line 1, column 0 regardless of where the class actually appeared. LSP "go to definition" on a flagged class jumped to the top of the file, hover anchored on the file header, SARIF regions all pointed at the first line, and `--diff-file` line-overlap classification could never intersect a real diff hunk because every CSS-Modules finding looked like it lived on line 1. After, the four pre-existing strip passes (block comments, SCSS line comments, quoted strings plus `url(...)`, and the `@layer` / `@import` prelude strip added in [#540](https://github.com/fallow-rs/fallow/issues/540)) replace each match with ASCII spaces of equal byte length instead of collapsing the range, so capture offsets in the masked buffer index 1:1 back into the original source. Each emitted `ExportInfo` now carries `Span::new(start, end)` pointing at the bare class identifier (no leading dot), matching how oxc spans identifiers elsewhere in the codebase. The extraction cache (`CACHE_VERSION` bumped from 90 to 91) invalidates automatically on upgrade; first run after upgrade re-extracts CSS-Modules files, subsequent runs are warm. (Closes [#549](https://github.com/fallow-rs/fallow/issues/549).)
+
+- **CSS Modules: nested cascade-layer sub-names no longer report as unused exports.** Before, `.module.css` files using `@layer foo.bar { ... }` (CSS Cascading and Inheritance Level 5 sub-layer syntax, widely shipped since Chrome 99 / Firefox 97 / Safari 15.4) produced phantom `unused-export 'bar'` / `unused-export 'baz'` findings because `extract_css_module_exports` ran the class regex `\.([a-zA-Z_][\w-]*)` over the full source and tokenised every dot-separated layer sub-segment as a class selector. Findings reported `line: 1, col: 0` because the scanner does not track positions. After, a narrow at-rule prelude strip runs after string and `url()` removal and before class scanning: `@layer foo.bar`, `@layer foo.bar, foo.baz`, and `@import url("x.css") layer(theme.button)` no longer leak their preludes into the class scan. The strip targets `@layer` and `@import` only; `@scope (.foo) to (.bar) { ... }` keeps its existing behavior because that prelude IS a selector list and the classes are real references. Block bodies inside any at-rule (`@media`, `@supports`, `@layer foo { .real {} }`, etc.) continue to extract normally because the strip stops at the opening `{`. Audit baselines (`audit --gate new-only`) recording `unused_exports` rows for cascade-layer sub-names should be regenerated. The extraction cache (`CACHE_VERSION` bumped from 89 to 90) invalidates automatically on upgrade. Thanks [@BowlingX](https://github.com/BowlingX) for the report. (Closes [#540](https://github.com/fallow-rs/fallow/issues/540).)
+
+- **`fallow-cov` sidecar request paths are now normalised to forward slashes on Windows.** `crates/cli/src/health/coverage.rs::build_request` emitted `static_findings.files[].path` via `relative.to_string_lossy().into_owned()`, which preserves backslashes on Windows checkouts. The sidecar JSON wire format is host-OS-independent (consumer may run on a different machine), so the path now goes through `.replace('\\', "/")` to match the existing convention in `report::ci::diff_filter` and `health::mod::relative_to_root`. Refs [#545](https://github.com/fallow-rs/fallow/issues/545); third follow-up after [#548](https://github.com/fallow-rs/fallow/pull/548) and [#551](https://github.com/fallow-rs/fallow/pull/551) reduced the Windows test failures from 13 down to 1.
+
+- **`fallow health`'s diff-filter call sites (`filter_complexity_findings_by_diff`, `filter_hotspots_by_diff`, `filter_large_functions_by_diff`, `retain_hot_paths_in_change_scope`, `runtime_coverage_diff_index_resolves_absolute_hot_path_against_root` consumers) now classify POSIX-style absolute paths correctly on Windows too.** `crates/cli/src/health/mod.rs` carried a near-duplicate `relative_to_root` helper that gated on `Path::is_absolute()` directly, and the `retain_hot_paths_in_change_scope` hot-path check did the same on `hot_path.path`. Both sites have been routed through the shared `crate::path_util` helpers, and `relative_to_root` mirrors the strip_prefix-first shape used by `report::ci::diff_filter::relative_to_diff_path`. Six previously-failing Windows tests (`health::tests::filter_*` and `health::coverage::tests::build_request_joins_dead_code_and_direct_test_signals`) pass under the new logic; Ubuntu and macOS behaviour is unchanged. Refs [#545](https://github.com/fallow-rs/fallow/issues/545), follow-up to the [#545 main fix](https://github.com/fallow-rs/fallow/pull/548) that closed the check-side and CI-formats sites.
+
+- **Diff-aware analyses (`--diff-file`, `--diff-stdin`, `--changed-since`) and the `--file` filter on `fallow check` no longer misclassify POSIX-style absolute paths as relative on Windows.** Five call sites in `crates/cli/src/` previously gated on `Path::is_absolute()` directly. Rust's `Path::is_absolute()` returns `false` on Windows for paths starting with `/` (Windows requires a drive prefix like `C:\foo` or a UNC root), so a `CiIssue.path` deserialized from JSON output on a Unix host and passed into a Windows-hosted post-processing step, a `--diff-file /ci/diff.patch` typed in a cross-platform CI config, a source-map file authored on either OS, or an audit baseline path read from a shared `.fallowrc.json` all leaked through as "relative" on Windows and downstream logic produced wrong results (silently dropped findings, wrong joined paths, broken `strip_prefix` calls). After, a new `crates/cli/src/path_util.rs` module exposes `is_absolute_path_any_platform(&Path)` that recognises three shapes regardless of host: host absolute (via `Path::is_absolute()`), POSIX-style root (via `Component::RootDir` which matches `/foo` on both platforms), and Windows-style drive prefix (via a byte-level scan of the path's `OsStr` encoding so a Unix-hosted analysis can still classify `C:/foo` paths in source-map content correctly). The helper is wired into `crates/cli/src/report/ci/diff_filter.rs::relative_to_diff_path` (the original bug surfaced by 13 test failures on the new Windows CI matrix leg), `crates/cli/src/main.rs::resolve_audit_baseline_path`, `crates/cli/src/health/coverage.rs::resolve_source_map_base`, `crates/cli/src/check/mod.rs` (the `--file` filter), and supersedes the local `looks_like_windows_absolute_path` helper in `coverage.rs` (now lifted to `path_util` and re-exported). All 13 previously-failing Windows tests pass under the new logic; Ubuntu and macOS behavior is unchanged. (Closes [#545](https://github.com/fallow-rs/fallow/issues/545); refs [#447](https://github.com/fallow-rs/fallow/issues/447) which surfaced the bug class.)
+
+### Internal
+
+- **`crates/mcp/src/server/tests/run.rs` import statement narrowed so `run_fallow_with_timeout` and `run_fallow_with_top_level_warnings` are only imported under `#[cfg(unix)]`.** Both helpers are only consumed by `#[cfg(unix)]`-gated tests (`run_fallow_with_top_level_warnings_inserts_empty_array` at line 61 and `run_fallow_timeout_returns_mcp_error` at line 467), but the original wildcard `use crate::tools::{run_fallow, run_fallow_with_timeout, run_fallow_with_top_level_warnings}` was unconditional. On Windows the two gated tests compile out, leaving the imports unused; Rust 1.95's `-D unused-imports` (implied by `-D warnings`) then failed `cargo clippy -p fallow-mcp --all-targets` on the `windows-latest` CI leg in the release pre-flight. Split the import: keep `run_fallow` (used unconditionally by `run_fallow_missing_binary`) at the top, gate the other two behind `#[cfg(unix)]`. Sibling fix to PR #587 which silenced an earlier batch of Windows-only clippy regressions in the same Rust upgrade window. Refs [#447](https://github.com/fallow-rs/fallow/issues/447).
+
+- **`--changed-since` and `fallow audit` no longer return zero findings on Windows due to a `\\?\` verbatim path prefix mismatch.** `crates/core/src/changed_files.rs::resolve_git_toplevel` called `std::fs::canonicalize` on the git toplevel, which on Windows adds the `\\?\` verbatim prefix. Every path from `git diff --name-only` got joined onto this verbatim-prefixed toplevel, and the resulting changed-files set then disagreed on prefix shape with `opts.root` (the CLI's project root, which does NOT carry the verbatim prefix). The focus filter's `strip_prefix` compared the two shapes component-by-component (verbatim disk prefix vs normal disk prefix), silently failed for every entry, and dropped EVERY finding before the audit attribution pass ran. Audit then reported 0 pre-existing findings, breaking 8 integration tests in `crates/cli/tests/audit_tests.rs` (`audit_default_gate_ignores_inherited_issues`, `audit_gate_all_reports_preexisting_issues`, `audit_max_crap_flag_fails_when_threshold_crossed`, etc.). After, three sites switch from `std::fs::canonicalize` to `dunce::canonicalize` so the canonical form omits the `\\?\` prefix and matches downstream comparisons: `fallow_core::changed_files::resolve_git_toplevel`, `crates/cli/src/audit.rs::git_toplevel`, and the `current_root` canonicalisation inside `base_analysis_root`. `dunce::canonicalize` is identical to `std::fs::canonicalize` on POSIX, so behaviour off-Windows is unchanged. (Closes [#561](https://github.com/fallow-rs/fallow/issues/561); refs [#447](https://github.com/fallow-rs/fallow/issues/447).)
+
+- **`fallow audit` BASE-vs-HEAD finding-key intersection no longer misclassifies every pre-existing issue as "introduced" on Windows.** `crates/cli/src/audit.rs::relative_key_path` stripped the project root prefix from each finding path before building the intersection key. On Windows, `config.root` (often canonicalized via `std::fs::canonicalize` which adds the `\\?\` verbatim prefix) and `finding.path` (constructed from the BASE worktree's `std::env::temp_dir()` join which does NOT) disagreed on prefix shape, so `strip_prefix` silently fell through to the un-stripped path. HEAD keys landed as `src/foo.ts` while BASE keys landed as `C:/Users/.../Temp/fallow-audit-base-xxx/src/foo.ts`; the intersection was empty and `audit --gate new-only` reported every inherited finding as freshly introduced. After, `relative_key_path` runs both inputs through `dunce::simplified` (a no-op on POSIX; strips `\\?\` on Windows) before the `strip_prefix` call. The fix unblocks 8 audit integration tests in `crates/cli/tests/audit_tests.rs` that depend on the BASE-snapshot comparison path (`audit_default_gate_ignores_inherited_issues`, `audit_gate_all_reports_preexisting_issues`, `audit_max_crap_flag_fails_when_threshold_crossed`, etc.). (Closes [#561](https://github.com/fallow-rs/fallow/issues/561); refs [#447](https://github.com/fallow-rs/fallow/issues/447) which surfaced the bug class.)
+
+- **Windows fallow binary now links with a 16 MiB main-thread stack (was 1 MiB, the Windows default).** The new push-to-main Windows CI matrix from #447 surfaced 22+ audit integration tests crashing with `STATUS_STACK_OVERFLOW` (exit `-1073741571`) on `crates/cli/tests/audit_tests.rs`. Some recursive code path inside `fallow audit` (graph traversal, AST visitor, glob matching, or git worktree orchestration) exceeded the Windows default 1 MiB stack but stayed under the POSIX default 8 MiB; the bug had been latent on every Windows checkout but invisible until Windows CI ran the integration suite. `.cargo/config.toml` now sets `rustflags = ["-C", "link-arg=/STACK:16777216"]` for both `x86_64-pc-windows-msvc` and `aarch64-pc-windows-msvc` targets, matching the 16 MiB ceiling that `crates/cli/src/rayon_pool.rs::WORKER_STACK_SIZE` already enforces on rayon worker threads. `/STACK` reserves virtual address space lazily so there is no runtime memory cost until the stack actually grows. Identifying and flattening the specific recursive offender is a follow-up; this PR is the unblock-Windows-CI quick fix. (Closes [#556](https://github.com/fallow-rs/fallow/issues/556); refs [#447](https://github.com/fallow-rs/fallow/issues/447) which surfaced the bug class.)
+
+- **The main Rust `Check` job now runs on Windows in addition to Linux on push to `main`.** PR runs stay ubuntu-only for fast feedback, but every push to `main` exercises the full test + clippy + fmt + NAPI build pipeline on `windows-latest` as a pre-release safety net. Before, `.github/workflows/ci.yml`'s `check` job was hard-coded to `ubuntu-latest` and Windows path bugs (backslash separators, UNC paths, long-path `\\?\` prefix, case insensitivity) only surfaced at release time or via user reports. The matrix mirrors the existing `zed` job's push-conditional pattern; macOS coverage continues to come from local pre-release runs (10x quota multiplier on the Free org plan vs 2x for Windows). (Closes [#447](https://github.com/fallow-rs/fallow/issues/447).)
+
+## [2.77.0] - 2026-05-21
+
+### Changed
+
+- **`--format review-github` / `--format review-gitlab` envelope evolved to `fallow-review-envelope/v2`.** Five additive contract changes designed for consumer-side posting in regulated CI environments (no remote includes, no jq, no token delegation): (1) **`summary: { body, fingerprint }` block at envelope root.** One fallow invocation now emits both the sticky summary AND the inline comments with reconciliation primitives; consumers upsert the summary by matching `summary.fingerprint` against existing comments instead of invoking fallow a second time. The legacy top-level `body` stays for v1 consumers (byte-identical to `summary.body`); a deprecation note points new consumers at `summary.body`. (2) **`marker_regex` + `marker_regex_flags` at envelope root.** Stable regex pattern `^<!-- fallow-fingerprint:v2: ((?:[a-z]+:)?[0-9a-f]{16}) -->\s*$` paired with `marker_regex_flags: "m"`. Capture group 1 yields the fingerprint verbatim. Emitted as two fields rather than baked-in `(?m)` because JavaScript RegExp rejects standalone inline flag groups; consumers construct with `new RegExp(env.marker_regex, env.marker_regex_flags)` on JS and `RegexBuilder::new(pat).multi_line(true).build()` on Rust. (3) **Same-line `(path, line)` merging in `comments[]` with a hashed-composite fingerprint.** When multiple findings collide on the same `path:line` (e.g., three `unused-dependency` variants on `package.json:5`), they collapse into one comment with stacked body paragraphs and a `fingerprint = "merged:<16-char hash>"` over the sorted constituent fingerprints. The composite identity shifts whenever the set of constituents changes, so the bundled wrappers' skip-if-fingerprint-exists logic naturally re-posts a merged comment on content change. Single-finding comments keep the v1-style bare 16-hex `fingerprint` shape. Consumers that want update-in-place reconciliation (preserving reviewer reply threads across content changes) implement their own identity tracking via `marker_regex` and the vendor edit endpoints; the bundled scripts and `fallow ci reconcile-review` do not. (4) **UTF-8-safe body truncation at 65,536 bytes** under the conservative floor of both vendors (GitLab accepts 1,000,000 chars per `Note#note` validation; GitHub PR review comments empirically cap at 65,536 chars). Truncation walks back to the nearest UTF-8 char boundary so multi-byte characters straddling the cut are not chopped mid-codepoint. Three co-present truncation signals: a typed `truncated: bool` field on each comment (authoritative machine-readable), an inline `<!-- fallow-truncated -->` HTML comment, and a `> Body truncated by fallow.` blockquote breadcrumb that matches the existing `> Run \`fallow fix --files\`...` suggestion-block convention. The closing fallow-fingerprint marker survives truncation so reconciliation continues to work. (5) **GitLab `position.old_path` for renamed files.** `DiffIndex` gained a `rename_pairs` field populated by parsing `rename from <old>` / `rename to <new>` extended-diff headers when `--diff-file` or `--diff-stdin` is supplied; the GitLab render path now populates `position.old_path` with the base-side filename when present, falling back to the head-side path otherwise. Inline comments on renamed files now anchor correctly via GitLab's discussion-position API. The bundled `fallow ci reconcile-review` subcommand recognizes both v1 and v2 marker shapes during the migration window so consumers with v1 backlogs continue to reconcile. The bundled GitHub Action (`action/scripts/review.sh`) and GitLab CI template (`ci/scripts/review.sh`) accept any `fallow-review-envelope/v<N>` schema marker via `test("^fallow-review-envelope/v[0-9]+$")` and extract fingerprints from both marker shapes via two-pass sed so dedup idempotency survives the upgrade. Thanks [@OmerGronich](https://github.com/OmerGronich) for the detailed consumer-side-posting writeup. (Closes [#528](https://github.com/fallow-rs/fallow/issues/528).)
+
+### Fixed
+
+- **`fallow audit` no longer accumulates persistent base-snapshot worktree caches forever.** Before, `fallow audit --base <ref>` keyed reusable worktrees by `<repo_hash>:<base_sha>` under the system temp directory and never expired them: every distinct base SHA the user ever audited against created a new persistent cache entry that lived forever. On developer machines running `fallow audit --base origin/main` daily against a rebased branch, temp dirs accumulated hundreds of MB to multiple GB over weeks; on shared CI runners with persistent `/tmp` mounts the bloat surfaced as disk-full failures. After, every `fallow audit` invocation runs `sweep_old_reusable_caches` at the top of the pipeline: it walks git-registered worktrees, filters to reusable cache paths, and removes entries whose sidecar `.last-used` mtime exceeds the configured age. The sidecar is touched on every cache-hit reuse so the staleness signal stays current even when the cache directory itself is not mutated. The default threshold is 30 days, overridable via `audit.cacheMaxAgeDays` in `.fallowrc.json` or the `FALLOW_AUDIT_CACHE_MAX_AGE_DAYS` env var (env wins; both interpret the value as whole days). Setting either source to `0` disables the sweep entirely (escape hatch for runners that prune caches out-of-band). Invalid env values silently fall back to config / default, so a typo in a runner env var does not fail audits. Each candidate is gated by the per-cache `ReusableWorktreeLock` (introduced by #472 / PR #489) so the sweep never disturbs an in-flight `fallow audit` mid-rebuild against the same cache entry; on contention the sweep skips and moves on. Pre-upgrade caches lacking a sidecar are NOT removed on first encounter; instead the sweep seeds a fresh sidecar so the next invocation can age them from real last-use, avoiding a cold-cache regression on the upgrade boundary. The `.lock` sidecar is intentionally NOT deleted on removal: a racing acquirer of an unlinked-but-still-flocked inode plus a sibling `open(O_CREAT)` at the same path would produce two processes each holding a kernel flock on different inodes. Removal events surface at `tracing::info!`, and a `fallow: reclaimed N stale base-snapshot caches` line is written to stderr when `--quiet` is not set so the disk reclaim is observable at default verbosity. Per-entry removal failures (`git worktree remove --force` leaving a surviving directory) emit `tracing::warn!`. Interaction with system tmp cleaners (systemd-tmpfiles, macOS launchd periodic) is unchanged: the system cleaner usually wins for caches older than its own threshold; fallow's GC is a safety net for runners that disable the system cleaner. (Closes [#498](https://github.com/fallow-rs/fallow/issues/498).)
+
+- **The LSP no longer publishes diagnostics that reference lines you no longer wrote.** Before, the language server captured analysis input when `did_save` fired but published the result unconditionally, even when the user typed further during the (potentially long) analysis run. Squiggles ended up pinned to lines from the pre-edit document and `code_action` suggestions referenced identifiers that had moved or disappeared. After, the LSP snapshots the per-URI document `version` at the entry of every analysis run, threads the snapshot through to the publish path, and per URI: when the live version has advanced past the snapshot (or the user closed the file during analysis) the publish AND the pull-model cache update are skipped, preserving the last-known-valid diagnostics on the client until the next analysis catches up. Every other publish now carries `Some(version)` in `PublishDiagnosticsParams.version` so LSP 3.17 clients (VS Code, Helix, Zed, Neovim 0.10+) can drop already-superseded notifications client-side as a belt-and-braces second line of defense. The single-flight `analysis_guard`, the 500ms `did_save` debouncer, the cancellation flag, and the pull-model `textDocument/diagnostic` handler are unchanged. (Closes [#450](https://github.com/fallow-rs/fallow/issues/450).)
+
+- **`fallow fix` now preserves the UTF-8 BOM on round-trip and skips files with mixed CRLF/LF line endings instead of silently mangling them.** Two file-encoding correctness gaps are closed in one pass. (1) Mixed CRLF/LF: `crates/cli/src/fix/io.rs::read_source` detected the line ending by `contains("\r\n")` then split exclusively on the detected style; on a file with both shapes (common after cross-platform edits without `core.autocrlf`), lines that did not end with the detected separator got embedded into adjacent lines, indices misaligned with `compute_line_offsets` (which counts `\n` only), and the fix wrote new content to the wrong line. After, `read_source` rejects mixed files with a new `SkipReason::MixedLineEndings`; the per-file fix is skipped with `skip_reason: "mixed_line_endings"` on the JSON envelope, an additive sibling counter `skipped_mixed_line_endings: M` appears next to `skipped_content_changed: N`, the human stderr prints `Skipping <path>: file has mixed CRLF/LF line endings. Normalize with dos2unix or set git config core.autocrlf input, then re-run fallow fix`, and the run exits with code 2 so CI surfaces the skip. The skip is NOT self-healing: re-running fallow alone does not normalize the file; the user (or MCP agent) must run `dos2unix <path>` or normalize via `git config core.autocrlf input` + re-checkout. `FixPlan::skip` dedupes on `(path, reason)` so a single mixed-EOL file carrying findings for multiple per-issue-type fixers (e.g. an unused export AND an unused enum member) surfaces as one entry on stderr and one increment on the envelope counter, not one per fixer. The `fix_preview` and `fix_apply` MCP tool descriptions are updated to flag this for AI agents. (2) UTF-8 BOM: `crates/extract/src/lib.rs`'s three file-read entry points (`parse_single_file_cached`, `parse_single_file`, `parse_from_content`) now strip the leading BOM before hashing and before parsing, so `content_hash`, `compute_line_offsets`, and the oxc parser all see a consistent post-BOM view; line numbers on BOM-bearing files no longer shift by the codepoint. `parse_source_to_module` carries a defense-in-depth strip for out-of-tree callers (fuzzers, integration fixtures). `crates/cli/src/fix/io.rs::stage_fixed_content` re-prepends the BOM bytes (`EF BB BF`) on write when the source had one, so Windows-authored files round-trip with their BOM intact. fallow neither adds nor removes a BOM; if your input has one, output has one. Cross-fixer composition: a second fixer reading the same path through `staged_content` re-runs the same classifier on the staged bytes, so the `had_bom` flag survives the round trip across multiple fixers touching the same file. The extraction cache (`CACHE_VERSION` bumped from 88 to 89) invalidates automatically on upgrade because pre-fix caches keyed `content_hash` over BOM-included bytes for any BOM file. First run after upgrade is uncached and therefore slower than usual; subsequent runs are warm. (Closes [#475](https://github.com/fallow-rs/fallow/issues/475).)
+- **Ctrl+C and SIGTERM now reap fallow's spawned subprocesses instead of leaking them.** Before, fallow installed zero signal handlers, so long-running children kept executing after the parent exited: the `fallow-cov` sidecar (can run for minutes on large coverage dumps), `npm install -g @fallow-cli/fallow-cov`, the self-invoked `fallow health --runtime-coverage` from `fallow coverage setup`, the `git log --numstat` churn-analysis subprocess used by `fallow health --hotspots`, the `git rev-parse` / `git diff` / `git ls-files` subprocesses used by `--changed-since` and the LSP's `changedSince` filter, and the `git worktree add` / `git worktree remove` operations used by `fallow audit`'s base-snapshot path all kept executing in the background. On self-hosted CI runners, cancelled jobs accumulated tens of zombie `fallow-cov` processes per week. After, every long-running spawn site is wrapped in a process-wide `ScopedChild` RAII registry; a single signal handler installed at `main()` entry kills every registered child on SIGINT (exit 130), SIGTERM (exit 143), or the Windows `CTRL_C_EVENT` / `CTRL_BREAK_EVENT` / `CTRL_CLOSE_EVENT` / `CTRL_LOGOFF_EVENT` / `CTRL_SHUTDOWN_EVENT` console-control events. `fallow watch` is the documented Ctrl+C consumer and exits cleanly with code 0 because the user-initiated stop is the intended termination path; in graceful mode the handler still drains registered children so a Ctrl+C delivered DURING `analyze_and_report` reaps in-flight git subprocesses instead of letting them complete. Every other CLI command exits with the conventional POSIX 128+signum. The LSP server's `shutdown` request now cancels in-flight diagnostic publishes via an `Arc<AtomicBool>` so a closing editor stops receiving updates; rayon work already running on the blocking thread pool runs to natural completion and its results are dropped (`spawn_blocking` is not interruptible, documented as a known limitation). On Unix the signal listener runs in a dedicated `std::thread` doing a blocking `sigwait` via `signal_hook 0.4`, which sidesteps async-signal-safety constraints; on Windows the kernel-spawned handler calls `TerminateProcess` directly via `windows-sys`. (Closes [#477](https://github.com/fallow-rs/fallow/issues/477).)
+
+- **`.fallow/cache.bin` now enforces its size cap on every save and invalidates automatically when extraction-affecting config changes.** Two structural gaps in the incremental extraction cache are closed in one pass. (1) The 256 MB ceiling was checked only at load time; once a long-running developer machine crossed the threshold, the next run silently discarded the entire cache and re-extracted everything cold. `CacheStore::save` now encodes once, evicts the oldest entries (by `last_access_secs` ascending, path-tiebroken for reproducible order across runs) when the encoded size crosses 80% of the cap, and re-encodes to write below 60%. The cap is overridable per-project via `cache.maxSizeMb` in `.fallowrc.json` or the `FALLOW_CACHE_MAX_SIZE` env var (env var wins; both interpret the value as whole megabytes; default 256 MB). Atomic-rename writes (`cache.bin.tmp` -> `cache.bin`) close the partial-truncate window the previous direct-`std::fs::write` exposed. Eviction logs at `tracing::debug!` by default and promotes to `tracing::info!` only when at least 25% of entries are removed in a single save, so warm-cache saves stay silent. (2) The cache key was `(file_path, content_hash)` plus a global `CACHE_VERSION` constant: disabling a plugin, removing an inline `framework: [...]` entry, or renaming a `.fallow/plugins/foo.json` left the cache stale until the next CACHE_VERSION bump. The cache header now carries a stable `config_hash: u64` (xxh3 over a sorted list of active external plugin names plus inline framework definition names) and a mismatch on load discards the cache, matching the version-mismatch path's shape. Narrow ingredient set by design: `entry`/`ignorePatterns` are detection inputs (not extraction inputs), so editing them does not bust the cache. The hash skips its computation entirely under `--no-cache`. `CACHE_VERSION` bumps from 87 to 88 (new `last_access_secs` field on `CachedModule`, new header field on `CacheStore`); existing warm caches discard automatically on upgrade with a one-line `Cache format upgraded, rebuilding (one-time cost after version bump)` info log. See [ADR-009](https://github.com/fallow-rs/fallow/blob/main/decisions/009-cache-config-hash-ingredients.md) for the contract on adding new ingredients in the future. (Closes [#466](https://github.com/fallow-rs/fallow/issues/466).)
+
+- **`// fallow-ignore-*` markers for a rule that is currently disabled (`rules.<kind> == "off"`, including per-file `overrides.rules`) no longer surface as `stale-suppression` findings.** Before, when a project set `rules.unused-exports = "off"` and kept a `// fallow-ignore-next-line unused-export` above a declaration, the detector skipped emission entirely (no `unused-export` finding) but the suppression's `used` flag stayed false, so `find_stale` reported the marker as stale. Users were told to remove a comment that documented intentional dormancy and was valid again the moment the rule was re-enabled. After, `SuppressionContext::find_stale` resolves rules once per file via `ResolvedConfig::resolve_rules_for_path` (per-file `overrides.rules` apply uniformly) and skips emission when the suppression's target kind is `Severity::Off`. Blanket markers (`// fallow-ignore-next-line` with no kind) are not anchored to any specific dormant kind and continue to surface as stale when nothing matches. Multi-kind markers (`// fallow-ignore-next-line unused-export, unused-type`) already track each kind as a separate `Suppression` entry, so a dormant clause in a list with a live clause now stays silent without affecting the live clause. CI baselines that contain these stale findings (from the prior false-positive behavior) will see them disappear on the next run, a strictly noise-reducing delta with no API or schema change. (Closes [#482](https://github.com/fallow-rs/fallow/issues/482).)
+
+- **Suppression markers with an unknown token now keep the recognized tokens working and surface the unknown one as a `stale-suppression` finding.** Before, `// fallow-ignore-next-line unused-export, complexity-typo` was silently discarded in full because one token did not parse; `unused-export` was NOT suppressed and no diagnostic surfaced. After, the recognized `unused-export` suppression still applies, and the typo (or obsolete kind name) appears as a `stale-suppression` carrying `kind_known: false` on the wire. The human-facing explanation reads `'<token>' is not a recognized fallow issue kind. Did you mean '<closest>'? Other tokens on this line still apply.` with a Levenshtein "did you mean?" hint when an existing kind is within edit distance 2. Issue-kind names are not stable forever: kinds get added, renamed, and removed across fallow releases, so a marker mentioning an old name no longer silently loses the rest of its tokens after an upgrade. JSON consumers (CI annotations, MCP agents, VS Code) can branch on the new `origin.kind_known` field to render typo-fix copy instead of "no longer matches any active issue." The bundled GitHub Action and GitLab CI templates have been updated to honor this. The extraction cache (`CACHE_VERSION` bumped from 86 to 87) invalidates on upgrade so warm `.fallow/cache` directories pick up the change without manual clearing. (Closes [#449](https://github.com/fallow-rs/fallow/issues/449).)
+
+### Added
+
+- **`re-export-cycle` is now a first-class finding type instead of an invisible `tracing::warn!`.** The upfront Tarjan SCC pass added in #442 already detected cycles in the re-export edge subgraph (two or more barrel files re-exporting from each other in a loop, or a single barrel re-exporting from itself); the cycles only reached operators running with `RUST_LOG=warn` because the data lived nowhere on `AnalysisResults`. The new `re_export_cycles[]` array surfaces each finding with its sorted member files, a `kind` discriminator (`multi-node` for two-or-more-file SCCs, `self-loop` for single-file rename leftovers), and a typed `actions[]` envelope (a `refactor-re-export-cycle` informational primary plus a `suppress-file` secondary; cycles are file-scoped so a single file-level suppression on the alphabetically-first member breaks the cycle). Default severity is `Warn` so projects with latent cycles do not get sudden CI failures on upgrade; users opt into hard failures via `rules.re-export-cycle: error`. New CLI flag `--re-export-cycles` filters the output to the new finding type only. The `re-export-cycle` rule appears in `--explain` output under the Architecture category, in SARIF with `helpUri` pointing at `https://docs.fallow.tools/explanations/dead-code#re-export-cycles`, in CodeClimate with a kind-prefixed fingerprint so self-loops and multi-node shapes cannot collide, and in the compact / markdown / human formats with chain notation `a.ts <-> b.ts`. The LSP server emits one diagnostic per member file so jumping to any member lands on the cycle; the GitHub Action emits one annotation per cycle (anchored at `files[0]`) to stay under the per-step annotation budget; the GitLab CI summary renders the cycle as a Markdown table row inside its details block. The MCP `analyze` tool description has been extended with the explicit wording "barrel files that form a structural loop, silently breaking re-exports" so AI agents can route to fallow when users describe the same symptom. The `re-export-cycle` rule accepts four serde aliases (`re-export-cycle`, `re-export-cycles`, `reexport-cycle`, `reexport-cycles`) on both `RulesConfig` and per-file `overrides.rules`; the per-file override is documented as a no-op (a cycle spans multiple files) and the load-time warn block points users at the working escape hatch. Suppression markers (`// fallow-ignore-file re-export-cycle` plus the three alias spellings) suppress the finding when placed on any member file. The audit, `--changed-since`, `--workspace`, and baseline paths all attribute findings symmetrically with `circular-dependencies`. Type-only re-export cycles (`export type * from './b'` paired symmetrically) still surface as findings, because chain propagation through the loop is a no-op regardless of whether the edges carry type-only semantics. **Heads-up:** projects that already had latent re-export cycles will see new findings appear; `total_issues` will show a step change on the first run after upgrade. The cache version did not change because the SCC pass ran before this PR and the new field lives on the output envelope, not the extract cache. (Closes [#515](https://github.com/fallow-rs/fallow/issues/515).)
+
+- **New `ignoreDecorators` config option lets you opt specific decorators out of the default `unused-class-members` skip-all-decorated behavior.** Before, every class member carrying any decorator was skipped to avoid false positives on framework-managed members (NestJS `@Get()`, Angular `@Input()`, TypeORM `@Column()`). After, a class library can list non-reflective utility decorators (Playwright `@step`, internal `@measure`, `@log`, etc.) so methods decorated with ONLY those names are checked for usage like undecorated methods. Conservative semantics: a method carrying any decorator NOT in the list stays skipped, so a `@step` + `@Inject` combination is still treated as framework-managed.
+
+  ```jsonc
+  // .fallowrc.json
+  {
+    "ignoreDecorators": ["@step"]
+  }
+  ```
+
+  Matching rule: entries containing `.` (`"decorators.log"`) match the full dotted path; bare entries (`"step"` or `"decorators"`) match the leftmost segment, so a single bare `"decorators"` entry collapses an entire `@decorators.*` namespace. Both `"@step"` and `"step"` round-trip equivalently (a leading `@` is stripped before matching). Unmatched entries (a decorator name in the config that never appears in the analyzed codebase) emit a one-time `tracing::warn!` at end of run, mirroring the existing `usedClassMembers` behavior. The default empty list preserves today's skip-all behavior, so existing NestJS / Angular / TypeORM projects see no change. The first run after enabling this option will surface new `unused-class-members` findings on members previously hidden by the unconditional skip. The extraction cache (`CACHE_VERSION` bumped from 84 to 85) invalidates automatically on upgrade so users with warm `.fallow/cache` directories get the fix without manual clearing. Thanks [@vethman](https://github.com/vethman) for the report. (Closes [#471](https://github.com/fallow-rs/fallow/issues/471).)
+
+### Security
+
+- **`npm install fallow` and the `fallow-rs/fallow` GitHub Action now verify Ed25519 signatures and GitHub Release SHA-256 digests on every platform binary before running it.** Each `@fallow-cli/<platform>` npm package ships `.sig` files alongside its `fallow`, `fallow-lsp`, and `fallow-mcp` binaries (produced at release time by the workflow's Ed25519 signing step). The npm postinstall script verifies all three signatures using a public key embedded in `npm/fallow/scripts/verify-binary.js`, then fetches the matching GitHub Release `asset.digest` and compares the binary SHA-256. A tampered binary aborts the install with exit code 1 and a structured `fallow: binary verification failed: ... (sig-invalid|sig-missing|binary-missing|digest-mismatch|digest-unavailable)` message. The GitHub Action installer (`action/scripts/install.sh`) installs with `--ignore-scripts`, then runs the verifier from the checked-out Action code instead of from the just-installed npm package, so CI runners do not execute package lifecycle scripts before verification. npm release publishing now hard-fails if `npm publish --provenance` fails. Set `FALLOW_SKIP_BINARY_VERIFY=1` only when deliberately replacing the published binary (source builds, airgapped registries, signed mirror repacks); see `SECURITY.md` for the public key fingerprint and the manual out-of-band verification recipe. (Closes [#465](https://github.com/fallow-rs/fallow/issues/465).)
+
+### Changed
+
+- **`fallow` now exits with code 2 at config load when a `boundaries.rules[]` entry references a zone not present in `boundaries.zones[]`, or when a zone pattern redundantly repeats its own `root` prefix.** Before, `crates/config/src/config/resolution.rs` emitted a `tracing::error!` and continued; the rule remained active with a phantom target, and `is_import_allowed` returned `false` for every import to the non-existent zone, producing a flood of false-positive boundary violations like "ui cannot import from typo-zone." The `tracing::error!` was invisible in normal operation, so a typo'd zone name or a stale `allow:` reference shipped as analysis output instead of a config-load failure. After, fallow validates references AFTER preset expansion and auto-discover (so Bulletproof's `features` logical-group rule resolves correctly) and lists every offending `(rule_index, field, zone_name)` tuple in one rendered diagnostic. The redundant-root-prefix path (`packages/app/src/**` inside a zone with `root: "packages/app/"`) also exits 2; the legacy `FALLOW-BOUNDARY-ROOT-REDUNDANT-PREFIX` tag is preserved in the Display rendering so existing CI grep recipes continue to work. The invalid-glob-pattern half of #468 was already closed by [#486](https://github.com/fallow-rs/fallow/issues/486) (`validate_user_globs` covering `boundaries.zones[].{patterns, root, autoDiscover}`); this completes the issue. (Closes [#468](https://github.com/fallow-rs/fallow/issues/468).)
+
+- **`fallow migrate` now warns on input rule / `exclude` / `include` keys it cannot translate, and prints a glob-drift caveat when `entry` or `ignorePatterns` are migrated.** Before, three classes of source-tool input silently disappeared from the generated fallow config: (a) rule keys that the migrator did not yet recognise (typos, source-tool updates, internal rules the migrator has not yet catalogued) were dropped without diagnostic; (b) `exclude` and `include` entries shared the same silent-drop bug; (c) `entry` / `ignorePatterns` globs were copied verbatim with no statement about the source tool's glob engine vs fallow's `globset` potentially diverging on corner cases (negation order, brace expansion, leading `./`, double-star semantics). After, the migrator emits a `MigrationWarning` for every untranslated key under all three fields, with two shapes: documented-unmappable issue types keep the existing message (`issue type \`X\` has no fallow equivalent`, no suggestion); completely-unknown keys carry a new message (`unknown issue type \`X\`; not migrated`) with a suggestion pointing at the relevant migration doc so users can fix the typo or report the missing mapping. The migrator also appends a one-line `Note:` block after the warnings section when the migration source uses globs AND the migrated config carries `entry` or `ignorePatterns`, telling users to run `fallow check` on a subset before relying on the migration in CI. The note is suppressed for duplication-only migrations and for rules-only source configs. The warnings header is now singular/plural-aware (`Warning (1 skipped field)` vs `Warnings (3 skipped fields)`) since a single typo'd rule is the most common count-one case. Content-detected `--from custom-name.json` paths whose filename does not match the canonical source-tool name are now tagged internally so the glob caveat still fires through that branch; the tag is stripped before printing the "Migrated from:" line and before writing the `// Migrated from ...` header to the generated config, so the suffix is never user-visible. New unit + integration tests cover the unknown-key warning at `rules` / `exclude` / `include` paths, the glob-caveat gating across all sources, the `source_head` helper (including path-with-parens and unclosed-paren edge cases), `OutputFormat::pick` auto-mirror through tagged sources, and a set of `glob_equivalence_*` assertions documenting the patterns where both engines agree today (brace expansion, `**` cross-segment, `src/**`, `?`) plus one negative case (`!keep.ts` is taken literally under `globset`; fallow `ignorePatterns` does not support `!` negation). End-to-end migration is exercised against a Next.js-shaped fixture project. (Closes [#457](https://github.com/fallow-rs/fallow/issues/457).)
+
+- **`fallow` now exits with code 2 at config load when a glob pattern is invalid, absolute, or contains a `..` segment.** Affected config fields: `entry`, `ignorePatterns`, `dynamicallyLoaded`, `duplicates.ignore`, `health.ignore`, `overrides[].files`, `ignoreExports[].file`, `ignoreCatalogReferences[].consumer`, `boundaries.zones[].{patterns, root, autoDiscover}`, every glob-bearing field on inline `framework[]` plugin definitions, and every glob-bearing field on external plugin files discovered from `.fallow/plugins/`, root-level `fallow-plugin-*.{toml,json,jsonc}`, or the `plugins:` config list (including `detection.fileExists.pattern` and nested `all` / `any` combinators). Before, invalid patterns silently no-op'd or warn-and-skipped, so a typo in `entry` could leave a user wondering why nothing was being analyzed. After, fallow lists every offending field + pattern in one go and tells you what to type instead. Closes the path-traversal surface flagged for malicious configs shipped via PR on misconfigured CI runners. Configs that ran with silently-dropped patterns must be fixed to upgrade; the dropped patterns were never doing what their author intended. (Closes [#463](https://github.com/fallow-rs/fallow/issues/463).)
+
+### Fixed
+
+- **`fallow fix` and any other writer routed through `fallow_config::atomic_write` now preserve the target file's existing Unix file mode on Unix instead of silently downgrading it to `0600`.** Before, `NamedTempFile` produced the temp at the tempfile-crate default of `0600`; `persist` swapped the temp into the target's path, replacing the target's mode with the temp's. A source file at `0644` (the typical mode after `git checkout`, editor save, or `tar` extract) ended up at `0600` after `fallow fix`, breaking shared workspaces and CI runners that relied on group / other read permissions. The bug was pre-existing in the `atomic_write` shape and inherited by the issue #454 batched-commit refactor. After, both `fallow_config::atomic_write` and the issue-#454 `FixPlan::commit` call a new `fallow_config::preserve_target_mode(temp, target)` helper between the temp write and the rename: when the target exists, its mode is copied onto the temp; when the target does not yet exist (fresh creation, e.g. the duplicate-exports config-add fallback writing `.fallowrc.json` for the first time), the temp's default mode is left in place. Windows ACLs already persist with the underlying file across `MoveFileEx`, so the helper is a no-op there. Three new regression tests in `crates/config/src/config_writer.rs` and `crates/cli/src/fix/plan.rs` pin the contract.
+
+- **`fallow check --regression-baseline <path>` now exits 2 with an actionable regenerate hint when the baseline's `schema_version` does not match this fallow build, instead of silently loading default-zero fields and producing a wrong "no regression detected" verdict.** Before, `crates/cli/src/regression/baseline.rs::load_regression_baseline` called `serde_json::from_str` with no version check, and `CheckCounts` carries `#[serde(default)]` on every count field. A baseline written by a different `REGRESSION_SCHEMA_VERSION` (today's value: `1`) silently deserialized with missing fields defaulting to zero, masking real regressions and letting CI gates pass on a structurally invalid baseline. After, the loader validates `baseline.schema_version == REGRESSION_SCHEMA_VERSION` immediately after parse and fails with `regression baseline '<path>' has schema_version <actual> but this fallow build expects <expected>. The baseline was written by fallow <writer-version>. Regenerate it by running: fallow check --save-regression-baseline <path>`. A baseline with `schema_version: 0` (predates versioning) and a baseline missing the field entirely both surface the same hint reworded for their case. Existing baselines with `schema_version: 1` continue to load unchanged; the constant has not changed. Future schema bumps require regenerating the baseline (re-run the save command), and downgrading fallow across a schema bump also requires regenerate. The three existing error paths in `load_regression_baseline` (file not found, read error, JSON parse error) plus the new schema-mismatch path now route through `emit_error`, so `--format json` CI consumers receive a structured `{"error": true, "message": "...", "exit_code": 2}` envelope on stdout instead of human text on stderr. (Closes [#451](https://github.com/fallow-rs/fallow/issues/451).)
+
+- **`fallow fix` now refuses to overwrite a file that changed between analysis and the per-file write, and batches its writes so a mid-run failure leaves the project untouched.** Before, `fallow fix` re-ran analysis in-process, then wrote each per-file rewrite via a standalone `atomic_write`. If a parallel editor save, CI rebase, or other tool mutated a target file between the analysis read and the fix-time write (window: seconds to minutes), the line offsets computed during analysis landed on the wrong bytes and silently corrupted the file. Per-file writes also ran unbatched, so an OOM, disk-full, or transient I/O error mid-run left the project in a half-applied state where the surviving files' offsets no longer matched the original analysis. After, every parsed source file's xxh3 content hash (the same hash the extract cache already computes) is captured during analysis and threaded into each fixer; per-file entry recomputes the hash and skips with a clear `Skipping <path>: file content changed since fallow check ran. Re-run fallow fix to refresh the analysis first.` diagnostic on mismatch. Each fixer stages its rewrite into a sibling `NamedTempFile` instead of writing directly; the orchestrator commits the plan only after every stage has succeeded, so a single stage failure leaves the project untouched (POSIX has no atomic multi-rename primitive, so a rename failure mid-commit reports per-path while keeping already-renamed files applied). Cross-fixer same-file edits compose: the second fixer reads the first fixer's pending staged content (not the original disk bytes) so unused-export removal AND unused-enum removal on the same source file land coherently in one rewrite instead of overwriting each other via last-write-wins. The commit path follows symlinks: the canonicalized resolved path drives the final rename, so a symbolic link to the real source file is preserved post-fix and the edit flows through to the real target. The JSON envelope gains a top-level `skipped_content_changed: number` (always present) and a new per-file entry shape `{type: "skipped", path: ..., skipped: true, skip_reason: "content_changed"}` in the `fixes[]` array; the existing `skipped` counter is unchanged (it keeps its prior meaning of catalog / YAML guard skips only). The action's `summary-fix.jq` template counts successful fix attempts in its headline (excluding skip entries) and surfaces `skipped_content_changed` in the prose. Hash precondition covers source files (TS / JS / Vue / Svelte / Astro / MDX); `package.json` and `pnpm-workspace.yaml` are not in the captured hash map because the extract layer does not parse them, and the dep / catalog fixers re-parse those files at fix time as the natural safety net. Skipped files contribute a non-zero exit code, so CI surfaces the diagnostic instead of treating a mid-flight edit as a successful no-op. Five new integration / unit tests cover round-trip clearing of targeted findings, batch abort when one target directory is read-only, the envelope-field contract, cross-fixer composition, and symlink follow-through. (Closes [#454](https://github.com/fallow-rs/fallow/issues/454).)
+
+- **GitHub Action and GitLab CI templates surface API failures and pagination errors instead of running unscoped analysis or posting duplicate PR/MR comments.** Two silent-fail patterns are closed. (1) `action/scripts/analyze.sh` previously masked `gh api --paginate` failures behind `2>/dev/null || true`, so a transient 500, expired token, or missing repo permissions silently fell through to the existing "shallow clone" warning. The action then ran analysis against the full codebase and posted every finding, not just findings on PR-changed lines. The new path captures gh stderr and exit code separately, emits a `::warning::` naming the API failure mode, and writes `changed_files_unavailable=true` to `$GITHUB_OUTPUT`. The marker is initialized to `false` unconditionally at the top of analyze.sh so downstream `if:` gates always see a definitive value rather than an absent-vs-false ambiguity. (2) Six call sites in `action/scripts/{review,comment}.sh` and `ci/scripts/{review,comment}.sh` consumed paginated API results via `paginate_fn ... | jq ... || echo '[]'` and `... | head -1 || true` patterns. When pagination failed mid-stream (the canonical case: GitLab API on a >100-comment MR returning a 502 on page 2 after page 1 succeeded), the empty fallback fed the dedup logic and produced N duplicate inline threads on every retry. Each call site now consumes the helper's exit code via a two-step `if paginate_fn > tmp; then ...; else warning + marker + exit; fi` pattern. Failure semantics diverge by surface: the multi-comment fingerprint dedup path aborts the post step (no inline review POST) because N duplicate threads is materially worse than no inline review; the summary-only path posts a fresh comment anyway (a duplicate summary is annoying but collapsible, while a missing summary is silently broken). Exit code on the abort path is conditional on the failure class: stderr matching `HTTP 4[0-9][0-9]` or `error: 4[0-9][0-9]` (and NOT `HTTP 429` / `error: 429` / `rate.limit`) escalates to `exit 1` for loud CI failure because a re-run will not resolve a configuration error; everything else (5xx, retry-exhausted 429, network errors) falls through to `exit 0` so transient blips do not break PRs. The action exposes three new composite outputs for downstream workflow gates: `changed-files-unavailable` (always emitted from analyze.sh), `post-skipped-reason` (`none` / `pagination_failure`, set to `pagination_failure` only on the multi-comment abort), and `dedup-lookup-failed` (`true` whenever a dedup lookup failed, including the summary-only path where the post proceeds). The GitLab template writes parallel sidecar artifacts (`fallow-skip-reason.txt`, `fallow-dedup-lookup-failed.txt`) declared in `artifacts: paths:` so downstream jobs can gate on them. `gitlab-ci.yml`'s existing `bash review.sh || echo "WARNING: ..."` swallows our `exit 1`, so the 4xx escalation is advisory for the default template; operators who want CI-fatal behavior on auth misconfiguration can drop the `|| echo` from their template or gate on the sidecar markers. `mktemp` files are cleaned up via a single `trap '... EXIT'` per script rather than inline `rm -f` so signal-driven exits do not leak tmp files. Regression tests inject synthetic 5xx, 4xx, and retry-exhausted 429 failures on every affected call site and assert the marker contracts plus the absence of duplicate POSTs. (Closes [#470](https://github.com/fallow-rs/fallow/issues/470).)
+
+- **Re-export chain resolution propagates references through barrel chains of arbitrary depth and tags multi-hop `export type *` synthetic stubs as type-only.** Before, the propagation fixpoint capped at 20 iterations and emitted only an invisible `tracing::warn!` when a chain truncated, so barrels deeper than 20 hops silently under-credited references on the leaf. After, the fixpoint terminates naturally via the existing dedup-by-`from_file` check, with a defensive safety backstop bounded by the number of re-export edges. Re-export cycles (`a.ts: export * from './b'` paired with `b.ts: export * from './a'`) and barrels that re-export from themselves are now surfaced as one `tracing::warn!` per cycle / self-loop with the member file paths, so they are discoverable when debugging. The synthetic bridge stub created on the source module during multi-hop star propagation inherits `is_type_only` from the triggering re-export edge instead of hardcoding `false`; two star edges reaching the same source with conflicting flags resolve to the value-bearing variant via a dedicated downgrade pass. Users running `--save-baseline` on barrel-heavy projects with chains longer than 20 hops may see slightly fewer findings after upgrade because the deeper hops now propagate correctly. Surfacing the cycle diagnostic as a structured `AnalysisResults` finding is tracked in [#515](https://github.com/fallow-rs/fallow/issues/515). (Closes [#442](https://github.com/fallow-rs/fallow/issues/442).)
+
+- **`unused-class-members` no longer false-positives when a Playwright fixture is created with `base.extend<MyFixtures>(...)` and returned from a helper function.** The #268 fix credited POM methods consumed via a directly-bound `const test = base.extend<MyFixtures>(...)`, but the helper form (`export function appTest() { return base.extend<MyFixtures>(...); }` consumed as `appTest()(...)`) reintroduced the false positive on nested POM methods. Three declarator shapes now capture the helper (function declaration, `const = () => ...`, `const = function () { ... }`) when the body is a single `return <call>` statement; a finalize-time pass gates the `base` local on `@playwright/test`'s `test` named import and emits the same def-sentinel `MemberAccess` the analyzer already correlates with use sentinels. Same-file helper chains (`function appTest() { return setupTestFixture(); } function setupTestFixture() { return base.extend<T>(...); }`) propagate via a capped fixed-point pass over `(caller, callee)` aliases captured at the same site. The use-side `appTest()(...)` form is recognised by extending `playwright_test_callee_name` to recurse into a `CallExpression` callee. Cross-file helper chains are intentionally out of scope. The extraction cache (`CACHE_VERSION` bumped to 86) invalidates automatically on upgrade so users with warm `.fallow/cache` directories get the fix without manual clearing. Thanks [@vethman](https://github.com/vethman) for the report. (Closes [#491](https://github.com/fallow-rs/fallow/issues/491).)
+
+- **Monorepo workspace discovery surfaces malformed `package.json`, unreachable glob matches, and missing tsconfig references instead of silently dropping them.** Seven silent-drop sites in `crates/config/src/workspace/{mod.rs,parsers.rs}` are replaced with typed `WorkspaceDiagnostic` values carrying a kind discriminator (`malformed-package-json`, `glob-matched-no-package-json`, `malformed-tsconfig`, `tsconfig-reference-dir-missing`, plus the existing `undeclared-workspace`). Severity is per-site: a malformed ROOT `package.json` exits 2 at config load (mirrors `validate_resolved_boundaries` from #468) because no workspace patterns can be collected without a parseable root; a malformed declared-workspace `package.json` (or tsconfig-referenced `package.json`) warns and continues so analysis still runs on the remaining workspaces; a glob match that resolves to a directory without `package.json` warns only when the path is NOT in the conventional skip list (extended to `dist`, `coverage`, plus dot-prefixed `.cache` / `.next` / `.turbo` / `.nuxt` / `.svelte-kit` via the existing `starts_with('.')` arm) AND NOT covered by user `ignorePatterns`; a shallow-scan candidate `package.json` stays silent because the user did not declare it and the heuristic should not generate noise; a missing `tsconfig.json` stays silent because many JS-only projects have none; a malformed `tsconfig.json` warns. Diagnostics emit via deduplicated `tracing::warn!` (process-wide `OnceLock<Mutex<FxHashSet>>` keyed on canonical-root + kind + path, matching the staged migration pattern of #467) and also land in a process-wide registry keyed by canonical root so the JSON envelope on `fallow check`, `fallow dupes`, and `fallow health` carries a new optional `workspace_diagnostics: WorkspaceDiagnostic[]` field. The field is omitted when empty (`#[serde(default, skip_serializing_if = "Vec::is_empty")]`), so consumers on monorepos without discovery noise see no wire change. A new `fallow list --workspaces` flag (alias: `fallow workspaces`) renders the discovered workspace table plus the diagnostics section; on a single-package project the explicit form prints `No workspaces declared (single-package project).` instead of silence. The `find_undeclared_workspaces_with_ignores` pass now folds its results into the same registry and suppresses entries that already carry a `MalformedPackageJson` diagnostic so a typo'd `package.json` is not flagged twice (once as malformed, once as "undeclared"). Every warning message ends with a concrete next step ("Fix the JSON syntax", "remove from the workspaces pattern", "add to `ignorePatterns`") so first-time users have a path forward. (Closes [#473](https://github.com/fallow-rs/fallow/issues/473).)
+
+- **Plugin system silent-fail patterns now surface as `tracing::warn!` diagnostics at config load instead of hiding behind broken configuration.** Three patterns in `crates/core/src/plugins/registry/` join the family already addressed by #449 / #457 / #467 / #468 / #473. (1) When two plugins (built-in OR external) declare a byte-identical `config_patterns` entry, fallow emits `plugin config_patterns collision: identical pattern 'pat' is claimed by plugins [a, b]; 'a' runs first (registration order), others (b) follow.` once per (pattern, owners) tuple, naming both sides and documenting the registration-order precedence rule (the owner that registered first wins Phase 3a matching). Detection is byte-equal on the pattern string; sub-glob overlap (e.g. `vite.config.{ts,js}` vs `vite.config.ts`) requires pattern-intersection logic that is not in `globset` and is intentionally deferred to a follow-up issue. (2) An external plugin (file-loaded from `.fallow/plugins/*.{toml,json,jsonc}`, root `fallow-plugin-*`, or inline `framework[]` in the config) whose `enablers` does not match any project dependency AND whose closest dep name is within Levenshtein distance two now warns `plugin 'my-vue' enabler '@vue/cor' does not match any dependency in package.json; did you mean '@vue/core'?`. Plugins with a richer `detection` block or empty `enablers` are skipped. No warning fires when no Levenshtein-close dep exists, so a plugin that legitimately does not apply to this project stays silent. The Levenshtein helper is lifted into `crates/config/src/levenshtein.rs` so both the rule-name path (`closest_known_rule_name` from #467) and the new enabler-typo path share one distance/length policy. (3) Invalid regexes in `PathRule.exclude_regexes` / `exclude_segment_regexes` (extracted by built-in plugins from user code such as TanStack Router route options) now validate eagerly inside `process_config_result` instead of failing silently at matcher use-time. Invalid patterns are dropped after a `plugin 'tanstack-router' in /path/to/routes.ts: invalid excluded regex '[unclosed' for entry pattern 'src/routes/...': ...; the pattern will be ignored.` warning. All three diagnostics dedupe process-wide so combined-mode (`check` + `dupes` + `health` through one config load path) emits at most one warning per (kind, key) pair. Tracing-warn matches the staged migration pattern of #467 / #510: every warning closes with "A future release may reject ..." so users know a hard-error escalation is on the roadmap once false-positive rates are well-understood. (Closes [#479](https://github.com/fallow-rs/fallow/issues/479).)
+- **Misspelled rule names in `.fallowrc.json` / `fallow.toml` now warn at config load instead of silently falling back to the default severity.** `crates/config/src/config/rules.rs` ships a canonical `KNOWN_RULE_NAMES` list covering every canonical kebab-case rule name plus every documented `#[serde(alias)]` form, and a Levenshtein-distance helper that suggests the closest match when an unknown key is plausibly a typo. `FallowConfig::load` walks the merged config value after `extends` resolution and emits one `tracing::warn!` per unknown key under `rules` or `overrides[i].rules`, deduped process-wide so combined-mode runs (`check` + `dupes` + `health` through one config load path) emit at most one warning per (context, key) pair. A `.fallowrc.json` with `{"rules": {"unsued-files": "warn"}}` now logs `unknown rule 'unsued-files' in rules (did you mean 'unused-files'?); the rule will be ignored. A future release will reject unknown rule names.` instead of silently leaving `unused-files` at its default severity. Two drift guards in the test suite catch future field or alias additions that forget to update the list. Phase 1 of a staged migration: a future minor release will flip `RulesConfig` and `PartialRulesConfig` to `#[serde(deny_unknown_fields)]` and turn the warning into a hard config-load error. (Closes [#467](https://github.com/fallow-rs/fallow/issues/467).)
+- **LSP hover content embeds user-controlled identifiers via CommonMark code spans, and the `remove unused export` quick fix validates the live declaration shape before producing an edit.** Two LSP fragilities are closed. (1) Hover bodies in `crates/lsp/src/hover.rs` previously built `MarkupKind::Markdown` content via bare `format!()` with no escaping of interpolated export names, member names, import specifiers, or duplication file paths. A crafted identifier such as `` `[click](command:vscode.open?evil)` `` would render as a clickable link in any LSP client that promotes hover content to trusted MarkdownString. VS Code's default `vscode-languageclient` configuration treats hover content as untrusted, so `command:` URIs do NOT execute under default settings; the realised risk is link-on-hover (image fetch to attacker-controlled domain, link-to-phishing on click) plus corrupted rendering. The new `format_inline_code(value)` helper in `crates/lsp/src/markdown.rs` wraps each interpolated value in a CommonMark inline code span with a backtick-fence length one greater than the longest backtick run in the value (with space padding when the value starts or ends with a backtick), so the value renders verbatim and cannot break out of the span even when it contains backticks. Inside a code span CommonMark suppresses every inline construct, neutralising every link-style injection vector. The helper is portable across VS Code, Helix, Zed, and Neovim. (2) `build_remove_export_actions` in `crates/lsp/src/code_actions/quick_fix.rs` previously trusted the cached `export_line` from `AnalysisResults` (computed at `did_save` time). A `did_change` between `did_save` and the `code_action` request would leave the cached line pointing at text the user had reshaped in memory, and the action would strip a leading `export ` prefix from an unrelated declaration. The handler now validates the live line via `declares_export_name`, which strips `export ` and any declaration / modifier keywords (`const`, `let`, `var`, `function`, `function*`, `class`, `type`, `interface`, `enum`, `namespace` plus `async`, `abstract`, `declare`) and asserts the leading identifier equals the cached name. The check rejects substring collisions (cached `foo` vs live `foobar`), value-position collisions (cached `foo` vs live `export const bar = foo;` where `foo` is referenced as a value, not the declared name, which would otherwise silently strip `export ` from `bar`), and re-export blocks (whose edit would produce a syntax error). `export default` declarations stay on prefix-only validation because each file has at most one default export and the cached finding refers to "the default export of this file" regardless of its current shape. `Diagnostic.message` synthesised in code-action handlers stays plain text per the LSP specification, matching the published diagnostic in `crates/lsp/src/diagnostics/unused.rs` so VS Code's "Fix all in file" correlation keeps working. (Closes [#480](https://github.com/fallow-rs/fallow/issues/480).)
+
+- **`fallow audit` worktree lifecycle is hardened against panic-cleanup leaks, Windows orphan accumulation, and parallel-CI cache races.** Three structural fragilities in `crates/cli/src/audit.rs` are fixed in one pass: (1) a hand-rolled `WorktreeCleanupGuard` is armed before every `git worktree add` subprocess and disarmed only after the `BaseWorktree` struct is constructed, so any early-return path between subprocess success and struct construction now rolls back BOTH git's `.git/worktrees/<name>` registration AND the on-disk directory; (2) `process_is_alive` on Windows was a `#[cfg(not(unix))] true` stub, so `sweep_orphan_audit_worktrees` never cleaned worktrees owned by dead PIDs on Windows. It now calls `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION) + WaitForSingleObject(handle, 0)` via target-gated `windows-sys` bindings, distinguishing `ERROR_INVALID_PARAMETER` (dead) from `ERROR_ACCESS_DENIED` (conservative: alive, matches `kill -0` semantics under EPERM). Long-running Windows dev machines and CI runners stop leaking disk across runs; (3) `BaseWorktree::reuse_or_create` now takes a kernel-level advisory lock on `<reusable_audit_worktree_path>.lock` for the duration of its critical section, via `std::fs::File::try_lock` (stable since Rust 1.89, wraps `flock(2)` on Unix and `LockFileEx` on Windows). Concurrent `fallow audit` runs against the same `base_sha` in matrix CI no longer race on `git worktree add` against the same cached path; the loser cleanly falls through to the non-reusable PID-named worktree instead of racing. `remove_audit_worktree` additionally emits a `tracing::warn!` when `git worktree remove --force` returns non-zero AND the on-disk directory survives, so leaked git registrations are observable via `RUST_LOG=warn` rather than silent. No new third-party deps; `windows-sys` is target-gated to `cfg(windows)`. (Closes [#472](https://github.com/fallow-rs/fallow/issues/472).)
+- **Barrel re-export member propagation through `extends` / `implements` is no longer order-sensitive.** Class-inheritance and interface-implementer credit now walks re-export origins, so a child class `extends BaseShape` (or `implements RenderableShape`) through a `contracts/index.ts` barrel correctly credits the parent's `this.*` accesses on the actual defining file. The visitor also now resolves `export { X }; import { X } from './a';` (export-before-import) as a re-export instead of a local export, matching the existing import-before-export behavior. A local declaration of `X` in the same module shadows the import and keeps the export local. The extraction cache is invalidated automatically on upgrade so users with warm `.fallow/cache` get the fix without manual clearing. Thanks [@M-Hassan-Raza](https://github.com/M-Hassan-Raza) for the patch. (Closes [#427](https://github.com/fallow-rs/fallow/pull/427).)
+
+- **Mask `api_key` and license JWT in `Debug` output and sanitize `Bearer` tokens before they reach stderr.** `CloudRequest` and `UploadInventoryArgs` previously derived `Debug` on their public `api_key` field, and `ActivateArgs` derived `Debug` on its raw-JWT field; any future `tracing::debug!`, `dbg!`, or unwrap-on-Err with the `Debug` formatter would have emitted the full credential to stderr. The derives are replaced with manual `impl Debug` that render the secret as `"***"` (or `Some("***")` for the optional cases). A new `sanitize_network_error(detail: &str)` helper in `crates/cli/src/api.rs` walks user-facing network-error strings and replaces every `Bearer <token>` substring with `Bearer ***`. The helper is wired at every `format!("{err}")` site that runs after an `Authorization: Bearer ...` header is set: `coverage/cloud_client`, `coverage/upload_inventory`, `coverage/upload_source_maps`, `license::activate_trial`, `license::refresh_active_license`, and `ci::with_rate_limit_retry` (GitHub PR-comment posting). The token charset matches the JWT / fallow API-key alphabet (`A-Za-z0-9_.\-=`); non-token bytes after `Bearer ` are preserved so prose mentioning the literal `Bearer ` is untouched. No real disclosure has hit production; this is a defensive lockdown against `ureq::Error`'s `Display` impl that can include outgoing request headers on TLS / connection / internal failure modes. (Closes [#476](https://github.com/fallow-rs/fallow/issues/476).)
+
+### Internal
+
+- **`schema.json` (the JSON Schema for `.fallowrc.json`) is now drift-gated against `FallowConfig::json_schema()` on every `cargo test` run.** Before, the committed root `schema.json` was hand-regenerated via `cargo run --bin fallow -- config-schema > schema.json`; an edit to a `#[derive(JsonSchema)]` struct or `///` docstring in `crates/config/` could ship without a matching regen, leaving the bundled schema (also `cp`'d to `npm/fallow/schema.json` at release time) stale for the entire release. After, a new test in `crates/cli/src/init.rs` parses the committed `schema.json` and `FallowConfig::json_schema()` to `serde_json::Value` and `assert_eq!`s; on mismatch the panic message tells the contributor exactly which command to run. The `rust` paths-filter in `.github/workflows/ci.yml` now also matches edits to `schema.json` directly, so a PR touching only the committed schema still triggers the gate. The `cp schema.json npm/fallow/schema.json` step in both `ci.yml` and `release.yml` is followed by a `diff schema.json npm/fallow/schema.json` so a future refactor that drops or moves the cp fails loud instead of silently shipping a stale schema to npm consumers. This closes the symmetric drift gap that `docs/output-schema.json` already had via the `--features schema-emit` binary (issue #338). (Closes [#440](https://github.com/fallow-rs/fallow/issues/440).)
+
+## [2.76.0] - 2026-05-19
+
+### Deprecated
+
+- **`fallow_core` is now an internal-only surface per [ADR-008](decisions/008-fallow-core-internal-policy.md).** The top-level entry points (`analyze`, `analyze_with_usages`, `analyze_with_trace`, `analyze_retaining_modules`, `analyze_with_parse_result`, `analyze_project`), the `fallow_core::analyze::*` detector helpers (`find_dead_code_full`, `find_unused_exports`, `find_duplicate_exports`, `find_unused_files`, `find_unused_members`, `find_unused_dependencies`, `find_unused_dependency_overrides`, `find_misconfigured_dependency_overrides`, `find_unused_catalog_entries`, `find_empty_catalog_groups`, `find_unresolved_catalog_references`, `find_boundary_violations`), and the feature-flag helpers (`collect_feature_flags`, `correlate_with_dead_code`) now carry `#[deprecated(since = "2.76.0")]` annotations pointing external consumers at `fallow_cli::programmatic` (or `fallow flags --format json` for feature-flag data). Workspace path-dependency callers in `fallow-cli`, `fallow-lsp`, `fallow-core` itself, and the in-tree integration tests continue to compile via `#[expect(deprecated)]` at the call sites. The next minor release (target `2.77.0`, no earlier than 2026-Q3) will flip `publish = false` on `fallow-core` so the crate is no longer fetchable from crates.io; this release is the one-cycle warning window for any external consumers. The replacement programmatic functions return `serde_json::Value` matching the CLI's `--format json` contract (with `*Finding` wrappers, so e.g. `unused_exports[i].export.path` rather than `unused_exports[i].path`), and structured `ProgrammaticError { exit_code, ... }` mirrors the CLI's exit-code ladder so CI integrations branching on exit codes work identically. See [`docs/fallow-core-migration.md`](docs/fallow-core-migration.md) for the function-by-function map and a minimal usage example. Consumers running `RUSTFLAGS=-Dwarnings` will need to allow `deprecated` on their `fallow-core` call sites or migrate before upgrading. (Closes [#418](https://github.com/fallow-rs/fallow/issues/418).)
+
+### Changed
+
+- **`--diff-file <PATH>` now scopes every finding to changed lines, not just the runtime-coverage `hot-path-touched` verdict.** Before: a developer running `fallow audit --diff-file pr.diff` saw line-level filtering only on the runtime-coverage section; every other finding type (unused-export, complexity hotspot, clone family, boundary violation, etc.) stayed at full project scope, and the GitHub Action / GitLab CI shipped a downstream jq filter (`filter-changed.jq`) to narrow the JSON output before posting to PRs. After: when `--diff-file` (or `$FALLOW_DIFF_FILE`) is set, fallow narrows ALL source-anchored findings to lines inside an added hunk for that file, so the JSON `total_issues` is already accurate without jq post-processing. Project-level findings (unused-deps, catalog entries, dependency overrides) bypass the filter because they anchor at fixed `package.json` / `pnpm-workspace.yaml` lines a PR rarely touches even when it semantically caused the finding (e.g. removing the last consumer of `lodash`). Range-shaped findings filter via overlap: a complexity hotspot at lines 10..120 touched by a PR at line 115 is kept; a clone family is kept when ANY of its instances overlaps the diff, even when the other instances are off-diff. Pass `-` as the path or use the new `--diff-stdin` alias to read the diff from stdin (`gh pr diff | fallow audit --diff-file -`). When both `--diff-file` and `--changed-since` are set, `--diff-file` wins for line-level filtering and `--changed-since` still scopes file discovery; fallow logs a one-line stderr note so the precedence is visible in CI logs. An opt-in `--diff-file` that parses 0 added lines (typo, wrong path, pure-rename diff with no content hunks) now emits a `fallow: warning [diff-file]: ... parsed 0 added lines` warning instead of silently dropping every finding. Existing Action / CI pipelines that already set `FALLOW_DIFF_FILE` keep working unchanged with stricter filtering; pipelines that relied on the pre-feature behavior (full project scope when `--diff-file` was set for runtime-coverage only) should unset `FALLOW_DIFF_FILE` or remove the flag. (Closes [#424](https://github.com/fallow-rs/fallow/issues/424).)
+
+- **`fallow fix` can remove leading pnpm-catalog comment blocks when deleting unused catalog entries.** The new `fix.catalog.deletePrecedingComments` config knob accepts `"auto"` (default), `"always"`, or `"never"`. `auto` deletes a contiguous same-indent YAML comment block only when it directly follows the parent catalog header or a blank separator, preserving sibling-adjacent comments for manual review. Two escape hatches keep curated comments safe: a `# fallow-keep` marker on any line in the block preserves it regardless of policy (mirroring the existing `fallow-ignore` inline-suppression convention), and the `auto` policy additionally preserves section-banner blocks whose comment body starts with three or more `=`, `-`, `*`, `_`, `~`, `+`, or `#` characters (e.g. `# === React 18 production pins ===`). The JSON fix action gains an `entry_line` field alongside the (now deletion-start) `line` field so CI annotators and agents can pick whichever anchor they need without ambiguity; the human-mode summary surfaces the absorbed comment-line count (`Fixed N issue(s) (+M catalog comment lines)`). LSP quick fixes intentionally stay conservative and do not delete leading comments. (Closes [#360](https://github.com/fallow-rs/fallow/issues/360).)
+
+- **Duplication `actions` flow through serde natively; the `inject_dupes_actions` JSON post-pass is fully retired.** `fallow dupes --format json` (and the `dupes` block of `audit` / combined output, and the per-bucket output under `--group-by`) now serialises each `clone_groups[]` item through a typed `CloneGroupFinding` wrapper that flattens the bare `CloneGroup` payload and carries `actions: CloneGroupAction[]` plus the optional audit-mode `introduced: boolean` as named fields. Each `clone_families[]` item flows through a typed `CloneFamilyFinding` wrapper; its nested `groups[]` items each carry their own typed `actions[]` array, preserving the issue [#393](https://github.com/fallow-rs/fallow/issues/393) regression contract for JSON-Schema strict consumers. Per-bucket `--group-by` items flow through `AttributedCloneGroupFinding`. The on-the-wire shape is unchanged: every inner field (`instances`, `token_count`, `line_count`, `files`, `groups`, `total_duplicated_lines`, `total_duplicated_tokens`, `suggestions`, `primary_owner`, `instances[].owner`) still sits at the top level of each item alongside `actions` and (top-level only) `introduced`. The OLD-vs-NEW JSON diff on the vue-core benchmark fixture is byte-identical modulo `elapsed_ms` / `version` for both standalone `dupes --format json` and the bare combined invocation. A new `DupesReportPayload` mirrors `DuplicationReport` field-for-field with wrapped findings, and `DupesOutput.report` / `CombinedOutput.dupes` / `AuditOutput.duplication` now flatten the payload instead of the bare report. The 120-line `inject_dupes_actions` post-pass plus its `build_clone_family_actions` / `build_clone_group_actions` helpers are deleted from `crates/cli/src/report/json.rs`. With this batch the legacy `inject_*_actions` post-pass is fully retired across check, dupes, and health. The codegen-derived TS contracts (`editors/vscode/src/generated/output-contract.d.ts`, `npm/fallow/types/output-contract.d.ts`) gain matching `CloneGroupFinding` / `CloneFamilyFinding` / `AttributedCloneGroupFinding` interfaces; backwards-compat aliases (`type CloneGroup = CloneGroupFinding`, `type CloneFamily = CloneFamilyFinding`, `type AttributedCloneGroup = AttributedCloneGroupFinding`) live in `editors/vscode/src/types.ts` so existing consumers see no API break. (Closes [#409](https://github.com/fallow-rs/fallow/issues/409). Refs [#384](https://github.com/fallow-rs/fallow/issues/384).)
+
+- **`fallow coverage analyze --format json` envelope is now derived from a typed Rust struct; the last hand-built `serde_json::json!` root envelope is retired.** `print_runtime_json` in `crates/cli/src/coverage/analyze.rs` previously built the output via a `serde_json::json!({"schema_version": "1", "version": ..., "elapsed_ms": ..., "runtime_coverage": ...})` macro and grafted the optional `_meta` block via a JSON-map insertion. The envelope now flows through a typed `CoverageAnalyzeOutput` struct (singleton `schema_version: CoverageAnalyzeSchemaVersion::V1` discriminator, plus `version`, `elapsed_ms`, `runtime_coverage: RuntimeCoverageReport`, optional `_meta: Meta`) so the schema is derived from Rust source. `CoverageAnalyzeOutput` joins `FallowOutput` as a new untagged `CoverageAnalyze` variant rather than staying a hand-maintained sibling root `oneOf` branch; the document-root `oneOf` simplifies to two entries (`FallowOutput` + `CodeClimateOutput`). The wire shape is byte-identical: same four required fields, same optional `_meta`. The drift-gate registry in `crates/cli/src/bin/schema_emit.rs` drops the `CoverageAnalyzeOutput` entry from both `HAND_MAINTAINED_ALLOW_LIST` and `HAND_MAINTAINED_ROOT_ENVELOPES`, both now empty. The root schema `description` field gains `runtime_coverage` as a discriminator and drops the "still hand-maintained" caveat. (Closes [#410](https://github.com/fallow-rs/fallow/issues/410). Refs [#384](https://github.com/fallow-rs/fallow/issues/384).)
+
+- **Hotspot and refactoring-target `actions` flow through serde natively; the JSON post-pass that patched them in is fully retired.** `fallow health --hotspots --targets --format json` (and the `health` block of `audit` / combined output, and the per-group output under `--group-by`) now serialises each `hotspots[]` item through a typed `HotspotFinding` wrapper and each `targets[]` item through a typed `RefactoringTargetFinding` wrapper. Both wrappers flatten the inner payload via `#[serde(flatten)]` and carry `actions` as a named field (`HotspotAction[]` and `RefactoringTargetAction[]` respectively). The on-the-wire shape is unchanged: every inner field (`HotspotEntry`'s `path`, `score`, `commits`, `weighted_commits`, `lines_added`, `lines_deleted`, `complexity_density`, `fan_in`, `trend`, `ownership`, `is_test_path`; `RefactoringTarget`'s `path`, `priority`, `efficiency`, `recommendation`, `category`, `effort`, `confidence`, `factors`, `evidence`) still sits at the top level alongside `actions`. The OLD-vs-NEW JSON diff on the vue-core benchmark fixture is byte-identical modulo `elapsed_ms` / `version` for `health --hotspots --targets`, the bare combined invocation, and `audit --base HEAD~1`. The schema ships separate `HotspotFinding` / `HotspotEntry` and `RefactoringTargetFinding` / `RefactoringTarget` definitions in `docs/output-schema.json`, and the codegen-derived TS contracts (`editors/vscode/src/generated/output-contract.d.ts`, `npm/fallow/types/output-contract.d.ts`) gain matching `HotspotFinding` / `RefactoringTargetFinding` interfaces plus `HotspotEntry = Omit<HotspotFinding, "actions">` and `RefactoringTarget = Omit<RefactoringTargetFinding, "actions">` type aliases so downstream consumers can type either the wrapper or the inner payload. Asymmetry with `HealthFinding`: neither `HotspotFinding` nor `RefactoringTargetFinding` carries the audit-mode `introduced` flag because hotspot ranking and refactoring targets are not produced by `fallow audit`'s base-snapshot classifier; the pre-wrapper `finding_augmentation` set `include_introduced: false` for both and the typed wrappers preserve that. With this batch the legacy `inject_health_post_pass_actions` post-pass is fully retired across `report/json.rs`, `audit.rs`, and `combined.rs`. (Closes [#408](https://github.com/fallow-rs/fallow/issues/408). Refs [#384](https://github.com/fallow-rs/fallow/issues/384).)
+
+- **Health-finding `actions` and `introduced` flow through serde natively; the JSON post-pass that patched them in is retired for findings.** `fallow health --format json` (and the `health` block of `audit` / combined output) now serialises each `findings[]` item through a typed `HealthFinding` wrapper that flattens the inner `ComplexityViolation` payload and carries `actions: HealthFindingAction[]` plus the optional audit-mode `introduced: boolean` as named fields. The on-the-wire shape is unchanged: every inner field (`path`, `name`, `line`, `col`, `cyclomatic`, `cognitive`, ...) still sits at the top level of each `findings[]` item alongside `actions` and `introduced`. The OLD-vs-NEW JSON diff on the vue-core benchmark fixture (273 findings) is empty modulo `elapsed_ms` / `version`, and per-finding `actions[]` discriminants are byte-identical. The schema now ships separate `HealthFinding` and `ComplexityViolation` definitions in `docs/output-schema.json` (`HealthFinding` describes the wire envelope; `ComplexityViolation` is the inner payload); the codegen-derived TS contracts (`editors/vscode/src/generated/output-contract.d.ts`, `npm/fallow/types/output-contract.d.ts`) gain a matching `HealthFinding` interface plus a `ComplexityViolation` type alias (`Omit<HealthFinding, "actions" | "introduced">`) so downstream consumers can type either the wrapper or the inner payload. The `inject_health_actions` post-pass that previously mutated the serialised JSON tree to add `actions` arrays and the report-root `actions_meta` breadcrumb is retired for findings; the renamed `inject_health_post_pass_actions` still walks `targets[]` and `hotspots[]` until their typed-wrapper migrations land (out of scope for this PR). `actions_meta` is now set at construction time on the typed `HealthReport.actions_meta` field (and on each per-group `HealthGroup.actions_meta` when `--group-by` is active) when the active `HealthActionContext` requests suppress-line omission, so the breadcrumb flows through serde natively. (Refs [#384](https://github.com/fallow-rs/fallow/issues/384).)
+
+### Added
+
+- **Angular component complexity rollup: synthesise a `<component>` finding per component that has both class AND template above threshold.** `fallow health --complexity` (and `audit`, `combined`) now emits a synthetic `<component>` finding per Angular component whose class function findings AND `<template>` finding both cleared the cyclomatic / cognitive thresholds. The rollup's `cyclomatic` and `cognitive` are `worst_class_method + template`; the new `component_rollup` payload carries the pre-summation breakdown so consumers see WHY the component ranks high (`class_worst_function: "handleClick"`, `class_cyclomatic: 3`, `class_cognitive: 4`, `template_path: "src/host-game.component.html"`, `template_cyclomatic: 6`, `template_cognitive: 9`, `component: "host-game.component"` derived from the .ts owner's file stem). A component whose class scores moderately (3/4) and whose template scores moderately (6/9) was previously two scattered medium findings the headline rank could miss; the rollup surfaces it as one finding cyclomatic 9, cognitive 13 that wins `--targets` selection. Per-function and per-`<template>` entries stay where they are so existing suppression sites and per-finding tooling references keep working: the rollup is strictly additive. The rollup is anchored at the worst class method's line so `// fallow-ignore-next-line complexity` placed above that method hides both the function finding and the rollup; the JSON action declares `placement: "above-component-worst-method"`. Both external-`templateUrl` components (using the inverse-`templateUrl` provenance map populated alongside CRAP scoring) and inline `template:` components (where the `<template>` finding already lives on the owning .ts) are handled; defensive against the rare multi-`@Component` .ts file (no rollup, since fallow can't yet AST-attribute each template to a specific class). Wire-level deltas: (a) new `component_rollup: ComponentRollup` optional field on every `HealthFinding`, gated by `#[serde(default, skip_serializing_if = "Option::is_none")]` so non-rollup findings see no shape change; (b) new `ComponentRollup` definition in `docs/output-schema.json` and the codegen-derived TS contracts (`editors/vscode/src/generated/output-contract.d.ts`, `npm/fallow/types/output-contract.d.ts`); (c) `fallow health` human output renders a `rolled up: 3cyc 4cog on host-game.component.handleClick + 6cyc 9cog on host-game.component.html` breakdown line under the `<component>` row; (d) the MCP `check_health` tool description teaches AI agents how to read the discriminator and the breakdown so the rollup steers refactoring decisions. Existing baselines see the `<component>` findings as new (`audit --gate new-only` will surface them); rebake baselines after upgrade if you want to suppress the rollup historically. (Closes [#234](https://github.com/fallow-rs/fallow/issues/234).)
+
+- **Synthetic Angular `<template>` complexity findings now carry component-inherited CRAP provenance.** When `fallow health --complexity` (and `audit`, `combined`) emit a `<template>` finding on a `.html` template, the CRAP score is computed against the owning `.component.ts` reached via the inverse `templateUrl` `SideEffect` edge, and the finding ships two new fields: `coverage_source: "estimated_component_inherited"` and `inherited_from: "<owner>.component.ts"` (project-relative). The score itself does not move for the common case (BFS already cascades reachability through the `templateUrl` edge, so `.html.is_test_reachable()` already matches the owning `.ts`), so existing baselines and `--max-crap` gates are unaffected. The wire-level deltas are: (a) the two new optional fields appear on `HealthFinding` when the inherit path triggered, gated by `#[serde(skip_serializing_if = "Option::is_none")]` so existing consumers see no shape change otherwise; (b) the new `CoverageSource` enum (`istanbul` / `estimated` / `estimated_component_inherited`) is published in `docs/output-schema.json` and the codegen-derived TS contracts (`editors/vscode/src/generated/output-contract.d.ts`, `npm/fallow/types/output-contract.d.ts`); (c) `fallow health` human output renders `(inherited from foo.component.ts)` after the CRAP score on template rows; (d) the JSON action ladder pivots the primary coverage action for inherited `<template>` findings from "increase coverage on `<template>`" to "increase test coverage on `<owner>.component.ts`" with a `target_path` field, so AI agents target the component rather than scaffolding tests against a structurally untestable `.html` path. The MCP `check_health` tool description now explains the discriminator so agents discover the new fields without inspecting the schema. Tier 2 (AOT source-map back-mapping for projects whose tests are AOT-compiled) is tracked separately on the same issue. (Refs [#186](https://github.com/fallow-rs/fallow/issues/186) tier 1.)
+
+- **`fallow fix` creates `.fallowrc.json` when no fallow config exists, with framework-aware scaffolding plus the new `ignoreExports` rules.** Previously, `fallow fix` against a project with `duplicate-exports` findings and no fallow config file printed `Skipped duplicate-export config fix: no fallow config file at <root>. Run fallow init to create one, then re-run fallow fix --yes.` and exited without writing. Users had to run two commands to fix what felt like one issue. The applier now creates `.fallowrc.json` directly using the same scaffolding `fallow init` emits (framework detection for TypeScript / Storybook / Vitest / Jest / Playwright / React / Vue / Angular / Svelte, `$schema`, `entry`, `ignorePatterns`, `duplicates.minOccurrences = 3`, `rules.unused-dependencies = "warn"`) and layers the new `ignoreExports` entries on top, so the post-fix `fallow check` does not surface a fresh wave of `unused_files` for Storybook files or `unused_dependencies` for test-framework packages. The create-fallback refuses to fire inside a monorepo subpackage (one of `pnpm-workspace.yaml`, `package.json#workspaces`, `turbo.json`, `lerna.json`, `rush.json` above the invocation directory) and emits a targeted error pointing at the workspace root instead, so 8-package monorepos do not end up with 8 fragmented configs. A new `--no-create-config` flag (default off) opts out of the create-fallback for pre-commit hooks, CI bots, and `fallow watch` where silently materialising a new top-level file would surprise the user; the duplicate-export config-add path is skipped with an explanatory entry while source-file edits proceed normally. After a successful create, the human stderr emits `Created .fallowrc.json with N ignoreExports rule(s). Add it to git.` so the new artifact is not silently lost. The JSON `add-to-config` action's `auto_fixable` field is now `true` whenever the applier can safely write the rule (config exists, OR no config exists and the working directory is not inside a monorepo subpackage); the per-instance flip remains for the monorepo case, so agents that filter on `auto_fixable: true` continue to receive only actions they can safely pipe into `fallow fix --yes`. (Closes [#332](https://github.com/fallow-rs/fallow/issues/332).)
+
+- **`fallow fix --dry-run` previews `ignoreExports` config writes as a unified diff, replacing the prior `Would add N rule(s)` count-only line.** Both human (`--format human`) and JSON (`--format json`) modes carry the proposal in full. For the create-fallback case the diff is hand-rolled `+`-prefix output (BEFORE side is always empty). For the edit case it is a `similar::TextDiff` unified diff with 3 lines of context so callers can audit the exact bytes that will land in `.fallowrc.json` / `.fallowrc.jsonc` / `fallow.toml` / `.fallow.toml`. The JSON fix entry gains a `proposed_diff: "..."` field alongside the existing `entries: [...]` breadcrumb so agents piping `fallow fix --dry-run --format json` into `fallow fix --yes` can validate the proposal programmatically. The create-fallback also surfaces `created_files: [".fallowrc.json"]` so consumers know exactly which paths the apply step would (or did) materialize. Monorepo-subpackage refusals carry `skip_reason: "monorepo_subpackage"` with the resolved `workspace_root`; `--no-create-config` refusals carry `skip_reason: "no_create_config"`. (Refs [#332](https://github.com/fallow-rs/fallow/issues/332).)
+
+- **`fallow list --boundaries --format json` surfaces the user's logical group name for `autoDiscover` zones.** When a config declares `{ name: "features", autoDiscover: ["src/features"] }` (or uses a preset whose zones autoDiscover under the hood, e.g. Bulletproof), expansion previously rewrote `zones[]` into the discovered children (`features/auth`, `features/billing`) and dropped the user-authored `features` parent from the output. Consumers (config UIs, Sankey renderers of `from -> allow` rules, agent-driven config tooling, dashboards) had to reconstruct the grouping from the `features/<child>` naming convention. The output now carries a parallel `logical_groups[]` array with one entry per pre-expansion autoDiscover zone: `name` (the parent the user wrote), `children` (discovered zone names in stable directory-sorted order), `auto_discover` (the user's verbatim path strings, including trailing slash and leading `./`, so config-edit tooling round-trips without rewriting unchanged source), `status` (`ok` / `empty` / `invalid_path`, discriminating "directory empty" from "directory missing or unreadable"), `source_zone_index` (the parent's position in the pre-expansion `zones[]` for byte-accurate config patches), `file_count` (sum across children plus any fallback zone), `merged_from` (parent zone indices when the user declared the same parent name multiple times; surfaces the duplicate in JSON instead of hiding it behind a `tracing::warn!`), `original_zone_root` (echo of the parent's `root` subtree scope so monorepo patchers know whether `root` was authored on the parent or per-child), `child_source_indices` (parallel to `children`, attributing each child to a specific `auto_discover` entry when multiple paths were authored), and optional `authored_rule` (the pre-expansion `{ allow, allowTypeOnly }` keyed on the parent) and `fallback_zone` (cross-reference to the zone twin when the parent had both `patterns` and `autoDiscover`, e.g. the Bulletproof case). `zones[]`, `rules[]`, `zone_count`, `rule_count` are unchanged so existing consumers see zero behavioral delta; the empty-boundaries branch also gains `logical_group_count: 0, logical_groups: []` plus parity `zone_count` / `rule_count` so consumers can read the count fields without first branching on `configured`. The full envelope (`ListBoundariesOutput`, `BoundariesListing`, `BoundariesListZone`, `BoundariesListRule`, `BoundariesListLogicalGroup`, plus the `LogicalGroup`, `LogicalGroupStatus`, `AuthoredRule` building blocks) is now drift-gated in `docs/output-schema.json` via the same Rust-source-of-truth pipeline as the analytical commands (refs [#338](https://github.com/fallow-rs/fallow/issues/338), [#384](https://github.com/fallow-rs/fallow/issues/384)). The human `list --boundaries` output gains a `Logical groups:` section parallel to `Zones:` and `Rules:`, with empty sections suppressed, correct singular/plural counts, errors-first ordering inside the section so misconfigured paths surface at the top, and a `N files (X children + Y fallback)` split when the parent kept its own classifier. (Closes [#373](https://github.com/fallow-rs/fallow/issues/373).)
+
+- **Architecture boundaries: opt-in escape hatch for type-only imports across zones (`allowTypeOnly`).** TypeScript codebases often need type-level contracts between modules that should not have runtime dependencies on each other. Previously the only options were to scatter `// fallow-ignore-next-line` comments on every type-only cross-boundary import (noisy; real violations hide among the legitimate ignores) or duplicate type definitions in a shared layer (loses ownership clarity). A `BoundaryRule` now accepts an optional `allowTypeOnly: ["zoneA", ...]` list mirroring the existing `allow` shape. When `featureB` has `allow: [], allowTypeOnly: ["featureA"]`, type-only imports from `featureB` into `featureA` (`import type {...}`, `import type * as ns`, inline `import { type Foo }` where every named specifier carries the `type` qualifier, AND type-only re-exports `export type { Foo } from "..."`) no longer fire boundary violations. Mixed-specifier imports (`import { type Foo, Bar }`) still fire because the runtime dependency on `Bar` is real. The predicate is `edge.symbols.iter().all(|s| s.is_type_only)`, the same one cycle detection already uses to skip type-only edges from circular-dependency reports. Strictly additive: omitting `allowTypeOnly` preserves pre-feature behavior, and no preset (Layered, Hexagonal, FeatureSliced, Bulletproof) defaults the field on. (Closes [#365](https://github.com/fallow-rs/fallow/issues/365). Thanks [@DrJonki](https://github.com/DrJonki) for the report.)
+
+### Fixed
+
+- **Runtime coverage mapping is tightened along the V8-offset, source-map, and cloud-coverage paths.** Five contributor-PR fixes land together: V8 coverage offsets are now mapped as source positions before the line-and-column lookup so off-by-one ranges no longer misattribute; partial source-map remaps are kept when only some segments resolve cleanly instead of dropping the entire mapping; the owner segment is preserved in source-map project ids so monorepo deployments at `<owner>/<repo>` route to the right Fallow Cloud project instead of being conflated with a same-named repo at a different owner; cloud coverage now requires a line match before attributing a hit (the prior column-only fallback over-credited adjacent statements on a single line); and scoped source-map repo names (`@scope/name`) are accepted by the project-id parser without rejection. (PR [#376](https://github.com/fallow-rs/fallow/pull/376). Thanks [@M-Hassan-Raza](https://github.com/M-Hassan-Raza) for the patch.)
+
+- **Class methods reached via a typed getter chain inside a Playwright fixture teardown are credited.** A Playwright fixture pattern like `await use({ get processEventsService() { return container.resolve(ProcessEventsService); } });` followed by a teardown step that calls `fixtures.processEventsService.clearLast()` previously reported `ProcessEventsService.clearLast` as `unused-class-member` because the typed-getter chain dropped the receiver type before the bound-member-access pass could resolve it. The extract visitor now records typed getter declarations as instance bindings under the same machinery already used for typed fields, so the access chain `<fixtures>.<getter>.<method>` resolves through the existing bound-member pipeline. `CACHE_VERSION` bumped 79 to 80 so the fix takes effect on warm caches. (Closes [#386](https://github.com/fallow-rs/fallow/issues/386). Thanks [@vethman](https://github.com/vethman) for the report.)
+
+- **`docs/output-schema.json` no longer ships an orphan `SuppressAutoFixable` definition.** The committed schema carried a singleton `oneOf: [{type: "string", const: "false"}]` definition named `SuppressAutoFixable` whose prose suggested suppress-action `auto_fixable` should render as a literal `false` rather than a generic boolean. No Rust type ever produced the definition (it survived from a pre-#384 hand-authored draft into the merged regen via `merge_with_committed`), no `$ref` pointed at it, and the wire shape on `SuppressLineAction.auto_fixable` and `SuppressFileAction.auto_fixable` is and remains `{"type": "boolean"}`. Keeping the field as `boolean` is the documented intent on `IssueAction` in `crates/types/src/output.rs:61-64`: a future auto-applier (e.g. an LLM-driven suppression writer) can promote individual variants to `auto_fixable: true` without a schema bump. The definition is removed and the corresponding `HAND_MAINTAINED_ALLOW_LIST` entry in `crates/cli/src/bin/schema_emit.rs` is dropped, so the structural drift gate now rejects re-introduction of the name without a matching Rust source. Strictly an internal schema cleanup: no wire shape change, no codegen-derived TS contract change. (Closes [#402](https://github.com/fallow-rs/fallow/issues/402). Refs [#384](https://github.com/fallow-rs/fallow/issues/384) item 1 follow-up.)
+
+- **`typeof import('./path').X` inside `.d.ts` ambient declarations now traces the target file.** unplugin-auto-import's `auto-imports.d.ts` and unplugin-vue-components' `components.d.ts` embed `typeof import()` references inside `declare global { ... }` and `declare module 'vue' { ... }` bodies; fallow previously walked those bodies but had no extractor for the `TSImportType` node, so the referenced composables and components surfaced as `unused-files` in every Vite + Vue + unplugin-* project. The visitor now records each `TSImportType` as a type-only `ImportInfo` (qualifier root identifier becomes a `Named` import; bare `typeof import('./x')` and `typeof import('./x')['default']` indexed-access patterns produce `SideEffect`), and the graph layer promotes every `.d.ts` / `.d.mts` / `.d.cts` file to an overall reachability root so the new edge actually propagates through BFS. Declaration files were already exempt from `unused-files`; this aligns reachability with that existing "always alive" policy. Side effect: `is_entry_point()` returns `true` for `.d.ts` files, which auto-skips them in `unused-exports` / `unused-types` detection (preventing false positives on module-augmentation interfaces like `GlobalComponents` that TypeScript consumes invisibly via global type resolution). Pass `--include-entry-exports` if you need to re-enable unused-export checking on hand-authored `.d.ts` files. Runtime / test reachability is unchanged: declaration files emit no runtime side effects. `CACHE_VERSION` bumped 81 to 82. (Closes [#396](https://github.com/fallow-rs/fallow/issues/396), [#397](https://github.com/fallow-rs/fallow/issues/397). Thanks [@wouterkroes](https://github.com/wouterkroes) for the reports.)
+
+- **`new URL('./', import.meta.url)` no longer flags `./` as an unresolved import.** The canonical ESM `__dirname` idiom (`fileURLToPath(new URL('./', import.meta.url))`) shipped in nearly every Vite `vite.config.ts` was being treated as a relative module specifier by the `new URL()` worker / asset detector. Directory-only specifiers (`./`, `../`, and any path ending in `/`) are now skipped: they construct a directory URL, not a file URL, and resolve to no module. `./worker.js`, `./assets/foo.svg`, and other file-pointing specifiers are unaffected. (Closes [#399](https://github.com/fallow-rs/fallow/issues/399). Thanks [@wouterkroes](https://github.com/wouterkroes) for the report.)
+
+- **Duplication JSON output now emits `actions: []` on every `CloneGroup` and `CloneFamily`, including the nested `clone_families[].groups[]` items.** The published schema lists `actions` as required on every duplication finding (per the schema-emit augmentation contract introduced in [#338](https://github.com/fallow-rs/fallow/issues/338): the runtime always emits `actions`, so requiring the field on the wire keeps the schema honest). The runtime contract held for top-level `clone_groups[]` and `clone_families[]` but two paths under-emitted: (a) the nested `clone_families[i].groups[j]` items (one `CloneGroup` per inner array element) never received an `actions` field on any code path, and (b) the combined `fallow --format json` builder serialized the duplication sub-block without calling `inject_dupes_actions` at all, so its top-level `dupes.clone_groups[]` and `dupes.clone_families[]` shipped bare too. JSON Schema strict validation of a `fallow dupes --format json` of `vite` reported 234 `required 'actions' is a required property` violations (one per nested group); the combined output reported 608 (top-level families + groups + nested). `inject_dupes_actions` now also walks each family's nested `groups[]` and injects the per-group action set on each inner item, and the combined-mode JSON builder now calls `inject_dupes_actions` on its duplication sub-block. (Closes [#393](https://github.com/fallow-rs/fallow/issues/393).)
+
+- **`docs/output-schema.json` regen no longer silently drops struct fields named after JSON Schema keywords.** `normalize_schema` in `crates/cli/src/bin/schema_emit.rs` strips schemars' integer-width and validation-keyword hints (`format`, `default`, `minimum`, `maximum`, `examples`, `exclusiveMinimum`, `exclusiveMaximum`) so the regenerated document matches the committed canonical form. The recursive walk applied the strip at every map level, including inside `properties` / `definitions` / `$defs` / `patternProperties` maps where the keys are user-facing struct field or type names rather than schema keywords. `ContributorEntry` carries a `pub format: ContributorIdentifierFormat` field (the email-mode discriminator); regeneration silently dropped the property while leaving `"format"` in `required`, which trips ajv's `--strict=true` `strictRequired` check. Both `normalize_schema` and the drift-test mirror `normalize_one` now skip the strip when the key is the parent of a `properties` / `definitions` / `$defs` / `patternProperties` map, so a struct field literally named `format` (or `default` / `minimum` / etc.) survives regen. The committed schema picks up the missing `ContributorEntry.format` property with its `ContributorIdentifierFormat` `$ref`. (Closes [#394](https://github.com/fallow-rs/fallow/issues/394).)
+
+- **`autoDiscover` parent rule now auto-allows discovered child zones, so top-level barrels can re-export feature modules without false-positive cross-zone violations.** When a zone declared both `patterns` and `autoDiscover`, the parent rule's `allow` list was applied verbatim to the parent fallback zone, so a top-level `src/features/index.ts` barrel that re-exported children classified as `features` and surfaced `features → features/<child>` violations. The Bulletproof preset worked around this by leaving `patterns` empty on the `features` zone, which kept top-level files unclassified and unrestricted, including non-barrel files like `src/features/types.ts`. Parent-fallback rule expansion now automatically appends every discovered child to the parent's `allow` while generated child rules keep the original `allow` exactly, preserving sibling-feature isolation. The Bulletproof preset now sets `patterns: ["src/features/**"]` on the `features` zone so top-level feature files classify under the parent zone, barrels can re-export children, and non-barrel top-level files still obey the `features` rule. User configs of the same shape (`{ name: "features", patterns: [...], autoDiscover: [...] }` plus `{ from: "features", allow: [...] }`) inherit the same behavior with no schema change. (Closes [#372](https://github.com/fallow-rs/fallow/issues/372).)
+
+- **PR comment no longer renders empty when the only finding is a project-level dependency / catalog / override issue.** The `--format pr-comment-github` and `--format pr-comment-gitlab` renderers applied a line-based diff filter (`FALLOW_DIFF_FILTER`, default `added`) to every finding, including those anchored on fixed lines inside `package.json` and `pnpm-workspace.yaml`. PRs whose diff did not touch the anchored line, the common shape when a transitive dep drops out of the resolved tree and leaves a stale `pnpm.overrides` entry behind, rendered the comment body as "No GitHub PR/MR findings" while CI still exited non-zero from the same issue surfaced via annotations. Project-level rules (`unused-dependency-override`, `misconfigured-dependency-override`, `unused-catalog-entry`, `empty-catalog-group`, `unresolved-catalog-reference`, `unused-dependency`, `unused-dev-dependency`, `unused-optional-dependency`, `type-only-dependency`, `test-only-dependency`) now bypass the diff filter in the PR-comment path so the body always explains every CI-failure reason. Source-anchored rules continue to honor the filter so comments stay focused on the lines a PR actually changed. The review-envelope path keeps the unconditional filter because inline review comments must anchor on diff lines. (Closes [#381](https://github.com/fallow-rs/fallow/issues/381). Thanks [@cloud-walker](https://github.com/cloud-walker) for the report.)
+
+- **Standalone `export default <template>...</template>` in `.gts` files now extracts imports and the default export.** The v2.75.0 multi-template fix only treated single-byte expression delimiters (`=`, `,`, `(`, `?`, `:`) as expression position, so the canonical template-only-component shape (no `const` wrapper) fell through to blank-out, leaving `export default ;`, a TypeScript syntax error that made oxc bail and drop every import in the file. The stripper now also walks back through identifier bytes and matches against the expression-prefix keyword set `{default, return, throw, yield, await, new}`, with full-identifier comparison so user bindings like `mydefault` or `$return` do not false-positive. `CACHE_VERSION` bumped 78 to 79 so the fix takes effect on warm caches. (Closes [#379](https://github.com/fallow-rs/fallow/issues/379).)
+
+- **Abstract base-class methods called through a generic-constrained `this.<field>` are credited.** A class declared as `BaseService<TClient extends BaseClient>` with `constructor(protected readonly client: TClient)` and a body that calls `this.client.fetchLatest(id)` previously reported `BaseClient.fetchLatest` as an unused class member because the visitor recorded `this.client -> TClient` and `TClient` resolves nowhere. The class visitor now collects `<TypeParam, Constraint>` pairs from `class.type_parameters` on entry and substitutes the constraint when registering `this.<param>` typed bindings, so `this.client.fetchLatest` resolves to `BaseClient.fetchLatest` through the existing bound-member-access pipeline. Unconstrained parameters (`class Container<T>`) drop the binding without effect, matching what fallow already does for any unresolvable type name. Same substitution flows through nested object types and typed getters. (Closes [#388](https://github.com/fallow-rs/fallow/issues/388). Thanks [@vethman](https://github.com/vethman) for the report.)
+
+- **Fluent-builder chains credit intermediate setters, not just the static factory.** `EventBuilder.createWithDefaults().setProcessId("x").setSubject("y").build()` previously flagged every setter and `build()` as unused, because the static-factory machinery (#346) only credited the result of `ID.factory()` when bound to a local variable. The visitor now records each call expression chained off a previous call as a `__fallow_fluent_chain__:` sentinel `MemberAccess` carrying the root `ID`, root method, prior chain prefix, and the method being called now. A new analyze pass walks each chain step against the resolved class export: the root method must be `is_instance_returning_static`, intermediate methods must be `is_self_returning`, and only then is the terminal call credited. Static methods whose declared return type matches the class name are now also treated as factories (covers `static createWithDefaults(): EventBuilder { return chain; }`); instance methods carry a new `is_self_returning` flag set when the declared return type is the class OR when the body's last statement is `return this`. The chain stops at non-self-returning methods like `.build()` returning a different type, so `.build().toString()` does NOT over-credit `EventBuilder.toString`. `CACHE_VERSION` bumped 80 to 81. (Closes [#387](https://github.com/fallow-rs/fallow/issues/387). Thanks [@vethman](https://github.com/vethman) for the report.)
+
+### Documentation
+
+- **TypeScript bare-name backwards-compat aliases ship in the npm-published `fallow/types` contract.** After the #384 / #408 / #409 schema-derive ladder wrapped every bare finding type in a `*Finding` envelope, `json-schema-to-typescript` dropped the orphan bare names because their property set was fully subsumed by the flattening wrapper. The dupes aliases (`CloneGroup`, `CloneFamily`, `AttributedCloneGroup`, `DuplicationReport`) were already re-added at the generator level, but the 17 dead-code bare aliases (`UnusedExport`, `UnusedDependency`, `BoundaryViolation`, etc.) only lived in `editors/vscode/src/types.ts`, which is internal to the VS Code extension and NOT published to npm. External consumers running `import type { UnusedExport } from "fallow/types"` would have failed to type-check after upgrading. `editors/vscode/scripts/codegen-types.mjs` now emits all 17 dead-code bare aliases (plus the 2 union forms `UnusedDependency` and `UnusedMember`) alongside the dupes aliases under a shared `// Backwards-compat aliases` section in the generated `output-contract.d.ts`, so the npm-published and VS Code internal type contracts now carry the same surface. The previously hand-written aliases in `editors/vscode/src/types.ts` are removed; the file re-exports the generated names instead. A `TypeScript bare-name backwards-compat aliases` subsection in `docs/backwards-compatibility.md` documents the policy for public consumers: aliases ship as part of fallow's v2.x stable surface and are scheduled for removal alongside the kind-tagged `FallowOutput` major bump ([#413](https://github.com/fallow-rs/fallow/issues/413)) with a one-minor-cycle deprecation window (`@deprecated` JSDoc + CHANGELOG headline) preceding the removal. No JSON wire shape change. (Closes [#415](https://github.com/fallow-rs/fallow/issues/415).)
+
+- **`fallow explain` for the three complexity rules (`high-cyclomatic-complexity`, `high-cognitive-complexity`, `high-complexity`) now covers synthetic `<template>` and `<component>` Angular findings.** The `RuleDef.full`, `RuleGuide.example`, and `RuleGuide.how_to_fix` strings were function-scoped and read awkwardly for agents acting on Angular findings: a `<template>` row in `findings[]` pointed at prose about "early returns" and "guard clauses", and a `<component>` rollup row pointed at the same. The prose now names both synthetic shapes, lists the template constructs that contribute to cyclomatic (`@if`, `@else if`, `@for`, `@case`, `@defer (when ...)`, legacy `*ngIf`/`*ngFor`, plus ternary and logical operators inside bound attributes and `{{ }}` interpolations) and cognitive (nesting penalties on stacked `@if`/`@for`/`@switch`), explains the rollup math (worst class method's score plus the template's, for each metric), and points at the `component_rollup` payload for per-half breakdown. The same prose also flows through SARIF `fullDescription` (consumed by GitHub Code Scanning, code-quality dashboards) and the MCP `fallow_explain` tool, so AI agents reading either surface get actionable guidance without re-deriving it from JSON. fallow-docs `explanations/health` gains a `Synthetic <template> and <component> findings` subsection under `Complexity metrics` so the docs URLs in `fallow explain` output land on a real anchor. No behavior change. (Closes [#404](https://github.com/fallow-rs/fallow/issues/404).)
+
+- **`auto_fixable` is documented as per-finding, not per action type.** The JSON `actions[]` array has two semantically distinct shapes of `auto_fixable`: per-rule (constant across every finding for an action type) and per-instance (depends on the specific finding's payload). The distinction matters for agents that filter on `auto_fixable: true` to decide what is safe to apply blindly. The enum-level doc on `IssueAction`, the per-field docs on `FixAction.auto_fixable` and `AddToConfigAction.auto_fixable`, and a new `field_definitions` block in the `check` / `health` / `dupes` JSON `_meta` payload now call out per-finding evaluation explicitly and enumerate the four current per-instance flips: `remove-catalog-entry` on `hardcoded_consumers`, the dependency-action `remove-dependency` / `move-dependency` flip on `used_in_workspaces`, `add-to-config` for `ignoreExports` on config-file presence, and `update-catalog-reference` as a forward-compat `false`. The `docs/output-schema.json` descriptions, VS Code + npm typed contracts, fallow-docs `analysis/auto-fix.mdx` + `cli/dead-code.mdx`, and the bundled `fallow-skills` `cli-reference.md` all carry the same wording. No behavior change. (Closes [#361](https://github.com/fallow-rs/fallow/issues/361).)
+
+### Internal
+
+- **CI workflows guard schema drift more aggressively: PR edits to `docs/output-schema.json` now trigger the schema-emit drift gate, and `release.yml` blocks both privileged publish jobs on a fresh `pnpm run check:codegen` pass.** Two follow-ups on the #384 schema-derive ladder. (1) `.github/workflows/ci.yml`'s `rust:` paths-filter (which gates the `check` job that runs `cargo test/clippy --features schema-emit`) now also matches `docs/output-schema.json`, so a PR that touches only the schema document without a matching Rust change still trips the drift gate on PR rather than slipping through to a push-time failure on main. The filter retains the broad `crates/**` scope (instead of a per-crate allow-list) and a comment near the filter enumerates the JsonSchema-deriving subtrees (`crates/types/src/`, `crates/core/src/duplicates/types.rs`, `crates/cli/src/health_types/`, `crates/cli/src/output_envelope.rs`) so future narrowing PRs see the load-bearing scope explicitly. (2) `.github/workflows/release.yml` gains a new `check-codegen` prep-tier job (`contents: read` only, no publish tokens, runs `pnpm run check:codegen` in `editors/vscode/`) that `npm-publish` and `vscode-publish` both depend on. A single `check:codegen` pass validates both committed contracts (`editors/vscode/src/generated/output-contract.d.ts` and `npm/fallow/types/output-contract.d.ts`) because `codegen-types.mjs` writes them in lock-step. The new job sits on the same security boundary as the existing `npm-prep` / `vscode-prep` jobs (install scripts run without tokens, tokens-only jobs never install). (Closes [#416](https://github.com/fallow-rs/fallow/issues/416))
+
+- **MCP params field descriptions are now canonical `///` doc comments only, with a CI drift gate.** Twelve sites in `crates/mcp/src/params.rs` migrate from `#[schemars(description = "...")]` to `///` doc comments so contributors have a single canonical form for field prose. A new test in `crates/mcp/src/server/tests/server_info.rs` (`params_fields_do_not_carry_both_doc_comment_and_schemars_description`) parses the params source and fails the build when a field carries both forms simultaneously: the explicit attribute silently overrides the doc comment in schemars 1, so a later edit to the doc comment would never reach the JSON Schema agents read. The `#[schemars(description = "...")]` escape hatch remains supported when the schema text must intentionally differ from rustdoc, documented in a module-level comment. Wire shape of `tools/list` is unchanged for the affected fields (same names, types, and required flags); description text gained trailing periods and Markdown backticks where prose was reformatted, and a regression test (`converted_field_descriptions_render_in_schema`) pins that descriptions continue to render non-empty. (Closes [#421](https://github.com/fallow-rs/fallow/issues/421))
+
+- **Inner complexity-finding struct renamed from `HealthFinding` to `ComplexityViolation` at the Rust level only; the public schema and TS surface stay as `HealthFinding`.** Prerequisite for the upcoming #384 B2 wrapper migration, which introduces a new `HealthFinding` wrapper that flattens the inner struct via `#[serde(flatten)]` and adds typed `actions` + `introduced` natively, retiring `inject_health_actions` from the JSON post-pass. Renaming the inner up front avoids landing the wrapper under a `HealthFindingFinding` collision. The struct and every Rust consumer in `crates/cli` and `crates/types` flip to `ComplexityViolation`, but `schemars(rename = "HealthFinding")` pins the public schema definition name and the codegen-derived TS contracts (`docs/output-schema.json`'s `$ref` graph, `editors/vscode/src/generated/output-contract.d.ts`, `npm/fallow/types/output-contract.d.ts` published as `fallow/types`) all continue to expose the type as `HealthFinding`. At B2 the `schemars(rename)` attribute drops off and the public name migrates from this inner type to the wrapper, keeping the schema definition name stable across both PRs. JSON wire-level field name on `HealthReport.findings[]` (and its grouped / audit / combined echoes) is controlled by serde, so wire shape stays byte-identical; verified against the `vue-core` benchmark fixture (`total_issues`, `findings[]` ordering, and per-finding `actions[]` discriminants identical, only `elapsed_ms` differs). `HealthFindingAction` and `HealthFindingActionType` keep their names natively; they describe actions attached to the finding and naturally fit the future wrapper. (Refs [#384](https://github.com/fallow-rs/fallow/issues/384))
+
+- **Catalog and dependency-override findings now flow through typed `*Finding` envelope wrappers, retiring the legacy `inject_actions` JSON post-pass.** Continues the schema-derive ladder for item 1 of #384: six wrappers in `crates/types/src/output_dead_code.rs` (`DuplicateExportFinding`, `UnusedCatalogEntryFinding`, `EmptyCatalogGroupFinding`, `UnresolvedCatalogReferenceFinding`, `UnusedDependencyOverrideFinding`, `MisconfiguredDependencyOverrideFinding`) flatten the bare findings via `#[serde(flatten)]` and populate a typed `actions: Vec<IssueAction>` array at construction time. Data-dependent semantics that previously lived in the post-pass move into each wrapper's `with_actions` constructor: `UnusedCatalogEntryFinding` flips per-instance `auto_fixable` based on `hardcoded_consumers`, `UnresolvedCatalogReferenceFinding` discriminates between `add-catalog-entry` and `update-catalog-reference` at position 0 with optional `suggested_target` (a new field on `FixAction` for the unambiguous-single-alternative case), `DuplicateExportFinding` derives the position-0 `add-to-config` ignoreExports value from the finding's `locations[]` paths and exposes a `set_config_fixable` mutator the CLI's JSON serializer calls with the fix-applier's readiness signal, and both override wrappers omit the `add-to-config` suppress entirely when neither `target_package` nor `raw_key` yields a usable package name. `AnalysisResults`'s six matching fields flip from bare `Vec<Inner>` to `Vec<*Finding>`; construction wraps at `find_dead_code_full` in `crates/core/src/analyze/mod.rs`. The full ~400-line `inject_actions` scaffolding in `crates/cli/src/report/json.rs` (`actions_for_issue_type`, `build_actions`, `build_unresolved_catalog_reference_primary_action`, `build_duplicate_exports_config_value`, `is_dependency_issue`, the `SuppressKind` and `ActionSpec` types, the three `IGNORE_*_VALUE_SCHEMA` URL constants, and the `inject_actions` walker itself) is deleted; the grouped-JSON and single-JSON call sites no longer post-process the serialized value. Five named position-0 invariant tests in `crates/types/src/output_dead_code.rs` document the load-bearing `actions[0].type` semantics that downstream consumers (GitHub Action / GitLab CI jq scripts, MCP `actions[0].type` dispatch, VS Code LSP code-action rendering) depend on, separately from the omnibus snapshot tests. `schema_emit.rs` drops the six bare names from `finding_definition_names()` so the bare types lose the `actions` + `introduced` augmentation, and the wrappers carry both fields natively via schemars; `docs/output-schema.json` gains six `*Finding` definitions, and the bare `DuplicateExport` / `UnusedCatalogEntry` / `EmptyCatalogGroup` / `UnresolvedCatalogReference` / `UnusedDependencyOverride` / `MisconfiguredDependencyOverride` types stay in the registry without the wrapper fields so external consumers can still read the unwrapped shape. Generated TS contracts (`editors/vscode/src/generated/output-contract.d.ts`, `npm/fallow/types/output-contract.d.ts`) regenerated. Wire shape stays byte-identical (verified against the `vue-core` benchmark fixture). With this batch the legacy `inject_actions` post-pass is fully retired; `inject_health_actions` and `inject_dupes_actions` for the health and duplication families remain on the post-pass path until their own typed-wrapper migrations land. (Refs [#384](https://github.com/fallow-rs/fallow/issues/384))
+
+- **Document-root `oneOf` in `docs/output-schema.json` is now derived from a typed `FallowOutput` enum.** Every object-shaped `--format json` envelope (`AuditOutput`, `CheckOutput`, `CheckGroupedOutput`, `CombinedOutput`, `DupesOutput`, `HealthOutput`, `ExplainOutput`, `CoverageSetupOutput`, `ReviewEnvelopeOutput`, `ReviewReconcileOutput`, `ListBoundariesOutput`) is a variant of a typed `FallowOutput` enum in `crates/cli/src/output_envelope.rs`, derived via schemars; the schema-emit binary's `rewrite_document_root_one_of` step replaces the previously hand-maintained 12-entry root block. The regenerated TypeScript contracts (`editors/vscode/src/generated/output-contract.d.ts`, `npm/fallow/types/output-contract.d.ts`) now expose a `FallowOutput` discriminated union for downstream codegen consumers. Wire compatibility: the top-level shape of every envelope is unchanged byte-for-byte; consumers continue to narrow by unique field presence (`summary.total_issues` for check, `health_score` for health, `clone_groups` for dupes, `check`+`dupes`+`health` keys together for the bare combined invocation, `boundaries` for list --boundaries, `command: "audit"` for audit). `HealthOutput` and `DupesOutput` flatten their body (`HealthReport`/`DuplicationReport`) into top-level fields, so the discriminator is a body field, not a wrapper key. `CodeClimateOutput` stays as a sibling root branch because the Code Climate / GitLab Code Quality spec requires a bare JSON array at the root, which cannot be a variant of `FallowOutput` once the planned major-bump migration adds a top-level `kind` discriminator field that requires every variant to serialize as an object. `CoverageAnalyzeOutput` remains hand-maintained pending #384 item 3c; a new `HAND_MAINTAINED_ROOT_ENVELOPES` constant plus `hand_maintained_root_envelopes_appear_in_root_one_of` drift test ensure it stays reachable from the documented union until the typed migration lands. A future major release plans to add a top-level `kind` discriminator field for true O(1) narrowing on AI / agent consumers, paired with a one-cycle `--legacy-envelope` opt-out flag so existing consumers can migrate. (Closes [#384](https://github.com/fallow-rs/fallow/issues/384).)
+
+- **Dependency-family dead-code findings now flow through typed `*Finding` envelope wrappers.** Continues the schema-derive ladder for item 1 of #384: six wrappers in `crates/types/src/output_dead_code.rs` cover the dependency family (`UnusedDependencyFinding`, `UnusedDevDependencyFinding`, `UnusedOptionalDependencyFinding` over the shared `UnusedDependency` struct; `UnlistedDependencyFinding` over `UnlistedDependency`; `TypeOnlyDependencyFinding` and `TestOnlyDependencyFinding` over their respective bare structs). The three `UnusedDependency` views share `build_unused_dependency_actions` which swaps the primary fix from `remove-dependency` to `move-dependency` when `dep.used_in_workspaces` is non-empty (the cross-workspace discriminant). The four `Add to ignoreDependencies` suppress actions share `build_ignore_dependencies_suppress_action`. `AnalysisResults.unused_dependencies` / `unused_dev_dependencies` / `unused_optional_dependencies` / `unlisted_dependencies` / `type_only_dependencies` / `test_only_dependencies` flip from bare `Vec<T>` to `Vec<*Finding>`; construction wraps at `find_dead_code_full` in `crates/core/src/analyze/mod.rs`. The six entries retire from `actions_for_issue_type` / `inject_actions` in `crates/cli/src/report/json.rs`, and the now-unused `SuppressKind::ConfigIgnoreDep` variant plus its match arm and the `IGNORE_DEPENDENCIES_VALUE_SCHEMA` constant are deleted as dead code. `schema_emit.rs` drops the six bare names from `finding_definition_names()` and registers the six wrappers in `derived_definitions()`. Consumers across audit, baseline, regression, codeclimate / sarif / compact / markdown / human-output / json formatters, LSP diagnostics (with `Box<dyn Iterator>` unification for the three heterogeneous dependency view types), fix orchestrator, and the snapshot test suite now access fields via `entry.dep.*` (or pass `&entry.dep` to bare-typed helpers). Wire shape stays byte-identical (verified on vite / preact / zod fixtures: 2.9 MB, 1.5 MB, 2.2 MB JSON outputs respectively, all identical after stripping `elapsed_ms` / `generated_at`); `docs/output-schema.json` gains six `*Finding` definitions, the bare `UnusedDependency` / `UnlistedDependency` / `TypeOnlyDependency` / `TestOnlyDependency` types lose their `actions` + `introduced` augmentation, and the `AnalysisResults` field `items` refs flip to the wrappers. Generated TS contracts (`editors/vscode/src/generated/output-contract.d.ts`, `npm/fallow/types/output-contract.d.ts`) regenerated. (Refs [#384](https://github.com/fallow-rs/fallow/issues/384))
+
+- **CodeClimate, review-envelope, and coverage-setup wire emit now flows through typed envelope structs.** `crates/cli/src/report/codeclimate.rs` builds `Vec<CodeClimateIssue>` instead of `Vec<serde_json::Value>` (the `cc_issue` helper returns `CodeClimateIssue`, `severity_to_codeclimate` returns `CodeClimateSeverity`, all per-rule push helpers and the three `build_*_codeclimate` aggregators thread the typed vec through; a new `issues_to_value` helper centralises the `serde_json::to_value` conversion at every `print_*` / audit / combined / PR-comment / review-envelope boundary). `crates/cli/src/report/ci/review.rs::render_review_envelope` returns `ReviewEnvelopeOutput` and `render_comment` returns `ReviewComment::GitHub` / `ReviewComment::GitLab` instead of `serde_json::json!` literals. `crates/cli/src/coverage/mod.rs::build_setup_envelope` constructs `CoverageSetupOutput` end-to-end (with `FrameworkKind` / `PackageManager` / runtime-target enum conversions) so `build_setup_json` is now a thin `serde_json::to_value` wrapper. The file-wide `#![allow(dead_code)]` on `crates/cli/src/output_envelope.rs` is gone; per-struct `#[allow(dead_code)]` annotations scope the suppression to the remaining schema-source-of-truth-only envelopes (`AuditOutput`, `CodeClimateOutput` wrapper, `ListBoundariesOutput` family) until follow-up migrations land. Two unused string-returning helpers (`severity::codeclimate_severity`, `severity::github_check_conclusion`) were removed; the typed enums replace their callsites. Wire output is byte-identical (verified against `fallow --format codeclimate` on the `preact` benchmark and `fallow coverage setup --json` on a Next.js fixture). (Refs [#384](https://github.com/fallow-rs/fallow/issues/384) items 3a / 3b / 3c.)
+
+- **1:N dead-code findings (UnusedExport/UnusedType, UnusedEnumMember/UnusedClassMember) now flow through typed `*Finding` envelope wrappers.** Continues the schema-derive ladder for item 1 of #384: two Rust structs (`UnusedExport`, `UnusedMember`) each back two wrappers, one per issue-key view (`unused_exports` vs `unused_types`, `unused_enum_members` vs `unused_class_members`). The wrappers diverge in their fix actions: `UnusedExportFinding` emits `remove-export` with the public-API description, `UnusedTypeFinding` emits `remove-export` with the type-declaration description; both pick up the `is_re_export`-aware public-API note swap inside `with_actions` (replacing the post-pass `note` rewrite in `report/json.rs`). `UnusedEnumMemberFinding` emits `remove-enum-member` auto-fixable, `UnusedClassMemberFinding` emits `remove-class-member` with the dependency-injection caveat note and `auto_fixable: false`. `AnalysisResults.unused_exports` / `unused_types` / `unused_enum_members` / `unused_class_members` flip from bare `Vec<T>` to `Vec<*Finding>`; construction wraps at `find_dead_code_full` in `crates/core/src/analyze/mod.rs` so the detectors keep returning bare Vecs and the orchestrator maps through each wrapper's `with_actions` before assembly. `suppress_signature_backing_types` runs on the bare Vec before wrapping (function signature unchanged). The four entries retire from `actions_for_issue_type` / `inject_actions` in `crates/cli/src/report/json.rs`, including the `is_re_export` note-swap branch. `schema_emit.rs` drops `UnusedExport` and `UnusedMember` from the augmentation table and registers the four wrappers in `derived_definitions()`. Consumers across audit, baseline, regression, codeclimate / sarif / compact / markdown / human-output / json formatters, LSP diagnostics / quick-fix / hover, and the snapshot test suite now access fields via `entry.export.*` / `entry.member.*` (or pass `&entry.export` / `&entry.member` to bare-typed helpers). Wire shape stays byte-identical (8834 tests pass); `docs/output-schema.json` gains four `*Finding` definitions, the bare `UnusedExport` and `UnusedMember` types lose their `actions` + `introduced` augmentation, and the `AnalysisResults` field `items` refs flip to the wrappers. Generated TS contracts (`editors/vscode/src/generated/output-contract.d.ts`, `npm/fallow/types/output-contract.d.ts`) regenerated. (Refs [#384](https://github.com/fallow-rs/fallow/issues/384))
+
+- **Simple 1:1 dead-code findings now flow through typed `*Finding` envelope wrappers.** Continues the schema-derive ladder for item 1 of #384: `UnusedFile`, `PrivateTypeLeak`, `UnresolvedImport`, `CircularDependency`, and `BoundaryViolation` each gain a typed wrapper in `crates/types/src/output_dead_code.rs` that flattens the bare finding via `#[serde(flatten)]` plus a typed `actions: Vec<IssueAction>` populated at construction time, with `introduced: Option<AuditIntroduced>` carrying the optional audit breadcrumb so the schema renders the field via `$ref: #/definitions/AuditIntroduced`. `AnalysisResults` flips the five matching `Vec<Bare>` fields to `Vec<*Finding>`; construction wraps at `find_dead_code_full` in `crates/core/src/analyze/mod.rs`. The `actions_for_issue_type` / `inject_actions` post-pass in `crates/cli/src/report/json.rs` retires the five entries, and `crates/cli/src/bin/schema_emit.rs` drops the same five bare names from `finding_definition_names()` / `finding_augmentation()` and registers the new wrappers in `derived_definitions()`. `crates/types/src/output` is no longer feature-gated so `IssueAction` is available at runtime; `serde_json` becomes a hard dep for the types crate. Wire shape is byte-identical (8834 tests still pass); `docs/output-schema.json` gains five `*Finding` definitions with native `actions` + `introduced` properties and drops the augmentation on the bare types. Generated TS contracts (`editors/vscode/src/generated/output-contract.d.ts`, `npm/fallow/types/output-contract.d.ts`) regenerated. The `SuppressKind::FileComment` branch and the now-empty `actions_for_issue_type` arms for the five retired keys are deleted as dead code. (Refs [#384](https://github.com/fallow-rs/fallow/issues/384))
+
+- **`UntestedFile` and `UntestedExport` finding actions now flow through typed `UntestedFileFinding` / `UntestedExportFinding` envelope wrappers.** First stage of item 1 in the schema-derive ladder: source structs stay bare; new envelope wrappers in `crates/cli/src/health_types/coverage.rs` carry the inner finding via `#[serde(flatten)]` plus a typed `actions: Vec<UntestedXAction>` populated at construction time. `compute_coverage_gaps` in `crates/cli/src/health/scoring.rs` now takes `root: &Path` so action descriptions embed the project-root-relative path inline (matching the `strip_root_prefix` post-pass output on the inner `path` field). The Value-walking `build_untested_file_actions` / `build_untested_export_actions` post-pass is retired; `UntestedFile` and `UntestedExport` are removed from `finding_definition_names()` / `finding_augmentation()` in `schema_emit.rs`. `crates/types/src/output_health` is no longer feature-gated so the typed action structs are available at runtime. Wire shape stays byte-identical; `docs/output-schema.json` gains the `UntestedFileFinding` / `UntestedExportFinding` definitions, drops the `actions` augmentation on `UntestedFile` / `UntestedExport`, and flips `CoverageGaps.files.items` / `exports.items` `$ref` to the wrappers. (Refs [#384](https://github.com/fallow-rs/fallow/issues/384))
+
+- **`RuntimeCoverageReport.schema_version` is now derived from a typed `RuntimeCoverageSchemaVersion` enum.** The post-derivation `augment_runtime_coverage_report` graft in `crates/cli/src/bin/schema_emit.rs` and the matching `inject_runtime_coverage_report_schema_version` / `inject_runtime_schema` post-pass in `crates/cli/src/report/json.rs` and `crates/cli/src/coverage/analyze.rs` are retired; the field flows through schemars natively and serde keeps it first on the wire. `docs/output-schema.json` gains a `RuntimeCoverageSchemaVersion` definition that mirrors the `CoverageSetupSchemaVersion` / `ReviewEnvelopeSchema` precedent, and `RuntimeCoverageReport.properties.schema_version` becomes a `$ref` instead of an inline `enum: ["1"]` graft. Generated TS contracts (`editors/vscode/src/generated/output-contract.d.ts`, `npm/fallow/types/output-contract.d.ts`) regenerated. Closes the `MAINTENANCE:` coupling that required hand-editing the schema graft whenever the runtime coverage contract version bumped. (Refs [#384](https://github.com/fallow-rs/fallow/issues/384))
+
+- **Schema drift gate now covers every committed definition, not just the 105-entry explicit allow-list.** The strict structural gate (`drift_tests::committed_definitions_match_derived_structurally`) walks every key emitted by `derived_definitions()` and compares it against the committed entry, with a separate orphan check that fails when `docs/output-schema.json` lists a definition schemars no longer produces. The expanded coverage caught five hand-maintained orphans that the loose gate had silently preserved across regens: `AttributedCloneGroup`, `AttributedInstance`, and `DuplicationGroup` now derive from their Rust source (`crates/cli/src/report/dupes_grouping.rs`) with matching `JsonSchema` derives and `derived_definition_names()` registration; the stale `SuppressAutoFixable` singleton (defined but never `$ref`'d) is removed; and the three legitimately hand-maintained refs (`CloneFamilyAction`, `CloneGroupAction`, `CoverageAnalyzeOutput`) are now declared via a typed `HAND_MAINTAINED_ALLOW_LIST` with each entry linked to the meta-issue ladder rung that retires it (typed action wrappers, typed envelope builders). `AttributedCloneGroup` joins the augmentation map so its `actions` array references `CloneGroupAction` instead of being an untyped breadcrumb. (Refs [#384](https://github.com/fallow-rs/fallow/issues/384))
+
+- **`docs/output-schema.json` now carries a stable `$id` so consumers can SHA-pin a specific schema revision.** The top-level identifier is `https://raw.githubusercontent.com/fallow-rs/fallow/main/docs/output-schema.json`. Replace `main` with a release tag (for example `v2.75.0`) or commit SHA to pin. ajv and other validators do not fetch `$id` over the network by default; the URL functions as a deduplication key for `addSchema` and as a base URI for `$ref` resolution. The pinning contract, a minimal ajv strict setup snippet, and the relationship to the generated TS types (`npm/fallow/types/output-contract.d.ts`) are documented in `docs/backwards-compatibility.md`. (Refs [#384](https://github.com/fallow-rs/fallow/issues/384))
+
+- **`docs/output-schema.json` is now derived from Rust types as the source of truth.** Every definition registered in `derived_definition_names()` (`crates/cli/src/bin/schema_emit.rs`) is generated by schemars off `#[derive(JsonSchema)]` on the matching Rust struct; the `fallow-schema-emit` binary (gated on the `schema-emit` cargo feature) regenerates the committed file and a CI drift gate (`cargo test -p fallow-cli --features schema-emit --bin fallow-schema-emit`) fails on any structural divergence. The migration covers:
+  - **Health subtree**: `HealthFinding`, `HealthSummary`, `HealthScore` + `HealthScorePenalties`, `VitalSigns` + `VitalSignsCounts` + `RiskProfile`, `HotspotEntry` + `HotspotSummary` + `OwnershipMetrics` + `ContributorEntry`, `RefactoringTarget` + `TargetThresholds`, `HealthTrend` + `TrendCount`, `FileHealthScore`, `LargeFunctionEntry`, `CoverageGaps` + `CoverageGapSummary` + `UntestedFile` + `UntestedExport`, and the full `RuntimeCoverageReport` subtree (`RuntimeCoverageSummary`, `RuntimeCoverageCaptureQuality`, `RuntimeCoverageEvidence`, `RuntimeCoverageAction`, `RuntimeCoverageMessage`, `RuntimeCoverageFinding`, `RuntimeCoverageHotPath`, `RuntimeCoverageBlastRadiusEntry`, `RuntimeCoverageImportanceEntry`, plus the protocol-derived signal / verdict / watermark / confidence / risk-band enums).
+  - **Per-finding action wrappers** typed in `fallow_types::output_health` (`HealthFindingAction`, `HotspotAction`, `RefactoringTargetAction`, `UntestedFileAction`, `UntestedExportAction`), so the action arrays attached to health findings, hotspots, refactoring targets, and coverage-gap items are now drift-checked.
+  - **Envelope utility shapes** in `fallow_types::envelope` (`SchemaVersion`, `ToolVersion`, `ElapsedMs`, `AuditIntroduced`, `EntryPoints`, `CheckSummary`, `BaselineDeltas` + `BaselineCategoryDelta` + `BaselineMatch`, `RegressionResult` + `RegressionStatus` + `RegressionToleranceKind`, `Meta` + `MetaMetric` + `MetaRule`).
+  - **Per-command envelopes** in `crates/cli/src/output_envelope.rs` (`AuditOutput`, `CheckOutput`, `CheckGroupedOutput` + `CheckGroupedEntry`, `CombinedOutput`, `DupesOutput`, `HealthOutput` + `HealthGroup`, `ExplainOutput`, `CodeClimateOutput` + `CodeClimateIssue` + `CodeClimateLocation` + `CodeClimateLines`, `ReviewEnvelopeOutput` + `GitHubReviewComment` + `GitLabReviewComment` + `GitLabReviewPosition` + `ReviewEnvelopeMeta`, `ReviewReconcileOutput`, `CoverageSetupOutput` + `CoverageSetupMember` + `CoverageSetupFileToEdit` + `CoverageSetupSnippet`) along with the enum discriminators (`AuditVerdict`, `AuditCommand`, `CoverageSetupFramework`, `CoverageSetupPackageManager`, `CoverageSetupRuntimeTarget`, `GroupByMode`).
+  - **Body shapes**: `DuplicationReport` (`crates/core/src/duplicates/types.rs`) and `HealthReport` (`crates/cli/src/health_types/`) are registered so the `$ref` targets on `CombinedOutput.dupes` / `health` and `AuditOutput.duplication` / `complexity` resolve against the bare body the wire actually emits.
+  - **Fields previously emitted but missing from the schema** are now documented: `HotspotEntry.is_test_path`, `OwnershipMetrics.suggested_reviewers`, the four `VitalSignsCounts` fields (`duplicated_lines` / `total_lines` / `files_scored` / `total_deps`), the `actions` arrays on `UntestedFile` / `UntestedExport`. `OwnershipMetrics.unowned` and `RuntimeCoverageSummary.last_received_at` drop from `required` to match their `Option<T>` sources.
+  - The `crates/cli/src/report/json.rs` emission path is unchanged; the new types are schema-only for this PR. (Refs [#338](https://github.com/fallow-rs/fallow/issues/338))
+
+- **The strict structural drift gate is now active and `docs/output-schema.json` is fully regenerated from Rust.** `drift_tests::committed_definitions_match_derived_structurally` runs on every `cargo test` (no `#[ignore]`), so any hand edit to the in-scope definitions in `docs/output-schema.json` fails CI. Closes the prose-and-shape escape hatch the prior schema-derive bullet opened. Highlights:
+  - **Augmentation correctness**: `augment_finding_definition` now pushes `"actions"` into every finding type's `required` array (the wire always emits the array, possibly empty); the `actions_meta` breadcrumb on `HealthReport` is modeled as a typed `Option<HealthActionsMeta>` instead of the post-pass JSON-value injection key.
+  - **Schemars cosmetic strip on the production path**: `normalize_schema` drops `default` / `examples` / `format` / `minimum` / `maximum` / `exclusiveMinimum` / `exclusiveMaximum` and collapses single-arm `allOf:[{$ref}]` wrappers so the regenerated document stays clean. Mirrors what the test-side normalizer already strips so the gate is symmetric.
+  - **Schemars title preservation on envelopes**: each top-level envelope (`AuditOutput`, `CheckOutput`, `CombinedOutput`, etc.) carries `#[schemars(title = "fallow <command> --format json")]` so the Mintlify schema renderer keeps its section headings.
+  - **Helper-definition merge correctness**: `merge_with_committed`'s helper loop now always overwrites transitive helpers from the derived schema rather than silently preserving the prior committed entries; this fixed a `nest_js` / `svelte_kit` -> `nestjs` / `sveltekit` rename mismatch on `CoverageSetupFramework` that ajv strict would have rejected on every real NestJS / SvelteKit `coverage setup --json` output.
+  - **Latent schema bug**: the committed schema's `CoverageSetupOutput.package_manager` previously encoded `{ "type": "string", "enum": [null, ...] }` which is invalid against draft-07 strict. The regen replaces it with the proper `anyOf: [{$ref}, {type: "null"}]` form.
+  - **Prose preserved**: every previously-published per-field description is restored by enriching the `///` doc comments on the matching Rust source struct (141 field descriptions across 42 definitions).
+  - VS Code + npm typed contracts (`output-contract.d.ts`) regenerated via `pnpm run codegen:types`. `CONTRIBUTING.md` updated to reflect the closed escape hatch. (Refs [#338](https://github.com/fallow-rs/fallow/issues/338))
+
+## [2.75.0] - 2026-05-16
+
+### Added
+
+- **AdonisJS plugin (v5/v6/v7) added under the framework category.** Fallow now understands the conventional AdonisJS folder layout (controllers, models, middleware, validators, services, providers, preloads, commands, configs, contracts, database migrations / seeders / factories), bootstrap files (`server.{ts,js}`, `ace`, `bin/**/*.{ts,js}`), the `@ioc:` virtual import prefix in v5, and the framework-managed peer packages that ship via the runtime container. `resolve_config` understands both rc shapes: `.adonisrc.json` (v5, parsing `preloads`, `providers`, `commands`, `aceProviders` in both string and `{ file, environment }` forms, `aliases`, `metaFiles[].pattern`, and `types[]`) and `adonisrc.ts` (v6/v7, walking `defineConfig({...})` for thunk-wrapped lazy imports plus the assembler hook arrays under `hooks.*`, applying `directories.*` overrides as entry patterns, and feeding the project's `package.json#imports` into the resolver's path-alias table). Built-in plugin count goes from 94 to 95. As part of this, `fallow-extract` exposes three shared dynamic-import peel helpers (`extract_import_expression`, `extract_import_from_return_body`, `extract_import_from_callable`) so the v6/v7 rc parser and existing `try_extract_arrow_wrapped_import` / `try_extract_property_callback_import` visitor sites share one canonical peel path. Real-project validation (release build, `total_issues / unused_files`): AdonisJS 6 graphql playground 68/42 to 17/3, openapi playground 55/34 to 14/1, web-starter-kit 32/19 to 11/2, api-starter-kit 27/15 to 9/0, inertia-starter-kit 32/18 to 10/0, slim-starter-kit 22/13 to 9/0. Zero regression on zod, preact, vite, next.js. (PR [#364](https://github.com/fallow-rs/fallow/pull/364). Thanks [@AlphaLawless](https://github.com/AlphaLawless) for the patch.)
+
+### Fixed
+
+- **`.gts` files with multiple `<template>` blocks now extract imports and exports correctly.** Previously the `<template>` stripper blanked every block to spaces, which is fine for class-body templates (an empty class body is valid) but produces `const x = ;` for module-level template expressions, a TypeScript syntax error that caused oxc to bail and drop every import in the file. Real Ember/Glimmer route templates that combine an inline `TemplateOnlyComponent` with a class-body template were silently parsing as zero-edge files, and every component they referenced was reported as `unused-file`. The stripper now detects expression position (previous non-whitespace byte is `=`, `,`, `(`, `?`, or `:`) and replaces the block with a byte-length-preserving parenthesized template literal so the surrounding statement stays syntactically valid. Class-body templates retain the existing blank-out behavior. Marking is plumbed through the extract cache (`CACHE_VERSION` 77 to 78) so the fix takes effect on warm caches. (Closes [#375](https://github.com/fallow-rs/fallow/issues/375). Thanks [@ShockwaVee](https://github.com/ShockwaVee) for the report.)
+
+- **`vi.mock()` without a factory no longer surfaces a phantom `unresolved-import` pointing at a `__mocks__/` path the user never wrote.** Fallow synthesises a `<dir>/__mocks__/<file>` dynamic import next to every `vi.mock('./foo')` call so vitest's optional manual-mock convention credits the sibling when it does exist. When the sibling did NOT exist on disk, the synthesised path flowed through to `unresolved-imports` as if the user had typed it, producing findings like `@/utils/__mocks__/exportElementAsPng` for projects that rely on vitest's in-memory auto-mocking. The synthesised entry is now marked speculative and the resolver drops it silently when the target can't be found; the credit path is unchanged (a `__mocks__/<file>` that DOES exist on disk is still credited as referenced). Marking is plumbed through the extract cache (`CACHE_VERSION` 76 to 77) so the change takes effect even on warm caches. (Closes [#377](https://github.com/fallow-rs/fallow/issues/377) and [#378](https://github.com/fallow-rs/fallow/issues/378). Thanks [@cloud-walker](https://github.com/cloud-walker) for the report.)
+
+- **Istanbul `--coverage` now matches functions written as multiline typed async arrows.** Istanbul producers (Jest, nyc, c8, babel-plugin-istanbul) are inconsistent about `FnEntry.line`: some emit the declaration line, others the body start. Fallow extracts function positions at the declaration, so multiline TS signatures like `export const elementsFrom = async (...): Promise<T> => {...}` lost their coverage match whenever the producer pointed `line` at the body. The loader now indexes both the producer's effective line and the declaration start as aliases so lookups by declaration position resolve through the exact and name-fuzzy paths, and the anonymous-by-position fallback is guarded by a column-distance cap so the new aliases never credit unrelated functions sitting above a multiline arrow. (Closes [#370](https://github.com/fallow-rs/fallow/issues/370). Thanks [@Guria](https://github.com/Guria) for the report.)
+
+## [2.74.0] - 2026-05-14
+
+### Added
+
+- **Architecture boundary auto-discovery (`autoDiscover` on `BoundaryZone`).** A zone declaring `autoDiscover: ["src/features"]` expands at config-resolve time into one child zone per immediate child directory, named `<parent>/<child>` (e.g. `features/auth`, `features/billing`). Rules that reference the logical parent (`from: "features"`) expand to every discovered child, so a single rule declaration polices every feature; explicit child rules (`from: "features/auth"`) override the generated parent rule regardless of declaration order. The Bulletproof preset now uses `autoDiscover` for the `features` zone by default, so a fresh `preset: "bulletproof"` config gives sibling-feature isolation with zero per-feature boilerplate. A `src/features/index.ts` barrel that re-exports its children stays unclassified (and unrestricted) by design so the barrel does not produce false-positive `features -> features/<child>` violations; the trade-off is that other top-level files in `src/features/` are also unrestricted. A user-defined zone that sets BOTH `patterns` and `autoDiscover` triggers a once-per-process `tracing::warn!` because the parent fallback typically produces false positives on barrels. `BoundaryZone.patterns` is now optional in `.fallowrc.json` (a zone may define `patterns`, `autoDiscover`, or both). Follow-ups [#372](https://github.com/fallow-rs/fallow/issues/372) tracks differentiated parent-vs-child rule expansion for strict mode on non-barrel top-level files, and [#373](https://github.com/fallow-rs/fallow/issues/373) tracks surfacing the logical-group name in `list --boundaries` JSON. (Closes [#368](https://github.com/fallow-rs/fallow/issues/368). Thanks [@DrJonki](https://github.com/DrJonki) for the report.)
+
+- **`fallow fix` now auto-applies `ignoreExports` rules to the active fallow config.** Previously the only way to silence an unused-export finding was a per-file `// fallow-ignore-next-line` comment or hand-editing `ignoreExports`. The fixer now writes the suppression directly into the active config (`.fallowrc.json` / `.fallowrc.jsonc` / `fallow.toml` / `.fallow.toml`) via the same format-preserving writer that backs every `add-to-config` action: round-trips JSONC comments and CRLF line endings, preserves symlinked configs, follows `--config <path>` overrides, and deduplicates absolute-path entries against existing relative ones. The CRLF-doubling bug surfaced by the panel review during implementation is locked down by a regression test; the same writer is now the canonical path for every `add-to-config` action across rule families. (Closes [#366](https://github.com/fallow-rs/fallow/issues/366).)
+
+- **Detects empty named pnpm catalog groups in `pnpm-workspace.yaml` and auto-fixes them via `fallow fix` or an LSP quick-fix.** When `fallow fix` removes the last entry from a named catalog group, the v2.73.0 fixer rewrites the header to `catalogs.<name>: {}` so pnpm stays happy, but the named-catalog placeholder lingers in the file as lint-rot in long-lived monorepos. The new `empty-catalog-group` rule (default `warn`) flags every named group under `catalogs:` that has no package entries, with severity `warn` because removing them is a hygiene cleanup rather than a correctness fix. The top-level `catalog:` map is intentionally never flagged because users keep it as a stable hook. `fallow fix` deletes only the named `catalogs.<name>:` header line and leaves comments plus the parent `catalogs:` block intact; catalog-entry leading-comment deletion is controlled separately by `fix.catalog.deletePrecedingComments`. Multi-document YAML files (`---` separators) are rejected with a skip record; the post-edit content is reparsed via `serde_yaml_ng` before persisting. Findings render in all six report formats (human, JSON, SARIF `fallow/empty-catalog-group`, compact, markdown, CodeClimate), the LSP emits a matching `WARNING` diagnostic, and a `Remove empty catalog group \`<name>\`` quick-fix code action is offered for each finding with anchored key-prefix matching so sibling headers with shared prefixes (`react17` vs `react18`) cannot be deleted by mistake. The MCP `analyze` tool accepts `issue_types: ["empty-catalog-groups"]`, the GitHub Action and GitLab CI jq scripts surface the new field in summary tables and emit `::warning` annotations, and `fallow explain empty-catalog-group` opens with the rationale and a fixed example. Suppression is via YAML comment (`# fallow-ignore-next-line empty-catalog-group`) or rule severity (`empty-catalog-groups: "off"`). New `IssueKind::EmptyCatalogGroup` (discriminant 25); new `EmptyCatalogGroup` struct on `AnalysisResults`. (Closes [#359](https://github.com/fallow-rs/fallow/issues/359))
+
+### Fixed
+
+- **`unused-dependency-overrides` no longer false-positives on transitive-only overrides resolved through `pnpm-lock.yaml`.** Overrides that pin a CVE-fix version of a purely transitive dependency (no direct dep in any workspace `package.json`) were flagged as unused even though pnpm resolved them at install time. The detector now consults `pnpm-lock.yaml` to confirm whether the lockfile resolved a version that satisfies the override; an override is reported as unused only when neither a workspace `package.json` declares the target nor the lockfile resolves it. Parent-chain shapes (`react>react-dom: ^17`) inherit the same lockfile awareness. (Closes [#371](https://github.com/fallow-rs/fallow/issues/371). Thanks [@cloud-walker](https://github.com/cloud-walker) for the report.)
+
+- **`add-to-config` action metadata now respects explicit `--config <path>` flags.** When fallow was invoked with `--config ./my-config.json`, the `auto_fixable` boolean and the `path` field on emitted `add-to-config` actions still used the auto-detected config path instead of the user-supplied one. Tools that gate auto-fix on the `auto_fixable` bool would skip a fix that was actually applicable. The path is now threaded through `IssueFilters` to the JSON-action builder so `auto_fixable` reflects whether the explicitly-named config is writable. (Closes [#367](https://github.com/fallow-rs/fallow/issues/367).)
+
+- **The audit `--gate new-only` flow now attributes `unused-catalog-entries` and `empty-catalog-groups` findings as introduced vs inherited.** Both finding types were missing from `dead_code_keys`, `retain_introduced_dead_code`, and `annotate_dead_code_json`, so the audit verdict counted them as pre-existing baseline even when freshly added in the head commit. The keys now include line number and catalog name so a fresh entry in the same group is correctly classified as introduced; a new `audit_empty_catalog_group_changed_manifest_is_introduced` integration test locks the behavior in.
+- **`docs/output-schema.json` now documents two fields the JSON output layer already emitted.** `UnresolvedImport.specifier_col` (the LSP-grade column offset of the source-string literal, used to underline just the specifier) was on the Rust struct since v2.39 but missing from the public schema, so AJV-strict consumers rejected every unresolved-import finding. `MisconfiguredDependencyOverride.target_package` (the parsed package name on `empty-value` findings) was emitted whenever the override key was syntactically valid but missing from the schema, so the value flowed through to consumers without a matching property declaration. The schema bumps these to documented + (for `specifier_col`) required so validators see the same shape as the JSON output. (Refs [#338](https://github.com/fallow-rs/fallow/issues/338))
+
+### Internal
+
+- **The in-scope per-finding result structs are now `#[derive(schemars::JsonSchema)]` behind a `schema` cargo feature, with a `fallow-schema-emit` dev binary that regenerates `docs/output-schema.json#/definitions` from the Rust source of truth.** A new drift test (`cargo test -p fallow-cli --features schema-emit --bin fallow-schema-emit`) verifies for every in-scope definition that the committed schema's `properties` and `required` sets match what the Rust struct derives, catching field renames / additions / required-flag drift between Rust and the public schema. `IssueAction`, `FixAction`, `SuppressLineAction`, `SuppressFileAction`, `AddToConfigAction`, and their discriminant + payload subtypes are now Rust types under `fallow_types::output` so a future PR can route `crates/cli/src/report/json.rs` through them instead of `serde_json::json!` builders. The strict structural variant of the drift gate (descriptions, integer formats, nullable union shape) is shipped as an `#[ignore]`d follow-up. (Refs [#338](https://github.com/fallow-rs/fallow/issues/338))
+- **The health output subtree now derives `JsonSchema` behind a `schema` cargo feature on `fallow-cli`, so the drift gate covers `HealthFinding`, `HealthSummary`, `HealthScore` + `HealthScorePenalties`, `VitalSigns` + `VitalSignsCounts` + `RiskProfile`, `HotspotEntry` + `HotspotSummary` + `OwnershipMetrics` + `ContributorEntry`, `RefactoringTarget` + `TargetThresholds`, `HealthTrend` + `TrendCount`, `FileHealthScore`, `LargeFunctionEntry`, `CoverageGaps` + `CoverageGapSummary` + `UntestedFile` + `UntestedExport`, and the full `RuntimeCoverageReport` subtree (including the protocol-derived signal, verdict, watermark, confidence, and risk-band enums).** Per-finding action wrappers (`HealthFindingAction`, `HotspotAction`, `RefactoringTargetAction`) are typed in `fallow_types::output_health` so the action arrays attached to health findings, hotspots, and refactoring targets are now drift-checked too. Three new fields previously emitted by the JSON layer but missing from the schema (`HotspotEntry.is_test_path`, `OwnershipMetrics.suggested_reviewers`, the four `VitalSignsCounts` fields `duplicated_lines`/`total_lines`/`files_scored`/`total_deps`) are now documented. `OwnershipMetrics.unowned` drops from `required` to match the `Option<bool>` source. The `crates/cli/src/report/json.rs` emission path is unchanged; the new types are schema-only for this PR. (Refs [#338](https://github.com/fallow-rs/fallow/issues/338))
+
+## [2.73.0] - 2026-05-13
+
+### Fixed
+
+- **Dependencies imported only from a config file in a hidden directory referenced by `package.json#scripts` are no longer reported as unused.** A script like `"lint": "eslint -c .config/eslint.config.js"` puts the ESLint config in `.config/`, a hidden directory the file walker normally skips. Fallow detected the file as an entry point (the script-parser found it) but never parsed it, so the imports inside (`@eslint/js`, anything else the config pulls in) became phantom unused dependencies. The walker now traverses hidden directories referenced from `package.json#scripts` config arguments (`--config` / `-c`) and positional file arguments. The same scope mechanism React Router uses for `.client` / `.server` is reused; the names are extracted per-package and scoped to the package root, so a workspace's `.config/` stays isolated from a sibling's. Three guardrails: a denylist of known build-cache / VCS / IDE directories (`.git`, `.next`, `.nuxt`, `.output`, `.svelte-kit`, `.turbo`, `.nx`, `.cache`, `.parcel-cache`, `.vercel`, `.netlify`, `.yarn`, `.pnpm-store`, `.docusaurus`, `.vscode`, `.idea`, `.fallow`, `.husky`) is never auto-scoped even when a script reads or writes into one; only the structured `config_args` / `file_args` outputs of the script parser are inspected, so a logging path like `.nx/cache/result.json` mentioned in a script body cannot pull `.nx/` into scope; and paths containing `..` segments are skipped so a workspace script referencing `../../.config/...` cannot generate a scope rooted at a sibling. Projects without hidden-dir paths in their scripts see no behavior change. Surfaces a `tracing::debug!` line per inferred scope (`RUST_LOG=fallow_core=debug`) for support diagnostics. (Closes [#358](https://github.com/fallow-rs/fallow/issues/358). Thanks [@FunctionDJ](https://github.com/FunctionDJ) for the report.)
+
+### Added
+
+- **`fallow fix` now auto-removes unused pnpm catalog entries from `pnpm-workspace.yaml`.** The `unused-catalog-entries` detector shipped in v2.70.0, but until now the only available action was `# fallow-ignore-next-line unused-catalog-entry`; users had to hand-edit the YAML to drop the entry. The fix is line-aware (preserves comments and stylistic choices in the file) and detects object-form entries such as `react:\n  specifier: ^18.2.0\n  publishConfig: {}` by consuming subsequent lines whose indent is strictly greater than the entry's own. When removing the last entry of a catalog group (default `catalog:` or a named `catalogs.<name>:`) leaves the header with no children, the fix rewrites the header to `catalog: {}` / `<name>: {}` so the file stays installable; bare `key:` in YAML parses as null which pnpm rejects with `Cannot convert undefined or null to object` at install time. Entries whose `hardcoded_consumers` is non-empty are skipped: removing the catalog entry while a workspace package still pins a hardcoded version of the same package would break the user's next `pnpm install`. The skip is surfaced in the human stderr summary and in the JSON output (`{"type": "remove_catalog_entry", "applied": false, "skipped": true, "skip_reason": "hardcoded_consumers", "consumers": [...], "description": "..."}`), and the per-instance `auto_fixable` bool on the check-command action correctly flips to `false` for findings with hardcoded consumers so agents that filter on the bool skip those automatically. After a successful run the CLI emits a one-line `Run \`pnpm install\` to refresh pnpm-lock.yaml` reminder so the workspace stays internally consistent. The fix output's top-level envelope adds a `"skipped"` count alongside the existing `"total_fixed"` so consumers can gate on partial-fix runs. The LSP `unused-catalog-entry` diagnostic now exposes a matching `Remove unused catalog entry` quick-fix code action with the same hardcoded-consumer guard, the same empty-parent rewrite, and an anchored key-prefix sanity check so sibling entries with shared prefixes (`react` vs `react-native`, `lodash` vs `lodash-es`) cannot be deleted by mistake. (Closes [#335](https://github.com/fallow-rs/fallow/issues/335).)
+
+- **Detects unused and misconfigured pnpm `overrides` entries.** **Upgrade note:** the new `misconfigured-dependency-overrides` rule defaults to `error`, so a workspace with a malformed override key or empty value will flip from a green `fallow check` on v2.72 to a red one on the next minor. To absorb the change without action, set `rules.misconfigured-dependency-overrides: "warn"` in your fallow config before upgrading. Two new rules read both `pnpm-workspace.yaml`'s `overrides:` top-level (canonical, pnpm 9+) and the root `package.json`'s `pnpm.overrides` (legacy form). `unused-dependency-overrides` (default `warn`) flags entries whose target package is not declared in any workspace `package.json`; conservative static algorithm uses the parent-chain rule (`react>react-dom` is considered USED when EITHER `react` OR `react-dom` is declared, covering the CVE-fix pattern where the parent is declared and the override forces a transitive version). Findings carry the raw key, structured `target_package` / `parent_package` / `version_constraint` / `version_range` decomposition, the source file (`pnpm-workspace.yaml` or `package.json`), 1-based line number, and an optional `hint` flagging entries that may target a purely transitive dependency (CVE-fix or canary-alias pattern). `misconfigured-dependency-overrides` (default `error`) catches entries whose key cannot be parsed (empty key, dangling separators) or whose value is missing; `pnpm install` refuses to honor these. Special pnpm values (`-` removal, `$ref` self-reference, `npm:alias@^1`) are explicitly allowlisted and never flagged as misconfigured. Suppression is config-only via `ignoreDependencyOverrides: [{ package, source? }]` (inline YAML / JSON comments are not feasible since `pnpm-workspace.yaml` uses YAML and `package.json` has no comment syntax); the optional `source` field scopes a suppression to `"pnpm-workspace.yaml"` or `"package.json"`. New `IssueKind::UnusedDependencyOverride` (discriminant 23) and `IssueKind::MisconfiguredDependencyOverride` (discriminant 24); new `UnusedDependencyOverride` + `MisconfiguredDependencyOverride` structs on `AnalysisResults`. All six report formats render the findings (human two-tier, JSON with discriminated `remove-dependency-override` / `fix-dependency-override` primary actions + `ignoreDependencyOverrides` add-to-config suppress, SARIF rules `fallow/unused-dependency-override` and `fallow/misconfigured-dependency-override`, compact, markdown, CodeClimate). The GitHub Action and GitLab CI jq scripts surface both in summary tables and emit `::warning` for unused and `::error` for misconfigured annotations. The LSP emits matching diagnostics anchored on the source file line. The MCP `analyze` tool accepts `issue_types: ["unused-dependency-overrides", "misconfigured-dependency-overrides"]`, and the VS Code "Unused Code" tree shows two new categories. `fallow explain unused-dependency-override` and `fallow explain misconfigured-dependency-override` open with the CVE-pin caveat and pnpm-grammar examples respectively. (Closes [#336](https://github.com/fallow-rs/fallow/issues/336))
+
+### Changed
+
+- **Internal refactor:** drop redundant per-call `FileId` / path indices in detectors (`find_unused_exports`, `find_private_type_leaks`, `find_duplicate_exports`). These detectors each rebuilt the same `FxHashMap` of file lookups on every invocation; they now index `graph.modules` directly by sequential `FileId.0` (the same pattern `find_unused_files` already used). Findings counts unchanged across `next.js` (24986), `typescript`, `vite`, `vue-core`, `svelte`. No behavior change. (Closes [#333](https://github.com/fallow-rs/fallow/issues/333))
+- **CI dependency bumps:** `pnpm/action-setup` 6.0.3 -> 6.0.5, `crate-ci/typos` 1.45.2 -> 1.46.0.
+
+## [2.72.0] - 2026-05-12
+
+### Added
+
+- **Filter clone groups by minimum occurrence count with `duplicates.minOccurrences` (config) or `--min-occurrences N` (CLI).** Two-instance clones often reflect context-sensitive parallel code (similar reducer pairs, mirrored controller handlers) that's not worth extracting into a shared helper. Raising `minOccurrences` to `3` or higher tells fallow to report only widespread copy-paste, the kind that's actually worth refactoring. The default stays at `2` for backwards compatibility, so existing pipelines see no change on upgrade. `fallow init` now writes `minOccurrences: 3` into freshly-generated config files so new projects start with the tighter signal-to-noise ratio; existing projects can opt in by adding the key. Validation rejects `< 2` at both the config-load and CLI-parse layers with a clear message ("a single occurrence isn't a duplicate"). The filter runs AFTER line-level `// fallow-ignore-* code-duplication` suppressions, so a suppressed instance correctly reduces the group's effective size for the threshold. Threaded through `fallow dupes`, `fallow audit`, and the bare `fallow` pipeline; exposed on the MCP `find_dupes` and `trace_clone` tools; available in the napi binding (`DuplicationOptions.min_occurrences`). A new `stats.clone_groups_below_min_occurrences` JSON field discloses how many groups were hidden so consumers can lower the threshold without re-running. `duplication_percentage` keeps reflecting the FULL corpus (computed before the filter) so `threshold` gates and trend lines stay stable when the filter changes. `stats.clone_groups` and `stats.clone_instances` match the post-filter `clone_groups[]` array length. Human output emits a one-line `note: hid N clone groups below minOccurrences=M` reminder on stderr when the filter has hidden anything. (Refs [#342](https://github.com/fallow-rs/fallow/discussions/342). Thanks [@danielo515](https://github.com/danielo515) for the report.)
+
+### Fixed
+
+- **Workspace dependency ownership scopes per `package.json` so monorepo `unlisted-dependency` detection matches per-workspace ownership instead of the root.** Previously a dependency declared only in the root `package.json` (or any workspace's `@types/X`) globally satisfied bare imports from any workspace, hiding real `unlisted-dependency` findings inside individual workspaces. The most-specific owning workspace's `package.json` is now the source of truth for files inside that workspace; root deps only count for files outside every workspace. Upgrade impact: monorepo users may see new `unlisted-dependencies` findings where root-declared deps are imported from workspaces that do not redeclare them; the new findings are correct semantics, the prior behavior was too permissive. (Closes [#343](https://github.com/fallow-rs/fallow/pull/343). Thanks [@M-Hassan-Raza](https://github.com/M-Hassan-Raza) for the patch.)
+- **`fallow dupes --top N` now returns the N MOST-DUPLICATED clone groups instead of N alphabetically-first ones.** The truncation step ran against a path-sorted list, so `--top 20` effectively returned twenty arbitrary groups whose file paths sorted earliest. Real-world impact on a 494-group svelte run: the previous behavior put cosmetic test-fixture pairs at positions 1 through 20 and buried the actual 33-instance hotspot at position 487. After this fix, `--top` first sorts by instance count descending (tiebreak: line count descending, then deterministic path/line) and only then truncates, so users see the widest-impact clones first. `stats.clone_groups` and `stats.clone_instances` are also recomputed to match the truncated array length so JSON consumers iterating `clone_groups[]` see the same count as the stats block; `duplication_percentage` stays corpus-wide. Within the kept set, output order remains path/line-sorted for stable rendering. CI baselines that captured `--top N` output may show different groups after upgrade.
+- **VS Code extension installs on Cursor and Windsurf again by lowering the `engines.vscode` floor from `^1.116.0` to `^1.96.0`.** The 1.116 floor came in incidentally when dependabot bumped `@types/vscode`; vsce demands `engines.vscode >= @types/vscode`, so the engine floor followed. No code in the extension actually used any VS Code API newer than 1.65, so the floor was unnecessary. Windsurf 1.110.1 (and other VS Code forks tracking older bases) were rejecting install with "not compatible with Windsurf '1.110.1'". The floor now matches the December 2024 baseline that Cursor, Windsurf, and current VS Code can all satisfy. Dependabot now ignores `@types/vscode` in `editors/vscode` so the floor cannot drift again without a deliberate bump. (Refs [#287](https://github.com/fallow-rs/fallow/discussions/287). Thanks [@FunctionDJ](https://github.com/FunctionDJ) for the install-failure report.)
+- **Static factory methods returning `new this()` (or `new <SameClassName>()`) no longer cause false-positive `unused-class-member` findings on the methods consumed through them.** Before the fix, `class MyClass { static getInstance() { return new this(); } getData() { return [1, 2, 3]; } }` followed by `const x = MyClass.getInstance(); x.getData();` in another file reported `MyClass.getData` as unused because the call result was untyped and fallow's instance-binding tracking only fired on direct `new ClassName()` shapes. Static methods whose body's last top-level statement is `return new this()` or `return new <SameClassName>()` now carry an `is_instance_returning_static` flag on their `MemberInfo`; a new analyze-layer pass walks `const <local> = <ID>.<method>()` bindings (cross-file via imports, same-file via local class declarations, plus barrel re-export chains) and credits accesses on `<local>` against the resolved class export. Conservative on purpose: chained `.build()` calls, ternary returns, and named-target factories (`Wrapper.getBuilder() { return new MyClass(); }`) stay out of scope to avoid wrong-class crediting. Cache version bumped from 75 to 76. (Closes [#346](https://github.com/fallow-rs/fallow/issues/346). Thanks [@robbtraister](https://github.com/robbtraister) for the report.)
+
+### Changed
+
+- **Routine dependency bumps for the underlying toolchain:** `napi-derive` 3.5.4 -> 3.5.5, `napi` 3.8.5 -> 3.8.6, `tokio` 1.52.1 -> 1.52.2, `rmcp` 1.5.0 -> 1.6.0, `oxc_coverage_instrument` (oxc group), `github/codeql-action` 4.35.2 -> 4.35.3. VS Code extension dev deps: `rolldown` (dev), `@tanstack/intent` (dev).
+
+## [2.71.1] - 2026-05-12
+
+### Fixed
+
+- **Release workflow restores the two-step npm bootstrap so npm packages publish on Node 22 runners again.** The v2.71.0 release workflow consolidated the npm install to a single `npm install -g --ignore-scripts npm@11.14.1` step, but the Node 22 runner's bundled npm has a broken dependency tree (`Cannot find module 'promise-retry'`) when asked to install npm@11.x directly; the v2.71.0 `Publish to npm` job failed before any tarball reached the registry, leaving `npm install fallow` at v2.70.0 while crates.io, the GitHub release, and the VS Code marketplace all shipped v2.71.0. The install step now does `npm install -g --ignore-scripts npm@10.9.8` first to repair the tree, then upgrades to the pinned `npm@11.14.1` that holds the OIDC trusted-publishing config. Both invocations keep `--ignore-scripts` so the supply-chain hardening surface stays narrow. v2.71.0 is functionally equivalent on every platform except npm; users on `npm` jump from `2.70.0` directly to `2.71.1`.
+
+## [2.71.0] - 2026-05-12
+
+### Added
+
+- **`import type { CheckOutput, FallowJsonOutput } from "fallow/types"` now works for any TypeScript consumer of `npx fallow --format json`.** Previously CI scripts, monorepo tooling, and AI agents parsing fallow output invented their own `interface`s or used `any`. The npm `fallow` package now exposes the generated `.d.ts` the VS Code extension already uses, covering every command's JSON shape (`CheckOutput`, `HealthOutput`, `DupesOutput`, `AuditOutput`, `CombinedOutput`, `IssueAction`, every per-finding struct). `SchemaVersion` is pinned to a literal (currently `6`) at codegen time, so a future major-version schema bump produces a compile error at consumer call sites that gate on the version rather than silently drifting. Works on both modern (`moduleResolution: "node16"` / `"nodenext"` / `"bundler"`) and legacy (`"node"`) TypeScript configs via paired `exports` and `typesVersions` entries. Types-only, no JS runtime added. (Closes [#339](https://github.com/fallow-rs/fallow/issues/339))
+- **Detects pnpm catalog references whose catalog does not declare the package.** **Upgrade note:** the new rule's default severity is `error`, so a workspace that already had a broken catalog reference will flip from a green `fallow check` on v2.70 to a red one on the next minor. To absorb the change without action, set `rules.unresolved-catalog-references: "warn"` in your fallow config before upgrading; pin to `"error"` later once the broken references are resolved. New `unresolved-catalog-references` rule (default severity `error`) walks every workspace `package.json` and flags `catalog:` / `catalog:<name>` references whose target catalog has no entry for the consumed package. `pnpm install` fails with `ERR_PNPM_CATALOG_ENTRY_NOT_FOUND_FOR_CATALOG_PROTOCOL` on these references; fallow surfaces them statically so the failure is caught at `fallow check` time, before any install. Each finding carries the consumer `package.json` path + line, the broken `(package, catalog)` pair, and an `available_in_catalogs` list naming OTHER catalogs in the same workspace that DO declare the package; agents and humans can flip the reference to one of those catalogs instead of growing a new entry. The default catalog renders with a special-case "default catalog" phrasing across human / JSON / SARIF / markdown / CodeClimate / LSP output. Suppression is config-only because `package.json` has no comment syntax: the new `ignoreCatalogReferences: [{ package, catalog?, consumer? }]` array suppresses by package name, optionally scoped to a specific catalog and / or consumer-path glob (covers staged catalog migrations where the catalog edit lands separately, and library-internal placeholder packages whose target catalog isn't ready yet). JSON `actions[]` is discriminated: when `available_in_catalogs` is non-empty the primary action is `update-catalog-reference` (high-confidence machine-actionable fix), otherwise `add-catalog-entry`; `remove-catalog-reference` is the fallback, and the `add-to-config` suppress action carries a paste-ready `ignoreCatalogReferences` value with a `value_schema` pointer. New `IssueKind::UnresolvedCatalogReference` (discriminant 22, suppression tokens `unresolved-catalog-reference` and `unresolved-catalog-references`); new `UnresolvedCatalogReference` finding on `AnalysisResults`. The shared YAML parse + workspace `package.json` walk is reused with the existing `unused-catalog-entries` detector so both rules cost a single pass. All six report formats render the finding (human two-tier + default-catalog special case, JSON, SARIF rule `fallow/unresolved-catalog-reference`, compact, markdown, CodeClimate), the GitHub Action and GitLab CI jq scripts surface it in summary tables and emit `::error` annotations on the consumer `package.json` line, the LSP emits an `ERROR`-severity `unresolved-catalog-reference` diagnostic anchored on the consumer `package.json` line, the MCP `analyze` tool accepts `issue_types: ["unresolved-catalog-references"]`, and the VS Code "Unused Code" tree shows a new category with an error icon. `fallow explain unresolved-catalog-reference` opens with the install-failure consequence and cross-references the inverse `unused-catalog-entries` rule (both directions). (Closes [#334](https://github.com/fallow-rs/fallow/issues/334))
+
+### Fixed
+
+- **Combined, audit, and `flags` JSON output now emit `schema_version: 6` (was `3`), matching every other command and the documented `SchemaVersion` definition.** Three top-level envelope writers (`crates/cli/src/combined.rs`, `crates/cli/src/audit.rs`, `crates/cli/src/flags.rs`) hardcoded `schema_version: 3` independently of the central `SCHEMA_VERSION` constant in `crates/cli/src/report/json.rs`, so the bare `fallow --format json` invocation, `fallow audit --format json`, and `fallow flags --format json` all stayed pinned at version 3 while `fallow check`, `fallow health`, `fallow dupes`, etc. progressed through `4`, `5`, and `6`. The schema at `docs/output-schema.json` and the generated `fallow/types` `SchemaVersion` literal both reference the central constant, so consumers gating on `schema_version === 6` saw runtime `3` from any of the three envelopes. All three sites now read from `report::SCHEMA_VERSION` directly, eliminating the drift class. Surfaced by an end-to-end probe of the new `fallow/types` subpath: the literal-pinned types matched per-command outputs but not the combined envelope. No `--format json` schema content changed; only the metadata field's value harmonized upward.
+
+### Changed
+
+- **VS Code extension TypeScript types for fallow's JSON output are now generated from `docs/output-schema.json` instead of hand-maintained.** The hand-written `editors/vscode/src/types.ts` shapes have repeatedly drifted from the Rust source of truth: issue [#323](https://github.com/fallow-rs/fallow/issues/323) crashed the Unused Code tree because `UnlistedDependency` had been restructured Rust-side but the TS interface still read the removed `path` field, and an audit at the time surfaced two more latent drifts on `UnusedDependency` and `TypeOnlyDependency`. The contract is now derived: `editors/vscode/scripts/codegen-types.mjs` runs `json-schema-to-typescript` against `docs/output-schema.json` and writes `editors/vscode/src/generated/output-contract.d.ts` (committed). `prebuild` and `prepackage` regenerate before the bundle is built or packaged, so the marketplace artifact never ships against stale types. CI runs `pnpm run check:codegen` as a dedicated step so a forgotten regen fails the build with an actionable message. Existing `FallowCheckResult` / `FallowDupesResult` / `FallowCombinedResult` aliases stay re-exported from `types.ts` so consumer code keeps compiling; new code should prefer the schema-derived names (`CheckOutput`, `DupesOutput`, `CombinedOutput`). The settings shapes that are NOT in the output contract (`IssueTypeConfig`, `DuplicationMode`, `TraceLevel`), UI label maps (`IssueCategory`, `ISSUE_CATEGORY_LABELS`), and the still-unschematized `fallow fix --format json` shape (`FixAction`, `FallowFixResult`) split out into `src/settings.ts`, `src/labels.ts`, and `src/fix-types.ts` and stay hand-written. Renamed the `Action` definition in `docs/output-schema.json` to `IssueAction` so the generated TS does not collide with the consumer-facing `FixAction` (fallow-fix output entry); no `schema_version` bump because the rename is to an internal definition name and does not change the JSON payload. (Closes [#326](https://github.com/fallow-rs/fallow/issues/326))
+
+## [2.70.0] - 2026-05-12
+
+### Added
+
+- **Runtime coverage Phase 2 surfaces a `hot-path-touched` verdict in `fallow audit` when a PR diff overlaps a hot path.** Consumes `fallow-cov-protocol 0.5` which gains a per-hot-path `end_line` so the sidecar reports the full span of every hot path instead of just its start. The new `--diff-file <unified.diff>` flag on `fallow audit` (and the matching `diff-file` input on the GitHub Action / GitLab CI template) feeds the PR's unified diff into the runtime-coverage matcher, which intersects the changed line ranges against each hot path's `[start_line, end_line]` and fires the verdict when any overlap is found. The GitHub Action and GitLab CI templates pre-compute the diff in the analyze step so the verdict fires automatically on PRs; PR/MR comments render a "hot path touched" framing when the verdict fires (separate from the existing `hot-path-changes-needed` block) so reviewers see at a glance which changed lines landed on production-hot code. Protocol JSON gains a structured `signals[]` array (replacing the prior flat `signal` string) for forward-compatible multi-signal verdicts; PR-aware precedence ordering picks the strongest applicable verdict when multiple fire. Internal: `HotPathChangesNeeded` renamed to `HotPathTouched` across the runtime-coverage layer; filter context lifted into a dedicated struct.
+- **VS Code "Unused Code" tree surfaces four additional diagnostic categories.** Previously the tree only rendered the original five categories (unused files / exports / types / enum members / class members); namespace-barrel duplicate exports, circular dependencies, boundary violations, and unused-catalog-entry findings all existed in fallow's JSON output but never showed up in the sidebar. The tree builder now branches on `IssueKind` and renders each category under its own collapsible header with the same path-relative line/column display the existing categories use, so users get a complete picture of what fallow found without dropping to the terminal.
+- **`add-to-config` actions now carry an optional `value_schema` URL pointing at the schema fragment that describes the `value` shape.** AI agents and other programmatic consumers can fetch the linked schema and validate the action's `value` before writing into a user's config. The URL is a JSON Pointer fragment into fallow's `schema.json` (`#/properties/ignoreExports` for the `duplicate-exports` action, `#/properties/ignoreDependencies/items` for the `ignoreDependencies` action emitted on dependency findings). Strictly additive optional field, no `schema_version` bump; consumers that ignore the field keep working unchanged. Documented in `docs/output-schema.json` under `AddToConfigAction.value_schema`. (Closes [#331](https://github.com/fallow-rs/fallow/issues/331))
+- **Detects unused entries in pnpm `catalog:` / `catalogs:` sections.** New `unused-catalog-entries` rule (default severity `warn`) reads `pnpm-workspace.yaml`, parses the default `catalog:` map plus every named catalog under `catalogs:`, and reports entries that no workspace `package.json` references via the `catalog:` protocol. Both `"react": "catalog:"` (bare, default catalog) and `"react": "catalog:default"` are treated as references to the default catalog per pnpm's spec. Each finding carries the entry name, catalog name, source line, and a `hardcoded_consumers` list pointing at workspace `package.json` files that declare the same package with a hardcoded version range instead of `catalog:`; surfacing the latter lets AI agents and humans choose between "switch consumers to `catalog:`" and "delete the catalog entry" instead of rubber-stamping the wrong one. New `IssueKind::PnpmCatalogEntry` (discriminant 21, suppression tokens `unused-catalog-entry` and `unused-catalog-entries`); new `UnusedCatalogEntry { entry_name, catalog_name, path, line, hardcoded_consumers }` on `AnalysisResults`. All six report formats render the finding (human / JSON / SARIF / compact / markdown / CodeClimate), the GitHub Action and GitLab CI jq scripts surface it in summary tables and annotations, the LSP emits a `unused-catalog-entry` diagnostic anchored on the YAML line, the MCP `analyze` tool accepts `issue_types: ["unused-catalog-entries"]`, the VS Code "Unused Code" tree shows a new category, and JSON `actions[]` injects a YAML-style `# fallow-ignore-next-line unused-catalog-entry` suppress action. Thanks [@Luzefiru](https://github.com/Luzefiru) for the report. (Closes [#329](https://github.com/fallow-rs/fallow/issues/329))
+- **Human `Duplicate exports` section surfaces a namespace-barrel orientation hint when the findings look like a shadcn / Radix-clone barrel layout.** The JSON `remove-duplicate` action has carried a `note` calling out the namespace-barrel shape since #317 ("If every location is the sole `index.*` of its directory, this is likely an intentional namespace-barrel API. Prefer the `add-to-config` ignoreExports action over removing exports."), but `--format human` never showed it, so users seeing 40+ duplicate-exports findings in a shadcn-style codebase had no surfacing of the recommended escape hatch. The human renderer now emits the same string once at the bottom of the section when at least 80% of renderable findings have every location matching `**/<dir>/index.{ts,tsx,js,jsx,mjs,cjs}` (case-insensitive on the extension only) AND there are at least 3 renderable findings. The wording is now a shared `NAMESPACE_BARREL_HINT` constant so the human and JSON output paths cannot drift. The dual gate prevents the hint from spamming small projects with one or two coincidental duplicates while still firing reliably on the shadcn / Radix-clone case where dozens of `components/ui/<name>/index.ts` barrels intentionally share short export names. (Refs [#322](https://github.com/fallow-rs/fallow/issues/322))
+
+### Changed
+
+- **Workspace and plugin discovery now run in parallel hot loops.** The first cut walked workspace `package.json` files serially and ran every plugin's `extract_referenced_dependencies` pass sequentially per project; with rayon already on the dependency tree the serial paths were leaving cores idle on large monorepos. Both passes now distribute over a rayon thread pool with results merged back through the existing aggregator; the parallel build is benchmark-stable across the eight workspace fixtures (svelte, vue-core, fastify, query, vite, preact, zod, next.js) with no regressions on smaller projects (the rayon scheduler's work-stealing keeps overhead at zero on single-package layouts).
+- **Dead-code analysis early-skips modules with no exports and lazy-builds detector matcher lists.** Two micro-passes that together cut a measurable slice off `fallow check` on monorepos with many ambient `.d.ts` / barrel-less utility files: the unused-exports detector now bails before the matcher walk when the file has zero export records, and the matcher lists for `unused-types` / `unused-exports` / `unused-class-members` are built lazily per-file on first finding instead of upfront for every file. No behavior change; same findings, less work per file.
+- **Duplicate-clone detection caches per-finding suppression metadata.** `find_duplicates` was re-parsing each clone instance's source file for fallow-ignore directives once per overlapping clone group; long files with many overlapping clones (the shadcn / Radix component-library shape) burned proportional time on redundant scans. The suppression metadata for each `(file, line-range)` pair is now memoised within a single `find_duplicates` invocation, so the second-and-later groups touching the same file read from a cache instead of re-parsing. No JSON, CLI, or cache-format change.
+- **`overrides.rules.{duplicate-exports,circular-dependency}` load-time warnings dedupe to one per `(rule, glob list)` per process in workspace mode.** When a top-level config sets `overrides.rules.duplicate-exports` or `overrides.rules.circular-dependency` for a file glob, every workspace package resolve was re-emitting the same `tracing::warn` ("`overrides.rules.duplicate-exports has no effect for files matching [...]`"). On a 200-package monorepo with a single top-level config, that surfaced as 200 (or 400 with both rules set) identical warn lines per invocation, training users to filter `tracing` output entirely. The warning is now deduplicated against a process-local set keyed on a stable hash of `(rule name, sorted glob list)`, so logically identical override blocks across packages produce a single warning per process lifetime. The set persists across resolves within a single process (so `fallow watch`, the LSP server, and NAPI consumers re-using a worker see the warning once until the host restarts) and is documented as such in the resolver source. Internal pre-compilation of `ignoreExports` globs also moves to `ResolvedConfig` construction, so the existing "invalid `ignoreExports` pattern" warning fires at resolve time once instead of once per detector invocation, and both `find_unused_exports` and `find_duplicate_exports` read pre-built matchers from the shared compiled list. Policy note (ADR-008): `fallow-core`'s `pub fn analyze::*` items are explicitly internal; embedders should consume `fallow_cli::programmatic` (a deprecation cycle for direct `fallow-core` consumers will land in a subsequent minor release). (Refs [#322](https://github.com/fallow-rs/fallow/issues/322))
+
+### Fixed
+
+- **Wildcard tsconfig paths (`"*": ["./src/*"]`) no longer make Node / Bun / Cloudflare builtin imports surface as `unresolved-import`.** `import { fileURLToPath } from "node:url"` was reported as unresolved whenever the project's `tsconfig.json` defined a wildcard `paths` entry, even with `@types/node` installed and listed under `compilerOptions.types`. The TypeScript plugin's `paths` normalization strips the trailing `*` from each find pattern; for the wildcard `"*"` that produced an empty-prefix entry in `path_aliases`, and the resolver's `matches_plugin_alias` fast path (`specifier.starts_with(prefix)`) then matched every specifier (since every string starts with `""`) and routed them through the path-alias fallback, which classifies failed-alias resolutions as `Unresolvable`. Wildcards are still honoured by `oxc_resolver`'s native tsconfig paths handling, so dropping them from `path_aliases` does not regress legitimate `*` rewrites (e.g. `import { greeting } from "helpers"` still resolves to `./src/helpers.ts`). Side effect of the same root cause: bare-specifier typos (`import { x } from "doesnotexist"`) in wildcard-paths projects were also misreported as `unresolved-import` instead of `unlisted-dependency`; the fix restores parity with the no-paths baseline so the messaging matches. Thanks [@FunctionDJ](https://github.com/FunctionDJ) for the report and the minimal reproduction repo. (Closes [#327](https://github.com/fallow-rs/fallow/issues/327))
+- **Cross-package namespace-object aliases stay credited when the alias target itself does `export * as N from './source'`.** Follow-up to #303 and #310. The first-cut Phase 2b pass credited consumer accesses of the form `<consumer_local>.<suffix>.<member>` onto the namespace target file. Real-world chains layer a second indirection: the namespace target is itself a barrel whose only purpose is to namespace-re-export deeper files (`export * as inner from './leaf'`). For a consumer access `<consumer_local>.<suffix>.<inner>.<X>`, Phase 2b credited `inner` on the barrel (so the synthesised `inner` stub got a reference) but stopped there; Phase 4's named-re-export propagation never follows `imported_name="*"` edges, so the underlying `X` on `./leaf` stayed flagged as a false `unused-export`. The Phase 2b matcher now walks chained `export * as <name> from './source'` re-exports on the alias-target side after the initial credit: when the credited member name lands on a namespace re-export edge, the consumer's deeper accesses (`<expected_object>.<member>.<X>`) are propagated onto the underlying source recursively. Cycle-protected by a per-access visited set keyed on module index. Per-member precision is preserved (same-file unused siblings stay flagged), per-re-export-name precision is preserved (sibling namespace re-exports the consumer never touches stay flagged), and multi-hop chains (`export * as outer from './deeper-barrel'` followed by `export * as deep from './deeper-leaf'`) credit all the way through. No JSON, CLI, or cache-format change. Thanks [@filipw01](https://github.com/filipw01) for the report and the precise reproduction repo. (Closes [#328](https://github.com/fallow-rs/fallow/issues/328))
+- **`export * as Foo from './bar'` followed by `import { Foo } from './barrel'; Foo.X(...)` no longer falsely flags `X` as `unused-export`.** A barrel that namespace-re-exports a module records a `ReExportEdge { imported_name: "*", exported_name: "Foo" }` plus a synthesised `ExportSymbol` named `Foo`. The Phase 2 reference-narrowing pass only narrowed member accesses for `import * as ns` (the direct namespace import form), so a consumer using the named import form for the same logical namespace got no member credit on the target file. Phase 4's named-re-export propagation then looked for a source export literally named `"*"` and matched nothing, so every export of the re-exported source file stayed unreferenced. A new Phase 2c pass (`namespace_re_exports`) walks every namespace re-export edge, enumerates the consumer files that import the re-exported name directly or through outer named-re-export barrels, collects each consumer's `<local>.<member>` accesses and whole-object uses, and credits the matching members on the namespace target file via the same `mark_member_exports_referenced` plus `create_synthetic_exports_for_star_re_exports` pair used for direct namespace imports. Multi-hop named-re-export chains (`outer -> inner -> source`) are handled by a forward BFS on re-export edges; `export * from` propagates the source name unchanged; renamed re-exports (`export { Foo as Bar }`) follow the new name; barrels that expose the namespace through an entry point credit every target export to match the existing `propagate_entry_point_star` semantics. Real-world delta on the `astro` benchmark fixture: 103 false-positive `unused-export` findings (every `AstroErrorData.<ErrorName>` entry in `packages/astro/src/core/errors/errors-data.ts`) disappear. No JSON, CLI, or cache-format change. Thanks [@ivayloc](https://github.com/ivayloc) for the report and the precise reproduction. (Closes [#324](https://github.com/fallow-rs/fallow/issues/324))
+- **VS Code: tree view no longer crashes with `The "path" argument must be of type string. Received undefined` when an unlisted dependency is present.** The extension's TypeScript type for `UnlistedDependency` had drifted from the Rust struct: it declared a single top-level `path` field but the actual JSON shape carries `imported_from: ImportSite[]` (so one unlisted dependency reports every site that imports it, with per-site file / line / column). When the user's project produced at least one unlisted dependency, the tree view's `unlisted-dependencies` mapping passed `d.path` (`undefined`) into Node's `path.isAbsolute`, which threw and prevented the tree from rendering, so the "Unused Code" tab silently fell back to the empty "No unused code found" welcome message. The fix updates the TypeScript type to match the Rust shape, mirrors the existing `duplicate_exports.locations.flatMap` pattern to emit one tree row per import site (so each row navigates to the actual import line), and hardens `resolveFilePath` to return empty strings on undefined / empty input as a defensive guard against any future shape drift. The audit also surfaced two latent type drifts in the same file that hadn't crashed yet only because no consumer happened to read the missing fields: `UnusedDependency` now declares the `location` (`"dependencies" | "devDependencies" | "optionalDependencies"`), `line`, and optional `used_in_workspaces` fields that the Rust struct has always emitted, and `TypeOnlyDependency` now declares the `line` field. Thanks [@FunctionDJ](https://github.com/FunctionDJ) for the report. (Closes [#323](https://github.com/fallow-rs/fallow/issues/323))
+- **`ignoreExports` now also excludes matching files from `duplicate-exports` grouping, and `overrides.rules.duplicate-exports` emits a load-time warning instead of silently no-opping.** shadcn / Radix / bits-ui-style component libraries ship a folder per component (`components/ui/<name>/index.ts`) where every barrel intentionally exports the same short names (`Root`, `Content`, `Trigger`, `Title`, ...) so consumers can do `import * as Dialog from '$lib/components/ui/dialog'`. Without this fix, every short name surfaced as a `duplicate-export` group across the whole component set even though the duplication is the API. `ignoreExports` was the obvious escape hatch but only gated `unused-export` findings; `overrides.rules.duplicate-exports = "off"` on a file glob silently did nothing because the rule's severity is project-wide and the finding spans multiple files. The fix: a file matched by `ignoreExports` is excluded from the duplicate-exports grouping at the file level (`exports: ["*"]` removes the file entirely, a name list removes only those names), so the documented config knob works the way the field name implies. Setting `overrides.rules.duplicate-exports` or `overrides.rules.circular-dependency` now emits a `tracing::warn` at config load pointing users at the working escape hatch (`ignoreExports` for duplicates, `// fallow-ignore-file circular-dependency` for cycles), so the silent no-op is gone. JSON `duplicate_exports` findings gain a new `add-to-config` action with a paste-ready `ignoreExports` snippet built from the finding's actual location paths, and the action is emitted in position 0 (the documented primary slot) so AI agents that pick the first action get the non-destructive path for the namespace-barrel case rather than being nudged to delete one of the duplicates. The note on the existing `remove-duplicate` action now calls out that locations shaped like `<name>/index.*` are likely intentional namespace barrels and should prefer the config action. JSON `schema_version` bumps to `6` because `AddToConfigAction.value` widens from a scalar string to `oneOf: [string, array]` so the `ignoreExports` action can carry an array of `{ file, exports }` rule objects; the legacy `ignoreDependencies` / `type-only-dependency` / etc. variants still emit strings, so consumers that switch on `config_key` keep working unchanged. Real-world delta on `huntabyte/shadcn-svelte`'s `docs` package with `ignoreExports: [{ "file": "src/lib/registry/ui/**", "exports": ["*"] }]`: 29 duplicate-export groups drop to 3 (the 26 that flipped off are exactly the shadcn barrel names `Root`, `Content`, `Trigger`, `Dialog`, ...; the 3 remaining are genuine duplicates in non-registry files). Thanks [@Vantrongs](https://github.com/Vantrongs) for the report and the precise reproduction. (Closes [#317](https://github.com/fallow-rs/fallow/issues/317))
+- **`// fallow-ignore-next-line` accepts multiple kinds stacked on consecutive lines.** The single-comma `// fallow-ignore-next-line unused-export, unused-type` form has always worked, but stacking the same suppression as two adjacent single-kind comments (`// fallow-ignore-next-line unused-export` then `// fallow-ignore-next-line unused-type`, both above the same target line) only honoured the comment closest to the target and silently dropped the other. The comment scanner now coalesces every contiguous `fallow-ignore-next-line` comment block above a target line and unions their kinds, so the documented stack-or-comma equivalence holds in both directions. Doc note added to the suppression reference to make the equivalence explicit. (Closes [#318](https://github.com/fallow-rs/fallow/issues/318))
+- **Duplicate-clone detector filters out atomic invocation-shaped clones (bare function calls).** A 5-line call expression like `someFunction(\n  arg1,\n  arg2,\n  arg3,\n)` is already a single named abstraction; flagging it as a duplicate clone produces no actionable extraction (there is nothing to factor out beyond the call itself). The detector now identifies clones whose normalised token stream is a single invocation expression (`<callee>(args...)` with no surrounding statements) and drops them before grouping. Multi-statement clones that happen to contain a call as one of their statements are preserved; only the bare-call shape is filtered. Closes the false-positive class reported in discussion [#320](https://github.com/fallow-rs/fallow/discussions/320). Thanks [@danielo515](https://github.com/danielo515) for the report.
+- **Singular rule keys in `.fallowrc` are accepted as aliases for every plural rule.** The canonical rule keys describe categories and are plural (`unused-exports`, `unused-types`, `boundary-violations`, `private-type-leaks`, ...) but the matching `IssueKind` names are singular (`unused-export`, `unused-type`, `boundary-violation`, `private-type-leak`). Users writing config from memory of the issue type instead of the rule reference saw their `"boundary-violation": "warn"` silently ignored (the schema accepted it but no rule matched it). Every plural rule key now also accepts its singular form via a serde alias, so the rule fires either way. The human-mode footer now uses the singular `boundary-violation` token when nudging users to add the rule to their config, matching the canonical issue-kind spelling used in suppression comments and JSON output. The full alias table is documented in the rules reference.
+- **Rustdoc intra-doc link `[`RuntimeCoverageReport::signals`]` uses the fully-qualified path so `cargo doc --document-private-items` stays green on CI.**
+
+### Security
+
+- **Drop the unmaintained `serde_yml 0.0.12` crate (RUSTSEC-2025-0068, unsound segfault advisory) in favour of `serde_yaml_ng 0.10`.** `serde_yml` was archived after unsoundness issues were raised against its YAML serializer (`Serializer.emitter` segfault, RUSTSEC-2025-0068) and `cargo deny check advisories` started rejecting it. Both crates expose the same `Value` / `Mapping` / `from_str` API used by the pnpm catalog parser, so the swap is a one-line `use` rename plus dep update. No behavior change; the parser handles the same set of `pnpm-workspace.yaml` shapes as before, and the 14 catalog parsing tests continue to pass without modification.
+
+## [2.69.0] - 2026-05-09
+
+### Added
+
+- **VS Code: `fallow.configPath` setting mirrors the CLI's `--config` flag.** A new string setting points the extension at an explicit Fallow config file. Absolute paths pass through; relative paths are resolved against the workspace root (the first folder in multi-root workspaces) before being forwarded to both the LSP via `initializationOptions.configPath` and the CLI via `--config <path>` for analyze and fix commands. Empty (the default) keeps the existing auto-discovery behavior (`.fallowrc.json` > `.fallowrc.jsonc` > `fallow.toml` > `.fallow.toml`). Changing the setting restarts the LSP and re-runs the sidebar analysis. A broken `configPath` (typo, missing file, parse error) surfaces a WARNING-level notification including the path so users see what went wrong instead of a silent empty Problems panel; auto-discovery still falls back to defaults on parse errors. Two new public `fallow_core` entry points (`config_for_project` and `analyze_project_with_config`) let other programmatic embedders request an explicit config the same way. Thanks [@FunctionDJ](https://github.com/FunctionDJ) for the question. (Closes [#314](https://github.com/fallow-rs/fallow/discussions/314))
+
+## [2.68.0] - 2026-05-09
+
+### Added
+
+- **Typed PR / MR comment and review-envelope formats replace the bash + jq feedback layer.** Four new `--format` variants render the surfaces the GitHub Action and GitLab CI templates post on every pull / merge request: `pr-comment-github` and `pr-comment-gitlab` produce sticky comment markdown with a `<!-- fallow-id: ... -->` HTML-comment marker for upsert, and `review-github` and `review-gitlab` produce JSON envelopes shaped for the respective inline-review POST endpoints (GitHub PR Reviews API, GitLab Discussions API) with deterministic per-finding fingerprints, side-aware positions, and code-suggestion blocks for unused-export / unused-class-member / unused-enum-member / unused-files findings. Combined mode renders a single sticky comment with collapsible `<details>` sections per category (Dead code, Dependencies, Duplication, Health, Architecture, Suppressions); truncated sections foreshadow the cap in the section header (`Duplication (160, showing 50)`). The companion `fallow ci reconcile-review --provider {github,gitlab}` subcommand reads a typed review envelope, joins it against existing review threads, posts an idempotent `Resolved in <sha>` reply per stale finding, and resolves the thread; bot-authorship gated, rate-limit-aware retry capped at 60s per attempt with bounded total budget. Eleven new typed `inputs:` / `variables:` (`comment-id`, `diff-filter`, `max-comments`, `api-retries`, `api-retry-delay`, ...) make every wrapper knob discoverable in the GitHub Marketplace UI and the GitLab template instead of being env-var-only. `--workspace <one>` auto-suffixes the sticky marker with the workspace name; `--workspace web,admin` hashes the sorted list to a stable 6-hex suffix so parallel monorepo jobs do not race each other's sticky body on the same PR. The CodeClimate format gains a deterministic `fingerprint` (required by the GitLab Code Quality spec) and SARIF gains `partialFingerprints` under both `tools.fallow.fingerprint/v1` and `primaryLocationLineHash/v1` so GitHub Code Scanning's alert-correlation engine deduplicates fallow alerts across pushes. Twelve review-pad jq files retire; `comment.sh` and `review.sh` shrink to typed-format wrappers with bounded `gh_api_retry` / `curl_retry` helpers, paginated comment-list lookups, and explicit structured-error envelope guards. Suggestion blocks widen to enum-members, class-members, and a text hint for unused-files (no `\`\`\`suggestion` block since deletion needs a separate review action). (#315)
+- **`fallow migrate` writes `.fallowrc.jsonc` when migrating from a `.jsonc`-named source, and a new `--jsonc` flag forces it explicitly.** `fallow migrate` has always generated JSONC content (with `//` comments) but wrote it to `.fallowrc.json`, which trips up editor JSON validators and project lint rules that flag comments in `.json`. The output filename is now picked in this order: `--toml` writes `fallow.toml`, `--jsonc` writes `.fallowrc.jsonc`, otherwise the source extension is mirrored, so a `knip.jsonc` or `.knip.jsonc` migration writes `.fallowrc.jsonc` and a `knip.json` / `package.json` `knip` key migration writes `.fallowrc.json`. `--jsonc` and `--toml` are mutually exclusive (clap rejects them together). The generated content is identical between the two JSON variants; the `.jsonc` extension exists so editors auto-detect JSON-with-comments syntax highlighting.
+
+### Fixed
+
+- **`.fallowrc.jsonc` is consistently documented across every user-facing surface.** The config crate has detected `.fallowrc.jsonc` since v2.57.0 (it sits second in the canonical priority order, mirroring `tsconfig.json` > `tsconfig.jsonc`), but the supporting documentation drifted: the MCP `config` param doc, the `fallow --config` flag help, the GitHub Action `config` input description, the GitLab CI `FALLOW_CONFIG` comment, the VS Code first-run "configure" page, the `AGENTS.md` configuration paragraph, two `fallow-docs` page meta descriptions (`configuration/overview`, `cli/init`), and the bundled npm-vendored `cli-reference.md` all listed only a subset (`.fallowrc.json` plus `fallow.toml`, sometimes omitting both `.fallowrc.jsonc` and `.fallow.toml`). Each surface now lists the full `.fallowrc.json` > `.fallowrc.jsonc` > `fallow.toml` > `.fallow.toml` set with a one-line note that the two JSON variants share the same JSONC parser and the `.jsonc` extension exists so editors auto-detect JSON-with-comments syntax highlighting. No behavior change: detection has always worked. Thanks [@pdeveltere](https://github.com/pdeveltere) for the report. (Closes [#313](https://github.com/fallow-rs/fallow/issues/313))
+- **`vi.mock('./target', factory)` credits the target file and no longer surfaces a phantom `__mocks__/target` as an `unresolved-import`.** Two bugs fell out of one: vitest only consults the `__mocks__/<file>` sibling when no factory is provided, but fallow's auto-mock heuristic synthesized a `__mocks__/<file>` import for every `vi.mock` call regardless of factory. With a factory present, the synthesized sibling almost never exists, so it surfaced as a false `unresolved-import`; meanwhile the actual target (the file the user wrote in the first argument) was never recorded as a referenced module, so the target file became a false `unused-file`. The visitor now records the vi.mock target itself as side-effect reachability, and only synthesizes the `__mocks__/<file>` sibling when no factory is provided. This keeps the target file reachable without blanket-crediting every export in it. Detects arrow factories, function-expression factories, and nested parenthesized variants (`vi.mock('x', (((() => ({})))))`); preserves the existing options-form behavior (`vi.mock(spec, { spy: true })` still synthesizes because vitest still consults `__mocks__/<file>` in that shape). Bumps the extract `CACHE_VERSION` so warm caches do not retain pre-fix data. Thanks [@filipw01](https://github.com/filipw01) for the report and the minimal reproduction repo. (Closes [#311](https://github.com/fallow-rs/fallow/issues/311))
+- **Cross-package namespace-object aliases stay credited through multi-hop named-re-export barrels.** Follow-up to #303. The first-cut Phase 2b pass only credited consumers whose `import { API } from '@scope/lib'` resolved DIRECTLY to the file containing `import * as bar from './bar'; export const API = { bar }`. Real-world workspace packages layer 1-3 named-re-export barrels between the package's public entry and the alias-defining file (e.g. `apps/foo/src/foo.ts` -> `packages/bar/src/index.ts` -> `packages/bar/src/methods/index.ts` -> `packages/bar/src/methods/methods.ts`), and consumers landing at any intermediate barrel were missed, surfacing `searchFoo` (and every other `API.bar.<member>` access target) as a false `unused-export`. The Phase 2b matcher now does a forward BFS over the graph's re-export edges starting from `(alias_file, via_export_name)` to enumerate every `(barrel_file, exported_name_at_barrel)` pair through which the alias is reachable, then matches consumer imports against the full set. Plain `export * from './src'` propagates names unchanged; `export { A as B } from './src'` propagates the renamed `B`; `export * as ns from './src'` is correctly skipped so unrelated same-named exports of the source are never spuriously credited at a namespace-aliased star barrel. Cycle-protected via the visited set. Thanks [@filipw01](https://github.com/filipw01) for the report and the precise multi-hop reproduction repo. (Closes [#310](https://github.com/fallow-rs/fallow/issues/310))
+- **Angular `@if (member(); as alias)` no longer flags the conditioned member as unused.** Fallow previously reported a false-positive `unused-class-member` when an Angular 17+ `@if` block bound its truthy result to a template-local via `; as alias`. The Angular template scanner passed the entire parenthesized content (`withAlias(); as aliased`) to oxc as a single expression, which oxc rejects (a `;` inside `void (...)` is invalid), so neither the call nor the alias was extracted. The scanner now splits the alias clause off the condition before parsing, parses the condition normally, and registers the alias as a block-scoped local so `{{ alias }}` inside the body does not leak as an unresolved identifier. Applies to inline `@Component({ template: \`...\` })` and external `templateUrl` shapes, and to nested `;` inside string literals or call arguments. Bumps `CACHE_VERSION` so warm caches do not retain pre-fix data. Thanks [@OmerGronich](https://github.com/OmerGronich) for the report and the precise reproduction. (Closes [#308](https://github.com/fallow-rs/fallow/issues/308))
+- **PR / MR comment Complexity dropdown header pluralizes when only one function is above threshold.** The `<details>` summary previously read `(1 functions above threshold)` for a single-finding PR. Each variant now branches on `count == 1` to produce `(1 function above threshold)`. Same fix applied to the GitHub Action and GitLab CI variants of `summary-combined.jq`.
+- **Inline review-comment "Also found in:" links keep the full path in the URL when display is shortened.** Same `rel_path` truncation bug as the dupes-locations table fix: the `file_link` helper in `review-comments-dupes.jq` (both Action and GitLab variants) used the truncated path for both display and URL, producing 404 links on monorepo paths longer than 3 segments. The helper now applies `rel_path` only to the display half and uses the caller-supplied full path in the URL. Regression test covers a 6-segment monorepo path.
+- **PR / MR comment Duplication links keep the full path in the URL when display is shortened.** The new clone-locations table truncates display paths to the last 3 segments for compactness (e.g. `services/billing/calculator.ts` instead of `apps/web/src/services/billing/calculator.ts`), but the previous version used the truncated path for BOTH display AND the GitHub / GitLab blob URL. For any path with more than 3 segments, the link 404'd because the URL was missing the leading directory components. The `file_link` helper now applies `rel_path` only to the display half and uses the full path in the URL. Regression test `dupes: deep-path URL keeps full path` covers a 6-segment monorepo path.
+- **PR / MR comment status bar pluralizes `code issue(s)`, `clone group(s)`, and `health finding(s)` when the count is 1.** Previously the one-line summary read ungrammatically as `**1** code issues · **1** clone groups · **1** health findings`. Each noun now branches on `count == 1` so a single-finding PR reads `**1** code issue · **1** clone group · **1** health finding`. Same fix in both the GitHub Action and GitLab CI variants of `summary-combined.jq`. Regression tests in `action/tests/run.sh` and `ci/tests/run.sh` cover all three nouns.
+- **Turborepo `_generators/config.ts` is detected as a generator config and credited.** The Turborepo plugin previously only looked for the canonical `turbo.json` location; projects that ship a Turborepo Custom Generator alongside other monorepo configs (in `<root>/turbo/generators/config.ts` or per-package `<package>/_generators/config.ts`) saw the generator file flagged as `unused-file`. The plugin now treats those locations as additional generator-config entry points and recurses through them. Thanks [@filipw01](https://github.com/filipw01) for the patch. ([#312](https://github.com/fallow-rs/fallow/pull/312))
+- **Plugin-scoped hidden directories (`.client`, `.server`, ...) are traversed by every discovery consumer, not just dead-code analysis.** The first cut wired `discovery_hidden_dir_scopes` into the analyze pipeline, so dead-code saw plugin-contributed hidden folders correctly, but `list`, `dupes`, `health`, `flags`, `coverage`, and the rest of the discovery consumers re-walked the project with the default hidden-directory allowlist and skipped those folders. React-Router-Modules-style projects with `app/.client/` and `app/.server/` saw inconsistent file sets between commands. Every discovery consumer now reads the same plugin-scoped hidden-dir list, so coverage of `.client` / `.server` / equivalent plugin-contributed directories is uniform across the toolchain. Thanks [@jadengis](https://github.com/jadengis) for the patch. (Closes [#309](https://github.com/fallow-rs/fallow/issues/309))
+
+### Changed
+
+- **PR / MR comment Duplication section lists the actual clone locations instead of aggregate counts only.** The GitHub Action and GitLab CI top-level summary previously rendered a metric table (`Duplicated lines: 7`, `Clone instances: 2`, `Files with clones: 1`) and left readers to dig through the inline review comments to find the file paths and line ranges. The block now opens a top-5 locations table sorted by `line_count` descending (largest extractable wins first), with each row stacking the clone instances as `path:start-end` ranges joined by `<br>`. Aggregate counts move into the `<details>` summary header (`(N group(s) · M lines · X%)`) so the closed dropdown is still self-explanatory, and a footer states how many distinct files contain clones. When `GH_REPO` + `PR_HEAD_SHA` (Action) or `CI_PROJECT_URL` + `CI_COMMIT_SHA` (GitLab) are set, each cell links to the GitHub or GitLab blob URL with a line-range fragment so a click lands at the right span. Singular/plural grammar is rendered in the header and footer (1 group vs N groups, 1 file vs N files). Top-5 truncation matches the Complexity section's behaviour, with an "and N more groups" overflow line. The same shape is mirrored into the standalone `fallow dupes` summary so users hitting that surface no longer see a bare file list with no line ranges.
+
+### Fixed
+
+- **Jest plugin follows the `projects` field across all three of its real-world shapes (string globs, `package.json#jest` keys, and inline ProjectConfig objects).** A root `jest.config.js` that delegates discovery via `projects: ['<rootDir>/packages/*']` (or the file-shaped `projects: ['<rootDir>/packages/*/jest.config.{js,ts}']` variant) previously left fallow blind to every child config. Each child's `preset`, `transform`, `reporters`, `setupFiles`, `globalSetup`, `snapshotSerializers`, `testRunner`, `runner`, and other referenced packages went uncredited, so monorepo projects saw spurious `unused-dependency` / `unlisted-dependency` reports for everything only used inside per-package Jest configs. The plugin now expands each `projects` entry against the filesystem (with `<rootDir>` substitution and glob support), probes resolved directories for `jest.config.{ts,js,mjs,cjs,json}` first and falls back to `package.json` carrying a top-level `"jest"` object key, and recurses with cycle protection (canonicalised-path visited set, depth-bounded at 4) plus two complementary caps for pathological globs (raw glob iteration capped at 1024 matches inspected, accepted child configs capped at 64). Each child runs into a scratch result so its `testMatch` / `testRegex` / `replace_entry_patterns` stay scoped to that project; only `referenced_dependencies` and `setup_files` merge back into the parent, matching Jest's per-project semantics so a narrow `testMatch` in one package does not silently drop sibling packages' tests from entry-point analysis. Inline `ProjectConfig` objects (`projects: [{ preset: "ts-jest", runner: "jest-runner-eslint" }]`) are also followed: each object's package-typed fields (`preset`, `runner`, `testRunner`, `testEnvironment`, `resolver`, `snapshotSerializers`, `watchPlugins`, `reporters`) are credited as referenced dependencies and its setup files (`setupFiles`, `setupFilesAfterEnv`, `globalSetup`, `globalTeardown`) are credited as setup entry points, with the same builtin-runner / builtin-environment / relative-resolver filters the top-level extractor applies.
+
+## [2.67.0] - 2026-05-07
+
+### Added
+
+- **`fallow audit` runs through `command: audit` in the GitHub Action and `FALLOW_COMMAND=audit` in the GitLab CI template.** Wrapping the severity-aware new-only PR gate previously required dropping to a manual `npx fallow audit ...` step alongside the action, because the action's `command:` validation rejected `audit` and there was no plumbing for `gate`, `coverage`, `max-crap`, or per-analysis baselines. Both wrappers now accept `audit` as a first-class command and forward `gate` (`new-only` / `all`), `coverage` + `coverage-root`, `max-crap`, and the three `dead-code-baseline` / `health-baseline` / `dupes-baseline` inputs to the CLI. The `outputs.issues` counter for audit returns the gate-aware introduced-finding count (sums `attribution.*_introduced` under `gate: new-only`, sums `summary.*` totals under `gate: all`) so downstream workflows comparing `outputs.issues > N` keep working without changes. PR comments render the verdict banner with per-category attribution tables (dead-code, complexity, duplication) plus a coverage-model footer that hints at `--coverage-root` when Istanbul match rate is low. Annotations and review comments fan out per-category through the existing comment and annotation jq scripts. Thanks [@hc-12](https://github.com/hc-12) for the report. (Closes [#302](https://github.com/fallow-rs/fallow/issues/302))
+- **`fallow audit --coverage` / `--coverage-root` forward Istanbul coverage data to the embedded health analysis for accurate CRAP scoring.** Audit's CRAP threshold check previously saw the static estimate even when the project had real coverage data, so PRs touching well-tested code drew noisy `--max-crap` violations. The new `--coverage <path>` flag (or `FALLOW_COVERAGE` env var, or the MCP audit tool's `coverage` param) feeds the same `coverage-final.json` shape that `fallow health --coverage` accepts, and `--coverage-root` rebases CI-side absolute paths onto the local checkout when needed. The base-snapshot cache key folds in a content hash of the coverage file so cache entries invalidate when coverage changes. As a side fix, relative `--coverage` paths now resolve against `--root` rather than the process cwd, matching every other path-shaped CLI input (this also covers standalone `fallow health --coverage`). Empty-string MCP `Option<String>` params (`coverage: ""`, etc.) are dropped before reaching clap, so agents that emit empty-string-for-no-value no longer end up with `--coverage ""`. (Closes [#300](https://github.com/fallow-rs/fallow/issues/300))
+
+### Fixed
+
+- **Statically analyzable dynamic imports (`import('./foo')` with a literal specifier) flow through the unresolved, unlisted, member-usage, and external-style analyzers exactly like static imports do.** Until now, `import('@scope/pkg')` and `import('./foo')` produced graph edges and entry-point coverage, but the per-finding analyzers (unresolved imports, unlisted dependencies, dependency usage, unused-class-member lookup, external CSS package resolution) walked only `static_imports` and `requires`, so a literal dynamic import to a missing file or an unlisted package was silently elided from those reports. A shared `ResolvedModule::all_resolved_imports()` iterator now includes `dynamic_imports` whose specifier kind is `Literal`; pattern-shaped dynamic imports and graph-edge construction are unchanged. Suppression directives apply uniformly across all three import shapes. Thanks [@hussainarslan](https://github.com/hussainarslan) for the patch and [@filipw01](https://github.com/filipw01) for the report. (Closes [#304](https://github.com/fallow-rs/fallow/issues/304))
+- **Cross-package consumers of a namespace re-exported through an object literal credit the original member.** When a barrel does `import * as foo from './bar'; export const API = { foo }` and a downstream package accesses `API.foo.bar`, `bar` was reported as `unused-export` because the binding-target metadata that ties `API.foo` to the namespace `foo` stayed local to the barrel file's extractor and never reached the consumer's resolution path. The visitor now collects per-module `NamespaceObjectAlias` entries (one per `(exported-object, suffix, namespace-local)` triple) at finalize time, the graph layer plumbs them through `ResolvedModule`, and a new Phase 2b pass walks each consumer's `member_accesses` for `<imported>.<suffix>` and credits the matching member on the namespace's source file. Star-barrel namespace targets (`./foo/index.ts` doing `export * from './bar'`) reuse the same synthetic-export helper that direct-namespace narrowing uses, so the credit lands on a stub that Phase 4 chain resolution then propagates to the real defining file. Same-file aliases (issue #269) keep working unchanged; nested suffixes such as `motionNet.adEngine` are handled via dotted-path matching. Targeted to the alias pattern: zero delta on all eight benchmark fixtures (preact, zod, svelte, vue-core, fastify, query, vite, next.js). Bumps the extract `CACHE_VERSION` so warm caches do not retain pre-fix data. Thanks [@filipw01](https://github.com/filipw01) for the report and the clean reproduction repo. (Closes [#303](https://github.com/fallow-rs/fallow/issues/303))
+- **Structured fallow errors no longer slip past the GitHub Action and GitLab CI wrappers as a green run.** When fallow fails on a config or validation error it emits `{"error":true,"message":"...","exit_code":N}` on stdout. Both wrappers' issue-counter jq filters used `// 0` defaults, so a null-on-error-shape silently became `issues=0` and the workflow went green even though fallow exited non-zero. Both wrappers now check `jq -e '.error == true' fallow-results.json` after capture and before counting, surface the structured error message, and exit with the CLI's reported `exit_code`. The same path intercepts the `audit` + generic `baseline` / `save-baseline` misuse pre-spawn with a message pointing at the three `dead-code-baseline` / `health-baseline` / `dupes-baseline` inputs (audit's three sub-analyses use incompatible baseline formats).
+- **GitHub Action and GitLab CI threshold gates branch on the audit verdict, not the raw introduced-finding count.** `fallow audit` returns a severity-aware verdict (`pass` / `warn` / `fail`) where `warn` means "warn-tier issues only, do not fail CI". The wrappers' threshold step previously gated on `attribution.*_introduced > 0`, so a project with `unused-exports: warn` and the action default `fail-on-issues: true` saw CI fail on every PR that touched a warn-tier finding even though the verdict said "do not fail". Both wrappers now extract `.verdict` and `.attribution.gate` from audit JSON, expose them as `outputs.verdict` / `outputs.gate` (Action) / equivalent script vars (GitLab), and the Check threshold step branches on `command=audit`: gates on `VERDICT==fail` for audit, falls through to the existing `ISSUES>0` logic for every other command. Fail-tier still fails as expected. Refs [#302](https://github.com/fallow-rs/fallow/issues/302).
+- **`--coverage-root` rejects relative paths with an actionable error instead of silently no-op'ing.** `--coverage-root` is a strip-prefix argument applied to absolute paths inside Istanbul coverage data (CI runners emit paths like `/ci/workspace/src/index.ts`, and the user passes `/ci/workspace` as the prefix to rebase). Relative values such as `src` cannot match those paths under any normalisation, but the previous behaviour was to absolutise them against `--root` and proceed, producing an unmatched prefix and zero coverage matches with no signal to the user. The validator at `health::scoring::validate_coverage_root_absolute` now exits 2 with `--coverage-root expects an absolute path prefix from the coverage data, got 'src'. Use the checkout prefix from the machine that generated coverage, for example '/home/runner/work/myapp'.` Runs at every entry point that accepts the flag (`audit::run_audit`, `health::execute_health`, combined-mode bare run, the NAPI `programmatic::compute_complexity` binding, plus a defence-in-depth check at the Istanbul load site). The companion `--coverage` file flag keeps its root-relative resolution since it points at a file fallow opens.
+## [2.66.2] - 2026-05-07
+
+### Fixed
+
+- **`fallow audit` no longer fails when invoked from a `pre-commit` / `pre-push` hook.** When git runs hooks it exports ambient repo-state environment variables into the hook subprocess (`GIT_INDEX_FILE=.git/index` as a relative path, plus `GIT_PREFIX` and friends). Audit's `git worktree add` was inheriting those, and the relative `GIT_INDEX_FILE` failed to resolve from the temporary worktree directory, so worktree creation aborted with `could not create a temporary worktree for base ref 'main'` (workaround was `env -u GIT_INDEX_FILE fallow audit`). Every production `git` invocation in fallow now strips the documented set of ambient repo-state vars (`GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY`, `GIT_COMMON_DIR`, `GIT_PREFIX`) via a shared helper, so lint-staged, husky, lefthook, and the `pre-commit` framework all work transparently. The same robustness applies to churn / hotspot, regression baselines, coverage uploads, init's branch detection, and vital signs. The worktree-creation error also surfaces a hint when an ambient repo-state var is detected so users on older fallow versions can self-rescue. Thanks [@videvian](https://github.com/videvian) for the report. (Closes [#301](https://github.com/fallow-rs/fallow/issues/301))
+
+## [2.66.1] - 2026-05-06
+
+### Changed
+
+- **User-facing CLI output uses ASCII punctuation in place of em-dashes.** Rule descriptions in `fallow explain`, the top-level `fallow --help` about line, `fallow list` boundary output, the JSON `actions` note for refactor-together clone groups, the markdown health metric legend, hotspot stderr notes, the LSP test-only-dep diagnostic, the MCP `list_boundaries` tool description, and a handful of lower-traffic strings are now em-dash-free. Internal asserts, code comments, and clippy `#[expect]` reasons are out of scope.
+
+### Fixed
+
+- **Astro `<script src="...">` and inline `<script>` ESM imports are followed during static analysis.** Astro pages route per-component client code through two template-side shapes the extractor previously did not see: external `<script src="../scripts/foo.ts"></script>` references and inline `<script>import '../scripts/bar';</script>` ESM bodies. Targets of either form are bundled into the build output but were surfacing as `unused-file`. The Astro parser now scans the post-frontmatter template body for external script and link references via the shared HTML asset-ref collector, and parses inline `<script>` bodies as TypeScript to extract their ES module imports. Astro only processes a `<script>` tag when it has zero attributes or only `src=` (any other attribute, e.g. `is:inline` or `type="module"` with extras, renders as authored without bundling), so attributed inline scripts are intentionally excluded from the import graph to match Astro's own behavior. HTML comments are stripped before scanning, and inline bodies are skipped when a `src=` attribute is present so external references are never double-counted. Thanks [@zaphir](https://github.com/zaphir) for the report. (Closes [#295](https://github.com/fallow-rs/fallow/issues/295))
+- **`node:module` `register()` loader specifiers credit their target packages.** `register('@swc-node/register/esm', pathToFileURL('./'))` from `node:module` (or the bare `module` builtin) loads a loader module by string specifier rather than via a static or dynamic import, so registered packages like `@swc-node/register` and `tsx` were surfacing as `unused-dependency` even though Node loads them at startup. The visitor now records the first argument of `register(...)` calls as a require / dynamic-import specifier when the callee resolves to the `register` export of `node:module` / `module`. Named imports (`import { register }`), aliased named imports (`import { register as reg }`), and namespace imports (`import * as Module from 'node:module'; Module.register(...)`) all engage; same-named functions from any other source are skipped. Template-literal and dotted-call first-argument forms are recognized too. Thanks [@ChrisJr404](https://github.com/ChrisJr404) for the patch and [@pdeveltere](https://github.com/pdeveltere) for the report. (Closes [#293](https://github.com/fallow-rs/fallow/issues/293))
+- **`fallow audit` base-side worktrees see the same `node_modules` as HEAD.** Audit base worktrees lacked `node_modules`, breaking tsconfig `extends` chains that point into installed packages and disabling path-alias resolution on the BASE side. The result was spurious `Broken tsconfig chain` warnings and false-positive attributions on React Native repos whose tsconfig extends `./node_modules/@react-native/typescript-config/tsconfig.json`. Fresh, reusable, and ready persistent base worktrees now symlink `repo_root/node_modules` so the BASE-side analysis sees the same dependency context as HEAD. The audit base snapshot cache version is bumped so prior snapshots captured under the broken behavior are invalidated. Thanks [@iarmankhan](https://github.com/iarmankhan) for the report. (Closes [#292](https://github.com/fallow-rs/fallow/issues/292))
+- **Local tsconfig `paths`, `baseUrl`, and `rootDirs` stay usable when an `extends` chain is broken.** When a tsconfig's `extends` target was missing or unparsable, the resolver previously fell back to a no-aliases mode for the entire config, so valid local imports against `paths` defined in the same tsconfig surfaced as `unresolved-import`. The graph resolver now keeps the local tsconfig's alias contract alive and only drops the broken-extends parent's contributions, so React Native and Expo projects whose framework base tsconfig is untracked or out of sync continue to resolve their own aliases. Audit base snapshots also compare against the same merged config contract as the current run, with new test coverage for React Native / Expo aliases, config inheritance, project references, cache hits, and import edge shapes. Thanks [@M-Hassan-Raza](https://github.com/M-Hassan-Raza) for the patch. ([#299](https://github.com/fallow-rs/fallow/pull/299))
+- **Combined-mode `--format json` outside a git repository is now exactly one JSON document.** When the project root sat outside any git checkout, the hotspot pipeline emitted a structured `{"error": true, "message": "hotspot analysis requires a git repository", ...}` blob to stdout and then combined mode appended its normal report on top, so `fallow --format json | jq .` and any agent / CI parser failed with `trailing characters at line 6 column 1`. Missing git history is now treated as unavailable hotspot data: stdout stays a single document with empty hotspots, a non-fatal `note: hotspot analysis skipped: no git repository found at project root` goes to stderr (suppressed by `--quiet`). Standalone `fallow health --hotspots --format json` outside a git repo now exits 0 with empty hotspot fields instead of exiting 2 with a JSON error; CI scripts that depended on the old exit-2 signal need to inspect the (now omitted) `hotspot_summary` field instead. Thanks [@ChrisJr404](https://github.com/ChrisJr404) for the patch. (Closes [#294](https://github.com/fallow-rs/fallow/issues/294))
+
+## [2.66.0] - 2026-05-06
+
+### Added
+
+- **Prisma `generator { provider = "..." }` blocks credit custom-generator npm packages.** The prisma plugin now scans `prisma/schema.prisma`, root-level `schema.prisma`, and the multi-file `prisma/schema/*.prisma` layout for `generator <name> { provider = "<pkg>" }` blocks and credits each non-built-in provider as a referenced dependency, so packages like `prisma-json-types-generator` and `prisma-erd-generator` no longer surface as `unused-dependency`. `datasource` providers (`postgresql`, `mysql`, etc.), the shell-command form (`provider = "node ./gen.js"`), and the relative-path form (`provider = "./local-generator"`) are intentionally skipped; line and block comments are stripped before scanning so commented-out generators do not produce phantom credits. (Closes [#288](https://github.com/fallow-rs/fallow/issues/288))
+- **Custom Prisma schema paths declared in `prisma.config.ts` are honored.** The plugin now reads the static `schema` field from `prisma.config.{ts,mts,cts,js,mjs,cjs}` (or the new `.config/prisma.{ts,...}` Prisma 6 alternate location), resolves the path against the project root, marks the configured schema file or folder as always-used, and recursively scans it for generator providers. Layouts where the schema sits at e.g. `db/schema/` instead of the canonical `prisma/schema/` are now covered without needing `ignoreDependencies`. Thanks [@M-Hassan-Raza](https://github.com/M-Hassan-Raza) for the patch. ([#291](https://github.com/fallow-rs/fallow/pull/291))
+- **VS Code extension: client-side diagnostic mute and dynamic issue types.** Diagnostics can be muted from the editor without round-tripping through `.fallowrc.jsonc`, and the issue-type list shown in the LSP filter is now populated dynamically from the language server instead of a hardcoded enum, so newly-added issue kinds appear without an extension release. Thanks [@FunctionDJ](https://github.com/FunctionDJ) for the report. (Closes [#287](https://github.com/fallow-rs/fallow/discussions/287))
+
+### Changed
+
+- **Plugin discovery skips the filesystem walk for source-extension config patterns.** Patterns like `webpack.config.{ts,js,mjs,cjs}` describe source files that are already in the file index, so re-stat'ing them once per plugin during `discover_config_files` was redundant. Root-anchored patterns whose extensions are all in `SOURCE_EXTENSIONS` and that have no path separator or leading dot are now wrapped with a `**/` prefix and matched against the in-memory file set instead. Production mode (which excludes `*.config.*` from the source walker) preserves the filesystem fallback for those patterns to keep correctness. Measured on a 21,033-file Next.js monorepo: bare `fallow` 9.7s to 3.3s (-66%), `fallow audit --gate all` 11.7s to 5.4s (-54%), plugins stage alone 7.4s to 1.4s (-82%). Smaller projects show no regression.
+- **`fallow audit` caches base-branch snapshots and parallelizes HEAD analyses against base-snapshot computation.** Repeat audit runs on the same base reuse cached dead-code + dupes snapshots, and the worktree analysis runs concurrently with the base snapshot rebuild via rayon, so `audit` finishes closer to the slower of the two halves rather than their sum.
+- **`fallow` (combined mode) runs check and dupes concurrently via `rayon::join`.** The two analysis trees are independent; running them on separate worker pools shaves wall-clock without changing per-stage CPU budget.
+
+### Fixed
+
+- **`fallow dupes` honors `duplicates.{minLines, minTokens, threshold, mode, skipLocal}` from `.fallowrc.jsonc` when the matching CLI flag is omitted.** Standalone `fallow dupes` previously stomped these config values with the clap defaults (`minLines=5`, `minTokens=50`, etc.) because the CLI args were typed as `usize`/`f64` with `default_value` attributes, so "flag omitted" was indistinguishable from "user passed the default". The CLI scalars are now `Option<T>`, an absent flag falls through to the toml value, and `skipLocal` adopts the OR-merge already used for `crossLanguage` / `ignoreImports`. The failure threshold for the gate now sources from the merged config too, so `--threshold` omitted no longer disables a config-declared gate. `audit`, `combined`, and the programmatic API are unaffected (they merge config themselves and pass explicit `Some(...)` values). Thanks [@ryota-murakami](https://github.com/ryota-murakami) for the patch. ([#290](https://github.com/fallow-rs/fallow/pull/290))
+- **`fallow dupes --performance` actually emits the duplication performance panel.** The flag was parsed by clap but never plumbed into `DupesOptions`, so it was silently a no-op even though combined-mode `fallow --performance` already printed a duplication stage in its panel. The standalone command now emits a `Duplication Performance` panel on stderr (human / compact / markdown only; structured formats stay clean).
+
+## [2.65.0] - 2026-05-05
+
+### Added
+
+- **Lit and Web Components classes registered through runtime side effects are credited as used.** Two patterns are now recognized end-to-end: Lit's `@customElement('tag')` decorator on a class (named-import form, aliased imports, namespace-call form like `@decorators.customElement('tag')`, and anonymous `export default @customElement('x') class extends LitElement {}`), and `customElements.define('tag', ClassRef)` calls at any depth. The decorator binding is verified against `lit/decorators.js` / `lit/decorators/custom-element.js` before crediting, so a same-named decorator from any other module is intentionally ignored. A new `lit` plugin contributes heritage-scoped allowlists for Lit lifecycle methods (`render`, `updated`, etc.) on `LitElement` / `ReactiveElement` subclasses; native Custom Elements lifecycle members (`connectedCallback`, `observedAttributes`, etc.) are built-in heritage-scoped allowlists for `HTMLElement` subclasses so they work without a Lit dependency. Non-lifecycle methods on Web Component classes are still reported.
+- **`schema.json` is bundled inside the published `fallow` npm package.** Consumers can now write `"$schema": "./node_modules/fallow/schema.json"` for version-aligned config validation with no network round-trip to `raw.githubusercontent.com`. The release workflow copies `schema.json` into the wrapper before publishing, and CI asserts the file is present in every published tarball so the package never silently loses it. Thanks [@ChrisJr404](https://github.com/ChrisJr404) for the patch and [@OmerGronich](https://github.com/OmerGronich) for the report. (Closes [#275](https://github.com/fallow-rs/fallow/issues/275))
+
+### Fixed
+
+- **Angular signal-based query factories and plural decorator queries are now traced for `unused-class-members`.** `viewChild()`, `viewChildren()`, `contentChild()`, `contentChildren()` properties (`readonly vc = viewChild<ChildComponent>('vc')`) and `@ViewChildren` / `@ContentChildren` properties typed as `QueryList<T>` previously produced false `unused-class-member` findings on the child component's methods because the call-graph could not see through `this.vc()?.refresh()` (signal queries return a callable signal) or `this.dvcs?.forEach(c => c.refresh())` (the iteration parameter had no resolved type). The visitor now extracts the query's element type (explicit `<T>` type argument or first identifier argument for the signal factories, peeled `QueryList<T>` annotation for the plural decorators) and registers it against a synthetic call-form binding (`this.vc()` to `T`) for the singular signal queries, and against an iterable map (`this.vcs()` / `this.dvcs` to `T`) for the plural cases. `forEach` arrow callbacks on a registered iterable bind their first parameter to the element type so the existing bound-member-access pipeline credits the child's methods. The pre-existing `@ViewChild` and `@ContentChild` paths continue to work unchanged. Thanks [@ChrisJr404](https://github.com/ChrisJr404) for the patch and [@OmerGronich](https://github.com/OmerGronich) for the eight-pattern reproducer. (Closes [#274](https://github.com/fallow-rs/fallow/issues/274))
+- **`vite.config.{ts,js,mts,mjs}` default export is no longer flagged under `--include-entry-exports`.** The vite plugin now contributes `used_exports` for `vite.config.*` (default), mirroring the existing vitest treatment. With `--include-entry-exports` the strict reachability check previously surfaced the default export even though Vite's CLI consumes it. Thanks [@ChrisJr404](https://github.com/ChrisJr404) for the patch and [@filipw01](https://github.com/filipw01) for the report. (Fixes [#282](https://github.com/fallow-rs/fallow/issues/282))
+- **`prisma.config.{ts,mts,cts,js,mjs,cjs}` recognized as an entry point.** The prisma plugin now treats the new Prisma 6 config file as an entry, so the file (and any imports it reaches) stays alive in the graph and does not surface as `unused-file`. Thanks [@ChrisJr404](https://github.com/ChrisJr404) for the patch and [@FunctionDJ](https://github.com/FunctionDJ) for the report. (Closes [#281](https://github.com/fallow-rs/fallow/issues/281))
+- **`fallow migrate` accepts JSONC trailing commas.** Real-world JSONC files (`tsconfig.json`, `.vscode/settings.json`, and similar) routinely trail commas before `}` / `]`. `load_json_or_jsonc` ran the input through comment-stripping and then handed the result to `serde_json`, which rejects trailing commas. A final byte-level pass now strips them only when the comment-stripped parse fails, leaves commas inside string literals untouched, and still rejects genuinely malformed input like `{,}` (the `comma_follows_json_value` predicate keeps malformed leading-commas reporting as parse errors). Thanks [@ChrisJr404](https://github.com/ChrisJr404) for the patch and [@madflow](https://github.com/madflow) for the report. (Closes [#276](https://github.com/fallow-rs/fallow/issues/276))
+- **Vue `generic` and Svelte `generics` script-tag attributes scan for type references.** A type-only import whose only consumer was a generic constraint on the `<script>` tag (`<script lang="ts" generic="T extends Test<boolean>">` for Vue, `<script lang="ts" generics="T extends Item">` for Svelte) was falsely flagged as `unused_types` because the constraint lives on the tag, not in the script body. The SFC parser now appends an augmented-source probe that re-introduces the constraint to the parse so the imported type's binding shows up as referenced and `oxc_semantic` no longer classifies it as unused.
+
+## [2.64.0] - 2026-05-04
+
+### Added
+
+- **Webpack `resolve.alias` and entry `context` are parsed from `webpack.config.{js,ts,cjs,mjs}`.** Aliases written as `'@components': path.resolve(__dirname, 'src/components')` (or `path.join(__dirname, ...)`, or plain string values) now feed the resolver, matching what Vite, Nuxt, and SvelteKit already do. Aliased imports (`import { Button } from '@components/Button'`) no longer surface as `unresolved-import`, and files reachable only through an alias no longer cascade as `unused-file` / `unused-export`. The Webpack 5 entry-descriptor shape (`entry: { app: { import: './src/app.ts' } }`), object-array entries (`entry: { app: ['./polyfill.ts', './app.ts'] }`), and the optional top-level `context: path.resolve(__dirname, 'src')` are also recognized; entries are normalized against the context path so descriptor + context configurations resolve end-to-end. Dynamic and function-valued entries remain out of scope; static evaluation of those would require a much larger change. Thanks [@michaljuris](https://github.com/michaljuris) for the detailed report including the workaround analysis. (Closes [#273](https://github.com/fallow-rs/fallow/issues/273))
+- **`tap` and `tsd` test runners get built-in plugin support.** The `tap` plugin activates from a `tap` dependency and treats node-tap's default test discovery (`test/`, `tests/`, `__tests__/`, `*.test.*` / `*.spec.*`, top-level `test.*` / `tests.*`) plus `.taprc` configs as reachable. The `tsd` plugin activates from a `tsd` dependency and treats `.test-d.ts(x)` declaration tests plus `package.json#tsd.directory` as reachable. Test-only code in either runner no longer surfaces as `unused-file`.
+
+### Fixed
+
+- **Bundler entry patterns with a leading `./` now resolve.** Webpack/Rollup/Rspack/Rsbuild/Rolldown configs commonly write `entry: './src/app.ts'` or `input: './src/index.js'`. The entry-pattern matcher compiles globs with `literal_separator(true)`, so a `./src/app.ts` pattern would never match the project-relative path `src/app.ts` in the file index, and the entry was silently dropped. `extend_entry_patterns` and `push_entry_pattern` now strip the prefix at the push site, so descriptor entries without an accompanying `context:` and plain string entries with `./` both resolve end-to-end.
+- **`import * as ns from './x'` namespace member access is credited through re-exporting barrels.** A namespace import that flows into an object literal (`const API = { motionNet: { adEngine } }`) and is then read via a chained property access (`API.motionNet.adEngine.getMetaAssetsTeam`) now correctly credits `getMetaAssetsTeam` as used, even when the namespace target is itself a `export * from './queries'` barrel. Previously the leaf access stopped tracking at the object literal and the `getMetaAssetsTeam` export surfaced as unused. Thanks [@filipw01](https://github.com/filipw01) for the report with a complete reproduction. (Closes [#269](https://github.com/fallow-rs/fallow/issues/269))
+- **Public-package class members are no longer flagged as unused.** When a workspace package is listed in `publicPackages` (because it's published as a library), classes re-exported from the package's entry file are part of the public API. Member methods that aren't called inside the workspace previously surfaced as `unused-class-member` even when their containing class was clearly part of the package's exported surface. The same logic that already suppressed enum members on public packages now extends to class members. Non-public packages still report unused members so consumers of the workspace's own internal classes still benefit from member-level dead-code detection. Thanks [@ghost23](https://github.com/ghost23) for the report. (Closes [#267](https://github.com/fallow-rs/fallow/issues/267))
+- **Playwright Page Object Model methods consumed through nested fixture types are credited.** Fixtures with nested object-literal types (`{ pages: { adminPage: AdminPage } }`) and fixtures that reference a named type alias for the inner shape (`type PageFixtures = { adminPage: AdminPage }; type MyFixtures = { pages: PageFixtures }`) now credit POM methods accessed through the dotted path (`pages.adminPage.assertGreeting()`). The visitor walks both the type-side and the destructure-side via a dotted path, so multi-level `{ pages: { adminPage } }` destructures and `await pages.adminPage.method()` chains both flow into use credits. Thanks [@vethman](https://github.com/vethman) for the report. (Closes [#268](https://github.com/fallow-rs/fallow/issues/268))
+- **`.gts` (Glimmer TypeScript) imports honor `tsconfig.json#paths` aliases.** Imports inside `.gts` files now go through the same TypeScript path-alias resolver the rest of the codebase uses, so Ember + Glimmer projects with `paths: { "@app/*": ["src/*"] }` no longer surface every aliased import as `unresolved-import`. Thanks [@square-brackets](https://github.com/square-brackets) for the report. (Closes [#270](https://github.com/fallow-rs/fallow/issues/270))
+- **`vitest.config.*` default exports and Storybook story conventions stop appearing as unused under `--include-entry-exports`.** With `--include-entry-exports`, the strict reachability check previously flagged `vitest.config.ts`'s default export and `*.stories.*` / `.storybook/**` exports even though they're framework-consumed. The Vitest plugin now contributes `used_exports` for `vitest.config.*` and `vitest.workspace.*` (default), and the Storybook plugin contributes a `*` wildcard for `**/*.stories.*` and `.storybook/**`. The wildcard required restoring symmetry in `is_export_ignored` so plugin-supplied `used_exports` honor `*` the same way user-config `ignoreExports` already did. Thanks [@filipw01](https://github.com/filipw01) for the report. (Fixes [#271](https://github.com/fallow-rs/fallow/issues/271))
+
+## [2.63.0] - 2026-05-04
+
+### Added
+
+- **Vitest `/__mocks__` virtual specifiers are no longer flagged as unlisted dependencies.** Vitest's manual-mock convention places mock factories at `<package>/__mocks__/<module>.ts` and some test setups also import directly from `@<scope>/__mocks__` paths via `package.json#imports` aliases or workspace virtual paths. `@aws-sdk/__mocks__`, `@sentry/__mocks__`, `@supabase/__mocks__`, etc. do not exist on npm and previously triggered an `unlisted-dependency` finding with an "install this package" auto-fix that pointed at a package that does not exist. The Vitest plugin now contributes a `/__mocks__` package-name suffix to the new `Plugin::virtual_package_suffixes()` trait method; specifiers ending in that suffix are suppressed from `find_unlisted_dependencies`. The suffix list merges across workspace plugin runs into the root `AggregatedPluginResult`, so monorepos that put Vitest only in a workspace's `package.json` (not the root) get the same suppression. Thanks [@fmguerreiro](https://github.com/fmguerreiro) for the report and the fix. ([#265](https://github.com/fallow-rs/fallow/pull/265))
+
+### Changed
+
+- **`health_score` is now scale-invariant.** The penalty formula previously used absolute counts (`unused_dep_count`), unweighted averages (`avg_cyclomatic`), and order-statistics (`p90_cyclomatic`) that are mathematically incapable of firing at large-monorepo scale: a 50k-LOC monorepo with 200 unused devDependencies and 1500 functions over 60 LOC scored in the B band because the per-dimension caps were saturated and the averages were diluted by clean code in the long tail. The reworked formula switches to scale-invariant aggregators: `critical_complexity_pct` (functions over a hard CC threshold), `maintainability_low_pct` (files below the MI threshold), `unused_deps_per_k_files`, `circular_deps_per_k_files`, `functions_over_60_loc_per_k`, `coupling_high_pct`, and `hotspot_top_pct_count` (top-percentile hotspots normalized against `total_files`). Caps on `unused_deps` and `circular_deps` raised from 10 to 25, allowing those dimensions to actually contribute at monorepo scale. New `formula_version: 2` field on `HealthScore` lets consumers detect the formula change. Older snapshots that lack the scale-invariant fields fall back to the previous aggregators so cached / archived data still scores. Thanks [@OmerGronich](https://github.com/OmerGronich) for the detailed report including the per-dimension cap analysis. (Closes [#260](https://github.com/fallow-rs/fallow/issues/260))
+
+### Fixed
+
+- **CSS `@import 'pkg/subpath.css'` resolves through `package.json#exports` with the `style` condition.** Bare CSS imports whose target is exposed only through an `exports` map under the `"style"` condition (the canonical pattern for design-system packages like shadcn, daisyui, and Tailwind v4 plugins) previously surfaced as `unresolved_imports` even when the file existed and bundlers resolved it correctly. The CSS / SCSS resolver now consults the package's `exports` map for the requested subpath before falling back to the `node_modules/<pkg>/<file>` direct path, picking up `{ "./tailwind.css": { "style": "./dist/tailwind.css" } }` shapes that target arbitrary subdirectories. Thanks [@VidhyaKumar](https://github.com/VidhyaKumar) for the report with a complete shadcn 4.6.0 reproduction. (Closes [#261](https://github.com/fallow-rs/fallow/issues/261))
+- **CI YAML scanner stops emitting `WARN invalid entry pattern` for shell and regex fragments.** GitHub Actions expressions (`${{ env.URL }}/api/health`), `jq -r '.[]'` array iterators, and Perl regex shards (`grep -oP '(?<=Module )\./[^ ]+'`) split on whitespace into tokens like `}}/api/health`, `'.[]'`, and `)\./[^` that reached `globset::GlobBuilder::new(...).build()` and produced 10+ noise warnings on a typical CI repo. A new `could_be_file_path` negative-only guard rejects tokens whose syntax precludes a Unix path (unbalanced `${{`/`}}`, backslashes, malformed `[...]`) before they reach globset compilation. The guard runs on `cmd.config_args` extracted from `--config`/`-c` flags and on `cmd.file_args` via the existing `looks_like_file_path` path. Next.js dynamic-route segments (`app/[id]/page.tsx`, `pages/[...slug].ts`) remain valid. Thanks [@fmguerreiro](https://github.com/fmguerreiro) for the report and the fix. ([#262](https://github.com/fallow-rs/fallow/pull/262))
+- **Next.js `dynamic(() => import('./X').then(m => m.X))` lazy-loaded re-exports no longer flagged as `duplicate-export`.** The Next.js code-splitting idiom where `Foo-lazy.tsx` exports `Foo = dynamic(() => import('./Foo').then(m => m.Foo), { ssr: false })` is semantically a re-export of `Foo`, equivalent to `export { Foo } from './Foo'` (which fallow already does not flag). `find_duplicate_exports` now extends `re_export_sources` with dynamic-import edges that act as re-exports: a dynamic import targeting an internal module counts as a re-export only when the wrapper module exports the same shape (`Named("X")` requires the wrapper to export `X`; `Default` requires the wrapper to have a default export). The wrapper-must-export check guards against false negatives where a module dynamically imports something but does not actually re-export it. Thanks [@fmguerreiro](https://github.com/fmguerreiro) for the report and the fix. ([#263](https://github.com/fallow-rs/fallow/pull/263))
+- **ESLint flat-config plugin imports trace through workspace-internal config packages.** Turborepo / Nx monorepos that centralize ESLint config in a workspace package (`packages/eslint-config` exporting from `index.js`) were producing false `unused-devdep` flags for plugins that the shared config imports transitively. Two cooperating fixes: the ESLint plugin's `read_package_entry_for_specifier` now walks up `start.ancestors()` checking `node_modules/<pkg>/package.json` (bounded by `MAX_NODE_MODULES_WALK_DEPTH = 8`), so packages hoisted to the monorepo root are found from a workspace root, and resolves `@scope/pkg/subpath` imports via the package's `exports` map with `.js`/`.mjs`/`.cjs` extension fallback. `must_parse_workspace_config_when_root_active` now includes `"eslint"` so when the root-level ESLint plugin is active, every workspace's `eslint.config.*` still gets parsed instead of being silently skipped by `run_workspace_fast`. Thanks [@fmguerreiro](https://github.com/fmguerreiro) for the report and the fix. ([#266](https://github.com/fallow-rs/fallow/pull/266))
+
+## [2.62.0] - 2026-05-02
+
+### Added
+
+- **`usedClassMembers` entries accept glob patterns.** Member strings containing `*` or `?` now compile as glob matchers, so a single rule can cover the entire family of methods a framework dispatches reflectively. Use `"*"` to match every member on a heritage-matching class, `"enter*"` / `"*Handler"` for prefix or suffix matching, or `"on*Event"` for combined prefix+suffix. The shape (`{ extends?, implements?, members }`) is unchanged; exact-string entries still work as before. Glob patterns matching zero members across the codebase emit a `WARN` so dead allowlist entries surface. Designed for parser-generator listeners (ANTLR), code-generated bridges (`protoc-ts`, `openapi-typescript`, `graphql-codegen`), and abstract framework bases that dispatch on a member-name prefix instead of an enumerated list. Thanks [@OmerGronich](https://github.com/OmerGronich) for the report. (Closes [#254](https://github.com/fallow-rs/fallow/issues/254))
+- **`overrides[].rules.circular-dependency: "off"` suppresses cycles whose files all match the override glob.** Previously `circular-dependency` was the only rule that ignored per-folder `overrides[]` entries; you had to disable cycle detection globally or add `// fallow-ignore-file circular-dependency` to every file in every cycle. Now a cycle is suppressed when **every** file in the cycle resolves to `Severity::Off` for `circular-dependency` via `overrides[]`. Cycles that touch even one non-overridden file remain reported, preserving real-positive detection on shared modules. Thanks [@OmerGronich](https://github.com/OmerGronich) for the report. (Closes [#255](https://github.com/fallow-rs/fallow/issues/255))
+- **First-class blast-radius and importance sections on `fallow coverage analyze`.** New `--blast-radius` and `--importance` flags surface runtime-weighted blast-radius and importance findings in the human output, alongside the existing hot-path / cold-path sections.
+- **Runtime coverage `--top` flag.** Limits the runtime findings + hot-path display to the top N entries, matching `fallow dead-code`'s top-N flag for parity.
+
+### Changed
+
+- **`analyze` stage runs detectors in parallel.** The pipeline's analyze stage now schedules its ten independent detectors (`unused_files`, `unused_exports`, `unused_members`, dependency detectors, `unresolved_imports`, `duplicate_exports`, `boundary_violations`, `circular_dependencies`, etc.) across rayon worker threads instead of serially on a single core. On a synthetic 24,320-file monorepo with realistic barrel files and cross-workspace imports the analyze stage drops from `~6.75s` to under half a second on a 14-core machine. Real-world fixtures (`next.js`, `preact`) show a `~2x` speedup on the analyze stage with byte-identical results. Find-unused-exports and find-unused-members also parallelise their inner module loops via rayon. Thanks [@OmerGronich](https://github.com/OmerGronich) for the report. (Closes [#259](https://github.com/fallow-rs/fallow/issues/259))
+- **Git churn cache is incremental.** `.fallow/churn.bin` now stores per-commit events keyed by `last_indexed_sha`. When `HEAD` advances from the cached SHA, fallow runs `git log <cached>..HEAD --numstat` and merges the delta into the cached state instead of re-shelling out for the entire churn window. CI runs that fallow on every push and pre-commit hooks now hit the cache for the bulk of the work, paying only the marginal-commit cost. The cold path is unchanged. The cache automatically invalidates when the `--since` window changes or when `cache.last_indexed_sha` is no longer reachable from the current HEAD (force-push, branch switch). Thanks [@OmerGronich](https://github.com/OmerGronich) for the report. (Closes [#258](https://github.com/fallow-rs/fallow/issues/258))
+- **`--performance` table includes the duplication stage.** The `Pipeline Performance` table on `fallow --performance` (combined mode) now prints a `duplication: <ms>` row alongside the other stages instead of leaving the cost as an easy-to-miss parenthetical in the body output. The dead-code-only and dupes-only timing breakdowns are unchanged. Thanks [@OmerGronich](https://github.com/OmerGronich) for the report. (Closes [#257](https://github.com/fallow-rs/fallow/issues/257))
+
+### Fixed
+
+- **`circular-dependency` line-level inline directives now actually suppress.** `// fallow-ignore-next-line circular-dependency` on the offending import line previously landed in `stale_suppressions` and the cycle still appeared in the output, even though `fallow dead-code --format json` recommended exactly that comment in `actions[]`. The directive now decrements the cycle count as expected, and IDE/CLI consumers of the recommended `actions[]` produce working patches instead of silent no-ops. Singular and plural slug aliases (`circular-dependency` vs `circular-dependencies`) are now interchangeable across inline directives, `rules`, and `overrides[].rules`, so the wrong-form / right-form mismatch between surfaces is resolved. Thanks [@pippenz](https://github.com/pippenz) for the report. (Closes [#256](https://github.com/fallow-rs/fallow/issues/256))
+- **Bare `() => import('./X')` route callbacks credit the default export.** Object-literal properties named `component`, `loadChildren`, or `loadComponent` whose value is `() => import('./X')` (or a function-expression equivalent) now credit the target module's default export as used, even when no `.then(m => m.default)` is spelled. The control case (`.then(m => m.default)`) was already covered. Fixes the `unused-export` false positive on the standard Angular Router (`loadChildren: () => import('./feature.routes')`) and Vue Router (`component: () => import('./View.vue')`) lazy-loading shapes. The property-name list is an exact whitelist; other property names with the same shape (e.g. `loader`, `Component`) are not credited. Thanks [@OmerGronich](https://github.com/OmerGronich) for the report. (Closes [#253](https://github.com/fallow-rs/fallow/issues/253))
+- **CSS `@import 'pkg/subpath.css'` resolves through `node_modules` for both relative and bare specifiers.** Tailwind v4 `@import 'tailwindcss/theme.css'` and `@import 'tailwindcss/utilities.css'` patterns no longer surface as unresolved imports or as unused-dependency on `tailwindcss`. The CSS extractor preserves the package subpath, the resolver now probes the npm package's subpath via the standard `node_modules` walk-up, and the dependency credit flows through the resolved hit.
+
+## [2.61.0] - 2026-05-01
+
+### Added
+
+- **GraphQL document `#import` edges follow into the module graph.** `.graphql` and `.gql` files are now discovered as source files, and lines matching `#import "./fragment.graphql"` (or `# import '../shared/fragment.gql'`) emit `SideEffect` imports so fragment and schema documents reachable only through GraphQL import comments stay connected. Only relative string specifiers (`./`, `../`) are extracted; package-style imports are left to the resolver. Extensionless relative imports probe `.graphql` and `.gql` automatically. Thanks [@lsbyerley](https://github.com/lsbyerley) for the report. (Closes [#250](https://github.com/fallow-rs/fallow/issues/250))
+- **Vitest `vi.mock()` credits the `__mocks__/` sibling.** `vi.mock('./services/api')` now synthesizes a dynamic namespace import of `./services/__mocks__/api`, crediting the auto-mock sibling file (and all of its exports) as used so vitest's `__mocks__/<file>` convention does not surface as `unused-file`. Handles string-literal sources, expressionless template literals, and the `vi.mock(import('./api'))` argument form. Path-alias prefixes (`@/src/...`) are preserved so the importer's tsconfig aliases resolve the synthetic specifier. Bare-package mocks paired with a project-root `__mocks__/<pkg>.ts` and Jest's `jest.mock(...)` are intentionally out of scope. Thanks [@boroth](https://github.com/boroth) for the report. (Closes [#251](https://github.com/fallow-rs/fallow/issues/251))
+
+### Fixed
+
+- **Angular 14+ `inject()` field-initializer DI is recognized.** Class fields written `private readonly inner = inject(InnerService)` (or `inject<InnerService>()`) now register `this.inner -> InnerService` so any `this.inner.member` chain credits `member` as used on `InnerService`. Previously every member of an `inject()`-acquired service consumed only via the field chain was reported as `unused-class-member`; the legacy constructor-parameter form was unaffected. The `inject` callee is gated by a named-import check against `@angular/core`, so a same-named `inject` from any other module is intentionally ignored. Thanks [@OmerGronich](https://github.com/OmerGronich) for the report. (Closes [#244](https://github.com/fallow-rs/fallow/issues/244))
+- **Playwright POM fixture members consumed only through typed `base.extend<T>(...)` definitions are now credited.** Methods on a Page Object Model class that are referenced exclusively from a Playwright `test('name', async ({ adminPage }) => { adminPage.method() })` callback no longer surface as `unused-class-members`. Fixture definitions accept a named type alias (`type MyFixtures = { adminPage: AdminPage }`), an inline type literal, or any intersection / parenthesized form thereof; the analyzer correlates each typed fixture with the matching callback-side member access and credits the method on the defining POM class. The `base.extend` callee is gated against `@playwright/test`-named imports so the same identifier from any other module is intentionally ignored. Thanks [@vethman](https://github.com/vethman) for the report. (Closes [#246](https://github.com/fallow-rs/fallow/issues/246))
+
+## [2.60.0] - 2026-05-01
+
+### Added
+
+- **`includeEntryExports` config option, and `--include-entry-exports` is now a global CLI flag.** Set `"includeEntryExports": true` (JSON / JSONC) or `includeEntryExports = true` (TOML) in your fallow config to opt in to entry-file export validation persistently, without passing `--include-entry-exports` on every run. The flag is now accepted in combined mode (`fallow --include-entry-exports`) as well as on `fallow dead-code` and `fallow audit`; previously the bare combined invocation rejected the flag because it was only defined on the `dead-code` subcommand. The `audit` MCP tool also gains an `include_entry_exports` param to match `analyze` / `check_changed`. Thanks [@filipw01](https://github.com/filipw01) for the report. (Closes [#249](https://github.com/fallow-rs/fallow/issues/249))
+
+### Fixed
+
+- **SCSS / Sass `@use 'X'` no longer resolves to a sibling `X.tsx`.** When both `Widget.scss` and `Widget.tsx` exist next to each other and a `.scss` importer does `@use 'Widget'`, fallow now resolves the import to `Widget.scss` per Sass's actual resolution algorithm. The standard module resolver's extension list contains `.tsx` / `.ts` before `.scss`, so without this guard a bare specifier from a stylesheet was silently picking the JS/TS sibling, creating phantom circular dependencies in CSS-modules / Angular `styleUrls` patterns where the `.tsx` component imports its own `.scss` and a sibling `.scss` shares variables/mixins. Stylesheet importers now reject any standard-resolver hit whose extension is a JS/TS-family extension (`.tsx`, `.ts`, `.mts`, `.cts`, `.js`, `.jsx`, `.mjs`, `.cjs`) and re-route through the SCSS-aware fallback chain (CSS-extension probe, `_filename` partial convention, framework include paths, `node_modules` walk-up); when those also fail, the import is reported as unresolved instead of falling through to JS/TS extensions. Thanks [@OmerGronich](https://github.com/OmerGronich) for the precise reproduction and the suggested fix. (Closes [#245](https://github.com/fallow-rs/fallow/issues/245))
+
+## [2.59.0] - 2026-05-01
+
+### Added
+
+- **Persistent token cache for `fallow dupes`.** Projects above `duplicates.minCorpusSizeForTokenCache` (default `5000` source files) reuse tokenized output across runs under `<root>/.fallow/cache/dupes-tokens-vN/`. Below the threshold the cache stays disabled because load/save overhead exceeds the tokenize savings. Disable explicitly with `--no-cache`.
+- **Shingle prefilter for focused-mode duplication.** When `--changed-since` is set on a project at or above `duplicates.minCorpusSizeForShingleFilter` (default `1024` files), the detector drops unchanged files whose k-token shingles do not overlap any changed file before building the suffix array. This is the dominant speed-up on large monorepos with small diffs.
+- **`duplicates.ignoreDefaults` config + `--explain-skipped` global flag.** Opt-out for the new built-in ignores below; `--explain-skipped` expands the human/markdown skipped-file note into per-pattern counts.
+
+### Changed
+
+- **`fallow dupes` skips generated framework output by default.** Duplication analysis now ignores `**/.next/**`, `**/.nuxt/**`, `**/.svelte-kit/**`, `**/.turbo/**`, `**/.parcel-cache/**`, `**/.vite/**`, `**/.cache/**`, `**/out/**`, and `**/storybook-static/**` before tokenization, while keeping authored-looking `lib/`, `legacy/`, and nested `build/` directories in scope. These defaults merge with `duplicates.ignore`; set `duplicates.ignoreDefaults: false` to opt out and use only your configured ignore list. If your duplication number drops on upgrade, it is because fallow is now excluding generated framework output from duplicate detection by default. Human and markdown output show a one-line skipped-file note, and `--explain-skipped` expands it to per-pattern counts; JSON, SARIF, CodeClimate, and compact output stay unchanged.
+- **`fallow init` scaffolds a commented-out `[duplicates]` block.** The generated `.fallowrc.json` (now valid JSONC end-to-end) and `fallow.toml` ship with example `ignore` additions for `lib/`, `legacy/`, `__generated__/`, and `generated/` directories that vary per project.
+- **`--changed-since` wires straight into the focused fast path.** Resolving the changed-file set up front lets the engine engage the shingle prefilter and extraction-time interval pruning instead of running a full-corpus scan followed by a redundant post-filter. The audit driver also skips the base-snapshot pass when `--gate all` is set, because attribution is irrelevant to the verdict in that mode. Also fixes a latent `IntervalIndex` coalescing bug in post-LCP filtering that was fragmenting intervals and keeping more groups than necessary. Thanks [@OmerGronich](https://github.com/OmerGronich) for the deep profiling on MUI that surfaced both this fix and the new default-ignore set below. (Closes [#243](https://github.com/fallow-rs/fallow/issues/243))
+### Fixed
+
+- **Rayon worker stack pinned to 16 MiB.** Deep AST visitor and graph traversals could overflow Rust's default 8 MiB worker stack on very large real-world projects (e.g. `microsoft/TypeScript`), aborting `dead-code` and `health` analysis with `fatal runtime error: stack overflow`. The CLI and NAPI entry points now share a single rayon pool builder that pins worker stack size to 16 MiB and agrees on thread-count defaults, so the previous `RUST_MIN_STACK=16777216` workaround is no longer needed and embedders see consistent parallel behaviour. Thanks [@OmerGronich](https://github.com/OmerGronich) for the report. (Closes [#247](https://github.com/fallow-rs/fallow/issues/247))
+
+## [2.58.0] - 2026-05-01
+
+### Added
+
+- **`fallow hooks install --target {git,agent}` and `fallow hooks uninstall --target {git,agent}` namespace.** Single command surface for both the shell-level Git pre-commit hook scaffolder and the Claude Code / Codex agent gate. `fallow init --hooks` and `fallow setup-hooks` continue to work as compatibility aliases that delegate to the same engine. `install` accepts `--branch`, `--agent`, `--dry-run`, `--force`, `--user`, and `--gitignore-claude`; `uninstall` reuses `--target`, `--agent`, `--dry-run`, `--force`, and `--user`. A `# Generated by fallow hooks install --target git.` marker on Git hook scripts lets `uninstall` preserve user-authored pre-commit scripts unless `--force` is passed.
+- **`fallow coverage upload-source-maps` CI subcommand.** Scans a build output directory for `.map` files and uploads them to `/v1/coverage/{repo}/source-maps` so cloud-mode runtime coverage can resolve bundled paths back to original sources. Flags: `--dir` (default `dist`, scanned recursively), `--include` / `--exclude` (glob patterns), `--repo` (auto-detected from `package.json` `repository.url` or `git remote get-url origin`), `--git-sha` (auto: `$GITHUB_SHA` → `$CI_COMMIT_SHA` → `$COMMIT_SHA` → `git rev-parse HEAD`), `--endpoint`, `--strip-path` (default `true`; emit basename as `fileName`, set `false` to keep dir-relative paths for monorepo bundlers), `--dry-run`, `--concurrency` (default 4), `--fail-fast`. The API key is read only from `$FALLOW_API_KEY` (no flag form, intentional, keeps the secret out of argv). Per-map retry on transient `429`/`5xx`. Maps over 10 MiB warn; over 100 MiB are rejected. Exit codes: 0 ok · 1 partial-failure · 2 validation.
+
+### Changed
+
+- **Generated Git pre-commit hook resolves the base ref at commit time via `git merge-base @{upstream} HEAD`.** Previously the hook baked the auto-detected default branch in literally at install time, which broke on repos with multiple long-lived integration branches (next-release / hotfix / LTS) where the right base depends on which branch the feature targets. The new resolution diffs against the merge-base of the current branch's upstream and `HEAD`, so feature branches forked off a non-default integration branch compare against the actual fork point, not against their own remote tracking branch. `--branch` is repurposed as the fallback used only when no upstream is set. Existing on-disk hook scripts are unchanged; the new behaviour applies after re-running `fallow init --hooks` or `fallow hooks install --target git`. Thanks [@OmerGronich](https://github.com/OmerGronich) for the report. (Closes [#242](https://github.com/fallow-rs/fallow/issues/242))
+
+## [2.57.0] - 2026-04-30
+
+### Added
+
+- **`fallow coverage analyze` runtime coverage subcommand.** Focused entry point alongside `coverage setup` and `coverage upload-inventory`. Local mode (`--runtime-coverage <path>`) reads a V8 coverage directory, V8 JSON file, or Istanbul `coverage-final.json`. Cloud mode is explicit opt-in only via `--cloud` / `--runtime-coverage-cloud` / `FALLOW_RUNTIME_COVERAGE_SOURCE=cloud`, fetches `/v1/coverage/{repo}/runtime-context` from fallow cloud, and merges runtime facts with the local AST/static analysis. `FALLOW_API_KEY` alone never selects cloud mode; ambiguous combinations are rejected. JSON output adds `summary.data_source` (`local`/`cloud`), `summary.last_received_at`, `summary.capture_quality`, kebab-case action identifiers (`delete-cold-code` / `review-runtime`), and a `cloud_functions_unmatched` warning when cloud sees functions absent from the local AST. `--explain` attaches a top-level `_meta` block with field definitions, enum vocabularies, and warning-code documentation.
+- **`fallow explain <issue-type>` standalone rule explainer.** Prints a rule's rationale, worked example, fix guidance, and docs URL without running an analysis. Accepts shorthand (`unused-export`, `code-duplication`) and the canonical rule id (`fallow/unused-export`). JSON output is stable (`id`, `name`, `summary`, `rationale`, `example`, `how_to_fix`, `docs`); MCP exposes the same data via the `fallow_explain` tool.
+- **`fallow audit --gate new-only|all`.** Default `new-only` gates only findings introduced by the changeset and reports inherited findings as context with a JSON `attribution` block plus per-finding `introduced: true|false`. `--gate all` (or `[audit] gate = "all"` in TOML, `audit.gate` in JSON) fails on every finding in changed files and skips the extra base-snapshot attribution pass.
+- **Workspace-aware `fallow coverage setup --json`.** Workspace projects emit a per-runtime-package `members[]` array, union `runtime_targets`, and prefix member file paths; pure aggregator roots and build-only library packages are filtered out. Adds four paid runtime-context MCP tools (`get_blast_radius`, `get_importance`, `get_cleanup_candidates`, `check_runtime_coverage`) backed by the same fallow-cloud endpoint.
+- **`.fallowrc.jsonc` discovered alongside `.fallowrc.json`.** First-match-wins discovery accepts a JSON-with-comments file as a peer of `.fallowrc.json`. CLI `--config` accepts the new extension; the discovery helper, init scaffolding, and config docs cover it. Thanks [@filipw01](https://github.com/filipw01) for reporting that `ignoreDependencies` was silently ignored when set in a `.fallowrc.jsonc` file. (Closes [#231](https://github.com/fallow-rs/fallow/issues/231))
+
+### Fixed
+
+- **Class members typed with a nullable annotation now bind correctly.** `class Foo { bar: Baz | null }` binds `Baz` for member-usage tracking; this eliminates false `unused-class-member` findings on type-annotated nullable fields. Thanks [@pedrobgodoy](https://github.com/pedrobgodoy). ([#233](https://github.com/fallow-rs/fallow/pull/233))
+- **`--changed-since` git invocations no longer inherit `GIT_DIR`.** Prevents resolving against the wrong repository when `GIT_DIR` is set in the environment. The `fallow_explain` MCP tool name and `ExplainOutput` schema are corrected.
+- **Single local V8/Istanbul capture works without a license.** Restores the documented free-tier behaviour; continuous/cloud monitoring still requires a license.
+- **Nested barrel re-exports across workspace packages.** Re-export chains are now followed transitively through chained barrel files (e.g. `packages/app` importing a symbol from `packages/ui` via `foo/index.ts` → `foo/bar/index.ts` → `foo/bar/baz/index.ts` → the leaf module), so symbols re-exported through deep barrel structures are no longer flagged as unused. Thanks [@filipw01](https://github.com/filipw01) for the StackBlitz repro. (Closes [#236](https://github.com/fallow-rs/fallow/issues/236))
+- **Runtime-coverage feature-gated build is clippy-clean** and several `coverage setup` rough edges (workspace recipe rendering, sidecar discovery messaging) are smoothed over.
+- **`coverage analyze --cloud`:**
+  - Switched to `Accept-Encoding: identity` (the bundled ureq build does not include the gzip feature); the cloud body now parses on production responses.
+  - Empty-window responses no longer emit duplicate `no_runtime_data` warnings; the CLI defers to the server's variant.
+  - Markdown / compact / sarif / codeclimate / badge `--format` values are rejected with an actionable error instead of silently emitting JSON.
+  - HTTP 400 from the cloud endpoint maps to exit 2 (validation), not exit 7 (network).
+  - The 404 catch-all branch no longer attributes routing 404s to "Repo not accessible to your org"; only `code: "repo_not_found"` produces that message.
+  - `runtime_coverage.findings[].id` and `hot_paths[].id` are 8 hex chars, matching the published JSON schema.
+
+### Changed
+
+- MCP runtime-coverage tool descriptions reflect the single-capture-free contract.
+- CI enforces conventional commit messages.
+
+## [2.56.0] - 2026-04-30
+
+### Added
+
+- **`fallow fix --yes` removes unused exported enum declarations entirely.** When an exported `enum` is unused outside its file, the whole `export enum Foo { ... }` block is dropped instead of leaving a non-exported zombie declaration. Covers single-line, multi-line, `export const enum`, and `export declare enum` forms, with safe descending-index ordering when other export-list lines on the same file also get rewritten. Falls back to keyword-only stripping when the enum is still referenced locally so the file continues to compile. The remove-export action description in JSON output and the `fix_apply` MCP tool description are refreshed so consumers see the broader behaviour.
+- **All-member enum-member removal folds into whole-enum removal.** When `fallow fix --yes` would remove every member of an exported enum, the entire `export enum X { ... }` block is dropped in a single write instead of stripping members one at a time and leaving behind a syntactically valid but semantically dead `export enum X {}` shell that detection then fails to surface on the next pass. JSON output collapses the per-member entries for a folded enum into a single `remove_export` entry at the declaration line so consumers see exactly the edit that happened. Non-JSON output emits a stderr advisory pointing at the TypeScript build for importer cleanup, since fallow's reachability detector cannot surface a name-level dangling import once the file resolves successfully. Thanks [@mjfwebb](https://github.com/mjfwebb) for reporting. (Closes [#232](https://github.com/fallow-rs/fallow/issues/232))
+- **Tailwind v4 `@plugin` directive recognised in CSS, SCSS, and Vue/Svelte `<style>` blocks.** `@plugin "..."` is parsed as a default import, so package plugins (`daisyui`, `@tailwindcss/typography`) are credited as used dependencies and relative plugin files have their default export marked used. Unlike SCSS `@use`, extensionless package names stay bare in `.scss`/`.sass` files because they are package specifiers, not local partials. Verified against `daisyui`'s own `packages/playground`: without the fix, `daisyui` is flagged as an unused dev dependency; with the fix, it is correctly credited via `@plugin "daisyui"`. Thanks [@filipw01](https://github.com/filipw01) for reporting. (Closes [#230](https://github.com/fallow-rs/fallow/issues/230))
+
+### Changed
+
+- **Workspace packages treated as first-class dependencies.** Workspace package names are now checked the same way as external npm packages: resolved internal-module imports whose specifier matches a workspace name are credited to package usage, so monorepo edges between workspace packages count as usage. Declared-but-unimported workspace deps now surface in `unused_dependencies`, and imports of a workspace package from a workspace whose own `package.json` does not list it surface in `unlisted_dependencies`. Self-references stay allowed without requiring a package to depend on itself. External plugin definitions (`fallow-plugin-*` / inline framework configs) now also activate per-workspace inside `run_workspace_fast`, so a custom plugin enabled by a workspace dependency keeps its `alwaysUsed` and `toolingDependencies` honored during real analysis instead of only appearing in `fallow list --plugins`. Verified against `vue-core` (real pnpm monorepo): the change surfaces 3 new unused-dependency findings (incl. `@vue/reactivity` declared but only referenced via `declare module` in `runtime-dom`) and 11 new unlisted-dependency findings on `@vue/*` internal packages. Thanks [@filipw01](https://github.com/filipw01) for reporting. (Closes [#228](https://github.com/fallow-rs/fallow/issues/228))
+
+### Fixed
+
+- **Enum-member fix dedup keys on full triple so single-line folds fire.** The sort + dedup of `EnumMemberFix` previously used `line_idx` alone, which collapsed distinct members of a single-line enum (`export enum E { A, B }`) down to one entry before `detect_folded_enums` could see them. The fold's all-members-removed check then concluded the body still held member `B` and refused to fire, leaving a half-stripped one-liner instead of the whole-block delete the fold path expects. Sort and dedup now use `(line_idx desc, parent, member)`, so same-line distinct members survive into the fold pass.
+
+### Internal
+
+- Enum-declaration helpers (`declares_exported_enum`, `find_enum_declaration_range`, `removable_exported_enum_range`, supporting identifier-boundary helpers) extracted from `fix/exports.rs` into a new `fix/enum_helpers.rs` sibling module with `pub(super)` visibility, so both `exports.rs` and `enum_members.rs` can share them without re-implementation. No behaviour change.
+
+## [2.55.0] - 2026-04-29
+
+### Added
+
+- **`private-type-leak` issue type for exported function and method signatures.** Detects when an exported `function`, class method, or class field references a type that is not also exported from the same module, producing a finding the consumer cannot name when they need to type a wrapper, mock, or destructured argument. Opt-in via the `private-type-leaks` rule (`rules.private-type-leaks: "error"` or `"warn"`); default severity is `"off"` so existing projects don't see new findings without explicit consent. Framework routing convention files (Next.js `app/` route handlers, Nuxt `pages/`, SvelteKit `+page.ts`/`+layout.ts`, Remix routes, TanStack route configs, Astro pages, Solid/Qwik routes) are skipped because their exports are framework contracts rather than public API surface.
+- **`ignoreExportsUsedInFile` config option (knip parity).** When set to `true`, exports that are referenced inside the same file as their declaration are not reported as unused, matching knip's behavior for projects that re-export internal utilities purely for convenience or testing. Default `false` keeps the stricter fallow behavior.
+- **TanStack virtual route configs supported.** The TanStack Router plugin now recognises virtual route files declared via `route(...)` / `index(...)` / `layout(...)` in a config, so route components consumed only by `routeTree.gen.ts` are no longer reported as unused. Thanks [@M-Hassan-Raza](https://github.com/M-Hassan-Raza). (#223)
+
+### Changed
+
+- **`fallow health --score` no longer auto-runs churn-backed hotspot analysis.** Plain `--score` now computes the score using duplication, dead-code, complexity, maintainability, unused-deps, circular-deps, unit-size, and coupling penalties. The `hotspots` penalty is only included when hotspot analysis runs (via `--hotspots`, or `--targets` with `--score`). The previous behavior forced every `--score` invocation to run a `git log` shell-out, which dominated health timing on large repos. Snapshot (`--save-snapshot`) and trend (`--trend`) flows still trigger hotspot vital signs so saved snapshots remain complete. Score numbers can rise on projects that previously took a non-zero hotspot penalty; CI `--min-score` gates may need re-baselining. The human output now hints `N/A: hotspots (enable the corresponding analysis flags)` and the JSON `health_score.penalties.hotspots` field is omitted when the penalty was not computed.
+
+### Fixed
+
+- **LSP server now serves document diagnostic pulls.** Editors that follow the `textDocument/diagnostic` pull model (modern Helix, Zed, recent Neovim configs) previously got no diagnostics from the fallow LSP because the server only published via the push channel. The pull handler now returns a `RelatedFullDocumentDiagnosticReport` keyed by the requested document's URI, so pull-mode and push-mode editors see the same findings.
+
+### Performance
+
+- **Audit shares dead-code parse and analysis with health and dupes.** `fallow audit` previously ran the dead-code pipeline (parse, semantic, graph build, plugin pass) once for `check`, again for `health`, and again for `dupes`. The orchestrator now computes the shared result once and threads the file list and analysis output through to both downstream steps, cutting redundant parsing work in the dominant local-developer flow.
+- **Workspace plugin runs see only their own files.** `run_plugins` now buckets discovered files by workspace root before parallel plugin execution and passes each workspace its own pre-computed relative paths, instead of feeding every workspace the full project file list. Cuts the per-workspace plugin matcher work from `O(workspaces × all_files × matchers)` to `O(workspace_files × matchers)` on monorepos. End-to-end plugin detection is unchanged because the filesystem-fallback Phase 3b still scans workspace and project roots for unmatched config files.
+- **Duplicate-export importer overlap is single-pass.** `find_duplicate_exports` pre-builds an `FxHashMap<&Path, FileId>` index instead of scanning every module per location, and `has_common_importer` walks each duplicate file's `reverse_deps` once into an `importer_owner` map instead of comparing every pair of importer sets. Same output, lower complexity on projects with many duplicate-export groups.
+
+### Internal
+
+- New regression test asserts `expand_recursive_workspace_pattern` preserves nested workspace roots (e.g., `apps/app/packages/nested/`) when both parent and child have a `package.json`.
+- New end-to-end test asserts `run_workspace_fast` invokes `plugin.resolve_config()` for workspace-local config files and surfaces the parsed entry pattern.
+- Pre-push hook now unsets `GIT_DIR` and `GIT_WORK_TREE` so integration tests run from the worktree path even when the user's shell environment exports those variables (fixes flaky push from worktrees with bare-repo-style configs).
+- `.gitignore` updated to exclude crash handover marker files.
+- Dependency bump: `tokio` 1.51.1 → 1.52.1 (#218).
+- Docs touch-ups: MCP `analyze` tool description, agent context note for the new opt-in default of the `private-type-leaks` rule, and `crap_max` description refined across coverage_model variants.
+
+## [2.54.3] - 2026-04-29
+
+### Fixed
+
+- **Class members are credited through cross-file exported instances.** When an instance is created in one file (`export const box = new Box()`) and consumed in another (`box.bump()`), the visitor now records a synthetic `MemberAccess` entry tying each instance export to its source class. The analysis layer reads those entries to build an instance-export to class-export-key map, walks through re-export chains, and propagates accumulated `accessed_members` from each instance key onto its target class key. Previously `Box.bump` (and getters/setters) were reported as unused with `auto_fixable: true`, which would let `fallow fix` silently delete methods in active use. Sentinel-prefixed accesses are filtered out of the main accessed-members loop and the heritage chain extractor so they do not leak into unrelated detection paths. (Closes [#222](https://github.com/fallow-rs/fallow/issues/222))
+- **Class members accessed via nested injected-dependency object types are credited.** Members reached through typed nested object bindings such as `constructor(private deps: { foo: FooClass }) { ... } this.deps.foo.foo()` were previously reported as unused. The visitor now walks `TSTypeLiteral` nodes to register dotted-path bindings (`this.deps.foo -> FooClass`), records full-chain object names in `visit_static_member_expression`, and propagates nested bindings through explicit `this.x = y` assignments for the no-accessibility-modifier form.
+
+### Internal
+
+- Cache version bumped 54 → 55 so warm caches re-extract the new instance-binding shape.
+
+## [2.54.2] - 2026-04-28
+
+### Fixed
+
+- **Svelte template scanner now credits identifiers used in ternary branches and inline spread objects.** A double-increment bug in `scan_curly_section` caused the brace-section reader to skip the closing quote of an empty quoted string (`''` / `""`), leaving the in-quote flag stuck on, returning `None`, and aborting the rest of the template via the outer loop's `break`. Any expression inside or after `{cond ? expr : ''}` was therefore invisible to the scanner. The first byte of the brace was already incremented by the loop's terminal `index += 1`, so removing the in-arm increment fixes empty-string handling without changing any other path. Additionally, markup-tag braces now process `{...spread}` rest-attributes (and any non-`@attach` brace) instead of dropping them, so `<button {...{ "data-x": inSpread() }}>` correctly marks `inSpread` as used. Cache version bumped 53 → 54 so warm caches re-extract the new template-usage shape.
+
+### Internal
+
+- Bash test helpers (`ci/tests/run.sh`, `action/tests/run.sh`) replaced their `echo "$output" | grep -q ...` `assert_contains` / `assert_not_contains` implementations with bash native `[[ "$output" == *"$expected"* ]]` matching. The pipeline form was prone to `SIGPIPE` under `set -o pipefail` when grep matched early and closed the pipe before echo finished, intermittently failing CI with a misleading "expected to contain: ..." message on whichever assertion happened to ride the race.
+- VS Code extension `engines.vscode` bumped to `^1.116.0` to align with `@types/vscode@1.116.0`; vsce had been rejecting the package with "@types/vscode greater than engines.vscode".
+- Dependency bumps: `clap` 4.6.0 → 4.6.1, `rmcp` 1.4.0 → 1.5.0, `srcmap-sourcemap` 0.3.5 → 0.3.6, the `oxc` group (8 crates), plus VS Code dev-dependency refreshes (`@types/vscode`, `@vscode/vsce`, `rolldown`, `typescript`, `vitest`) and CI action bumps (`actions/setup-node`, `dependabot/fetch-metadata`).
+
+## [2.54.1] - 2026-04-28
+
+### Fixed
+
+- **`fallow-cli` now publishes to crates.io.** v2.54.0 introduced `crates/cli/src/ci_template.rs` with `include_str!` paths (`"../../../ci/gitlab-ci.yml"` and 13 others) that resolved during workspace builds but failed during `cargo package` because the published tarball only contains `crates/cli/`, not the workspace's `ci/` and `action/` directories. The publish step's verification compile failed silently behind a `|| echo "Already published, skipping"` mask, so v2.54.0 of `fallow-cli` never reached crates.io while the eight upstream crates published cleanly. The 14 bundled files now live under `crates/cli/templates/` so `include_str!` resolves inside the crate, and a new `bundled_templates_match_workspace_sources` unit test asserts byte-equivalence between the bundled copies and the canonical workspace sources at `<root>/ci/` and `<root>/action/`. Drift between the two is caught by `cargo test` against the workspace before the next tag.
+
+## [2.54.0] - 2026-04-28
+
+### Added
+
+- **`fallow ci-template gitlab` subcommand for offline-runner pipelines.** `fallow ci-template gitlab` prints the bundled `ci/gitlab-ci.yml` to stdout. `fallow ci-template gitlab --vendor [DIR]` writes the template plus 13 jq/bash helper files (4 `ci/jq/`, 2 `ci/scripts/`, 7 `action/jq/`) under DIR (default `.`), letting GitLab pipelines run the full MR-comments + Code Quality + review integration without reaching `raw.githubusercontent.com` at pipeline runtime. `--force` is required to overwrite files that diverge from the bundled template; refusing to overwrite is the default to protect user edits.
+- **`--format gitlab-codequality` and `--format gitlab-code-quality` aliases for `codeclimate`.** The CodeClimate JSON array format is unchanged; the new aliases just make the GitLab Code Quality use case discoverable via the name GitLab consumers actually reach for. Aliases work via `--format`, `FALLOW_FORMAT`, and `fallow schema`.
+- **`fallow health --sort severity`** orders complexity findings by exceeded-priority + severity rather than by cyclomatic complexity. Opt-in: the CLI default stays `cyclomatic` to avoid breaking JSON consumers that assume cyclomatic ordering. The PR/MR jq scripts use the same composite-key sort independently, so the default does not affect comment rendering. Available across the CLI, the NAPI bindings, and the MCP server.
+
+### Changed
+
+- **GitHub Action and GitLab CI PR/MR complexity tables widened from 4 to 7 columns.** The complexity table in PR/MR comments now shows Severity, Cyclomatic, Cognitive, CRAP, Lines, plus per-cell `**!**` markers identifying which thresholds each function exceeded. The footnote spells out the active thresholds with explicit `default` fallbacks so older fallow JSON renders cleanly. CRAP-only findings (functions flagged purely by CRAP=30 with no runtime coverage) now stay visible even when several cyclomatic flags exist; previously they were buried below the cyclomatic-sorted top-5 cut. The CRAP column auto-hides when the JSON lacks CRAP metadata, preserving back-compat with older fallow versions.
+- **GitLab CI template: `GIT_STRATEGY: "fetch"` and `GIT_DEPTH: "0"` set as defaults** so shared organisation templates that set `GIT_STRATEGY=none` or a shallow clone do not strand fallow without a working tree or without enough history to diff against the MR base SHA.
+
+### Fixed
+
+- **GitHub Action now respects package.json fallow pins.** The action's default `version: latest` previously installed whatever npm tagged latest, ignoring the project's `package.json` `fallow` pin. Local `pnpm exec fallow` could run 2.7.3 while CI ran 2.52.2, producing wildly divergent reports. The `version` input default is now empty; when omitted, `install.sh` reads the project package.json `fallow` dependency and installs that, falling back to `latest` only when no pin is found. The new spec whitelist accepts semver versions and ranges (`^2.52.0`, `>=2.0.0 <3.0.0`) and rejects `file:`, `link:`, `workspace:`, git URLs, paths, and `2.0.0 -g malicious` style flag injection. A drift warning fires when an exact pin diverges from the installed version (suppressed when `version:` was set explicitly). `INPUT_ROOT` is plumbed so monorepos with non-root `package.json` work.
+- **GitLab CI now respects package.json fallow pins to match GitHub Action behavior.** When `FALLOW_VERSION` is empty, the GitLab template reads the project's `package.json` `fallow` dependency, validates the spec with the same injection-safe whitelist as the GitHub Action, supports semver ranges, falls back to `latest` for unsupported package specs, and warns when an exact package pin drifts from the installed CLI version. The default value of `FALLOW_VERSION` changed from `"latest"` to `""`; pipelines that omit `FALLOW_VERSION` and have a `fallow` entry in `package.json` will now install that pinned version on the next run instead of `latest`. Set `FALLOW_VERSION: "latest"` explicitly to keep the previous behaviour.
+- **GitLab CI: `comment.sh` and `review.sh` hard-require `GITLAB_TOKEN`.** GitLab's documented `CI_JOB_TOKEN` permissions allow reading MR notes, but not creating, updating, or deleting them; the previous fallback was non-functional in practice and produced confusing 401/403 errors at API call time. The scripts now exit `0` with a clear stdout warning when `GITLAB_TOKEN` is unset rather than blocking the pipeline. `CI_JOB_TOKEN` is still useful for GitLab package registry authentication.
+
+## [2.53.0] - 2026-04-28
+
+### Added
+
+- **Cross-workspace dependency leak detection.** `fallow dead-code` now flags packages declared in one workspace's `package.json` but only consumed from another workspace's source files, surfaced as a new `cross-workspace-dependency` issue with a `move-dependency` action carrying the suggested target workspace path. Helps monorepo maintainers find dependencies that drifted out of their original workspace as code moved around. Available across every output format (human, JSON, SARIF, CodeClimate, markdown, compact); the JSON action `type` enum gains `move-dependency`.
+
+### Fixed
+
+- **Vue script-instance member access in templates is now credited.** `<script setup> const counter = new Counter(); ...` followed by `<button @click="counter.bump()">{{ counter.value }}</button>` no longer reports `Counter.bump` and `Counter.value` as unused class members. The Vue template scanner threads the script block's instance-binding map through expression and statement evaluation so `counter.bump()` remaps to `Counter.bump`. v-for / v-slot locals continue to shadow the script binding, avoiding false positives. Mirrors the same fix shipped earlier in this cycle for Svelte. Cache version bumped to 53 so existing caches re-extract the new member-access shape.
+- **Svelte 5 `{@attach}` directives and arrow-bound class member calls are now credited as used.** `<div {@attach myAttach}>` no longer reports `myAttach` as an unused export, and `onclick={() => counter.bump()}` plus `{counter.value}` correctly map to the script-local `Counter` instance's `bump` and `value` members through the script's binding-target table. Template locals (e.g., `{#each rows as counter}`) shadow the script binding so genuinely unused names in shadowed scopes still get reported. A small follow-up skips synthetic `this.*` keys when seeding the template scanner's bound targets, trimming dead weight from the reference set. Closes [#200](https://github.com/fallow-rs/fallow/issues/200). Thanks [@kevmodrome](https://github.com/kevmodrome) for the report and [@imwyvern](https://github.com/imwyvern) for [#201](https://github.com/fallow-rs/fallow/pull/201).
+- **Peer dependencies of used packages are no longer reported as unused.** `fallow dead-code` now reads installed packages' required `peerDependencies` and credits them when the package itself is used, recursively. Peers marked optional via `peerDependenciesMeta.<name>.optional: true` are still reported when otherwise unused. Package lookup follows ancestor `node_modules` directories so workspace-local, hoisted monorepo, and scoped-package installs are covered. Closes [#199](https://github.com/fallow-rs/fallow/issues/199).
+- **Linux GNU release binaries now run on glibc 2.31+ (Debian Bullseye, Ubuntu 20.04, RHEL 9, Amazon Linux 2023).** Previous releases inherited the GitHub `ubuntu-latest` runner's glibc 2.39, which broke fallow on most CI images and older distros. The release workflow now compiles `x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu` inside the `rust:1.95-bullseye` container, with a post-build `readelf` gate that fails the release if any shipped binary requires a glibc version newer than 2.31. Forward-only fix: applies to artifacts produced from this tag onward. Closes [#191](https://github.com/fallow-rs/fallow/issues/191). Thanks [@OmerGronich](https://github.com/OmerGronich).
+- **`docs/output-schema.json` now lists `move-dependency` in the action `type` enum.** New emit sites in `crates/cli/src/report/json.rs` introduced a value the schema didn't know about, which would have rejected every cross-workspace finding for consumers validating against the published schema.
+
+## [2.52.2] - 2026-04-28
+
+### Fixed
+
+- **Workspace-aware unused-dependency baselines.** When the same package appeared as unused in multiple workspace `package.json` files, `fallow dead-code --save-baseline` collapsed them into a single bare-package-name key. Suppressing the entry in one workspace then silenced every other workspace's report of the same package, hiding genuinely unused deps in the rest of the monorepo. Baseline keys for `unused_dependencies`, `unused_dev_dependencies`, `unused_optional_dependencies`, `type_only_dependencies`, and `test_only_dependencies` are now `package.json:package_name` so per-workspace instances stay distinct. Existing baselines saved with bare-package-name keys still match on load, so upgrading does not require regenerating baselines.
+
+## [2.52.1] - 2026-04-27
+
+### Fixed
+
+- **Stack overflow on Svelte snippet params with typed tuple bindings.** `extract_pattern_binding_names` and `collect_pattern_usage` only stripped trailing TS type annotations when the pattern started with `{` or `[`. A snippet param like `{#snippet foo(x: [number, number])}` reached the comma-split branch where `split_top_level` refused to split (commas at depth=1 inside the tuple) and recursed on the unchanged input until the stack overflowed. Now top-level commas split first, then a top-level `:` scan strips trailing type annotations for both destructured and plain identifier bindings. Closes [#172](https://github.com/fallow-rs/fallow/issues/172).
+- **ESLint config: dependencies inside `overrides[*]` and relative `extends` chains are now detected.** Two parser gaps produced false-positive unused devDependency reports: `parser`/`plugins`/`extends` inside `overrides[*]` were ignored (only top-level fields were extracted), and `extends` entries pointing at relative paths (`./config/base.js`, `../shared/eslintrc.json`) were passed verbatim to the package-name resolver, producing nonsense like `eslint-config-./config/base.js`. The walker now recurses into each override entry as a sub-config and resolves path-like extends relative to the parent dir, probing `.js`/`.cjs`/`.mjs`/`.json` like ESLint's resolver. Cycle protection via `FxHashSet<PathBuf>`; depth bounded at 8. Closes [#198](https://github.com/fallow-rs/fallow/issues/198).
+- **`ignorePatterns` is now honored when warning about undeclared workspaces.** Directories whose project-root-relative path matched the user's `ignorePatterns` config still triggered the `package.json directory not declared as a workspace` warning. The compiled `GlobSet` from `ResolvedConfig` is now plumbed into `find_undeclared_workspaces` and matched against both the relative directory path and its `package.json` suffix, so paths like `references/vitest` are silenced consistently with the rest of the analysis. Closes [#193](https://github.com/fallow-rs/fallow/issues/193).
+- **Five false-positive cases for files referenced from non-source artifacts.** Vite `css.preprocessorOptions.{scss,sass,less,stylus}.additionalData` bodies are now scanned for `@use`/`@import`/`@forward`; local paths seed entry patterns and bare specifiers credit referenced dependencies. Vue/Svelte SFC `<style lang="scss">` body imports and `<style src="...">` references are extracted symmetrically with `<script src>` (imports tagged `from_style: true` so the resolver routes through CSS-restricted SCSS fallbacks before the standard resolver, avoiding `./Foo` resolving to the `.vue` self-file). `package.json` scripts positional file arguments now use the workspace prefix when joined into entry patterns with `..` segment normalization. CI YAML scanner returns `CiAnalysis { used_packages, entry_files }` so positional file paths in `.gitlab-ci.yml` and `.github/workflows/*.yml` are seeded as entries. Cypress plugin extracts `e2e.specPattern`, `component.specPattern`, `e2e.supportFile`, `component.supportFile` from `cypress.config.{ts,js,mjs,cjs}` so Cypress 10+ projects whose specs live outside `cypress/**` stay reachable. A follow-up commit covered additional Vite preprocessor and Cypress edge cases. Cache version bumped to 51 (new `from_style` field on `CachedImport`). Closes [#195](https://github.com/fallow-rs/fallow/issues/195).
+- **LSP `changedSince` filter now works when the workspace is a subdirectory of the git repo.** Turborepo, Next.js `apps/`, and Nx `packages/` layouts silently produced an empty filter because `try_get_changed_files` joined `git diff` output (toplevel-relative) against the workspace root (subdirectory). The resolver now resolves the canonical git toplevel via `git rev-parse --show-toplevel`, joins git output against it, and passes `--full-name` to `git ls-files` for parity with `git diff`. The LSP canonicalizes the workspace root in `initialize` so absolute paths agree across symlink boundaries on macOS and Windows. A one-time WARN log fires when workspace differs from toplevel so monorepo subdirectory layouts are self-diagnosable. Same release also dedupes cross-root duplicates that `merge_results` accumulates when multiple project roots walk overlapping files (with `UnlistedDependency` getting a real merge of `imported_from` sites across roots), stamps `Diagnostic.data` with `{ "changedSince": "<ref>" }` when the filter is active so AI agents reading via `vscode.languages.getDiagnostics()` can verify the filter, and promotes the `(since <ref>)` indicator to all four status bar states via a shared `renderStatusBarText` helper. Closes [#190](https://github.com/fallow-rs/fallow/issues/190).
+- **LSP advertises `diagnostic_provider` (LSP 3.17 pull-model) so strict clients call `textDocument/diagnostic`.** The pull handler and `cached_diagnostics` map were already wired up, but `ServerCapabilities.diagnostic_provider` was unset. Strict 3.17 clients (Helix, Zed) gate the pull request on the advertised capability, so the handler was dead code for those editors; VS Code's LSP client tolerated the gap by falling back to push-mode. The advertisement uses `identifier: "fallow"`, `inter_file_dependencies: true` (cross-file findings such as unused exports / unused dependencies), and `workspace_diagnostics: false` (no `workspace/diagnostic` handler).
+- **`cargo doc --document-private-items` no longer fails on a public-doc-links-private warning in `crates/extract/src/css.rs`.** The doc comment on `extract_css_imports` (public) referenced `[\`normalize_css_import_path\`]` (private), which `-D rustdoc::private-intra-doc-links` rejects. Reverted to plain backtick formatting; CI `cargo doc --workspace --no-deps --document-private-items` is green again. Pre-existing problem; no behavior change.
+- **`zizmor` Actions Security scan no longer audits fallow's own test fixtures.** The CI step ran `uvx zizmor ... .` from the repo root, which swept in `tests/fixtures/issue-195-ci-file-args/.github/workflows/deploy.yml` (a deliberately lax fixture used by fallow's CI YAML detection, not a real workflow) and failed on `unpinned-uses` plus `excessive-permissions`. Scoped the invocation to `.github/` and `action.yml` so the audit covers the workflows we actually ship.
+
+## [2.52.0] - 2026-04-26
+
+### Added
+
+- **`fallow dupes --group-by` partitions clone groups by owner / directory / package / section.** Previously the flag was validated (so global flag errors stayed consistent across `check`, `health`, and `dupes`) but the resolver was built and discarded; the output stayed ungrouped. Now grouped output mirrors the existing `health --group-by` shape across every format. Multi-owner clone groups are attributed to the **largest-owner** (most instances in the group) with **alphabetical tiebreak** on equal counts, matching jscpd's majority-instance attribution; per-instance owners are surfaced inline so consumers can see split ownership. JSON output gains `grouped_by`, `total_issues`, and a `groups` array carrying per-bucket `stats`, `clone_groups` (each with `primary_owner`), and `clone_families`. SARIF gains `properties.group` per result; CodeClimate gains a top-level `group` per issue. Human output mirrors health's grouped section style: cyan-bullet `Per-{mode} duplication` header, per-bucket cyan-bullet sub-headers with stats, and a project-totals footer. The largest-owner attribution preamble renders only for `--group-by owner` (where attribution is genuinely ambiguous); directory / package / section modes hide it as cognitive noise. `--top` is skipped when `--group-by` is active so per-bucket stats reflect the full bucket; the renderer applies its own per-bucket cap. The MCP `find_dupes` tool already plumbed `--group-by`; no MCP-side change needed.
+- **`BoundaryZone.root` for monorepo per-package boundary configurations.** `[[boundaries.zones]] root = "packages/app/"` resolves the zone's `patterns` against paths relative to the subtree instead of the project root. At classification time, `classify_zone` checks the path starts with the root prefix; if yes, strips it and glob-matches the patterns against the remainder; if no, skips the zone. Filter approach over prefix-rewriting: zero-cost for zones without `root`, keeps stored pattern strings un-corrupted, debug output stays clean. Closes the `FALLOW-BOUNDARY-ROOT-RESERVED` warning ramp from v2.51.0; the warning emission and `BoundaryConfig::reserved_root_zones()` method are removed. A new `FALLOW-BOUNDARY-ROOT-REDUNDANT-PREFIX` validation flags patterns that double-prefix the root (e.g., `root: "packages/app/"` + `patterns: ["packages/app/src/**"]`) so users who manually pre-prefixed their patterns during the warning ramp see the migration cue. Validation is emitted via `tracing::error!` consistent with `validate_zone_references`. Root matching is case-sensitive, matching globset's pattern conventions; locked down with a regression test to prevent silent platform-divergent classification on case-insensitive filesystems. New ADR: `decisions/007-boundary-zone-root.md`.
+- **`<template>` complexity findings now cover inline Angular `@Component({ template: \`...\` })` decorators.** v2.51.0 emitted synthetic `<template>` cyclomatic/cognitive findings only for standalone `.html` files referenced via `templateUrl`, leaving codebases that put their templates inline (the modern Angular default) with zero coverage for the same control-flow density. The visitor now records each captured inline `template:` literal and the parser runs the existing template-complexity scanner over it, anchoring the resulting finding at the host file's `@Component`/`@Directive` decorator line. Jump-to-source lands on the decorator and `// fallow-ignore-next-line complexity` placed directly above the decorator suppresses through the existing health-side check, no extra suppression plumbing required. Template literals containing `${...}` expressions and `template:` properties bound to a variable are skipped (out of scope for the first cut). Cache version bumped to 49 so existing caches re-extract the new finding shape. Closes [#187](https://github.com/fallow-rs/fallow/issues/187).
+
+### Changed
+
+- **Schema version policy documented explicitly in `docs/output-schema.json`.** The `SchemaVersion` definition now states the bump policy: additive changes (new optional top-level fields, new optional struct fields, new array entries, new MCP tools, new CLI flags that map to new optional fields) do NOT bump the version; breaking changes (renamed fields, removed fields, type changes, enum-variant removals, semantic changes to existing fields) DO bump. Consumers should feature-detect new fields via JSON-key existence rather than gating on the version number. Resolves the ambiguity around `dupes --group-by` adding `grouped_by` / `total_issues` / `groups` without a version bump.
+
+### Fixed
+
+- **`cargo doc --document-private-items` no longer fails on `<template>` and unresolved intra-doc links.** Three rustdoc errors landed in earlier v2.51.x work: a bare `<template>` HTML tag in a doc comment on `InlineTemplateFinding`, an unresolved `[`VitalSigns`]` / `[`HealthScore`]` intra-doc link in `crates/cli/src/health/grouping.rs`, and a public-doc-links-private warning on `[`crate::health::HealthResult`]` in `crates/cli/src/health_types/grouped.rs`. CI `cargo doc --workspace --no-deps --document-private-items` is green again. Pre-existing problem; no behavior change.
+
+## [2.51.0] - 2026-04-26
+
+### Added
+
+- **Synthetic `<template>` complexity findings for Angular HTML templates.** `fallow health --complexity` now scans standalone `.html` files for Angular template syntax and emits a synthetic finding named `<template>` whenever the template uses control-flow blocks (`@if`/`@else`/`@for`/`@switch`/`@case`/`@defer (when ...)`/`@let`), legacy structural directives (`*ngIf`, `*ngFor`, `[ngFor]`, `[ngForOf]`), expression-bound attributes (`[x]`, `(x)`, `bind-x`, `on-x`), or `{{ }}` interpolations. Cyclomatic increments per branch; cognitive accumulates with nesting and resets logical-operator runs across ternary branches. The finding flows through every output format (human, JSON, SARIF, CodeClimate, markdown, compact) and feeds the existing health score, hotspot, and refactoring-target pipelines. Suppress with `<!-- fallow-ignore-file complexity -->` at the top of the template; the JSON `actions` array carries a `suppress-file` entry with the exact comment so AI agents can apply it. Closes [#183](https://github.com/fallow-rs/fallow/issues/183). The CRAP-coverage story for `<template>` findings (JIT inherit-from-`.ts`, AOT source-map back-mapping) is tracked separately in [#186](https://github.com/fallow-rs/fallow/issues/186).
+- **Tier-aware CRAP refactoring actions and baseline-aware suppression.** `fallow health --complexity` now emits coverage-leaning actions tailored to the function's coverage tier when CRAP triggers a finding: `add-tests` for `coverage_tier: none`, `increase-coverage` for `partial`/`high`, and `refactor-function` when even 100% coverage cannot bring CRAP below the threshold. CRAP-only findings within five of the cyclomatic threshold also append a secondary `refactor-function` action when cognitive complexity passes the cognitive floor (suppresses false positives on flat type-tag dispatchers and JSX render maps). Baseline-active runs and projects with `health.suggestInlineSuppression: false` no longer emit `suppress-line` actions; the report root carries an `actions_meta: { suppression_hints_omitted: true, reason: "baseline-active" }` breadcrumb so consumers can detect the omission.
+
+### Changed
+
+- **`--production-coverage` renamed to `--runtime-coverage` (no backwards-compatibility alias).** V8 and Istanbul measure invocations at runtime regardless of environment, so "production coverage" implied a restriction that did not exist; the beacon ships from any environment the operator points it at (staging, dev, load test, production). Surface changes: CLI flag `--production-coverage` → `--runtime-coverage`; MCP tool `check_production_coverage` → `check_runtime_coverage`; JWT feature claim `production_coverage` → `runtime_coverage`; SARIF rule IDs `fallow/production-*` → `fallow/runtime-*` (subtypes `safe-to-delete`/`review-required`/`low-traffic`); Rust types `ProductionCoverage*` → `RuntimeCoverage*`; source files `health_types/production_coverage.rs` → `runtime_coverage.rs`; tests `production_coverage_tests.rs` → `runtime_coverage_tests.rs`; snapshots `*_with_production_coverage.snap` → `*_with_runtime_coverage.snap`. The unrelated `--production` static-analysis flag (excludes test/dev files) is unchanged; only the paid V8/Istanbul coverage feature is renamed. SARIF / CodeClimate consumers that filter by `ruleId` need to update their selectors. Counterpart changes ship in fallow-cloud (sidecar + dashboard) and the companion repos (fallow-docs, fallow-skills) so the protocol, server, docs, and skill references stay in sync.
+
+## [2.50.0] - 2026-04-26
+
+### Added
+
+- **Per-workspace health metrics with `--group-by package`.** `fallow health --group-by package|owner|directory|section` finally produces a real grouped envelope instead of silently discarding the flag. JSON output keeps `vital_signs`, `health_score`, `summary`, `findings`, `file_scores`, `hotspots`, `large_functions`, and `targets` at the project level so consumers that ignore grouping still see the headline, then adds `grouped_by` plus a `groups` array where each bucket carries its own `vital_signs` and `health_score` recomputed from the group's files. SARIF results gain `properties.group` and CodeClimate issues gain a top-level `group` field, so GitHub Code Scanning and GitLab Code Quality can partition findings per team or package without dropping out of the SARIF/CodeClimate pipeline. Human output adds a per-group score / files / hot / p90 summary block sorted worst-first when `--score` is set, with a color-coded grade column and a `(root)` legend for files outside any workspace package. Compact, markdown, and badge fall back to ungrouped output with a stderr note pointing at `--format json`. The `check_health` MCP tool description now spells out the per-group output so AI agents can use it for per-team or per-package quality questions in a single invocation. Closes [#184](https://github.com/fallow-rs/fallow/issues/184).
+- **VS Code extension: `fallow.changedSince` setting to scope LSP diagnostics to changed files.** New extension setting accepts a git ref (e.g. `main`, `HEAD~1`, `origin/main`); the LSP only emits diagnostics for files changed since that ref. Useful for legacy codebases adopting fallow incrementally without surfacing the entire pre-existing dead-code backlog at once. The status bar tooltip surfaces the active scope so users can see when diagnostics are filtered.
+
+### Fixed
+
+- **`fallow health --workspace X` now scopes `vital_signs`, `health_score`, and `summary.files_analyzed` to the workspace's files.** Previously the workspace flag scoped only `findings`, `file_scores`, and `hotspots`, leaving the project-level metrics at monorepo-wide values; consumers asking "what is the health score of workspace X" got the monorepo answer back. Now every per-module aggregate (cyclomatic distribution, total LOC, unit profiles), every `analysis_counts` denominator (dead files, dead exports, unused deps, circular deps), and the summary file count is recomputed against the workspace subset. Internal change: introduces `SubsetFilter` (`Full` / `Workspaces` / `Paths`) and `AnalysisCountsSnapshot` retained on `FileScoreOutput` so per-subset counts can be derived without re-running the analyser.
+- **`fallow health --group-by package` on a non-monorepo emits exactly one structured JSON error instead of two.** The pre-existing flow validated `--group-by package` *after* the hotspot pipeline, so a non-monorepo run produced a `hotspot analysis requires a git repository` error followed by a `--group-by package requires a monorepo` error in the same stdout, breaking any pipeline that did `jq .` on the output. Validation now runs upfront so misconfigured invocations short-circuit before any expensive work and emit a single error object. The non-monorepo error message also suggests `--group-by directory` as a fallback for single-package projects.
+- **VS Code status bar: `changedSince` value is HTML-escaped in the trusted-content tooltip and truncated to 40 characters in the status bar.** Avoids breaking tooltip rendering when the ref string contains markdown-active characters and prevents long refs (commit SHAs, full origin/branch names) from squeezing the rest of the bar.
+
+## [2.49.0] - 2026-04-25
+
+### Added
+
+- **Per-analysis production mode for the programmatic API.** `analyze_project` now accepts an optional `production` configuration that overrides the global `FallowConfig.production` flag for that single call, so an embedder can run a check pass with `production: false` (developer-mode entry points, full graph) and a follow-up health pass with `production: true` (start/build entries only, type-only deps detected) against the same project state without rebuilding config. CLI users get the same toggle via the existing `--production` flag, but the new path is the embedder API surface (Vite plugin, GitHub Action library mode, IDE plugins). Programmatic callers see `production: bool` on the analysis options struct; CLI callers see no behavior change.
+
+### Fixed
+
+- **Cross-package enum and class members are no longer flagged as unused when consumed through a barrel re-export.** When `enum Foo { A, B, C }` is defined in `lib/types.ts`, re-exported by `lib/index.ts` (`export { Foo } from './types'`), and consumed by another workspace package via `import { Foo } from '@scope/lib'; Foo.A`, every member of `Foo` was reported unused. Phase 4 chain resolution synthesizes a stub `ExportSymbol` on barrel files for reference tracking, which is indistinguishable from a real local declaration by name alone, so the access map keyed at the barrel while the detection loop looked up accesses at the origin file (where `members` are populated). `find_unused_members` now walks each access key through `ReExportEdge` chains (named, renamed, and `export *` fan-out) to every defining-site export and copies the access set. Same fix applies to `whole_object_used_exports` for `Object.values(Foo)` patterns. Covers both `unused_enum_members` and `unused_class_members`. Real-world impact on vue-core: 17 false positives eliminated (12 enum + 5 class). Closes [#178](https://github.com/fallow-rs/fallow/issues/178).
+- **Embedder API now respects per-analysis production config end-to-end.** `analyze_project` was reading the global `FallowConfig.production` flag for downstream filtering even when the per-call options overrode it, so the new per-analysis production mode silently fell back to the project default in the trace and reachability passes. The flatten step now threads the resolved per-analysis flag through every detector consistently.
+- **GitLab CI template defaults FALLOW_PRODUCTION* variables to empty strings.** The `.fallow:base` template previously set `FALLOW_PRODUCTION_CHECK: "false"` and similar; pipelines that overrode these via `extends:` could not unset them because GitLab merges variable values rather than replacing. Switching the defaults to `""` makes the template idempotent under user overrides.
+- **Health Istanbul coverage now keys by `(name, line, col)` instead of `(name, line)`.** Curried arrow functions that share a start line on the same column would merge their coverage records and double-count one branch. Adding the column disambiguates the rare collision without affecting any other coverage shape.
+
+## [2.48.5] - 2026-04-25
+
+### Added
+
+- **MCP trace tools for chasing why a finding exists.** Four new tools land in the MCP server: `trace_export` (why is this export reachable, or why isn't it), `trace_file` (which entry points pull this file in), `trace_dependency` (which scripts and config files keep this package alive), and `trace_clone` (where else does this clone group appear). Each returns the full propagation chain, not just the verdict, so an agent can walk from "fallow says X" back to the entry point or script that justifies it without re-running analysis. `trace_dependency` correctly credits packages referenced only from `package.json` `scripts` blocks (e.g., husky, lint-staged) so they stop showing as unused in the trace; `trace_clone` strips absolute paths from instance locations so the output stays portable across machines, and validation errors share the same error envelope as the rest of the MCP surface. Closes [#176](https://github.com/fallow-rs/fallow/pull/176). Thanks [@M-Hassan-Raza](https://github.com/M-Hassan-Raza).
+
+### Fixed
+
+- **VS Code status bar tooltip now renders codicons instead of literal `$(error)` / `$(warning)` / `$(check)` text.** The popup markdown is built as a `vscode.MarkdownString` and the missing `supportThemeIcons = true` flag meant every codicon shorthand fell through as raw text. Independently, the status bar text and tooltip could disagree (e.g., `0.8% duplication` in the bar, `0.6% duplication` in the popup) because two code paths drove the surface: the LSP `analysisComplete` notification updated both, while CLI completion only updated the text. Both paths now feed through one `buildParamsFromCli` + `applyTooltipAndSeverity` pipeline so text and tooltip always derive from the same data. Crashed analysis runs now also surface as `setStatusBarError()` instead of a misleading "$(check) No issues found" tooltip. Closes [#179](https://github.com/fallow-rs/fallow/issues/179).
+- **Health CRAP score no longer mismerges curried arrow functions that share a start line.** When two named arrow functions in the same file had identical line numbers (typical for one-line curried definitions like `const f = (a) => (b) => a + b`), the per-function CRAP merge collapsed them into a single record and double-counted coverage. The merge key now includes function name alongside `(file, line)` so curried arrows produce distinct CRAP entries.
+
+## [2.48.4] - 2026-04-24
+
+### Fixed
+
+- **npm release pipeline recovery, second attempt.** v2.48.3 shipped on crates.io and GitHub Releases but the npm-publish job failed again: the v2.48.3 release commit had `crates/napi/package.json` at 2.48.3 while the lockfile's `packages.node_modules/@fallow-cli/fallow-node-*` entries pointed at 2.48.1, so CI's `npm ci --omit=optional` rejected the repo as out-of-sync. The working v2.48.1 pattern leaves `crates/napi/*` entirely unchanged in the release commit and lets CI's own "Update NAPI package version" step bump them at publish time. v2.48.4 reverts `crates/napi/package.json`, `crates/napi/package-lock.json`, and `crates/napi/index.js` to that in-sync 2.48.1 state; CI then bumps them from the tag after `npm ci` passes. No user-visible behavior change relative to v2.48.2 / v2.48.3; this ships the same PandaCSS plugin, Angular template fixes, and MCP rename in a form that finally makes it through the npm publish pipeline.
+
+## [2.48.3] - 2026-04-24
+
+### Fixed
+
+- **npm release pipeline recovery.** v2.48.2 shipped on crates.io and GitHub Releases but the `npm-publish` job failed at the pre-publish `npm ci` in `crates/napi/` because the canonical sync step's `npm install --package-lock-only` dropped the `packages.node_modules/@fallow-cli/fallow-node-*` entries (npm could not resolve the new platform-package versions pre-publish). v2.48.3 restores the lockfile's nested package entries pointing at the last-published platform version (2.48.1), leaving `optionalDependencies` at 2.48.3; npm ci is happy because the platform packages are optional. No user-visible behavior change relative to v2.48.2. See [`48a5947d`](https://github.com/fallow-rs/fallow/commit/48a5947d) for the prior manifestation of the same drift.
+
+## [2.48.2] - 2026-04-24
+
+### Added
+
+- **PandaCSS framework plugin.** `panda.config.{ts,js,mjs,cjs}` is no longer flagged as an unused file when `@pandacss/dev` is a dependency. The Panda CLI (`panda codegen`, `panda`) discovers the config by filesystem convention with no import edge, so static analysis alone cannot see it as used. The new built-in plugin mirrors the UnoCSS / Tailwind pattern: enabler `@pandacss/dev`, config patterns and always-used on `panda.config.{ts,js,mjs,cjs}`, tooling dependencies for `@pandacss/dev` / `@pandacss/studio` / `@pandacss/eslint-plugin`, and `resolve_config` that captures both ES imports and shallow-string `presets` entries so preset packages like `@pandacss/preset-panda` and `@park-ui/panda-preset` are not flagged as unused. Closes [#175](https://github.com/fallow-rs/fallow/issues/175).
+
+### Changed
+
+- **MCP tool `health_production_coverage` renamed to `check_production_coverage`** for picker parallelism with `check_health` and `check_changed`. The tool description now leads with `(paid)`, and the server instructions gain a disambiguation line so agents pick the right tool between `check_health` (static, free) and `check_production_coverage` (V8-runtime-backed, paid). `check_health` also gains `min_observation_volume` and `low_traffic_threshold` params to reach parity with the underlying CLI flags, and `check_production_coverage` gains `group_by` for CODEOWNERS / directory / package / section grouping. Breaking change on the MCP wire protocol (tool name); accepted since this is a paid preview tool with no production users yet.
+
+### Fixed
+
+- **Angular inherited and DI-injected members referenced in external templates are no longer reported as unused.** Two independent root causes: (1) child-component template references bridged into `self_accessed_members` were not propagated up the `extends` chain to the base class's file (e.g., a base component's lifecycle hooks or helpers used in a child's `templateUrl`), and (2) the template scanner captured only top-level identifiers (losing `getTotal` in `{{ dataService.getTotal() }}`), and constructor-param types from DI were not exposed on `ModuleInfo`, so standalone-parsed HTML could not resolve chains to injected services. Scanner now returns member-access chains alongside identifiers; constructor params with accessibility modifiers and typed property declarations are captured into `ClassHeritageInfo.instance_bindings`; the analysis bridge resolves HTML chains through the importing component's bindings. Cache version bumped to 47. Closes [#174](https://github.com/fallow-rs/fallow/issues/174).
+
+## [2.48.1] - 2026-04-24
+
+### Fixed
+
+- **`fallow setup-hooks` now ships a gate script that refuses to run with a stale fallow on `PATH`.** A fallow older than v2.46.0 (before the uncommitted-changes inclusion fix, commit `aabb8e1b`) silently passed audits that newer fallow would fail, defeating the purpose of the Claude Code `git commit` / `git push` gate. The generated `.claude/hooks/fallow-gate.sh` now enforces a `FALLOW_GATE_MIN_VERSION` floor (default `2.46.0`) and blocks with a copy-pasteable upgrade hint when the binary resolved from `PATH` is below it. Override with `FALLOW_GATE_MIN_VERSION=<semver>` or disable with an empty string. Every verdict=fail block now also prepends `fallow-gate: blocked by fallow <version> at <binary>` to stderr so the responsible binary is identifiable without re-diagnosis, and the installed script stamps `# Installer version: <semver>` in its header for forensics (substituted at install time from `fallow setup-hooks`'s own version). See <https://docs.fallow.tools/integrations/claude-hooks#version-floor>.
+
+### Changed
+
+- **Internal unit-size refactors with no behavioral change.** `find_unused_members` class inheritance propagation split into `build_parent_to_children` + `propagate_class_inheritance` helpers; `build_human_lines` / `build_sarif` / `build_codeclimate` each split into per-section helpers; package-path dep sections in CodeClimate collapsed behind a `NamedPkgDep` trait. Output byte-identical across all formats; same fingerprints, same severities, same issue ordering.
+
+## [2.48.0] - 2026-04-23
+
+### Added
+
+- **Agent skill now ships inside the `fallow` npm package.** The `skills/fallow/` content (SKILL.md plus CLI reference, gotchas, and patterns references) is now packaged alongside the CLI wrapper, so `npm install fallow` places the skill on disk next to the binary the agent drives. This removes version drift between the installed binary and the skill an agent loads from a separately-cloned `fallow-skills` checkout, and removes the manual clone step from the onboarding path. Claude Code, Codex, and other agents that discover skills on disk pick it up without any extra configuration. The same content remains published from the `fallow-skills` repo for users who prefer plugin-style installs. A CI lane now verifies the bundled skill stays in sync with the source of truth on every PR. Closes [#173](https://github.com/fallow-rs/fallow/issues/173). Thanks [@OmerGronich](https://github.com/OmerGronich) for the proposal.
+
+## [2.47.1] - 2026-04-23
+
+### Fixed
+
+- **Windows ARM64 (`aarch64-pc-windows-msvc`) is now a first-class release target.** `npx fallow` previously hard-failed on Windows ARM devices because no native binary was published. The release pipeline now builds and publishes `@fallow-cli/win32-arm64-msvc` for the CLI / LSP / MCP binaries and `@fallow-cli/fallow-node-win32-arm64-msvc` for the Node bindings, and the npm wrapper plus VS Code extension downloader both resolve the new target. A PR-time CI lane on native Windows ARM64 runners compiles the CLI and the NAPI addon so the target is covered before release instead of only at tag time. The npm platform resolution was also factored into a shared helper with tests so future targets stay consistent. Closes [#165](https://github.com/fallow-rs/fallow/issues/165). Thanks [@M-Hassan-Raza](https://github.com/M-Hassan-Raza) ([#171](https://github.com/fallow-rs/fallow/pull/171)).
+
+## [2.47.0] - 2026-04-23
+
+### Added
+
+- **Native Node.js bindings package (`@fallow-cli/fallow-node`).** New async NAPI-RS bindings expose the main one-shot analyses directly inside Node without spawning the CLI: `detectDeadCode`, `detectCircularDependencies`, `detectBoundaryViolations`, `detectDuplication`, `computeComplexity`, and `computeHealth`. The bindings reuse the CLI orchestration layer and return the same JSON report envelopes the CLI emits, including `schema_version`, `summary`, relative paths, and injected `actions`. The Rust-side programmatic facade lives in `fallow-cli::programmatic`, and the repo now includes a temp-project Node smoke test plus CI/release wiring for the addon package. The JS API accepts lowercase CLI-style enum literals (`"mild"`, `"cyclomatic"`, `"low"`, `"handle"`) and rejected promises now expose structured fallow fields like `exitCode`, `help`, and `context`. See <https://docs.fallow.tools/integrations/node-bindings>.
+
+### Fixed
+
+- **Benchmark JSON parsing hardened against partial runs.** The benchmark harness used a best-effort parser that silently treated truncated or malformed JSON as "zero findings", so a crashed run scored as a clean run. Parsing now validates the envelope and rejects invalid payloads up front, so partial results no longer poison cross-tool comparisons.
+- **Benchmark validity checks tightened; Vite overhead reduced.** The benchmark validity gate used to accept runs whose `summary.total_issues` silently disagreed with the sum of its per-category counts. It now rejects those runs, matching the stricter behavior the public comparison tables rely on. Adjacent Vite bench setup no longer installs dev dependencies it never invokes, cutting per-run overhead.
+- **Recursive plugin config scans avoided.** Some framework plugins re-scanned the project config object every time a file was processed, producing redundant work on large monorepos. The scans now memoize the resolved config per analysis run, removing the redundant traversals.
+- **`unused-listed-deps` no longer false-positives on broken `tsconfig.json` path aliases.** A `tsconfig.json` whose `compilerOptions.paths` pointed at a non-existent prefix would cause the resolver to fall through to "unlisted" on imports that were actually listed in `package.json`, flagging legitimate dependencies as unused. The resolver now treats unresolved alias prefixes as transient rather than definitive, so the listed-dep check only fires on genuinely missing entries.
+
+### Changed
+
+- **`cargo shear` no longer flags `tokio` in `crates/napi`.** The Node bindings crate no longer declares a direct `tokio` dependency; the napi `tokio_rt` feature already pulls it transitively.
+- **NAPI option parsing no longer silently truncates `maxCyclomatic` / `maxCognitive`.** Both fields are now validated against `u16::MAX`; out-of-range values produce a typed `InvalidArg` napi error instead of wrapping to a different threshold.
+- **`sync-npm-versions.sh` now rewrites the version strings NAPI-RS bakes into `crates/napi/index.js`.** Bumping a release used to leave the hardcoded `!== 'X.Y.Z'` comparisons at the previous tag, so strict `NAPI_RS_ENFORCE_VERSION_CHECK` consumers saw spurious mismatches on every release. The sync script now rewrites those literals in lockstep with `package.json`.
 
 ## [2.46.0] - 2026-04-23
 
@@ -28,7 +5695,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **Istanbul `--coverage` now matches functions produced by standard Istanbul tooling (Jest, nyc, c8, babel-plugin-istanbul).** Standard Istanbul producers omit the non-standard `FnEntry.line` field that `oxc-coverage-instrument` writes, so fallow's `load_istanbul_coverage` silently defaulted the line to `0` and every lookup failed — `istanbul_matched: 0` out of N, all CRAP scores fell back to binary estimation, and `--max-crap` ran against estimates instead of real coverage. The loader now falls back to `FnEntry.decl.start.line` when `FnEntry.line` is missing, restoring the anonymous-by-line and fuzzy lookup paths for Jest/nyc/c8-produced coverage while preserving the fast path for `oxc-coverage-instrument` output. Closes [#166](https://github.com/fallow-rs/fallow/issues/166).
+- **Istanbul `--coverage` now matches functions produced by standard Istanbul tooling (Jest, nyc, c8, babel-plugin-istanbul).** Standard Istanbul producers omit the non-standard `FnEntry.line` field that `oxc-coverage-instrument` writes, so fallow's `load_istanbul_coverage` silently defaulted the line to `0` and every lookup failed , `istanbul_matched: 0` out of N, all CRAP scores fell back to binary estimation, and `--max-crap` ran against estimates instead of real coverage. The loader now falls back to `FnEntry.decl.start.line` when `FnEntry.line` is missing, restoring the anonymous-by-line and fuzzy lookup paths for Jest/nyc/c8-produced coverage while preserving the fast path for `oxc-coverage-instrument` output. Closes [#166](https://github.com/fallow-rs/fallow/issues/166).
 - **Repeated "entry point outside project root" warnings collapse into a single diagnostic.** Monorepos with shared entry points (e.g. workspace `package.json` pointing at a sibling build output) used to emit the same warning once per analysis target, spamming `stderr` with dozens of identical lines. The warnings are now deduplicated with a counted summary so the signal stays visible without drowning out other diagnostics.
 - **`fallow dupes` tuning flags (`--min-lines`, `--min-tokens`, `--mode`, `--cross-language`) are forwarded correctly in combined GitLab CI mode.** The wrapper's combined-mode `ARGS=()` block built the `dupes` invocation without reading the `FALLOW_DUPES_*` env vars, so user overrides set in `.gitlab-ci.yml` silently became defaults. Fix pairs with the same GitHub Action fix from v2.44.x so both CI integrations honor the same tuning surface.
 - **Entry point discovery and VS Code extension downloads are hardened.** The entry-point walker now tolerates package manifests with missing / non-object `bin` or `exports` fields instead of aborting discovery, and the VS Code extension's binary-download path validates content-length + checksum against the expected artifact before unpacking (no more silent half-downloads that fail the first `fallow` invocation with an opaque error).
@@ -143,7 +5810,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Production Coverage Intelligence (Phase 2)** -- `fallow health --production-coverage <path>` merges V8 or Istanbul runtime coverage into the existing health report. Spawns the closed-source `fallow-cov` sidecar (distributed separately; binary distribution deferred to Phase 2.5) and surfaces a typed report with stable content-hash IDs, per-finding verdicts, a supporting evidence block, hot-path percentiles, and a `license-expired-grace` watermark track. Paid feature — gated on a valid Ed25519-signed license JWT with the `production_coverage` feature.
+- **Production Coverage Intelligence (Phase 2)** -- `fallow health --production-coverage <path>` merges V8 or Istanbul runtime coverage into the existing health report. Spawns the closed-source `fallow-cov` sidecar (distributed separately; binary distribution deferred to Phase 2.5) and surfaces a typed report with stable content-hash IDs, per-finding verdicts, a supporting evidence block, hot-path percentiles, and a `license-expired-grace` watermark track. Paid feature , gated on a valid Ed25519-signed license JWT with the `production_coverage` feature.
 - **`fallow license` subcommand** -- `activate` (with `--trial --email <addr>` for zero-credit-card onboarding or `--from-file <path>` / stdin for existing licenses), `status`, `refresh`, `deactivate`. JWT verification is fully offline against a compiled-in Ed25519 public key; only `activate --trial` and `refresh` make network calls (5s connect timeout, 10s total). License is stored at `~/.fallow/license.jwt` (or `$FALLOW_LICENSE_PATH`) with owner-only permissions on Unix; the Windows fallback honours `%USERPROFILE%`. Grace ladder matches Docker Desktop / JetBrains: 0–7 day warning, 7–30 day watermark, 30+ day hard-fail.
 - **`fallow coverage setup`** -- single-entry-point resumable first-run flow that walks a user through: license check, `fallow-cov` sidecar discovery/install, framework-specific coverage recipe (Next.js / Nest / SvelteKit / Remix / Astro / plain Node), and automatic handoff into `fallow health --production-coverage`. Sidecar discovery resolves `$FALLOW_COV_BIN` → `./node_modules/.bin/fallow-cov` → package-manager bin → `~/.fallow/bin/fallow-cov` → `$PATH`.
 - **`--min-observation-volume <N>`** on `fallow health` -- minimum total trace volume before the sidecar is allowed to emit high-confidence `safe_to_delete` / `review_required` verdicts. Below this threshold the sidecar caps confidence at `medium`. Defaults to the spec value (5000) when omitted.
@@ -173,9 +5840,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Ownership risk analysis on hotspots** -- `fallow health --hotspots --ownership` surfaces per-file ownership signals derived from git author history and CODEOWNERS. For each hotspot: Avelino truck factor (`bus_factor`), contributor count, top contributor with stale-days and commits, up to three additional recent contributors, `suggested_reviewers` (recent contributors with `stale_days < 90` — first-class field for AI agent routing), declared CODEOWNERS owner, tristate `unowned` flag (`true`=no rule matches / `false`=rule matches / `null`=no CODEOWNERS file), drift detection with human-readable reason. Human output prepends a project-level summary line (`9/10 hotspots depend on a single recent contributor · top authors: @alice (6), @bob (4)`) so tech leads see the organizational pattern before scanning per-file rows. JSON gains three new action types: `low-bus-factor` (with file-specific candidate reviewers from `suggested_reviewers`), `unowned-hotspot` (with synthesized CODEOWNERS pattern + `heuristic: "directory-deepest"` discriminator for future evolution), and `ownership-drift`. Test-path hotspots tagged `[test]` in human output and `is_test_path: true` in JSON. Only the free tool combining dead code + complexity + ownership risk. Research-backed (Avelino et al., Thongtanunam et al. ICSE 2016). ([#116](https://github.com/fallow-rs/fallow/discussions/116))
+- **Ownership risk analysis on hotspots** -- `fallow health --hotspots --ownership` surfaces per-file ownership signals derived from git author history and CODEOWNERS. For each hotspot: Avelino truck factor (`bus_factor`), contributor count, top contributor with stale-days and commits, up to three additional recent contributors, `suggested_reviewers` (recent contributors with `stale_days < 90` , first-class field for AI agent routing), declared CODEOWNERS owner, tristate `unowned` flag (`true`=no rule matches / `false`=rule matches / `null`=no CODEOWNERS file), drift detection with human-readable reason. Human output prepends a project-level summary line (`9/10 hotspots depend on a single recent contributor · top authors: @alice (6), @bob (4)`) so tech leads see the organizational pattern before scanning per-file rows. JSON gains three new action types: `low-bus-factor` (with file-specific candidate reviewers from `suggested_reviewers`), `unowned-hotspot` (with synthesized CODEOWNERS pattern + `heuristic: "directory-deepest"` discriminator for future evolution), and `ownership-drift`. Test-path hotspots tagged `[test]` in human output and `is_test_path: true` in JSON. Only the free tool combining dead code + complexity + ownership risk. Research-backed (Avelino et al., Thongtanunam et al. ICSE 2016). ([#116](https://github.com/fallow-rs/fallow/discussions/116))
 - **`--ownership-emails={raw|handle|hash}` privacy control** -- chooses how author emails are rendered in output. `handle` (default) shows the local-part only, unwrapping GitHub-style noreply prefixes (`12345+alice@users.noreply.github.com` → `alice`); `hash` emits stable non-cryptographic `xxh3:<16hex>` pseudonyms for regulated environments where author identities are sensitive in CI artifacts (SARIF, code-scanning uploads); `raw` shows full email addresses for public OSS repos. `ContributorEntry` gains a `format` discriminator so typed JSON consumers can branch without re-parsing the identifier. Configure the repo-wide default via `health.ownership.emailMode` in config.
-- **`health.ownership` config section** -- `botPatterns` (glob patterns matched against raw author emails; defaults cover `*\[bot\]*`, `dependabot*`, `renovate*`, `github-actions*`, `svc-*`, `*-service-account*` — `*noreply*` is deliberately NOT a default because it would filter real human contributors using GitHub's privacy-default email format), `emailMode` (raw/handle/hash).
+- **`health.ownership` config section** -- `botPatterns` (glob patterns matched against raw author emails; defaults cover `*\[bot\]*`, `dependabot*`, `renovate*`, `github-actions*`, `svc-*`, `*-service-account*` , `*noreply*` is deliberately NOT a default because it would filter real human contributors using GitHub's privacy-default email format), `emailMode` (raw/handle/hash).
 - **Ownership signals in MCP `check_health` tool** -- new `ownership: bool` and `ownership_email_mode: "raw"|"handle"|"hash"` params (typed enum so JSON Schema constrains input at the agent layer). Tool description updated.
 
 ### Changed
@@ -275,8 +5942,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **`production: true` no longer excludes Angular `app.config.ts`** -- the `**/*.config.*` production exclude pattern was too broad, matching Angular's `src/app/app.config.ts` (a runtime application file) and breaking the entire import chain. Narrowed to `*.config.*` (root-anchored) with `literal_separator(true)` so nested config files in `src/` are preserved. Also added `app.config.ts` and `app.config.server.ts` to the Angular plugin's `always_used` list as defense-in-depth. ([#111](https://github.com/fallow-rs/fallow/issues/111))
-- **Health test no longer fails with global git signing config** -- isolated temp repo git operations from global config (`GIT_CONFIG_GLOBAL=/dev/null`) to prevent commit signing requirements from breaking the `--changed-since` integration test.
-
 ## [2.30.0] - 2026-04-12
 
 ### Added
@@ -308,7 +5973,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **`` html`...` `` tagged template literal asset references** -- `<script src="...">` and `<link rel="stylesheet|modulepreload" href="...">` inside the `html` tagged template literal (used by [Hono](https://hono.dev) via `hono/html`, [lit-html](https://lit.dev), and [htm](https://github.com/developit/htm)) now emit `SideEffect` imports via a new `visit_tagged_template_expression` override, mirroring the JSX `<script src>` / `<link href>` fix shipped in 2.28.1. The bare identifier tag `html` is matched only — `css`, `sql`, `gql`, `styled.div`, and member or call expressions are deliberately ignored so unrelated tagged templates in the same file are never misread as HTML. Each template quasi is scanned independently with the same regex pipeline used by the HTML file parser (extracted into a shared `collect_asset_refs` helper), so an asset reference split across an interpolation boundary (`` html`<script src="${base}/app.js">` ``) is skipped rather than producing a garbled, unresolvable specifier. Addresses till's follow-up comment on [#105](https://github.com/fallow-rs/fallow/issues/105) where `.ts` Hono layouts using the `html` tagged template (rather than JSX) still flagged sibling `static/*.js` files as unused.
+- **`` html`...` `` tagged template literal asset references** -- `<script src="...">` and `<link rel="stylesheet|modulepreload" href="...">` inside the `html` tagged template literal (used by [Hono](https://hono.dev) via `hono/html`, [lit-html](https://lit.dev), and [htm](https://github.com/developit/htm)) now emit `SideEffect` imports via a new `visit_tagged_template_expression` override, mirroring the JSX `<script src>` / `<link href>` fix shipped in 2.28.1. The bare identifier tag `html` is matched only , `css`, `sql`, `gql`, `styled.div`, and member or call expressions are deliberately ignored so unrelated tagged templates in the same file are never misread as HTML. Each template quasi is scanned independently with the same regex pipeline used by the HTML file parser (extracted into a shared `collect_asset_refs` helper), so an asset reference split across an interpolation boundary (`` html`<script src="${base}/app.js">` ``) is skipped rather than producing a garbled, unresolvable specifier. Addresses till's follow-up comment on [#105](https://github.com/fallow-rs/fallow/issues/105) where `.ts` Hono layouts using the `html` tagged template (rather than JSX) still flagged sibling `static/*.js` files as unused.
 
 ## [2.28.1] - 2026-04-11
 
@@ -610,8 +6275,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [2.18.2] - 2026-04-07
 
 ### Fixed
-
-- **npm publish CI** -- pinned `npm@10` in the release workflow to avoid `promise-retry` module error on Node 22 runners that broke npm package publishing.
 
 ## [2.18.1] - 2026-04-07
 
@@ -1045,148 +6708,145 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Comprehensive test coverage** — 1,200+ new tests across all crates bringing total to 4,700+ unit/integration tests, 101 snapshot tests, 30 property-based tests, 14 doc tests, and 7 conformance fixtures, achieving 91% line coverage
-- **CJS `module.exports.foo` detection** — individual property assignments like `module.exports.foo = fn` are now extracted as named exports, closing ~60 missed findings on CJS-heavy projects
-- **Conformance test harness** — `tests/conformance/verify-fixtures.sh` and `verify-expected.py` provide automated expected-output verification for 7 analysis scenarios (barrel resolution, circular deps, suppression, type-only imports, and more)
+- **Comprehensive test coverage** , 1,200+ new tests across all crates bringing total to 4,700+ unit/integration tests, 101 snapshot tests, 30 property-based tests, 14 doc tests, and 7 conformance fixtures, achieving 91% line coverage
+- **CJS `module.exports.foo` detection** , individual property assignments like `module.exports.foo = fn` are now extracted as named exports, closing ~60 missed findings on CJS-heavy projects
+- **Conformance test harness** , `tests/conformance/verify-fixtures.sh` and `verify-expected.py` provide automated expected-output verification for 7 analysis scenarios (barrel resolution, circular deps, suppression, type-only imports, and more)
 
 ### Fixed
 
-- **Unreachable module export blindspot** — modules not reachable from entry points but containing a mix of used/unused exports were previously skipped entirely; now each export is evaluated individually
-- **Dead test file removed** — `unused_exports_tests.rs` (924 lines) was never compiled due to a missing module directive and contained a type mismatch; inline tests already covered all cases
+- **Unreachable module export blindspot** , modules not reachable from entry points but containing a mix of used/unused exports were previously skipped entirely; now each export is evaluated individually
+- **Dead test file removed** , `unused_exports_tests.rs` (924 lines) was never compiled due to a missing module directive and contained a type mismatch; inline tests already covered all cases
 
 ## [2.3.0] - 2026-03-27
 
 ### Added
 
-- **GitLab CI rich MR comments** — new `FALLOW_COMMENT` and `FALLOW_REVIEW` variables enable rich MR summary comments with collapsible sections and inline review discussions with suggestion blocks, matching the GitHub Action's review quality
-- **GitLab inline review discussions** — posts findings as positioned `DiffNote` discussions on MR diffs with "Why this matters" sections, actionable fix steps, docs links, and one-click suppress instructions
-- **GitLab suggestion blocks** — unused export findings include `suggestion:-0+0` blocks for one-click `export` keyword removal directly in the MR diff
-- **Comment merging pipeline** — groups unused exports per file into single comments, deduplicates clone group findings, drops redundant refactoring targets, and merges same-line findings with numbered headers
-- **Auto `--changed-since` in GitLab MR context** — automatically scopes analysis to changed files using `CI_MERGE_REQUEST_DIFF_BASE_SHA` when running in merge request pipelines
-- **Package manager detection** — review comments and annotations now show correct install/uninstall commands (`npm uninstall`, `pnpm remove`, or `yarn remove`) based on lock file detection
-- **GitLab comment cleanup** — automatically removes previous fallow comments and discussions on re-runs to prevent comment spam
+- **GitLab CI rich MR comments** , new `FALLOW_COMMENT` and `FALLOW_REVIEW` variables enable rich MR summary comments with collapsible sections and inline review discussions with suggestion blocks, matching the GitHub Action's review quality
+- **GitLab inline review discussions** , posts findings as positioned `DiffNote` discussions on MR diffs with "Why this matters" sections, actionable fix steps, docs links, and one-click suppress instructions
+- **GitLab suggestion blocks** , unused export findings include `suggestion:-0+0` blocks for one-click `export` keyword removal directly in the MR diff
+- **Comment merging pipeline** , groups unused exports per file into single comments, deduplicates clone group findings, drops redundant refactoring targets, and merges same-line findings with numbered headers
+- **Auto `--changed-since` in GitLab MR context** , automatically scopes analysis to changed files using `CI_MERGE_REQUEST_DIFF_BASE_SHA` when running in merge request pipelines
+- **Package manager detection** , review comments and annotations now show correct install/uninstall commands (`npm uninstall`, `pnpm remove`, or `yarn remove`) based on lock file detection
+- **GitLab comment cleanup** , automatically removes previous fallow comments and discussions on re-runs to prevent comment spam
 
 ### Changed
 
-- **GitLab CI template modularized** — inline jq scripts extracted to separate files in `ci/jq/` and `ci/scripts/`, downloaded at runtime for maintainability
-- **`diff_refs` from MR API** — GitLab inline discussions now fetch `base_sha`, `start_sha`, `head_sha` from the MR API instead of CI environment variables, matching the ictu-mcp pattern and improving positioning accuracy after rebases
-- **Suggestion block ANSI-C quoting** — GitHub Action suggestion blocks fixed to use `$'...'` quoting for correct newline rendering
+- **GitLab CI template modularized** , inline jq scripts extracted to separate files in `ci/jq/` and `ci/scripts/`, downloaded at runtime for maintainability
+- **`diff_refs` from MR API** , GitLab inline discussions now fetch `base_sha`, `start_sha`, `head_sha` from the MR API instead of CI environment variables, matching the ictu-mcp pattern and improving positioning accuracy after rebases
+- **Suggestion block ANSI-C quoting** , GitHub Action suggestion blocks fixed to use `$'...'` quoting for correct newline rendering
 
 ### Fixed
 
-- **Subshell variable loss** — review comment counters (`POSTED`/`SKIPPED`) now use process substitution instead of pipe subshell to correctly track posting results
-- **Comment body assignment** — `comment.sh` separates jq execution from string concatenation to correctly detect jq failures
-- **Combined mode null arrays** — `jq -s 'add'` replaced with explicit `jq -n --argjson` to prevent null output when all comment arrays are empty
+- **Subshell variable loss** , review comment counters (`POSTED`/`SKIPPED`) now use process substitution instead of pipe subshell to correctly track posting results
+- **Comment body assignment** , `comment.sh` separates jq execution from string concatenation to correctly detect jq failures
+- **Combined mode null arrays** , `jq -s 'add'` replaced with explicit `jq -n --argjson` to prevent null output when all comment arrays are empty
 
 ## [2.2.3] - 2026-03-27
 
 ### Added
 
-- **Auto-changed-since for PRs** — GitHub Action automatically scopes analysis to changed files in pull requests using `--changed-since` with the merge base, eliminating the need for manual configuration
-- **Enriched PR annotations** — inline annotations now include actionable context (export names, dependency names, file paths) with improved formatting for duplication annotations
-- **VS Code status bar and tree views** — expanded extension UX with project health status bar, issue tree view, and pnpm workspace support
-- **`analyze_with_parse_result` API** — new public function in `fallow-core` that accepts pre-parsed modules, enabling callers to skip the parsing stage when modules are already available
+- **Auto-changed-since for PRs** , GitHub Action automatically scopes analysis to changed files in pull requests using `--changed-since` with the merge base, eliminating the need for manual configuration
+- **Enriched PR annotations** , inline annotations now include actionable context (export names, dependency names, file paths) with improved formatting for duplication annotations
+- **VS Code status bar and tree views** , expanded extension UX with project health status bar, issue tree view, and pnpm workspace support
+- **`analyze_with_parse_result` API** , new public function in `fallow-core` that accepts pre-parsed modules, enabling callers to skip the parsing stage when modules are already available
 
 ### Changed
 
-- **Health pipeline optimization** — `fallow health --file-scores` no longer runs the analysis pipeline twice; pre-parsed modules are reused via the new `analyze_with_parse_result` API
-- **O(1) tooling dependency lookups** — `GENERAL_TOOLING_EXACT` (76 entries) converted from linear slice scan to `OnceLock<FxHashSet>` for constant-time lookups
-- **O(1) unused import binding lookups** — `ResolvedModule.unused_import_bindings` converted from `Vec<String>` to `FxHashSet<String>` in hot-path reference population
-- **Optimized member export referencing** — `mark_member_exports_referenced` now uses `FxHashSet<&str>` and avoids per-export `to_string()` allocation
-- **Report dispatcher unified** — new `ReportContext` struct replaces individual parameters across all 3 report dispatch functions for consistent signatures
-- **`define_plugin!` macro extended** — supports `resolve_config: imports_only` variant; Cypress, Commitlint, Remark plugins migrated
-- **Comprehensive code deduplication** — `emit_json()`, `plural()`, `build_json_envelope()`, shared `sample_results` test helper, fix module helpers, config parser shared traversal
+- **Health pipeline optimization** , `fallow health --file-scores` no longer runs the analysis pipeline twice; pre-parsed modules are reused via the new `analyze_with_parse_result` API
+- **O(1) tooling dependency lookups** , `GENERAL_TOOLING_EXACT` (76 entries) converted from linear slice scan to `OnceLock<FxHashSet>` for constant-time lookups
+- **O(1) unused import binding lookups** , `ResolvedModule.unused_import_bindings` converted from `Vec<String>` to `FxHashSet<String>` in hot-path reference population
+- **Optimized member export referencing** , `mark_member_exports_referenced` now uses `FxHashSet<&str>` and avoids per-export `to_string()` allocation
+- **Report dispatcher unified** , new `ReportContext` struct replaces individual parameters across all 3 report dispatch functions for consistent signatures
+- **`define_plugin!` macro extended** , supports `resolve_config: imports_only` variant; Cypress, Commitlint, Remark plugins migrated
+- **Comprehensive code deduplication** , `emit_json()`, `plural()`, `build_json_envelope()`, shared `sample_results` test helper, fix module helpers, config parser shared traversal
 
 ### Fixed
 
-- **Watch mode reload stability** — hardened debounce behavior and related cleanup
-- **Windows CI path normalization** — discovery tests now normalize path separators for cross-platform compatibility
-- **GitHub Action `pull_request_target` handling** — correctly detects and handles `pull_request_target` events in auto-changed-since logic
+- **Watch mode reload stability** , hardened debounce behavior and related cleanup
+- **Windows CI path normalization** , discovery tests now normalize path separators for cross-platform compatibility
+- **GitHub Action `pull_request_target` handling** , correctly detects and handles `pull_request_target` events in auto-changed-since logic
 
 ### Removed
 
-- **1,986 lines of dead code** — removed orphaned `crates/graph/src/graph/build/` directory that was never compiled (abandoned refactoring artifact)
+- **1,986 lines of dead code** , removed orphaned `crates/graph/src/graph/build/` directory that was never compiled (abandoned refactoring artifact)
 
 ## [2.2.2] - 2026-03-27
 
 ### Added
 
-- **CodeClimate output format** — `--format codeclimate` for GitLab Code Quality integration, with deterministic FNV-1a fingerprints and proper severity mapping
-- **GitHub Actions inline annotations** — `--format annotations` emits `::warning` / `::error` workflow commands for inline PR annotations without any Action dependency
-- **Real-world conformance benchmarks** — CI now validates against 8 real-world projects (zod, preact, vite, next.js, angular, nuxt, svelte, vue-core)
-- **~283 new tests** — comprehensive coverage for complexity metrics, JSDoc @public tags, config extends/merge, re-export chain propagation, dynamic import patterns, declaration extraction, visitor helpers, analysis predicates, cycle detection, and file discovery
+- **CodeClimate output format** , `--format codeclimate` for GitLab Code Quality integration, with deterministic FNV-1a fingerprints and proper severity mapping
+- **GitHub Actions inline annotations** , `--format annotations` emits `::warning` / `::error` workflow commands for inline PR annotations without any Action dependency
+- **Real-world conformance benchmarks** , CI now validates against 8 real-world projects (zod, preact, vite, next.js, angular, nuxt, svelte, vue-core)
+- **~283 new tests** , comprehensive coverage for complexity metrics, JSDoc @public tags, config extends/merge, re-export chain propagation, dynamic import patterns, declaration extraction, visitor helpers, analysis predicates, cycle detection, and file discovery
 
 ### Fixed
 
-- **CodeClimate fingerprint stability** — use FNV-1a instead of `DefaultHasher` for deterministic cross-run fingerprints; include group index in duplication fingerprints
-- **Circular dependency annotations** — sanitize chain strings and guard against empty files in annotation output
-- **npm/pnpm install stdout leak** — suppress package manager install stdout that leaked into JSON report output
-- **Duplicate exports comparison** — handle dict locations correctly in `duplicate_exports` comparison
+- **CodeClimate fingerprint stability** , use FNV-1a instead of `DefaultHasher` for deterministic cross-run fingerprints; include group index in duplication fingerprints
+- **Circular dependency annotations** , sanitize chain strings and guard against empty files in annotation output
+- **npm/pnpm install stdout leak** , suppress package manager install stdout that leaked into JSON report output
+- **Duplicate exports comparison** , handle dict locations correctly in `duplicate_exports` comparison
 
 ## [2.2.1] - 2026-03-26
 
 ### Changed
 
-- **Parallel workspace processing** — workspace entry point discovery and plugin runs now execute in parallel using rayon, with sequential merge for deterministic results. Up to 21% faster on monorepos (vite: 507ms → 399ms, next.js: 1532ms → 1371ms)
-- **Lazy canonicalize** — skips upfront bulk `canonicalize()` of all source files when the project root is already canonical (common case). A `OnceLock`-based fallback handles the rare intra-project symlink edge case on demand. Saves up to 148ms on 20k-file projects
-- **O(1) plugin dedup** — workspace plugin name and virtual module prefix deduplication uses `FxHashSet` instead of `Vec::contains` (O(n²) → O(n))
+- **Parallel workspace processing** , workspace entry point discovery and plugin runs now execute in parallel using rayon, with sequential merge for deterministic results. Up to 21% faster on monorepos (vite: 507ms → 399ms, next.js: 1532ms → 1371ms)
+- **Lazy canonicalize** , skips upfront bulk `canonicalize()` of all source files when the project root is already canonical (common case). A `OnceLock`-based fallback handles the rare intra-project symlink edge case on demand. Saves up to 148ms on 20k-file projects
+- **O(1) plugin dedup** , workspace plugin name and virtual module prefix deduplication uses `FxHashSet` instead of `Vec::contains` (O(n²) → O(n))
 
 ### Fixed
 
-- **Benchmark accuracy** — benchmark script now correctly excludes knip runs that crash (exit code 2) instead of counting crash timings as valid results. Also guards against null status from timeouts
-- **Updated benchmark numbers** — rebenchmarked all projects with honest error handling. Speed claims updated: 5-41x vs knip v5 (was 3-36x), 2-18x vs knip v6 (was 2-14x), 8-26x vs jscpd (was 20-33x)
+- **Benchmark accuracy** , benchmark script now correctly excludes knip runs that crash (exit code 2) instead of counting crash timings as valid results. Also guards against null status from timeouts
+- **Updated benchmark numbers** , rebenchmarked all projects with honest error handling. Speed claims updated: 5-41x vs knip v5 (was 3-36x), 2-18x vs knip v6 (was 2-14x), 8-26x vs jscpd (was 20-33x)
 
 ## [2.2.0] - 2026-03-26
 
 ### Added
 
-- **Efficiency score** — refactoring targets now include an `efficiency` field (`priority / effort`) and are sorted by efficiency descending, surfacing quick wins first
-- **Confidence levels** — each target includes a `confidence` field (`high`/`medium`/`low`) based on data source reliability: `high` for graph/AST analysis, `medium` for heuristic thresholds, `low` for git-dependent recommendations
-- **Adaptive thresholds** — fan-in/fan-out normalization uses percentile-based thresholds (p95/p90/p75/p25) from the project's distribution instead of hardcoded constants, with floors to prevent degenerate values in small projects
-- **Target thresholds in JSON** — `target_thresholds` object in health JSON output exposes the computed adaptive thresholds for programmatic consumers
-- **Effort summary** — human output shows effort breakdown after the targets header (e.g., `16 low effort · 34 medium · 43 high`)
-- **Machine-parseable compact categories** — compact output uses underscore-delimited category labels (`circular_dep`, `dead_code`) instead of space-separated labels
+- **Efficiency score** , refactoring targets now include an `efficiency` field (`priority / effort`) and are sorted by efficiency descending, surfacing quick wins first
+- **Confidence levels** , each target includes a `confidence` field (`high`/`medium`/`low`) based on data source reliability: `high` for graph/AST analysis, `medium` for heuristic thresholds, `low` for git-dependent recommendations
+- **Adaptive thresholds** , fan-in/fan-out normalization uses percentile-based thresholds (p95/p90/p75/p25) from the project's distribution instead of hardcoded constants, with floors to prevent degenerate values in small projects
+- **Target thresholds in JSON** , `target_thresholds` object in health JSON output exposes the computed adaptive thresholds for programmatic consumers
+- **Effort summary** , human output shows effort breakdown after the targets header (e.g., `16 low effort · 34 medium · 43 high`)
+- **Machine-parseable compact categories** , compact output uses underscore-delimited category labels (`circular_dep`, `dead_code`) instead of space-separated labels
 
 ### Changed
 
-- **Human output: efficiency as primary score** — the hero number is now efficiency (sort key), with priority shown as a dimmed secondary value
-- **Human output: labeled metadata** — effort and confidence on line 2 are now prefixed (`effort:low · confidence:high`) for self-documenting output
-- **Markdown table: 5 columns** — reduced from 7 to 5 columns by merging effort/confidence and dropping the separate priority column
-- **SARIF messages** — now include priority, efficiency, and confidence values
+- **Human output: efficiency as primary score** , the hero number is now efficiency (sort key), with priority shown as a dimmed secondary value
+- **Human output: labeled metadata** , effort and confidence on line 2 are now prefixed (`effort:low · confidence:high`) for self-documenting output
+- **Markdown table: 5 columns** , reduced from 7 to 5 columns by merging effort/confidence and dropping the separate priority column
+- **SARIF messages** , now include priority, efficiency, and confidence values
 
 ### Fixed
 
-- **Cycle path deduplication** — `evidence.cycle_path` no longer contains duplicate entries when a file participates in multiple cycles
-- **GitLab CI template** — uses Alpine image and detects package manager correctly
-- **Benchmark alert threshold** — corrected for `customBiggerIsBetter` benchmarks
+- **Cycle path deduplication** , `evidence.cycle_path` no longer contains duplicate entries when a file participates in multiple cycles
+- **GitLab CI template** , uses Alpine image and detects package manager correctly
+- **Benchmark alert threshold** , corrected for `customBiggerIsBetter` benchmarks
 - **SARIF version redaction** in test fixtures
-- **MCP analyze tool description** — corrected to match `dead-code` command
+- **MCP analyze tool description** , corrected to match `dead-code` command
 
 ## [2.1.0] - 2026-03-25
 
 ### Added
 
-- **GitLab CI template** (`ci/gitlab-ci.yml`) — includable template with full feature parity to the GitHub Action: Code Quality reports (CodeClimate format) for inline MR annotations, MR comment summaries, incremental caching, and all fallow commands/options via `FALLOW_*` variables
-- **GitHub Action: test workflow** — CI validation for SARIF, JSON, dupes, fix, zero-issues, and PR comment scenarios
-
 ### Fixed
 
-- **`list --no-cache`** — the `--no-cache` flag now works correctly with the `list` command
-- **GitHub Action: `check` → `dead-code` rename** — completed the rename across all case statements, SARIF fallback, and job summary dispatch
+- **`list --no-cache`** , the `--no-cache` flag now works correctly with the `list` command
+- **GitHub Action: `check` → `dead-code` rename** , completed the rename across all case statements, SARIF fallback, and job summary dispatch
 - **`dead-code` subcommand** in backwards-compatibility stable interface list
 
 ## [2.0.1] - 2026-03-25
 
 ### Added
 
-- **MCP server: all global CLI flags exposed** — `--baseline`, `--save-baseline`, `--no-cache`, `--threads` now available on all MCP tools; `--config` gap-filled on `find_dupes`/`check_health`; `--workspace` gap-filled on `find_dupes`/`fix_preview`/`fix_apply`
-- **GitHub Action: 13 new inputs** — `no-cache`, `threads`, `only`, `skip`, `cross-language`, `file-scores`, `hotspots`, `targets`, `complexity`, `since`, `min-commits`, `save-snapshot`, `issue-types`
-- **GitHub Action: `dead-code` alias support** — all case statements now handle both `dead-code` and legacy `check` command names
-- **GitHub Action: bare invocation support** — combined issue count extraction, job summary, and PR comments work when no command is specified
+- **MCP server: all global CLI flags exposed** , `--baseline`, `--save-baseline`, `--no-cache`, `--threads` now available on all MCP tools; `--config` gap-filled on `find_dupes`/`check_health`; `--workspace` gap-filled on `find_dupes`/`fix_preview`/`fix_apply`
+- **GitHub Action: 13 new inputs** , `no-cache`, `threads`, `only`, `skip`, `cross-language`, `file-scores`, `hotspots`, `targets`, `complexity`, `since`, `min-commits`, `save-snapshot`, `issue-types`
+- **GitHub Action: `dead-code` alias support** , all case statements now handle both `dead-code` and legacy `check` command names
+- **GitHub Action: bare invocation support** , combined issue count extraction, job summary, and PR comments work when no command is specified
 
 ### Fixed
 
-- **GitHub Action: `fix` without `--dry-run` now adds `--yes`** — previously would hang in CI waiting for TTY input
+- **GitHub Action: `fix` without `--dry-run` now adds `--yes`** , previously would hang in CI waiting for TTY input
 
 ## [2.0.0] - 2026-03-25
 
@@ -1206,7 +6866,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`dead-code` command alias**: `fallow dead-code` as the canonical name for dead code analysis (replaces `check`)
 - **`--ci` on all commands**: `fallow dupes --ci` and `fallow health --ci` now work (SARIF + quiet + fail-on-issues)
 - **Vital signs snapshots** (`fallow health --save-snapshot`): save codebase health metrics for trend tracking
-- **Execute/run split**: internal refactor enabling combined mode — `execute_check`, `execute_dupes`, `execute_health` return results without printing
+- **Execute/run split**: internal refactor enabling combined mode , `execute_check`, `execute_dupes`, `execute_health` return results without printing
 
 ### Changed
 
@@ -1219,8 +6879,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Seven recommendation rules evaluated in priority order: urgent churn+complexity, break circular dependency, split high-impact file, remove dead code, extract complex functions, reduce coupling
   - Priority formula: `min(density,1)×30 + hotspot×25 + dead_code×20 + fan_in_norm×15 + fan_out_norm×10`
   - Contributing factors with raw `value` and `threshold` for programmatic use
-  - **Effort estimation** (`low`/`medium`/`high`) based on file size, function count, and fan-in — shown in all output formats
-  - **Evidence linking**: structured data for AI agents — unused export names, complex function names with line numbers, cycle member paths
+  - **Effort estimation** (`low`/`medium`/`high`) based on file size, function count, and fan-in , shown in all output formats
+  - **Evidence linking**: structured data for AI agents , unused export names, complex function names with line numbers, cycle member paths
   - **Baseline support**: `--save-baseline` / `--baseline` now includes refactoring targets for tracking progress over time
   - All five output formats: human (category · effort labels), JSON (with evidence), compact, markdown (Effort column), SARIF (warning-level findings)
   - MCP server: `targets` parameter on `check_health` tool
@@ -1485,7 +7145,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.3.0] - 2026-03-18
 
 ### Added
-- Production mode (`--production`) — excludes test/dev files, limits to production scripts, reports type-only imports
+- Production mode (`--production`) , excludes test/dev files, limits to production scripts, reports type-only imports
 - Clone families with refactoring suggestions (extract function/module)
 - Config schema generation (`fallow config-schema`) with `$schema` support for IDE autocomplete
 - Duplication baselines (`--save-baseline` / `--baseline`) for incremental CI adoption
@@ -1580,7 +7240,108 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `--changed-since` and `--fail-on-issues` for CI
 - Cross-workspace resolution for npm/yarn/pnpm workspaces
 
-[Unreleased]: https://github.com/fallow-rs/fallow/compare/v2.45.1...HEAD
+[Unreleased]: https://github.com/fallow-rs/fallow/compare/v3.21.0...HEAD
+[3.21.0]: https://github.com/fallow-rs/fallow/compare/v3.20.0...v3.21.0
+[3.20.0]: https://github.com/fallow-rs/fallow/compare/v3.19.0...v3.20.0
+[3.19.0]: https://github.com/fallow-rs/fallow/compare/v3.18.0...v3.19.0
+[3.18.0]: https://github.com/fallow-rs/fallow/compare/v3.17.0...v3.18.0
+[3.17.0]: https://github.com/fallow-rs/fallow/compare/v3.16.0...v3.17.0
+[3.16.0]: https://github.com/fallow-rs/fallow/compare/v3.15.0...v3.16.0
+[3.15.0]: https://github.com/fallow-rs/fallow/compare/v3.14.0...v3.15.0
+[3.14.0]: https://github.com/fallow-rs/fallow/compare/v3.13.0...v3.14.0
+[3.13.0]: https://github.com/fallow-rs/fallow/compare/v3.12.0...v3.13.0
+[3.12.0]: https://github.com/fallow-rs/fallow/compare/v3.11.0...v3.12.0
+[3.11.0]: https://github.com/fallow-rs/fallow/compare/v3.10.0...v3.11.0
+[3.10.0]: https://github.com/fallow-rs/fallow/compare/v3.9.1...v3.10.0
+[3.9.1]: https://github.com/fallow-rs/fallow/compare/v3.8.1...v3.9.1
+[3.8.1]: https://github.com/fallow-rs/fallow/compare/v3.8.0...v3.8.1
+[3.8.0]: https://github.com/fallow-rs/fallow/compare/v3.7.1...v3.8.0
+[3.7.1]: https://github.com/fallow-rs/fallow/compare/v3.7.0...v3.7.1
+[3.7.0]: https://github.com/fallow-rs/fallow/compare/v3.6.0...v3.7.0
+[3.6.0]: https://github.com/fallow-rs/fallow/compare/v3.5.1...v3.6.0
+[3.5.1]: https://github.com/fallow-rs/fallow/compare/v3.5.0...v3.5.1
+[3.5.0]: https://github.com/fallow-rs/fallow/compare/v3.4.2...v3.5.0
+[3.4.2]: https://github.com/fallow-rs/fallow/compare/v3.3.0...v3.4.2
+[3.3.0]: https://github.com/fallow-rs/fallow/compare/v3.2.0...v3.3.0
+[3.2.0]: https://github.com/fallow-rs/fallow/compare/v3.1.0...v3.2.0
+[3.1.0]: https://github.com/fallow-rs/fallow/compare/v3.0.0...v3.1.0
+[3.0.0]: https://github.com/fallow-rs/fallow/compare/v2.104.0...v3.0.0
+[2.104.0]: https://github.com/fallow-rs/fallow/compare/v2.103.0...v2.104.0
+[2.103.0]: https://github.com/fallow-rs/fallow/compare/v2.102.0...v2.103.0
+[2.102.0]: https://github.com/fallow-rs/fallow/compare/v2.101.0...v2.102.0
+[2.101.0]: https://github.com/fallow-rs/fallow/compare/v2.100.0...v2.101.0
+[2.100.0]: https://github.com/fallow-rs/fallow/compare/v2.99.0...v2.100.0
+[2.99.0]: https://github.com/fallow-rs/fallow/compare/v2.98.0...v2.99.0
+[2.98.0]: https://github.com/fallow-rs/fallow/compare/v2.97.0...v2.98.0
+[2.97.0]: https://github.com/fallow-rs/fallow/compare/v2.96.0...v2.97.0
+[2.96.0]: https://github.com/fallow-rs/fallow/compare/v2.95.0...v2.96.0
+[2.95.0]: https://github.com/fallow-rs/fallow/compare/v2.94.0...v2.95.0
+[2.94.0]: https://github.com/fallow-rs/fallow/compare/v2.93.0...v2.94.0
+[2.93.0]: https://github.com/fallow-rs/fallow/compare/v2.92.1...v2.93.0
+[2.92.1]: https://github.com/fallow-rs/fallow/compare/v2.91.0...v2.92.1
+[2.91.0]: https://github.com/fallow-rs/fallow/compare/v2.90.0...v2.91.0
+[2.90.0]: https://github.com/fallow-rs/fallow/compare/v2.89.0...v2.90.0
+[2.89.0]: https://github.com/fallow-rs/fallow/compare/v2.88.3...v2.89.0
+[2.88.3]: https://github.com/fallow-rs/fallow/compare/v2.88.2...v2.88.3
+[2.88.2]: https://github.com/fallow-rs/fallow/compare/v2.88.1...v2.88.2
+[2.88.1]: https://github.com/fallow-rs/fallow/compare/v2.88.0...v2.88.1
+[2.88.0]: https://github.com/fallow-rs/fallow/compare/v2.87.0...v2.88.0
+[2.87.0]: https://github.com/fallow-rs/fallow/compare/v2.86.0...v2.87.0
+[2.86.0]: https://github.com/fallow-rs/fallow/compare/v2.85.0...v2.86.0
+[2.85.0]: https://github.com/fallow-rs/fallow/compare/v2.84.0...v2.85.0
+[2.84.0]: https://github.com/fallow-rs/fallow/compare/v2.83.0...v2.84.0
+[2.83.0]: https://github.com/fallow-rs/fallow/compare/v2.82.0...v2.83.0
+[2.82.0]: https://github.com/fallow-rs/fallow/compare/v2.81.0...v2.82.0
+[2.81.0]: https://github.com/fallow-rs/fallow/compare/v2.80.0...v2.81.0
+[2.80.0]: https://github.com/fallow-rs/fallow/compare/v2.79.0...v2.80.0
+[2.79.0]: https://github.com/fallow-rs/fallow/compare/v2.78.1...v2.79.0
+[2.78.1]: https://github.com/fallow-rs/fallow/compare/v2.78.0...v2.78.1
+[2.78.0]: https://github.com/fallow-rs/fallow/compare/v2.77.0...v2.78.0
+[2.77.0]: https://github.com/fallow-rs/fallow/compare/v2.76.0...v2.77.0
+[2.76.0]: https://github.com/fallow-rs/fallow/compare/v2.75.0...v2.76.0
+[2.75.0]: https://github.com/fallow-rs/fallow/compare/v2.74.0...v2.75.0
+[2.74.0]: https://github.com/fallow-rs/fallow/compare/v2.73.0...v2.74.0
+[2.73.0]: https://github.com/fallow-rs/fallow/compare/v2.72.0...v2.73.0
+[2.72.0]: https://github.com/fallow-rs/fallow/compare/v2.71.1...v2.72.0
+[2.71.1]: https://github.com/fallow-rs/fallow/compare/v2.71.0...v2.71.1
+[2.71.0]: https://github.com/fallow-rs/fallow/compare/v2.70.0...v2.71.0
+[2.70.0]: https://github.com/fallow-rs/fallow/compare/v2.69.0...v2.70.0
+[2.69.0]: https://github.com/fallow-rs/fallow/compare/v2.68.0...v2.69.0
+[2.68.0]: https://github.com/fallow-rs/fallow/compare/v2.67.0...v2.68.0
+[2.67.0]: https://github.com/fallow-rs/fallow/compare/v2.66.2...v2.67.0
+[2.66.2]: https://github.com/fallow-rs/fallow/compare/v2.66.1...v2.66.2
+[2.66.1]: https://github.com/fallow-rs/fallow/compare/v2.66.0...v2.66.1
+[2.66.0]: https://github.com/fallow-rs/fallow/compare/v2.65.0...v2.66.0
+[2.65.0]: https://github.com/fallow-rs/fallow/compare/v2.64.0...v2.65.0
+[2.64.0]: https://github.com/fallow-rs/fallow/compare/v2.63.0...v2.64.0
+[2.63.0]: https://github.com/fallow-rs/fallow/compare/v2.62.0...v2.63.0
+[2.62.0]: https://github.com/fallow-rs/fallow/compare/v2.61.0...v2.62.0
+[2.61.0]: https://github.com/fallow-rs/fallow/compare/v2.60.0...v2.61.0
+[2.60.0]: https://github.com/fallow-rs/fallow/compare/v2.59.0...v2.60.0
+[2.59.0]: https://github.com/fallow-rs/fallow/compare/v2.58.0...v2.59.0
+[2.58.0]: https://github.com/fallow-rs/fallow/compare/v2.57.0...v2.58.0
+[2.57.0]: https://github.com/fallow-rs/fallow/compare/v2.56.0...v2.57.0
+[2.56.0]: https://github.com/fallow-rs/fallow/compare/v2.55.0...v2.56.0
+[2.55.0]: https://github.com/fallow-rs/fallow/compare/v2.54.3...v2.55.0
+[2.54.3]: https://github.com/fallow-rs/fallow/compare/v2.54.2...v2.54.3
+[2.54.2]: https://github.com/fallow-rs/fallow/compare/v2.54.1...v2.54.2
+[2.54.1]: https://github.com/fallow-rs/fallow/compare/v2.54.0...v2.54.1
+[2.54.0]: https://github.com/fallow-rs/fallow/compare/v2.53.0...v2.54.0
+[2.53.0]: https://github.com/fallow-rs/fallow/compare/v2.52.2...v2.53.0
+[2.52.2]: https://github.com/fallow-rs/fallow/compare/v2.52.1...v2.52.2
+[2.52.1]: https://github.com/fallow-rs/fallow/compare/v2.52.0...v2.52.1
+[2.52.0]: https://github.com/fallow-rs/fallow/compare/v2.51.0...v2.52.0
+[2.51.0]: https://github.com/fallow-rs/fallow/compare/v2.50.0...v2.51.0
+[2.50.0]: https://github.com/fallow-rs/fallow/compare/v2.49.0...v2.50.0
+[2.49.0]: https://github.com/fallow-rs/fallow/compare/v2.48.5...v2.49.0
+[2.48.5]: https://github.com/fallow-rs/fallow/compare/v2.48.4...v2.48.5
+[2.48.4]: https://github.com/fallow-rs/fallow/compare/v2.48.3...v2.48.4
+[2.48.3]: https://github.com/fallow-rs/fallow/compare/v2.48.2...v2.48.3
+[2.48.2]: https://github.com/fallow-rs/fallow/compare/v2.48.1...v2.48.2
+[2.48.1]: https://github.com/fallow-rs/fallow/compare/v2.48.0...v2.48.1
+[2.48.0]: https://github.com/fallow-rs/fallow/compare/v2.47.1...v2.48.0
+[2.47.1]: https://github.com/fallow-rs/fallow/compare/v2.47.0...v2.47.1
+[2.47.0]: https://github.com/fallow-rs/fallow/compare/v2.46.0...v2.47.0
 [2.46.0]: https://github.com/fallow-rs/fallow/compare/v2.45.1...v2.46.0
 [2.45.1]: https://github.com/fallow-rs/fallow/compare/v2.45.0...v2.45.1
 [2.45.0]: https://github.com/fallow-rs/fallow/compare/v2.44.2...v2.45.0

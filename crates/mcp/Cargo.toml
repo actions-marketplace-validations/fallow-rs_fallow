@@ -12,17 +12,32 @@ categories.workspace = true
 description = "MCP server for fallow codebase intelligence (exposes fallow as typed tools to AI agents)"
 readme = "../../README.md"
 
+[lib]
+name = "fallow_mcp"
+path = "src/lib.rs"
+
 [[bin]]
 name = "fallow-mcp"
 path = "src/main.rs"
 
 [dependencies]
-rmcp = { version = "1.4", features = ["transport-io"] }
+rmcp = { version = "3.1", features = ["transport-io"] }
+rquickjs = "0.12"
+fallow-api = { workspace = true, features = ["schema"] }
+fallow-process = { workspace = true, features = ["tokio"] }
+fallow-types.workspace = true
 tokio.workspace = true
 serde.workspace = true
-serde_json.workspace = true
+serde_json = { workspace = true, features = ["preserve_order"] }
 schemars.workspace = true
+tempfile.workspace = true
 tracing-subscriber.workspace = true
+
+[dev-dependencies]
+regex.workspace = true
+
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys.workspace = true
 
 [lints]
 workspace = true

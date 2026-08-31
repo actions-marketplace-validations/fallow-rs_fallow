@@ -1,7 +1,5 @@
 use super::Tolerance;
 
-// ── Regression outcome ──────────────────────────────────────────
-
 /// Result of a regression check.
 #[derive(Debug)]
 pub enum RegressionOutcome {
@@ -31,7 +29,8 @@ impl RegressionOutcome {
 
     /// Build a JSON value for the regression outcome (added to JSON output envelope).
     #[must_use]
-    pub fn to_json(&self) -> serde_json::Value {
+    #[cfg(test)]
+    pub(crate) fn to_json(&self) -> serde_json::Value {
         match self {
             Self::Pass {
                 baseline_total,
@@ -106,17 +105,13 @@ pub fn print_regression_outcome(outcome: &RegressionOutcome) {
                 eprintln!("  {name}: {sign}{d}");
             }
         }
-        RegressionOutcome::Skipped { .. } => {
-            // Warning already printed in compare_* functions
-        }
+        RegressionOutcome::Skipped { .. } => {}
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ── RegressionOutcome::to_json ──────────────────────────────────
 
     #[test]
     fn pass_outcome_json() {
@@ -155,8 +150,6 @@ mod tests {
         assert_eq!(json["exceeded"], false);
     }
 
-    // ── Tolerance display in regression messages ────────────────────
-
     #[test]
     fn regression_outcome_is_failure() {
         let pass = RegressionOutcome::Pass {
@@ -176,8 +169,6 @@ mod tests {
         let skipped = RegressionOutcome::Skipped { reason: "test" };
         assert!(!skipped.is_failure());
     }
-
-    // ── RegressionOutcome JSON with absolute tolerance ──────────────
 
     #[test]
     fn exceeded_outcome_json_absolute() {
@@ -206,15 +197,12 @@ mod tests {
         assert_eq!(json["exceeded"], false);
     }
 
-    // ── print_regression_outcome ────────────────────────────────────
-
     #[test]
     fn print_pass_outcome_does_not_panic() {
         let outcome = RegressionOutcome::Pass {
             baseline_total: 10,
             current_total: 8,
         };
-        // Just verify it doesn't panic — output goes to stderr
         print_regression_outcome(&outcome);
     }
 

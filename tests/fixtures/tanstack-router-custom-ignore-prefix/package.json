@@ -1,0 +1,9 @@
+{
+  "name": "tanstack-router-custom-ignore-prefix",
+  "dependencies": {
+    "@tanstack/react-router": "1.0.0",
+    "@tanstack/react-start": "1.0.0",
+    "@tanstack/router-plugin": "1.0.0",
+    "vite": "1.0.0"
+  }
+}

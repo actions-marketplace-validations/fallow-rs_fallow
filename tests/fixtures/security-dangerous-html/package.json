@@ -1,0 +1,10 @@
+{
+  "name": "security-dangerous-html-fixture",
+  "version": "0.0.0",
+  "private": true,
+  "dependencies": {
+    "dompurify": "3.2.6",
+    "isomorphic-dompurify": "2.25.0",
+    "react": "19.0.0"
+  }
+}

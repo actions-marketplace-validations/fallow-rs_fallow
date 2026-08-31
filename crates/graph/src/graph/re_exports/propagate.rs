@@ -3,212 +3,1492 @@
 //! Handles both star (`export * from`) and named (`export { foo } from`) re-exports,
 //! including entry-point special cases where exports are consumed externally.
 
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
+
+#[cfg(test)]
+use std::cell::Cell;
 
 use fallow_types::discover::FileId;
-use fallow_types::extract::{ExportName, VisibilityTag};
+use fallow_types::extract::{ExportName, ModuleLoadMechanism, VisibilityTag};
 
-use crate::graph::types::{ExportSymbol, ModuleNode, ReferenceKind, SymbolReference};
+use crate::graph::effective_exports::{
+    DeclarationSlotQuery, EffectiveExportBinding, EffectiveExportIndex, EffectiveExportResolution,
+    ExportNamespace,
+};
+use crate::graph::effective_re_exports::InternedEffectiveDeclarationRoute;
+use crate::graph::types::{
+    ExportSymbol, ModuleNode, ReferenceKind, ReferencePathInterner, RoutedReference,
+    RoutedReferenceKey, SymbolReference,
+};
 use crate::graph::{Edge, ImportedName};
+use crate::resolve::ResolvedModule;
 
-/// Handle `export * from './source'` — propagate named imports through to the source module.
+#[cfg(test)]
+thread_local! {
+    static STAR_REFERENCE_SET_REBUILDS: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(super) fn count_star_reference_set_rebuilds<T>(run: impl FnOnce() -> T) -> (T, usize) {
+    STAR_REFERENCE_SET_REBUILDS.set(0);
+    let result = run();
+    let rebuilds = STAR_REFERENCE_SET_REBUILDS.get();
+    (result, rebuilds)
+}
+
+/// Handle `export * from './source'`: propagate named imports through to the source module.
 ///
 /// Star re-exports don't create named `ExportSymbol` entries on the barrel. Instead we look
 /// at which named imports other modules make from the barrel and propagate each to the
 /// matching export in the source module.
 ///
 /// Returns `true` if any new references were added.
-pub(in crate::graph) fn propagate_star_re_export(
-    modules: &mut [ModuleNode],
-    edges: &[Edge],
-    edges_by_target: &rustc_hash::FxHashMap<FileId, Vec<usize>>,
-    barrel_id: FileId,
-    barrel_idx: usize,
-    source_idx: usize,
-    entry_star_targets: &FxHashSet<FileId>,
-) -> bool {
-    // Entry point barrels with star re-exports: all source exports are
-    // transitively exposed to external consumers — mark them as used.
-    // Also applies to barrels that are themselves star-re-exported from an
-    // entry point (e.g., `types/index.ts` does `export * from 'Component.vue'`
-    // and the package entry does `export * from './types'`). Without this,
-    // types accessible only via multi-level star re-export chains get zero
-    // references and are falsely reported as unused.
+pub(in crate::graph) struct StarReExportPropagation<'a> {
+    pub(in crate::graph) modules: &'a mut [ModuleNode],
+    pub(in crate::graph) edges: &'a [Edge],
+    pub(in crate::graph) edges_by_target: &'a FxHashMap<FileId, Vec<usize>>,
+    pub(in crate::graph) binding_usage: &'a ImportBindingUsageIndex,
+    pub(in crate::graph) effective_exports: &'a EffectiveExportIndex,
+    pub(in crate::graph) barrel_id: FileId,
+    pub(in crate::graph) barrel_idx: usize,
+    pub(in crate::graph) source_id: FileId,
+    pub(in crate::graph) source_idx: usize,
+    pub(in crate::graph) entry_star_targets: &'a FxHashSet<FileId>,
+    pub(in crate::graph) triggering_is_type_only: bool,
+    pub(in crate::graph) synthetic_stubs: &'a mut FxHashSet<(FileId, String, bool)>,
+    pub(in crate::graph) reference_paths: &'a mut ReferencePathInterner,
+}
+
+pub(in crate::graph) fn propagate_star_re_export(input: StarReExportPropagation<'_>) -> bool {
+    let StarReExportPropagation {
+        modules,
+        edges,
+        edges_by_target,
+        binding_usage,
+        effective_exports,
+        barrel_id,
+        barrel_idx,
+        source_id,
+        source_idx,
+        entry_star_targets,
+        triggering_is_type_only,
+        synthetic_stubs,
+        reference_paths,
+    } = input;
+
     if modules[barrel_idx].is_entry_point()
         || entry_star_targets.contains(&modules[barrel_idx].file_id)
     {
-        return propagate_entry_point_star(modules, barrel_id, source_idx);
+        return propagate_entry_point_star(EntryPointStarPropagation {
+            modules,
+            barrel_id,
+            source_idx,
+            source_id,
+            effective_exports,
+            triggering_is_type_only,
+            reference_paths,
+        });
     }
 
-    // Collect named imports that target the barrel using the pre-built reverse index.
-    // Previously this scanned ALL edges O(E) per call — now O(incoming edges to barrel).
     let barrel_file_id = modules[barrel_idx].file_id;
-    let named_refs: Vec<(String, SymbolReference)> = edges_by_target
-        .get(&barrel_file_id)
-        .map(|indices| {
-            indices
-                .iter()
-                .flat_map(|&idx| {
-                    let edge = &edges[idx];
-                    edge.symbols.iter().filter_map(move |sym| {
-                        if let ImportedName::Named(name) = &sym.imported_name {
-                            Some((
-                                name.clone(),
-                                SymbolReference {
-                                    from_file: edge.source,
-                                    kind: ReferenceKind::NamedImport,
-                                    import_span: sym.import_span,
-                                },
-                            ))
-                        } else {
-                            None
-                        }
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    let refs_by_name = collect_star_refs_by_name(StarReferenceCollection {
+        modules,
+        edges,
+        edges_by_target,
+        binding_usage,
+        effective_exports,
+        barrel_file_id,
+        barrel_idx,
+        reference_paths,
+    });
 
-    // Collect barrel exports with references: one entry per export (not per reference).
-    // Previously this was O(exports × refs) String allocations; now O(exports_with_refs).
-    let barrel_refs: Vec<(String, Vec<SymbolReference>)> = modules[barrel_idx]
-        .exports
-        .iter()
-        .filter(|e| !e.references.is_empty())
-        .map(|e| (e.name.to_string(), e.references.clone()))
-        .collect();
-
-    // Check if the source module itself has star re-exports (for multi-level chains).
-    // If so, we may need to create synthetic ExportSymbol entries on it so
-    // that the next iteration can propagate names further down the chain.
     let source_has_star_re_exports = modules[source_idx]
         .re_exports
         .iter()
         .any(|re| re.exported_name == "*");
 
-    // Group all references by name: combine named edge imports with barrel export refs.
-    // This looks up each export in the source at most once instead of per-reference.
-    let mut refs_by_name: FxHashMap<String, Vec<SymbolReference>> = FxHashMap::default();
+    let matching_exports_by_name = build_named_export_index(&modules[source_idx]);
+
+    let mut changed = false;
+    let mut existing_references: FxHashSet<RoutedReferenceKey> = FxHashSet::default();
+    let source = &mut modules[source_idx];
+    for (name, refs) in &refs_by_name {
+        let type_resolves = effective_exports.resolves_through(
+            barrel_id,
+            name,
+            source_id,
+            name,
+            ExportNamespace::Type,
+        );
+        let value_resolves = effective_exports.resolves_through(
+            barrel_id,
+            name,
+            source_id,
+            name,
+            ExportNamespace::Value,
+        );
+        if !type_resolves && !value_resolves {
+            continue;
+        }
+        let matching_exports: &[usize] = matching_exports_by_name
+            .get(name.as_str())
+            .map_or(&[], Vec::as_slice);
+        changed |= apply_star_refs_to_source(ApplyStarRefs {
+            source: &mut *source,
+            name,
+            refs,
+            effective_exports,
+            type_resolves,
+            value_resolves,
+            matching_exports,
+            source_id,
+            triggering_is_type_only,
+            source_has_star_re_exports,
+            existing_references: &mut existing_references,
+            synthetic_stubs: &mut *synthetic_stubs,
+            reference_paths,
+        });
+    }
+    changed
+}
+
+/// Index the source module's named exports by name so the per-re-exported-name
+/// star propagation can look up matching exports in O(1) instead of rescanning
+/// `source.exports` once per name.
+///
+/// Issue #1843 follow-up: the removed per-name scan was O(names x source_exports)
+/// and re-ran on every fixpoint visit, dominating wide-barrel re-export
+/// resolution. The map is built once over the module's pre-existing exports;
+/// synthetic exports appended during propagation are always named after the name
+/// currently being processed (each name is visited exactly once), so they never
+/// need to appear in a later name's lookup. The result is therefore byte-identical
+/// to the exact-`ExportName::Named`-match, ascending-index scan it replaces.
+///
+/// Unlike `ExportNameIndex` (issue #2374), this map keeps a `"default"` key
+/// rather than folding it into a default slot. Star propagation never forwards
+/// `default`, and the `name == "default"` early returns in
+/// `collect_star_refs_by_name` and `apply_star_refs_to_source` mean the entry
+/// is never read, so the two indexes cannot disagree in practice.
+fn build_named_export_index(source: &ModuleNode) -> FxHashMap<String, Vec<usize>> {
+    let mut index: FxHashMap<String, Vec<usize>> =
+        FxHashMap::with_capacity_and_hasher(source.exports.len(), FxBuildHasher);
+    for (idx, export) in source.exports.iter().enumerate() {
+        if let ExportName::Named(name) = &export.name {
+            index.entry(name.clone()).or_default().push(idx);
+        }
+    }
+    index
+}
+
+/// Collect the per-name references that must propagate through a star
+/// re-export: named imports made directly from the barrel plus any references
+/// already attached to the barrel's own exports.
+struct StarReferenceCollection<'a> {
+    modules: &'a [ModuleNode],
+    edges: &'a [Edge],
+    edges_by_target: &'a FxHashMap<FileId, Vec<usize>>,
+    binding_usage: &'a ImportBindingUsageIndex,
+    effective_exports: &'a EffectiveExportIndex,
+    barrel_file_id: FileId,
+    barrel_idx: usize,
+    reference_paths: &'a mut ReferencePathInterner,
+}
+
+fn collect_star_refs_by_name(
+    input: StarReferenceCollection<'_>,
+) -> FxHashMap<String, Vec<RoutedReference>> {
+    let StarReferenceCollection {
+        modules,
+        edges,
+        edges_by_target,
+        binding_usage,
+        effective_exports,
+        barrel_file_id,
+        barrel_idx,
+        reference_paths,
+    } = input;
+    let named_refs = named_star_refs(
+        edges,
+        edges_by_target,
+        binding_usage,
+        effective_exports,
+        barrel_file_id,
+        reference_paths,
+    );
+    let barrel_refs = barrel_star_refs(&modules[barrel_idx]);
+
+    let mut refs_by_name: FxHashMap<String, Vec<RoutedReference>> = FxHashMap::default();
     for (name, ref_item) in named_refs {
         refs_by_name.entry(name).or_default().push(ref_item);
     }
     for (name, refs) in barrel_refs {
         refs_by_name.entry(name).or_default().extend(refs);
     }
+    refs_by_name
+}
+
+fn named_star_refs(
+    edges: &[Edge],
+    edges_by_target: &FxHashMap<FileId, Vec<usize>>,
+    binding_usage: &ImportBindingUsageIndex,
+    effective_exports: &EffectiveExportIndex,
+    barrel_file_id: FileId,
+    reference_paths: &mut ReferencePathInterner,
+) -> Vec<(String, RoutedReference)> {
+    edges_by_target
+        .get(&barrel_file_id)
+        .map(|indices| {
+            indices
+                .iter()
+                .flat_map(|&idx| {
+                    named_refs_for_edge(
+                        &edges[idx],
+                        binding_usage,
+                        effective_exports,
+                        reference_paths,
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn named_refs_for_edge(
+    edge: &Edge,
+    binding_usage: &ImportBindingUsageIndex,
+    effective_exports: &EffectiveExportIndex,
+    reference_paths: &mut ReferencePathInterner,
+) -> Vec<(String, RoutedReference)> {
+    let mut references = Vec::new();
+    for symbol in &edge.symbols {
+        let ImportedName::Named(name) = &symbol.imported_name else {
+            continue;
+        };
+        if name == "default" {
+            continue;
+        }
+
+        let uses_type = symbol.is_type_only
+            || binding_usage.has_type_usage(edge.source, symbol.local_name.as_str());
+        let uses_value = !symbol.is_type_only
+            && binding_usage.has_value_usage(edge.source, symbol.local_name.as_str());
+        // A binding with no recorded usage keeps the value-space fallback unless
+        // the name exists only as a type on the barrel, in which case the value
+        // guess would attach nothing and drop the type export's only reference.
+        // Unused-import analysis still owns whether that site is reported.
+        let namespaces: &[ExportNamespace] = match (uses_type, uses_value) {
+            (true, true) => &[ExportNamespace::Type, ExportNamespace::Value],
+            (true, false) => &[ExportNamespace::Type],
+            (false, true) => &[ExportNamespace::Value],
+            (false, false) => unclassified_binding_namespaces(effective_exports, edge.target, name),
+        };
+        let path = reference_paths.direct(edge.target, symbol.mechanism);
+        for &namespace in namespaces {
+            references.push((
+                name.clone(),
+                RoutedReference {
+                    reference: SymbolReference {
+                        from_file: edge.source,
+                        kind: ReferenceKind::NamedImport,
+                        namespace,
+                        import_span: symbol.import_span,
+                    },
+                    path,
+                },
+            ));
+        }
+    }
+    references
+}
+
+/// Keep an unclassified binding on the only namespace that resolves, so a
+/// type-only name reached through the barrel still credits its export.
+fn unclassified_binding_namespaces(
+    effective_exports: &EffectiveExportIndex,
+    barrel: FileId,
+    name: &str,
+) -> &'static [ExportNamespace] {
+    if !resolves_uniquely(effective_exports, barrel, name, ExportNamespace::Value)
+        && resolves_uniquely(effective_exports, barrel, name, ExportNamespace::Type)
+    {
+        return &[ExportNamespace::Type];
+    }
+    &[ExportNamespace::Value]
+}
+
+fn resolves_uniquely(
+    effective_exports: &EffectiveExportIndex,
+    file_id: FileId,
+    name: &str,
+    namespace: ExportNamespace,
+) -> bool {
+    matches!(
+        effective_exports.resolve(file_id, name, namespace),
+        EffectiveExportResolution::Unique(_)
+    )
+}
+
+fn barrel_star_refs(module: &ModuleNode) -> Vec<(String, Vec<RoutedReference>)> {
+    module
+        .exports
+        .iter()
+        .filter(|export| !export.references.is_empty())
+        .map(|export| {
+            let name = export.name.to_string();
+            let refs = export.routed_references().collect();
+            (name, refs)
+        })
+        .collect()
+}
+
+struct ApplyStarRefs<'a> {
+    source: &'a mut ModuleNode,
+    name: &'a str,
+    refs: &'a [RoutedReference],
+    effective_exports: &'a EffectiveExportIndex,
+    type_resolves: bool,
+    value_resolves: bool,
+    /// Indices into `source.exports` whose name exactly matches `name`, prebuilt
+    /// once per source module by `build_named_export_index` (issue #1843 follow-up).
+    matching_exports: &'a [usize],
+    source_id: FileId,
+    triggering_is_type_only: bool,
+    source_has_star_re_exports: bool,
+    existing_references: &'a mut FxHashSet<RoutedReferenceKey>,
+    synthetic_stubs: &'a mut FxHashSet<(FileId, String, bool)>,
+    reference_paths: &'a mut ReferencePathInterner,
+}
+
+/// Attach the collected references for one re-exported name to the source
+/// module, creating a synthetic stub when the source forwards via its own
+/// `export *`. Returns `true` if any reference or stub was added.
+fn apply_star_refs_to_source(input: ApplyStarRefs<'_>) -> bool {
+    let ApplyStarRefs {
+        source,
+        name,
+        refs,
+        effective_exports,
+        type_resolves,
+        value_resolves,
+        matching_exports,
+        source_id,
+        triggering_is_type_only,
+        source_has_star_re_exports,
+        existing_references,
+        synthetic_stubs,
+        reference_paths,
+    } = input;
+
+    if name == "default" {
+        return false;
+    }
+
+    if !matching_exports.is_empty() {
+        apply_star_refs_to_matching_exports(ApplyMatchingStarRefs {
+            source,
+            name,
+            refs,
+            effective_exports,
+            type_resolves,
+            value_resolves,
+            source_id,
+            triggering_is_type_only,
+            source_has_star_re_exports,
+            matching_exports,
+            existing_references,
+            synthetic_stubs,
+            reference_paths,
+        })
+    } else if source_has_star_re_exports {
+        create_synthetic_exports_for_refs(CreateSyntheticExports {
+            source,
+            name,
+            export_name: ExportName::Named(name.to_string()),
+            refs,
+            type_resolves,
+            value_resolves,
+            source_id,
+            triggering_is_type_only,
+            synthetic_stubs,
+            reference_paths,
+        })
+    } else {
+        false
+    }
+}
+
+struct ApplyMatchingStarRefs<'a> {
+    source: &'a mut ModuleNode,
+    name: &'a str,
+    refs: &'a [RoutedReference],
+    effective_exports: &'a EffectiveExportIndex,
+    type_resolves: bool,
+    value_resolves: bool,
+    source_id: FileId,
+    triggering_is_type_only: bool,
+    source_has_star_re_exports: bool,
+    matching_exports: &'a [usize],
+    existing_references: &'a mut FxHashSet<RoutedReferenceKey>,
+    synthetic_stubs: &'a mut FxHashSet<(FileId, String, bool)>,
+    reference_paths: &'a mut ReferencePathInterner,
+}
+
+struct MatchingStarExports {
+    type_indices: Vec<usize>,
+    value_indices: Vec<usize>,
+}
+
+#[derive(Clone, Copy)]
+struct StarExportTargets {
+    has_type: bool,
+    has_value: bool,
+    type_resolves: bool,
+    value_resolves: bool,
+}
+
+fn apply_star_refs_to_matching_exports(input: ApplyMatchingStarRefs<'_>) -> bool {
+    let ApplyMatchingStarRefs {
+        source,
+        name,
+        refs,
+        effective_exports,
+        type_resolves,
+        value_resolves,
+        source_id,
+        triggering_is_type_only,
+        source_has_star_re_exports,
+        matching_exports,
+        existing_references,
+        synthetic_stubs,
+        reference_paths,
+    } = input;
+
+    let can_synthesize = source_has_star_re_exports;
+    let mut exports =
+        matching_star_exports(source, matching_exports, effective_exports, source_id, name);
+    let (needs_type_export, needs_value_export) = required_matching_star_exports(
+        refs,
+        type_resolves && (!exports.type_indices.is_empty() || can_synthesize),
+        value_resolves
+            && (!exports.value_indices.is_empty() || (can_synthesize && !triggering_is_type_only)),
+        triggering_is_type_only,
+    );
+
+    let mut changed = ensure_matching_star_exports(EnsureMatchingStarExports {
+        source,
+        name,
+        source_id,
+        needs_type_export,
+        needs_value_export,
+        can_synthesize,
+        exports: &mut exports,
+        synthetic_stubs,
+    });
+    changed |= attach_matching_star_refs(AttachMatchingStarRefs {
+        source,
+        refs,
+        triggering_is_type_only,
+        type_resolves,
+        value_resolves,
+        exports: &exports,
+        existing_references,
+        source_id,
+        reference_paths,
+    });
+    changed
+}
+
+fn matching_star_exports(
+    source: &ModuleNode,
+    matching_exports: &[usize],
+    effective_exports: &EffectiveExportIndex,
+    source_id: FileId,
+    name: &str,
+) -> MatchingStarExports {
+    MatchingStarExports {
+        type_indices: effective_exports.declaration_slots(
+            &source.exports,
+            matching_exports,
+            source_id,
+            name,
+            ExportNamespace::Type,
+        ),
+        value_indices: effective_exports.declaration_slots(
+            &source.exports,
+            matching_exports,
+            source_id,
+            name,
+            ExportNamespace::Value,
+        ),
+    }
+}
+
+fn required_matching_star_exports(
+    refs: &[RoutedReference],
+    effective_has_type_exports: bool,
+    effective_has_value_exports: bool,
+    triggering_is_type_only: bool,
+) -> (bool, bool) {
+    let mut needs_type_export = false;
+    let mut needs_value_export = false;
+    for routed in refs {
+        let (attach_type_exports, attach_value_exports) = star_reference_attach_targets(
+            routed.reference.namespace,
+            StarExportTargets {
+                has_type: effective_has_type_exports,
+                has_value: effective_has_value_exports,
+                type_resolves: effective_has_type_exports,
+                value_resolves: effective_has_value_exports,
+            },
+            triggering_is_type_only,
+        );
+        needs_type_export |= attach_type_exports;
+        needs_value_export |= attach_value_exports;
+    }
+    (needs_type_export, needs_value_export)
+}
+
+struct EnsureMatchingStarExports<'a> {
+    source: &'a mut ModuleNode,
+    name: &'a str,
+    source_id: FileId,
+    needs_type_export: bool,
+    needs_value_export: bool,
+    can_synthesize: bool,
+    exports: &'a mut MatchingStarExports,
+    synthetic_stubs: &'a mut FxHashSet<(FileId, String, bool)>,
+}
+
+fn ensure_matching_star_exports(input: EnsureMatchingStarExports<'_>) -> bool {
+    let EnsureMatchingStarExports {
+        source,
+        name,
+        source_id,
+        needs_type_export,
+        needs_value_export,
+        can_synthesize,
+        exports,
+        synthetic_stubs,
+    } = input;
 
     let mut changed = false;
-    let mut existing_files: FxHashSet<FileId> = FxHashSet::default();
-    let source = &mut modules[source_idx];
-    for (name, refs) in &refs_by_name {
-        let export_name = if name == "default" {
-            ExportName::Default
-        } else {
-            ExportName::Named(name.clone())
-        };
-        if let Some(export) = source.exports.iter_mut().find(|e| e.name == export_name) {
-            // Use a HashSet for O(1) duplicate detection instead of O(n) linear scan.
-            // Reference lists grow across iterations, making the linear check quadratic.
-            existing_files.clear();
-            existing_files.extend(export.references.iter().map(|r| r.from_file));
-            for ref_item in refs {
-                if existing_files.insert(ref_item.from_file) {
-                    export.references.push(*ref_item);
-                    changed = true;
-                }
+    if needs_type_export
+        && exports.type_indices.is_empty()
+        && can_synthesize
+        && let Some(idx) = synthesize_and_locate_star_export(
+            source,
+            source_id,
+            name,
+            true,
+            synthetic_stubs,
+            &mut changed,
+        )
+    {
+        exports.type_indices.push(idx);
+    }
+    if needs_value_export
+        && exports.value_indices.is_empty()
+        && can_synthesize
+        && let Some(idx) = synthesize_and_locate_star_export(
+            source,
+            source_id,
+            name,
+            false,
+            synthetic_stubs,
+            &mut changed,
+        )
+    {
+        exports.value_indices.push(idx);
+    }
+    changed
+}
+
+/// Synthesize the star-re-export stub for `name`/`is_type_only` (if not already
+/// present) and return the index star references should attach to, preserving the
+/// exact first-match semantics of the positional [`matching_synthetic_export_index`]
+/// scan it replaces.
+///
+/// Fast path: a freshly appended stub lands at `exports.len() - 1`, and reaching this
+/// branch guarantees that stub is the sole match, so the O(source_exports) `.position()`
+/// scan is elided (issue #1916, follow-up to the #1914 main-path index). The branch only
+/// runs when `exports.{type,value}_indices` is empty, i.e. the source carries no earlier
+/// `Named(name)` export of that type-ness (otherwise `build_named_export_index` would have
+/// populated the index and this branch would have been skipped, which also means an
+/// already-synthesized stub from a prior fixpoint visit cannot re-enter it, so `create`
+/// always appends here). `name` is likewise never `"default"` on this path: the caller
+/// `apply_star_refs_to_source` returns early for `"default"` before ever calling into the
+/// matching-exports synthesis.
+///
+/// The positional [`matching_synthetic_export_index`] fallback is retained as a defensive
+/// exact-semantics preserver should either upstream invariant ever change (a `"default"`
+/// name, whose exports are not keyed into the named index, or a non-appending `create`).
+fn synthesize_and_locate_star_export(
+    source: &mut ModuleNode,
+    source_id: FileId,
+    name: &str,
+    is_type_only: bool,
+    synthetic_stubs: &mut FxHashSet<(FileId, String, bool)>,
+    changed: &mut bool,
+) -> Option<usize> {
+    let appended =
+        create_empty_synthetic_export(source, source_id, name, is_type_only, synthetic_stubs);
+    *changed |= appended;
+    if appended && name != "default" {
+        return Some(source.exports.len() - 1);
+    }
+    matching_synthetic_export_index(source, name, is_type_only)
+}
+
+fn matching_synthetic_export_index(
+    source: &ModuleNode,
+    name: &str,
+    is_type_only: bool,
+) -> Option<usize> {
+    source
+        .exports
+        .iter()
+        .position(|export| export.name.matches_str(name) && export.is_type_only == is_type_only)
+}
+
+struct AttachMatchingStarRefs<'a> {
+    source: &'a mut ModuleNode,
+    refs: &'a [RoutedReference],
+    triggering_is_type_only: bool,
+    type_resolves: bool,
+    value_resolves: bool,
+    exports: &'a MatchingStarExports,
+    existing_references: &'a mut FxHashSet<RoutedReferenceKey>,
+    source_id: FileId,
+    reference_paths: &'a mut ReferencePathInterner,
+}
+
+fn attach_matching_star_refs(input: AttachMatchingStarRefs<'_>) -> bool {
+    let AttachMatchingStarRefs {
+        source,
+        refs,
+        triggering_is_type_only,
+        type_resolves,
+        value_resolves,
+        exports,
+        existing_references,
+        source_id,
+        reference_paths,
+    } = input;
+
+    let mut type_refs = Vec::new();
+    let mut value_refs = Vec::new();
+    for routed in refs {
+        let (attach_type_exports, attach_value_exports) = star_reference_attach_targets(
+            routed.reference.namespace,
+            StarExportTargets {
+                has_type: !exports.type_indices.is_empty(),
+                has_value: !exports.value_indices.is_empty(),
+                type_resolves,
+                value_resolves,
+            },
+            triggering_is_type_only,
+        );
+        let routed = through_re_export(*routed, source_id, reference_paths);
+        if attach_type_exports {
+            let mut typed = routed;
+            typed.reference.namespace = ExportNamespace::Type;
+            type_refs.push(typed);
+        }
+        if attach_value_exports {
+            let mut valued = routed;
+            valued.reference.namespace = ExportNamespace::Value;
+            value_refs.push(valued);
+        }
+    }
+
+    let mut changed = false;
+    if !type_refs.is_empty() {
+        changed |= attach_star_refs_to_exports(
+            source,
+            &exports.type_indices,
+            &type_refs,
+            existing_references,
+        );
+    }
+    if !value_refs.is_empty() {
+        changed |= attach_star_refs_to_exports(
+            source,
+            &exports.value_indices,
+            &value_refs,
+            existing_references,
+        );
+    }
+    changed
+}
+
+struct CreateSyntheticExports<'a> {
+    source: &'a mut ModuleNode,
+    name: &'a str,
+    export_name: ExportName,
+    refs: &'a [RoutedReference],
+    type_resolves: bool,
+    value_resolves: bool,
+    source_id: FileId,
+    triggering_is_type_only: bool,
+    synthetic_stubs: &'a mut FxHashSet<(FileId, String, bool)>,
+    reference_paths: &'a mut ReferencePathInterner,
+}
+
+fn create_synthetic_exports_for_refs(input: CreateSyntheticExports<'_>) -> bool {
+    let CreateSyntheticExports {
+        source,
+        name,
+        export_name,
+        refs,
+        type_resolves,
+        value_resolves,
+        source_id,
+        triggering_is_type_only,
+        synthetic_stubs,
+        reference_paths,
+    } = input;
+
+    let mut type_refs = Vec::new();
+    let mut value_refs = Vec::new();
+    for routed in refs {
+        let (attach_type_exports, attach_value_exports) = star_reference_attach_targets(
+            routed.reference.namespace,
+            StarExportTargets {
+                has_type: true,
+                has_value: !triggering_is_type_only,
+                type_resolves,
+                value_resolves,
+            },
+            triggering_is_type_only,
+        );
+        let routed = through_re_export(*routed, source_id, reference_paths);
+        if attach_type_exports {
+            let mut typed = routed;
+            typed.reference.namespace = ExportNamespace::Type;
+            type_refs.push(typed);
+        }
+        if attach_value_exports {
+            let mut valued = routed;
+            valued.reference.namespace = ExportNamespace::Value;
+            value_refs.push(valued);
+        }
+    }
+
+    let mut changed = false;
+    if !type_refs.is_empty() {
+        changed |= create_synthetic_export(CreateSyntheticExport {
+            source,
+            source_id,
+            name,
+            export_name: export_name.clone(),
+            is_type_only: true,
+            references: type_refs,
+            synthetic_stubs,
+        });
+    }
+    if !value_refs.is_empty() {
+        changed |= create_synthetic_export(CreateSyntheticExport {
+            source,
+            source_id,
+            name,
+            export_name,
+            is_type_only: false,
+            references: value_refs,
+            synthetic_stubs,
+        });
+    }
+    changed
+}
+
+fn create_empty_synthetic_export(
+    source: &mut ModuleNode,
+    source_id: FileId,
+    name: &str,
+    is_type_only: bool,
+    synthetic_stubs: &mut FxHashSet<(FileId, String, bool)>,
+) -> bool {
+    let export_name = if name == "default" {
+        ExportName::Default
+    } else {
+        ExportName::Named(name.to_string())
+    };
+    create_synthetic_export(CreateSyntheticExport {
+        source,
+        source_id,
+        name,
+        export_name,
+        is_type_only,
+        references: Vec::new(),
+        synthetic_stubs,
+    })
+}
+
+struct CreateSyntheticExport<'a> {
+    source: &'a mut ModuleNode,
+    source_id: FileId,
+    name: &'a str,
+    export_name: ExportName,
+    is_type_only: bool,
+    references: Vec<RoutedReference>,
+    synthetic_stubs: &'a mut FxHashSet<(FileId, String, bool)>,
+}
+
+fn create_synthetic_export(input: CreateSyntheticExport<'_>) -> bool {
+    let CreateSyntheticExport {
+        source,
+        source_id,
+        name,
+        export_name,
+        is_type_only,
+        references,
+        synthetic_stubs,
+    } = input;
+
+    if !synthetic_stubs.insert((source_id, name.to_string(), is_type_only)) {
+        return false;
+    }
+
+    let mut export = ExportSymbol {
+        name: export_name,
+        is_type_only,
+        is_side_effect_used: false,
+        visibility: VisibilityTag::None,
+        expected_unused_reason: None,
+        span: oxc_span::Span::new(0, 0),
+        references: Vec::new(),
+        reference_paths: Vec::new(),
+        members: Vec::new(),
+    };
+    for routed in references {
+        export.push_reference(routed.reference, routed.path);
+    }
+    source.exports.push(export);
+    true
+}
+
+fn attach_star_refs_to_exports(
+    source: &mut ModuleNode,
+    export_indices: &[usize],
+    references: &[RoutedReference],
+    existing_references: &mut FxHashSet<RoutedReferenceKey>,
+) -> bool {
+    let mut changed = false;
+    for export_idx in export_indices {
+        #[cfg(test)]
+        STAR_REFERENCE_SET_REBUILDS.set(STAR_REFERENCE_SET_REBUILDS.get() + 1);
+
+        existing_references.clear();
+        existing_references.extend(
+            source.exports[*export_idx]
+                .routed_references()
+                .map(RoutedReference::key),
+        );
+        for routed in references {
+            if existing_references.insert(routed.key()) {
+                source.exports[*export_idx].push_reference(routed.reference, routed.path);
+                changed = true;
             }
-        } else if source_has_star_re_exports {
-            source.exports.push(ExportSymbol {
-                name: export_name,
-                is_type_only: false,
-                visibility: VisibilityTag::None,
-                span: oxc_span::Span::new(0, 0),
-                references: refs.clone(),
-                members: Vec::new(),
-            });
-            changed = true;
         }
     }
     changed
 }
 
-/// Entry point barrel with `export *` — mark all non-default source exports as used.
-fn propagate_entry_point_star(
-    modules: &mut [ModuleNode],
+fn through_re_export(
+    routed: RoutedReference,
+    target: FileId,
+    reference_paths: &mut ReferencePathInterner,
+) -> RoutedReference {
+    RoutedReference {
+        reference: routed.reference,
+        path: reference_paths.extend(routed.path, target, ModuleLoadMechanism::EsModule),
+    }
+}
+
+const fn star_reference_attach_targets(
+    namespace: ExportNamespace,
+    targets: StarExportTargets,
+    triggering_is_type_only: bool,
+) -> (bool, bool) {
+    if triggering_is_type_only || matches!(namespace, ExportNamespace::Type) {
+        return type_attach_targets(targets);
+    }
+    (false, targets.value_resolves && targets.has_value)
+}
+
+const fn type_attach_targets(targets: StarExportTargets) -> (bool, bool) {
+    if !targets.type_resolves {
+        return (false, false);
+    }
+    (targets.has_type, !targets.has_type && targets.has_value)
+}
+
+/// Per-module lookup for the import bindings the extractor classified as type
+/// or value usage.
+///
+/// The propagation fixpoint revisits a star entry once per observed change, and
+/// every visit reclassifies each named symbol on every edge into the barrel.
+/// Reading the `Vec<String>` fields directly made that a linear string scan per
+/// symbol per visit (issue #1843 shape), so the sets are built once per run.
+#[derive(Default)]
+pub(in crate::graph) struct ImportBindingUsageIndex {
+    by_module: FxHashMap<FileId, ModuleBindingUsage>,
+}
+
+#[derive(Default)]
+struct ModuleBindingUsage {
+    r#type: FxHashSet<Box<str>>,
+    value: FxHashSet<Box<str>>,
+}
+
+impl ImportBindingUsageIndex {
+    pub(in crate::graph) fn build(module_by_id: &FxHashMap<FileId, &ResolvedModule>) -> Self {
+        let by_module = module_by_id
+            .iter()
+            .filter(|(_, module)| {
+                !module.type_referenced_import_bindings.is_empty()
+                    || !module.value_referenced_import_bindings.is_empty()
+            })
+            .map(|(file_id, module)| {
+                let usage = ModuleBindingUsage {
+                    r#type: module
+                        .type_referenced_import_bindings
+                        .iter()
+                        .map(|binding| Box::from(binding.as_str()))
+                        .collect(),
+                    value: module
+                        .value_referenced_import_bindings
+                        .iter()
+                        .map(|binding| Box::from(binding.as_str()))
+                        .collect(),
+                };
+                (*file_id, usage)
+            })
+            .collect();
+        Self { by_module }
+    }
+
+    fn has_type_usage(&self, file_id: FileId, local_name: &str) -> bool {
+        !local_name.is_empty()
+            && self
+                .by_module
+                .get(&file_id)
+                .is_some_and(|usage| usage.r#type.contains(local_name))
+    }
+
+    fn has_value_usage(&self, file_id: FileId, local_name: &str) -> bool {
+        !local_name.is_empty()
+            && self
+                .by_module
+                .get(&file_id)
+                .is_some_and(|usage| usage.value.contains(local_name))
+    }
+}
+
+/// Entry point barrel with `export *`: mark all non-default source exports as used.
+struct EntryPointStarPropagation<'a> {
+    modules: &'a mut [ModuleNode],
     barrel_id: FileId,
     source_idx: usize,
-) -> bool {
+    source_id: FileId,
+    effective_exports: &'a EffectiveExportIndex,
+    triggering_is_type_only: bool,
+    reference_paths: &'a mut ReferencePathInterner,
+}
+
+fn propagate_entry_point_star(input: EntryPointStarPropagation<'_>) -> bool {
+    let EntryPointStarPropagation {
+        modules,
+        barrel_id,
+        source_idx,
+        source_id,
+        effective_exports,
+        triggering_is_type_only,
+        reference_paths,
+    } = input;
+    let path = reference_paths.direct(source_id, ModuleLoadMechanism::EsModule);
     let mut changed = false;
-    let source = &mut modules[source_idx];
-    for export in &mut source.exports {
-        // `export *` does not re-export the default export per ES spec.
+    for export in &mut modules[source_idx].exports {
         if matches!(export.name, ExportName::Default) {
             continue;
         }
-        if export.references.iter().all(|r| r.from_file != barrel_id) {
-            export.references.push(SymbolReference {
-                from_file: barrel_id,
-                kind: ReferenceKind::ReExport,
-                import_span: oxc_span::Span::new(0, 0),
-            });
-            changed = true;
+        let name = match &export.name {
+            ExportName::Named(name) => name.as_str(),
+            ExportName::Default => unreachable!(),
+        };
+        let resolves_type = effective_exports.resolves_through(
+            barrel_id,
+            name,
+            source_id,
+            name,
+            ExportNamespace::Type,
+        );
+        let resolves_value = !export.is_type_only
+            && !triggering_is_type_only
+            && effective_exports.resolves_through(
+                barrel_id,
+                name,
+                source_id,
+                name,
+                ExportNamespace::Value,
+            );
+        for (namespace, resolves) in [
+            (ExportNamespace::Type, resolves_type),
+            (ExportNamespace::Value, resolves_value),
+        ] {
+            if resolves
+                && !export.has_reference_from(barrel_id, oxc_span::Span::new(0, 0), path, namespace)
+            {
+                export.push_reference(
+                    SymbolReference {
+                        from_file: barrel_id,
+                        kind: ReferenceKind::ReExport,
+                        namespace,
+                        import_span: oxc_span::Span::new(0, 0),
+                    },
+                    path,
+                );
+                changed = true;
+            }
         }
     }
     changed
+}
+
+/// Reusable buffers for one run of the named re-export fixpoint.
+///
+/// The worklist revisits each named re-export entry once per observed change,
+/// and every visit rebuilt the same short vectors. Reusing the allocations
+/// keeps the visit allocation-free without changing what it computes.
+#[derive(Default)]
+pub(in crate::graph) struct NamedPropagationScratch {
+    candidates: Vec<usize>,
+    indices: Vec<usize>,
+    type_refs: Vec<RoutedReference>,
+    value_refs: Vec<RoutedReference>,
+}
+
+/// Buffers reused by one export-slot lookup.
+struct SlotBuffers<'a> {
+    candidates: &'a mut Vec<usize>,
+    indices: &'a mut Vec<usize>,
+}
+
+fn collect_namespace_export_indices(
+    module: &ModuleNode,
+    effective_exports: &EffectiveExportIndex,
+    file_id: FileId,
+    name: &str,
+    namespace: ExportNamespace,
+    buffers: SlotBuffers<'_>,
+) {
+    let SlotBuffers {
+        candidates,
+        indices,
+    } = buffers;
+    candidates.clear();
+    candidates.extend(
+        module
+            .exports
+            .iter()
+            .enumerate()
+            .filter_map(|(index, export)| export.name.matches_str(name).then_some(index)),
+    );
+    indices.clear();
+    effective_exports.extend_declaration_slots(
+        DeclarationSlotQuery {
+            exports: &module.exports,
+            candidates,
+            file_id,
+            name,
+            namespace,
+        },
+        indices,
+    );
+}
+
+fn namespace_export_indices(
+    module: &ModuleNode,
+    effective_exports: &EffectiveExportIndex,
+    file_id: FileId,
+    name: &str,
+    namespace: ExportNamespace,
+) -> Vec<usize> {
+    let mut candidates = Vec::new();
+    let mut indices = Vec::new();
+    collect_namespace_export_indices(
+        module,
+        effective_exports,
+        file_id,
+        name,
+        namespace,
+        SlotBuffers {
+            candidates: &mut candidates,
+            indices: &mut indices,
+        },
+    );
+    indices
+}
+
+fn collect_namespace_references(
+    module: &ModuleNode,
+    name: &str,
+    namespace: ExportNamespace,
+    references: &mut Vec<RoutedReference>,
+) {
+    references.clear();
+    references.extend(
+        module
+            .exports
+            .iter()
+            .filter(|export| export.name.matches_str(name))
+            .flat_map(ExportSymbol::routed_references)
+            .filter(|routed| routed.reference.namespace == namespace),
+    );
+}
+
+/// Memoized declaration routes for the propagation fixpoint.
+///
+/// `effective_declaration_route` runs a BFS over re-export topology, and the
+/// worklist re-processes each named re-export entry once per observed change.
+/// Neither module re-export edges nor the effective export index change during
+/// propagation, so a route is computed and interned at most once per
+/// module/name/namespace. Interning is content-addressed, so reusing the
+/// interned route yields the same ids a repeated call would.
+#[derive(Default)]
+pub(in crate::graph) struct EffectiveDeclarationRouteCache {
+    routes: FxHashMap<(FileId, ExportNamespace), FxHashMap<Box<str>, Option<CachedRoute>>>,
+}
+
+#[derive(Clone, Copy)]
+struct CachedRoute {
+    binding: EffectiveExportBinding,
+    route: InternedEffectiveDeclarationRoute,
+}
+
+struct EffectiveOriginPropagation<'a> {
+    modules: &'a mut [ModuleNode],
+    effective_exports: &'a EffectiveExportIndex,
+    source_id: FileId,
+    imported_name: &'a str,
+    namespace: ExportNamespace,
+    references: &'a [RoutedReference],
+    existing_refs: &'a mut FxHashSet<RoutedReferenceKey>,
+    declaration_routes: &'a mut EffectiveDeclarationRouteCache,
+    reference_paths: &'a mut ReferencePathInterner,
+}
+
+fn cached_declaration_route(
+    cache: &mut EffectiveDeclarationRouteCache,
+    modules: &[ModuleNode],
+    effective_exports: &EffectiveExportIndex,
+    key: (FileId, &str, ExportNamespace),
+    reference_paths: &mut ReferencePathInterner,
+) -> Option<CachedRoute> {
+    let (file_id, name, namespace) = key;
+    if let Some(cached) = cache
+        .routes
+        .get(&(file_id, namespace))
+        .and_then(|by_name| by_name.get(name))
+    {
+        return *cached;
+    }
+    let cached = super::super::effective_re_exports::effective_declaration_route(
+        modules,
+        effective_exports,
+        file_id,
+        name,
+        namespace,
+    )
+    .map(|route| CachedRoute {
+        binding: route.binding,
+        route: route.intern(reference_paths),
+    });
+    cache
+        .routes
+        .entry((file_id, namespace))
+        .or_default()
+        .insert(Box::from(name), cached);
+    cached
+}
+
+fn propagate_to_effective_origin(input: EffectiveOriginPropagation<'_>) -> bool {
+    let EffectiveOriginPropagation {
+        modules,
+        effective_exports,
+        source_id,
+        imported_name,
+        namespace,
+        references,
+        existing_refs,
+        declaration_routes,
+        reference_paths,
+    } = input;
+    let Some(cached) = cached_declaration_route(
+        declaration_routes,
+        modules,
+        effective_exports,
+        (source_id, imported_name, namespace),
+        reference_paths,
+    ) else {
+        return false;
+    };
+    let origin_file = cached.binding.origin_file();
+    let Some(origin_slot) = cached.binding.origin_slot() else {
+        return false;
+    };
+    let mut origin_slots: Vec<usize> = if namespace == ExportNamespace::Type {
+        effective_exports
+            .declaration_group_slots(cached.binding)
+            .to_vec()
+    } else {
+        Vec::new()
+    };
+    if origin_slots.is_empty() {
+        origin_slots.push(origin_slot);
+    }
+    let route = cached.route;
+    let Some(origin) = modules.get_mut(origin_file.0 as usize) else {
+        return false;
+    };
+    let mut changed = false;
+    for origin_slot in origin_slots {
+        existing_refs.clear();
+        existing_refs.extend(
+            origin.exports[origin_slot]
+                .routed_references()
+                .map(RoutedReference::key),
+        );
+        for reference in references {
+            let routed = RoutedReference {
+                reference: reference.reference,
+                path: route.extend_path(reference.path, reference_paths),
+            };
+            if existing_refs.insert(routed.key()) {
+                origin.exports[origin_slot].push_reference(routed.reference, routed.path);
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
+fn same_effective_binding(
+    effective_exports: &EffectiveExportIndex,
+    barrel: (FileId, &str),
+    source: (FileId, &str),
+    namespace: ExportNamespace,
+) -> bool {
+    matches!(
+        (
+            effective_exports.resolve(barrel.0, barrel.1, namespace),
+            effective_exports.resolve(source.0, source.1, namespace),
+        ),
+        (
+            EffectiveExportResolution::Unique(barrel_binding),
+            EffectiveExportResolution::Unique(source_binding),
+        ) if barrel_binding == source_binding
+    )
 }
 
 /// Handle named re-exports (`export { foo } from './source'`) — propagate barrel references
 /// to the source module's matching export.
 ///
 /// Returns `true` if any new references were added.
-pub(in crate::graph) fn propagate_named_re_export(
-    modules: &mut [ModuleNode],
-    barrel_id: FileId,
-    barrel_idx: usize,
-    source_idx: usize,
-    imported_name: &str,
-    exported_name: &str,
-    existing_refs: &mut FxHashSet<FileId>,
-) -> bool {
-    // Find references to the exported name on the barrel
-    let refs_on_barrel: Vec<SymbolReference> = modules[barrel_idx]
-        .exports
-        .iter()
-        .filter(|e| e.name.matches_str(exported_name))
-        .flat_map(|e| e.references.iter().copied())
-        .collect();
+pub(in crate::graph) struct NamedReExportPropagation<'a> {
+    pub(in crate::graph) modules: &'a mut [ModuleNode],
+    pub(in crate::graph) effective_exports: &'a EffectiveExportIndex,
+    pub(in crate::graph) barrel_id: FileId,
+    pub(in crate::graph) barrel_idx: usize,
+    pub(in crate::graph) source_id: FileId,
+    pub(in crate::graph) source_idx: usize,
+    pub(in crate::graph) imported_name: &'a str,
+    pub(in crate::graph) exported_name: &'a str,
+    pub(in crate::graph) is_type_only: bool,
+    pub(in crate::graph) existing_refs: &'a mut FxHashSet<RoutedReferenceKey>,
+    pub(in crate::graph) declaration_routes: &'a mut EffectiveDeclarationRouteCache,
+    pub(in crate::graph) scratch: &'a mut NamedPropagationScratch,
+    pub(in crate::graph) reference_paths: &'a mut ReferencePathInterner,
+}
 
-    if refs_on_barrel.is_empty() {
-        // Entry point barrels' re-exports are consumed externally (not
-        // tracked in the graph). Synthesize a ReExport reference so the
-        // source export is correctly marked as used.
+/// Fill the per-namespace reference buffers the source module will receive.
+fn collect_barrel_namespace_references(
+    barrel: &ModuleNode,
+    exported_name: &str,
+    resolves: (bool, bool),
+    buffers: (&mut Vec<RoutedReference>, &mut Vec<RoutedReference>),
+) {
+    let ((type_resolves, value_resolves), (type_refs, value_refs)) = (resolves, buffers);
+    type_refs.clear();
+    value_refs.clear();
+    if type_resolves {
+        collect_namespace_references(barrel, exported_name, ExportNamespace::Type, type_refs);
+    }
+    if value_resolves {
+        collect_namespace_references(barrel, exported_name, ExportNamespace::Value, value_refs);
+    }
+}
+
+pub(in crate::graph) fn propagate_named_re_export(input: NamedReExportPropagation<'_>) -> bool {
+    let NamedReExportPropagation {
+        modules,
+        effective_exports,
+        barrel_id,
+        barrel_idx,
+        source_id,
+        source_idx,
+        imported_name,
+        exported_name,
+        is_type_only,
+        existing_refs,
+        declaration_routes,
+        scratch,
+        reference_paths,
+    } = input;
+
+    let type_resolves = same_effective_binding(
+        effective_exports,
+        (barrel_id, exported_name),
+        (source_id, imported_name),
+        ExportNamespace::Type,
+    );
+    let value_resolves = !is_type_only
+        && same_effective_binding(
+            effective_exports,
+            (barrel_id, exported_name),
+            (source_id, imported_name),
+            ExportNamespace::Value,
+        );
+    if !type_resolves && !value_resolves {
+        return false;
+    }
+
+    let NamedPropagationScratch {
+        candidates,
+        indices,
+        type_refs,
+        value_refs,
+    } = scratch;
+    collect_barrel_namespace_references(
+        &modules[barrel_idx],
+        exported_name,
+        (type_resolves, value_resolves),
+        (type_refs, value_refs),
+    );
+
+    if type_refs.is_empty() && value_refs.is_empty() {
         if modules[barrel_idx].is_entry_point() {
-            return propagate_entry_point_named(modules, barrel_id, source_idx, imported_name);
+            return propagate_entry_point_named(EntryPointNamedPropagation {
+                modules,
+                effective_exports,
+                barrel_id,
+                source_id,
+                source_idx,
+                imported_name,
+                type_resolves,
+                value_resolves,
+                reference_paths,
+            });
         }
         return false;
     }
 
-    // Propagate to source module's export
     let mut changed = false;
-    let source = &mut modules[source_idx];
-    let target_exports: Vec<usize> = source
-        .exports
-        .iter()
-        .enumerate()
-        .filter(|(_, e)| e.name.matches_str(imported_name))
-        .map(|(i, _)| i)
-        .collect();
+    for (namespace, refs) in [
+        (ExportNamespace::Type, type_refs.as_slice()),
+        (ExportNamespace::Value, value_refs.as_slice()),
+    ] {
+        changed |= attach_named_refs_for_namespace(NamedNamespacePropagation {
+            modules,
+            effective_exports,
+            source_id,
+            source_idx,
+            imported_name,
+            namespace,
+            refs,
+            existing_refs,
+            declaration_routes,
+            buffers: SlotBuffers {
+                candidates,
+                indices,
+            },
+            reference_paths,
+        });
+    }
+    changed
+}
 
-    for export_idx in target_exports {
+struct NamedNamespacePropagation<'a> {
+    modules: &'a mut [ModuleNode],
+    effective_exports: &'a EffectiveExportIndex,
+    source_id: FileId,
+    source_idx: usize,
+    imported_name: &'a str,
+    namespace: ExportNamespace,
+    refs: &'a [RoutedReference],
+    existing_refs: &'a mut FxHashSet<RoutedReferenceKey>,
+    declaration_routes: &'a mut EffectiveDeclarationRouteCache,
+    buffers: SlotBuffers<'a>,
+    reference_paths: &'a mut ReferencePathInterner,
+}
+
+/// Attach one namespace's barrel references to the source module's matching
+/// declaration slots, or route them to the effective origin when the source
+/// only forwards the name.
+fn attach_named_refs_for_namespace(input: NamedNamespacePropagation<'_>) -> bool {
+    let NamedNamespacePropagation {
+        modules,
+        effective_exports,
+        source_id,
+        source_idx,
+        imported_name,
+        namespace,
+        refs,
+        existing_refs,
+        declaration_routes,
+        buffers,
+        reference_paths,
+    } = input;
+    let SlotBuffers {
+        candidates,
+        indices,
+    } = buffers;
+    collect_namespace_export_indices(
+        &modules[source_idx],
+        effective_exports,
+        source_id,
+        imported_name,
+        namespace,
+        SlotBuffers {
+            candidates,
+            indices: &mut *indices,
+        },
+    );
+    if indices.is_empty() && !refs.is_empty() {
+        return propagate_to_effective_origin(EffectiveOriginPropagation {
+            modules,
+            effective_exports,
+            source_id,
+            imported_name,
+            namespace,
+            references: refs,
+            existing_refs,
+            declaration_routes,
+            reference_paths,
+        });
+    }
+    let mut changed = false;
+    for &export_idx in &*indices {
+        let source = &mut modules[source_idx];
         existing_refs.clear();
         existing_refs.extend(
             source.exports[export_idx]
-                .references
-                .iter()
-                .map(|r| r.from_file),
+                .routed_references()
+                .map(RoutedReference::key),
         );
-        for ref_item in &refs_on_barrel {
-            if !existing_refs.contains(&ref_item.from_file) {
-                source.exports[export_idx].references.push(*ref_item);
+        for ref_item in refs {
+            let routed = through_re_export(*ref_item, source.file_id, reference_paths);
+            if existing_refs.insert(routed.key()) {
+                source.exports[export_idx].push_reference(routed.reference, routed.path);
                 changed = true;
             }
         }
@@ -218,35 +1498,143 @@ pub(in crate::graph) fn propagate_named_re_export(
 
 /// Entry point barrel with named re-export and no in-graph consumers — synthesize
 /// a `ReExport` reference so the source export is correctly marked as used.
-fn propagate_entry_point_named(
-    modules: &mut [ModuleNode],
+struct EntryPointNamedPropagation<'a> {
+    modules: &'a mut [ModuleNode],
+    effective_exports: &'a EffectiveExportIndex,
     barrel_id: FileId,
+    source_id: FileId,
     source_idx: usize,
-    imported_name: &str,
-) -> bool {
-    let synthetic_ref = SymbolReference {
-        from_file: barrel_id,
-        kind: ReferenceKind::ReExport,
-        import_span: oxc_span::Span::new(0, 0),
-    };
+    imported_name: &'a str,
+    type_resolves: bool,
+    value_resolves: bool,
+    reference_paths: &'a mut ReferencePathInterner,
+}
+
+fn propagate_entry_point_named(input: EntryPointNamedPropagation<'_>) -> bool {
+    let EntryPointNamedPropagation {
+        modules,
+        effective_exports,
+        barrel_id,
+        source_id,
+        source_idx,
+        imported_name,
+        type_resolves,
+        value_resolves,
+        reference_paths,
+    } = input;
+    let synthetic_path = reference_paths.direct(source_id, ModuleLoadMechanism::EsModule);
     let mut changed = false;
-    let source = &mut modules[source_idx];
-    let target_exports: Vec<usize> = source
-        .exports
-        .iter()
-        .enumerate()
-        .filter(|(_, e)| e.name.matches_str(imported_name))
-        .map(|(i, _)| i)
-        .collect();
-    for export_idx in target_exports {
-        if source.exports[export_idx]
-            .references
-            .iter()
-            .all(|r| r.from_file != barrel_id)
+    for namespace in [ExportNamespace::Type, ExportNamespace::Value] {
+        if (namespace == ExportNamespace::Type && !type_resolves)
+            || (namespace == ExportNamespace::Value && !value_resolves)
         {
-            source.exports[export_idx].references.push(synthetic_ref);
-            changed = true;
+            continue;
+        }
+        for export_idx in namespace_export_indices(
+            &modules[source_idx],
+            effective_exports,
+            source_id,
+            imported_name,
+            namespace,
+        ) {
+            let source = &mut modules[source_idx];
+            if !source.exports[export_idx].has_reference_from(
+                barrel_id,
+                oxc_span::Span::new(0, 0),
+                synthetic_path,
+                namespace,
+            ) {
+                source.exports[export_idx].push_reference(
+                    SymbolReference {
+                        from_file: barrel_id,
+                        kind: ReferenceKind::ReExport,
+                        namespace,
+                        import_span: oxc_span::Span::new(0, 0),
+                    },
+                    synthetic_path,
+                );
+                changed = true;
+            }
         }
     }
     changed
+}
+
+#[cfg(test)]
+mod star_index_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn named(name: &str) -> ExportSymbol {
+        export_symbol(ExportName::Named(name.to_string()))
+    }
+
+    fn export_symbol(name: ExportName) -> ExportSymbol {
+        ExportSymbol {
+            name,
+            is_type_only: false,
+            is_side_effect_used: false,
+            visibility: VisibilityTag::None,
+            expected_unused_reason: None,
+            span: oxc_span::Span::new(0, 0),
+            references: Vec::new(),
+            reference_paths: Vec::new(),
+            members: Vec::new(),
+        }
+    }
+
+    fn module_with(exports: Vec<ExportSymbol>) -> ModuleNode {
+        ModuleNode {
+            file_id: FileId(0),
+            path: PathBuf::from("/project/source.ts"),
+            edge_range: 0..0,
+            exports,
+            re_exports: Vec::new(),
+            flags: 0,
+        }
+    }
+
+    /// The prebuilt name -> indices map must reproduce, byte-for-byte, the indices
+    /// the removed per-name `source.exports` scan produced: exact
+    /// `ExportName::Named` matching, ascending index order, `Default` excluded.
+    /// This pins the behavior-preserving contract for a wide-barrel source module.
+    #[test]
+    fn named_export_index_matches_reference_scan() {
+        // A wide barrel source: many named exports, a duplicate name, and a
+        // Default export interleaved to prove index alignment survives it.
+        let module = module_with(vec![
+            named("a"),
+            named("b"),
+            export_symbol(ExportName::Default),
+            named("c"),
+            named("b"), // duplicate name at a later index
+            named("d"),
+        ]);
+
+        let index = build_named_export_index(&module);
+
+        // Reference computation mirrors the old inline scan for each candidate name.
+        let reference = |name: &str| -> Vec<usize> {
+            let export_name = ExportName::Named(name.to_string());
+            module
+                .exports
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, export)| (export.name == export_name).then_some(idx))
+                .collect()
+        };
+
+        for name in ["a", "b", "c", "d"] {
+            let looked_up = index.get(name).cloned().unwrap_or_default();
+            assert_eq!(looked_up, reference(name), "index mismatch for `{name}`");
+        }
+
+        // A repeated name keeps both indices in ascending order (the `Default`
+        // export at index 2 is skipped, so the second `b` lands at index 4).
+        assert_eq!(index.get("b").map(Vec::as_slice), Some(&[1usize, 4][..]));
+
+        // Default is never keyed as a named export, and an absent name is empty.
+        assert!(!index.contains_key("default"));
+        assert!(!index.contains_key("missing"));
+    }
 }

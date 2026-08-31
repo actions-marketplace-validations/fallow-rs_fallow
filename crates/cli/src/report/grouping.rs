@@ -5,9 +5,9 @@
 
 use std::path::{Path, PathBuf};
 
+pub use fallow_api::ResultGroup;
 use fallow_config::WorkspaceInfo;
-use fallow_core::results::AnalysisResults;
-use rustc_hash::FxHashMap;
+use fallow_types::results::AnalysisResults;
 
 use super::relative_path;
 use crate::codeowners::{self, CodeOwners, NO_SECTION_LABEL, UNOWNED_LABEL};
@@ -24,10 +24,6 @@ pub enum OwnershipResolver {
     /// Group by workspace package (monorepo).
     Package(PackageResolver),
     /// Group by GitLab CODEOWNERS section name (`[Section]` headers).
-    ///
-    /// Distinct sections produce distinct groups even when they share the
-    /// same default owner. Rules that appear before any section header
-    /// fall into the `(no section)` bucket.
     Section(CodeOwners),
 }
 
@@ -47,7 +43,7 @@ impl PackageResolver {
     ///
     /// Workspace roots are stored relative to `project_root` and sorted by path
     /// length descending so the first match is always the most specific prefix.
-    pub fn new(project_root: &Path, workspaces: &[WorkspaceInfo]) -> Self {
+    pub(crate) fn new(project_root: &Path, workspaces: &[WorkspaceInfo]) -> Self {
         let mut ws: Vec<(PathBuf, String)> = workspaces
             .iter()
             .map(|w| {
@@ -70,7 +66,7 @@ impl PackageResolver {
 
 impl OwnershipResolver {
     /// Resolve the group key for a file path (relative to project root).
-    pub fn resolve(&self, rel_path: &Path) -> String {
+    pub(crate) fn resolve(&self, rel_path: &Path) -> String {
         match self {
             Self::Owner(co) => co.owner_of(rel_path).unwrap_or(UNOWNED_LABEL).to_string(),
             Self::Directory => codeowners::directory_group(rel_path).to_string(),
@@ -89,7 +85,7 @@ impl OwnershipResolver {
     /// `(directory, None)` for Directory/Package mode,
     /// `(section, Some(pattern))` for Section mode (pattern is the raw
     /// CODEOWNERS pattern from the last matching rule).
-    pub fn resolve_with_rule(&self, rel_path: &Path) -> (String, Option<String>) {
+    pub(crate) fn resolve_with_rule(&self, rel_path: &Path) -> (String, Option<String>) {
         match self {
             Self::Owner(co) => {
                 if let Some((owner, rule)) = co.owner_and_rule_of(rel_path) {
@@ -112,7 +108,7 @@ impl OwnershipResolver {
     }
 
     /// Label for the grouping mode (used in JSON `grouped_by` field).
-    pub fn mode_label(&self) -> &'static str {
+    pub(crate) fn mode_label(&self) -> &'static str {
         match self {
             Self::Owner(_) => "owner",
             Self::Directory => "directory",
@@ -126,7 +122,7 @@ impl OwnershipResolver {
     /// Returns `Some(&[...])` only in Section mode when `rel_path` resolves
     /// to a rule inside a named section. Used to emit the `owners` metadata
     /// array in grouped JSON output.
-    pub fn section_owners_of(&self, rel_path: &Path) -> Option<&[String]> {
+    pub(crate) fn section_owners_of(&self, rel_path: &Path) -> Option<&[String]> {
         if let Self::Section(co) = self
             && let Some((_, owners)) = co.section_and_owners_of(rel_path)
         {
@@ -137,224 +133,33 @@ impl OwnershipResolver {
     }
 }
 
-/// A single group: a label and its subset of results.
-pub struct ResultGroup {
-    /// Group label (owner name, directory, package, or section).
-    pub key: String,
-    /// Section default owners for `--group-by section`.
-    ///
-    /// `None` for all other grouping modes. `Some(vec![])` for the
-    /// `(no section)` and `(unowned)` buckets in Section mode.
-    pub owners: Option<Vec<String>>,
-    /// Issues belonging to this group.
-    pub results: AnalysisResults,
-}
-
 /// Partition analysis results into groups by ownership or directory.
 ///
 /// Each issue is assigned to a group by extracting its primary file path
 /// and resolving the group key via the `OwnershipResolver`.
 /// Returns groups sorted alphabetically by key, with `(unowned)` last.
-pub fn group_analysis_results(
+pub(crate) fn group_analysis_results(
     results: &AnalysisResults,
     root: &Path,
     resolver: &OwnershipResolver,
 ) -> Vec<ResultGroup> {
-    let mut groups: FxHashMap<String, AnalysisResults> = FxHashMap::default();
-    // Section-mode: remember the default owners for each section key. Written
-    // once per key (the first path that lands there); all subsequent paths in
-    // the same section share the same defaults.
-    let mut group_owners: FxHashMap<String, Vec<String>> = FxHashMap::default();
     let is_section_mode = matches!(resolver, OwnershipResolver::Section(_));
-
-    let mut key_for = |path: &Path| -> String {
-        let rel = relative_path(path, root);
-        let key = resolver.resolve(rel);
-        if is_section_mode && !group_owners.contains_key(&key) {
-            let owners = resolver
-                .section_owners_of(rel)
-                .map(<[String]>::to_vec)
-                .unwrap_or_default();
-            group_owners.insert(key.clone(), owners);
-        }
-        key
-    };
-
-    // ── File-scoped issue types ─────────────────────────────────
-    for item in &results.unused_files {
-        groups
-            .entry(key_for(&item.path))
-            .or_default()
-            .unused_files
-            .push(item.clone());
-    }
-    for item in &results.unused_exports {
-        groups
-            .entry(key_for(&item.path))
-            .or_default()
-            .unused_exports
-            .push(item.clone());
-    }
-    for item in &results.unused_types {
-        groups
-            .entry(key_for(&item.path))
-            .or_default()
-            .unused_types
-            .push(item.clone());
-    }
-    for item in &results.unused_enum_members {
-        groups
-            .entry(key_for(&item.path))
-            .or_default()
-            .unused_enum_members
-            .push(item.clone());
-    }
-    for item in &results.unused_class_members {
-        groups
-            .entry(key_for(&item.path))
-            .or_default()
-            .unused_class_members
-            .push(item.clone());
-    }
-    for item in &results.unresolved_imports {
-        groups
-            .entry(key_for(&item.path))
-            .or_default()
-            .unresolved_imports
-            .push(item.clone());
-    }
-
-    // ── Dependency-scoped (use package.json path) ───────────────
-    for item in &results.unused_dependencies {
-        groups
-            .entry(key_for(&item.path))
-            .or_default()
-            .unused_dependencies
-            .push(item.clone());
-    }
-    for item in &results.unused_dev_dependencies {
-        groups
-            .entry(key_for(&item.path))
-            .or_default()
-            .unused_dev_dependencies
-            .push(item.clone());
-    }
-    for item in &results.unused_optional_dependencies {
-        groups
-            .entry(key_for(&item.path))
-            .or_default()
-            .unused_optional_dependencies
-            .push(item.clone());
-    }
-    for item in &results.type_only_dependencies {
-        groups
-            .entry(key_for(&item.path))
-            .or_default()
-            .type_only_dependencies
-            .push(item.clone());
-    }
-    for item in &results.test_only_dependencies {
-        groups
-            .entry(key_for(&item.path))
-            .or_default()
-            .test_only_dependencies
-            .push(item.clone());
-    }
-
-    // ── Multi-location types (use first location) ───────────────
-    for item in &results.unlisted_dependencies {
-        let key = item
-            .imported_from
-            .first()
-            .map_or_else(|| UNOWNED_LABEL.to_string(), |site| key_for(&site.path));
-        groups
-            .entry(key)
-            .or_default()
-            .unlisted_dependencies
-            .push(item.clone());
-    }
-    for item in &results.duplicate_exports {
-        let key = item
-            .locations
-            .first()
-            .map_or_else(|| UNOWNED_LABEL.to_string(), |loc| key_for(&loc.path));
-        groups
-            .entry(key)
-            .or_default()
-            .duplicate_exports
-            .push(item.clone());
-    }
-    for item in &results.circular_dependencies {
-        let key = item
-            .files
-            .first()
-            .map_or_else(|| UNOWNED_LABEL.to_string(), |f| key_for(f));
-        groups
-            .entry(key)
-            .or_default()
-            .circular_dependencies
-            .push(item.clone());
-    }
-    for item in &results.boundary_violations {
-        groups
-            .entry(key_for(&item.from_path))
-            .or_default()
-            .boundary_violations
-            .push(item.clone());
-    }
-    for item in &results.stale_suppressions {
-        groups
-            .entry(key_for(&item.path))
-            .or_default()
-            .stale_suppressions
-            .push(item.clone());
-    }
-
-    finalize_groups(groups, group_owners, is_section_mode)
-}
-
-/// Merge per-key results and owners into sorted `ResultGroup`s.
-///
-/// Ordering: most issues first, alphabetical tiebreaker, `(unowned)` pinned to
-/// the end. `group_owners` is consumed only when `is_section_mode` is true.
-fn finalize_groups(
-    groups: FxHashMap<String, AnalysisResults>,
-    mut group_owners: FxHashMap<String, Vec<String>>,
-    is_section_mode: bool,
-) -> Vec<ResultGroup> {
-    let mut sorted: Vec<_> = groups
-        .into_iter()
-        .map(|(key, results)| {
-            let owners = if is_section_mode {
-                Some(group_owners.remove(&key).unwrap_or_default())
-            } else {
-                None
-            };
-            ResultGroup {
-                key,
-                owners,
-                results,
-            }
-        })
-        .collect();
-    sorted.sort_by(|a, b| {
-        let a_unowned = a.key == UNOWNED_LABEL;
-        let b_unowned = b.key == UNOWNED_LABEL;
-        match (a_unowned, b_unowned) {
-            (true, false) => std::cmp::Ordering::Greater,
-            (false, true) => std::cmp::Ordering::Less,
-            _ => b
-                .results
-                .total_issues()
-                .cmp(&a.results.total_issues())
-                .then_with(|| a.key.cmp(&b.key)),
-        }
-    });
-    sorted
+    fallow_api::group_analysis_results_with(
+        results,
+        |path| {
+            let rel = relative_path(path, root);
+            resolver.resolve(rel)
+        },
+        |path| {
+            let rel = relative_path(path, root);
+            resolver.section_owners_of(rel).map(<[String]>::to_vec)
+        },
+        is_section_mode,
+    )
 }
 
 /// Resolve the group key for a single path (for per-result tagging in SARIF/CodeClimate).
-pub fn resolve_owner(path: &Path, root: &Path, resolver: &OwnershipResolver) -> String {
+pub(crate) fn resolve_owner(path: &Path, root: &Path, resolver: &OwnershipResolver) -> String {
     resolver.resolve(relative_path(path, root))
 }
 
@@ -362,40 +167,27 @@ pub fn resolve_owner(path: &Path, root: &Path, resolver: &OwnershipResolver) -> 
 mod tests {
     use std::path::{Path, PathBuf};
 
-    use fallow_core::results::*;
+    use fallow_types::output_dead_code::*;
+    use fallow_types::results::*;
 
     use super::*;
     use crate::codeowners::CodeOwners;
-
-    // ── Helpers ────────────────────────────────────────────────────
 
     fn root() -> PathBuf {
         PathBuf::from("/root")
     }
 
-    fn unused_file(path: &str) -> UnusedFile {
-        UnusedFile {
+    fn unused_file(path: &str) -> UnusedFileFinding {
+        UnusedFileFinding::with_actions(UnusedFile {
             path: PathBuf::from(path),
-        }
+        })
     }
 
-    fn unused_export(path: &str, name: &str) -> UnusedExport {
-        UnusedExport {
-            path: PathBuf::from(path),
-            export_name: name.to_string(),
-            is_type_only: false,
-            line: 1,
-            col: 0,
-            span_start: 0,
-            is_re_export: false,
-        }
-    }
-
-    fn unlisted_dep(name: &str, sites: Vec<ImportSite>) -> UnlistedDependency {
-        UnlistedDependency {
+    fn unlisted_dep(name: &str, sites: Vec<ImportSite>) -> UnlistedDependencyFinding {
+        UnlistedDependencyFinding::with_actions(UnlistedDependency {
             package_name: name.to_string(),
             imported_from: sites,
-        }
+        })
     }
 
     fn import_site(path: &str) -> ImportSite {
@@ -406,298 +198,80 @@ mod tests {
         }
     }
 
-    // ── 1. Empty results ──────────────────────────────────────────
-
     #[test]
-    fn empty_results_returns_empty_vec() {
-        let results = AnalysisResults::default();
-        let groups = group_analysis_results(&results, &root(), &OwnershipResolver::Directory);
-        assert!(groups.is_empty());
-    }
-
-    // ── 2. Single group ──────────────────────────────────────────
-
-    #[test]
-    fn single_group_all_same_directory() {
-        let mut results = AnalysisResults::default();
-        results.unused_files.push(unused_file("/root/src/a.ts"));
-        results.unused_files.push(unused_file("/root/src/b.ts"));
-        results
-            .unused_exports
-            .push(unused_export("/root/src/c.ts", "foo"));
-
-        let groups = group_analysis_results(&results, &root(), &OwnershipResolver::Directory);
-
-        assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].key, "src");
-        assert_eq!(groups[0].results.unused_files.len(), 2);
-        assert_eq!(groups[0].results.unused_exports.len(), 1);
-        assert_eq!(groups[0].results.total_issues(), 3);
-    }
-
-    // ── 3. Multiple groups ───────────────────────────────────────
-
-    #[test]
-    fn multiple_groups_split_by_directory() {
+    fn groups_unused_files_by_directory() {
         let mut results = AnalysisResults::default();
         results.unused_files.push(unused_file("/root/src/a.ts"));
         results.unused_files.push(unused_file("/root/lib/b.ts"));
-        results
-            .unused_exports
-            .push(unused_export("/root/src/c.ts", "bar"));
 
         let groups = group_analysis_results(&results, &root(), &OwnershipResolver::Directory);
-
         assert_eq!(groups.len(), 2);
-
-        let src_group = groups.iter().find(|g| g.key == "src").unwrap();
-        let lib_group = groups.iter().find(|g| g.key == "lib").unwrap();
-
-        assert_eq!(src_group.results.total_issues(), 2);
-        assert_eq!(lib_group.results.total_issues(), 1);
-    }
-
-    // ── 4. Sort order: most issues first ─────────────────────────
-
-    #[test]
-    fn sort_order_descending_by_total_issues() {
-        let mut results = AnalysisResults::default();
-        // lib: 1 issue
-        results.unused_files.push(unused_file("/root/lib/a.ts"));
-        // src: 3 issues
-        results.unused_files.push(unused_file("/root/src/a.ts"));
-        results.unused_files.push(unused_file("/root/src/b.ts"));
-        results
-            .unused_exports
-            .push(unused_export("/root/src/c.ts", "x"));
-        // test: 2 issues
-        results.unused_files.push(unused_file("/root/test/a.ts"));
-        results.unused_files.push(unused_file("/root/test/b.ts"));
-
-        let groups = group_analysis_results(&results, &root(), &OwnershipResolver::Directory);
-
-        assert_eq!(groups.len(), 3);
-        assert_eq!(groups[0].key, "src");
-        assert_eq!(groups[0].results.total_issues(), 3);
-        assert_eq!(groups[1].key, "test");
-        assert_eq!(groups[1].results.total_issues(), 2);
-        assert_eq!(groups[2].key, "lib");
-        assert_eq!(groups[2].results.total_issues(), 1);
+        assert_eq!(groups[0].key, "lib");
+        assert_eq!(groups[1].key, "src");
     }
 
     #[test]
-    fn sort_order_alphabetical_tiebreaker() {
-        let mut results = AnalysisResults::default();
-        results.unused_files.push(unused_file("/root/beta/a.ts"));
-        results.unused_files.push(unused_file("/root/alpha/a.ts"));
-
-        let groups = group_analysis_results(&results, &root(), &OwnershipResolver::Directory);
-
-        assert_eq!(groups.len(), 2);
-        // Same issue count (1 each) -> alphabetical
-        assert_eq!(groups[0].key, "alpha");
-        assert_eq!(groups[1].key, "beta");
-    }
-
-    // ── 5. Unowned always last ───────────────────────────────────
-
-    #[test]
-    fn unowned_sorts_last_regardless_of_count() {
-        let mut results = AnalysisResults::default();
-        // src: 1 issue
-        results.unused_files.push(unused_file("/root/src/a.ts"));
-        // unlisted dep with empty imported_from -> goes to (unowned)
-        results
-            .unlisted_dependencies
-            .push(unlisted_dep("pkg-a", vec![]));
-        results
-            .unlisted_dependencies
-            .push(unlisted_dep("pkg-b", vec![]));
-        results
-            .unlisted_dependencies
-            .push(unlisted_dep("pkg-c", vec![]));
-
-        let groups = group_analysis_results(&results, &root(), &OwnershipResolver::Directory);
-
-        assert_eq!(groups.len(), 2);
-        // (unowned) has 3 issues vs src's 1, but must still be last
-        assert_eq!(groups[0].key, "src");
-        assert_eq!(groups[1].key, UNOWNED_LABEL);
-        assert_eq!(groups[1].results.total_issues(), 3);
-    }
-
-    // ── 6. Multi-location fallback ───────────────────────────────
-
-    #[test]
-    fn unlisted_dep_empty_imported_from_goes_to_unowned() {
+    fn groups_dependencies_with_empty_locations_as_unowned() {
         let mut results = AnalysisResults::default();
         results
             .unlisted_dependencies
-            .push(unlisted_dep("missing-pkg", vec![]));
+            .push(unlisted_dep("react", vec![]));
 
         let groups = group_analysis_results(&results, &root(), &OwnershipResolver::Directory);
-
-        assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].key, UNOWNED_LABEL);
         assert_eq!(groups[0].results.unlisted_dependencies.len(), 1);
     }
 
     #[test]
-    fn unlisted_dep_with_import_site_goes_to_directory() {
+    fn groups_dependencies_by_first_import_site() {
         let mut results = AnalysisResults::default();
         results.unlisted_dependencies.push(unlisted_dep(
-            "lodash",
-            vec![import_site("/root/src/util.ts")],
+            "react",
+            vec![import_site("/root/app/page.ts")],
         ));
 
         let groups = group_analysis_results(&results, &root(), &OwnershipResolver::Directory);
-
-        assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].key, "src");
-        assert_eq!(groups[0].results.unlisted_dependencies.len(), 1);
-    }
-
-    // ── 7. Directory mode ────────────────────────────────────────
-
-    #[test]
-    fn directory_mode_groups_by_first_path_component() {
-        let mut results = AnalysisResults::default();
-        results
-            .unused_files
-            .push(unused_file("/root/packages/ui/Button.ts"));
-        results
-            .unused_files
-            .push(unused_file("/root/packages/auth/login.ts"));
-        results
-            .unused_exports
-            .push(unused_export("/root/apps/web/index.ts", "main"));
-
-        let groups = group_analysis_results(&results, &root(), &OwnershipResolver::Directory);
-
-        assert_eq!(groups.len(), 2);
-
-        let pkgs = groups.iter().find(|g| g.key == "packages").unwrap();
-        let apps = groups.iter().find(|g| g.key == "apps").unwrap();
-
-        assert_eq!(pkgs.results.total_issues(), 2);
-        assert_eq!(apps.results.total_issues(), 1);
-    }
-
-    // ── 8. Owner mode ────────────────────────────────────────────
-
-    #[test]
-    fn owner_mode_groups_by_codeowners_owner() {
-        let co = CodeOwners::parse("* @default\n/src/ @frontend\n").unwrap();
-        let resolver = OwnershipResolver::Owner(co);
-
-        let mut results = AnalysisResults::default();
-        results.unused_files.push(unused_file("/root/src/app.ts"));
-        results.unused_files.push(unused_file("/root/README.md"));
-
-        let groups = group_analysis_results(&results, &root(), &resolver);
-
-        assert_eq!(groups.len(), 2);
-
-        let frontend = groups.iter().find(|g| g.key == "@frontend").unwrap();
-        let default = groups.iter().find(|g| g.key == "@default").unwrap();
-
-        assert_eq!(frontend.results.unused_files.len(), 1);
-        assert_eq!(default.results.unused_files.len(), 1);
+        assert_eq!(groups[0].key, "app");
     }
 
     #[test]
-    fn owner_mode_unmatched_goes_to_unowned() {
-        // No catch-all rule -- files outside /src/ have no owner
+    fn owner_grouping_uses_codeowners() {
         let co = CodeOwners::parse("/src/ @frontend\n").unwrap();
         let resolver = OwnershipResolver::Owner(co);
-
         let mut results = AnalysisResults::default();
-        results.unused_files.push(unused_file("/root/README.md"));
+        results.unused_files.push(unused_file("/root/src/a.ts"));
+        results
+            .unused_files
+            .push(unused_file("/root/docs/readme.md"));
 
         let groups = group_analysis_results(&results, &root(), &resolver);
-
-        assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].key, UNOWNED_LABEL);
-    }
-
-    // ── Boundary violations ──────────────────────────────────────
-
-    #[test]
-    fn boundary_violations_grouped_by_from_path() {
-        let mut results = AnalysisResults::default();
-        results.boundary_violations.push(BoundaryViolation {
-            from_path: PathBuf::from("/root/src/bad.ts"),
-            to_path: PathBuf::from("/root/lib/secret.ts"),
-            from_zone: "src".to_string(),
-            to_zone: "lib".to_string(),
-            import_specifier: "../lib/secret".to_string(),
-            line: 1,
-            col: 0,
-        });
-
-        let groups = group_analysis_results(&results, &root(), &OwnershipResolver::Directory);
-
-        assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].key, "src");
-        assert_eq!(groups[0].results.boundary_violations.len(), 1);
-    }
-
-    // ── Circular dependencies ────────────────────────────────────
-
-    #[test]
-    fn circular_dep_empty_files_goes_to_unowned() {
-        let mut results = AnalysisResults::default();
-        results.circular_dependencies.push(CircularDependency {
-            files: vec![],
-            length: 0,
-            line: 0,
-            col: 0,
-            is_cross_package: false,
-        });
-
-        let groups = group_analysis_results(&results, &root(), &OwnershipResolver::Directory);
-
-        assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].key, UNOWNED_LABEL);
+        assert_eq!(groups[0].key, "@frontend");
+        assert_eq!(groups[1].key, UNOWNED_LABEL);
     }
 
     #[test]
-    fn circular_dep_uses_first_file() {
+    fn unowned_group_is_pinned_last() {
+        let co = CodeOwners::parse("/src/ @frontend\n").unwrap();
+        let resolver = OwnershipResolver::Owner(co);
         let mut results = AnalysisResults::default();
-        results.circular_dependencies.push(CircularDependency {
-            files: vec![
-                PathBuf::from("/root/src/a.ts"),
-                PathBuf::from("/root/lib/b.ts"),
-            ],
-            length: 2,
-            line: 1,
-            col: 0,
-            is_cross_package: false,
-        });
+        results.unused_files.push(unused_file("/root/aaa/a.ts"));
+        results.unused_files.push(unused_file("/root/src/a.ts"));
 
-        let groups = group_analysis_results(&results, &root(), &OwnershipResolver::Directory);
-
-        assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].key, "src");
+        let groups = group_analysis_results(&results, &root(), &resolver);
+        assert_eq!(groups.last().unwrap().key, UNOWNED_LABEL);
     }
-
-    // ── Duplicate exports ────────────────────────────────────────
 
     #[test]
-    fn duplicate_exports_empty_locations_goes_to_unowned() {
+    fn sorts_by_issue_count_then_key() {
         let mut results = AnalysisResults::default();
-        results.duplicate_exports.push(DuplicateExport {
-            export_name: "dup".to_string(),
-            locations: vec![],
-        });
+        results.unused_files.push(unused_file("/root/src/a.ts"));
+        results.unused_files.push(unused_file("/root/app/a.ts"));
+        results.unused_files.push(unused_file("/root/app/b.ts"));
 
         let groups = group_analysis_results(&results, &root(), &OwnershipResolver::Directory);
-
-        assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].key, UNOWNED_LABEL);
+        assert_eq!(groups[0].key, "app");
+        assert_eq!(groups[1].key, "src");
     }
-
-    // ── resolve_owner ────────────────────────────────────────────
 
     #[test]
     fn resolve_owner_returns_directory() {
@@ -711,362 +285,20 @@ mod tests {
 
     #[test]
     fn resolve_owner_returns_codeowner() {
-        let co = CodeOwners::parse("/src/ @team\n").unwrap();
+        let co = CodeOwners::parse("/src/ @frontend\n").unwrap();
         let resolver = OwnershipResolver::Owner(co);
         let owner = resolve_owner(Path::new("/root/src/file.ts"), &root(), &resolver);
-        assert_eq!(owner, "@team");
-    }
-
-    // ── mode_label ───────────────────────────────────────────────
-
-    #[test]
-    fn mode_label_owner() {
-        let co = CodeOwners::parse("").unwrap();
-        let resolver = OwnershipResolver::Owner(co);
-        assert_eq!(resolver.mode_label(), "owner");
+        assert_eq!(owner, "@frontend");
     }
 
     #[test]
-    fn mode_label_directory() {
+    fn mode_label_matches_group_by_flag() {
         assert_eq!(OwnershipResolver::Directory.mode_label(), "directory");
-    }
-
-    #[test]
-    fn mode_label_package() {
-        let pr = PackageResolver { workspaces: vec![] };
+        let pr = PackageResolver {
+            workspaces: vec![(PathBuf::from("packages/a"), "a".to_string())],
+        };
         assert_eq!(OwnershipResolver::Package(pr).mode_label(), "package");
-    }
-
-    #[test]
-    fn mode_label_section() {
-        let co = CodeOwners::parse("[S] @owner\nfoo/\n").unwrap();
+        let co = CodeOwners::parse("[Docs]\n/docs/ @docs\n").unwrap();
         assert_eq!(OwnershipResolver::Section(co).mode_label(), "section");
-    }
-
-    // ── Section mode ────────────────────────────────────────────
-
-    #[test]
-    fn section_mode_groups_distinct_sections_with_shared_owners() {
-        // Issue #133 reproduction: billing and notifications share the lead
-        // owner but are separate sections, so they must produce 2 groups.
-        let content = "\
-            [billing] @core-reviewers @alice @bob\n\
-            src/billing/\n\
-            [notifications] @core-reviewers @alice @bob\n\
-            src/notifications/\n\
-        ";
-        let co = CodeOwners::parse(content).unwrap();
-        let resolver = OwnershipResolver::Section(co);
-
-        let mut results = AnalysisResults::default();
-        results
-            .unused_files
-            .push(unused_file("/root/src/billing/a.ts"));
-        results
-            .unused_files
-            .push(unused_file("/root/src/billing/b.ts"));
-        results
-            .unused_files
-            .push(unused_file("/root/src/notifications/c.ts"));
-
-        let groups = group_analysis_results(&results, &root(), &resolver);
-
-        assert_eq!(groups.len(), 2);
-        let billing = groups.iter().find(|g| g.key == "billing").unwrap();
-        let notifications = groups.iter().find(|g| g.key == "notifications").unwrap();
-        assert_eq!(billing.results.total_issues(), 2);
-        assert_eq!(notifications.results.total_issues(), 1);
-        assert_eq!(
-            billing.owners.as_deref(),
-            Some(
-                [
-                    "@core-reviewers".to_string(),
-                    "@alice".to_string(),
-                    "@bob".to_string()
-                ]
-                .as_slice()
-            )
-        );
-        assert_eq!(
-            notifications.owners.as_deref(),
-            Some(
-                [
-                    "@core-reviewers".to_string(),
-                    "@alice".to_string(),
-                    "@bob".to_string()
-                ]
-                .as_slice()
-            )
-        );
-    }
-
-    #[test]
-    fn section_mode_pre_section_rule_goes_to_no_section() {
-        let content = "\
-            * @default\n\
-            [Utilities] @utils\n\
-            src/utils/\n\
-        ";
-        let co = CodeOwners::parse(content).unwrap();
-        let resolver = OwnershipResolver::Section(co);
-
-        let mut results = AnalysisResults::default();
-        results.unused_files.push(unused_file("/root/README.md"));
-        results
-            .unused_files
-            .push(unused_file("/root/src/utils/greet.ts"));
-
-        let groups = group_analysis_results(&results, &root(), &resolver);
-
-        assert_eq!(groups.len(), 2);
-        let no_section = groups.iter().find(|g| g.key == "(no section)").unwrap();
-        let utils = groups.iter().find(|g| g.key == "Utilities").unwrap();
-        assert_eq!(no_section.owners.as_deref(), Some([].as_slice()));
-        assert_eq!(
-            utils.owners.as_deref(),
-            Some(["@utils".to_string()].as_slice())
-        );
-    }
-
-    #[test]
-    fn section_mode_unmatched_goes_to_unowned() {
-        let co = CodeOwners::parse("[Utilities] @utils\nsrc/utils/\n").unwrap();
-        let resolver = OwnershipResolver::Section(co);
-
-        let mut results = AnalysisResults::default();
-        results.unused_files.push(unused_file("/root/README.md"));
-
-        let groups = group_analysis_results(&results, &root(), &resolver);
-
-        assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].key, UNOWNED_LABEL);
-        assert_eq!(groups[0].owners.as_deref(), Some([].as_slice()));
-    }
-
-    #[test]
-    fn directory_mode_groups_have_no_owners_metadata() {
-        let mut results = AnalysisResults::default();
-        results.unused_files.push(unused_file("/root/src/a.ts"));
-        let groups = group_analysis_results(&results, &root(), &OwnershipResolver::Directory);
-        assert_eq!(groups[0].owners, None);
-    }
-
-    // ── PackageResolver ─────────────────────────────────────────
-
-    #[test]
-    fn package_resolver_matches_longest_prefix() {
-        let ws = vec![
-            fallow_config::WorkspaceInfo {
-                name: "packages/ui".to_string(),
-                root: PathBuf::from("/root/packages/ui"),
-                is_internal_dependency: false,
-            },
-            fallow_config::WorkspaceInfo {
-                name: "packages".to_string(),
-                root: PathBuf::from("/root/packages"),
-                is_internal_dependency: false,
-            },
-        ];
-        let pr = PackageResolver::new(Path::new("/root"), &ws);
-        // A file in packages/ui/ should match the more specific workspace
-        assert_eq!(
-            pr.resolve(Path::new("packages/ui/Button.ts")),
-            "packages/ui"
-        );
-    }
-
-    #[test]
-    fn package_resolver_root_fallback() {
-        let ws = vec![fallow_config::WorkspaceInfo {
-            name: "packages/ui".to_string(),
-            root: PathBuf::from("/root/packages/ui"),
-            is_internal_dependency: false,
-        }];
-        let pr = PackageResolver::new(Path::new("/root"), &ws);
-        // A file outside any workspace returns (root)
-        assert_eq!(pr.resolve(Path::new("src/app.ts")), ROOT_PACKAGE_LABEL);
-    }
-
-    #[test]
-    fn package_mode_groups_by_workspace() {
-        let ws = vec![
-            fallow_config::WorkspaceInfo {
-                name: "ui".to_string(),
-                root: PathBuf::from("/root/packages/ui"),
-                is_internal_dependency: false,
-            },
-            fallow_config::WorkspaceInfo {
-                name: "auth".to_string(),
-                root: PathBuf::from("/root/packages/auth"),
-                is_internal_dependency: false,
-            },
-        ];
-        let pr = PackageResolver::new(Path::new("/root"), &ws);
-        let resolver = OwnershipResolver::Package(pr);
-
-        let mut results = AnalysisResults::default();
-        results
-            .unused_files
-            .push(unused_file("/root/packages/ui/Button.ts"));
-        results
-            .unused_files
-            .push(unused_file("/root/packages/auth/login.ts"));
-        results.unused_files.push(unused_file("/root/src/main.ts"));
-
-        let groups = group_analysis_results(&results, &root(), &resolver);
-        assert_eq!(groups.len(), 3);
-
-        let ui_group = groups.iter().find(|g| g.key == "ui");
-        let auth_group = groups.iter().find(|g| g.key == "auth");
-        let root_group = groups.iter().find(|g| g.key == ROOT_PACKAGE_LABEL);
-
-        assert!(ui_group.is_some());
-        assert!(auth_group.is_some());
-        assert!(root_group.is_some());
-    }
-
-    // ── resolve_with_rule ───────────────────────────────────────
-
-    #[test]
-    fn resolve_with_rule_directory_mode_no_rule() {
-        let (key, rule) = OwnershipResolver::Directory.resolve_with_rule(Path::new("src/file.ts"));
-        assert_eq!(key, "src");
-        assert!(rule.is_none());
-    }
-
-    #[test]
-    fn resolve_with_rule_owner_mode_with_match() {
-        let co = CodeOwners::parse("/src/ @frontend\n").unwrap();
-        let resolver = OwnershipResolver::Owner(co);
-        let (key, rule) = resolver.resolve_with_rule(Path::new("src/file.ts"));
-        assert_eq!(key, "@frontend");
-        assert!(rule.is_some());
-        assert!(rule.unwrap().contains("src"));
-    }
-
-    #[test]
-    fn resolve_with_rule_owner_mode_no_match() {
-        let co = CodeOwners::parse("/src/ @frontend\n").unwrap();
-        let resolver = OwnershipResolver::Owner(co);
-        let (key, rule) = resolver.resolve_with_rule(Path::new("docs/readme.md"));
-        assert_eq!(key, UNOWNED_LABEL);
-        assert!(rule.is_none());
-    }
-
-    #[test]
-    fn resolve_with_rule_package_mode_no_rule() {
-        let pr = PackageResolver { workspaces: vec![] };
-        let resolver = OwnershipResolver::Package(pr);
-        let (key, rule) = resolver.resolve_with_rule(Path::new("src/file.ts"));
-        assert_eq!(key, ROOT_PACKAGE_LABEL);
-        assert!(rule.is_none());
-    }
-
-    // ── Missing issue type groupings ────────────────────────────
-
-    #[test]
-    fn group_unused_optional_deps() {
-        let mut results = AnalysisResults::default();
-        results.unused_optional_dependencies.push(UnusedDependency {
-            package_name: "fsevents".to_string(),
-            location: fallow_core::results::DependencyLocation::OptionalDependencies,
-            path: PathBuf::from("/root/package.json"),
-            line: 5,
-        });
-
-        let groups = group_analysis_results(&results, &root(), &OwnershipResolver::Directory);
-        assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].results.unused_optional_dependencies.len(), 1);
-    }
-
-    #[test]
-    fn group_type_only_deps() {
-        let mut results = AnalysisResults::default();
-        results
-            .type_only_dependencies
-            .push(fallow_core::results::TypeOnlyDependency {
-                package_name: "zod".to_string(),
-                path: PathBuf::from("/root/package.json"),
-                line: 8,
-            });
-
-        let groups = group_analysis_results(&results, &root(), &OwnershipResolver::Directory);
-        assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].results.type_only_dependencies.len(), 1);
-    }
-
-    #[test]
-    fn group_test_only_deps() {
-        let mut results = AnalysisResults::default();
-        results
-            .test_only_dependencies
-            .push(fallow_core::results::TestOnlyDependency {
-                package_name: "vitest".to_string(),
-                path: PathBuf::from("/root/package.json"),
-                line: 10,
-            });
-
-        let groups = group_analysis_results(&results, &root(), &OwnershipResolver::Directory);
-        assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].results.test_only_dependencies.len(), 1);
-    }
-
-    #[test]
-    fn group_unused_enum_members() {
-        let mut results = AnalysisResults::default();
-        results
-            .unused_enum_members
-            .push(fallow_core::results::UnusedMember {
-                path: PathBuf::from("/root/src/types.ts"),
-                parent_name: "Status".to_string(),
-                member_name: "Deprecated".to_string(),
-                kind: fallow_core::extract::MemberKind::EnumMember,
-                line: 5,
-                col: 0,
-            });
-
-        let groups = group_analysis_results(&results, &root(), &OwnershipResolver::Directory);
-        assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].key, "src");
-        assert_eq!(groups[0].results.unused_enum_members.len(), 1);
-    }
-
-    #[test]
-    fn group_unused_class_members() {
-        let mut results = AnalysisResults::default();
-        results
-            .unused_class_members
-            .push(fallow_core::results::UnusedMember {
-                path: PathBuf::from("/root/lib/service.ts"),
-                parent_name: "UserService".to_string(),
-                member_name: "legacyMethod".to_string(),
-                kind: fallow_core::extract::MemberKind::ClassMethod,
-                line: 42,
-                col: 0,
-            });
-
-        let groups = group_analysis_results(&results, &root(), &OwnershipResolver::Directory);
-        assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].key, "lib");
-        assert_eq!(groups[0].results.unused_class_members.len(), 1);
-    }
-
-    #[test]
-    fn group_unresolved_imports() {
-        let mut results = AnalysisResults::default();
-        results
-            .unresolved_imports
-            .push(fallow_core::results::UnresolvedImport {
-                path: PathBuf::from("/root/src/app.ts"),
-                specifier: "./missing".to_string(),
-                line: 1,
-                col: 0,
-                specifier_col: 0,
-            });
-
-        let groups = group_analysis_results(&results, &root(), &OwnershipResolver::Directory);
-        assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].key, "src");
-        assert_eq!(groups[0].results.unresolved_imports.len(), 1);
     }
 }

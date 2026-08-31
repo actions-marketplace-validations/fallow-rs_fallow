@@ -1,9 +1,9 @@
 {
   "name": "fallow-vscode",
   "displayName": "Fallow",
-  "description": "Codebase intelligence for TypeScript and JavaScript. Real-time diagnostics for unused code, duplication, complexity hotspots, and architecture drift, with optional runtime evidence via Fallow Runtime.",
-  "version": "2.46.0",
-  "packageManager": "pnpm@10.33.0",
+  "description": "Codebase intelligence for TypeScript and JavaScript. Real-time diagnostics for unused code, duplication, complexity hotspots, architecture drift, and design-system styling, with optional runtime evidence via Fallow Runtime.",
+  "version": "2.48.1",
+  "packageManager": "pnpm@11.10.0",
   "publisher": "fallow-rs",
   "license": "MIT",
   "repository": {
@@ -51,16 +51,22 @@
     "circular-dependencies"
   ],
   "engines": {
-    "vscode": "^1.115.0"
+    "vscode": "^1.96.0"
   },
   "activationEvents": [
     "workspaceContains:**/package.json"
   ],
   "main": "./dist/extension.js",
+  "extensionKind": [
+    "workspace"
+  ],
   "contributes": {
     "jsonValidation": [
       {
-        "fileMatch": ".fallowrc.json",
+        "fileMatch": [
+          ".fallowrc.json",
+          ".fallowrc.jsonc"
+        ],
         "url": "https://raw.githubusercontent.com/fallow-rs/fallow/main/schema.json"
       }
     ],
@@ -69,6 +75,65 @@
         "command": "fallow.analyze",
         "title": "Fallow: Run Analysis",
         "icon": "$(search)"
+      },
+      {
+        "command": "fallow.reloadAnalysis",
+        "title": "Fallow: Reload Analysis",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "fallow.health.reload",
+        "title": "Fallow: Reload Health",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "fallow.analyzeSecurity",
+        "title": "Fallow: Scan for Security Candidates",
+        "icon": "$(shield)"
+      },
+      {
+        "command": "fallow.inspectActiveFile",
+        "title": "Fallow: Inspect Active File",
+        "icon": "$(inspect)"
+      },
+      {
+        "command": "fallow.inspectActiveSymbol",
+        "title": "Fallow: Inspect Symbol at Cursor",
+        "icon": "$(references)"
+      },
+      {
+        "command": "fallow.setBaselineAtHead",
+        "title": "Fallow: Set Baseline at HEAD",
+        "icon": "$(git-commit)"
+      },
+      {
+        "command": "fallow.selectWorkspace",
+        "title": "Fallow: Select Workspace Scope...",
+        "icon": "$(layers)"
+      },
+      {
+        "command": "fallow.clearWorkspace",
+        "title": "Fallow: Clear Workspace Scope (Analyze All)"
+      },
+      {
+        "command": "fallow.loadCoverage",
+        "title": "Fallow: Load Runtime Coverage",
+        "icon": "$(graph)"
+      },
+      {
+        "command": "fallow.reloadCoverage",
+        "title": "Fallow: Reload Runtime Coverage",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "fallow.clearCoverage",
+        "title": "Fallow: Clear Runtime Coverage",
+        "icon": "$(clear-all)"
+      },
+      {
+        "command": "fallow.audit",
+        "title": "Fallow: Audit Changed Files",
+        "icon": "$(shield)"
       },
       {
         "command": "fallow.fix",
@@ -97,6 +162,55 @@
       {
         "command": "fallow.noop",
         "title": "Fallow: No-op (internal)"
+      },
+      {
+        "command": "fallow.toggleMuteDuplicates",
+        "title": "Fallow: Toggle Hide Code-Duplication Findings",
+        "icon": "$(eye-closed)"
+      },
+      {
+        "command": "fallow.toggleAllDiagnostics",
+        "title": "Fallow: Toggle Hide All Findings",
+        "icon": "$(eye-closed)"
+      },
+      {
+        "command": "fallow.manageDiagnosticMutes",
+        "title": "Fallow: Manage Hidden Findings...",
+        "icon": "$(filter)"
+      },
+      {
+        "command": "fallow.clearDiagnosticMutes",
+        "title": "Fallow: Show All Findings"
+      },
+      {
+        "command": "fallow.resetDiagnosticFilters",
+        "title": "Fallow: Reset Hidden Findings (Restart Server)"
+      },
+      {
+        "command": "fallow.muteDiagnosticCategory",
+        "title": "Fallow: Hide Diagnostic Category"
+      },
+      {
+        "command": "fallow.license.activate",
+        "title": "Fallow: Activate License",
+        "category": "Fallow",
+        "icon": "$(key)"
+      },
+      {
+        "command": "fallow.license.status",
+        "title": "Fallow: Show License Status",
+        "category": "Fallow"
+      },
+      {
+        "command": "fallow.license.refresh",
+        "title": "Fallow: Refresh License",
+        "category": "Fallow",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "fallow.license.deactivate",
+        "title": "Fallow: Deactivate License",
+        "category": "Fallow"
       }
     ],
     "configuration": {
@@ -107,10 +221,47 @@
           "default": "",
           "description": "Path to the fallow-lsp binary. Leave empty for auto-detection."
         },
+        "fallow.configPath": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Path to a Fallow config file. Relative paths are resolved from the workspace root (the first folder, in multi-root workspaces). Mirrors the CLI's `--config` flag. Empty = auto-discover `.fallowrc.json`, `.fallowrc.jsonc`, `fallow.toml`, or `.fallow.toml`."
+        },
+        "fallow.allowRemoteExtends": {
+          "type": "boolean",
+          "default": false,
+          "scope": "machine",
+          "markdownDescription": "Allow the language server to load trusted `https://` config inheritance. Disabled by default."
+        },
+        "fallow.typeAware.enabled": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Refine Fallow's project-wide public API analysis with TypeScript symbol identity. This does not surface compiler diagnostics or generic typed lint rules."
+        },
+        "fallow.typeAware.projects": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "markdownDescription": "Optional tsconfig paths for type-aware analysis. Relative paths resolve from the workspace root."
+        },
+        "fallow.typeAware.require": {
+          "type": "string",
+          "enum": [
+            "best-effort",
+            "complete"
+          ],
+          "enumDescriptions": [
+            "Keep conservative findings and report incomplete semantic evidence as advisory.",
+            "Keep conservative findings, but fail the analysis when semantic evidence is incomplete."
+          ],
+          "default": "best-effort",
+          "markdownDescription": "Choose whether incomplete semantic evidence stays advisory or fails the analysis after emitting its conservative result."
+        },
         "fallow.autoDownload": {
           "type": "boolean",
           "default": true,
-          "description": "Automatically download the fallow-lsp binary if not found."
+          "description": "Automatically download managed fallow-lsp and fallow CLI binaries if not found."
         },
         "fallow.issueTypes": {
           "type": "object",
@@ -118,15 +269,43 @@
             "unused-files": true,
             "unused-exports": true,
             "unused-types": true,
+            "private-type-leaks": true,
             "unused-dependencies": true,
             "unused-dev-dependencies": true,
+            "unused-optional-dependencies": true,
             "unused-enum-members": true,
             "unused-class-members": true,
+            "unused-store-members": true,
             "unresolved-imports": true,
             "unlisted-dependencies": true,
             "duplicate-exports": true,
             "type-only-dependencies": true,
-            "circular-dependencies": true
+            "test-only-dependencies": true,
+            "dev-dependencies-in-production": true,
+            "circular-dependencies": true,
+            "re-export-cycle": true,
+            "boundary-violation": true,
+            "policy-violation": true,
+            "invalid-client-export": true,
+            "mixed-client-server-barrel": true,
+            "misplaced-directive": true,
+            "unprovided-injects": true,
+            "unrendered-components": true,
+            "unused-component-props": true,
+            "unused-component-emits": true,
+            "unused-component-inputs": true,
+            "unused-component-outputs": true,
+            "unused-svelte-events": true,
+            "unused-server-actions": true,
+            "unused-load-data-keys": true,
+            "route-collision": true,
+            "dynamic-segment-name-conflict": true,
+            "stale-suppressions": true,
+            "unused-catalog-entries": true,
+            "empty-catalog-groups": true,
+            "unresolved-catalog-references": true,
+            "unused-dependency-overrides": true,
+            "misconfigured-dependency-overrides": true
           },
           "description": "Toggle individual issue types on or off. Uses kebab-case names matching fallow's rules config.",
           "properties": {
@@ -139,16 +318,25 @@
             "unused-types": {
               "type": "boolean"
             },
+            "private-type-leaks": {
+              "type": "boolean"
+            },
             "unused-dependencies": {
               "type": "boolean"
             },
             "unused-dev-dependencies": {
               "type": "boolean"
             },
+            "unused-optional-dependencies": {
+              "type": "boolean"
+            },
             "unused-enum-members": {
               "type": "boolean"
             },
             "unused-class-members": {
+              "type": "boolean"
+            },
+            "unused-store-members": {
               "type": "boolean"
             },
             "unresolved-imports": {
@@ -163,18 +351,116 @@
             "type-only-dependencies": {
               "type": "boolean"
             },
+            "test-only-dependencies": {
+              "type": "boolean"
+            },
+            "dev-dependencies-in-production": {
+              "type": "boolean"
+            },
             "circular-dependencies": {
+              "type": "boolean"
+            },
+            "re-export-cycle": {
+              "type": "boolean"
+            },
+            "boundary-violation": {
+              "type": "boolean"
+            },
+            "policy-violation": {
+              "type": "boolean"
+            },
+            "invalid-client-export": {
+              "type": "boolean"
+            },
+            "mixed-client-server-barrel": {
+              "type": "boolean"
+            },
+            "misplaced-directive": {
+              "type": "boolean"
+            },
+            "unprovided-injects": {
+              "type": "boolean"
+            },
+            "unrendered-components": {
+              "type": "boolean"
+            },
+            "unused-component-props": {
+              "type": "boolean"
+            },
+            "unused-component-emits": {
+              "type": "boolean"
+            },
+            "unused-component-inputs": {
+              "type": "boolean"
+            },
+            "unused-component-outputs": {
+              "type": "boolean"
+            },
+            "unused-svelte-events": {
+              "type": "boolean"
+            },
+            "unused-server-actions": {
+              "type": "boolean"
+            },
+            "unused-load-data-keys": {
+              "type": "boolean"
+            },
+            "route-collision": {
+              "type": "boolean"
+            },
+            "dynamic-segment-name-conflict": {
+              "type": "boolean"
+            },
+            "stale-suppressions": {
+              "type": "boolean"
+            },
+            "unused-catalog-entries": {
+              "type": "boolean"
+            },
+            "empty-catalog-groups": {
+              "type": "boolean"
+            },
+            "unresolved-catalog-references": {
+              "type": "boolean"
+            },
+            "unused-dependency-overrides": {
+              "type": "boolean"
+            },
+            "misconfigured-dependency-overrides": {
               "type": "boolean"
             }
           }
         },
         "fallow.duplication.threshold": {
+          "scope": "resource",
           "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "description": "Maximum allowed duplication percentage before the analysis is marked as failing. Set to 0 (the default) for no limit."
+        },
+        "fallow.duplication.minTokens": {
+          "scope": "resource",
+          "type": "integer",
+          "default": 50,
+          "minimum": 1,
+          "description": "Minimum token count for a clone before it can be reported as duplicated code."
+        },
+        "fallow.duplication.minLines": {
+          "scope": "resource",
+          "type": "integer",
           "default": 5,
           "minimum": 1,
-          "description": "Minimum number of lines for a code block to be reported as a duplicate."
+          "description": "Minimum line count for a clone before it can be reported as duplicated code."
+        },
+        "fallow.duplication.minOccurrences": {
+          "scope": "resource",
+          "type": "integer",
+          "default": 2,
+          "minimum": 2,
+          "description": "Minimum number of occurrences (instances of the same clone) before a group is reported. Defaults to 2 (every duplicated pair is reported). Raise to 3 or more to focus on widespread copy-paste worth refactoring and skip context-sensitive pairs."
         },
         "fallow.duplication.mode": {
+          "scope": "resource",
           "type": "string",
           "default": "mild",
           "enum": [
@@ -191,10 +477,163 @@
             "Renames variables for semantic matching"
           ]
         },
-        "fallow.production": {
+        "fallow.duplication.near": {
+          "scope": "resource",
           "type": "boolean",
           "default": false,
-          "description": "Enable production mode (excludes test/dev files, only production scripts)."
+          "description": "Detect function-scoped near-miss clones with small structural edits in addition to exact clones."
+        },
+        "fallow.duplication.skipLocal": {
+          "scope": "resource",
+          "type": "boolean",
+          "default": false,
+          "description": "Only report duplicate code that appears across different directories."
+        },
+        "fallow.duplication.crossLanguage": {
+          "scope": "resource",
+          "type": "boolean",
+          "default": false,
+          "description": "Compare TypeScript and JavaScript files after stripping TypeScript type annotations."
+        },
+        "fallow.duplication.ignoreImports": {
+          "scope": "resource",
+          "type": "boolean",
+          "default": true,
+          "description": "Exclude import declarations from duplicate-code detection. Enabled by default: token-identical sorted import blocks are a formatting artifact, not copy-paste. Set to false to count import blocks as clone candidates again."
+        },
+        "fallow.production": {
+          "scope": "resource",
+          "type": "string",
+          "default": "auto",
+          "enum": [
+            "auto",
+            "on",
+            "off"
+          ],
+          "description": "Production mode for the sidebar tree and the editor diagnostics (they stay in sync). Production mode excludes test/dev files and only counts production scripts. Editor-only: CI and `fallow check` always report every finding.",
+          "enumDescriptions": [
+            "Defer to the project config (.fallowrc.json); the editor does not override it (default)",
+            "Force production mode on",
+            "Force production mode off, even if the project config enables it"
+          ]
+        },
+        "fallow.coverage.capturePath": {
+          "type": "string",
+          "default": "",
+          "scope": "resource",
+          "markdownDescription": "Path to a local runtime-coverage capture (a file or directory). Relative paths are resolved from the workspace root. Used by the Runtime Coverage view to show hot paths and cleanup candidates via `fallow coverage analyze --runtime-coverage`. This is local-only and offline; cloud/continuous monitoring is never invoked. Requires the fallow-cov sidecar (and a runtime-coverage license or trial when a license JWT is present): run `fallow coverage setup` first. Empty = you will be prompted to pick a capture on first load."
+        },
+        "fallow.coverage.top": {
+          "type": "integer",
+          "default": 0,
+          "minimum": 0,
+          "markdownDescription": "Show only the top N hot paths and findings in the Runtime Coverage view (mirrors the CLI's `--top`). Set to 0 (the default) for no limit."
+        },
+        "fallow.changedSince": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Show only issues in files changed since the given git ref. Run **Fallow: Set Baseline at HEAD** to create the local `fallow-baseline` tag and configure this setting in one step. The command never pushes or moves an existing tag. Mirrors the CLI's `--changed-since`. Empty = full scope."
+        },
+        "fallow.health.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show the Fallow Health view (score and grade, complexity findings, hotspot candidates, refactoring candidates). When off, the Health view stays empty and no extra analysis runs."
+        },
+        "fallow.health.hotspots": {
+          "type": "boolean",
+          "default": true,
+          "description": "Include git churn hotspots in the Health view. Hotspot analysis walks git history; disable on very large repositories to keep the Health refresh fast. Has no effect outside a git repository."
+        },
+        "fallow.health.topFindings": {
+          "type": "integer",
+          "default": 20,
+          "minimum": 1,
+          "markdownDescription": "Maximum number of complexity findings shown in the Health view (passed to `fallow health --top`)."
+        },
+        "fallow.health.statusBar": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show the project health score and grade in the Fallow status bar item."
+        },
+        "fallow.health.inlineComplexity": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Show a compact complexity lens (`N cyc, N cog`) above functions that exceed Fallow Health thresholds. Click the lens to expand or collapse the per-line `+N` breakdown for that function. On by default; the dense per-line text stays hidden until you expand it (or enable `#fallow.complexity.afterText#`)."
+        },
+        "fallow.complexity.breakdownEnabled": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Show the inline complexity breakdown in the editor: a per-line marker and hover that explain WHY a function scored high (each `else if`, nested `if`, boolean operator, loop, ... with its cyclomatic/cognitive weight), plus a CRAP explanation on the function line. Backed by the Health view's analysis, so the breakdown appears after the Health view first runs."
+        },
+        "fallow.complexity.afterText": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Always show the dim per-line `+N` complexity breakdown for every complex function, instead of only the function you expand (via its lens) or select in the Health view. Off by default to keep the editor quiet; hovering a function or its decision-point lines always shows the breakdown in a popup regardless. Inert unless `#fallow.complexity.breakdownEnabled#` is enabled."
+        },
+        "fallow.complexity.decorationCap": {
+          "type": "integer",
+          "default": 200,
+          "minimum": 1,
+          "markdownDescription": "How many top complexity findings to fetch for inline editor decorations when the breakdown is enabled. Decoupled from `#fallow.health.topFindings#` so a complex function open in the editor but outside the Health view's top-N still gets decorated; the tree still shows only `#fallow.health.topFindings#`."
+        },
+        "fallow.workspace": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Scope Fallow's sidebar analysis to a single monorepo workspace package, by name. Empty = analyze the whole project. Use the **Fallow: Select Workspace Scope** command (or the layers icon in the status bar) to pick interactively; that per-folder choice overrides this pinned default. Mirrors the CLI `--workspace` flag.",
+          "scope": "resource"
+        },
+        "fallow.audit.gate": {
+          "type": "string",
+          "enum": [
+            "new-only",
+            "all"
+          ],
+          "default": "new-only",
+          "enumDescriptions": [
+            "Fail only on findings introduced by the current change set (runs an extra base-snapshot pass).",
+            "Fail on every finding in changed files (no base-snapshot attribution)."
+          ],
+          "markdownDescription": "Which findings affect the audit verdict shown in the editor. Mirrors `fallow audit --gate`."
+        },
+        "fallow.audit.statusBar.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show the audit verdict (pass/warn/fail) for the current change set in the status bar."
+        },
+        "fallow.audit.runOnSave": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Re-run the audit verdict automatically when a JS/TS file is saved. Off by default to avoid added latency; the **Fallow: Audit Changed Files** command and the status-bar item run it on demand."
+        },
+        "fallow.diagnostics.statusBar": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Show the **Fallow** eye button in the status bar to hide or show all Fallow squiggles in the editor with one click. Editor-only; CI and `fallow check` still report every finding. Turn this off to remove the button (the **Fallow: Toggle Hide All Findings** command still works and can be bound to a key)."
+        },
+        "fallow.diagnostics.severity": {
+          "type": "string",
+          "default": "warning",
+          "scope": "application",
+          "enum": [
+            "warning",
+            "information",
+            "hint"
+          ],
+          "enumDescriptions": [
+            "Render Fallow diagnostics as warnings, matching the current default.",
+            "Render Fallow diagnostics as information.",
+            "Render Fallow diagnostics as hints, which VS Code shows without squiggles."
+          ],
+          "markdownDescription": "Render Fallow editor diagnostics at the selected VS Code severity. `hint` keeps findings available without squiggles. Editor-only; CI and `fallow check` still report every finding."
+        },
+        "fallow.diagnostics.mutedCategories": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "scope": "resource",
+          "markdownDescription": "Team-shareable baseline of Fallow diagnostic categories to hide in the editor, such as `code-duplication` or `stale-suppression`. Commit this in `.vscode/settings.json` to give everyone the same quiet starting point. Per-machine mutes can still hide more or show a baseline-hidden category locally. Editor-only; CI and `fallow check` still report every finding."
         },
         "fallow.trace.server": {
           "type": "string",
@@ -205,6 +644,21 @@
             "verbose"
           ],
           "description": "Trace level for the LSP server communication."
+        },
+        "fallow.security.enabled": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Surface local **security candidates** (`client-server-leak`, the tainted-sink CWE catalogue) from `fallow security` in the Security Candidates sidebar view. Off by default. Findings are UNVERIFIED candidates for you or an AI agent to verify, never confirmed vulnerabilities. Enabling this runs a separate `fallow security` analysis only when the Security Candidates view is opened, so it does not affect the main sidebar's speed."
+        },
+        "fallow.license.showStatusBar": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show a Fallow license indicator in the status bar, but only when license material is present (active, in grace, or expired). Machines with no license never show the indicator. Disable to remove it entirely and skip the license status probe on activation."
+        },
+        "fallow.license.refreshOnStartup": {
+          "type": "boolean",
+          "default": false,
+          "description": "Probe license status once when the extension activates. Off by default so the editor never shells out to fallow on startup unless you opt in; the indicator otherwise updates only when you run a Fallow license command."
         }
       }
     },
@@ -226,6 +680,18 @@
         {
           "id": "fallow.duplicates",
           "name": "Duplicates"
+        },
+        {
+          "id": "fallow.health",
+          "name": "Health"
+        },
+        {
+          "id": "fallow.security",
+          "name": "Security Candidates"
+        },
+        {
+          "id": "fallow.runtimeCoverage",
+          "name": "Runtime Coverage"
         }
       ]
     },
@@ -233,8 +699,95 @@
       "view/title": [
         {
           "command": "fallow.analyze",
-          "when": "view == fallow.deadCode || view == fallow.duplicates",
+          "when": "(view == fallow.deadCode || view == fallow.duplicates) && !fallow.hasAnalyzed",
           "group": "navigation"
+        },
+        {
+          "command": "fallow.reloadAnalysis",
+          "when": "(view == fallow.deadCode || view == fallow.duplicates) && fallow.hasAnalyzed",
+          "group": "navigation"
+        },
+        {
+          "command": "fallow.health.reload",
+          "when": "view == fallow.health",
+          "group": "navigation"
+        },
+        {
+          "command": "fallow.analyzeSecurity",
+          "when": "view == fallow.security && fallow.security.enabled && !fallow.hasAnalyzedSecurity",
+          "group": "navigation"
+        },
+        {
+          "command": "fallow.analyzeSecurity",
+          "when": "view == fallow.security && fallow.security.enabled && fallow.hasAnalyzedSecurity",
+          "group": "navigation"
+        },
+        {
+          "command": "fallow.loadCoverage",
+          "when": "view == fallow.runtimeCoverage && !fallow.hasCoverage",
+          "group": "navigation"
+        },
+        {
+          "command": "fallow.reloadCoverage",
+          "when": "view == fallow.runtimeCoverage && fallow.hasCoverage",
+          "group": "navigation"
+        },
+        {
+          "command": "fallow.clearCoverage",
+          "when": "view == fallow.runtimeCoverage && fallow.hasCoverage",
+          "group": "navigation"
+        },
+        {
+          "command": "fallow.selectWorkspace",
+          "when": "view == fallow.deadCode || view == fallow.duplicates",
+          "group": "navigation@9"
+        },
+        {
+          "command": "fallow.manageDiagnosticMutes",
+          "when": "view == fallow.deadCode || view == fallow.duplicates",
+          "group": "navigation@10"
+        },
+        {
+          "command": "fallow.license.activate",
+          "when": "view == fallow.deadCode",
+          "group": "license@1"
+        },
+        {
+          "command": "fallow.license.status",
+          "when": "view == fallow.deadCode",
+          "group": "license@2"
+        },
+        {
+          "command": "fallow.license.refresh",
+          "when": "view == fallow.deadCode",
+          "group": "license@3"
+        },
+        {
+          "command": "fallow.license.deactivate",
+          "when": "view == fallow.deadCode",
+          "group": "license@4"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "fallow.reloadAnalysis",
+          "when": "false"
+        },
+        {
+          "command": "fallow.reloadCoverage",
+          "when": "fallow.hasCoverage"
+        },
+        {
+          "command": "fallow.clearCoverage",
+          "when": "fallow.hasCoverage"
+        },
+        {
+          "command": "fallow.muteDiagnosticCategory",
+          "when": "false"
+        },
+        {
+          "command": "fallow.noop",
+          "when": "false"
         }
       ]
     },
@@ -258,6 +811,41 @@
         "view": "fallow.duplicates",
         "contents": "$(check) No code duplication found.",
         "when": "fallow.hasAnalyzed"
+      },
+      {
+        "view": "fallow.health",
+        "contents": "The Health view is turned off.\nEnable [fallow.health.enabled](command:fallow.openSettings) to see the project health score, complexity findings, hotspot candidates, and refactoring candidates.",
+        "when": "!fallow.health.enabled"
+      },
+      {
+        "view": "fallow.health",
+        "contents": "No health results yet.\n[$(refresh) Reload Health](command:fallow.health.reload)\nFallow reports a project health score and grade, complexity findings, hotspot candidates, and refactoring candidates. Hotspots and refactoring targets are heuristic suggestions, so verify before acting.",
+        "when": "fallow.health.enabled"
+      },
+      {
+        "view": "fallow.security",
+        "contents": "Security candidate scanning is off by default.\nEnable [fallow.security.enabled](command:fallow.openSettings) to scan for security candidates.\nResults are UNVERIFIED candidates to verify, never confirmed vulnerabilities.",
+        "when": "!fallow.security.enabled"
+      },
+      {
+        "view": "fallow.security",
+        "contents": "No security candidate scan yet.\n[$(shield) Scan for Security Candidates](command:fallow.analyzeSecurity)\nResults are UNVERIFIED candidates to verify, never confirmed vulnerabilities.",
+        "when": "fallow.security.enabled && !fallow.hasAnalyzedSecurity"
+      },
+      {
+        "view": "fallow.security",
+        "contents": "$(check) No security candidates found.\nNote: an empty result is not a clean bill of health.",
+        "when": "fallow.security.enabled && fallow.hasAnalyzedSecurity"
+      },
+      {
+        "view": "fallow.runtimeCoverage",
+        "contents": "No runtime coverage loaded. Point Fallow at a local capture to see hot paths and cleanup candidates.\n[$(graph) Load Runtime Coverage](command:fallow.loadCoverage)\nRuntime coverage is local-only and offline. Requires the fallow-cov sidecar (and a runtime-coverage license or trial when a license is present): run `fallow coverage setup` first.",
+        "when": "!fallow.hasCoverage"
+      },
+      {
+        "view": "fallow.runtimeCoverage",
+        "contents": "$(check) No hot paths or cleanup candidates in this capture.",
+        "when": "fallow.hasCoverage"
       }
     ],
     "walkthroughs": [
@@ -269,7 +857,7 @@
           {
             "id": "fallow.gettingStarted.analyze",
             "title": "Run your first analysis",
-            "description": "Fallow analyzes your codebase for unused code, circular dependencies, code duplication, complexity hotspots, and architecture boundary violations.\n\nOpen the Command Palette and run **Fallow: Run Analysis**, or click the search icon in the Fallow sidebar.\n\n[Run Analysis](command:fallow.analyze)",
+            "description": "Fallow analyzes your codebase for unused code, circular dependencies, code duplication, complexity hotspots, and architecture boundary violations. If needed, the extension downloads managed fallow-lsp and fallow CLI binaries on first use.\n\nOpen the Command Palette and run **Fallow: Run Analysis**, or click the search icon in the Fallow sidebar.\n\n[Run Analysis](command:fallow.analyze)",
             "media": {
               "markdown": "media/step-analyze.md"
             },
@@ -315,31 +903,40 @@
     ]
   },
   "scripts": {
-    "build": "rolldown -c",
+    "codegen:contracts": "node ./scripts/codegen-contracts.mjs",
+    "check:contracts": "node ./scripts/codegen-contracts.mjs --check",
+    "prebuild": "pnpm run codegen:contracts",
+    "build": "rolldown -c && node ./scripts/package-type-aware.mjs",
     "watch": "rolldown -c --watch",
     "lint": "tsc --noEmit && tsc --noEmit -p tsconfig.test.json",
     "test": "pnpm run test:unit && pnpm run test:integration",
     "test:unit": "vitest run",
+    "test:packaging": "node --test ./scripts/*.test.mjs",
     "test:integration": "pnpm run build && tsc -p tsconfig.test.json && node ./.test-dist/test/integration/runTest.js",
-    "prepackage": "cp ../../LICENSE ./LICENSE",
+    "test:integration:real": "pnpm run build && tsc -p tsconfig.test.json && node ./.test-dist/test/integration/real/runTest.js",
+    "prepackage": "pnpm run codegen:contracts && pnpm run build && node ./scripts/copy-license.mjs",
     "package": "vsce package --no-dependencies",
+    "package:variants": "pnpm run build && node ./scripts/copy-license.mjs && node ./scripts/package-vsix-variants.mjs",
+    "verify:vsix": "node ./scripts/verify-packaged-type-aware.mjs",
     "publish": "vsce publish --no-dependencies",
     "publish:ovsx": "ovsx publish --no-dependencies"
   },
   "dependencies": {
-    "vscode-languageclient": "9.0.1",
-    "vscode-languageserver-protocol": "3.17.5"
+    "vscode-languageclient": "10.1.0",
+    "vscode-languageserver-protocol": "3.18.2"
   },
   "devDependencies": {
-    "@types/node": "25.6.0",
-    "@types/vscode": "1.115.0",
+    "@types/node": "26.2.0",
+    "@types/vscode": "1.96.0",
     "@types/mocha": "10.0.10",
-    "@vscode/test-electron": "2.5.2",
-    "@vscode/vsce": "3.7.1",
-    "mocha": "11.7.5",
-    "rolldown": "1.0.0-rc.15",
-    "ovsx": "0.10.11",
-    "typescript": "6.0.2",
-    "vitest": "4.1.4"
+    "@vscode/test-electron": "3.1.0",
+    "@vscode/vsce": "3.9.2",
+    "json-schema-to-typescript": "15.0.4",
+    "mocha": "11.8.0",
+    "rolldown": "1.2.5",
+    "ovsx": "1.1.1",
+    "typescript": "7.0.2",
+    "vitest": "4.1.10",
+    "yauzl": "3.4.0"
   }
 }

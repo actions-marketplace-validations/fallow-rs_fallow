@@ -165,6 +165,22 @@ expression: json_str
   },
   {
     "type": "issue",
+    "check_name": "fallow/unused-store-member",
+    "description": "Store member 'useCounterStore.legacyAction' is never referenced",
+    "categories": [
+      "Bug Risk"
+    ],
+    "severity": "minor",
+    "fingerprint": "a2cd7cf87121a06f",
+    "location": {
+      "path": "src/stores/counter.ts",
+      "lines": {
+        "begin": 24
+      }
+    }
+  },
+  {
+    "type": "issue",
     "check_name": "fallow/unresolved-import",
     "description": "Import './missing-module' could not be resolved",
     "categories": [
@@ -238,6 +254,214 @@ expression: json_str
     "fingerprint": "405f0abed155920d",
     "location": {
       "path": "src/a.ts",
+      "lines": {
+        "begin": 3
+      }
+    }
+  },
+  {
+    "type": "issue",
+    "check_name": "fallow/re-export-cycle",
+    "description": "Re-export cycle: src/api/index.ts <-> src/api/internal/index.ts",
+    "categories": [
+      "Bug Risk"
+    ],
+    "severity": "minor",
+    "fingerprint": "3b15e7a61f99e1df",
+    "location": {
+      "path": "src/api/index.ts",
+      "lines": {
+        "begin": 1
+      }
+    }
+  },
+  {
+    "type": "issue",
+    "check_name": "fallow/invalid-client-export",
+    "description": "Export `metadata` is not allowed in a \"use client\" file (Next.js server-only / route-config name)",
+    "categories": [
+      "Bug Risk"
+    ],
+    "severity": "minor",
+    "fingerprint": "8e530508aa988833",
+    "location": {
+      "path": "app/page.tsx",
+      "lines": {
+        "begin": 3
+      }
+    }
+  },
+  {
+    "type": "issue",
+    "check_name": "fallow/mixed-client-server-barrel",
+    "description": "Barrel re-exports both a \"use client\" module (`./Button`) and a server-only module (`./fetchUser`); one import drags the other's directive across the boundary",
+    "categories": [
+      "Bug Risk"
+    ],
+    "severity": "minor",
+    "fingerprint": "2e57fc499772bc84",
+    "location": {
+      "path": "app/components/index.ts",
+      "lines": {
+        "begin": 2
+      }
+    }
+  },
+  {
+    "type": "issue",
+    "check_name": "fallow/unprovided-inject",
+    "description": "inject(`THEME_KEY`) has no matching provide(`THEME_KEY`) in this project; at runtime it returns undefined (provide the key or remove this inject)",
+    "categories": [
+      "Bug Risk"
+    ],
+    "severity": "minor",
+    "fingerprint": "82ebf4620cc2bba5",
+    "location": {
+      "path": "src/useTheme.ts",
+      "lines": {
+        "begin": 5
+      }
+    }
+  },
+  {
+    "type": "issue",
+    "check_name": "fallow/unused-component-input",
+    "description": "input `variant` is declared but referenced nowhere in component `UserCardComponent` (remove it or use it)",
+    "categories": [
+      "Bug Risk"
+    ],
+    "severity": "minor",
+    "fingerprint": "43da4dfe078e4765",
+    "location": {
+      "path": "src/user-card.component.ts",
+      "lines": {
+        "begin": 12
+      }
+    }
+  },
+  {
+    "type": "issue",
+    "check_name": "fallow/unused-component-output",
+    "description": "output `selected` is declared but emitted nowhere in component `UserCardComponent` (remove it or emit it)",
+    "categories": [
+      "Bug Risk"
+    ],
+    "severity": "minor",
+    "fingerprint": "48412c022e3ac5ab",
+    "location": {
+      "path": "src/user-card.component.ts",
+      "lines": {
+        "begin": 15
+      }
+    }
+  },
+  {
+    "type": "issue",
+    "check_name": "fallow/unused-svelte-event",
+    "description": "event `dead` is dispatched by component `Child` but listened to nowhere in the project (remove it or listen for it)",
+    "categories": [
+      "Bug Risk"
+    ],
+    "severity": "minor",
+    "fingerprint": "844a7c0e7c849332",
+    "location": {
+      "path": "src/Child.svelte",
+      "lines": {
+        "begin": 6
+      }
+    }
+  },
+  {
+    "type": "issue",
+    "check_name": "fallow/unused-catalog-entry",
+    "description": "Catalog entry 'is-even' is not referenced by any workspace package",
+    "categories": [
+      "Bug Risk"
+    ],
+    "severity": "minor",
+    "fingerprint": "01c68b8e65ee42b9",
+    "location": {
+      "path": "pnpm-workspace.yaml",
+      "lines": {
+        "begin": 6
+      }
+    }
+  },
+  {
+    "type": "issue",
+    "check_name": "fallow/unused-catalog-entry",
+    "description": "Catalog entry 'old-thing' (catalog 'legacy') is not referenced by any workspace package",
+    "categories": [
+      "Bug Risk"
+    ],
+    "severity": "minor",
+    "fingerprint": "2d5072d3451b44dd",
+    "location": {
+      "path": "pnpm-workspace.yaml",
+      "lines": {
+        "begin": 12
+      }
+    }
+  },
+  {
+    "type": "issue",
+    "check_name": "fallow/empty-catalog-group",
+    "description": "Catalog group 'react17' has no entries",
+    "categories": [
+      "Bug Risk"
+    ],
+    "severity": "minor",
+    "fingerprint": "03506bd5a376e100",
+    "location": {
+      "path": "pnpm-workspace.yaml",
+      "lines": {
+        "begin": 10
+      }
+    }
+  },
+  {
+    "type": "issue",
+    "check_name": "fallow/unresolved-catalog-reference",
+    "description": "Package 'old-react' is referenced via `catalog:react17` but catalog 'react17' does not declare it; `pnpm install` will fail (available in: react18)",
+    "categories": [
+      "Bug Risk"
+    ],
+    "severity": "major",
+    "fingerprint": "3b583c29be84724a",
+    "location": {
+      "path": "packages/app/package.json",
+      "lines": {
+        "begin": 14
+      }
+    }
+  },
+  {
+    "type": "issue",
+    "check_name": "fallow/unused-dependency-override",
+    "description": "Override `axios` forces version `^1.6.0` but `axios` is not declared by any workspace package or resolved in the lockfile (may target a transitive dependency; pnpm install --frozen-lockfile is the ground truth)",
+    "categories": [
+      "Bug Risk"
+    ],
+    "severity": "minor",
+    "fingerprint": "9e455c649fd184fe",
+    "location": {
+      "path": "pnpm-workspace.yaml",
+      "lines": {
+        "begin": 9
+      }
+    }
+  },
+  {
+    "type": "issue",
+    "check_name": "fallow/misconfigured-dependency-override",
+    "description": "Override `@types/react@<<18` -> `18.0.0` is malformed: override key cannot be parsed",
+    "categories": [
+      "Bug Risk"
+    ],
+    "severity": "major",
+    "fingerprint": "21be520b86ce0207",
+    "location": {
+      "path": "package.json",
       "lines": {
         "begin": 3
       }

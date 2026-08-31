@@ -8,7 +8,9 @@ use super::{Plugin, PluginResult};
 
 const ENABLERS: &[&str] = &["semantic-release"];
 
-const CONFIG_PATTERNS: &[&str] = &["release.config.{js,cjs,mjs}", ".releaserc.{js,cjs}"];
+// The YAML forms and bare `.releaserc` (JSON or YAML, with no extension to tell
+// them apart) stay activation-only: the extractor is a JS/JSON parser.
+const CONFIG_PATTERNS: &[&str] = &["release.config.{js,cjs,mjs}", ".releaserc.{js,cjs,json}"];
 
 const ALWAYS_USED: &[&str] = &[
     "release.config.{js,cjs,mjs}",
@@ -33,14 +35,8 @@ define_plugin! {
     tooling_dependencies: TOOLING_DEPENDENCIES,
     resolve_config(config_path, source, _root) {
         let mut result = PluginResult::default();
+        super::add_import_referenced_dependencies(&mut result, source, config_path);
 
-        let imports = config_parser::extract_imports(source, config_path);
-        for imp in &imports {
-            let dep = crate::resolve::extract_package_name(imp);
-            result.referenced_dependencies.push(dep);
-        }
-
-        // plugins -> referenced dependencies (shallow to avoid options objects)
         let plugins = config_parser::extract_config_shallow_strings(source, config_path, "plugins");
         for plugin in &plugins {
             let dep = crate::resolve::extract_package_name(plugin);
@@ -84,7 +80,6 @@ mod tests {
 
     #[test]
     fn resolve_config_plugins_with_options_skipped() {
-        // Shallow extraction should pick up string elements but skip array/object elements
         let source = r#"
             module.exports = {
                 plugins: [
@@ -169,6 +164,38 @@ mod tests {
             result
                 .referenced_dependencies
                 .contains(&"@semantic-release/git".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_config_json_releaserc_credits_plugin_outside_name_prefix() {
+        let source = r#"{
+            "branches": ["main"],
+            "plugins": [
+                ["@semantic-release/commit-analyzer", { "preset": "conventionalcommits" }],
+                "conventional-changelog-conventionalcommits"
+            ]
+        }"#;
+        let plugin = SemanticReleasePlugin;
+        let result =
+            plugin.resolve_config(Path::new(".releaserc.json"), source, Path::new("/project"));
+        let deps = &result.referenced_dependencies;
+        assert!(
+            deps.contains(&"conventional-changelog-conventionalcommits".to_string()),
+            "a plugin outside the `semantic-release` name prefix is not covered by the \
+             tooling.toml prefix exemption, so only config extraction can credit it: {deps:?}"
+        );
+    }
+
+    #[test]
+    fn config_patterns_cover_json_releaserc_but_not_yaml() {
+        let patterns = SemanticReleasePlugin.config_patterns();
+        assert!(patterns.contains(&".releaserc.{js,cjs,json}"));
+        assert!(
+            !patterns
+                .iter()
+                .any(|p| p.contains("yaml") || p.contains("yml")),
+            "the extractor is a JS/JSON parser; the YAML forms stay activation-only"
         );
     }
 }

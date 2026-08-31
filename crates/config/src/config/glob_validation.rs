@@ -1,0 +1,545 @@
+//! Validation of user-supplied glob patterns from the config file.
+//!
+//! Fallow accepts filesystem glob patterns in several config fields (`entry`,
+//! `ignorePatterns`, `ignoreFindings`, `dynamicallyLoaded`, `duplicates.ignore`, `health.ignore`,
+//! `health.thresholdOverrides[].files`, `boundaries.zones[].patterns`,
+//! `overrides[].files`, `ignoreExports[].file`, `ignoreCatalogReferences[].consumer`).
+//! All of these are matched against
+//! project-root-relative file paths. The matcher cannot reach outside the
+//! project root by construction, but a malicious config can still slip in
+//! absolute paths or `..` traversal segments that silently no-op today and
+//! mask user intent.
+//!
+//! This module rejects such patterns at config-load time so users get a clear
+//! error instead of a silent no-match. Invalid glob syntax also fails loud
+//! here, replacing the historical `if let Ok(glob) = Glob::new(pattern)` drop
+//! patterns scattered across the codebase.
+//!
+//! See issue #463 for the threat model.
+
+use std::fmt;
+use std::path::{Component, Path};
+
+use globset::Glob;
+
+use super::finding_ignore::FindingIgnoreMatcher;
+
+/// Validation failure for user-supplied glob configuration.
+#[derive(Debug)]
+pub enum GlobValidationError {
+    /// Pattern is an absolute path (`/foo`, `\foo`, `C:\foo`, `\\share`).
+    AbsolutePath {
+        /// Config field the pattern came from (e.g. `entry`), named in the error.
+        field: &'static str,
+        /// The offending pattern as written in the config.
+        pattern: String,
+    },
+    /// Pattern contains a `..` path segment.
+    TraversalSegment {
+        /// Config field the pattern came from, named in the error.
+        field: &'static str,
+        /// The offending pattern as written in the config.
+        pattern: String,
+    },
+    /// Pattern is not valid glob syntax.
+    InvalidSyntax {
+        /// Config field the pattern came from, named in the error.
+        field: &'static str,
+        /// The offending pattern as written in the config.
+        pattern: String,
+        /// Underlying glob parse error.
+        source: globset::Error,
+    },
+    /// A finding-ignore exception contains `!` without a pattern body.
+    EmptyNegation {
+        /// Config field the pattern came from, named in the error.
+        field: &'static str,
+        /// The offending pattern as written in the config.
+        pattern: String,
+    },
+    /// Individually valid patterns cannot be compiled into one matcher.
+    PatternSetCompilation {
+        /// Config field whose pattern set failed to build, named in the error.
+        field: &'static str,
+        /// Underlying glob-set build error.
+        source: globset::Error,
+    },
+}
+
+impl fmt::Display for GlobValidationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AbsolutePath { field, pattern } => {
+                write!(
+                    f,
+                    "{field}: '{pattern}' is an absolute path; \
+                     use a pattern relative to the project root (e.g. 'src/**')"
+                )
+            }
+            Self::TraversalSegment { field, pattern } => {
+                write!(
+                    f,
+                    "{field}: '{pattern}' contains a '..' segment; \
+                     rewrite the pattern to stay inside the project root, \
+                     or run fallow with --root pointing at the directory you want to scan"
+                )
+            }
+            Self::InvalidSyntax {
+                field,
+                pattern,
+                source,
+            } => {
+                let source_msg = source.to_string();
+                let tail = source_msg
+                    .find("': ")
+                    .map_or(source_msg.as_str(), |idx| &source_msg[idx + 3..]);
+                write!(
+                    f,
+                    "{field}: invalid glob '{pattern}': {tail}; \
+                     fix the syntax (see https://docs.rs/globset for the supported grammar)"
+                )
+            }
+            Self::EmptyNegation { field, pattern } => write!(
+                f,
+                "{field}: invalid glob '{pattern}': a negated pattern requires a pattern after '!'"
+            ),
+            Self::PatternSetCompilation { field, source } => write!(
+                f,
+                "{field}: glob patterns cannot be compiled together: {source}; simplify the pattern set"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for GlobValidationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidSyntax { source, .. } | Self::PatternSetCompilation { source, .. } => {
+                Some(source)
+            }
+            Self::AbsolutePath { .. }
+            | Self::TraversalSegment { .. }
+            | Self::EmptyNegation { .. } => None,
+        }
+    }
+}
+
+/// Detect absolute paths cross-platform without relying on `Path::is_absolute`
+/// (which is platform-specific: on Unix, `C:\foo` would be treated as relative).
+///
+/// Rejected shapes:
+/// - Unix root: `/foo`
+/// - Windows backslash root: `\foo`
+/// - UNC: `\\share\path` or `//share/path`
+/// - Drive letter: `C:\foo`, `c:/foo`, `D:foo`
+fn is_absolute_pattern(pattern: &str) -> bool {
+    if pattern.starts_with('/') || pattern.starts_with('\\') {
+        return true;
+    }
+    let bytes = pattern.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        return true;
+    }
+    false
+}
+
+/// Return `true` if any segment of `pattern` is `..`.
+///
+/// We split on BOTH `/` and `\` so a backslash-separated traversal pattern
+/// (`..\foo`) authored on a Windows machine is rejected even when fallow runs
+/// on Unix. `Path::components` on Unix treats `\` as a regular character, so
+/// it cannot be relied on as a cross-platform separator detector.
+///
+/// Glob meta characters (`*`, `**`, `[abc]`, `{a,b}`) pass through unchanged
+/// because the split only inspects separators.
+fn has_traversal_segment(pattern: &str) -> bool {
+    pattern.split(['/', '\\']).any(|seg| seg == "..")
+        || Path::new(pattern)
+            .components()
+            .any(|c| matches!(c, Component::ParentDir))
+}
+
+/// Validate that `pattern` is a relative, non-traversal, syntactically valid
+/// glob; return the compiled glob on success.
+///
+/// `field` is the dotted-path name of the config field the pattern came from
+/// (e.g. `"entry"`, `"ignorePatterns"`, `"duplicates.ignore"`); it appears
+/// verbatim in the error message so users can locate the bad value.
+///
+/// # Errors
+///
+/// Returns:
+/// - `AbsolutePath` if the pattern is rooted at `/`, `\`, `\\`, `//`, or a
+///   Windows drive letter
+/// - `TraversalSegment` if any path segment of the pattern is `..`
+/// - `InvalidSyntax` if `globset::Glob::new` rejects the pattern
+pub fn compile_user_glob(pattern: &str, field: &'static str) -> Result<Glob, GlobValidationError> {
+    if is_absolute_pattern(pattern) {
+        return Err(GlobValidationError::AbsolutePath {
+            field,
+            pattern: pattern.to_owned(),
+        });
+    }
+    if has_traversal_segment(pattern) {
+        return Err(GlobValidationError::TraversalSegment {
+            field,
+            pattern: pattern.to_owned(),
+        });
+    }
+    Glob::new(pattern).map_err(|source| GlobValidationError::InvalidSyntax {
+        field,
+        pattern: pattern.to_owned(),
+        source,
+    })
+}
+
+/// Validate a glob pattern that matches a raw import specifier, not a
+/// filesystem path.
+///
+/// Specifiers such as `../generated/foo` are valid import strings, so this
+/// intentionally skips the absolute-path and traversal-segment checks used for
+/// project-root-relative file globs.
+///
+/// # Errors
+///
+/// Returns `InvalidSyntax` if `globset::Glob::new` rejects the pattern.
+pub fn compile_user_specifier_glob(
+    pattern: &str,
+    field: &'static str,
+) -> Result<Glob, GlobValidationError> {
+    Glob::new(pattern).map_err(|source| GlobValidationError::InvalidSyntax {
+        field,
+        pattern: pattern.to_owned(),
+        source,
+    })
+}
+
+/// Validate a slice of import-specifier patterns, accumulating syntax errors.
+pub fn validate_user_specifier_globs(
+    patterns: &[String],
+    field: &'static str,
+    errors: &mut Vec<GlobValidationError>,
+) {
+    for pattern in patterns {
+        if let Err(e) = compile_user_specifier_glob(pattern, field) {
+            errors.push(e);
+        }
+    }
+}
+
+/// Validate a slice of patterns, accumulating ALL errors so the user sees
+/// every offending pattern in one run rather than fixing them one at a time.
+pub fn validate_user_globs(
+    patterns: &[String],
+    field: &'static str,
+    errors: &mut Vec<GlobValidationError>,
+) {
+    for pattern in patterns {
+        if let Err(e) = compile_user_glob(pattern, field) {
+            errors.push(e);
+        }
+    }
+}
+
+/// Validate finding-ignore patterns, treating a leading `!` as a report
+/// exception, validating each project-relative body, and proving both matcher
+/// sets can be compiled together.
+///
+/// An empty body is only an error after an explicit `!`. A bare empty pattern is
+/// a glob that matches nothing, which `ignorePatterns` already accepts.
+pub fn validate_user_finding_ignore_globs(
+    patterns: &[String],
+    field: &'static str,
+    errors: &mut Vec<GlobValidationError>,
+) {
+    let initial_error_count = errors.len();
+    for pattern in patterns {
+        let negated_body = pattern.strip_prefix('!');
+        if negated_body.is_some_and(str::is_empty) {
+            errors.push(GlobValidationError::EmptyNegation {
+                field,
+                pattern: pattern.clone(),
+            });
+            continue;
+        }
+        if let Err(error) = compile_user_glob(negated_body.unwrap_or(pattern.as_str()), field) {
+            errors.push(error);
+        }
+    }
+
+    if errors.len() == initial_error_count
+        && let Err(source) = FindingIgnoreMatcher::validate_compilation(patterns)
+    {
+        errors.push(GlobValidationError::PatternSetCompilation { field, source });
+    }
+}
+
+/// Validate a user-supplied DIRECTORY PATH (not a glob). Same absolute-path
+/// and traversal checks as `compile_user_glob`, but skips the glob-syntax
+/// check because the value is a literal path, not a pattern.
+///
+/// Used for fields like `boundaries.zones[].root` and
+/// `boundaries.zones[].autoDiscover` that name a directory subtree rather
+/// than a match pattern.
+///
+/// # Errors
+///
+/// Returns `AbsolutePath` or `TraversalSegment` for the same shapes
+/// `compile_user_glob` rejects. Never returns `InvalidSyntax`.
+pub fn validate_user_path(path: &str, field: &'static str) -> Result<(), GlobValidationError> {
+    if is_absolute_pattern(path) {
+        return Err(GlobValidationError::AbsolutePath {
+            field,
+            pattern: path.to_owned(),
+        });
+    }
+    if has_traversal_segment(path) {
+        return Err(GlobValidationError::TraversalSegment {
+            field,
+            pattern: path.to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Same as `validate_user_path` but accumulates errors over a slice.
+pub fn validate_user_paths(
+    paths: &[String],
+    field: &'static str,
+    errors: &mut Vec<GlobValidationError>,
+) {
+    for path in paths {
+        if let Err(e) = validate_user_path(path, field) {
+            errors.push(e);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relative_glob_accepted() {
+        assert!(compile_user_glob("src/**/*.ts", "entry").is_ok());
+        assert!(compile_user_glob("**/*.test.ts", "entry").is_ok());
+        assert!(compile_user_glob("./src/main.ts", "entry").is_ok());
+        assert!(compile_user_glob("packages/*/src/index.ts", "entry").is_ok());
+        assert!(compile_user_glob("**/{a,b}.ts", "entry").is_ok());
+    }
+
+    #[test]
+    fn finding_ignore_globs_validate_negated_pattern_bodies() {
+        let mut errors = Vec::new();
+        validate_user_finding_ignore_globs(
+            &["**/*.test.ts".to_string(), "!src/public/**".to_string()],
+            "ignoreFindings",
+            &mut errors,
+        );
+
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn finding_ignore_globs_reject_bare_negation() {
+        let mut errors = Vec::new();
+        validate_user_finding_ignore_globs(&["!".to_string()], "ignoreFindings", &mut errors);
+
+        assert!(matches!(
+            errors.as_slice(),
+            [GlobValidationError::EmptyNegation { .. }]
+        ));
+    }
+
+    #[test]
+    fn finding_ignore_globs_validate_negated_paths_and_syntax() {
+        let cases = ["!/absolute/**", "!../outside/**", "![unclosed"];
+
+        for pattern in cases {
+            let mut errors = Vec::new();
+            validate_user_finding_ignore_globs(
+                &[pattern.to_string()],
+                "ignoreFindings",
+                &mut errors,
+            );
+            assert_eq!(errors.len(), 1, "pattern: {pattern}");
+        }
+    }
+
+    #[test]
+    fn bracket_character_class_accepted() {
+        assert!(compile_user_glob("[A-Z]*.tsx", "entry").is_ok());
+        assert!(compile_user_glob("src/**/[A-Z]*.{ts,tsx}", "ignoreExports[].file").is_ok());
+        assert!(compile_user_glob("**/[0-9][0-9]*.md", "entry").is_ok());
+    }
+
+    #[test]
+    fn validate_user_path_rejects_traversal_and_absolute() {
+        assert!(validate_user_path("../escape", "boundaries.zones[].root").is_err());
+        assert!(validate_user_path("/abs/dir", "boundaries.zones[].root").is_err());
+        assert!(validate_user_path("packages/ui", "boundaries.zones[].root").is_ok());
+        assert!(validate_user_path("[brackets-literal]/dir", "boundaries.zones[].root").is_ok());
+    }
+
+    #[test]
+    fn absolute_unix_path_rejected() {
+        let err = compile_user_glob("/etc/passwd", "entry").unwrap_err();
+        assert!(matches!(err, GlobValidationError::AbsolutePath { .. }));
+        let msg = err.to_string();
+        assert!(msg.contains("/etc/passwd"), "msg: {msg}");
+        assert!(msg.contains("entry"), "msg: {msg}");
+        assert!(msg.contains("absolute"), "msg: {msg}");
+        assert!(msg.contains("relative to the project root"), "msg: {msg}");
+    }
+
+    #[test]
+    fn absolute_unix_glob_rejected() {
+        let err = compile_user_glob("/root/.ssh/**", "ignorePatterns").unwrap_err();
+        assert!(matches!(err, GlobValidationError::AbsolutePath { .. }));
+    }
+
+    #[test]
+    fn absolute_windows_backslash_path_rejected() {
+        let err = compile_user_glob("\\Windows\\System32", "entry").unwrap_err();
+        assert!(matches!(err, GlobValidationError::AbsolutePath { .. }));
+    }
+
+    #[test]
+    fn unc_path_rejected() {
+        let err = compile_user_glob("\\\\share\\secrets", "entry").unwrap_err();
+        assert!(matches!(err, GlobValidationError::AbsolutePath { .. }));
+    }
+
+    #[test]
+    fn unc_forward_slash_rejected() {
+        let err = compile_user_glob("//share/secrets", "entry").unwrap_err();
+        assert!(matches!(err, GlobValidationError::AbsolutePath { .. }));
+    }
+
+    #[test]
+    fn windows_drive_letter_rejected() {
+        for pat in ["C:\\Users", "c:/Users", "D:foo", "Z:\\"] {
+            let err = compile_user_glob(pat, "entry").unwrap_err();
+            assert!(
+                matches!(err, GlobValidationError::AbsolutePath { .. }),
+                "expected AbsolutePath for {pat}, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn traversal_segment_rejected() {
+        let err = compile_user_glob("../foo", "entry").unwrap_err();
+        assert!(matches!(err, GlobValidationError::TraversalSegment { .. }));
+        assert!(err.to_string().contains("../foo"));
+    }
+
+    #[test]
+    fn traversal_in_middle_rejected() {
+        let err = compile_user_glob("src/../../../etc", "ignorePatterns").unwrap_err();
+        assert!(matches!(err, GlobValidationError::TraversalSegment { .. }));
+    }
+
+    #[test]
+    fn traversal_with_backslash_rejected() {
+        let err = compile_user_glob("..\\foo", "entry").unwrap_err();
+        assert!(matches!(err, GlobValidationError::TraversalSegment { .. }));
+    }
+
+    #[test]
+    fn traversal_in_glob_pattern_rejected() {
+        let err = compile_user_glob("**/../secrets", "entry").unwrap_err();
+        assert!(matches!(err, GlobValidationError::TraversalSegment { .. }));
+    }
+
+    #[test]
+    fn double_dot_filename_accepted() {
+        assert!(compile_user_glob("foo..bar", "entry").is_ok());
+        assert!(compile_user_glob("src/file.with..dots.ts", "entry").is_ok());
+    }
+
+    #[test]
+    fn current_dir_dot_accepted() {
+        assert!(compile_user_glob("./src/**", "entry").is_ok());
+    }
+
+    #[test]
+    fn invalid_glob_syntax_rejected() {
+        let err = compile_user_glob("[invalid", "entry").unwrap_err();
+        assert!(matches!(err, GlobValidationError::InvalidSyntax { .. }));
+        let msg = err.to_string();
+        assert!(msg.contains("entry"), "msg: {msg}");
+        assert_eq!(msg.matches("[invalid").count(), 1, "msg: {msg}");
+        assert!(msg.contains("unclosed character class"), "msg: {msg}");
+    }
+
+    #[test]
+    fn empty_pattern_accepted_as_globset_handles_it() {
+        assert!(compile_user_glob("", "entry").is_ok());
+    }
+
+    #[test]
+    fn validate_user_globs_collects_all_errors() {
+        let patterns = vec![
+            "src/**".to_owned(),
+            "../foo".to_owned(),
+            "/abs".to_owned(),
+            "[bad".to_owned(),
+            "**/*.ts".to_owned(),
+        ];
+        let mut errors = Vec::new();
+        validate_user_globs(&patterns, "ignorePatterns", &mut errors);
+        assert_eq!(errors.len(), 3);
+        assert!(matches!(
+            errors[0],
+            GlobValidationError::TraversalSegment { .. }
+        ));
+        assert!(matches!(
+            errors[1],
+            GlobValidationError::AbsolutePath { .. }
+        ));
+        assert!(matches!(
+            errors[2],
+            GlobValidationError::InvalidSyntax { .. }
+        ));
+    }
+
+    #[test]
+    fn field_name_in_error_message() {
+        let err = compile_user_glob("../oops", "duplicates.ignore").unwrap_err();
+        assert!(err.to_string().starts_with("duplicates.ignore:"));
+    }
+
+    /// `ignorePatterns` accepts an empty pattern, so `ignoreFindings` rejecting it
+    /// was both an asymmetry and a misleading message about a `!` it lacks.
+    #[test]
+    fn finding_ignore_globs_accept_empty_pattern_like_ignore_patterns() {
+        let mut findings_errors = Vec::new();
+        validate_user_finding_ignore_globs(
+            &[String::new()],
+            "ignoreFindings",
+            &mut findings_errors,
+        );
+
+        let mut patterns_errors = Vec::new();
+        validate_user_globs(&[String::new()], "ignorePatterns", &mut patterns_errors);
+
+        assert!(findings_errors.is_empty(), "errors: {findings_errors:?}");
+        assert!(patterns_errors.is_empty(), "errors: {patterns_errors:?}");
+    }
+
+    #[test]
+    fn finding_ignore_globs_reject_empty_body_only_after_bang() {
+        let mut errors = Vec::new();
+        validate_user_finding_ignore_globs(
+            &[String::new(), "!".to_string(), "src/**".to_string()],
+            "ignoreFindings",
+            &mut errors,
+        );
+        assert_eq!(errors.len(), 1, "only the bare `!` is invalid: {errors:?}");
+        assert!(matches!(
+            errors[0],
+            GlobValidationError::EmptyNegation { .. }
+        ));
+    }
+}

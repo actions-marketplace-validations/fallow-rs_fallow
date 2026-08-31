@@ -24,6 +24,14 @@
 //! Matches Docker Desktop / JetBrains conventions. See [`grace_state`].
 
 #![forbid(unsafe_code)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        reason = "tests use unwrap and expect to keep fixture setup concise"
+    )
+)]
 
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -41,6 +49,19 @@ pub const DEFAULT_HARD_FAIL_DAYS: u64 = 30;
 /// Days post-expiry after which the public output gains a visible watermark.
 pub const WATERMARK_DAYS: u64 = 7;
 
+/// Default tolerance (in seconds) for `iat` clock skew: 24h.
+///
+/// Matches the leeway defaults used by `jsonwebtoken` (Node),
+/// `pyjwt`, and `jjwt`. A JWT whose `iat` is more than this many seconds in
+/// the future relative to the local clock is rejected as
+/// [`LicenseError::ClockSkew`]. Override via
+/// `FALLOW_LICENSE_SKEW_TOLERANCE_SECONDS` (consumed by
+/// [`skew_tolerance_seconds_from_env`]).
+pub const DEFAULT_SKEW_TOLERANCE_SECONDS: i64 = 86_400;
+
+/// Env var name for overriding [`DEFAULT_SKEW_TOLERANCE_SECONDS`].
+pub const SKEW_TOLERANCE_ENV: &str = "FALLOW_LICENSE_SKEW_TOLERANCE_SECONDS";
+
 /// JWT claims emitted by `api.fallow.cloud` for fallow CLI licenses.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LicenseClaims {
@@ -52,7 +73,10 @@ pub struct LicenseClaims {
     pub tid: String,
     /// Number of seats licensed.
     pub seats: u32,
-    /// Tier string: `team`, `enterprise`, `trial`, `founding`.
+    /// Tier string emitted by fallow-cloud: `pro`, `enterprise`, `trial`, `founding`.
+    /// (`team` is the legacy name for `pro`; the server now emits `pro`.) The
+    /// value is informational only: capability gating is on `features`, never on
+    /// this string, so any tier value is tolerated.
     pub tier: String,
     /// Feature flags. Modeled as strings on the wire for forward-compat;
     /// callers convert to [`Feature`] for matching.
@@ -77,13 +101,16 @@ pub struct LicenseClaims {
 /// bumps and unrecognized strings round-trip through [`Feature::Other`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Feature {
-    /// The Phase-2 paid local analyzer.
-    ProductionCoverage,
-    /// Phase-3+ cloud features (placeholder).
+    /// Paid local runtime coverage analyzer (CLI + sidecar).
+    RuntimeCoverage,
+    /// Cloud portfolio dashboard. Currently inert: granted in JWTs but not
+    /// yet consumed by any CLI command.
     PortfolioDashboard,
-    /// Phase-4+ MCP cloud tools (placeholder).
+    /// Cloud MCP tools. Currently inert: granted in JWTs but not yet
+    /// consumed by any CLI command.
     McpCloudTools,
-    /// Phase-3+ cross-repo aggregation (placeholder).
+    /// Cross-repo aggregation. Currently inert: granted in JWTs but not yet
+    /// consumed by any CLI command.
     CrossRepoAggregation,
     /// Forward-compat sentinel for unrecognized feature strings.
     Other(String),
@@ -96,7 +123,7 @@ impl Feature {
     #[must_use]
     pub fn parse(s: &str) -> Self {
         match s {
-            "production_coverage" => Self::ProductionCoverage,
+            "runtime_coverage" => Self::RuntimeCoverage,
             "portfolio_dashboard" => Self::PortfolioDashboard,
             "mcp_cloud_tools" => Self::McpCloudTools,
             "cross_repo_aggregation" => Self::CrossRepoAggregation,
@@ -179,6 +206,22 @@ pub enum LicenseError {
     BadSignature,
     /// JWT length looks truncated (typical valid range 700-1500 chars).
     Truncated { actual: usize },
+    /// The license JWT's `iat` claim is more than the configured tolerance in
+    /// the future relative to the local clock. Mathematically equivalent to
+    /// "the local clock is more than the tolerance behind the license issue
+    /// time"; the two interpretations are the same condition.
+    ///
+    /// Tolerance is applied only to `iat`, not to `exp`. The existing grace
+    /// ladder (7 / 30 / hard-fail) absorbs sub-day `exp` skew. This is a
+    /// deliberate asymmetry; revisit if a real incident shows otherwise.
+    ClockSkew {
+        /// JWT `iat` claim (unix seconds).
+        iat_seconds: i64,
+        /// Local clock at verification time (unix seconds).
+        now_seconds: i64,
+        /// Tolerance window applied (seconds).
+        tolerance_seconds: i64,
+    },
 }
 
 impl std::fmt::Display for LicenseError {
@@ -193,6 +236,21 @@ impl std::fmt::Display for LicenseError {
                 f,
                 "the token looks truncated (got {actual} chars; expected 700+). Did you copy the whole thing? Try: fallow license activate --from-file license.jwt"
             ),
+            Self::ClockSkew {
+                iat_seconds,
+                now_seconds,
+                tolerance_seconds,
+            } => {
+                let delta = iat_seconds.saturating_sub(*now_seconds).unsigned_abs();
+                let tolerance = u64::try_from(*tolerance_seconds).unwrap_or(0);
+                write!(
+                    f,
+                    "license appears to be issued {duration} in the future (allowed skew {tolerance_human}). The system clock and the license issue time differ significantly; this commonly happens in CI containers without NTP, on machines with a dead BIOS battery, or when a clock has drifted. After confirming your clock is correct, set {env}=<seconds> to override the default 24h window.",
+                    duration = format_duration_seconds(delta),
+                    tolerance_human = format_duration_seconds(tolerance),
+                    env = SKEW_TOLERANCE_ENV,
+                )
+            }
         }
     }
 }
@@ -208,15 +266,43 @@ impl From<std::io::Error> for LicenseError {
 /// Verify a raw JWT string against the supplied public key and (optionally)
 /// the wall clock. The `now` parameter is the unix-seconds reference used to
 /// classify expiry; pass [`current_unix_seconds`] in production.
+///
+/// Delegates to [`verify_jwt_with_skew`] with [`DEFAULT_SKEW_TOLERANCE_SECONDS`]
+/// so existing callers retain the same signature; new code that needs to
+/// honor the `FALLOW_LICENSE_SKEW_TOLERANCE_SECONDS` env var should call
+/// [`verify_jwt_with_skew`] directly with [`skew_tolerance_seconds_from_env`].
 pub fn verify_jwt(
     raw_jwt: &str,
     public_key: &VerifyingKey,
     now: i64,
     hard_fail_days: u64,
 ) -> Result<LicenseStatus, LicenseError> {
+    verify_jwt_with_skew(
+        raw_jwt,
+        public_key,
+        now,
+        hard_fail_days,
+        DEFAULT_SKEW_TOLERANCE_SECONDS,
+    )
+}
+
+/// Verify a raw JWT string with an explicit clock-skew tolerance.
+///
+/// Rejects JWTs whose `iat` is more than `skew_tolerance_seconds` in the
+/// future relative to `now`. The same condition catches both forward-signed
+/// JWTs and systems whose clocks are behind reality (since
+/// `now < iat - tolerance` is equivalent to `iat > now + tolerance`).
+/// Tolerance is applied only to `iat`; `exp` continues to flow through the
+/// grace ladder unchanged.
+pub fn verify_jwt_with_skew(
+    raw_jwt: &str,
+    public_key: &VerifyingKey,
+    now: i64,
+    hard_fail_days: u64,
+    skew_tolerance_seconds: i64,
+) -> Result<LicenseStatus, LicenseError> {
     let trimmed = normalize_jwt(raw_jwt);
 
-    // Length sanity-check before crypto. Real JWTs are 700-1500 chars.
     if trimmed.len() < 200 {
         return Err(LicenseError::Truncated {
             actual: trimmed.len(),
@@ -232,8 +318,6 @@ pub fn verify_jwt(
     }
     let (header_b64, payload_b64, signature_b64) = (parts[0], parts[1], parts[2]);
 
-    // 1. Verify header alg pinning. We never trust the header to pick the alg;
-    // we verify the header's alg matches the alg we've already pinned in code.
     let header_bytes = URL_SAFE_NO_PAD
         .decode(header_b64)
         .map_err(|err| LicenseError::BadHeader(format!("base64 decode: {err}")))?;
@@ -249,7 +333,6 @@ pub fn verify_jwt(
         )));
     }
 
-    // 2. Verify signature over the canonical signing input (header.payload).
     let signature_bytes = URL_SAFE_NO_PAD
         .decode(signature_b64)
         .map_err(|_| LicenseError::BadSignature)?;
@@ -263,14 +346,21 @@ pub fn verify_jwt(
         .verify_strict(signing_input.as_bytes(), &signature)
         .map_err(|_| LicenseError::BadSignature)?;
 
-    // 3. Parse payload claims.
     let payload_bytes = URL_SAFE_NO_PAD
         .decode(payload_b64)
         .map_err(|err| LicenseError::BadPayload(format!("base64 decode: {err}")))?;
     let claims: LicenseClaims = serde_json::from_slice(&payload_bytes)
         .map_err(|err| LicenseError::BadPayload(format!("json parse: {err}")))?;
 
-    // 4. Apply grace ladder.
+    let earliest_iat = now.saturating_add(skew_tolerance_seconds);
+    if claims.iat > earliest_iat {
+        return Err(LicenseError::ClockSkew {
+            iat_seconds: claims.iat,
+            now_seconds: now,
+            tolerance_seconds: skew_tolerance_seconds,
+        });
+    }
+
     Ok(grace_state(claims, now, hard_fail_days))
 }
 
@@ -314,8 +404,9 @@ pub fn load_and_verify(
     hard_fail_days: u64,
 ) -> Result<LicenseStatus, LicenseError> {
     let now = current_unix_seconds();
+    let skew = skew_tolerance_seconds_from_env();
     match load_raw_jwt()? {
-        Some(jwt) => verify_jwt(&jwt, public_key, now, hard_fail_days),
+        Some(jwt) => verify_jwt_with_skew(&jwt, public_key, now, hard_fail_days, skew),
         None => Ok(LicenseStatus::Missing),
     }
 }
@@ -345,7 +436,7 @@ pub fn load_raw_jwt() -> Result<Option<String>, LicenseError> {
 /// default-path discovery; otherwise returns the trimmed path. Without this,
 /// shells that export `FALLOW_LICENSE_PATH=""` (empty-string) produced a
 /// cryptic `license I/O error: No such file or directory` on `health
-/// --production-coverage` because `read_jwt_file(Path::new(""))` fails at the
+/// --runtime-coverage` because `read_jwt_file(Path::new(""))` fails at the
 /// fs layer.
 fn resolve_license_path_env(raw: Option<String>) -> Option<PathBuf> {
     let raw = raw?;
@@ -424,16 +515,85 @@ pub fn current_unix_seconds() -> i64 {
 
 const SECONDS_PER_DAY: i64 = 86_400;
 
+/// Resolve the clock-skew tolerance (in seconds) from
+/// `FALLOW_LICENSE_SKEW_TOLERANCE_SECONDS`, falling back to
+/// [`DEFAULT_SKEW_TOLERANCE_SECONDS`] when the variable is unset, empty,
+/// whitespace-only, or unparsable.
+///
+/// Parsing is lenient by design: a typo in a CI runner's env block must not
+/// fail license verification. The value is parsed as `u64` and capped at
+/// `i64::MAX`, so any positive integer is accepted.
+#[must_use]
+pub fn skew_tolerance_seconds_from_env() -> i64 {
+    skew_tolerance_seconds_from(|key| std::env::var(key).ok())
+}
+
+fn skew_tolerance_seconds_from(getenv: impl Fn(&str) -> Option<String>) -> i64 {
+    let Some(raw) = getenv(SKEW_TOLERANCE_ENV) else {
+        return DEFAULT_SKEW_TOLERANCE_SECONDS;
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return DEFAULT_SKEW_TOLERANCE_SECONDS;
+    }
+    match trimmed.parse::<u64>() {
+        Ok(value) => i64::try_from(value).unwrap_or(i64::MAX),
+        Err(_) => DEFAULT_SKEW_TOLERANCE_SECONDS,
+    }
+}
+
+/// Render a duration in seconds as a human-friendly string. Used by
+/// [`LicenseError::ClockSkew`]'s [`Display`] impl so users see "2 days"
+/// instead of "172800 seconds".
+///
+/// Integer floor at each tier; no fractional units. Tiers:
+/// `< 60s` -> "N seconds", `< 3600s` -> "M minutes", `< 86_400s` ->
+/// "H hours [M minutes]", `>= 86_400s` -> "D days [H hours]".
+///
+/// [`Display`]: std::fmt::Display
+fn format_duration_seconds(seconds: u64) -> String {
+    const MINUTE: u64 = 60;
+    const HOUR: u64 = 60 * MINUTE;
+    const DAY: u64 = 24 * HOUR;
+
+    fn unit(value: u64, singular: &str) -> String {
+        if value == 1 {
+            format!("1 {singular}")
+        } else {
+            format!("{value} {singular}s")
+        }
+    }
+
+    if seconds < MINUTE {
+        return unit(seconds, "second");
+    }
+    if seconds < HOUR {
+        return unit(seconds / MINUTE, "minute");
+    }
+    if seconds < DAY {
+        let hours = seconds / HOUR;
+        let minutes = (seconds % HOUR) / MINUTE;
+        if minutes == 0 {
+            return unit(hours, "hour");
+        }
+        return format!("{} {}", unit(hours, "hour"), unit(minutes, "minute"));
+    }
+    let days = seconds / DAY;
+    let hours = (seconds % DAY) / HOUR;
+    if hours == 0 {
+        return unit(days, "day");
+    }
+    format!("{} {}", unit(days, "day"), unit(hours, "hour"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     use ed25519_dalek::{Signer, SigningKey};
-    use rand::rngs::OsRng;
 
     fn fixed_keypair() -> (SigningKey, VerifyingKey) {
-        let mut csprng = OsRng;
-        let signing = SigningKey::generate(&mut csprng);
+        let signing = SigningKey::from_bytes(&[42u8; 32]);
         let verifying = signing.verifying_key();
         (signing, verifying)
     }
@@ -454,8 +614,8 @@ mod tests {
             sub: "org_test".into(),
             tid: "tenant_test".into(),
             seats: 5,
-            tier: "team".into(),
-            features: vec!["production_coverage".into()],
+            tier: "pro".into(),
+            features: vec!["runtime_coverage".into()],
             iat: 1_700_000_000,
             exp,
             jti: "jti_test".into(),
@@ -470,7 +630,7 @@ mod tests {
         let jwt = sign_jwt(&signing, &claims);
         let status = verify_jwt(&jwt, &verifying, 1_900_000_000, DEFAULT_HARD_FAIL_DAYS).unwrap();
         assert!(matches!(status, LicenseStatus::Valid { .. }));
-        assert!(status.permits(&Feature::ProductionCoverage));
+        assert!(status.permits(&Feature::RuntimeCoverage));
         assert!(!status.permits(&Feature::PortfolioDashboard));
     }
 
@@ -479,7 +639,6 @@ mod tests {
         let (signing, verifying) = fixed_keypair();
         let claims = make_claims(2_000_000_000);
         let mut jwt = sign_jwt(&signing, &claims);
-        // Flip a byte in the payload segment.
         let mid = jwt.find('.').unwrap() + 5;
         let bad: String = jwt
             .chars()
@@ -496,8 +655,6 @@ mod tests {
 
     #[test]
     fn rs256_header_rejected() {
-        // Build a JWT with alg=RS256 in the header but signed with Ed25519.
-        // The verifier MUST reject because we pin alg=EdDSA in code.
         let (signing, verifying) = fixed_keypair();
         let header = serde_json::json!({"alg": "RS256", "typ": "JWT"});
         let header_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap());
@@ -513,7 +670,6 @@ mod tests {
 
     #[test]
     fn alg_none_rejected() {
-        // The classic JWT footgun: alg=none with empty signature. Must reject.
         let (_, verifying) = fixed_keypair();
         let header = serde_json::json!({"alg": "none", "typ": "JWT"});
         let header_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap());
@@ -539,15 +695,11 @@ mod tests {
 
     #[test]
     fn normalize_jwt_empty_string_stays_empty() {
-        // Guards the `FALLOW_LICENSE=""` path in `load_raw_jwt`: a shell that
-        // exports an empty-string license must not be treated as a real JWT.
         assert!(normalize_jwt("").is_empty());
     }
 
     #[test]
     fn normalize_jwt_whitespace_only_becomes_empty() {
-        // Same guard as above for `FALLOW_LICENSE="   "` and tab/newline
-        // variants.
         assert!(normalize_jwt("   ").is_empty());
         assert!(normalize_jwt("\t\n\r ").is_empty());
     }
@@ -555,22 +707,18 @@ mod tests {
     #[test]
     fn grace_ladder_classifies_correctly() {
         let claims = make_claims(1_000_000_000);
-        // Now equals exp: still valid (delta == 0).
         assert!(matches!(
             grace_state(claims.clone(), 1_000_000_000, 30),
             LicenseStatus::Valid { .. }
         ));
-        // 3 days past expiry: warning.
         assert!(matches!(
             grace_state(claims.clone(), 1_000_000_000 + 3 * SECONDS_PER_DAY, 30),
             LicenseStatus::ExpiredWarning { .. }
         ));
-        // 15 days past expiry: watermark.
         assert!(matches!(
             grace_state(claims.clone(), 1_000_000_000 + 15 * SECONDS_PER_DAY, 30),
             LicenseStatus::ExpiredWatermark { .. }
         ));
-        // 35 days past expiry: hard-fail.
         assert!(matches!(
             grace_state(claims, 1_000_000_000 + 35 * SECONDS_PER_DAY, 30),
             LicenseStatus::HardFail { .. }
@@ -595,7 +743,7 @@ mod tests {
     fn permits_short_circuits_on_hard_fail() {
         let claims = make_claims(1_000_000_000);
         let hard = grace_state(claims, 1_000_000_000 + 60 * SECONDS_PER_DAY, 30);
-        assert!(!hard.permits(&Feature::ProductionCoverage));
+        assert!(!hard.permits(&Feature::RuntimeCoverage));
     }
 
     #[test]
@@ -611,8 +759,8 @@ mod tests {
             "sub": "org_test",
             "tid": "tenant_test",
             "seats": 5,
-            "tier": "team",
-            "features": ["production_coverage"],
+            "tier": "pro",
+            "features": ["runtime_coverage"],
             "iat": 1_700_000_000,
             "exp": 2_000_000_000_i64,
             "jti": "jti_test",
@@ -626,8 +774,8 @@ mod tests {
             "sub": "org_test",
             "tid": "tenant_test",
             "seats": 5,
-            "tier": "team",
-            "features": ["production_coverage"],
+            "tier": "pro",
+            "features": ["runtime_coverage"],
             "iat": 1_700_000_000,
             "exp": 2_000_000_000_i64,
             "jti": "jti_test",
@@ -663,8 +811,6 @@ mod tests {
 
     #[test]
     fn user_home_from_env_skips_empty_values() {
-        // A CI runner that exports HOME="" should not be treated as "HOME is /"
-        // (was a real footgun: join(".fallow") produced "/.fallow").
         let getenv = |key: &str| match key {
             "HOME" => Some(String::new()),
             "USERPROFILE" => Some(r"C:\Users\alice".to_owned()),
@@ -688,8 +834,6 @@ mod tests {
 
     #[test]
     fn resolve_license_path_env_returns_none_for_empty_string() {
-        // Shells that export `FALLOW_LICENSE_PATH=""` must fall through to
-        // default discovery rather than attempt to read `Path::new("")`.
         assert_eq!(resolve_license_path_env(Some(String::new())), None);
     }
 
@@ -713,5 +857,176 @@ mod tests {
             resolve_license_path_env(Some("/etc/fallow/license.jwt".to_owned())),
             Some(PathBuf::from("/etc/fallow/license.jwt"))
         );
+    }
+
+    fn make_claims_with_iat(iat: i64, exp: i64) -> LicenseClaims {
+        LicenseClaims {
+            iss: "https://api.fallow.cloud".into(),
+            sub: "org_test".into(),
+            tid: "tenant_test".into(),
+            seats: 5,
+            tier: "pro".into(),
+            features: vec!["runtime_coverage".into()],
+            iat,
+            exp,
+            jti: "jti_test".into(),
+            refresh_after: None,
+        }
+    }
+
+    #[test]
+    fn iat_within_tolerance_passes() {
+        let (signing, verifying) = fixed_keypair();
+        let now = 1_900_000_000;
+        let claims = make_claims_with_iat(now + 3_600, now + 100 * SECONDS_PER_DAY);
+        let jwt = sign_jwt(&signing, &claims);
+        let status = verify_jwt_with_skew(
+            &jwt,
+            &verifying,
+            now,
+            DEFAULT_HARD_FAIL_DAYS,
+            DEFAULT_SKEW_TOLERANCE_SECONDS,
+        )
+        .expect("within-tolerance JWT must verify");
+        assert!(matches!(status, LicenseStatus::Valid { .. }));
+    }
+
+    #[test]
+    fn iat_far_in_future_rejected_as_clock_skew() {
+        let (signing, verifying) = fixed_keypair();
+        let now = 1_900_000_000;
+        let claims = make_claims_with_iat(now + 48 * 3_600, now + 100 * SECONDS_PER_DAY);
+        let jwt = sign_jwt(&signing, &claims);
+        let err = verify_jwt_with_skew(
+            &jwt,
+            &verifying,
+            now,
+            DEFAULT_HARD_FAIL_DAYS,
+            DEFAULT_SKEW_TOLERANCE_SECONDS,
+        )
+        .expect_err("future-iat JWT must be rejected");
+        assert!(
+            matches!(err, LicenseError::ClockSkew { .. }),
+            "expected ClockSkew, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn clock_far_behind_iat_rejected_as_clock_skew() {
+        let (signing, verifying) = fixed_keypair();
+        let iat = 1_700_000_000;
+        let now = iat - 60 * SECONDS_PER_DAY;
+        let claims = make_claims_with_iat(iat, iat + 100 * SECONDS_PER_DAY);
+        let jwt = sign_jwt(&signing, &claims);
+        let err = verify_jwt_with_skew(
+            &jwt,
+            &verifying,
+            now,
+            DEFAULT_HARD_FAIL_DAYS,
+            DEFAULT_SKEW_TOLERANCE_SECONDS,
+        )
+        .expect_err("clock-behind verification must be rejected");
+        assert!(
+            matches!(err, LicenseError::ClockSkew { .. }),
+            "expected ClockSkew, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn verify_jwt_shim_uses_default_tolerance() {
+        let (signing, verifying) = fixed_keypair();
+        let now = 1_900_000_000;
+        let claims = make_claims_with_iat(now + 48 * 3_600, now + 100 * SECONDS_PER_DAY);
+        let jwt = sign_jwt(&signing, &claims);
+        let err = verify_jwt(&jwt, &verifying, now, DEFAULT_HARD_FAIL_DAYS)
+            .expect_err("shim must reject 48h-future iat under default tolerance");
+        assert!(matches!(err, LicenseError::ClockSkew { .. }));
+    }
+
+    #[test]
+    fn clock_skew_display_is_human_friendly() {
+        let err = LicenseError::ClockSkew {
+            iat_seconds: 1_900_000_000 + 2 * SECONDS_PER_DAY,
+            now_seconds: 1_900_000_000,
+            tolerance_seconds: DEFAULT_SKEW_TOLERANCE_SECONDS,
+        };
+        let rendered = format!("{err}");
+        assert!(
+            !rendered.contains("iat"),
+            "ClockSkew Display must not leak 'iat' jargon: {rendered}"
+        );
+        assert!(
+            rendered.contains("days"),
+            "ClockSkew Display must render a human-friendly duration: {rendered}"
+        );
+        assert!(
+            rendered.contains("CI") || rendered.contains("NTP") || rendered.contains("drift"),
+            "ClockSkew Display must name a non-user-error cause: {rendered}"
+        );
+        assert!(
+            rendered.contains(SKEW_TOLERANCE_ENV),
+            "ClockSkew Display must mention the env var override: {rendered}"
+        );
+    }
+
+    #[test]
+    fn skew_tolerance_seconds_from_env_parses_or_defaults() {
+        let unset = |_: &str| None;
+        assert_eq!(
+            skew_tolerance_seconds_from(unset),
+            DEFAULT_SKEW_TOLERANCE_SECONDS
+        );
+
+        let empty = |_: &str| Some(String::new());
+        assert_eq!(
+            skew_tolerance_seconds_from(empty),
+            DEFAULT_SKEW_TOLERANCE_SECONDS
+        );
+
+        let whitespace = |_: &str| Some("   \t\n".to_owned());
+        assert_eq!(
+            skew_tolerance_seconds_from(whitespace),
+            DEFAULT_SKEW_TOLERANCE_SECONDS
+        );
+
+        let garbage = |_: &str| Some("twenty".to_owned());
+        assert_eq!(
+            skew_tolerance_seconds_from(garbage),
+            DEFAULT_SKEW_TOLERANCE_SECONDS
+        );
+
+        let negative = |_: &str| Some("-1".to_owned());
+        assert_eq!(
+            skew_tolerance_seconds_from(negative),
+            DEFAULT_SKEW_TOLERANCE_SECONDS
+        );
+
+        let valid = |_: &str| Some("172800".to_owned());
+        assert_eq!(skew_tolerance_seconds_from(valid), 172_800);
+
+        let valid_trimmed = |_: &str| Some("  3600  ".to_owned());
+        assert_eq!(skew_tolerance_seconds_from(valid_trimmed), 3_600);
+
+        let huge = |_: &str| Some(u64::MAX.to_string());
+        assert_eq!(skew_tolerance_seconds_from(huge), i64::MAX);
+    }
+
+    #[test]
+    fn format_duration_seconds_renders_human_friendly() {
+        assert_eq!(format_duration_seconds(0), "0 seconds");
+        assert_eq!(format_duration_seconds(1), "1 second");
+        assert_eq!(format_duration_seconds(45), "45 seconds");
+        assert_eq!(format_duration_seconds(59), "59 seconds");
+        assert_eq!(format_duration_seconds(60), "1 minute");
+        assert_eq!(format_duration_seconds(90), "1 minute");
+        assert_eq!(format_duration_seconds(120), "2 minutes");
+        assert_eq!(format_duration_seconds(3_599), "59 minutes");
+        assert_eq!(format_duration_seconds(3_600), "1 hour");
+        assert_eq!(format_duration_seconds(3_660), "1 hour 1 minute");
+        assert_eq!(format_duration_seconds(7_320), "2 hours 2 minutes");
+        assert_eq!(format_duration_seconds(86_400), "1 day");
+        assert_eq!(format_duration_seconds(90_000), "1 day 1 hour");
+        assert_eq!(format_duration_seconds(172_800), "2 days");
+        assert_eq!(format_duration_seconds(180_000), "2 days 2 hours");
     }
 }

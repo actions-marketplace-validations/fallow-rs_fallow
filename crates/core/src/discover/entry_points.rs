@@ -1,15 +1,12 @@
 use std::path::{Component, Path, PathBuf};
 
-use super::parse_scripts::extract_script_file_refs;
 use super::walk::SOURCE_EXTENSIONS;
 use fallow_config::{EntryPointRole, PackageJson, ResolvedConfig};
+use fallow_graph::resolve::OUTPUT_DIRS;
 use fallow_types::discover::{DiscoveredFile, EntryPoint, EntryPointSource};
-use rustc_hash::FxHashMap;
+use fallow_types::path_util::is_absolute_path_any_platform;
+use rustc_hash::{FxHashMap, FxHashSet};
 
-/// Known output directory names from exports maps.
-/// When an entry point path is inside one of these directories, we also try
-/// the `src/` equivalent to find the tracked source file.
-const OUTPUT_DIRS: &[&str] = &["dist", "build", "out", "esm", "cjs"];
 const SKIPPED_ENTRY_WARNING_PREVIEW: usize = 5;
 
 fn format_skipped_entry_warning(skipped_entries: &FxHashMap<String, usize>) -> Option<String> {
@@ -55,35 +52,50 @@ fn format_skipped_entry_warning(skipped_entries: &FxHashMap<String, usize>) -> O
 }
 
 pub fn warn_skipped_entry_summary(skipped_entries: &FxHashMap<String, usize>) {
-    if let Some(message) = format_skipped_entry_warning(skipped_entries) {
+    let Some(message) = format_skipped_entry_warning(skipped_entries) else {
+        return;
+    };
+    if should_warn_skipped_entry(&message) {
         tracing::warn!("{message}");
     }
+}
+
+/// Process-wide dedupe for [`warn_skipped_entry_summary`]. Returns `true` when
+/// `message` was newly inserted (caller should emit). On a poisoned mutex
+/// returns `true` so over-warning beats swallowing.
+fn should_warn_skipped_entry(message: &str) -> bool {
+    static WARNED: std::sync::OnceLock<std::sync::Mutex<FxHashSet<String>>> =
+        std::sync::OnceLock::new();
+    let warned = WARNED.get_or_init(|| std::sync::Mutex::new(FxHashSet::default()));
+    warned
+        .lock()
+        .map_or(true, |mut set| set.insert(message.to_owned()))
 }
 
 /// Entry points grouped by reachability role.
 #[derive(Debug, Clone, Default)]
 pub struct CategorizedEntryPoints {
-    pub all: Vec<EntryPoint>,
-    pub runtime: Vec<EntryPoint>,
-    pub test: Vec<EntryPoint>,
+    pub(crate) all: Vec<EntryPoint>,
+    pub(crate) runtime: Vec<EntryPoint>,
+    pub(crate) test: Vec<EntryPoint>,
 }
 
 impl CategorizedEntryPoints {
-    pub fn push_runtime(&mut self, entry: EntryPoint) {
+    fn push_runtime(&mut self, entry: EntryPoint) {
         self.runtime.push(entry.clone());
         self.all.push(entry);
     }
 
-    pub fn push_test(&mut self, entry: EntryPoint) {
+    fn push_test(&mut self, entry: EntryPoint) {
         self.test.push(entry.clone());
         self.all.push(entry);
     }
 
-    pub fn push_support(&mut self, entry: EntryPoint) {
+    fn push_support(&mut self, entry: EntryPoint) {
         self.all.push(entry);
     }
 
-    pub fn extend_runtime<I>(&mut self, entries: I)
+    pub(crate) fn extend_runtime<I>(&mut self, entries: I)
     where
         I: IntoIterator<Item = EntryPoint>,
     {
@@ -110,14 +122,14 @@ impl CategorizedEntryPoints {
         }
     }
 
-    pub fn extend(&mut self, other: Self) {
+    pub(crate) fn extend(&mut self, other: Self) {
         self.all.extend(other.all);
         self.runtime.extend(other.runtime);
         self.test.extend(other.test);
     }
 
     #[must_use]
-    pub fn dedup(mut self) -> Self {
+    pub(crate) fn dedup(mut self) -> Self {
         dedup_entry_paths(&mut self.all);
         dedup_entry_paths(&mut self.runtime);
         dedup_entry_paths(&mut self.test);
@@ -132,8 +144,19 @@ fn dedup_entry_paths(entries: &mut Vec<EntryPoint>) {
 
 #[derive(Debug, Default)]
 pub struct EntryPointDiscovery {
+    /// Runtime entry points declared by package metadata or inferred defaults.
     pub entries: Vec<EntryPoint>,
+    /// Tooling entry points referenced only from non-runtime package scripts.
+    pub support_entries: Vec<EntryPoint>,
     pub skipped_entries: FxHashMap<String, usize>,
+}
+
+impl EntryPointDiscovery {
+    fn into_all_entries(mut self) -> Vec<EntryPoint> {
+        self.entries.append(&mut self.support_entries);
+        dedup_entry_paths(&mut self.entries);
+        self.entries
+    }
 }
 
 /// Resolve a path relative to a base directory, with security check and extension fallback.
@@ -149,44 +172,73 @@ fn resolve_entry_path_with_tracking(
     source: EntryPointSource,
     mut skipped_entries: Option<&mut FxHashMap<String, usize>>,
 ) -> Option<EntryPoint> {
-    // Wildcard exports (e.g., `./src/themes/*.css`) can't be resolved to a single
-    // file. Return None and let the caller expand them separately.
     if entry.contains('*') {
         return None;
     }
 
     if entry_has_parent_dir(entry) {
-        if let Some(skipped_entries) = skipped_entries.as_mut() {
-            *skipped_entries.entry(entry.to_owned()).or_default() += 1;
-        } else {
-            tracing::warn!(path = %entry, "Skipping entry point containing parent directory traversal");
-        }
+        record_or_warn_skipped_entry(
+            skipped_entries.as_deref_mut(),
+            entry,
+            "Skipping entry point containing parent directory traversal",
+        );
         return None;
     }
 
-    let resolved = base.join(entry);
+    if let OutputDirEntry::ShortCircuit(result) = resolve_entry_via_output_dir(
+        base,
+        entry,
+        canonical_root,
+        source.clone(),
+        skipped_entries.as_deref_mut(),
+    ) {
+        return result;
+    }
 
-    // If the path is in an output directory (dist/, build/, etc.), try mapping to src/ first.
-    // This handles exports map targets like `./dist/utils.js` → `./src/utils.ts`.
-    // We check this BEFORE the exists() check because even if the dist file exists,
-    // fallow ignores dist/ by default, so we need the source file instead.
+    resolve_entry_via_filesystem_probe(base, entry, canonical_root, source, skipped_entries)
+}
+
+/// Record a skipped entry in the dedup map, or warn when no map is tracking skips.
+fn record_or_warn_skipped_entry(
+    skipped_entries: Option<&mut FxHashMap<String, usize>>,
+    entry: &str,
+    warning: &str,
+) {
+    if let Some(skipped_entries) = skipped_entries {
+        *skipped_entries.entry(entry.to_owned()).or_default() += 1;
+    } else {
+        tracing::warn!(path = %entry, "{warning}");
+    }
+}
+
+/// Outcome of the output-directory mapping step.
+///
+/// `ShortCircuit` means an output-dir branch applied and carries the resolved
+/// entry (which may itself be `None` when validation rejected the candidate);
+/// `Continue` signals that filesystem probing should proceed.
+enum OutputDirEntry {
+    ShortCircuit(Option<EntryPoint>),
+    Continue,
+}
+
+/// Map an output-directory entry back to a source file, short-circuiting resolution.
+fn resolve_entry_via_output_dir(
+    base: &Path,
+    entry: &str,
+    canonical_root: &Path,
+    source: EntryPointSource,
+    mut skipped_entries: Option<&mut FxHashMap<String, usize>>,
+) -> OutputDirEntry {
     if let Some(source_path) = try_output_to_source_path(base, entry) {
-        return validated_entry_point(
+        return OutputDirEntry::ShortCircuit(validated_entry_point(
             &source_path,
             canonical_root,
             entry,
             source,
             skipped_entries.as_deref_mut(),
-        );
+        ));
     }
 
-    // When the entry lives under an output directory but has no direct src/ mirror
-    // (e.g. `./dist/esm2022/index.js` where `src/esm2022/index.ts` does not exist),
-    // probe the package root for a conventional source index. TypeScript libraries
-    // commonly point `main`/`module`/`exports` at compiled output while keeping the
-    // canonical source entry at `src/index.ts`. Without this fallback, the dist file
-    // becomes the entry point, gets filtered out by the default dist ignore pattern,
-    // and leaves the entire src/ tree unreachable. See issue #102.
     if is_entry_in_output_dir(entry)
         && let Some(source_path) = try_source_index_fallback(base)
     {
@@ -195,14 +247,28 @@ fn resolve_entry_path_with_tracking(
             fallback = %source_path.display(),
             "package.json entry resolves to an ignored output directory; falling back to source index"
         );
-        return validated_entry_point(
+        return OutputDirEntry::ShortCircuit(validated_entry_point(
             &source_path,
             canonical_root,
             entry,
             source,
-            skipped_entries.as_deref_mut(),
-        );
+            skipped_entries,
+        ));
     }
+
+    OutputDirEntry::Continue
+}
+
+/// Probe the filesystem for the entry: exact file, extension fallback, directory
+/// index, then a package-root source-index fallback.
+fn resolve_entry_via_filesystem_probe(
+    base: &Path,
+    entry: &str,
+    canonical_root: &Path,
+    source: EntryPointSource,
+    mut skipped_entries: Option<&mut FxHashMap<String, usize>>,
+) -> Option<EntryPoint> {
+    let resolved = base.join(entry);
 
     if resolved.is_file() {
         return validated_entry_point(
@@ -214,7 +280,6 @@ fn resolve_entry_path_with_tracking(
         );
     }
 
-    // Try with source extensions
     for ext in SOURCE_EXTENSIONS {
         let with_ext = resolved.with_extension(ext);
         if with_ext.is_file() {
@@ -227,6 +292,37 @@ fn resolve_entry_path_with_tracking(
             );
         }
     }
+
+    if let Some(index_entry) = try_directory_index_entry(&resolved) {
+        return validated_entry_point(
+            &index_entry,
+            canonical_root,
+            entry,
+            source,
+            skipped_entries.as_deref_mut(),
+        );
+    }
+
+    if is_package_root_index_entry(entry)
+        && let Some(source_path) = try_source_index_fallback(base)
+    {
+        tracing::info!(
+            entry = %entry,
+            fallback = %source_path.display(),
+            "package.json root index entry is missing; falling back to source index"
+        );
+        return validated_entry_point(&source_path, canonical_root, entry, source, skipped_entries);
+    }
+    None
+}
+
+fn try_directory_index_entry(resolved: &Path) -> Option<PathBuf> {
+    for ext in SOURCE_EXTENSIONS {
+        let candidate = resolved.join(format!("index.{ext}"));
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
     None
 }
 
@@ -234,6 +330,23 @@ fn entry_has_parent_dir(entry: &str) -> bool {
     Path::new(entry)
         .components()
         .any(|component| matches!(component, Component::ParentDir))
+}
+
+fn is_package_root_index_entry(entry: &str) -> bool {
+    let mut components = Path::new(entry)
+        .components()
+        .filter(|component| !matches!(component, Component::CurDir));
+
+    let Some(Component::Normal(file_name)) = components.next() else {
+        return false;
+    };
+    if components.next().is_some() {
+        return false;
+    }
+
+    file_name
+        .to_str()
+        .is_some_and(|name| name == "index" || name.starts_with("index."))
 }
 
 fn validated_entry_point(
@@ -298,7 +411,6 @@ fn try_output_to_source_path(base: &Path, entry: &str) -> Option<PathBuf> {
     let entry_path = Path::new(entry);
     let components: Vec<_> = entry_path.components().collect();
 
-    // Find the last output directory component in the entry path
     let output_pos = components.iter().rposition(|c| {
         if let std::path::Component::Normal(s) = c
             && let Some(name) = s.to_str()
@@ -308,16 +420,13 @@ fn try_output_to_source_path(base: &Path, entry: &str) -> Option<PathBuf> {
         false
     })?;
 
-    // Build the relative prefix before the output dir, filtering out CurDir (".")
     let prefix: PathBuf = components[..output_pos]
         .iter()
         .filter(|c| !matches!(c, std::path::Component::CurDir))
         .collect();
 
-    // Build the relative path after the output dir (e.g., "utils.js")
     let suffix: PathBuf = components[output_pos + 1..].iter().collect();
 
-    // Try base + prefix + "src" + suffix-with-source-extension
     for ext in SOURCE_EXTENSIONS {
         let source_candidate = base
             .join(&prefix)
@@ -375,6 +484,20 @@ const DEFAULT_INDEX_PATTERNS: &[&str] = &[
     "main.{ts,tsx,js,jsx}",
 ];
 
+/// Process-wide matcher for the compile-time default index patterns.
+fn default_index_matchers() -> &'static globset::GlobSet {
+    static MATCHERS: std::sync::OnceLock<globset::GlobSet> = std::sync::OnceLock::new();
+    MATCHERS.get_or_init(|| {
+        let mut builder = globset::GlobSetBuilder::new();
+        for pattern in DEFAULT_INDEX_PATTERNS {
+            if let Ok(glob) = globset::Glob::new(pattern) {
+                builder.add(glob);
+            }
+        }
+        builder.build().unwrap_or_default()
+    })
+}
+
 /// Fall back to default index patterns if no entries were found.
 ///
 /// When `ws_filter` is `Some`, only files whose path starts with the given
@@ -384,14 +507,10 @@ fn apply_default_fallback(
     root: &Path,
     ws_filter: Option<&Path>,
 ) -> Vec<EntryPoint> {
-    let default_matchers: Vec<globset::GlobMatcher> = DEFAULT_INDEX_PATTERNS
-        .iter()
-        .filter_map(|p| globset::Glob::new(p).ok().map(|g| g.compile_matcher()))
-        .collect();
+    let default_matchers = default_index_matchers();
 
     let mut entries = Vec::new();
     for file in files {
-        // Use strip_prefix instead of canonicalize for workspace filtering
         if let Some(ws_root) = ws_filter
             && file.path.strip_prefix(ws_root).is_err()
         {
@@ -399,10 +518,7 @@ fn apply_default_fallback(
         }
         let relative = file.path.strip_prefix(root).unwrap_or(&file.path);
         let relative_str = relative.to_string_lossy();
-        if default_matchers
-            .iter()
-            .any(|m| m.is_match(relative_str.as_ref()))
-        {
+        if default_matchers.is_match(relative_str.as_ref()) {
             entries.push(EntryPoint {
                 path: file.path.clone(),
                 source: EntryPointSource::DefaultIndex,
@@ -410,6 +526,265 @@ fn apply_default_fallback(
         }
     }
     entries
+}
+
+/// Compute each file's path relative to `root` as a forward-slash-lossy string.
+fn relative_paths_for(files: &[DiscoveredFile], root: &Path) -> Vec<String> {
+    files
+        .iter()
+        .map(|f| {
+            f.path
+                .strip_prefix(root)
+                .unwrap_or(&f.path)
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect()
+}
+
+/// Push entries for files matching the user-configured manual entry glob patterns.
+#[expect(
+    clippy::expect_used,
+    reason = "entry glob patterns are validated before entry point discovery"
+)]
+fn push_manual_entry_matches(
+    entries: &mut Vec<EntryPoint>,
+    config: &ResolvedConfig,
+    relative_paths: &[String],
+    files: &[DiscoveredFile],
+) {
+    let mut builder = globset::GlobSetBuilder::new();
+    for pattern in &config.entry_patterns {
+        builder.add(
+            globset::Glob::new(pattern).expect("entry pattern was validated at config load time"),
+        );
+    }
+    let Ok(glob_set) = builder.build() else {
+        return;
+    };
+    if glob_set.is_empty() {
+        return;
+    }
+    for (idx, rel) in relative_paths.iter().enumerate() {
+        if glob_set.is_match(rel) {
+            entries.push(EntryPoint {
+                path: files[idx].path.clone(),
+                source: EntryPointSource::ManualEntry,
+            });
+        }
+    }
+}
+
+/// Push entries derived from a package.json's declared entry points and scripts.
+fn push_package_json_entries(
+    discovery: &mut EntryPointDiscovery,
+    root: &Path,
+    pkg: &PackageJson,
+    canonical_root: &Path,
+) {
+    for entry_path in pkg.entry_points() {
+        if let Some(ep) = resolve_entry_path_with_tracking(
+            root,
+            &entry_path,
+            canonical_root,
+            EntryPointSource::PackageJsonMain,
+            Some(&mut discovery.skipped_entries),
+        ) {
+            discovery.entries.push(ep);
+        }
+    }
+
+    let Some(scripts) = &pkg.scripts else {
+        return;
+    };
+    let runtime_scripts = runtime_package_script_names(scripts);
+    for (script_name, script_value) in scripts {
+        let refs = package_script_refs(script_value);
+        for file_ref in refs.inheritable {
+            if let Some(ep) = resolve_entry_path_with_tracking(
+                root,
+                &file_ref,
+                canonical_root,
+                EntryPointSource::PackageJsonScript,
+                Some(&mut discovery.skipped_entries),
+            ) {
+                if runtime_scripts.contains(script_name) {
+                    discovery.entries.push(ep);
+                } else {
+                    discovery.support_entries.push(ep);
+                }
+            }
+        }
+        for config_ref in refs.support {
+            if let Some(ep) = resolve_entry_path_with_tracking(
+                root,
+                &config_ref,
+                canonical_root,
+                EntryPointSource::PackageJsonScript,
+                Some(&mut discovery.skipped_entries),
+            ) {
+                discovery.support_entries.push(ep);
+            }
+        }
+    }
+}
+
+struct PackageScriptRefs {
+    inheritable: Vec<String>,
+    support: Vec<String>,
+}
+
+fn package_script_refs(script: &str) -> PackageScriptRefs {
+    let mut inheritable = Vec::new();
+    let mut support = Vec::new();
+    for command in crate::scripts::parse_script(script) {
+        inheritable.extend(command.file_args);
+        support.extend(command.config_args);
+    }
+    inheritable.extend(super::parse_scripts::extract_script_file_refs(script));
+    support.sort_unstable();
+    support.dedup();
+    inheritable.retain(|path| support.binary_search(path).is_err());
+    inheritable.sort_unstable();
+    inheritable.dedup();
+    PackageScriptRefs {
+        inheritable,
+        support,
+    }
+}
+
+/// npm's start lifecycle is a production execution surface. Other package
+/// scripts are conservatively treated as tooling: their files stay reachable,
+/// but do not prove that a devDependency ships with the application.
+#[expect(
+    clippy::disallowed_types,
+    reason = "API matches serde-deserialized package.json scripts map"
+)]
+fn runtime_package_script_names(
+    scripts: &std::collections::HashMap<String, String>,
+) -> FxHashSet<String> {
+    runtime_package_script_names_with_seeds(scripts, &FxHashSet::default())
+}
+
+#[expect(
+    clippy::disallowed_types,
+    reason = "API matches serde-deserialized package.json scripts map"
+)]
+fn runtime_package_script_names_with_seeds(
+    scripts: &std::collections::HashMap<String, String>,
+    seeds: &FxHashSet<String>,
+) -> FxHashSet<String> {
+    let catalog = crate::scripts::ScriptCatalog::from_scripts(scripts);
+    let mut runtime = FxHashSet::default();
+    let mut pending = Vec::new();
+
+    enqueue_runtime_script("start", scripts, &mut runtime, &mut pending);
+    for seed in seeds {
+        enqueue_runtime_script(seed, scripts, &mut runtime, &mut pending);
+    }
+
+    while let Some(name) = pending.pop() {
+        let Some(body) = scripts.get(&name) else {
+            continue;
+        };
+        for referenced in crate::scripts::referenced_package_scripts(body, &catalog) {
+            enqueue_runtime_script(&referenced, scripts, &mut runtime, &mut pending);
+        }
+    }
+
+    runtime
+}
+
+pub fn workspace_runtime_script_seeds(
+    project_root: &Path,
+    root_pkg: Option<&PackageJson>,
+    workspace_pkgs: &[(fallow_config::WorkspaceInfo, PackageJson)],
+) -> FxHashMap<String, FxHashSet<String>> {
+    let mut seeds: FxHashMap<String, FxHashSet<String>> = FxHashMap::default();
+    let mut selectors = FxHashMap::default();
+    for (idx, (workspace, _)) in workspace_pkgs.iter().enumerate() {
+        selectors.insert(workspace.name.clone(), idx);
+        if let Ok(relative) = workspace.root.strip_prefix(project_root) {
+            let relative = relative.to_string_lossy().replace('\\', "/");
+            selectors.insert(relative.clone(), idx);
+            selectors.insert(format!("./{relative}"), idx);
+        }
+    }
+
+    let mut pending = Vec::new();
+    if let Some(scripts) = root_pkg.and_then(|pkg| pkg.scripts.as_ref()) {
+        pending.extend(
+            runtime_package_script_names(scripts)
+                .into_iter()
+                .map(|name| (None, name)),
+        );
+    }
+    for (idx, (_, pkg)) in workspace_pkgs.iter().enumerate() {
+        if let Some(scripts) = pkg.scripts.as_ref() {
+            pending.extend(
+                runtime_package_script_names(scripts)
+                    .into_iter()
+                    .map(|name| (Some(idx), name)),
+            );
+        }
+    }
+
+    let mut visited = FxHashSet::default();
+    while let Some((source_idx, name)) = pending.pop() {
+        if !visited.insert((source_idx, name.clone())) {
+            continue;
+        }
+        let scripts = match source_idx {
+            Some(idx) => workspace_pkgs[idx].1.scripts.as_ref(),
+            None => root_pkg.and_then(|pkg| pkg.scripts.as_ref()),
+        };
+        let Some(body) = scripts.and_then(|scripts| scripts.get(&name)) else {
+            continue;
+        };
+        for (selector, script) in crate::scripts::referenced_workspace_scripts(body) {
+            let Some(&target_idx) = selectors.get(&selector) else {
+                continue;
+            };
+            let (workspace, target_pkg) = &workspace_pkgs[target_idx];
+            let Some(target_scripts) = target_pkg.scripts.as_ref() else {
+                continue;
+            };
+            let target_seeds = FxHashSet::from_iter([script]);
+            for runtime_name in
+                runtime_package_script_names_with_seeds(target_scripts, &target_seeds)
+            {
+                if seeds
+                    .entry(workspace.name.clone())
+                    .or_default()
+                    .insert(runtime_name.clone())
+                {
+                    pending.push((Some(target_idx), runtime_name));
+                }
+            }
+        }
+    }
+    seeds
+}
+
+#[expect(
+    clippy::disallowed_types,
+    reason = "API matches serde-deserialized package.json scripts map"
+)]
+fn enqueue_runtime_script(
+    name: &str,
+    scripts: &std::collections::HashMap<String, String>,
+    runtime: &mut FxHashSet<String>,
+    pending: &mut Vec<String>,
+) {
+    for candidate in [
+        format!("pre{name}"),
+        name.to_string(),
+        format!("post{name}"),
+    ] {
+        if scripts.contains_key(&candidate) && runtime.insert(candidate.clone()) {
+            pending.push(candidate);
+        }
+    }
 }
 
 /// Discover entry points from package.json, framework rules, and defaults.
@@ -422,102 +797,42 @@ fn discover_entry_points_with_warnings_impl(
     let _span = tracing::info_span!("discover_entry_points").entered();
     let mut discovery = EntryPointDiscovery::default();
 
-    // Pre-compute relative paths for all files (once, not per pattern)
-    let relative_paths: Vec<String> = files
-        .iter()
-        .map(|f| {
-            f.path
-                .strip_prefix(&config.root)
-                .unwrap_or(&f.path)
-                .to_string_lossy()
-                .into_owned()
-        })
-        .collect();
+    let relative_paths = relative_paths_for(files, &config.root);
+    push_manual_entry_matches(&mut discovery.entries, config, &relative_paths, files);
 
-    // 1. Manual entries from config — batch all patterns into a single GlobSet
-    // for O(files) matching instead of O(patterns × files).
-    {
-        let mut builder = globset::GlobSetBuilder::new();
-        for pattern in &config.entry_patterns {
-            if let Ok(glob) = globset::Glob::new(pattern) {
-                builder.add(glob);
-            }
-        }
-        if let Ok(glob_set) = builder.build()
-            && !glob_set.is_empty()
-        {
-            for (idx, rel) in relative_paths.iter().enumerate() {
-                if glob_set.is_match(rel) {
-                    discovery.entries.push(EntryPoint {
-                        path: files[idx].path.clone(),
-                        source: EntryPointSource::ManualEntry,
-                    });
-                }
-            }
-        }
-    }
-
-    // 2. Package.json entries
-    // Pre-compute canonical root once for all resolve_entry_path calls
     let canonical_root = dunce::canonicalize(&config.root).unwrap_or_else(|_| config.root.clone());
     if let Some(pkg) = root_pkg {
-        for entry_path in pkg.entry_points() {
-            if let Some(ep) = resolve_entry_path_with_tracking(
-                &config.root,
-                &entry_path,
-                &canonical_root,
-                EntryPointSource::PackageJsonMain,
-                Some(&mut discovery.skipped_entries),
-            ) {
-                discovery.entries.push(ep);
-            }
-        }
-
-        // 2b. Package.json scripts — extract file references as entry points
-        if let Some(scripts) = &pkg.scripts {
-            for script_value in scripts.values() {
-                for file_ref in extract_script_file_refs(script_value) {
-                    if let Some(ep) = resolve_entry_path_with_tracking(
-                        &config.root,
-                        &file_ref,
-                        &canonical_root,
-                        EntryPointSource::PackageJsonScript,
-                        Some(&mut discovery.skipped_entries),
-                    ) {
-                        discovery.entries.push(ep);
-                    }
-                }
-            }
-        }
-
-        // Framework rules now flow through PluginRegistry via external_plugins.
+        push_package_json_entries(&mut discovery, &config.root, pkg, &canonical_root);
     }
 
-    // 4. Auto-discover nested package.json entry points
-    // For monorepo-like structures without explicit workspace config, scan for
-    // package.json files in subdirectories and use their main/exports as entries.
     if include_nested_package_entries {
         let exports_dirs = root_pkg
             .map(PackageJson::exports_subdirectories)
             .unwrap_or_default();
+        let mut nested_entries = PackageEntryBuckets {
+            runtime: &mut discovery.entries,
+            support: &mut discovery.support_entries,
+        };
         discover_nested_package_entries(
             &config.root,
             files,
-            &mut discovery.entries,
+            &mut nested_entries,
             &canonical_root,
             &exports_dirs,
             &mut discovery.skipped_entries,
         );
     }
 
-    // 5. Default index files (if no other entries found)
     if discovery.entries.is_empty() {
         discovery.entries = apply_default_fallback(files, &config.root, None);
     }
 
-    // Deduplicate by path
     discovery.entries.sort_by(|a, b| a.path.cmp(&b.path));
     discovery.entries.dedup_by(|a, b| a.path == b.path);
+    discovery
+        .support_entries
+        .sort_by(|a, b| a.path.cmp(&b.path));
+    discovery.support_entries.dedup_by(|a, b| a.path == b.path);
 
     discovery
 }
@@ -540,15 +855,14 @@ pub fn discover_entry_points_with_warnings(
     config: &ResolvedConfig,
     files: &[DiscoveredFile],
 ) -> EntryPointDiscovery {
-    let pkg_path = config.root.join("package.json");
-    let root_pkg = PackageJson::load(&pkg_path).ok();
+    let root_pkg = fallow_config::load_dir_package_json(&config.root);
     discover_entry_points_with_warnings_impl(config, files, root_pkg.as_ref(), true)
 }
 
 pub fn discover_entry_points(config: &ResolvedConfig, files: &[DiscoveredFile]) -> Vec<EntryPoint> {
     let discovery = discover_entry_points_with_warnings(config, files);
     warn_skipped_entry_summary(&discovery.skipped_entries);
-    discovery.entries
+    discovery.into_all_entries()
 }
 
 /// Discover entry points from nested package.json files in subdirectories.
@@ -560,17 +874,21 @@ pub fn discover_entry_points(config: &ResolvedConfig, files: &[DiscoveredFile]) 
 ///
 /// For each discovered sub-package with a `package.json`, the `main`, `module`,
 /// `source`, `exports`, and `bin` fields are treated as entry points.
+struct PackageEntryBuckets<'a> {
+    runtime: &'a mut Vec<EntryPoint>,
+    support: &'a mut Vec<EntryPoint>,
+}
+
 fn discover_nested_package_entries(
     root: &Path,
     _files: &[DiscoveredFile],
-    entries: &mut Vec<EntryPoint>,
+    entries: &mut PackageEntryBuckets<'_>,
     canonical_root: &Path,
     exports_subdirectories: &[String],
     skipped_entries: &mut FxHashMap<String, usize>,
 ) {
     let mut visited = rustc_hash::FxHashSet::default();
 
-    // 1. Walk common monorepo patterns
     let search_dirs = [
         "packages", "apps", "libs", "modules", "plugins", "services", "tools", "utils",
     ];
@@ -585,16 +903,27 @@ fn discover_nested_package_entries(
         for entry in read_dir.flatten() {
             let pkg_dir = entry.path();
             if visited.insert(pkg_dir.clone()) {
-                collect_nested_package_entries(&pkg_dir, entries, canonical_root, skipped_entries);
+                collect_nested_package_entries(
+                    &pkg_dir,
+                    entries.runtime,
+                    entries.support,
+                    canonical_root,
+                    skipped_entries,
+                );
             }
         }
     }
 
-    // 2. Scan directories derived from the root exports map
     for dir_name in exports_subdirectories {
         let pkg_dir = root.join(dir_name);
         if pkg_dir.is_dir() && visited.insert(pkg_dir.clone()) {
-            collect_nested_package_entries(&pkg_dir, entries, canonical_root, skipped_entries);
+            collect_nested_package_entries(
+                &pkg_dir,
+                entries.runtime,
+                entries.support,
+                canonical_root,
+                skipped_entries,
+            );
         }
     }
 }
@@ -603,14 +932,11 @@ fn discover_nested_package_entries(
 fn collect_nested_package_entries(
     pkg_dir: &Path,
     entries: &mut Vec<EntryPoint>,
+    support_entries: &mut Vec<EntryPoint>,
     canonical_root: &Path,
     skipped_entries: &mut FxHashMap<String, usize>,
 ) {
-    let pkg_path = pkg_dir.join("package.json");
-    if !pkg_path.exists() {
-        return;
-    }
-    let Ok(pkg) = PackageJson::load(&pkg_path) else {
+    let Some(pkg) = fallow_config::load_dir_package_json(pkg_dir) else {
         return;
     };
     for entry_path in pkg.entry_points() {
@@ -627,8 +953,10 @@ fn collect_nested_package_entries(
         }
     }
     if let Some(scripts) = &pkg.scripts {
-        for script_value in scripts.values() {
-            for file_ref in extract_script_file_refs(script_value) {
+        let runtime_scripts = runtime_package_script_names(scripts);
+        for (script_name, script_value) in scripts {
+            let refs = package_script_refs(script_value);
+            for file_ref in refs.inheritable {
                 if let Some(ep) = resolve_entry_path_with_tracking(
                     pkg_dir,
                     &file_ref,
@@ -636,7 +964,22 @@ fn collect_nested_package_entries(
                     EntryPointSource::PackageJsonScript,
                     Some(&mut *skipped_entries),
                 ) {
-                    entries.push(ep);
+                    if runtime_scripts.contains(script_name) {
+                        entries.push(ep);
+                    } else {
+                        support_entries.push(ep);
+                    }
+                }
+            }
+            for config_ref in refs.support {
+                if let Some(ep) = resolve_entry_path_with_tracking(
+                    pkg_dir,
+                    &config_ref,
+                    canonical_root,
+                    EntryPointSource::PackageJsonScript,
+                    Some(&mut *skipped_entries),
+                ) {
+                    support_entries.push(ep);
                 }
             }
         }
@@ -679,6 +1022,7 @@ fn discover_workspace_entry_points_with_warnings_impl(
     ws_root: &Path,
     all_files: &[DiscoveredFile],
     pkg: Option<&PackageJson>,
+    runtime_script_seeds: &FxHashSet<String>,
 ) -> EntryPointDiscovery {
     let mut discovery = EntryPointDiscovery::default();
 
@@ -704,10 +1048,12 @@ fn discover_workspace_entry_points_with_warnings_impl(
             }
         }
 
-        // Scripts field — extract file references as entry points
         if let Some(scripts) = &pkg.scripts {
-            for script_value in scripts.values() {
-                for file_ref in extract_script_file_refs(script_value) {
+            let runtime_scripts =
+                runtime_package_script_names_with_seeds(scripts, runtime_script_seeds);
+            for (script_name, script_value) in scripts {
+                let refs = package_script_refs(script_value);
+                for file_ref in refs.inheritable {
                     if let Some(ep) = resolve_entry_path_with_tracking(
                         ws_root,
                         &file_ref,
@@ -715,16 +1061,28 @@ fn discover_workspace_entry_points_with_warnings_impl(
                         EntryPointSource::PackageJsonScript,
                         Some(&mut discovery.skipped_entries),
                     ) {
-                        discovery.entries.push(ep);
+                        if runtime_scripts.contains(script_name) {
+                            discovery.entries.push(ep);
+                        } else {
+                            discovery.support_entries.push(ep);
+                        }
+                    }
+                }
+                for config_ref in refs.support {
+                    if let Some(ep) = resolve_entry_path_with_tracking(
+                        ws_root,
+                        &config_ref,
+                        &canonical_ws_root,
+                        EntryPointSource::PackageJsonScript,
+                        Some(&mut discovery.skipped_entries),
+                    ) {
+                        discovery.support_entries.push(ep);
                     }
                 }
             }
         }
-
-        // Framework rules now flow through PluginRegistry via external_plugins.
     }
 
-    // Fall back to default index files if no entry points found for this workspace
     if discovery.entries.is_empty() {
         discovery.entries = apply_default_fallback(all_files, ws_root, Some(ws_root));
     }
@@ -732,14 +1090,24 @@ fn discover_workspace_entry_points_with_warnings_impl(
     discovery.entries.sort_by(|a, b| a.path.cmp(&b.path));
     discovery.entries.dedup_by(|a, b| a.path == b.path);
     discovery
+        .support_entries
+        .sort_by(|a, b| a.path.cmp(&b.path));
+    discovery.support_entries.dedup_by(|a, b| a.path == b.path);
+    discovery
 }
 
-pub fn discover_workspace_entry_points_with_warnings_from_pkg(
+pub fn discover_workspace_entry_points_with_runtime_scripts(
     ws_root: &Path,
     all_files: &[DiscoveredFile],
     pkg: Option<&PackageJson>,
+    runtime_script_seeds: &FxHashSet<String>,
 ) -> EntryPointDiscovery {
-    discover_workspace_entry_points_with_warnings_impl(ws_root, all_files, pkg)
+    discover_workspace_entry_points_with_warnings_impl(
+        ws_root,
+        all_files,
+        pkg,
+        runtime_script_seeds,
+    )
 }
 
 #[must_use]
@@ -748,9 +1116,13 @@ pub fn discover_workspace_entry_points_with_warnings(
     _config: &ResolvedConfig,
     all_files: &[DiscoveredFile],
 ) -> EntryPointDiscovery {
-    let pkg_path = ws_root.join("package.json");
-    let pkg = PackageJson::load(&pkg_path).ok();
-    discover_workspace_entry_points_with_warnings_impl(ws_root, all_files, pkg.as_ref())
+    let pkg = fallow_config::load_dir_package_json(ws_root);
+    discover_workspace_entry_points_with_warnings_impl(
+        ws_root,
+        all_files,
+        pkg.as_ref(),
+        &FxHashSet::default(),
+    )
 }
 
 #[must_use]
@@ -761,7 +1133,7 @@ pub fn discover_workspace_entry_points(
 ) -> Vec<EntryPoint> {
     let discovery = discover_workspace_entry_points_with_warnings(ws_root, config, all_files);
     warn_skipped_entry_summary(&discovery.skipped_entries);
-    discovery.entries
+    discovery.into_all_entries()
 }
 
 /// Discover entry points from plugin results (dynamic config parsing).
@@ -786,20 +1158,21 @@ pub fn discover_plugin_entry_point_sets(
 ) -> CategorizedEntryPoints {
     let mut entries = CategorizedEntryPoints::default();
 
-    // Pre-compute relative paths
-    let relative_paths: Vec<String> = files
-        .iter()
-        .map(|f| {
-            f.path
-                .strip_prefix(&config.root)
-                .unwrap_or(&f.path)
-                .to_string_lossy()
-                .into_owned()
-        })
-        .collect();
+    let relative_paths = relative_paths_for(files, &config.root);
+    let (glob_set, glob_meta) = build_plugin_glob_meta(plugin_result);
+    if let Some(glob_set) = glob_set.filter(|set| !set.is_empty()) {
+        match_plugin_entry_files(&mut entries, &glob_set, &glob_meta, &relative_paths, files);
+    }
 
-    // Match plugin entry patterns against files using a single GlobSet for
-    // include globs, then filter candidate matches through any exclusions.
+    push_plugin_setup_files(&mut entries, &config.root, plugin_result);
+
+    entries.dedup()
+}
+
+/// Compile plugin entry-pattern and support globs into a glob set plus per-glob metadata.
+fn build_plugin_glob_meta(
+    plugin_result: &crate::plugins::AggregatedPluginResult,
+) -> (Option<globset::GlobSet>, Vec<CompiledEntryRule<'_>>) {
     let mut builder = globset::GlobSetBuilder::new();
     let mut glob_meta: Vec<CompiledEntryRule<'_>> = Vec::new();
     for (rule, pname) in &plugin_result.entry_patterns {
@@ -831,55 +1204,74 @@ pub fn discover_plugin_entry_point_sets(
             }
         }
     }
-    if let Ok(glob_set) = builder.build()
-        && !glob_set.is_empty()
-    {
-        for (idx, rel) in relative_paths.iter().enumerate() {
-            let matches: Vec<usize> = glob_set
-                .matches(rel)
-                .into_iter()
-                .filter(|match_idx| glob_meta[*match_idx].matches(rel))
-                .collect();
-            if !matches.is_empty() {
-                let name = glob_meta[matches[0]].plugin_name;
-                let entry = EntryPoint {
-                    path: files[idx].path.clone(),
-                    source: EntryPointSource::Plugin {
-                        name: name.to_string(),
-                    },
-                };
+    (builder.build().ok(), glob_meta)
+}
 
-                let mut has_runtime = false;
-                let mut has_test = false;
-                let mut has_support = false;
-                for match_idx in matches {
-                    match glob_meta[match_idx].role {
-                        EntryPointRole::Runtime => has_runtime = true,
-                        EntryPointRole::Test => has_test = true,
-                        EntryPointRole::Support => has_support = true,
-                    }
-                }
+/// Match each file against the compiled plugin glob set, categorizing hits by role.
+fn match_plugin_entry_files(
+    entries: &mut CategorizedEntryPoints,
+    glob_set: &globset::GlobSet,
+    glob_meta: &[CompiledEntryRule<'_>],
+    relative_paths: &[String],
+    files: &[DiscoveredFile],
+) {
+    for (idx, rel) in relative_paths.iter().enumerate() {
+        let matches: Vec<usize> = glob_set
+            .matches(rel)
+            .into_iter()
+            .filter(|match_idx| glob_meta[*match_idx].matches(rel))
+            .collect();
+        if matches.is_empty() {
+            continue;
+        }
+        let name = glob_meta[matches[0]].plugin_name;
+        let entry = EntryPoint {
+            path: files[idx].path.clone(),
+            source: EntryPointSource::Plugin {
+                name: name.to_string(),
+            },
+        };
+        categorize_plugin_match(entries, entry, glob_meta, &matches);
+    }
+}
 
-                if has_runtime {
-                    entries.push_runtime(entry.clone());
-                }
-                if has_test {
-                    entries.push_test(entry.clone());
-                }
-                if has_support || (!has_runtime && !has_test) {
-                    entries.push_support(entry);
-                }
-            }
+/// Push a matched entry into the runtime/test/support buckets implied by its roles.
+fn categorize_plugin_match(
+    entries: &mut CategorizedEntryPoints,
+    entry: EntryPoint,
+    glob_meta: &[CompiledEntryRule<'_>],
+    matches: &[usize],
+) {
+    let mut has_runtime = false;
+    let mut has_test = false;
+    let mut has_support = false;
+    for &match_idx in matches {
+        match glob_meta[match_idx].role {
+            EntryPointRole::Runtime => has_runtime = true,
+            EntryPointRole::Test => has_test = true,
+            EntryPointRole::Support => has_support = true,
         }
     }
 
-    // Add setup files (absolute paths from plugin config parsing)
+    if has_runtime {
+        entries.push_runtime(entry.clone());
+    }
+    if has_test {
+        entries.push_test(entry.clone());
+    }
+    if has_support || (!has_runtime && !has_test) {
+        entries.push_support(entry);
+    }
+}
+
+/// Resolve plugin-declared setup files (with source-extension fallback) into support entries.
+fn push_plugin_setup_files(
+    entries: &mut CategorizedEntryPoints,
+    root: &Path,
+    plugin_result: &crate::plugins::AggregatedPluginResult,
+) {
     for (setup_file, pname) in &plugin_result.setup_files {
-        let resolved = if setup_file.is_absolute() {
-            setup_file.clone()
-        } else {
-            config.root.join(setup_file)
-        };
+        let resolved = resolve_plugin_setup_file(root, setup_file);
         if resolved.exists() {
             entries.push_support(EntryPoint {
                 path: resolved,
@@ -887,30 +1279,39 @@ pub fn discover_plugin_entry_point_sets(
                     name: pname.clone(),
                 },
             });
-        } else {
-            // Try with extensions
-            for ext in SOURCE_EXTENSIONS {
-                let with_ext = resolved.with_extension(ext);
-                if with_ext.exists() {
-                    entries.push_support(EntryPoint {
-                        path: with_ext,
-                        source: EntryPointSource::Plugin {
-                            name: pname.clone(),
-                        },
-                    });
-                    break;
-                }
+            continue;
+        }
+        for ext in SOURCE_EXTENSIONS {
+            let with_ext = resolved.with_extension(ext);
+            if with_ext.exists() {
+                entries.push_support(EntryPoint {
+                    path: with_ext,
+                    source: EntryPointSource::Plugin {
+                        name: pname.clone(),
+                    },
+                });
+                break;
             }
         }
     }
+}
 
-    entries.dedup()
+fn resolve_plugin_setup_file(root: &Path, setup_file: &Path) -> PathBuf {
+    if is_absolute_path_any_platform(setup_file) {
+        setup_file.to_path_buf()
+    } else {
+        root.join(setup_file)
+    }
 }
 
 /// Discover entry points from `dynamicallyLoaded` config patterns.
 ///
 /// Matches the configured glob patterns against the discovered file list and
 /// marks matching files as entry points so they are never flagged as unused.
+#[expect(
+    clippy::expect_used,
+    reason = "dynamicallyLoaded glob patterns are validated before entry point discovery"
+)]
 #[must_use]
 pub fn discover_dynamically_loaded_entry_points(
     config: &ResolvedConfig,
@@ -922,9 +1323,10 @@ pub fn discover_dynamically_loaded_entry_points(
 
     let mut builder = globset::GlobSetBuilder::new();
     for pattern in &config.dynamically_loaded {
-        if let Ok(glob) = globset::Glob::new(pattern) {
-            builder.add(glob);
-        }
+        builder.add(
+            globset::Glob::new(pattern)
+                .expect("dynamicallyLoaded pattern was validated at config load time"),
+        );
     }
     let Ok(glob_set) = builder.build() else {
         return Vec::new();
@@ -1025,7 +1427,6 @@ mod tests {
             ext in prop::sample::select(vec!["ts", "tsx", "js", "jsx", "vue", "svelte", "astro", "mdx"]),
         ) {
             let pattern = format!("**/{prefix}*.{ext}");
-            // Should not panic — either compiles or returns Err gracefully
             let result = globset::Glob::new(&pattern);
             prop_assert!(result.is_ok(), "Glob::new should not fail for well-formed patterns");
         }
@@ -1046,12 +1447,10 @@ mod tests {
         fn compile_glob_set_no_panic(
             patterns in prop::collection::vec("[a-zA-Z0-9_*/.]{1,30}", 0..10),
         ) {
-            // Should not panic regardless of input
             let _ = compile_glob_set(&patterns);
         }
     }
 
-    // compile_glob_set unit tests
     #[test]
     fn compile_glob_set_empty_input() {
         assert!(
@@ -1081,6 +1480,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "test fixture; linear setup/assert, length is not a maintainability concern"
+    )]
     fn plugin_entry_point_sets_preserve_runtime_test_and_support_roles() {
         let dir = tempfile::tempdir().expect("create temp dir");
         let root = dir.path();
@@ -1091,21 +1494,31 @@ mod tests {
         std::fs::write(root.join("tests/app.test.ts"), "export const test = 1;").unwrap();
 
         let config = FallowConfig {
+            type_aware: fallow_config::TypeAwareConfig::default(),
             schema: None,
             extends: vec![],
             entry: vec![],
             ignore_patterns: vec![],
+            ignore_findings: vec![],
             framework: vec![],
             workspaces: None,
             ignore_dependencies: vec![],
+            ignore_unresolved_imports: vec![],
             ignore_exports: vec![],
+            ignore_catalog_references: vec![],
+            ignore_dependency_overrides: vec![],
+            ignore_exports_used_in_file: fallow_config::IgnoreExportsUsedInFileConfig::default(),
             used_class_members: vec![],
+            ignore_decorators: vec![],
+            unused_component_props: fallow_config::UnusedComponentPropsConfig::default(),
             duplicates: fallow_config::DuplicatesConfig::default(),
+            similar_code: fallow_config::SimilarCodeConfig::default(),
             health: fallow_config::HealthConfig::default(),
             rules: RulesConfig::default(),
             boundaries: fallow_config::BoundaryConfig::default(),
-            production: false,
+            production: false.into(),
             plugins: vec![],
+            rule_packs: vec![],
             dynamically_loaded: vec![],
             overrides: vec![],
             regression: None,
@@ -1113,10 +1526,15 @@ mod tests {
             codeowners: None,
             public_packages: vec![],
             flags: fallow_config::FlagsConfig::default(),
+            security: fallow_config::SecurityConfig::default(),
+            fix: fallow_config::FixConfig::default(),
             resolve: fallow_config::ResolveConfig::default(),
             sealed: false,
+            include_entry_exports: false,
+            auto_imports: false,
+            cache: fallow_config::CacheConfig::default(),
         }
-        .resolve(root.to_path_buf(), OutputFormat::Human, 4, true, true);
+        .resolve(root.to_path_buf(), OutputFormat::Human, 4, true, true, None);
 
         let files = vec![
             DiscoveredFile {
@@ -1199,6 +1617,29 @@ mod tests {
     }
 
     #[test]
+    fn resolve_plugin_setup_file_preserves_windows_absolute_path_on_any_host() {
+        let root = Path::new("/workspace/project");
+        let setup_file = Path::new(r"C:\workspace\project\setup.ts");
+
+        assert_eq!(
+            resolve_plugin_setup_file(root, setup_file),
+            setup_file.to_path_buf()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn resolve_plugin_setup_file_preserves_posix_rooted_path_on_windows() {
+        let root = Path::new(r"C:\workspace\project");
+        let setup_file = Path::new(r"/workspace/project/setup.ts");
+
+        assert_eq!(
+            resolve_plugin_setup_file(root, setup_file),
+            setup_file.to_path_buf()
+        );
+    }
+
+    #[test]
     fn plugin_entry_point_rules_respect_exclusions() {
         let dir = tempfile::tempdir().expect("create temp dir");
         let root = dir.path();
@@ -1215,21 +1656,31 @@ mod tests {
         .unwrap();
 
         let config = FallowConfig {
+            type_aware: fallow_config::TypeAwareConfig::default(),
             schema: None,
             extends: vec![],
             entry: vec![],
             ignore_patterns: vec![],
+            ignore_findings: vec![],
             framework: vec![],
             workspaces: None,
             ignore_dependencies: vec![],
+            ignore_unresolved_imports: vec![],
             ignore_exports: vec![],
+            ignore_catalog_references: vec![],
+            ignore_dependency_overrides: vec![],
+            ignore_exports_used_in_file: fallow_config::IgnoreExportsUsedInFileConfig::default(),
             used_class_members: vec![],
+            ignore_decorators: vec![],
+            unused_component_props: fallow_config::UnusedComponentPropsConfig::default(),
             duplicates: fallow_config::DuplicatesConfig::default(),
+            similar_code: fallow_config::SimilarCodeConfig::default(),
             health: fallow_config::HealthConfig::default(),
             rules: RulesConfig::default(),
             boundaries: fallow_config::BoundaryConfig::default(),
-            production: false,
+            production: false.into(),
             plugins: vec![],
+            rule_packs: vec![],
             dynamically_loaded: vec![],
             overrides: vec![],
             regression: None,
@@ -1237,10 +1688,15 @@ mod tests {
             codeowners: None,
             public_packages: vec![],
             flags: fallow_config::FlagsConfig::default(),
+            security: fallow_config::SecurityConfig::default(),
+            fix: fallow_config::FixConfig::default(),
             resolve: fallow_config::ResolveConfig::default(),
             sealed: false,
+            include_entry_exports: false,
+            auto_imports: false,
+            cache: fallow_config::CacheConfig::default(),
         }
-        .resolve(root.to_path_buf(), OutputFormat::Human, 4, true, true);
+        .resolve(root.to_path_buf(), OutputFormat::Human, 4, true, true, None);
 
         let files = vec![
             DiscoveredFile {
@@ -1283,7 +1739,6 @@ mod tests {
         assert!(!entry_paths.contains(&"app/pages/-helper.ts".to_string()));
     }
 
-    // resolve_entry_path unit tests
     mod resolve_entry_path_tests {
         use super::*;
 
@@ -1308,13 +1763,11 @@ mod tests {
         #[test]
         fn resolves_with_extension_fallback() {
             let dir = tempfile::tempdir().expect("create temp dir");
-            // Use canonical base to avoid macOS /var → /private/var symlink mismatch
             let canonical = dunce::canonicalize(dir.path()).unwrap();
             let src = canonical.join("src");
             std::fs::create_dir_all(&src).unwrap();
             std::fs::write(src.join("index.ts"), "export const a = 1;").unwrap();
 
-            // Provide path without extension — should try adding .ts, .tsx, etc.
             let result = resolve_entry_path(
                 &canonical,
                 "src/index",
@@ -1330,6 +1783,107 @@ mod tests {
                 ep.path.to_string_lossy().contains("index.ts"),
                 "should find index.ts via extension fallback"
             );
+        }
+
+        #[test]
+        fn exact_file_wins_before_directory_index_fallback() {
+            let dir = tempfile::tempdir().expect("create temp dir");
+            let canonical = dunce::canonicalize(dir.path()).unwrap();
+            let scripts = canonical.join("scripts");
+            std::fs::create_dir_all(scripts.join("process-messages")).unwrap();
+            std::fs::write(
+                scripts.join("process-messages.js"),
+                "export const direct = true;",
+            )
+            .unwrap();
+            std::fs::write(
+                scripts.join("process-messages").join("index.js"),
+                "export const index = true;",
+            )
+            .unwrap();
+
+            let result = resolve_entry_path(
+                &canonical,
+                "scripts/process-messages.js",
+                &canonical,
+                EntryPointSource::PackageJsonScript,
+            )
+            .expect("exact file should resolve");
+
+            assert!(result.path.ends_with("scripts/process-messages.js"));
+        }
+
+        #[test]
+        fn extension_fallback_wins_before_directory_index_fallback() {
+            let dir = tempfile::tempdir().expect("create temp dir");
+            let canonical = dunce::canonicalize(dir.path()).unwrap();
+            let scripts = canonical.join("scripts");
+            std::fs::create_dir_all(scripts.join("process-messages")).unwrap();
+            std::fs::write(
+                scripts.join("process-messages.ts"),
+                "export const withExt = true;",
+            )
+            .unwrap();
+            std::fs::write(
+                scripts.join("process-messages").join("index.js"),
+                "export const index = true;",
+            )
+            .unwrap();
+
+            let result = resolve_entry_path(
+                &canonical,
+                "scripts/process-messages",
+                &canonical,
+                EntryPointSource::PackageJsonScript,
+            )
+            .expect("extension fallback should resolve");
+
+            assert!(result.path.ends_with("scripts/process-messages.ts"));
+        }
+
+        #[test]
+        fn resolves_directory_index_after_exact_and_extension_fallbacks() {
+            let dir = tempfile::tempdir().expect("create temp dir");
+            let canonical = dunce::canonicalize(dir.path()).unwrap();
+            let scripts = canonical.join("scripts/process-messages");
+            std::fs::create_dir_all(&scripts).unwrap();
+            std::fs::write(scripts.join("index.js"), "export const index = true;").unwrap();
+
+            let result = resolve_entry_path(
+                &canonical,
+                "scripts/process-messages",
+                &canonical,
+                EntryPointSource::PackageJsonScript,
+            )
+            .expect("directory index should resolve");
+
+            assert!(result.path.ends_with("scripts/process-messages/index.js"));
+        }
+
+        #[test]
+        fn directory_index_fallback_ignores_wildcards_and_url_like_entries() {
+            let dir = tempfile::tempdir().expect("create temp dir");
+            let canonical = dunce::canonicalize(dir.path()).unwrap();
+            std::fs::create_dir_all(canonical.join("scripts/process-messages")).unwrap();
+            std::fs::write(
+                canonical.join("scripts/process-messages/index.js"),
+                "export const index = true;",
+            )
+            .unwrap();
+
+            for entry in [
+                "scripts/*",
+                "https://example.com/scripts/process-messages",
+                "@scope/package/scripts/process-messages",
+            ] {
+                let result = resolve_entry_path(
+                    &canonical,
+                    entry,
+                    &canonical,
+                    EntryPointSource::PackageJsonScript,
+                );
+                assert!(result.is_none(), "{entry} should not resolve");
+            }
         }
 
         #[test]
@@ -1352,7 +1906,6 @@ mod tests {
             std::fs::create_dir_all(&src).unwrap();
             std::fs::write(src.join("utils.ts"), "export const u = 1;").unwrap();
 
-            // Also create the dist/ file to make sure it prefers src/
             let dist = dir.path().join("dist");
             std::fs::create_dir_all(&dist).unwrap();
             std::fs::write(dist.join("utils.js"), "// compiled").unwrap();
@@ -1378,7 +1931,6 @@ mod tests {
         #[test]
         fn maps_build_output_to_src() {
             let dir = tempfile::tempdir().expect("create temp dir");
-            // Use canonical base to avoid macOS /var → /private/var symlink mismatch
             let canonical = dunce::canonicalize(dir.path()).unwrap();
             let src = canonical.join("src");
             std::fs::create_dir_all(&src).unwrap();
@@ -1457,6 +2009,22 @@ mod tests {
         }
 
         #[test]
+        fn skipped_entry_summary_dedupes_identical_messages() {
+            let message = format!(
+                "Skipped 1 package.json entry point outside project root: ../../pkg-{}/bin/x",
+                std::process::id()
+            );
+            assert!(
+                should_warn_skipped_entry(&message),
+                "first occurrence of a message emits"
+            );
+            assert!(
+                !should_warn_skipped_entry(&message),
+                "identical repeat is suppressed"
+            );
+        }
+
+        #[test]
         fn rejects_parent_dir_escape_for_exact_file() {
             let sandbox = tempfile::tempdir().expect("create sandbox");
             let root = sandbox.path().join("project");
@@ -1507,7 +2075,6 @@ mod tests {
         }
     }
 
-    // try_output_to_source_path unit tests
     mod output_to_source_tests {
         use super::*;
 
@@ -1532,7 +2099,6 @@ mod tests {
         #[test]
         fn returns_none_when_no_source_file_exists() {
             let dir = tempfile::tempdir().expect("create temp dir");
-            // No src/ directory at all
             let result = try_output_to_source_path(dir.path(), "./dist/missing.js");
             assert!(result.is_none());
         }
@@ -1544,7 +2110,6 @@ mod tests {
             std::fs::create_dir_all(&src).unwrap();
             std::fs::write(src.join("foo.ts"), "export const f = 1;").unwrap();
 
-            // "lib" is not in OUTPUT_DIRS, so no mapping should occur
             let result = try_output_to_source_path(dir.path(), "./lib/foo.js");
             assert!(result.is_none());
         }
@@ -1568,7 +2133,6 @@ mod tests {
         }
     }
 
-    // Source index fallback unit tests (issue #102)
     mod source_index_fallback_tests {
         use super::*;
 
@@ -1591,8 +2155,17 @@ mod tests {
         }
 
         #[test]
+        fn root_index_entries_are_recognized_for_source_fallback() {
+            assert!(is_package_root_index_entry("./index.js"));
+            assert!(is_package_root_index_entry("index.cjs"));
+            assert!(is_package_root_index_entry("./index.d.ts"));
+            assert!(!is_package_root_index_entry("./src/index.js"));
+            assert!(!is_package_root_index_entry("./main.js"));
+            assert!(!is_package_root_index_entry(""));
+        }
+
+        #[test]
         fn rejects_substring_match_for_output_dir() {
-            // "distro" contains "dist" as a substring but is not an output dir
             assert!(!is_entry_in_output_dir("./distro/index.js"));
             assert!(!is_entry_in_output_dir("./build-scripts/run.js"));
         }
@@ -1623,8 +2196,6 @@ mod tests {
 
         #[test]
         fn prefers_src_index_over_root_index() {
-            // Source index fallback must prefer `src/index.*` over root-level `index.*`
-            // because library conventions keep source under `src/`.
             let dir = tempfile::tempdir().expect("create temp dir");
             let src = dir.path().join("src");
             std::fs::create_dir_all(&src).unwrap();
@@ -1671,10 +2242,6 @@ mod tests {
             let dir = tempfile::tempdir().expect("create temp dir");
             let canonical = dunce::canonicalize(dir.path()).unwrap();
 
-            // dist/esm2022/index.js exists but there's no src/esm2022/ mirror —
-            // only src/index.ts. Without the fallback, resolve_entry_path would
-            // return the dist file, which then gets filtered out by the ignore
-            // pattern.
             let dist_dir = canonical.join("dist").join("esm2022");
             std::fs::create_dir_all(&dist_dir).unwrap();
             std::fs::write(dist_dir.join("index.js"), "export const x = 1;").unwrap();
@@ -1697,8 +2264,6 @@ mod tests {
 
         #[test]
         fn resolve_entry_path_uses_direct_src_mirror_when_available() {
-            // When `src/esm2022/index.ts` exists, the existing mirror logic wins
-            // and the fallback should not fire.
             let dir = tempfile::tempdir().expect("create temp dir");
             let canonical = dunce::canonicalize(dir.path()).unwrap();
 
@@ -1707,7 +2272,6 @@ mod tests {
             let mirror_index = src_mirror.join("index.ts");
             std::fs::write(&mirror_index, "export const x = 1;").unwrap();
 
-            // Also create src/index.ts to confirm the mirror wins over the fallback.
             let src_index = canonical.join("src").join("index.ts");
             std::fs::write(&src_index, "export const y = 2;").unwrap();
 
@@ -1719,9 +2283,27 @@ mod tests {
             );
             assert_eq!(result.map(|e| e.path), Some(mirror_index));
         }
+
+        #[test]
+        fn resolve_entry_path_falls_back_to_src_index_for_missing_root_index() {
+            let dir = tempfile::tempdir().expect("create temp dir");
+            let canonical = dunce::canonicalize(dir.path()).unwrap();
+
+            let src = canonical.join("src");
+            std::fs::create_dir_all(&src).unwrap();
+            let src_index = src.join("index.ts");
+            std::fs::write(&src_index, "export const x = 1;").unwrap();
+
+            let result = resolve_entry_path(
+                &canonical,
+                "./index.js",
+                &canonical,
+                EntryPointSource::PackageJsonMain,
+            );
+            assert_eq!(result.map(|entry| entry.path), Some(src_index));
+        }
     }
 
-    // apply_default_fallback unit tests
     mod default_fallback_tests {
         use super::*;
 
@@ -1804,7 +2386,6 @@ mod tests {
                 },
             ];
 
-            // Filter to workspace A only
             let ws_root = dir.path().join("packages").join("a");
             let entries = apply_default_fallback(&files, &ws_root, Some(&ws_root));
             assert_eq!(entries.len(), 1);
@@ -1812,14 +2393,11 @@ mod tests {
         }
     }
 
-    // expand_wildcard_entries unit tests
     mod wildcard_entry_tests {
         use super::*;
 
         #[test]
         fn expands_wildcard_css_entries() {
-            // Wildcard subpath exports like `"./themes/*": { "import": "./src/themes/*.css" }`
-            // should expand to actual CSS files on disk.
             let dir = tempfile::tempdir().expect("create temp dir");
             let themes = dir.path().join("src").join("themes");
             std::fs::create_dir_all(&themes).unwrap();
@@ -1847,7 +2425,6 @@ mod tests {
         #[test]
         fn wildcard_does_not_match_nonexistent_files() {
             let dir = tempfile::tempdir().expect("create temp dir");
-            // No files matching the pattern
             std::fs::create_dir_all(dir.path().join("src/themes")).unwrap();
 
             let canonical = dunce::canonicalize(dir.path()).unwrap();
@@ -1862,7 +2439,6 @@ mod tests {
 
         #[test]
         fn wildcard_only_matches_specified_extension() {
-            // Wildcard pattern `*.css` should not match `.ts` files
             let dir = tempfile::tempdir().expect("create temp dir");
             let themes = dir.path().join("src").join("themes");
             std::fs::create_dir_all(&themes).unwrap();
@@ -1883,5 +2459,457 @@ mod tests {
                     .ends_with(".css")
             );
         }
+    }
+
+    fn config_for(root: &Path) -> ResolvedConfig {
+        FallowConfig::default().resolve(
+            root.to_path_buf(),
+            OutputFormat::Human,
+            1,
+            true,
+            true,
+            None,
+        )
+    }
+
+    fn discovered(root: &Path, rel: &str, id: u32) -> DiscoveredFile {
+        DiscoveredFile {
+            id: FileId(id),
+            path: root.join(rel),
+            size_bytes: 1,
+        }
+    }
+
+    #[test]
+    fn root_entry_points_use_package_json_scripts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("scripts")).expect("scripts dir");
+        std::fs::write(root.join("scripts/build.ts"), "export const build = true;")
+            .expect("script file");
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"scripts":{"build":"tsx scripts/build.ts"}}"#,
+        )
+        .expect("package file");
+        let config = config_for(root);
+        let files = [discovered(root, "scripts/build.ts", 0)];
+
+        let entries = discover_entry_points(&config, &files);
+
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].path.ends_with("scripts/build.ts"));
+        assert!(matches!(
+            entries[0].source,
+            EntryPointSource::PackageJsonScript
+        ));
+    }
+
+    #[test]
+    fn build_script_is_support_while_default_index_stays_runtime() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("scripts")).expect("scripts dir");
+        std::fs::create_dir_all(root.join("src")).expect("src dir");
+        std::fs::write(root.join("scripts/build.ts"), "export const build = true;")
+            .expect("script file");
+        std::fs::write(root.join("src/index.ts"), "export const app = true;").expect("index file");
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"scripts":{"build":"tsx scripts/build.ts"}}"#,
+        )
+        .expect("package file");
+        let config = config_for(root);
+        let files = [
+            discovered(root, "scripts/build.ts", 0),
+            discovered(root, "src/index.ts", 1),
+        ];
+
+        let discovery = discover_entry_points_with_warnings(&config, &files);
+
+        assert_eq!(discovery.entries.len(), 1);
+        assert!(discovery.entries[0].path.ends_with("src/index.ts"));
+        assert_eq!(discovery.support_entries.len(), 1);
+        assert!(
+            discovery.support_entries[0]
+                .path
+                .ends_with("scripts/build.ts")
+        );
+    }
+
+    #[test]
+    fn indirect_quoted_start_script_stays_runtime() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src")).expect("src dir");
+        std::fs::write(root.join("src/server.ts"), "export const server = true;")
+            .expect("server file");
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"scripts":{"start":"npm run serve","serve":"node 'src/server.ts'"}}"#,
+        )
+        .expect("package file");
+        let config = config_for(root);
+        let files = [discovered(root, "src/server.ts", 0)];
+
+        let discovery = discover_entry_points_with_warnings(&config, &files);
+
+        assert_eq!(discovery.entries.len(), 1);
+        assert!(discovery.entries[0].path.ends_with("src/server.ts"));
+        assert!(discovery.support_entries.is_empty());
+    }
+
+    #[test]
+    fn indirect_start_script_includes_its_lifecycle_hooks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src")).expect("src dir");
+        for file in ["pre.ts", "server.ts", "post.ts"] {
+            std::fs::write(root.join("src").join(file), "export const value = true;")
+                .expect("runtime file");
+        }
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"scripts":{"start":"npm run serve","preserve":"node src/pre.ts","serve":"node src/server.ts","postserve":"node src/post.ts"}}"#,
+        )
+        .expect("package file");
+        let config = config_for(root);
+        let files = [
+            discovered(root, "src/pre.ts", 0),
+            discovered(root, "src/server.ts", 1),
+            discovered(root, "src/post.ts", 2),
+        ];
+
+        let discovery = discover_entry_points_with_warnings(&config, &files);
+
+        assert_eq!(discovery.entries.len(), 3);
+        assert!(discovery.support_entries.is_empty());
+    }
+
+    #[test]
+    #[expect(
+        clippy::disallowed_types,
+        reason = "test input matches the serde-deserialized package.json scripts map"
+    )]
+    fn start_does_not_recursively_invent_hooks_for_lifecycle_hooks() {
+        let scripts = std::collections::HashMap::from([
+            ("preprestart".to_string(), "node src/tool.ts".to_string()),
+            ("prestart".to_string(), "node src/pre.ts".to_string()),
+            ("start".to_string(), "node src/server.ts".to_string()),
+            ("poststart".to_string(), "node src/post.ts".to_string()),
+            ("postpoststart".to_string(), "node src/tool.ts".to_string()),
+        ]);
+
+        let runtime = runtime_package_script_names(&scripts);
+
+        assert_eq!(
+            runtime,
+            FxHashSet::from_iter([
+                "prestart".to_string(),
+                "start".to_string(),
+                "poststart".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn bun_build_script_remains_support_entry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("scripts")).expect("scripts dir");
+        std::fs::write(root.join("scripts/build.ts"), "export const build = true;")
+            .expect("build file");
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"scripts":{"build":"bun scripts/build.ts"}}"#,
+        )
+        .expect("package file");
+        let config = config_for(root);
+        let files = [discovered(root, "scripts/build.ts", 0)];
+
+        let discovery = discover_entry_points_with_warnings(&config, &files);
+
+        assert!(discovery.entries.is_empty());
+        assert_eq!(discovery.support_entries.len(), 1);
+    }
+
+    #[test]
+    fn start_script_config_remains_support_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::write(root.join("vite.config.ts"), "export default {};").expect("config file");
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"scripts":{"start":"vite --config vite.config.ts"}}"#,
+        )
+        .expect("package file");
+        let config = config_for(root);
+        let files = [discovered(root, "vite.config.ts", 0)];
+
+        let discovery = discover_entry_points_with_warnings(&config, &files);
+
+        assert!(discovery.entries.is_empty());
+        assert_eq!(discovery.support_entries.len(), 1);
+        assert!(
+            discovery.support_entries[0]
+                .path
+                .ends_with("vite.config.ts")
+        );
+    }
+
+    #[test]
+    fn manifest_entry_remains_runtime_when_build_script_references_same_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src")).expect("src dir");
+        std::fs::write(root.join("src/index.ts"), "export const app = true;").expect("index file");
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"main":"src/index.ts","scripts":{"build":"tsx src/index.ts"}}"#,
+        )
+        .expect("package file");
+        let config = config_for(root);
+        let files = [discovered(root, "src/index.ts", 0)];
+
+        let discovery = discover_entry_points_with_warnings(&config, &files);
+
+        assert_eq!(discovery.entries.len(), 1);
+        assert!(discovery.entries[0].path.ends_with("src/index.ts"));
+    }
+
+    #[test]
+    fn workspace_build_script_is_support_with_runtime_fallback() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let workspace = root.join("packages/app");
+        std::fs::create_dir_all(workspace.join("scripts")).expect("scripts dir");
+        std::fs::create_dir_all(workspace.join("src")).expect("src dir");
+        std::fs::write(
+            workspace.join("scripts/build.ts"),
+            "export const build = true;",
+        )
+        .expect("script file");
+        std::fs::write(workspace.join("src/index.ts"), "export const app = true;")
+            .expect("index file");
+        std::fs::write(
+            workspace.join("package.json"),
+            r#"{"name":"app","scripts":{"build":"tsx scripts/build.ts"}}"#,
+        )
+        .expect("package file");
+        let files = [
+            discovered(root, "packages/app/scripts/build.ts", 0),
+            discovered(root, "packages/app/src/index.ts", 1),
+        ];
+
+        let discovery =
+            discover_workspace_entry_points_with_warnings(&workspace, &config_for(root), &files);
+
+        assert_eq!(discovery.entries.len(), 1);
+        assert!(discovery.entries[0].path.ends_with("src/index.ts"));
+        assert_eq!(discovery.support_entries.len(), 1);
+        assert!(
+            discovery.support_entries[0]
+                .path
+                .ends_with("scripts/build.ts")
+        );
+    }
+
+    #[test]
+    fn workspace_script_selected_by_root_start_is_runtime() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let workspace = root.join("packages/api");
+        std::fs::create_dir_all(workspace.join("src")).expect("src dir");
+        std::fs::write(workspace.join("src/server.ts"), "export const app = true;")
+            .expect("server file");
+        let workspace_pkg: PackageJson = serde_json::from_str(
+            r#"{"name":"@scope/api","scripts":{"serve":"node src/server.ts"}}"#,
+        )
+        .expect("workspace package");
+        let files = [discovered(root, "packages/api/src/server.ts", 0)];
+        let seeds = FxHashSet::from_iter(["serve".to_string()]);
+
+        let discovery = discover_workspace_entry_points_with_runtime_scripts(
+            &workspace,
+            &files,
+            Some(&workspace_pkg),
+            &seeds,
+        );
+
+        assert_eq!(discovery.entries.len(), 1);
+        assert!(discovery.entries[0].path.ends_with("src/server.ts"));
+        assert!(discovery.support_entries.is_empty());
+    }
+
+    #[test]
+    fn workspace_script_selection_does_not_promote_same_named_root_script() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let root_pkg: PackageJson = serde_json::from_str(
+            r#"{
+                "scripts": {
+                    "start": "pnpm --filter=@scope/api run serve",
+                    "serve": "node src/unrelated.ts"
+                }
+            }"#,
+        )
+        .expect("root package");
+        let api_pkg: PackageJson = serde_json::from_str(
+            r#"{"name":"@scope/api","scripts":{"serve":"node src/server.ts"}}"#,
+        )
+        .expect("api package");
+        let workspace_pkgs = vec![(
+            fallow_config::WorkspaceInfo {
+                root: root.join("packages/api"),
+                name: "@scope/api".to_string(),
+                is_internal_dependency: false,
+            },
+            api_pkg,
+        )];
+        let scripts = root_pkg.scripts.as_ref().expect("root scripts");
+
+        let runtime = runtime_package_script_names(scripts);
+        let workspace_seeds =
+            workspace_runtime_script_seeds(root, Some(&root_pkg), &workspace_pkgs);
+
+        assert_eq!(runtime, FxHashSet::from_iter(["start".to_string()]));
+        assert_eq!(
+            workspace_seeds.get("@scope/api"),
+            Some(&FxHashSet::from_iter(["serve".to_string()]))
+        );
+    }
+
+    #[test]
+    fn workspace_runtime_script_seeds_follow_transitive_workspace_calls() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let root_pkg: PackageJson =
+            serde_json::from_str(r#"{"scripts":{"start":"pnpm --filter @scope/api run serve"}}"#)
+                .expect("root package");
+        let api_pkg: PackageJson = serde_json::from_str(
+            r#"{"name":"@scope/api","scripts":{"serve":"npm --workspace packages/worker run work"}}"#,
+        )
+        .expect("api package");
+        let worker_pkg: PackageJson = serde_json::from_str(
+            r#"{"name":"@scope/worker","scripts":{"prework":"node pre.ts","work":"node worker.ts"}}"#,
+        )
+        .expect("worker package");
+        let workspace_pkgs = vec![
+            (
+                fallow_config::WorkspaceInfo {
+                    root: root.join("packages/api"),
+                    name: "@scope/api".to_string(),
+                    is_internal_dependency: false,
+                },
+                api_pkg,
+            ),
+            (
+                fallow_config::WorkspaceInfo {
+                    root: root.join("packages/worker"),
+                    name: "@scope/worker".to_string(),
+                    is_internal_dependency: false,
+                },
+                worker_pkg,
+            ),
+        ];
+
+        let seeds = workspace_runtime_script_seeds(root, Some(&root_pkg), &workspace_pkgs);
+
+        assert_eq!(
+            seeds.get("@scope/api"),
+            Some(&FxHashSet::from_iter(["serve".to_string()]))
+        );
+        assert_eq!(
+            seeds.get("@scope/worker"),
+            Some(&FxHashSet::from_iter([
+                "prework".to_string(),
+                "work".to_string(),
+            ]))
+        );
+    }
+
+    #[test]
+    fn root_entry_points_fall_back_to_default_index() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src")).expect("src dir");
+        std::fs::write(root.join("src/index.ts"), "export const main = true;").expect("index file");
+        let config = config_for(root);
+        let files = [discovered(root, "src/index.ts", 0)];
+
+        let entries = discover_entry_points(&config, &files);
+
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].path.ends_with("src/index.ts"));
+        assert!(matches!(entries[0].source, EntryPointSource::DefaultIndex));
+    }
+
+    #[test]
+    fn default_index_matchers_preserve_patterns_and_are_shared() {
+        let matchers = default_index_matchers();
+        for path in [
+            "src/index.ts",
+            "src/index.tsx",
+            "src/index.js",
+            "src/index.jsx",
+            "src/main.ts",
+            "src/main.tsx",
+            "src/main.js",
+            "src/main.jsx",
+            "index.ts",
+            "index.tsx",
+            "index.js",
+            "index.jsx",
+            "main.ts",
+            "main.tsx",
+            "main.js",
+            "main.jsx",
+        ] {
+            assert!(
+                matchers.is_match(path),
+                "default index did not match {path}"
+            );
+        }
+        for path in [
+            "src/index.mts",
+            "src/nested/index.ts",
+            "packages/app/src/index.ts",
+            "custom-entry.ts",
+        ] {
+            assert!(!matchers.is_match(path), "non-default index matched {path}");
+        }
+
+        std::thread::scope(|scope| {
+            let handles = std::iter::repeat_with(|| scope.spawn(default_index_matchers))
+                .take(4)
+                .collect::<Vec<_>>();
+            for handle in handles {
+                let from_thread = handle.join().expect("fallback matcher thread");
+                assert!(std::ptr::eq(matchers, from_thread));
+            }
+        });
+    }
+
+    #[test]
+    fn workspace_entry_points_use_workspace_package_json() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let ws_root = root.join("packages/app");
+        std::fs::create_dir_all(ws_root.join("src")).expect("workspace src dir");
+        std::fs::write(ws_root.join("src/main.ts"), "export const main = true;")
+            .expect("workspace main");
+        std::fs::write(ws_root.join("package.json"), r#"{"main":"src/main.ts"}"#)
+            .expect("workspace package file");
+        let config = config_for(root);
+        let files = [discovered(root, "packages/app/src/main.ts", 0)];
+
+        let entries = discover_workspace_entry_points(&ws_root, &config, &files);
+
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].path.ends_with("packages/app/src/main.ts"));
+        assert!(matches!(
+            entries[0].source,
+            EntryPointSource::PackageJsonMain
+        ));
     }
 }

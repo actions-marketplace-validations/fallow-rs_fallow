@@ -1,6 +1,8 @@
 [files]
 extend-exclude = [
     "editors/vscode/dist/",
+    "crates/cli/viz-assets/",
+    "viz-frontend/package-lock.json",
     "*.js.map",
     "tests/fixtures/",
     "reference/",
@@ -12,13 +14,39 @@ ue = "ue"
 ba = "ba"
 caf = "caf"
 fpr = "fpr"
+# `xdescribe`/`xit` are the Jasmine/Jest skipped-suite APIs matched as
+# string literals by the E3 weakening-signal detector, not misspellings.
+xdescribe = "xdescribe"
+xit = "xit"
 
 [default.extend-words]
+# Level-of-detail rendering tiers in the viz frontend
+LOD = "LOD"
 ba = "ba"
+daa = "daa"
 ist = "ist"
+ede = "ede"
 Informations = "Informations"
 Konfiguration = "Konfiguration"
 Paket = "Paket"
 Pn = "Pn"
 ot = "ot"
 Ot = "Ot"
+# Intentional misspellings in #467 phase 1 unknown-rule-name tests.
+# These mirror the typos the warn path is designed to catch.
+unsued = "unsued"
+dependnecy = "dependnecy"
+# Intentional misspelling in #449 unknown-suppression-kind tests.
+# `unsed-export` is the close-typo Levenshtein-suggestion fixture.
+unsed = "unsed"
+# `unparseable` is a valid variant spelling used in VS Code license parsing.
+unparseable = "unparseable"
+# `vulnerabilit` is a deliberate truncated substring matched via `.includes()`
+# in the VS Code package-manifest test, not a misspelling of "vulnerability".
+vulnerabilit = "vulnerabilit"
+# `sais` is the SA-IS algorithm (Suffix Array by Induced Sorting) used for
+# clone-detection suffix array construction, not a misspelling of "says".
+sais = "sais"
+# Candle API identifiers used by the local similar-code model implementation.
+mmaped = "mmaped"
+arange = "arange"

@@ -139,14 +139,12 @@ impl FallowError {
 
 impl std::fmt::Display for FallowError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Error code prefix: "error[E001]: ..." or "error: ..."
         if let Some(ref code) = self.code {
             write!(f, "error[{code}]: ")?;
         } else {
             write!(f, "error: ")?;
         }
 
-        // Main message from the kind
         match &*self.kind {
             FallowErrorKind::FileReadError { path, source } => {
                 write!(f, "Failed to read {}: {source}", path.display())?;
@@ -171,12 +169,10 @@ impl std::fmt::Display for FallowError {
             }
         }
 
-        // Context line
         if let Some(ref context) = self.context {
             write!(f, "\n  context: {context}")?;
         }
 
-        // Help line
         if let Some(ref help) = self.help {
             write!(f, "\n  help: {help}")?;
         }
@@ -197,8 +193,6 @@ impl std::error::Error for FallowError {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ── Display tests (struct variants via constructors) ──────────
 
     #[test]
     fn fallow_error_display_file_read() {
@@ -246,8 +240,6 @@ mod tests {
         assert!(msg.contains("E004"));
     }
 
-    // ── Builder method tests ─────────────────────────────────────
-
     #[test]
     fn with_help_appends_help_line() {
         let err =
@@ -294,8 +286,6 @@ mod tests {
         assert!(!msg.contains('['));
     }
 
-    // ── Accessor tests ───────────────────────────────────────────
-
     #[test]
     fn accessors_return_expected_values() {
         let err = FallowError::file_read(
@@ -319,8 +309,6 @@ mod tests {
         assert!(err.help().is_none());
         assert!(err.context().is_none());
     }
-
-    // ── Display format tests ─────────────────────────────────────
 
     #[test]
     fn context_appears_before_help() {
@@ -354,8 +342,6 @@ mod tests {
         assert!(err.help().unwrap().contains("installed"));
     }
 
-    // ── std::error::Error trait ─────────────────────────────────
-
     #[test]
     fn file_read_error_has_source() {
         let err = FallowError::file_read(
@@ -380,13 +366,10 @@ mod tests {
         assert!(std::error::Error::source(&err).is_none());
     }
 
-    // ── Parse error edge cases ──────────────────────────────────
-
     #[test]
     fn parse_single_error_no_count() {
         let err = FallowError::parse("bad.ts", vec!["unexpected token".into()]);
         let msg = format!("{err}");
-        // Single error: no "(N errors)" suffix
         assert!(!msg.contains("errors)"));
         assert!(msg.contains("Parse error in"));
     }

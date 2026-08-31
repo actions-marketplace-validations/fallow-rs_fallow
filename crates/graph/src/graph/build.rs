@@ -2,14 +2,34 @@
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::resolve::{ResolveResult, ResolvedImport, ResolvedModule};
+use crate::resolve::{ResolvedImport, ResolvedModule};
 use fallow_types::discover::{DiscoveredFile, FileId};
-use fallow_types::extract::{ExportName, ImportedName, VisibilityTag};
+use fallow_types::extract::{ExportName, ImportedName, ModuleLoadMechanism, VisibilityTag};
 
-use super::narrowing::attach_symbol_reference;
-use super::types::ModuleNode;
+use super::narrowing::{AttachContext, ReferenceDedup, attach_symbol_reference};
 use super::types::{ExportSymbol, ReExportEdge};
+use super::types::{ModuleNode, ReferencePathInterner};
 use super::{Edge, ImportedSymbol, ModuleGraph};
+
+pub(super) struct PopulateEdgesInput<'a> {
+    pub(super) files: &'a [DiscoveredFile],
+    pub(super) module_by_id: &'a FxHashMap<FileId, &'a ResolvedModule>,
+    pub(super) entry_point_ids: &'a FxHashSet<FileId>,
+    pub(super) runtime_entry_point_ids: &'a FxHashSet<FileId>,
+    pub(super) test_entry_point_ids: &'a FxHashSet<FileId>,
+    pub(super) module_count: usize,
+    pub(super) total_capacity: usize,
+}
+
+/// The one importable name that both `ExportName` and `ImportedName` can
+/// spell either as their `Default` variant or as a `Named` string.
+const DEFAULT_EXPORT_NAME: &str = "default";
+
+#[derive(Clone, Copy, Default)]
+pub(super) struct NamespaceFeatures {
+    pub(super) has_aliases: bool,
+    pub(super) has_re_exports: bool,
+}
 
 /// Mutable accumulator state shared across all files during edge population.
 struct EdgeAccumulator {
@@ -61,29 +81,29 @@ fn collect_import_edge(
     edges_by_target: &mut FxHashMap<FileId, Vec<ImportedSymbol>>,
     acc: &mut EdgeAccumulator,
 ) {
-    match &import.target {
-        ResolveResult::InternalModule(target_id) => {
-            if matches!(import.info.imported_name, ImportedName::Namespace) {
-                record_namespace_import(
-                    *target_id,
-                    &mut acc.namespace_imported,
-                    acc.total_capacity,
-                );
-            }
-            edges_by_target
-                .entry(*target_id)
-                .or_default()
-                .push(ImportedSymbol {
-                    imported_name: import.info.imported_name.clone(),
-                    local_name: import.info.local_name.clone(),
-                    import_span: import.info.span,
-                    is_type_only: import.info.is_type_only,
-                });
+    if let Some(package_name) = import.target.package_usage_name() {
+        record_package_usage(acc, package_name, file_id, import.info.is_type_only);
+    }
+
+    if let Some(target_id) = import.target.internal_file_id() {
+        if matches!(import.info.imported_name, ImportedName::Namespace) {
+            record_namespace_import(target_id, &mut acc.namespace_imported, acc.total_capacity);
         }
-        ResolveResult::NpmPackage(name) => {
-            record_package_usage(acc, name, file_id, import.info.is_type_only);
-        }
-        _ => {}
+        edges_by_target
+            .entry(target_id)
+            .or_default()
+            .push(ImportedSymbol {
+                imported_name: import.info.imported_name.clone(),
+                local_name: import.info.local_name.clone(),
+                import_span: import.info.span,
+                is_type_only: import.info.is_type_only,
+                is_type_only_star: import.info.is_type_only_star,
+                mechanism: if import.target.is_commonjs_require() {
+                    ModuleLoadMechanism::CommonJsRequire
+                } else {
+                    ModuleLoadMechanism::EsModule
+                },
+            });
     }
 }
 
@@ -98,40 +118,47 @@ fn collect_edges_for_module(
 ) -> Vec<(FileId, Vec<ImportedSymbol>)> {
     let mut edges_by_target: FxHashMap<FileId, Vec<ImportedSymbol>> = FxHashMap::default();
 
-    // Static imports
     for import in &resolved.resolved_imports {
         collect_import_edge(import, file_id, &mut edges_by_target, acc);
     }
 
-    // Re-exports — use SideEffect edges to avoid marking source exports as "used"
-    // just because they're re-exported. Re-export chain propagation handles tracking
-    // which specific names consumers actually import.
     for re_export in &resolved.re_exports {
-        if let ResolveResult::InternalModule(target_id) = &re_export.target {
+        if let Some(package_name) = re_export.target.package_usage_name() {
+            record_package_usage(acc, package_name, file_id, re_export.info.is_type_only);
+        }
+        if let Some(target_id) = re_export.target.internal_file_id() {
             edges_by_target
-                .entry(*target_id)
+                .entry(target_id)
                 .or_default()
                 .push(ImportedSymbol {
                     imported_name: ImportedName::SideEffect,
                     local_name: String::new(),
                     import_span: oxc_span::Span::new(0, 0),
                     is_type_only: re_export.info.is_type_only,
+                    is_type_only_star: false,
+                    mechanism: ModuleLoadMechanism::EsModule,
                 });
-        } else if let ResolveResult::NpmPackage(name) = &re_export.target {
-            record_package_usage(acc, name, file_id, re_export.info.is_type_only);
         }
     }
 
-    // Dynamic imports — Named imports create Named edges, Namespace imports create
-    // Namespace edges with a local_name (enabling member access narrowing),
-    // Side-effect imports create SideEffect edges.
     for import in &resolved.resolved_dynamic_imports {
         collect_import_edge(import, file_id, &mut edges_by_target, acc);
     }
 
-    // Dynamic import patterns (template literals, string concat, import.meta.glob)
-    for (_pattern, matched_ids) in &resolved.resolved_dynamic_patterns {
+    // Patterns from `import()`, `import.meta.glob`, and `require.context` each
+    // resolve to a set of target files. A single importer can hold many patterns
+    // whose match sets overlap heavily, so duplicate matches would otherwise add
+    // redundant namespace symbols and references. Deduplicate by target and load
+    // mechanism: matches with the same mechanism carry no additional information,
+    // while ESM and CommonJS matches must remain distinct for mock-aware coverage.
+    // The set is per-file, so different importers still create their own edges.
+    let mut credited_pattern_targets: FxHashSet<(FileId, ModuleLoadMechanism)> =
+        FxHashSet::default();
+    for (pattern, matched_ids) in &resolved.resolved_dynamic_patterns {
         for target_id in matched_ids {
+            if !credited_pattern_targets.insert((*target_id, pattern.mechanism)) {
+                continue;
+            }
             record_namespace_import(*target_id, &mut acc.namespace_imported, acc.total_capacity);
             edges_by_target
                 .entry(*target_id)
@@ -141,11 +168,12 @@ fn collect_edges_for_module(
                     local_name: String::new(),
                     import_span: oxc_span::Span::new(0, 0),
                     is_type_only: false,
+                    is_type_only_star: false,
+                    mechanism: pattern.mechanism,
                 });
         }
     }
 
-    // Sort by target FileId for deterministic edge order across runs
     let mut sorted: Vec<_> = edges_by_target.into_iter().collect();
     sorted.sort_by_key(|(target_id, _)| target_id.0);
     sorted
@@ -157,98 +185,167 @@ fn build_module_node(
     module_by_id: &FxHashMap<FileId, &ResolvedModule>,
     entry_point_ids: &FxHashSet<FileId>,
     edge_range: std::ops::Range<usize>,
-) -> ModuleNode {
-    let mut exports: Vec<ExportSymbol> = module_by_id
-        .get(&file.id)
+) -> (ModuleNode, NamespaceFeatures) {
+    let resolved = module_by_id.get(&file.id).copied();
+
+    let mut exports = build_export_symbols(resolved);
+    if let Some(resolved) = resolved {
+        append_named_re_export_stubs(&mut exports, resolved);
+    }
+
+    let has_cjs_exports = resolved.is_some_and(|m| m.has_cjs_exports);
+    let (re_export_edges, has_namespace_re_exports) = build_re_export_edges(resolved);
+    let has_namespace_aliases = resolved.is_some_and(|m| !m.namespace_object_aliases.is_empty());
+
+    (
+        ModuleNode {
+            file_id: file.id,
+            path: file.path.clone(),
+            edge_range,
+            exports,
+            re_exports: re_export_edges,
+            flags: ModuleNode::flags_from(
+                entry_point_ids.contains(&file.id),
+                false,
+                has_cjs_exports,
+            ),
+        },
+        NamespaceFeatures {
+            has_aliases: has_namespace_aliases,
+            has_re_exports: has_namespace_re_exports,
+        },
+    )
+}
+
+/// Copy a resolved module's own exports into fresh `ExportSymbol` entries
+/// (references start empty; they are populated in Phase 2).
+fn build_export_symbols(resolved: Option<&ResolvedModule>) -> Vec<ExportSymbol> {
+    resolved
         .map(|m| {
             m.exports
                 .iter()
                 .map(|e| ExportSymbol {
                     name: e.name.clone(),
                     is_type_only: e.is_type_only,
+                    is_side_effect_used: e.is_side_effect_used,
                     visibility: e.visibility,
+                    expected_unused_reason: e.expected_unused_reason.clone(),
                     span: e.span,
                     references: Vec::new(),
+                    reference_paths: Vec::new(),
                     members: e.members.clone(),
                 })
                 .collect()
         })
-        .unwrap_or_default();
+        .unwrap_or_default()
+}
 
-    // Create ExportSymbol entries for re-exports so that consumers
-    // importing from this barrel can have their references attached.
-    // Without this, `export { Foo } from './source'` on a barrel would
-    // not be trackable as an export of the barrel module.
-    if let Some(resolved) = module_by_id.get(&file.id) {
-        for re in &resolved.re_exports {
-            // Skip star re-exports without an alias (`export * from './x'`)
-            // — they don't create a named export on the barrel.
-            // But `export * as name from './x'` does create one.
-            if re.info.exported_name == "*" {
-                continue;
+/// Add a synthetic `ExportSymbol` for each named re-export that does not already
+/// have a same-named local export. Star re-exports are skipped.
+fn append_named_re_export_stubs(exports: &mut Vec<ExportSymbol>, resolved: &ResolvedModule) {
+    const LINEAR_SCAN_LIMIT: usize = 8;
+    if resolved.re_exports.len() <= LINEAR_SCAN_LIMIT {
+        append_named_re_export_stubs_linear(exports, resolved);
+        return;
+    }
+
+    let named_re_export_count = resolved
+        .re_exports
+        .iter()
+        .filter(|re_export| re_export.info.exported_name != "*")
+        .count();
+    exports.reserve(named_re_export_count);
+
+    let mut named_exports: FxHashSet<&str> = FxHashSet::default();
+    named_exports.reserve(resolved.exports.len().saturating_add(named_re_export_count));
+    let mut has_default = false;
+    for export in resolved.exports.iter() {
+        match &export.name {
+            ExportName::Named(name) => {
+                named_exports.insert(name.as_str());
             }
-
-            // Avoid duplicates: if an export with this name already exists
-            // (e.g. the module both declares and re-exports the same name),
-            // skip creating another one.
-            let export_name = if re.info.exported_name == "default" {
-                ExportName::Default
-            } else {
-                ExportName::Named(re.info.exported_name.clone())
-            };
-            let already_exists = exports.iter().any(|e| e.name == export_name);
-            if already_exists {
-                continue;
-            }
-
-            exports.push(ExportSymbol {
-                name: export_name,
-                is_type_only: re.info.is_type_only,
-                visibility: VisibilityTag::None,
-                // Use the real span from the visitor when available; falls back
-                // to (0, 0) for re-exports synthesized inside the graph layer.
-                span: re.info.span,
-                references: Vec::new(),
-                members: Vec::new(),
-            });
+            ExportName::Default => has_default = true,
         }
     }
 
-    let has_cjs_exports = module_by_id
-        .get(&file.id)
-        .is_some_and(|m| m.has_cjs_exports);
+    for re in &resolved.re_exports {
+        if re.info.exported_name == "*" {
+            continue;
+        }
+        let export_name = if re.info.exported_name == "default" {
+            if std::mem::replace(&mut has_default, true) {
+                continue;
+            }
+            ExportName::Default
+        } else {
+            if !named_exports.insert(re.info.exported_name.as_str()) {
+                continue;
+            }
+            ExportName::Named(re.info.exported_name.clone())
+        };
 
-    // Build re-export edges
-    let re_export_edges: Vec<ReExportEdge> = module_by_id
-        .get(&file.id)
-        .map(|m| {
-            m.re_exports
-                .iter()
-                .filter_map(|re| {
-                    if let ResolveResult::InternalModule(target_id) = &re.target {
-                        Some(ReExportEdge {
-                            source_file: *target_id,
-                            imported_name: re.info.imported_name.clone(),
-                            exported_name: re.info.exported_name.clone(),
-                            is_type_only: re.info.is_type_only,
-                            span: re.info.span,
-                        })
-                    } else {
-                        None
-                    }
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
-    ModuleNode {
-        file_id: file.id,
-        path: file.path.clone(),
-        edge_range,
-        exports,
-        re_exports: re_export_edges,
-        flags: ModuleNode::flags_from(entry_point_ids.contains(&file.id), false, has_cjs_exports),
+        push_re_export_stub(exports, export_name, re);
     }
+}
+
+fn append_named_re_export_stubs_linear(exports: &mut Vec<ExportSymbol>, resolved: &ResolvedModule) {
+    for re in &resolved.re_exports {
+        if re.info.exported_name == "*" {
+            continue;
+        }
+        let export_name = if re.info.exported_name == "default" {
+            ExportName::Default
+        } else {
+            ExportName::Named(re.info.exported_name.clone())
+        };
+        if exports.iter().any(|export| export.name == export_name) {
+            continue;
+        }
+        push_re_export_stub(exports, export_name, re);
+    }
+}
+
+fn push_re_export_stub(
+    exports: &mut Vec<ExportSymbol>,
+    name: ExportName,
+    re_export: &crate::resolve::ResolvedReExport,
+) {
+    exports.push(ExportSymbol {
+        name,
+        is_type_only: re_export.info.is_type_only,
+        is_side_effect_used: false,
+        visibility: VisibilityTag::None,
+        expected_unused_reason: None,
+        span: re_export.info.span,
+        references: Vec::new(),
+        reference_paths: Vec::new(),
+        members: Vec::new(),
+    });
+}
+
+/// Build the internal re-export edge list for a module (external re-export
+/// targets are dropped here; they are handled via package usage).
+fn build_re_export_edges(resolved: Option<&ResolvedModule>) -> (Vec<ReExportEdge>, bool) {
+    let Some(resolved) = resolved else {
+        return (Vec::new(), false);
+    };
+    let mut has_namespace_re_exports = false;
+    let edges = resolved
+        .re_exports
+        .iter()
+        .filter_map(|re| {
+            has_namespace_re_exports |=
+                re.info.imported_name == "*" && re.info.exported_name != "*";
+            re.target.internal_file_id().map(|target_id| ReExportEdge {
+                source_file: target_id,
+                imported_name: re.info.imported_name.clone(),
+                exported_name: re.info.exported_name.clone(),
+                is_type_only: re.info.is_type_only,
+                span: re.info.span,
+            })
+        })
+        .collect();
+    (edges, has_namespace_re_exports)
 }
 
 impl ModuleGraph {
@@ -256,18 +353,18 @@ impl ModuleGraph {
     ///
     /// Creates `ModuleNode` entries, flat `Edge` storage, reverse dependency
     /// indices, package usage maps, and the namespace-imported bitset.
-    pub(super) fn populate_edges(
-        files: &[DiscoveredFile],
-        module_by_id: &FxHashMap<FileId, &ResolvedModule>,
-        entry_point_ids: &FxHashSet<FileId>,
-        runtime_entry_point_ids: &FxHashSet<FileId>,
-        test_entry_point_ids: &FxHashSet<FileId>,
-        module_count: usize,
-        total_capacity: usize,
-    ) -> Self {
+    pub(super) fn populate_edges(input: &PopulateEdgesInput<'_>) -> (Self, NamespaceFeatures) {
+        let files = input.files;
+        let module_by_id = input.module_by_id;
+        let entry_point_ids = input.entry_point_ids;
+        let runtime_entry_point_ids = input.runtime_entry_point_ids;
+        let test_entry_point_ids = input.test_entry_point_ids;
+        let module_count = input.module_count;
+        let total_capacity = input.total_capacity;
         let mut all_edges = Vec::new();
         let mut modules = Vec::with_capacity(module_count);
         let mut reverse_deps = vec![Vec::new(); total_capacity];
+        let mut namespace_features = NamespaceFeatures::default();
         let mut acc = EdgeAccumulator {
             package_usage: FxHashMap::default(),
             type_only_package_usage: FxHashMap::default(),
@@ -296,25 +393,32 @@ impl ModuleGraph {
 
             let edge_end = all_edges.len();
 
-            modules.push(build_module_node(
-                file,
-                module_by_id,
-                entry_point_ids,
-                edge_start..edge_end,
-            ));
+            let (module, features) =
+                build_module_node(file, module_by_id, entry_point_ids, edge_start..edge_end);
+            namespace_features.has_aliases |= features.has_aliases;
+            namespace_features.has_re_exports |= features.has_re_exports;
+            modules.push(module);
         }
 
-        Self {
-            modules,
-            edges: all_edges,
-            package_usage: acc.package_usage,
-            type_only_package_usage: acc.type_only_package_usage,
-            entry_points: entry_point_ids.clone(),
-            runtime_entry_points: runtime_entry_point_ids.clone(),
-            test_entry_points: test_entry_point_ids.clone(),
-            reverse_deps,
-            namespace_imported: acc.namespace_imported,
-        }
+        (
+            Self {
+                modules,
+                edges: all_edges,
+                package_usage: acc.package_usage,
+                type_only_package_usage: acc.type_only_package_usage,
+                entry_points: entry_point_ids.clone(),
+                runtime_entry_points: runtime_entry_point_ids.clone(),
+                test_entry_points: test_entry_point_ids.clone(),
+                test_reachability_index: super::TestReachabilityIndex::default(),
+                reference_paths: Vec::new(),
+                reference_routes: super::types::ReferenceRoutes::default(),
+                reverse_deps,
+                namespace_imported: acc.namespace_imported,
+                re_export_cycles: Vec::new(),
+                effective_exports: super::effective_exports::EffectiveExportIndex::default(),
+            },
+            namespace_features,
+        )
     }
 
     /// Record which files reference which exports from edges.
@@ -322,48 +426,225 @@ impl ModuleGraph {
     /// Walks every edge and attaches `SymbolReference` entries to the target
     /// module's exports. Includes namespace import narrowing (member access
     /// tracking) and CSS Module default-import narrowing.
+    ///
+    /// Returns the targets whose whole namespace object a consumer observed
+    /// (the seeds of `ModuleGraph::collect_exposed_namespace_targets`), so the
+    /// namespace re-export and star propagation phases can credit the names
+    /// those targets only expose through their own re-export chains.
     pub(super) fn populate_references(
         &mut self,
         module_by_id: &FxHashMap<FileId, &ResolvedModule>,
         entry_point_ids: &FxHashSet<FileId>,
-    ) {
+        reference_paths: &mut ReferencePathInterner,
+    ) -> super::re_exports::WholeModuleObservations {
+        // Both maps are transient acceleration state for this pass: the name
+        // index gives O(1) export lookup per imported symbol instead of a scan
+        // over all target exports, and the dedup index keeps duplicate-
+        // reference checks O(1) for high-fan-in exports. Dropping them here
+        // keeps `references` as the only durable storage.
+        let mut dedup = ReferenceDedup::default();
+        let mut export_indices: FxHashMap<usize, ExportNameIndex> = FxHashMap::default();
+        let mut whole_module_targets = super::re_exports::WholeModuleObservations::default();
         for edge_idx in 0..self.edges.len() {
             let source_id = self.edges[edge_idx].source;
-            let target_idx = self.edges[edge_idx].target.0 as usize;
+            let target_id = self.edges[edge_idx].target;
+            let target_idx = target_id.0 as usize;
             if target_idx >= self.modules.len() {
                 continue;
             }
             for sym_idx in 0..self.edges[edge_idx].symbols.len() {
                 let sym = &self.edges[edge_idx].symbols[sym_idx];
+                if matches!(sym.imported_name, ImportedName::SideEffect) {
+                    // Preserve the direct path interned by `attach_symbol_reference`.
+                    // Side-effect imports affect reachability but never reference an
+                    // export, so building the target's name index cannot change output.
+                    let _ = reference_paths.direct(target_id, sym.mechanism);
+                    continue;
+                }
+                let module = &mut self.modules[target_idx];
+                let export_index = export_indices
+                    .entry(target_idx)
+                    .and_modify(|index| index.sync(&module.exports))
+                    .or_insert_with(|| {
+                        ExportNameIndex::build(
+                            &module.exports,
+                            NamedDefaultSpelling::for_target(&module.path),
+                        )
+                    });
                 attach_symbol_reference(
-                    &mut self.modules[target_idx],
+                    module,
                     source_id,
                     sym,
-                    module_by_id,
-                    entry_point_ids,
+                    reference_paths,
+                    AttachContext {
+                        module_by_id,
+                        entry_point_ids,
+                        export_index,
+                        effective_exports: &self.effective_exports,
+                        dedup: &mut dedup,
+                        whole_module_targets: &mut whole_module_targets,
+                    },
                 );
             }
         }
+        whole_module_targets
     }
 }
 
-/// Check if a path is a CSS Module file (`.module.css` or `.module.scss`).
-pub(super) fn is_css_module_path(path: &std::path::Path) -> bool {
+/// Whether a path carries the `.module` stem every CSS Module convention uses.
+fn has_css_module_stem(path: &std::path::Path) -> bool {
     path.file_stem()
         .and_then(|s| s.to_str())
         .is_some_and(|stem| stem.ends_with(".module"))
+}
+
+/// Check if a path is a CSS Module file in any syntax the extractor supports.
+pub(super) fn is_css_module_path(path: &std::path::Path) -> bool {
+    has_css_module_stem(path)
         && path
             .extension()
             .and_then(|e| e.to_str())
-            .is_some_and(|ext| ext == "css" || ext == "scss")
+            .is_some_and(|ext| matches!(ext, "css" | "scss" | "sass" | "less"))
 }
 
-/// Check if an export name matches an imported name.
-pub(super) fn export_matches(export: &ExportName, import: &ImportedName) -> bool {
-    match (export, import) {
-        (ExportName::Named(e), ImportedName::Named(i)) => e == i,
-        (ExportName::Default, ImportedName::Default) => true,
-        _ => false,
+/// Check if a path is a CSS Module stylesheet in any syntax the extractor
+/// treats as one: `.module.css`, `.module.scss`, `.module.sass` or
+/// `.module.less`. This mirrors `fallow_extract`'s own `is_css_module_file`,
+/// which decides where the class-name export list comes from, so it answers
+/// "are this module's exports a class map?".
+///
+pub(super) fn is_css_module_stylesheet(path: &std::path::Path) -> bool {
+    is_css_module_path(path)
+}
+
+/// Per-module index of exports by importable name: `ExportName::Named`
+/// matches `ImportedName::Named` with the same string, the default slot
+/// matches a default import, and namespace or side-effect imports match
+/// nothing.
+///
+/// `default` is one importable name spelled two ways on each side, so both
+/// spellings share the default slot (issue #2374). An export declares it as
+/// `ExportName::Default` (`export default x`) or as `ExportName::Named`
+/// (`export { x as default }`, which the extractor keeps under its written
+/// name); an import names it as `ImportedName::Default` (`import x from`) or
+/// as `ImportedName::Named` (`import { default as x } from`, and the ambient
+/// `declare module '<specifier>' { export { default } from './impl' }` form,
+/// which records one named type-space import per specifier). Keying those on
+/// the spelling left every mixed pairing uncredited, so the target's default
+/// export reported as unused.
+///
+/// That collapse holds only where a named `default` really is the module's
+/// default export, so `NamedDefaultSpelling` turns it off per target module.
+///
+/// Built once per target module in `populate_references` and reused across
+/// all of that module's incoming edge symbols, so wide barrels stop paying a
+/// full export scan per imported symbol (same shape as the star-propagation
+/// index from the issue #1843 follow-up). Per-name lists are appended in
+/// ascending export order, so lookups return exactly what the removed
+/// enumerate-and-filter scan produced.
+pub(super) struct ExportNameIndex {
+    named: FxHashMap<String, Vec<usize>>,
+    default: Vec<usize>,
+    indexed_len: usize,
+    named_default: NamedDefaultSpelling,
+}
+
+/// Whether a target module's `Named("default")` spells its default export.
+///
+/// It does for a JavaScript or TypeScript module: `export { x as default }`
+/// and `exports.default = x` both declare the binding `import x from './m'`
+/// reads, and the extractor keeps both under the written name.
+///
+/// It does not for a CSS Module, whose every export is a class name
+/// (`crates/extract/src/css.rs` emits one `ExportName::Named(class)` per rule
+/// and never an `ExportName::Default`). A class happens to be spelled
+/// `.default` no more meaningfully than it is spelled `.primary`, and a plain
+/// `import styles from './x.module.css'` binds the whole class map rather than
+/// any one class, so folding there credited a `.default` class unconditionally
+/// and silently dropped a real unused-class finding. Crediting for that import
+/// belongs to `narrow_css_module_references`, which reads the member accesses
+/// the consumer actually writes.
+///
+/// The stylesheet side is decided by [`is_css_module_stylesheet`], which
+/// tracks the extractor's own extension set (`.module.css`, `.module.scss`,
+/// `.module.sass`, `.module.less`), so every syntax that produces a class map
+/// is covered.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum NamedDefaultSpelling {
+    /// `Named("default")` and `Default` share the default slot.
+    IsDefaultExport,
+    /// `Named("default")` stays an ordinary name in the string map.
+    IsOrdinaryName,
+}
+
+impl NamedDefaultSpelling {
+    /// Pick the rule for a target module from its path.
+    pub(super) fn for_target(path: &std::path::Path) -> Self {
+        if is_css_module_stylesheet(path) {
+            Self::IsOrdinaryName
+        } else {
+            Self::IsDefaultExport
+        }
+    }
+
+    const fn folds(self) -> bool {
+        matches!(self, Self::IsDefaultExport)
+    }
+}
+
+impl ExportNameIndex {
+    pub(super) fn build(exports: &[ExportSymbol], named_default: NamedDefaultSpelling) -> Self {
+        let mut index = Self {
+            named: FxHashMap::default(),
+            default: Vec::new(),
+            indexed_len: 0,
+            named_default,
+        };
+        index.sync(exports);
+        index
+    }
+
+    /// Index exports appended since the last sync. Namespace narrowing pushes
+    /// synthetic star re-export stubs mid-pass; exports are append-only, so
+    /// picking up the tail keeps every per-name list complete and ascending.
+    ///
+    /// Under `NamedDefaultSpelling::IsDefaultExport`, `export { x as default }`
+    /// and `exports.default = x` land in the default slot rather than under the
+    /// string key, so the slot holds every export that declares the default in
+    /// ascending order and the named map never carries a `"default"` key.
+    /// Under `IsOrdinaryName` the name keeps its string key and the slot stays
+    /// empty, which is what a CSS Module target needs.
+    pub(super) fn sync(&mut self, exports: &[ExportSymbol]) {
+        let folds = self.named_default.folds();
+        for (idx, export) in exports.iter().enumerate().skip(self.indexed_len) {
+            match &export.name {
+                ExportName::Named(name) if folds && name == DEFAULT_EXPORT_NAME => {
+                    self.default.push(idx);
+                }
+                ExportName::Named(name) => self.named.entry(name.clone()).or_default().push(idx),
+                ExportName::Default => self.default.push(idx),
+            }
+        }
+        self.indexed_len = exports.len();
+    }
+
+    /// Indices of exports matching `import`, in ascending export order.
+    ///
+    /// A named import of `default` is a default import (`import { default as
+    /// x } from './m'` binds the same export as `import x from './m'`), so it
+    /// reads the default slot, unless the target spells `default` as an
+    /// ordinary name.
+    pub(super) fn matches(&self, import: &ImportedName) -> &[usize] {
+        match import {
+            ImportedName::Named(name)
+                if self.named_default.folds() && name == DEFAULT_EXPORT_NAME =>
+            {
+                &self.default
+            }
+            ImportedName::Named(name) => self.named.get(name).map_or(&[], Vec::as_slice),
+            ImportedName::Default => &self.default,
+            ImportedName::Namespace | ImportedName::SideEffect => &[],
+        }
     }
 }
 
@@ -374,66 +655,206 @@ mod tests {
     use fallow_types::discover::{DiscoveredFile, FileId};
     use fallow_types::extract::ImportedName;
 
-    // ── export_matches ─────────────────────────────────────────────────
-
-    #[test]
-    fn export_matches_named_same() {
-        assert!(export_matches(
-            &ExportName::Named("foo".to_string()),
-            &ImportedName::Named("foo".to_string())
-        ));
+    fn make_export(name: ExportName) -> ExportSymbol {
+        ExportSymbol {
+            name,
+            is_type_only: false,
+            is_side_effect_used: false,
+            visibility: VisibilityTag::None,
+            expected_unused_reason: None,
+            span: oxc_span::Span::new(0, 0),
+            references: Vec::new(),
+            reference_paths: Vec::new(),
+            members: Vec::new(),
+        }
     }
 
     #[test]
-    fn export_matches_named_different() {
-        assert!(!export_matches(
-            &ExportName::Named("foo".to_string()),
-            &ImportedName::Named("bar".to_string())
-        ));
+    fn export_name_index_matches_named_and_default() {
+        let exports = vec![
+            make_export(ExportName::Named("foo".to_string())),
+            make_export(ExportName::Default),
+            make_export(ExportName::Named("foo".to_string())),
+            make_export(ExportName::Named("bar".to_string())),
+        ];
+        let index = ExportNameIndex::build(&exports, NamedDefaultSpelling::IsDefaultExport);
+
+        assert_eq!(
+            index.matches(&ImportedName::Named("foo".to_string())),
+            &[0, 2]
+        );
+        assert_eq!(index.matches(&ImportedName::Named("bar".to_string())), &[3]);
+        assert_eq!(index.matches(&ImportedName::Default), &[1]);
+        assert!(
+            index
+                .matches(&ImportedName::Named("missing".to_string()))
+                .is_empty()
+        );
+    }
+
+    /// Issue #2374: `default` is one importable name however each side spells
+    /// it, so both spellings read the same slot and that slot holds both
+    /// declaration forms in ascending export order.
+    #[test]
+    fn export_name_index_matches_default_under_both_spellings() {
+        let exports = vec![
+            make_export(ExportName::Named("foo".to_string())),
+            make_export(ExportName::Default),
+            make_export(ExportName::Named("default".to_string())),
+            make_export(ExportName::Named("bar".to_string())),
+        ];
+        let index = ExportNameIndex::build(&exports, NamedDefaultSpelling::IsDefaultExport);
+
+        assert_eq!(index.matches(&ImportedName::Default), &[1, 2]);
+        assert_eq!(
+            index.matches(&ImportedName::Named("default".to_string())),
+            &[1, 2]
+        );
+        // The default slot never leaks into an unrelated name lookup.
+        assert_eq!(index.matches(&ImportedName::Named("foo".to_string())), &[0]);
+        assert_eq!(index.matches(&ImportedName::Named("bar".to_string())), &[3]);
+    }
+
+    /// A module that only declares `export { x as default }` still answers a
+    /// plain `import x from './m'`.
+    #[test]
+    fn export_name_index_matches_default_declared_only_as_a_named_export() {
+        let exports = vec![make_export(ExportName::Named("default".to_string()))];
+        let index = ExportNameIndex::build(&exports, NamedDefaultSpelling::IsDefaultExport);
+
+        assert_eq!(index.matches(&ImportedName::Default), &[0]);
+        assert_eq!(
+            index.matches(&ImportedName::Named("default".to_string())),
+            &[0]
+        );
+    }
+
+    /// Issue #2374 review: a CSS Module exports class names, so a class
+    /// spelled `default` must stay an ordinary name. Folding it would let a
+    /// plain `import styles from './x.module.css'` credit that class without
+    /// the consumer ever writing `styles.default`, silently dropping a real
+    /// unused-class finding.
+    #[test]
+    fn export_name_index_keeps_a_named_default_ordinary_for_a_css_module() {
+        let exports = vec![
+            make_export(ExportName::Named("default".to_string())),
+            make_export(ExportName::Named("primary".to_string())),
+        ];
+        let index = ExportNameIndex::build(&exports, NamedDefaultSpelling::IsOrdinaryName);
+
+        assert!(
+            index.matches(&ImportedName::Default).is_empty(),
+            "a plain default import of a class map names no single class"
+        );
+        assert_eq!(
+            index.matches(&ImportedName::Named("default".to_string())),
+            &[0],
+            "the class keeps its own string key"
+        );
+        assert_eq!(
+            index.matches(&ImportedName::Named("primary".to_string())),
+            &[1]
+        );
+    }
+
+    /// Issue #2374 review round 2: the exception must cover every stylesheet
+    /// syntax the extractor treats as a CSS Module. A `.module.less` or
+    /// `.module.sass` class map is built by the same extractor branch, so a
+    /// class spelled `.default` there is an ordinary class too.
+    #[test]
+    fn named_default_spelling_follows_the_target_path() {
+        for css in [
+            "Button.module.css",
+            "theme.module.scss",
+            "theme.module.sass",
+            "Button.module.less",
+        ] {
+            assert_eq!(
+                NamedDefaultSpelling::for_target(std::path::Path::new(css)),
+                NamedDefaultSpelling::IsOrdinaryName,
+                "{css}"
+            );
+        }
+        for code in [
+            "impl.ts",
+            "impl.js",
+            "Button.css",
+            "Button.less",
+            "theme.sass",
+            "styles.module.ts",
+        ] {
+            assert_eq!(
+                NamedDefaultSpelling::for_target(std::path::Path::new(code)),
+                NamedDefaultSpelling::IsDefaultExport,
+                "{code}"
+            );
+        }
     }
 
     #[test]
-    fn export_matches_default() {
-        assert!(export_matches(&ExportName::Default, &ImportedName::Default));
+    fn css_module_stylesheet_covers_every_extractor_extension() {
+        for stylesheet in [
+            "Button.module.css",
+            "Button.module.scss",
+            "Button.module.sass",
+            "Button.module.less",
+            "/project/src/components/Button.module.less",
+        ] {
+            assert!(
+                is_css_module_stylesheet(std::path::Path::new(stylesheet)),
+                "{stylesheet}"
+            );
+        }
+        for other in [
+            "Button.css",
+            "Button.less",
+            "Button.module.ts",
+            "Button.module",
+            "Button.module.json",
+        ] {
+            assert!(
+                !is_css_module_stylesheet(std::path::Path::new(other)),
+                "{other}"
+            );
+        }
     }
 
     #[test]
-    fn export_matches_named_vs_default() {
-        assert!(!export_matches(
-            &ExportName::Named("foo".to_string()),
-            &ImportedName::Default
-        ));
+    fn css_module_narrowing_covers_every_extractor_extension() {
+        for stylesheet in ["Button.module.less", "Button.module.sass"] {
+            let path = std::path::Path::new(stylesheet);
+            assert!(is_css_module_stylesheet(path), "{stylesheet}");
+            assert!(is_css_module_path(path), "{stylesheet}");
+        }
     }
 
     #[test]
-    fn export_matches_default_vs_named() {
-        assert!(!export_matches(
-            &ExportName::Default,
-            &ImportedName::Named("foo".to_string())
-        ));
+    fn export_name_index_namespace_and_side_effect_match_nothing() {
+        let exports = vec![
+            make_export(ExportName::Named("foo".to_string())),
+            make_export(ExportName::Default),
+        ];
+        let index = ExportNameIndex::build(&exports, NamedDefaultSpelling::IsDefaultExport);
+
+        assert!(index.matches(&ImportedName::Namespace).is_empty());
+        assert!(index.matches(&ImportedName::SideEffect).is_empty());
     }
 
     #[test]
-    fn export_matches_namespace_no_match() {
-        assert!(!export_matches(
-            &ExportName::Named("foo".to_string()),
-            &ImportedName::Namespace
-        ));
-        assert!(!export_matches(
-            &ExportName::Default,
-            &ImportedName::Namespace
-        ));
-    }
+    fn export_name_index_sync_picks_up_appended_exports() {
+        let mut exports = vec![make_export(ExportName::Named("foo".to_string()))];
+        let mut index = ExportNameIndex::build(&exports, NamedDefaultSpelling::IsDefaultExport);
 
-    #[test]
-    fn export_matches_side_effect_no_match() {
-        assert!(!export_matches(
-            &ExportName::Named("foo".to_string()),
-            &ImportedName::SideEffect
-        ));
-    }
+        exports.push(make_export(ExportName::Named("foo".to_string())));
+        exports.push(make_export(ExportName::Default));
+        index.sync(&exports);
 
-    // ── is_css_module_path ──────────────────────────────────────────────
+        assert_eq!(
+            index.matches(&ImportedName::Named("foo".to_string())),
+            &[0, 1]
+        );
+        assert_eq!(index.matches(&ImportedName::Default), &[2]);
+    }
 
     #[test]
     fn css_module_path_css() {
@@ -462,9 +883,8 @@ mod tests {
     }
 
     #[test]
-    fn css_module_path_less_not_matched() {
-        // .module.less is not supported (only .css and .scss)
-        assert!(!is_css_module_path(std::path::Path::new(
+    fn css_module_path_less_is_matched() {
+        assert!(is_css_module_path(std::path::Path::new(
             "Button.module.less"
         )));
     }
@@ -483,13 +903,10 @@ mod tests {
 
     #[test]
     fn css_module_path_double_module() {
-        // Edge case: file like "Button.module.module.css"
         assert!(is_css_module_path(std::path::Path::new(
             "Button.module.module.css"
         )));
     }
-
-    // ── record_namespace_import ─────────────────────────────────────────
 
     #[test]
     fn record_namespace_import_within_bounds() {
@@ -502,11 +919,8 @@ mod tests {
     fn record_namespace_import_out_of_bounds() {
         let mut bitset = fixedbitset::FixedBitSet::with_capacity(4);
         record_namespace_import(FileId(10), &mut bitset, 4);
-        // Should silently skip — bitset unchanged
         assert!(!bitset.contains(3));
     }
-
-    // ── record_package_usage ────────────────────────────────────────────
 
     #[test]
     fn record_package_usage_non_type_only() {
@@ -548,8 +962,6 @@ mod tests {
         assert_eq!(acc.type_only_package_usage["lodash"], vec![FileId(1)]);
     }
 
-    // ── collect_import_edge ─────────────────────────────────────────────
-
     fn make_acc(cap: usize) -> EdgeAccumulator {
         EdgeAccumulator {
             package_usage: FxHashMap::default(),
@@ -566,6 +978,8 @@ mod tests {
                 imported_name,
                 local_name: "localVar".to_string(),
                 is_type_only: false,
+                is_type_only_star: false,
+                from_style: false,
                 span: oxc_span::Span::new(0, 10),
                 source_span: oxc_span::Span::default(),
             },
@@ -590,6 +1004,27 @@ mod tests {
             ImportedName::Named(ref n) if n == "foo"
         ));
         assert!(!acc.namespace_imported.contains(2));
+        assert_eq!(
+            edges[&FileId(2)][0].mechanism,
+            ModuleLoadMechanism::EsModule
+        );
+    }
+
+    #[test]
+    fn collect_import_edge_retains_commonjs_mechanism() {
+        let mut acc = make_acc(4);
+        let mut edges: FxHashMap<FileId, Vec<ImportedSymbol>> = FxHashMap::default();
+        let import = make_import(
+            ImportedName::Namespace,
+            ResolveResult::CommonJsInternalModule(FileId(2)),
+        );
+
+        collect_import_edge(&import, FileId(0), &mut edges, &mut acc);
+
+        assert_eq!(
+            edges[&FileId(2)][0].mechanism,
+            ModuleLoadMechanism::CommonJsRequire
+        );
     }
 
     #[test]
@@ -638,7 +1073,6 @@ mod tests {
             edges[&FileId(1)][0].imported_name,
             ImportedName::SideEffect
         ));
-        // Side-effect should NOT set namespace bitset
         assert!(!acc.namespace_imported.contains(1));
     }
 
@@ -666,6 +1100,8 @@ mod tests {
                 imported_name: ImportedName::Named("FC".to_string()),
                 local_name: "FC".to_string(),
                 is_type_only: true,
+                is_type_only_star: false,
+                from_style: false,
                 span: oxc_span::Span::new(0, 10),
                 source_span: oxc_span::Span::default(),
             },
@@ -704,8 +1140,6 @@ mod tests {
         assert!(edges.is_empty());
     }
 
-    // ── collect_edges_for_module ─────────────────────────────────────────
-
     #[test]
     fn collect_edges_sorted_by_target_id() {
         let resolved = ResolvedModule {
@@ -718,6 +1152,8 @@ mod tests {
                         imported_name: ImportedName::Named("c".to_string()),
                         local_name: "c".to_string(),
                         is_type_only: false,
+                        is_type_only_star: false,
+                        from_style: false,
                         span: oxc_span::Span::new(0, 5),
                         source_span: oxc_span::Span::default(),
                     },
@@ -729,6 +1165,8 @@ mod tests {
                         imported_name: ImportedName::Named("a".to_string()),
                         local_name: "a".to_string(),
                         is_type_only: false,
+                        is_type_only_star: false,
+                        from_style: false,
                         span: oxc_span::Span::new(10, 15),
                         source_span: oxc_span::Span::default(),
                     },
@@ -740,7 +1178,6 @@ mod tests {
         let mut acc = make_acc(4);
         let sorted = collect_edges_for_module(&resolved, FileId(0), &mut acc);
 
-        // Should be sorted: FileId(1) before FileId(3)
         assert_eq!(sorted.len(), 2);
         assert_eq!(sorted[0].0, FileId(1));
         assert_eq!(sorted[1].0, FileId(3));
@@ -758,6 +1195,8 @@ mod tests {
                     exported_name: "foo".to_string(),
                     is_type_only: false,
                     span: oxc_span::Span::default(),
+                    statement_span: oxc_span::Span::new(0, 0),
+                    source_span: oxc_span::Span::new(0, 0),
                 },
                 target: ResolveResult::InternalModule(FileId(1)),
             }],
@@ -786,6 +1225,8 @@ mod tests {
                     exported_name: "useState".to_string(),
                     is_type_only: false,
                     span: oxc_span::Span::default(),
+                    statement_span: oxc_span::Span::new(0, 0),
+                    source_span: oxc_span::Span::new(0, 0),
                 },
                 target: ResolveResult::NpmPackage("react".to_string()),
             }],
@@ -804,6 +1245,7 @@ mod tests {
             prefix: "./locales/".to_string(),
             suffix: Some(".json".to_string()),
             span: oxc_span::Span::new(0, 10),
+            mechanism: ModuleLoadMechanism::EsModule,
         };
         let resolved = ResolvedModule {
             file_id: FileId(0),
@@ -819,11 +1261,125 @@ mod tests {
         assert!(acc.namespace_imported.contains(2));
     }
 
-    // ── build_module_node: star re-export skips creating export symbol ──
+    #[test]
+    fn collect_edges_dynamic_patterns_credit_each_target_once() {
+        // One importing file holding three dynamic-import patterns whose match sets
+        // all overlap on FileId(1). Without per-file dedup, FileId(1) would accrue one
+        // Namespace symbol per matching pattern (the O(patterns * files) blow-up of
+        // issue #963). With dedup it is credited exactly once.
+        let mk = |prefix: &str| fallow_types::extract::DynamicImportPattern {
+            prefix: prefix.to_string(),
+            suffix: None,
+            span: oxc_span::Span::new(0, 1),
+            mechanism: ModuleLoadMechanism::EsModule,
+        };
+        let resolved = ResolvedModule {
+            file_id: FileId(0),
+            path: std::path::PathBuf::from("/project/loader.ts"),
+            resolved_dynamic_patterns: vec![
+                (mk("./a/"), vec![FileId(1), FileId(2)]),
+                (mk("./b/"), vec![FileId(1)]),
+                (mk("./c/"), vec![FileId(1)]),
+            ],
+            ..Default::default()
+        };
+        let mut acc = make_acc(4);
+        let sorted = collect_edges_for_module(&resolved, FileId(0), &mut acc);
+
+        assert_eq!(sorted.len(), 2, "two distinct targets (FileId 1 and 2)");
+        let target_one = sorted
+            .iter()
+            .find(|(t, _)| *t == FileId(1))
+            .expect("target 1 present");
+        assert_eq!(
+            target_one.1.len(),
+            1,
+            "FileId(1) credited once despite three matching patterns"
+        );
+        assert!(acc.namespace_imported.contains(1));
+        assert!(acc.namespace_imported.contains(2));
+    }
+
+    #[test]
+    fn collect_edges_dynamic_patterns_dedup_is_per_importing_file() {
+        // Two different importing files both pattern-match the same target FileId(2).
+        // The dedup set is per-file (rebuilt per `collect_edges_for_module` call), so
+        // each importer independently creates its own edge to FileId(2). A global
+        // dedup would silently drop the second importer's reachability contribution.
+        let mk = || fallow_types::extract::DynamicImportPattern {
+            prefix: "./x/".to_string(),
+            suffix: None,
+            span: oxc_span::Span::new(0, 1),
+            mechanism: ModuleLoadMechanism::EsModule,
+        };
+        let importer_a = ResolvedModule {
+            file_id: FileId(0),
+            path: std::path::PathBuf::from("/project/a.ts"),
+            resolved_dynamic_patterns: vec![(mk(), vec![FileId(2)])],
+            ..Default::default()
+        };
+        let importer_b = ResolvedModule {
+            file_id: FileId(1),
+            path: std::path::PathBuf::from("/project/b.ts"),
+            resolved_dynamic_patterns: vec![(mk(), vec![FileId(2)])],
+            ..Default::default()
+        };
+        let mut acc = make_acc(4);
+        let edges_a = collect_edges_for_module(&importer_a, FileId(0), &mut acc);
+        let edges_b = collect_edges_for_module(&importer_b, FileId(1), &mut acc);
+
+        assert_eq!(
+            edges_a.len(),
+            1,
+            "importer A creates its own edge to target 2"
+        );
+        assert_eq!(
+            edges_b.len(),
+            1,
+            "importer B independently creates its own edge to target 2"
+        );
+        assert_eq!(edges_a[0].0, FileId(2));
+        assert_eq!(edges_b[0].0, FileId(2));
+    }
+
+    #[test]
+    fn collect_edges_dynamic_patterns_dedup_by_target_and_mechanism() {
+        let pattern = |mechanism| fallow_types::extract::DynamicImportPattern {
+            prefix: "./modules/".to_string(),
+            suffix: None,
+            span: oxc_span::Span::new(0, 1),
+            mechanism,
+        };
+        let resolved = ResolvedModule {
+            file_id: FileId(0),
+            path: std::path::PathBuf::from("/project/loader.ts"),
+            resolved_dynamic_patterns: vec![
+                (pattern(ModuleLoadMechanism::EsModule), vec![FileId(1)]),
+                (
+                    pattern(ModuleLoadMechanism::CommonJsRequire),
+                    vec![FileId(1)],
+                ),
+            ],
+            ..Default::default()
+        };
+        let mut acc = make_acc(2);
+
+        let edges = collect_edges_for_module(&resolved, FileId(0), &mut acc);
+        let mechanisms: FxHashSet<_> = edges[0].1.iter().map(|symbol| symbol.mechanism).collect();
+
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].1.len(), 2);
+        assert_eq!(
+            mechanisms,
+            FxHashSet::from_iter([
+                ModuleLoadMechanism::EsModule,
+                ModuleLoadMechanism::CommonJsRequire,
+            ])
+        );
+    }
 
     #[test]
     fn star_re_export_does_not_create_named_export_symbol() {
-        // `export * from './source'` should NOT create an ExportSymbol on the barrel
         let files = vec![
             DiscoveredFile {
                 id: FileId(0),
@@ -851,6 +1407,8 @@ mod tests {
                         exported_name: "*".to_string(),
                         is_type_only: false,
                         span: oxc_span::Span::default(),
+                        statement_span: oxc_span::Span::new(0, 0),
+                        source_span: oxc_span::Span::new(0, 0),
                     },
                     target: ResolveResult::InternalModule(FileId(1)),
                 }],
@@ -864,30 +1422,27 @@ mod tests {
                     local_name: Some("helper".to_string()),
                     is_type_only: false,
                     visibility: VisibilityTag::None,
+                    expected_unused_reason: None,
                     span: oxc_span::Span::new(0, 20),
                     members: vec![],
+                    is_side_effect_used: false,
                     super_class: None,
-                }],
+                }]
+                .into(),
                 ..Default::default()
             },
         ];
 
         let graph = ModuleGraph::build(&resolved_modules, &entry_points, &files);
         let barrel = &graph.modules[0];
-        // Star re-exports should NOT create named ExportSymbol entries
-        // (they are handled by re-export chain propagation instead)
         assert!(
             barrel.exports.is_empty(),
             "star re-export should not create named export symbols on barrel"
         );
     }
 
-    // ── duplicate re-export: skip if export already exists ──────────
-
     #[test]
     fn re_export_skips_duplicate_export_name() {
-        // If a module both declares and re-exports the same name, only one
-        // ExportSymbol should exist.
         let files = vec![DiscoveredFile {
             id: FileId(0),
             path: std::path::PathBuf::from("/project/barrel.ts"),
@@ -905,10 +1460,13 @@ mod tests {
                 local_name: Some("foo".to_string()),
                 is_type_only: false,
                 visibility: VisibilityTag::None,
+                expected_unused_reason: None,
                 span: oxc_span::Span::new(0, 20),
                 members: vec![],
+                is_side_effect_used: false,
                 super_class: None,
-            }],
+            }]
+            .into(),
             re_exports: vec![crate::resolve::ResolvedReExport {
                 info: fallow_types::extract::ReExportInfo {
                     source: "./source".to_string(),
@@ -916,6 +1474,8 @@ mod tests {
                     exported_name: "foo".to_string(),
                     is_type_only: false,
                     span: oxc_span::Span::default(),
+                    statement_span: oxc_span::Span::new(0, 0),
+                    source_span: oxc_span::Span::new(0, 0),
                 },
                 target: ResolveResult::InternalModule(FileId(1)),
             }],
@@ -933,5 +1493,47 @@ mod tests {
             1,
             "duplicate export name from re-export should be skipped"
         );
+    }
+
+    #[test]
+    fn duplicate_named_re_exports_keep_first_metadata_and_source_order() {
+        let make_re_export =
+            |name: &str, is_type_only: bool, start: u32| crate::resolve::ResolvedReExport {
+                info: fallow_types::extract::ReExportInfo {
+                    source: "./source".to_string(),
+                    imported_name: name.to_string(),
+                    exported_name: name.to_string(),
+                    is_type_only,
+                    span: oxc_span::Span::new(start, start + 1),
+                    statement_span: oxc_span::Span::new(0, 0),
+                    source_span: oxc_span::Span::new(0, 0),
+                },
+                target: ResolveResult::Unresolvable("./source".to_string()),
+            };
+        let resolved = ResolvedModule {
+            file_id: FileId(0),
+            path: std::path::PathBuf::from("/project/barrel.ts"),
+            re_exports: vec![
+                make_re_export("first", true, 10),
+                make_re_export("first", false, 20),
+                make_re_export("second", false, 30),
+                make_re_export("third", false, 40),
+                make_re_export("fourth", false, 50),
+                make_re_export("fifth", false, 60),
+                make_re_export("sixth", false, 70),
+                make_re_export("seventh", false, 80),
+                make_re_export("eighth", false, 90),
+            ],
+            ..Default::default()
+        };
+        let mut exports = Vec::new();
+
+        append_named_re_export_stubs(&mut exports, &resolved);
+
+        assert_eq!(exports.len(), 8);
+        assert_eq!(exports[0].name, ExportName::Named("first".to_string()));
+        assert!(exports[0].is_type_only);
+        assert_eq!(exports[0].span, oxc_span::Span::new(10, 11));
+        assert_eq!(exports[1].name, ExportName::Named("second".to_string()));
     }
 }

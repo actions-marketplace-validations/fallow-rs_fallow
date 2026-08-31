@@ -1,0 +1,1279 @@
+#![expect(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "benches use unwrap and expect to keep fixture setup concise"
+)]
+#![allow(
+    clippy::significant_drop_tightening,
+    reason = "the external Criterion macro owns the benchmark lifecycle"
+)]
+
+use std::fmt::Write as _;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
+use fallow_api::{
+    AnalysisOptions, AuditOptions, CombinedOptions, ComplexityOptions, DeadCodeOptions,
+    DuplicationMode, DuplicationOptions, EditorAnalysisSession, EngineHealthRunner, run_audit,
+    run_combined, run_dead_code, run_duplication, run_health_with_runner,
+};
+use fallow_extract::{
+    cache::{CacheStore, module_to_cached},
+    parse_all_files, parse_single_file,
+};
+use fallow_types::discover::{DiscoveredFile, FileId};
+use tempfile::TempDir;
+
+const BENCH_THREADS: usize = 4;
+const LARGE_AUDIT_PACKAGE_COUNT: usize = 8;
+const LARGE_AUDIT_MODULES_PER_PACKAGE: usize = 20;
+
+struct CommandInput {
+    _temp_dir: TempDir,
+    root: PathBuf,
+}
+
+struct ExtractCacheInput {
+    _temp_dir: TempDir,
+    files: Vec<DiscoveredFile>,
+    cache: CacheStore,
+}
+
+struct EditorSessionInput {
+    _temp_dir: TempDir,
+    session: EditorAnalysisSession,
+}
+
+fn write_file(root: &Path, path: &str, source: impl AsRef<str>) {
+    let path = root.join(path);
+    std::fs::create_dir_all(path.parent().expect("fixture file has parent")).unwrap();
+    std::fs::write(path, source.as_ref()).unwrap();
+}
+
+fn run_git(root: &Path, args: &[&str]) {
+    let status = Command::new("git")
+        .current_dir(root)
+        .args(args)
+        .status()
+        .expect("git command starts");
+    assert!(status.success(), "git {args:?} succeeds");
+}
+
+fn dependency_block(dependencies: &[(&str, &str)]) -> String {
+    if dependencies.is_empty() {
+        return "{}".to_string();
+    }
+
+    let mut source = String::from("{\n");
+    for (index, (name, version)) in dependencies.iter().enumerate() {
+        let comma = if index + 1 == dependencies.len() {
+            ""
+        } else {
+            ","
+        };
+        writeln!(&mut source, r#"    "{name}": "{version}"{comma}"#).unwrap();
+    }
+    source.push_str("  }");
+    source
+}
+
+fn package_json(name: &str, dependencies: &[(&str, &str)], extra_fields: &str) -> String {
+    let dependencies = dependency_block(dependencies);
+    let extra_fields = if extra_fields.is_empty() {
+        String::new()
+    } else {
+        format!(",\n{extra_fields}")
+    };
+
+    format!(
+        r#"{{
+  "name": "{name}",
+  "private": true,
+  "type": "module",
+  "dependencies": {dependencies},
+  "devDependencies": {{
+    "typescript": "5.8.0"
+  }}{extra_fields}
+}}"#
+    )
+}
+
+fn analysis_options(root: &Path, no_cache: bool) -> AnalysisOptions {
+    AnalysisOptions {
+        root: Some(root.to_path_buf()),
+        no_cache,
+        threads: Some(BENCH_THREADS),
+        ..AnalysisOptions::default()
+    }
+}
+
+fn is_source_path(path: &Path) -> bool {
+    let Some(extension) = path.extension().and_then(|extension| extension.to_str()) else {
+        return false;
+    };
+
+    matches!(extension, "css" | "js" | "jsx" | "ts" | "tsx")
+}
+
+fn collect_source_paths(dir: &Path, paths: &mut Vec<PathBuf>) {
+    for entry in fs::read_dir(dir).expect("benchmark fixture directory is readable") {
+        let entry = entry.expect("benchmark fixture entry is readable");
+        let path = entry.path();
+        if path.is_dir() {
+            collect_source_paths(&path, paths);
+        } else if is_source_path(&path) {
+            paths.push(path);
+        }
+    }
+}
+
+fn discovered_source_files(root: &Path) -> Vec<DiscoveredFile> {
+    let mut paths = Vec::new();
+    collect_source_paths(root, &mut paths);
+    paths.sort();
+
+    paths
+        .into_iter()
+        .enumerate()
+        .map(|(index, path)| DiscoveredFile {
+            id: FileId(u32::try_from(index).expect("benchmark fixture file count fits in u32")),
+            size_bytes: fs::metadata(&path)
+                .expect("benchmark fixture metadata is readable")
+                .len(),
+            path,
+        })
+        .collect()
+}
+
+fn create_library_project() -> CommandInput {
+    let temp_dir = TempDir::new().unwrap();
+    let root = temp_dir.path().to_path_buf();
+
+    write_file(
+        &root,
+        "package.json",
+        package_json(
+            "bench-package-library",
+            &[],
+            r#"  "exports": {
+    ".": "./src/index.ts",
+    "./server": "./src/server.ts"
+  },
+  "files": ["src"]"#,
+        ),
+    );
+    write_file(
+        &root,
+        "src/index.ts",
+        r#"
+export { usedFeature } from "./feature";
+export { createHandler } from "./server";
+export type { PublicOptions } from "./types";
+"#,
+    );
+    write_file(
+        &root,
+        "src/feature.ts",
+        r#"
+import { formatLabel } from "./format";
+
+export type PublicOptions = { label: string };
+
+export const usedFeature = (value: string): string => formatLabel(value);
+export const unusedFeature = (value: string): string => value.toUpperCase();
+export const unusedConstant = 42;
+"#,
+    );
+    write_file(
+        &root,
+        "src/server.ts",
+        r#"
+import type { PublicOptions } from "./types";
+
+export const createHandler = (options: PublicOptions) => {
+  return (request: Request): Response => {
+    const label = request.headers.get("x-label") ?? options.label;
+    return Response.json({ label });
+  };
+};
+
+export const createDebugHandler = () => Response.json({ debug: true });
+"#,
+    );
+    write_file(
+        &root,
+        "src/format.ts",
+        r"
+export const formatLabel = (value: string): string => `item:${value}`;
+export const debugLabel = (value: string): string => `debug:${value}`;
+",
+    );
+    write_file(
+        &root,
+        "src/types.ts",
+        r"
+export type PublicOptions = { label: string };
+export type InternalOptions = { retries: number };
+",
+    );
+    write_file(
+        &root,
+        "src/internal/legacy.ts",
+        r"
+export const onlyInUnusedFile = true;
+",
+    );
+
+    CommandInput {
+        _temp_dir: temp_dir,
+        root,
+    }
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the Next app router fixture keeps related generated files together"
+)]
+fn create_next_app_project() -> CommandInput {
+    let temp_dir = TempDir::new().unwrap();
+    let root = temp_dir.path().to_path_buf();
+
+    write_file(
+        &root,
+        "package.json",
+        package_json(
+            "bench-next-app-router",
+            &[
+                ("next", "15.0.0"),
+                ("react", "19.0.0"),
+                ("react-dom", "19.0.0"),
+            ],
+            r#"  "scripts": {
+    "build": "next build"
+  }"#,
+        ),
+    );
+    write_file(
+        &root,
+        "next.config.ts",
+        r#"
+import type { NextConfig } from "next";
+
+const nextConfig: NextConfig = {
+  experimental: {
+    typedRoutes: true,
+  },
+};
+
+export default nextConfig;
+"#,
+    );
+    write_file(
+        &root,
+        "app/layout.tsx",
+        r#"
+import "./globals.css";
+
+export default function Layout({ children }: { children: React.ReactNode }) {
+  return <html><body>{children}</body></html>;
+}
+"#,
+    );
+    write_file(
+        &root,
+        "app/page.tsx",
+        r#"
+import { Button } from "../components/button";
+import { createPost } from "./actions";
+import { getPosts } from "../lib/posts";
+
+export default async function Page() {
+  const posts = await getPosts();
+  return <main>{posts.map((post) => <Button key={post.id} label={post.title} action={createPost} />)}</main>;
+}
+"#,
+    );
+    write_file(
+        &root,
+        "app/blog/[slug]/page.tsx",
+        r#"
+import { getPost } from "../../../lib/posts";
+
+export default async function BlogPost({ params }: { params: { slug: string } }) {
+  const post = await getPost(params.slug);
+  return <article>{post.title}</article>;
+}
+"#,
+    );
+    write_file(
+        &root,
+        "app/(marketing)/pricing/page.tsx",
+        r#"
+import { getPlans } from "../../../lib/plans";
+
+export default async function PricingPage() {
+  const plans = await getPlans();
+  return <section>{plans.map((plan) => <p key={plan.id}>{plan.name}</p>)}</section>;
+}
+"#,
+    );
+    write_file(
+        &root,
+        "app/dashboard/@analytics/page.tsx",
+        r#"
+import { getDashboardStats } from "../../../lib/dashboard";
+
+export default async function AnalyticsSlot() {
+  const stats = await getDashboardStats();
+  return <aside>{stats.visits}</aside>;
+}
+"#,
+    );
+    write_file(
+        &root,
+        "app/api/posts/route.ts",
+        r#"
+import { getPosts } from "../../../lib/posts";
+
+export async function GET() {
+  return Response.json(await getPosts());
+}
+"#,
+    );
+    write_file(
+        &root,
+        "app/actions.ts",
+        r#"
+"use server";
+
+export const createPost = async (formData: FormData): Promise<string> => {
+  return String(formData.get("title") ?? "untitled");
+};
+
+export const unusedServerAction = async (): Promise<void> => {};
+"#,
+    );
+    write_file(
+        &root,
+        "components/button.tsx",
+        r#"
+"use client";
+
+export const Button = ({ action, label }: { action: (formData: FormData) => Promise<string>; label: string }) => {
+  return <form action={action}><button className="button primary">{label}</button></form>;
+};
+
+export const DebugButton = () => <button>debug</button>;
+"#,
+    );
+    write_file(
+        &root,
+        "lib/posts.ts",
+        r#"
+export const getPosts = async () => [{ id: "1", title: "Intro" }];
+export const getPost = async (slug: string) => ({ slug, title: "Intro" });
+export const unusedPostHelper = () => "unused";
+"#,
+    );
+    write_file(
+        &root,
+        "lib/plans.ts",
+        r#"
+export const getPlans = async () => [{ id: "starter", name: "Starter" }];
+export const unusedPlanMapper = (name: string) => name.toLowerCase();
+"#,
+    );
+    write_file(
+        &root,
+        "lib/dashboard.ts",
+        r"
+export const getDashboardStats = async () => ({ visits: 42 });
+export const unusedDashboardExport = () => ({ visits: 0 });
+",
+    );
+    write_file(
+        &root,
+        "app/globals.css",
+        r"
+.button { display: inline-flex; }
+.primary { color: white; }
+.unused-global { color: red; }
+",
+    );
+
+    CommandInput {
+        _temp_dir: temp_dir,
+        root,
+    }
+}
+
+fn create_workspace_project() -> CommandInput {
+    let temp_dir = TempDir::new().unwrap();
+    let root = temp_dir.path().to_path_buf();
+
+    write_file(
+        &root,
+        "package.json",
+        r#"{
+  "name": "bench-workspace",
+  "private": true,
+  "packageManager": "pnpm@10.0.0",
+  "workspaces": ["apps/*", "packages/*"],
+  "dependencies": {}
+}"#,
+    );
+    write_file(
+        &root,
+        "pnpm-workspace.yaml",
+        r#"
+packages:
+  - "apps/*"
+  - "packages/*"
+"#,
+    );
+    write_file(
+        &root,
+        "apps/web/package.json",
+        r#"{"name":"@bench/web","main":"src/index.ts","dependencies":{"@bench/config":"workspace:*","@bench/shared":"workspace:*","@bench/ui":"workspace:*"}}"#,
+    );
+    write_file(
+        &root,
+        "apps/admin/package.json",
+        r#"{"name":"@bench/admin","main":"src/index.ts","dependencies":{"@bench/shared":"workspace:*","@bench/ui":"workspace:*"}}"#,
+    );
+    write_file(
+        &root,
+        "packages/shared/package.json",
+        r#"{"name":"@bench/shared","main":"src/index.ts"}"#,
+    );
+    write_file(
+        &root,
+        "packages/ui/package.json",
+        r#"{"name":"@bench/ui","main":"src/index.ts","dependencies":{"react":"19.0.0"}}"#,
+    );
+    write_file(
+        &root,
+        "packages/config/package.json",
+        r#"{"name":"@bench/config","main":"src/index.ts"}"#,
+    );
+    write_file(
+        &root,
+        "apps/web/src/index.ts",
+        r#"
+import { featureFlags } from "@bench/config";
+import { formatUser } from "@bench/shared";
+import { Card } from "@bench/ui";
+
+export const render = (name: string) => Card({ title: `${formatUser(name)}:${featureFlags.checkout}` });
+"#,
+    );
+    write_file(
+        &root,
+        "apps/admin/src/index.ts",
+        r#"
+import { formatUser } from "@bench/shared";
+import { Card } from "@bench/ui";
+
+export const renderAdmin = (name: string) => Card({ title: `admin:${formatUser(name)}` });
+"#,
+    );
+    write_file(
+        &root,
+        "packages/shared/src/index.ts",
+        r"
+export const formatUser = (name: string): string => name.trim();
+export const unusedSharedHelper = (name: string): string => name.toUpperCase();
+",
+    );
+    write_file(
+        &root,
+        "packages/ui/src/index.ts",
+        r#"
+export const Card = ({ title }: { title: string }) => `<section>${title}</section>`;
+export const UnusedCard = () => "<section>unused</section>";
+"#,
+    );
+    write_file(
+        &root,
+        "packages/config/src/index.ts",
+        r#"
+export const featureFlags = { checkout: "new" } as const;
+export const unusedExperiment = { search: "legacy" } as const;
+"#,
+    );
+
+    CommandInput {
+        _temp_dir: temp_dir,
+        root,
+    }
+}
+
+fn create_duplication_project() -> CommandInput {
+    let temp_dir = TempDir::new().unwrap();
+    let root = temp_dir.path().to_path_buf();
+
+    write_file(
+        &root,
+        "package.json",
+        package_json("bench-next-route-callback-dupes", &[("next", "15.0.0")], ""),
+    );
+    let route_body = r#"
+const validateRequest = (request: Request): string => {
+  const auth = request.headers.get("authorization");
+  if (!auth) {
+    throw new Error("missing authorization");
+  }
+  const tenant = request.headers.get("x-tenant") ?? "default";
+  const trace = request.headers.get("x-trace") ?? "local";
+  return `${tenant}:${trace}:${auth}`;
+};
+
+const buildResponse = (value: string) => {
+  return Response.json({
+    ok: true,
+    value,
+    createdAt: new Date().toISOString(),
+    source: "api",
+  });
+};
+"#;
+
+    for i in 0..14 {
+        write_file(
+            &root,
+            &format!("app/api/resource{i}/route.ts"),
+            format!(
+                r"{route_body}
+export async function GET(request: Request) {{
+  const value = validateRequest(request);
+  return buildResponse(`${{value}}:{i}`);
+}}
+"
+            ),
+        );
+    }
+    write_file(
+        &root,
+        "middleware.ts",
+        r#"
+export const middleware = (request: Request): Response => {
+  const tenant = request.headers.get("x-tenant") ?? "default";
+  return Response.json({ tenant });
+};
+"#,
+    );
+
+    CommandInput {
+        _temp_dir: temp_dir,
+        root,
+    }
+}
+
+fn create_health_project() -> CommandInput {
+    let temp_dir = TempDir::new().unwrap();
+    let root = temp_dir.path().to_path_buf();
+
+    write_file(
+        &root,
+        "package.json",
+        package_json("bench-health-service", &[], ""),
+    );
+    let mut source = String::from(
+        r"
+export function scoreOrder(input: { status: string; amount: number; flags: string[] }): number {
+  let score = 0;
+",
+    );
+    for i in 0..40 {
+        writeln!(
+            &mut source,
+            r#"  if (input.flags.includes("flag{i}")) {{
+    score += input.amount > {i} ? {i} : -{i};
+  }}"#
+        )
+        .unwrap();
+    }
+    source.push_str(
+        r#"
+  if (input.status === "blocked") {
+    return -score;
+  }
+  return score;
+}
+"#,
+    );
+    write_file(&root, "src/score.ts", source);
+    write_file(
+        &root,
+        "src/index.ts",
+        r#"
+import { scoreOrder } from "./score";
+
+console.log(scoreOrder({ status: "open", amount: 10, flags: ["flag1"] }));
+"#,
+    );
+
+    CommandInput {
+        _temp_dir: temp_dir,
+        root,
+    }
+}
+
+fn create_css_project() -> CommandInput {
+    let temp_dir = TempDir::new().unwrap();
+    let root = temp_dir.path().to_path_buf();
+
+    write_file(
+        &root,
+        "package.json",
+        package_json(
+            "bench-css-tailwind-design-system",
+            &[("react", "19.0.0"), ("tailwindcss", "4.0.0")],
+            "",
+        ),
+    );
+    write_file(
+        &root,
+        "tailwind.config.ts",
+        r##"
+export default {
+  content: ["./src/**/*.{ts,tsx}"],
+  theme: {
+    extend: {
+      colors: {
+        brand: "#0055cc",
+      },
+    },
+  },
+};
+"##,
+    );
+    write_file(
+        &root,
+        "src/app.tsx",
+        r#"
+import "./styles.css";
+
+export const App = () => (
+  <main className="layout card text-brand shadow-panel animate-fade">
+    <button className="button button-primary">Save</button>
+    <span className="sr-only">Draft saved</span>
+  </main>
+);
+"#,
+    );
+
+    let mut css = String::from(
+        r"
+@theme {
+  --color-brand: #0055cc;
+  --color-unused-accent: #ff00aa;
+  --shadow-panel: 0 1px 8px rgb(0 0 0 / 20%);
+  --animate-fade: fade 200ms ease-in;
+}
+
+@keyframes fade {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+.layout { display: grid; gap: 1rem; }
+.card { color: var(--color-brand); box-shadow: var(--shadow-panel); }
+.button { border: 0; padding: .5rem 1rem; }
+.button-primary { background: var(--color-brand); }
+.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; }
+",
+    );
+    for i in 0..80 {
+        writeln!(
+            &mut css,
+            ".unused-{i} .child .leaf:nth-child({}) {{ color: rgb({} {} {}); }}",
+            (i % 9) + 1,
+            i % 255,
+            (i * 3) % 255,
+            (i * 7) % 255
+        )
+        .unwrap();
+    }
+    write_file(&root, "src/styles.css", css);
+
+    CommandInput {
+        _temp_dir: temp_dir,
+        root,
+    }
+}
+
+fn create_warm_metadata_workspace_project() -> CommandInput {
+    let input = create_workspace_project();
+    let options = DeadCodeOptions {
+        analysis: analysis_options(&input.root, false),
+        ..DeadCodeOptions::default()
+    };
+    let _ = run_dead_code(&options).expect("warm cache priming succeeds");
+    input
+}
+
+fn create_warm_hash_workspace_project() -> ExtractCacheInput {
+    let CommandInput {
+        _temp_dir: temp_dir,
+        root,
+    } = create_workspace_project();
+    let files = discovered_source_files(&root);
+    let mut cache = CacheStore::new();
+
+    for file in &files {
+        let module = parse_single_file(file).expect("benchmark fixture parses");
+        let cached = module_to_cached(
+            &module,
+            fallow_types::source_fingerprint::SourceFingerprint::new(1, 1),
+        );
+        cache.insert(&file.path, cached);
+    }
+
+    ExtractCacheInput {
+        _temp_dir: temp_dir,
+        files,
+        cache,
+    }
+}
+
+fn create_warm_complexity_health_project() -> CommandInput {
+    let input = create_health_project();
+    let options = ComplexityOptions {
+        analysis: analysis_options(&input.root, false),
+        complexity: true,
+        file_scores: true,
+        hotspots: true,
+        targets: true,
+        ..ComplexityOptions::default()
+    };
+    let _ = run_health_with_runner(&options, &EngineHealthRunner)
+        .expect("warm complexity cache priming succeeds");
+    input
+}
+
+fn create_audit_project(changed: bool) -> CommandInput {
+    let input = create_workspace_project();
+    run_git(&input.root, &["init", "-q"]);
+    run_git(&input.root, &["add", "."]);
+    run_git(
+        &input.root,
+        &[
+            "-c",
+            "user.name=Fallow Bench",
+            "-c",
+            "user.email=bench@example.com",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-qm",
+            "initial",
+        ],
+    );
+    if changed {
+        write_file(
+            &input.root,
+            "packages/shared/src/extra.ts",
+            r#"
+export const introducedUnusedHelper = (): string => "unused";
+"#,
+        );
+        let index = input.root.join("packages/shared/src/index.ts");
+        let mut source = fs::read_to_string(&index).expect("shared index is readable");
+        source.push_str("\nexport { introducedUnusedHelper } from \"./extra\";\n");
+        fs::write(index, source).expect("shared index is writable");
+    }
+    input
+}
+
+fn create_large_audit_project(changed: bool) -> CommandInput {
+    let temp_dir = TempDir::new().unwrap();
+    let root = temp_dir.path().to_path_buf();
+
+    write_file(
+        &root,
+        "package.json",
+        r#"{
+  "name": "bench-large-audit-workspace",
+  "private": true,
+  "packageManager": "pnpm@10.0.0",
+  "workspaces": ["packages/*"],
+  "dependencies": {}
+}"#,
+    );
+    write_file(
+        &root,
+        "pnpm-workspace.yaml",
+        r#"
+packages:
+  - "packages/*"
+"#,
+    );
+
+    for package_index in 0..LARGE_AUDIT_PACKAGE_COUNT {
+        let package_name = format!("@bench/large-{package_index}");
+        let dependency_block = if package_index == 0 {
+            "{}".to_string()
+        } else {
+            format!(r#"{{"@bench/large-{}":"workspace:*"}}"#, package_index - 1)
+        };
+        write_file(
+            &root,
+            &format!("packages/pkg-{package_index}/package.json"),
+            format!(
+                r#"{{"name":"{package_name}","main":"src/index.ts","dependencies":{dependency_block}}}"#
+            ),
+        );
+
+        let mut index_source = String::new();
+        if package_index > 0 {
+            writeln!(
+                &mut index_source,
+                r#"import {{ package{}Summary }} from "@bench/large-{}";"#,
+                package_index - 1,
+                package_index - 1
+            )
+            .unwrap();
+        }
+        for module_index in 0..LARGE_AUDIT_MODULES_PER_PACKAGE {
+            writeln!(
+                &mut index_source,
+                r#"export {{ value{package_index}_{module_index}, compute{package_index}_{module_index} }} from "./module_{module_index}";"#
+            )
+            .unwrap();
+        }
+        writeln!(
+            &mut index_source,
+            "export const package{package_index}Summary = (): string => {{"
+        )
+        .unwrap();
+        if package_index == 0 {
+            writeln!(&mut index_source, r#"  return "pkg-0";"#).unwrap();
+        } else {
+            writeln!(
+                &mut index_source,
+                r"  return `${{package{}Summary()}}:pkg-{package_index}`;",
+                package_index - 1
+            )
+            .unwrap();
+        }
+        writeln!(&mut index_source, "}};").unwrap();
+        write_file(
+            &root,
+            &format!("packages/pkg-{package_index}/src/index.ts"),
+            index_source,
+        );
+
+        for module_index in 0..LARGE_AUDIT_MODULES_PER_PACKAGE {
+            write_file(
+                &root,
+                &format!("packages/pkg-{package_index}/src/module_{module_index}.ts"),
+                format!(
+                    r#"
+export const value{package_index}_{module_index} = "pkg-{package_index}-{module_index}";
+
+export const compute{package_index}_{module_index} = (seed: string): string => {{
+  const normalized = seed.trim().toLowerCase();
+  return `${{normalized}}:${{value{package_index}_{module_index}}}`;
+}};
+
+export const unusedInternal{package_index}_{module_index} = (): string => "unused";
+"#
+                ),
+            );
+        }
+    }
+
+    write_file(
+        &root,
+        "packages/app/package.json",
+        r#"{"name":"@bench/large-app","main":"src/index.ts","dependencies":{"@bench/large-7":"workspace:*"}}"#,
+    );
+    write_file(
+        &root,
+        "packages/app/src/index.ts",
+        r#"
+import { package7Summary } from "@bench/large-7";
+
+export const render = (): string => package7Summary();
+"#,
+    );
+
+    let input = CommandInput {
+        _temp_dir: temp_dir,
+        root,
+    };
+
+    run_git(&input.root, &["init", "-q"]);
+    run_git(&input.root, &["add", "."]);
+    run_git(
+        &input.root,
+        &[
+            "-c",
+            "user.name=Fallow Bench",
+            "-c",
+            "user.email=bench@example.com",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-qm",
+            "initial",
+        ],
+    );
+
+    if changed {
+        write_file(
+            &input.root,
+            "packages/pkg-7/src/introduced.ts",
+            r#"
+export const introducedLargeWorkspaceHelper = (): string => "unused";
+"#,
+        );
+        let index = input.root.join("packages/pkg-7/src/index.ts");
+        let mut source = fs::read_to_string(&index).expect("large workspace index is readable");
+        source.push_str("\nexport { introducedLargeWorkspaceHelper } from \"./introduced\";\n");
+        fs::write(index, source).expect("large workspace index is writable");
+    }
+
+    input
+}
+
+fn audit_options(root: &Path) -> AuditOptions {
+    AuditOptions {
+        analysis: analysis_options(root, true),
+        base: Some("HEAD".to_string()),
+        ..AuditOptions::default()
+    }
+}
+
+fn audit_options_with_crap(root: &Path) -> AuditOptions {
+    AuditOptions {
+        max_crap: Some(30.0),
+        ..audit_options(root)
+    }
+}
+
+fn run_programmatic_combined(input: &CommandInput) {
+    let dead_code = DeadCodeOptions {
+        analysis: analysis_options(&input.root, true),
+        ..DeadCodeOptions::default()
+    };
+    let duplication = DuplicationOptions {
+        analysis: analysis_options(&input.root, true),
+        mode: Some(DuplicationMode::Mild),
+        min_tokens: Some(35),
+        min_lines: Some(5),
+        min_occurrences: Some(2),
+        ..DuplicationOptions::default()
+    };
+    let health = ComplexityOptions {
+        analysis: analysis_options(&input.root, true),
+        complexity: true,
+        file_scores: true,
+        score: true,
+        ..ComplexityOptions::default()
+    };
+
+    let _ = run_dead_code(&dead_code).expect("combined dead-code succeeds");
+    let _ = run_duplication(&duplication).expect("combined duplication succeeds");
+    let _ = run_health_with_runner(&health, &EngineHealthRunner).expect("combined health succeeds");
+}
+
+fn run_programmatic_combined_session(input: &CommandInput) {
+    let duplication = DuplicationOptions {
+        mode: Some(DuplicationMode::Mild),
+        min_tokens: Some(35),
+        min_lines: Some(5),
+        min_occurrences: Some(2),
+        ..DuplicationOptions::default()
+    };
+    let health = ComplexityOptions {
+        complexity: true,
+        file_scores: true,
+        score: true,
+        ..ComplexityOptions::default()
+    };
+
+    let options = CombinedOptions {
+        analysis: analysis_options(&input.root, true),
+        duplication_options: duplication,
+        health_options: health,
+        ..CombinedOptions::default()
+    };
+
+    let _ = run_combined(&options).expect("combined succeeds");
+}
+
+fn create_editor_session_workspace_project() -> EditorSessionInput {
+    let CommandInput {
+        _temp_dir: temp_dir,
+        root,
+    } = create_workspace_project();
+    let session = EditorAnalysisSession::load(&root, None).expect("editor session loads");
+    EditorSessionInput {
+        _temp_dir: temp_dir,
+        session,
+    }
+}
+
+fn dead_code_package_library_exports(c: &mut Criterion) {
+    c.bench_function("dead_code_package_library_exports", |bencher| {
+        bencher.iter_batched_ref(
+            create_library_project,
+            |input| {
+                let options = DeadCodeOptions {
+                    analysis: analysis_options(&input.root, true),
+                    ..DeadCodeOptions::default()
+                };
+                run_dead_code(&options)
+            },
+            BatchSize::LargeInput,
+        );
+    });
+}
+
+fn dead_code_next_app_router_segments(c: &mut Criterion) {
+    c.bench_function("dead_code_next_app_router_segments", |bencher| {
+        bencher.iter_batched_ref(
+            create_next_app_project,
+            |input| {
+                let options = DeadCodeOptions {
+                    analysis: analysis_options(&input.root, true),
+                    ..DeadCodeOptions::default()
+                };
+                run_dead_code(&options)
+            },
+            BatchSize::LargeInput,
+        );
+    });
+}
+
+fn dead_code_workspace_monorepo_cross_package(c: &mut Criterion) {
+    c.bench_function("dead_code_workspace_monorepo_cross_package", |bencher| {
+        bencher.iter_batched_ref(
+            create_workspace_project,
+            |input| {
+                let options = DeadCodeOptions {
+                    analysis: analysis_options(&input.root, true),
+                    ..DeadCodeOptions::default()
+                };
+                run_dead_code(&options)
+            },
+            BatchSize::LargeInput,
+        );
+    });
+}
+
+fn dead_code_workspace_monorepo_cross_package_warm_metadata_hit(c: &mut Criterion) {
+    c.bench_function(
+        "dead_code_workspace_monorepo_cross_package_warm_metadata_hit",
+        |bencher| {
+            bencher.iter_batched_ref(
+                create_warm_metadata_workspace_project,
+                |input| {
+                    let options = DeadCodeOptions {
+                        analysis: analysis_options(&input.root, false),
+                        ..DeadCodeOptions::default()
+                    };
+                    run_dead_code(&options)
+                },
+                BatchSize::LargeInput,
+            );
+        },
+    );
+}
+
+fn extract_workspace_monorepo_warm_hash_hit(c: &mut Criterion) {
+    c.bench_function("extract_workspace_monorepo_warm_hash_hit", |bencher| {
+        bencher.iter_batched_ref(
+            create_warm_hash_workspace_project,
+            |input| {
+                let result = parse_all_files(&input.files, Some(&input.cache), false);
+                assert_eq!(result.cache_hits, input.files.len());
+                assert_eq!(result.cache_misses, 0);
+                result
+            },
+            BatchSize::LargeInput,
+        );
+    });
+}
+
+fn audit_clean_workspace_no_changes(c: &mut Criterion) {
+    // I/O-bound git audit benches are useful local walltime probes, but too noisy
+    // for CodSpeed simulation gates.
+    c.bench_function("audit_clean_workspace_no_changes", |bencher| {
+        bencher.iter_batched_ref(
+            || create_audit_project(false),
+            |input| run_audit(&audit_options(&input.root)),
+            BatchSize::LargeInput,
+        );
+    });
+}
+
+fn audit_changed_workspace_new_export(c: &mut Criterion) {
+    c.bench_function("audit_changed_workspace_new_export", |bencher| {
+        bencher.iter_batched_ref(
+            || create_audit_project(true),
+            |input| run_audit(&audit_options(&input.root)),
+            BatchSize::LargeInput,
+        );
+    });
+}
+
+fn audit_large_workspace_changed_export(c: &mut Criterion) {
+    c.bench_function("audit_large_workspace_changed_export", |bencher| {
+        bencher.iter_batched_ref(
+            || create_large_audit_project(true),
+            |input| run_audit(&audit_options(&input.root)),
+            BatchSize::LargeInput,
+        );
+    });
+}
+
+fn audit_large_workspace_crap_graph_reuse(c: &mut Criterion) {
+    c.bench_function("audit_large_workspace_crap_graph_reuse", |bencher| {
+        bencher.iter_batched_ref(
+            || create_large_audit_project(true),
+            |input| run_audit(&audit_options_with_crap(&input.root)),
+            BatchSize::LargeInput,
+        );
+    });
+}
+
+fn combined_workspace_programmatic_all_sections(c: &mut Criterion) {
+    c.bench_function("combined_workspace_programmatic_all_sections", |bencher| {
+        bencher.iter_batched_ref(
+            create_workspace_project,
+            |input| run_programmatic_combined(input),
+            BatchSize::LargeInput,
+        );
+    });
+}
+
+fn combined_workspace_programmatic_session_reuse(c: &mut Criterion) {
+    c.bench_function("combined_workspace_programmatic_session_reuse", |bencher| {
+        bencher.iter_batched_ref(
+            create_workspace_project,
+            |input| run_programmatic_combined_session(input),
+            BatchSize::LargeInput,
+        );
+    });
+}
+
+fn editor_workspace_repeated_session_analysis(c: &mut Criterion) {
+    c.bench_function("editor_workspace_repeated_session_analysis", |bencher| {
+        bencher.iter_batched_ref(
+            create_editor_session_workspace_project,
+            |input| {
+                input
+                    .session
+                    .analyze_project_with(&input.session.config().duplicates, true)
+            },
+            BatchSize::LargeInput,
+        );
+    });
+}
+
+fn duplication_next_route_callbacks_repeated_auth(c: &mut Criterion) {
+    c.bench_function(
+        "duplication_next_route_callbacks_repeated_auth",
+        |bencher| {
+            bencher.iter_batched_ref(
+                create_duplication_project,
+                |input| {
+                    let options = DuplicationOptions {
+                        analysis: analysis_options(&input.root, true),
+                        mode: Some(DuplicationMode::Mild),
+                        min_tokens: Some(35),
+                        min_lines: Some(5),
+                        min_occurrences: Some(2),
+                        ..DuplicationOptions::default()
+                    };
+                    run_duplication(&options)
+                },
+                BatchSize::LargeInput,
+            );
+        },
+    );
+}
+
+fn health_complex_service_scoring(c: &mut Criterion) {
+    c.bench_function("health_complex_service_scoring", |bencher| {
+        bencher.iter_batched_ref(
+            create_health_project,
+            |input| {
+                let options = ComplexityOptions {
+                    analysis: analysis_options(&input.root, true),
+                    complexity: true,
+                    file_scores: true,
+                    hotspots: true,
+                    targets: true,
+                    ..ComplexityOptions::default()
+                };
+                run_health_with_runner(&options, &EngineHealthRunner)
+            },
+            BatchSize::LargeInput,
+        );
+    });
+}
+
+fn health_complex_service_warm_complexity_hit(c: &mut Criterion) {
+    c.bench_function("health_complex_service_warm_complexity_hit", |bencher| {
+        bencher.iter_batched_ref(
+            create_warm_complexity_health_project,
+            |input| {
+                let options = ComplexityOptions {
+                    analysis: analysis_options(&input.root, false),
+                    complexity: true,
+                    file_scores: true,
+                    hotspots: true,
+                    targets: true,
+                    ..ComplexityOptions::default()
+                };
+                run_health_with_runner(&options, &EngineHealthRunner)
+            },
+            BatchSize::LargeInput,
+        );
+    });
+}
+
+fn health_css_tailwind_design_system(c: &mut Criterion) {
+    c.bench_function("health_css_tailwind_design_system", |bencher| {
+        bencher.iter_batched_ref(
+            create_css_project,
+            |input| {
+                let options = ComplexityOptions {
+                    analysis: analysis_options(&input.root, true),
+                    css: true,
+                    score: true,
+                    ..ComplexityOptions::default()
+                };
+                run_health_with_runner(&options, &EngineHealthRunner)
+            },
+            BatchSize::LargeInput,
+        );
+    });
+}
+
+criterion_group!(
+    benches,
+    dead_code_package_library_exports,
+    dead_code_next_app_router_segments,
+    dead_code_workspace_monorepo_cross_package,
+    dead_code_workspace_monorepo_cross_package_warm_metadata_hit,
+    extract_workspace_monorepo_warm_hash_hit,
+    audit_clean_workspace_no_changes,
+    audit_changed_workspace_new_export,
+    audit_large_workspace_changed_export,
+    audit_large_workspace_crap_graph_reuse,
+    combined_workspace_programmatic_all_sections,
+    combined_workspace_programmatic_session_reuse,
+    editor_workspace_repeated_session_analysis,
+    duplication_next_route_callbacks_repeated_auth,
+    health_complex_service_scoring,
+    health_complex_service_warm_complexity_hit,
+    health_css_tailwind_design_system
+);
+criterion_main!(benches);

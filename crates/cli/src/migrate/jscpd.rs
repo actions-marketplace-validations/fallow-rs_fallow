@@ -79,9 +79,30 @@ pub(super) fn migrate_jscpd(
         return;
     };
 
-    let mut dupes = serde_json::Map::new();
+    let dupes = duplicate_options_from_jscpd(obj, warnings);
+    if !dupes.is_empty() {
+        config.insert("duplicates".to_string(), serde_json::Value::Object(dupes));
+    }
 
-    // minTokens -> duplicates.minTokens
+    push_unmappable_jscpd_warnings(obj, warnings);
+}
+
+fn duplicate_options_from_jscpd(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    warnings: &mut Vec<MigrationWarning>,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut dupes = serde_json::Map::new();
+    insert_jscpd_numeric_options(obj, &mut dupes);
+    insert_jscpd_mode(obj, &mut dupes, warnings);
+    insert_jscpd_skip_local(obj, &mut dupes);
+    insert_jscpd_ignore(obj, &mut dupes);
+    dupes
+}
+
+fn insert_jscpd_numeric_options(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    dupes: &mut serde_json::Map<String, serde_json::Value>,
+) {
     if let Some(min_tokens) = obj.get("minTokens").and_then(serde_json::Value::as_u64) {
         dupes.insert(
             "minTokens".to_string(),
@@ -89,7 +110,6 @@ pub(super) fn migrate_jscpd(
         );
     }
 
-    // minLines -> duplicates.minLines
     if let Some(min_lines) = obj.get("minLines").and_then(serde_json::Value::as_u64) {
         dupes.insert(
             "minLines".to_string(),
@@ -97,14 +117,18 @@ pub(super) fn migrate_jscpd(
         );
     }
 
-    // threshold -> duplicates.threshold
     if let Some(threshold) = obj.get("threshold").and_then(serde_json::Value::as_f64)
         && let Some(n) = serde_json::Number::from_f64(threshold)
     {
         dupes.insert("threshold".to_string(), serde_json::Value::Number(n));
     }
+}
 
-    // mode -> duplicates.mode
+fn insert_jscpd_mode(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    dupes: &mut serde_json::Map<String, serde_json::Value>,
+    warnings: &mut Vec<MigrationWarning>,
+) {
     if let Some(mode_str) = obj.get("mode").and_then(|v| v.as_str()) {
         let fallow_mode = match mode_str {
             "strict" => Some("strict"),
@@ -139,13 +163,21 @@ pub(super) fn migrate_jscpd(
             );
         }
     }
+}
 
-    // skipLocal -> duplicates.skipLocal
+fn insert_jscpd_skip_local(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    dupes: &mut serde_json::Map<String, serde_json::Value>,
+) {
     if let Some(skip_local) = obj.get("skipLocal").and_then(serde_json::Value::as_bool) {
         dupes.insert("skipLocal".to_string(), serde_json::Value::Bool(skip_local));
     }
+}
 
-    // ignore -> duplicates.ignore (glob patterns)
+fn insert_jscpd_ignore(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    dupes: &mut serde_json::Map<String, serde_json::Value>,
+) {
     if let Some(ignore_val) = obj.get("ignore") {
         let ignores = string_or_array(ignore_val);
         if !ignores.is_empty() {
@@ -157,12 +189,12 @@ pub(super) fn migrate_jscpd(
             );
         }
     }
+}
 
-    if !dupes.is_empty() {
-        config.insert("duplicates".to_string(), serde_json::Value::Object(dupes));
-    }
-
-    // Warn about unmappable fields
+fn push_unmappable_jscpd_warnings(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    warnings: &mut Vec<MigrationWarning>,
+) {
     for (field, message, suggestion) in JSCPD_UNMAPPABLE_FIELDS {
         if obj.contains_key(*field) {
             warnings.push(MigrationWarning {
@@ -255,8 +287,6 @@ mod tests {
         assert!(fields.contains(&"blame"));
     }
 
-    // -- Non-object root produces warning ------------------------------------
-
     #[test]
     fn migrate_jscpd_non_object_root_warns() {
         let jscpd: serde_json::Value = serde_json::json!("not an object");
@@ -270,8 +300,6 @@ mod tests {
         assert!(config.is_empty());
     }
 
-    // -- Mode mapping: strict ------------------------------------------------
-
     #[test]
     fn migrate_jscpd_mode_strict() {
         let jscpd: serde_json::Value = serde_json::from_str(r#"{"mode": "strict"}"#).unwrap();
@@ -283,8 +311,6 @@ mod tests {
         assert_eq!(dupes.get("mode").unwrap(), "strict");
         assert!(warnings.is_empty());
     }
-
-    // -- Mode mapping: mild --------------------------------------------------
 
     #[test]
     fn migrate_jscpd_mode_mild() {
@@ -298,8 +324,6 @@ mod tests {
         assert!(warnings.is_empty());
     }
 
-    // -- Mode mapping: unknown mode -----------------------------------------
-
     #[test]
     fn migrate_jscpd_mode_unknown() {
         let jscpd: serde_json::Value = serde_json::from_str(r#"{"mode": "experimental"}"#).unwrap();
@@ -307,9 +331,7 @@ mod tests {
         let mut warnings = Vec::new();
         migrate_jscpd(&jscpd, &mut config, &mut warnings);
 
-        // Unknown mode -> no mode set in duplicates, only a warning
         let dupes = config.get("duplicates");
-        // The duplicates section might not exist or might not have a "mode" key
         if let Some(dupes) = dupes {
             assert!(dupes.get("mode").is_none());
         }
@@ -317,8 +339,6 @@ mod tests {
         assert!(warnings[0].message.contains("unknown mode"));
         assert!(warnings[0].message.contains("experimental"));
     }
-
-    // -- skipLocal false is preserved ----------------------------------------
 
     #[test]
     fn migrate_jscpd_skip_local_false() {
@@ -330,8 +350,6 @@ mod tests {
         let dupes = config.get("duplicates").unwrap().as_object().unwrap();
         assert_eq!(dupes.get("skipLocal").unwrap(), false);
     }
-
-    // -- ignore as a single string ------------------------------------------
 
     #[test]
     fn migrate_jscpd_ignore_single_string() {
@@ -347,8 +365,6 @@ mod tests {
         );
     }
 
-    // -- Empty ignore array produces no ignore key ---------------------------
-
     #[test]
     fn migrate_jscpd_empty_ignore_array() {
         let jscpd: serde_json::Value = serde_json::from_str(r#"{"ignore": []}"#).unwrap();
@@ -356,13 +372,10 @@ mod tests {
         let mut warnings = Vec::new();
         migrate_jscpd(&jscpd, &mut config, &mut warnings);
 
-        // Either no duplicates key or no ignore within it
         if let Some(dupes) = config.get("duplicates") {
             assert!(dupes.get("ignore").is_none());
         }
     }
-
-    // -- threshold as integer -----------------------------------------------
 
     #[test]
     fn migrate_jscpd_threshold_integer() {
@@ -375,8 +388,6 @@ mod tests {
         assert_eq!(dupes.get("threshold").unwrap(), 10.0);
     }
 
-    // -- Empty object produces no duplicates key -----------------------------
-
     #[test]
     fn migrate_jscpd_empty_object() {
         let jscpd: serde_json::Value = serde_json::from_str(r"{}").unwrap();
@@ -387,8 +398,6 @@ mod tests {
         assert!(!config.contains_key("duplicates"));
         assert!(warnings.is_empty());
     }
-
-    // -- All unmappable fields have correct sources --------------------------
 
     #[test]
     fn migrate_jscpd_all_unmappable_fields() {
@@ -418,7 +427,6 @@ mod tests {
         let mut warnings = Vec::new();
         migrate_jscpd(&jscpd, &mut config, &mut warnings);
 
-        // Every field in the constant should produce a warning
         assert_eq!(warnings.len(), JSCPD_UNMAPPABLE_FIELDS.len());
 
         let warning_fields: Vec<&str> = warnings.iter().map(|w| w.field.as_str()).collect();
@@ -446,12 +454,10 @@ mod tests {
             );
         }
 
-        // All warnings should have source "jscpd"
         for w in &warnings {
             assert_eq!(w.source, "jscpd");
         }
 
-        // Spot-check specific warning messages
         let by_field = |f: &str| warnings.iter().find(|w| w.field == f).unwrap();
         assert_eq!(
             by_field("maxLines").message,
@@ -462,8 +468,6 @@ mod tests {
             "Reporters are not configurable in fallow"
         );
     }
-
-    // -- Unmappable fields with suggestions ----------------------------------
 
     #[test]
     fn migrate_jscpd_unmappable_with_suggestions() {
@@ -509,8 +513,6 @@ mod tests {
             "run fallow from the project root directory"
         );
     }
-
-    // -- Unmappable fields without suggestions -------------------------------
 
     #[test]
     fn migrate_jscpd_unmappable_without_suggestions() {
@@ -558,8 +560,6 @@ mod tests {
         assert!(by_field("pattern").suggestion.is_none());
     }
 
-    // -- Complex full jscpd config migration ---------------------------------
-
     #[test]
     fn migrate_jscpd_complex_full_config() {
         let jscpd: serde_json::Value = serde_json::from_str(
@@ -591,16 +591,13 @@ mod tests {
             &serde_json::json!(["**/vendor/**", "dist/**"])
         );
 
-        // Warnings: weak mode + maxLines + reporters + blame
         assert_eq!(warnings.len(), 4);
         let warning_fields: Vec<&str> = warnings.iter().map(|w| w.field.as_str()).collect();
-        assert!(warning_fields.contains(&"mode")); // weak mode warning
+        assert!(warning_fields.contains(&"mode"));
         assert!(warning_fields.contains(&"maxLines"));
         assert!(warning_fields.contains(&"reporters"));
         assert!(warning_fields.contains(&"blame"));
     }
-
-    // -- minTokens/minLines as non-numeric values are ignored ----------------
 
     #[test]
     fn migrate_jscpd_non_numeric_min_tokens_ignored() {
@@ -609,7 +606,6 @@ mod tests {
         let mut warnings = Vec::new();
         migrate_jscpd(&jscpd, &mut config, &mut warnings);
 
-        // Non-numeric minTokens should be silently ignored
         assert!(!config.contains_key("duplicates"));
     }
 
@@ -623,8 +619,6 @@ mod tests {
         assert!(!config.contains_key("duplicates"));
     }
 
-    // -- mode as non-string is ignored ---------------------------------------
-
     #[test]
     fn migrate_jscpd_mode_non_string_ignored() {
         let jscpd: serde_json::Value = serde_json::from_str(r#"{"mode": 42}"#).unwrap();
@@ -632,12 +626,9 @@ mod tests {
         let mut warnings = Vec::new();
         migrate_jscpd(&jscpd, &mut config, &mut warnings);
 
-        // Non-string mode silently ignored (no duplicates section, no warnings)
         assert!(!config.contains_key("duplicates"));
         assert!(warnings.is_empty());
     }
-
-    // -- threshold as non-numeric is ignored ---------------------------------
 
     #[test]
     fn migrate_jscpd_threshold_non_numeric_ignored() {
@@ -649,8 +640,6 @@ mod tests {
         assert!(!config.contains_key("duplicates"));
     }
 
-    // -- skipLocal as non-bool is ignored ------------------------------------
-
     #[test]
     fn migrate_jscpd_skip_local_non_bool_ignored() {
         let jscpd: serde_json::Value = serde_json::from_str(r#"{"skipLocal": "yes"}"#).unwrap();
@@ -661,8 +650,6 @@ mod tests {
         assert!(!config.contains_key("duplicates"));
     }
 
-    // -- minTokens as float is ignored (as_u64 fails) -----------------------
-
     #[test]
     fn migrate_jscpd_min_tokens_float_ignored() {
         let jscpd: serde_json::Value = serde_json::from_str(r#"{"minTokens": 50.5}"#).unwrap();
@@ -670,11 +657,8 @@ mod tests {
         let mut warnings = Vec::new();
         migrate_jscpd(&jscpd, &mut config, &mut warnings);
 
-        // as_u64 returns None for floating point, so minTokens is skipped
         assert!(!config.contains_key("duplicates"));
     }
-
-    // -- threshold as NaN/Infinity is handled --------------------------------
 
     #[test]
     fn migrate_jscpd_threshold_zero() {
@@ -687,8 +671,6 @@ mod tests {
         assert_eq!(dupes.get("threshold").unwrap(), 0.0);
     }
 
-    // -- ignore with mixed types in array ------------------------------------
-
     #[test]
     fn migrate_jscpd_ignore_mixed_types() {
         let jscpd: serde_json::Value =
@@ -698,14 +680,11 @@ mod tests {
         migrate_jscpd(&jscpd, &mut config, &mut warnings);
 
         let dupes = config.get("duplicates").unwrap().as_object().unwrap();
-        // Non-string elements are filtered out by string_or_array
         assert_eq!(
             dupes.get("ignore").unwrap(),
             &serde_json::json!(["dist/**"])
         );
     }
-
-    // -- ignore as non-string non-array ------------------------------------
 
     #[test]
     fn migrate_jscpd_ignore_non_value() {
@@ -714,11 +693,8 @@ mod tests {
         let mut warnings = Vec::new();
         migrate_jscpd(&jscpd, &mut config, &mut warnings);
 
-        // Non-string/non-array returns empty vec from string_or_array
         assert!(!config.contains_key("duplicates"));
     }
-
-    // -- All warnings have source "jscpd" -----------------------------------
 
     #[test]
     fn migrate_jscpd_all_warnings_have_jscpd_source() {
@@ -739,8 +715,6 @@ mod tests {
         }
     }
 
-    // -- Only mappable fields produce config, unmappable only produce warnings
-
     #[test]
     fn migrate_jscpd_only_unmappable_fields_no_duplicates_key() {
         let jscpd: serde_json::Value =
@@ -750,12 +724,9 @@ mod tests {
         let mut warnings = Vec::new();
         migrate_jscpd(&jscpd, &mut config, &mut warnings);
 
-        // No mappable fields -> no duplicates key
         assert!(!config.contains_key("duplicates"));
         assert_eq!(warnings.len(), 3);
     }
-
-    // -- minLines as zero ---------------------------------------------------
 
     #[test]
     fn migrate_jscpd_min_lines_zero() {
@@ -768,8 +739,6 @@ mod tests {
         assert_eq!(dupes.get("minLines").unwrap(), 0);
     }
 
-    // -- Large numeric values -----------------------------------------------
-
     #[test]
     fn migrate_jscpd_large_min_tokens() {
         let jscpd: serde_json::Value = serde_json::from_str(r#"{"minTokens": 999999}"#).unwrap();
@@ -780,8 +749,6 @@ mod tests {
         let dupes = config.get("duplicates").unwrap().as_object().unwrap();
         assert_eq!(dupes.get("minTokens").unwrap(), 999_999);
     }
-
-    // -- Non-object root types ----------------------------------------------
 
     #[test]
     fn migrate_jscpd_null_root() {

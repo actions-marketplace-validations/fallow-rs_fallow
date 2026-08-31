@@ -1,2017 +1,982 @@
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::ExitCode;
 
-use fallow_config::{RulesConfig, Severity};
-use fallow_core::duplicates::DuplicationReport;
-use fallow_core::results::{AnalysisResults, UnusedDependency, UnusedExport, UnusedMember};
+#[cfg(test)]
+use fallow_config::Severity;
+use fallow_config::{FallowConfig, RulesConfig};
+use fallow_output::{
+    SarifDocumentInput, SarifResultInput, SarifRuleInput, build_sarif_document, build_sarif_result,
+    build_sarif_rule,
+};
+use fallow_types::duplicates::DuplicationReport;
+use fallow_types::results::{AnalysisResults, SecurityFinding};
 
+use super::emit_json;
+use super::github::{AnnotationLevel, resolve_render_options};
+use super::github_annotations::{EnvelopeKind, collect_annotations};
 use super::grouping::{self, OwnershipResolver};
-use super::{emit_json, relative_uri};
 use crate::explain;
 
-/// Intermediate fields extracted from an issue for SARIF result construction.
-struct SarifFields {
-    rule_id: &'static str,
-    level: &'static str,
-    message: String,
-    uri: String,
-    region: Option<(u32, u32)>,
-    properties: Option<serde_json::Value>,
-}
-
-const fn severity_to_sarif_level(s: Severity) -> &'static str {
+#[cfg(test)]
+fn configured_sarif_level(s: Severity) -> &'static str {
     match s {
         Severity::Error => "error",
-        Severity::Warn | Severity::Off => "warning",
-    }
-}
-
-/// Build a single SARIF result object.
-///
-/// When `region` is `Some((line, col))`, a `region` block with 1-based
-/// `startLine` and `startColumn` is included in the physical location.
-fn sarif_result(
-    rule_id: &str,
-    level: &str,
-    message: &str,
-    uri: &str,
-    region: Option<(u32, u32)>,
-) -> serde_json::Value {
-    let mut physical_location = serde_json::json!({
-        "artifactLocation": { "uri": uri }
-    });
-    if let Some((line, col)) = region {
-        physical_location["region"] = serde_json::json!({
-            "startLine": line,
-            "startColumn": col
-        });
-    }
-    serde_json::json!({
-        "ruleId": rule_id,
-        "level": level,
-        "message": { "text": message },
-        "locations": [{ "physicalLocation": physical_location }]
-    })
-}
-
-/// Append SARIF results for a slice of items using a closure to extract fields.
-fn push_sarif_results<T>(
-    sarif_results: &mut Vec<serde_json::Value>,
-    items: &[T],
-    extract: impl Fn(&T) -> SarifFields,
-) {
-    for item in items {
-        let fields = extract(item);
-        let mut result = sarif_result(
-            fields.rule_id,
-            fields.level,
-            &fields.message,
-            &fields.uri,
-            fields.region,
-        );
-        if let Some(props) = fields.properties {
-            result["properties"] = props;
-        }
-        sarif_results.push(result);
+        Severity::Warn => "warning",
+        Severity::Off => "none",
     }
 }
 
 /// Build a SARIF rule definition with optional `fullDescription` and `helpUri`
 /// sourced from the centralized explain module.
 fn sarif_rule(id: &str, fallback_short: &str, level: &str) -> serde_json::Value {
-    explain::rule_by_id(id).map_or_else(
-        || {
-            serde_json::json!({
-                "id": id,
-                "shortDescription": { "text": fallback_short },
-                "defaultConfiguration": { "level": level }
-            })
-        },
-        |def| {
-            serde_json::json!({
-                "id": id,
-                "shortDescription": { "text": def.short },
-                "fullDescription": { "text": def.full },
-                "helpUri": explain::rule_docs_url(def),
-                "defaultConfiguration": { "level": level }
-            })
-        },
-    )
-}
-
-/// Extract SARIF fields for an unused export or type export.
-fn sarif_export_fields(
-    export: &UnusedExport,
-    root: &Path,
-    rule_id: &'static str,
-    level: &'static str,
-    kind: &str,
-    re_kind: &str,
-) -> SarifFields {
-    let label = if export.is_re_export { re_kind } else { kind };
-    SarifFields {
-        rule_id,
+    let def = explain::rule_by_id(id);
+    let short_description = def.map_or(fallback_short, |def| def.short);
+    let full_description = def.map(|def| def.full);
+    let help_uri = def.map(explain::rule_docs_url);
+    build_sarif_rule(SarifRuleInput {
+        id,
+        short_description,
         level,
-        message: format!(
-            "{} '{}' is never imported by other modules",
-            label, export.export_name
-        ),
-        uri: relative_uri(&export.path, root),
-        region: Some((export.line, export.col + 1)),
-        properties: if export.is_re_export {
-            Some(serde_json::json!({ "is_re_export": true }))
-        } else {
-            None
-        },
-    }
-}
-
-/// Extract SARIF fields for an unused dependency.
-fn sarif_dep_fields(
-    dep: &UnusedDependency,
-    root: &Path,
-    rule_id: &'static str,
-    level: &'static str,
-    section: &str,
-) -> SarifFields {
-    SarifFields {
-        rule_id,
-        level,
-        message: format!(
-            "Package '{}' is in {} but never imported",
-            dep.package_name, section
-        ),
-        uri: relative_uri(&dep.path, root),
-        region: if dep.line > 0 {
-            Some((dep.line, 1))
-        } else {
-            None
-        },
-        properties: None,
-    }
-}
-
-/// Extract SARIF fields for an unused enum or class member.
-fn sarif_member_fields(
-    member: &UnusedMember,
-    root: &Path,
-    rule_id: &'static str,
-    level: &'static str,
-    kind: &str,
-) -> SarifFields {
-    SarifFields {
-        rule_id,
-        level,
-        message: format!(
-            "{} member '{}.{}' is never referenced",
-            kind, member.parent_name, member.member_name
-        ),
-        uri: relative_uri(&member.path, root),
-        region: Some((member.line, member.col + 1)),
-        properties: None,
-    }
-}
-
-/// Build the SARIF rules list from the current rules configuration.
-fn build_sarif_rules(rules: &RulesConfig) -> Vec<serde_json::Value> {
-    vec![
-        sarif_rule(
-            "fallow/unused-file",
-            "File is not reachable from any entry point",
-            severity_to_sarif_level(rules.unused_files),
-        ),
-        sarif_rule(
-            "fallow/unused-export",
-            "Export is never imported",
-            severity_to_sarif_level(rules.unused_exports),
-        ),
-        sarif_rule(
-            "fallow/unused-type",
-            "Type export is never imported",
-            severity_to_sarif_level(rules.unused_types),
-        ),
-        sarif_rule(
-            "fallow/unused-dependency",
-            "Dependency listed but never imported",
-            severity_to_sarif_level(rules.unused_dependencies),
-        ),
-        sarif_rule(
-            "fallow/unused-dev-dependency",
-            "Dev dependency listed but never imported",
-            severity_to_sarif_level(rules.unused_dev_dependencies),
-        ),
-        sarif_rule(
-            "fallow/unused-optional-dependency",
-            "Optional dependency listed but never imported",
-            severity_to_sarif_level(rules.unused_optional_dependencies),
-        ),
-        sarif_rule(
-            "fallow/type-only-dependency",
-            "Production dependency only used via type-only imports",
-            severity_to_sarif_level(rules.type_only_dependencies),
-        ),
-        sarif_rule(
-            "fallow/test-only-dependency",
-            "Production dependency only imported by test files",
-            severity_to_sarif_level(rules.test_only_dependencies),
-        ),
-        sarif_rule(
-            "fallow/unused-enum-member",
-            "Enum member is never referenced",
-            severity_to_sarif_level(rules.unused_enum_members),
-        ),
-        sarif_rule(
-            "fallow/unused-class-member",
-            "Class member is never referenced",
-            severity_to_sarif_level(rules.unused_class_members),
-        ),
-        sarif_rule(
-            "fallow/unresolved-import",
-            "Import could not be resolved",
-            severity_to_sarif_level(rules.unresolved_imports),
-        ),
-        sarif_rule(
-            "fallow/unlisted-dependency",
-            "Dependency used but not in package.json",
-            severity_to_sarif_level(rules.unlisted_dependencies),
-        ),
-        sarif_rule(
-            "fallow/duplicate-export",
-            "Export name appears in multiple modules",
-            severity_to_sarif_level(rules.duplicate_exports),
-        ),
-        sarif_rule(
-            "fallow/circular-dependency",
-            "Circular dependency chain detected",
-            severity_to_sarif_level(rules.circular_dependencies),
-        ),
-        sarif_rule(
-            "fallow/boundary-violation",
-            "Import crosses an architecture boundary",
-            severity_to_sarif_level(rules.boundary_violation),
-        ),
-        sarif_rule(
-            "fallow/stale-suppression",
-            "Suppression comment or tag no longer matches any issue",
-            severity_to_sarif_level(rules.stale_suppressions),
-        ),
-    ]
+        full_description,
+        help_uri: help_uri.as_deref(),
+    })
 }
 
 #[must_use]
-#[expect(
-    clippy::too_many_lines,
-    reason = "SARIF builder mapping all issue types to SARIF schema"
-)]
-pub fn build_sarif(
+pub fn api_sarif_document(
     results: &AnalysisResults,
     root: &Path,
     rules: &RulesConfig,
 ) -> serde_json::Value {
-    let mut sarif_results = Vec::new();
+    fallow_api::build_sarif(results, root, rules, &sarif_rule)
+}
 
-    push_sarif_results(&mut sarif_results, &results.unused_files, |file| {
-        SarifFields {
-            rule_id: "fallow/unused-file",
-            level: severity_to_sarif_level(rules.unused_files),
-            message: "File is not reachable from any entry point".to_string(),
-            uri: relative_uri(&file.path, root),
-            region: None,
-            properties: None,
-        }
-    });
+/// Attach semantic provenance to a SARIF run without manufacturing findings.
+pub fn annotate_type_aware_sarif(
+    sarif: &mut serde_json::Value,
+    type_aware: Option<&fallow_types::envelope::TypeAwareMeta>,
+) {
+    let Some(type_aware) = type_aware else {
+        return;
+    };
+    let value = serde_json::to_value(type_aware).unwrap_or(serde_json::Value::Null);
+    annotate_type_aware_sarif_value(sarif, &value);
+}
 
-    push_sarif_results(&mut sarif_results, &results.unused_exports, |export| {
-        sarif_export_fields(
-            export,
-            root,
-            "fallow/unused-export",
-            severity_to_sarif_level(rules.unused_exports),
-            "Export",
-            "Re-export",
-        )
-    });
-
-    push_sarif_results(&mut sarif_results, &results.unused_types, |export| {
-        sarif_export_fields(
-            export,
-            root,
-            "fallow/unused-type",
-            severity_to_sarif_level(rules.unused_types),
-            "Type export",
-            "Type re-export",
-        )
-    });
-
-    push_sarif_results(&mut sarif_results, &results.unused_dependencies, |dep| {
-        sarif_dep_fields(
-            dep,
-            root,
-            "fallow/unused-dependency",
-            severity_to_sarif_level(rules.unused_dependencies),
-            "dependencies",
-        )
-    });
-
-    push_sarif_results(
-        &mut sarif_results,
-        &results.unused_dev_dependencies,
-        |dep| {
-            sarif_dep_fields(
-                dep,
-                root,
-                "fallow/unused-dev-dependency",
-                severity_to_sarif_level(rules.unused_dev_dependencies),
-                "devDependencies",
-            )
-        },
-    );
-
-    push_sarif_results(
-        &mut sarif_results,
-        &results.unused_optional_dependencies,
-        |dep| {
-            sarif_dep_fields(
-                dep,
-                root,
-                "fallow/unused-optional-dependency",
-                severity_to_sarif_level(rules.unused_optional_dependencies),
-                "optionalDependencies",
-            )
-        },
-    );
-
-    push_sarif_results(&mut sarif_results, &results.type_only_dependencies, |dep| {
-        SarifFields {
-            rule_id: "fallow/type-only-dependency",
-            level: severity_to_sarif_level(rules.type_only_dependencies),
-            message: format!(
-                "Package '{}' is only imported via type-only imports (consider moving to devDependencies)",
-                dep.package_name
-            ),
-            uri: relative_uri(&dep.path, root),
-            region: if dep.line > 0 {
-                Some((dep.line, 1))
+fn annotate_type_aware_sarif_value(sarif: &mut serde_json::Value, type_aware: &serde_json::Value) {
+    let Some(run) = sarif
+        .get_mut("runs")
+        .and_then(serde_json::Value::as_array_mut)
+        .and_then(|runs| runs.first_mut())
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+    let properties = run
+        .entry("properties")
+        .or_insert_with(|| serde_json::json!({}));
+    if let Some(properties) = properties.as_object_mut() {
+        properties.insert("typeAware".to_string(), type_aware.clone());
+    }
+    let mut grouped_queries = std::collections::BTreeMap::<String, Vec<&serde_json::Value>>::new();
+    for query in type_aware
+        .get("queries")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|query| query.get("status").and_then(serde_json::Value::as_str) != Some("complete"))
+    {
+        let key = serde_json::json!([
+            query.get("capability"),
+            query.get("status"),
+            query.get("assertion"),
+            query.get("reason_code"),
+            query.get("actions"),
+            query.get("omissions"),
+        ])
+        .to_string();
+        grouped_queries.entry(key).or_default().push(query);
+    }
+    let notifications = grouped_queries
+        .into_values()
+        .map(|queries| {
+            let query = queries[0];
+            let capability = query
+                .get("capability")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            let status = query
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unavailable");
+            let assertion = query
+                .get("assertion")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("no-safe-assertion");
+            let query_ids = queries
+                .iter()
+                .filter_map(|query| query.get("query_id").and_then(serde_json::Value::as_u64))
+                .collect::<Vec<_>>();
+            let query_count = queries.len();
+            let suffix = if query_count > 1 {
+                format!(" ({query_count} queries)")
             } else {
-                None
+                String::new()
+            };
+            serde_json::json!({
+                "level": "warning",
+                "message": {
+                    "text": format!(
+                        "Type-aware {capability} was {status}: {assertion}{suffix}"
+                    )
+                },
+                "properties": {
+                    "capability": capability,
+                    "status": status,
+                    "queryIds": query_ids,
+                    "queryCount": query_count,
+                    "reasonCode": query.get("reason_code"),
+                    "actions": query.get("actions"),
+                    "omissions": query.get("omissions")
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    if notifications.is_empty() {
+        return;
+    }
+    let invocations = run
+        .entry("invocations")
+        .or_insert_with(|| serde_json::json!([{"executionSuccessful": true}]));
+    if let Some(invocation) = invocations
+        .as_array_mut()
+        .and_then(|invocations| invocations.first_mut())
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        invocation.insert(
+            "toolExecutionNotifications".to_string(),
+            serde_json::Value::Array(notifications),
+        );
+    }
+}
+
+/// Re-render a stored JSON envelope as SARIF without repeating analysis.
+pub fn print_envelope_sarif_with_config(
+    kind: EnvelopeKind,
+    envelope: &serde_json::Value,
+    root: &Path,
+    config_path: Option<&Path>,
+    resolver: Option<&OwnershipResolver>,
+) -> ExitCode {
+    let sarif = envelope_sarif_document_with_context(kind, envelope, root, config_path, resolver);
+    emit_json(&sarif, "SARIF")
+}
+
+#[cfg(test)]
+fn envelope_sarif_document(
+    kind: EnvelopeKind,
+    envelope: &serde_json::Value,
+    root: &Path,
+) -> serde_json::Value {
+    envelope_sarif_document_with_config(kind, envelope, root, None)
+}
+
+#[cfg(test)]
+fn envelope_sarif_document_with_config(
+    kind: EnvelopeKind,
+    envelope: &serde_json::Value,
+    root: &Path,
+    config_path: Option<&Path>,
+) -> serde_json::Value {
+    envelope_sarif_document_with_context(kind, envelope, root, config_path, None)
+}
+
+fn envelope_sarif_document_with_context(
+    kind: EnvelopeKind,
+    envelope: &serde_json::Value,
+    root: &Path,
+    config_path: Option<&Path>,
+    resolver: Option<&OwnershipResolver>,
+) -> serde_json::Value {
+    if let Some(results) = saved_dead_code_results(kind, envelope) {
+        let rules = saved_report_rules(root, config_path);
+        let mut sarif = api_sarif_document(&results, root, &rules);
+        if let Some(type_aware) = envelope_type_aware(envelope) {
+            annotate_type_aware_sarif_value(&mut sarif, type_aware);
+        }
+        annotate_saved_sarif_grouping(&mut sarif, kind, resolver);
+        return sarif;
+    }
+    if kind == EnvelopeKind::Dupes
+        && let Ok(report) = serde_json::from_value::<DuplicationReport>(envelope.clone())
+    {
+        let sarif = resolver.map_or_else(
+            || fallow_api::build_duplication_sarif(&report, root, &sarif_rule),
+            |resolver| {
+                fallow_api::build_grouped_duplication_sarif(&report, root, &sarif_rule, |group| {
+                    super::dupes_grouping::largest_owner(group, root, resolver)
+                })
             },
-            properties: None,
+        );
+        return sarif;
+    }
+    if kind == EnvelopeKind::Health
+        && let Some(report) = fallow_output::health_report_from_saved_value(envelope)
+    {
+        let mut sarif = api_health_sarif_document(&report, root);
+        if let Some(type_aware) = envelope_type_aware(envelope) {
+            annotate_type_aware_sarif_value(&mut sarif, type_aware);
         }
-    });
-
-    push_sarif_results(&mut sarif_results, &results.test_only_dependencies, |dep| {
-        SarifFields {
-            rule_id: "fallow/test-only-dependency",
-            level: severity_to_sarif_level(rules.test_only_dependencies),
-            message: format!(
-                "Package '{}' is only imported by test files (consider moving to devDependencies)",
-                dep.package_name
-            ),
-            uri: relative_uri(&dep.path, root),
-            region: if dep.line > 0 {
-                Some((dep.line, 1))
-            } else {
-                None
-            },
-            properties: None,
-        }
-    });
-
-    push_sarif_results(&mut sarif_results, &results.unused_enum_members, |member| {
-        sarif_member_fields(
-            member,
-            root,
-            "fallow/unused-enum-member",
-            severity_to_sarif_level(rules.unused_enum_members),
-            "Enum",
-        )
-    });
-
-    push_sarif_results(
-        &mut sarif_results,
-        &results.unused_class_members,
-        |member| {
-            sarif_member_fields(
-                member,
-                root,
-                "fallow/unused-class-member",
-                severity_to_sarif_level(rules.unused_class_members),
-                "Class",
-            )
-        },
-    );
-
-    push_sarif_results(&mut sarif_results, &results.unresolved_imports, |import| {
-        SarifFields {
-            rule_id: "fallow/unresolved-import",
-            level: severity_to_sarif_level(rules.unresolved_imports),
-            message: format!("Import '{}' could not be resolved", import.specifier),
-            uri: relative_uri(&import.path, root),
-            region: Some((import.line, import.col + 1)),
-            properties: None,
-        }
-    });
-
-    // Unlisted deps: one result per importing file (SARIF points to the import site)
-    for dep in &results.unlisted_dependencies {
-        for site in &dep.imported_from {
-            sarif_results.push(sarif_result(
-                "fallow/unlisted-dependency",
-                severity_to_sarif_level(rules.unlisted_dependencies),
-                &format!(
-                    "Package '{}' is imported but not listed in package.json",
-                    dep.package_name
-                ),
-                &relative_uri(&site.path, root),
-                Some((site.line, site.col + 1)),
-            ));
-        }
+        annotate_saved_sarif_grouping(&mut sarif, kind, resolver);
+        return sarif;
+    }
+    if kind == EnvelopeKind::Audit
+        && let Some(mut sarif) = saved_audit_sarif(envelope, root, config_path)
+    {
+        annotate_saved_sarif_grouping(&mut sarif, kind, resolver);
+        return sarif;
+    }
+    if kind == EnvelopeKind::Combined
+        && let Some(mut sarif) = saved_combined_sarif(envelope, root, config_path)
+    {
+        annotate_saved_sarif_grouping(&mut sarif, kind, resolver);
+        return sarif;
+    }
+    if kind == EnvelopeKind::Security
+        && let Some(sarif) = saved_security_sarif(envelope)
+    {
+        return sarif;
     }
 
-    // Duplicate exports: one result per location (SARIF 2.1.0 section 3.27.12)
-    for dup in &results.duplicate_exports {
-        for loc in &dup.locations {
-            sarif_results.push(sarif_result(
-                "fallow/duplicate-export",
-                severity_to_sarif_level(rules.duplicate_exports),
-                &format!("Export '{}' appears in multiple modules", dup.export_name),
-                &relative_uri(&loc.path, root),
-                Some((loc.line, loc.col + 1)),
-            ));
+    let mut sarif = annotation_sarif_document(kind, envelope, root, config_path);
+    annotate_saved_sarif_grouping(&mut sarif, kind, resolver);
+    sarif
+}
+
+fn saved_security_sarif(envelope: &serde_json::Value) -> Option<serde_json::Value> {
+    let findings =
+        serde_json::from_value::<Vec<SecurityFinding>>(envelope.get("security_findings")?.clone())
+            .ok()?;
+    Some(crate::security::build_security_sarif(
+        &findings,
+        envelope.get("gate"),
+    ))
+}
+
+fn annotation_sarif_document(
+    kind: EnvelopeKind,
+    envelope: &serde_json::Value,
+    root: &Path,
+    config_path: Option<&Path>,
+) -> serde_json::Value {
+    let options = resolve_render_options(root);
+    let annotations = collect_annotations(kind, envelope, options.pm);
+    let mut sarif = envelope_sarif_base_with_config(kind, root, config_path);
+    let rule_order = sarif_rule_ids(&sarif);
+    let mut rules = sarif_rules_by_id(&sarif);
+    let mut results = Vec::with_capacity(annotations.len());
+
+    for annotation in annotations {
+        let rule_id = native_rule_id(&annotation.title);
+        let fallback_level = annotation_level(annotation.level);
+        let level = if is_dead_code_rule_id(&rule_id) {
+            rules
+                .get(&rule_id)
+                .and_then(|rule| {
+                    rule.pointer("/defaultConfiguration/level")
+                        .and_then(serde_json::Value::as_str)
+                })
+                .unwrap_or(fallback_level)
+        } else {
+            fallback_level
         }
+        .to_string();
+        rules
+            .entry(rule_id.clone())
+            .or_insert_with(|| sarif_rule(&rule_id, &annotation.title, &level));
+
+        let uri = options.rebase.apply(&annotation.path);
+        let region = annotation.line.map(|line| {
+            let line = line.clamp(1, u64::from(u32::MAX)) as u32;
+            let col = annotation.col.unwrap_or(1).clamp(1, u64::from(u32::MAX)) as u32;
+            (line, col)
+        });
+        let message = format!("{}: {}", annotation.title, annotation.message);
+        let mut result = build_sarif_result(SarifResultInput {
+            rule_id: &rule_id,
+            level: &level,
+            message: &message,
+            uri: &uri,
+            region,
+            snippet: None,
+        });
+        if let Some(end_line) = annotation.end_line
+            && let Some(region) = result
+                .pointer_mut("/locations/0/physicalLocation/region")
+                .and_then(serde_json::Value::as_object_mut)
+        {
+            let start_line = region
+                .get("startLine")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(1);
+            region.insert(
+                "endLine".to_string(),
+                serde_json::json!(end_line.clamp(start_line, u64::from(u32::MAX)) as u32),
+            );
+        }
+        results.push(result);
     }
 
-    push_sarif_results(
-        &mut sarif_results,
-        &results.circular_dependencies,
-        |cycle| {
-            let chain: Vec<String> = cycle.files.iter().map(|p| relative_uri(p, root)).collect();
-            let mut display_chain = chain.clone();
-            if let Some(first) = chain.first() {
-                display_chain.push(first.clone());
+    if let Some(driver) = sarif.pointer_mut("/runs/0/tool/driver") {
+        let mut ordered_rules = Vec::with_capacity(rules.len());
+        for id in rule_order {
+            if let Some(rule) = rules.remove(&id) {
+                ordered_rules.push(rule);
             }
-            let first_uri = chain.first().map_or_else(String::new, Clone::clone);
-            SarifFields {
-                rule_id: "fallow/circular-dependency",
-                level: severity_to_sarif_level(rules.circular_dependencies),
-                message: format!(
-                    "Circular dependency{}: {}",
-                    if cycle.is_cross_package {
-                        " (cross-package)"
-                    } else {
-                        ""
-                    },
-                    display_chain.join(" \u{2192} ")
-                ),
-                uri: first_uri,
-                region: if cycle.line > 0 {
-                    Some((cycle.line, cycle.col + 1))
-                } else {
-                    None
-                },
-                properties: None,
-            }
-        },
-    );
+        }
+        ordered_rules.extend(rules.into_values());
+        driver["rules"] = serde_json::Value::Array(ordered_rules);
+    }
+    if let Some(run_results) = sarif.pointer_mut("/runs/0/results") {
+        *run_results = serde_json::Value::Array(results);
+    }
+    if let Some(type_aware) = envelope_type_aware(envelope) {
+        annotate_type_aware_sarif_value(&mut sarif, type_aware);
+    }
+    sarif
+}
 
-    push_sarif_results(
-        &mut sarif_results,
-        &results.boundary_violations,
-        |violation| {
-            let from_uri = relative_uri(&violation.from_path, root);
-            let to_uri = relative_uri(&violation.to_path, root);
-            SarifFields {
-                rule_id: "fallow/boundary-violation",
-                level: severity_to_sarif_level(rules.boundary_violation),
-                message: format!(
-                    "Import from zone '{}' to zone '{}' is not allowed ({})",
-                    violation.from_zone, violation.to_zone, to_uri,
-                ),
-                uri: from_uri,
-                region: if violation.line > 0 {
-                    Some((violation.line, violation.col + 1))
-                } else {
-                    None
-                },
-                properties: None,
-            }
+fn saved_audit_sarif(
+    envelope: &serde_json::Value,
+    root: &Path,
+    config_path: Option<&Path>,
+) -> Option<serde_json::Value> {
+    let rules = saved_report_rules(root, config_path);
+    let mut dead_code = parse_optional_section::<AnalysisResults>(envelope, "/dead_code")
+        .ok()?
+        .map(|results| api_sarif_document(&results, root, &rules));
+    if let Some(sarif) = dead_code.as_mut()
+        && let Some(type_aware) = envelope_type_aware(envelope)
+    {
+        annotate_type_aware_sarif_value(sarif, type_aware);
+    }
+    let duplication = parse_optional_section::<DuplicationReport>(envelope, "/duplication").ok()?;
+    let health = match envelope.pointer("/complexity") {
+        Some(value) => Some(api_health_sarif_document(
+            &fallow_output::health_report_from_saved_value(value)?,
+            root,
+        )),
+        None => None,
+    };
+    Some(fallow_api::build_audit_sarif(
+        fallow_api::AuditSarifOutputInput {
+            dead_code: dead_code.as_ref(),
+            duplication: duplication.as_ref(),
+            health: health.as_ref(),
         },
-    );
+    ))
+}
 
-    push_sarif_results(
-        &mut sarif_results,
-        &results.stale_suppressions,
-        |suppression| SarifFields {
-            rule_id: "fallow/stale-suppression",
-            level: severity_to_sarif_level(rules.stale_suppressions),
-            message: suppression.description(),
-            uri: relative_uri(&suppression.path, root),
-            region: Some((suppression.line, suppression.col + 1)),
-            properties: None,
-        },
-    );
+fn saved_combined_sarif(
+    envelope: &serde_json::Value,
+    root: &Path,
+    config_path: Option<&Path>,
+) -> Option<serde_json::Value> {
+    let rules = saved_report_rules(root, config_path);
+    let dead_code = parse_optional_section::<AnalysisResults>(envelope, "/check").ok()?;
+    let duplication = parse_optional_section::<DuplicationReport>(envelope, "/dupes").ok()?;
+    let health = match envelope.pointer("/health") {
+        Some(value) => Some(fallow_output::health_report_from_saved_value(value)?),
+        None => None,
+    };
 
-    serde_json::json!({
+    let mut runs = Vec::new();
+    if let Some(results) = dead_code {
+        let mut sarif = api_sarif_document(&results, root, &rules);
+        if let Some(type_aware) = envelope_type_aware(envelope) {
+            annotate_type_aware_sarif_value(&mut sarif, type_aware);
+        }
+        extend_sarif_runs(&mut runs, &sarif);
+    }
+    if let Some(report) = duplication.filter(|report| !report.clone_groups.is_empty()) {
+        runs.push(combined_duplication_sarif_run(&report));
+    }
+    if let Some(report) = health {
+        extend_sarif_runs(&mut runs, &api_health_sarif_document(&report, root));
+    }
+    Some(serde_json::json!({
         "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
         "version": "2.1.0",
-        "runs": [{
-            "tool": {
-                "driver": {
-                    "name": "fallow",
-                    "version": env!("CARGO_PKG_VERSION"),
-                    "informationUri": "https://github.com/fallow-rs/fallow",
-                    "rules": build_sarif_rules(rules)
-                }
-            },
-            "results": sarif_results
-        }]
+        "runs": runs,
+    }))
+}
+
+fn parse_optional_section<T: serde::de::DeserializeOwned>(
+    envelope: &serde_json::Value,
+    pointer: &str,
+) -> Result<Option<T>, serde_json::Error> {
+    let Some(value) = envelope.pointer(pointer) else {
+        return Ok(None);
+    };
+    serde_json::from_value(value.clone()).map(Some)
+}
+
+fn extend_sarif_runs(runs: &mut Vec<serde_json::Value>, sarif: &serde_json::Value) {
+    if let Some(source_runs) = sarif.get("runs").and_then(serde_json::Value::as_array) {
+        runs.extend(source_runs.iter().cloned());
+    }
+}
+
+fn combined_duplication_sarif_run(report: &DuplicationReport) -> serde_json::Value {
+    serde_json::json!({
+        "tool": {
+            "driver": {
+                "name": "fallow",
+                "version": env!("CARGO_PKG_VERSION"),
+                "informationUri": "https://github.com/fallow-rs/fallow",
+            }
+        },
+        "automationDetails": { "id": "fallow/dupes" },
+        "results": report.clone_groups.iter().enumerate().map(|(index, group)| {
+            serde_json::json!({
+                "ruleId": "fallow/code-duplication",
+                "level": "warning",
+                "message": {
+                    "text": format!(
+                        "Clone group {} ({} lines, {} instances)",
+                        index + 1,
+                        group.line_count,
+                        group.instances.len(),
+                    ),
+                },
+            })
+        }).collect::<Vec<_>>(),
     })
 }
 
-pub(super) fn print_sarif(results: &AnalysisResults, root: &Path, rules: &RulesConfig) -> ExitCode {
-    let sarif = build_sarif(results, root, rules);
+fn annotate_saved_sarif_grouping(
+    sarif: &mut serde_json::Value,
+    kind: EnvelopeKind,
+    resolver: Option<&OwnershipResolver>,
+) {
+    let Some(resolver) = resolver else {
+        return;
+    };
+    let property = match kind {
+        EnvelopeKind::Health | EnvelopeKind::Dupes => "group",
+        _ => "owner",
+    };
+    fallow_api::annotate_sarif_results(sarif, property, |uri| {
+        let decoded = uri.replace("%5B", "[").replace("%5D", "]");
+        grouping::resolve_owner(Path::new(&decoded), Path::new(""), resolver)
+    });
+}
+
+pub(super) fn envelope_rule_level_with_config(
+    kind: EnvelopeKind,
+    title: &str,
+    root: &Path,
+    config_path: Option<&Path>,
+) -> Option<String> {
+    let rule_id = native_rule_id(title);
+    envelope_sarif_base_with_config(kind, root, config_path)
+        .pointer("/runs/0/tool/driver/rules")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|rule| rule.get("id").and_then(serde_json::Value::as_str) == Some(rule_id.as_str()))
+        .and_then(|rule| {
+            rule.pointer("/defaultConfiguration/level")
+                .and_then(serde_json::Value::as_str)
+        })
+        .map(str::to_owned)
+}
+
+fn saved_dead_code_results(
+    kind: EnvelopeKind,
+    envelope: &serde_json::Value,
+) -> Option<AnalysisResults> {
+    if kind != EnvelopeKind::DeadCode {
+        return None;
+    }
+    let mut results = serde_json::from_value::<AnalysisResults>(envelope.clone()).ok()?;
+    // Grouped saved envelopes are flattened in group order. Match the
+    // analyzer's canonical ordering before rendering the typed SARIF path.
+    results.sort();
+    Some(results)
+}
+
+pub(super) fn saved_report_rules(root: &Path, config_path: Option<&Path>) -> RulesConfig {
+    config_path
+        .and_then(|path| FallowConfig::load(path).ok())
+        .map(|config| config.rules)
+        .or_else(|| {
+            FallowConfig::find_and_load(root)
+                .ok()
+                .flatten()
+                .map(|(config, _)| config.rules)
+        })
+        .unwrap_or_default()
+}
+
+fn envelope_sarif_base_with_config(
+    kind: EnvelopeKind,
+    root: &Path,
+    config_path: Option<&Path>,
+) -> serde_json::Value {
+    let rules = saved_report_rules(root, config_path);
+    match kind {
+        EnvelopeKind::DeadCode => api_sarif_document(&AnalysisResults::default(), root, &rules),
+        EnvelopeKind::Dupes => {
+            fallow_api::build_duplication_sarif(&DuplicationReport::default(), root, &sarif_rule)
+        }
+        EnvelopeKind::Health => {
+            api_health_sarif_document(&fallow_output::HealthReport::default(), root)
+        }
+        EnvelopeKind::Audit | EnvelopeKind::Combined => {
+            let mut document = api_sarif_document(&AnalysisResults::default(), root, &rules);
+            merge_sarif_rules(
+                &mut document,
+                &fallow_api::build_duplication_sarif(
+                    &DuplicationReport::default(),
+                    root,
+                    &sarif_rule,
+                ),
+            );
+            merge_sarif_rules(
+                &mut document,
+                &api_health_sarif_document(&fallow_output::HealthReport::default(), root),
+            );
+            document
+        }
+        EnvelopeKind::Security | EnvelopeKind::Fix => build_sarif_document(SarifDocumentInput {
+            results: &[],
+            rules: &[],
+            tool_version: env!("CARGO_PKG_VERSION"),
+        }),
+    }
+}
+
+fn merge_sarif_rules(target: &mut serde_json::Value, source: &serde_json::Value) {
+    let mut rules = sarif_rules_by_id(target);
+    for (id, rule) in sarif_rules_by_id(source) {
+        rules.entry(id).or_insert(rule);
+    }
+    if let Some(driver) = target.pointer_mut("/runs/0/tool/driver") {
+        driver["rules"] = serde_json::Value::Array(rules.into_values().collect());
+    }
+}
+
+fn sarif_rules_by_id(document: &serde_json::Value) -> BTreeMap<String, serde_json::Value> {
+    document
+        .pointer("/runs/0/tool/driver/rules")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|rule| {
+            rule.get("id")
+                .and_then(serde_json::Value::as_str)
+                .map(|id| (id.to_string(), rule.clone()))
+        })
+        .collect()
+}
+
+fn sarif_rule_ids(document: &serde_json::Value) -> Vec<String> {
+    document
+        .pointer("/runs/0/tool/driver/rules")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|rule| {
+            rule.get("id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .collect()
+}
+
+pub(super) fn native_rule_id(title: &str) -> String {
+    let fixed = match title {
+        "Dynamic segment conflict" => Some("fallow/dynamic-segment-name-conflict"),
+        "Unused devDependency" => Some("fallow/unused-dev-dependency"),
+        "Unused optionalDependency" => Some("fallow/unused-optional-dependency"),
+        "Stale @expected-unused" | "Unknown suppression kind" => Some("fallow/stale-suppression"),
+        _ if title.starts_with("High cyclomatic complexity") => {
+            Some("fallow/high-cyclomatic-complexity")
+        }
+        _ if title.starts_with("High cognitive complexity") => {
+            Some("fallow/high-cognitive-complexity")
+        }
+        _ if title.starts_with("High complexity") => Some("fallow/high-complexity"),
+        _ if title.starts_with("High CRAP score") => Some("fallow/high-crap-score"),
+        _ if title.starts_with("Refactoring target") => Some("fallow/refactoring-target"),
+        _ if title.starts_with("Runtime coverage") => {
+            let normalized = title.replace('_', "-");
+            if normalized.contains("safe-to-delete") {
+                Some("fallow/runtime-safe-to-delete")
+            } else if normalized.contains("review-required") {
+                Some("fallow/runtime-review-required")
+            } else if normalized.contains("low-traffic") {
+                Some("fallow/runtime-low-traffic")
+            } else if normalized.contains("coverage-unavailable") {
+                Some("fallow/runtime-coverage-unavailable")
+            } else {
+                Some("fallow/runtime-coverage")
+            }
+        }
+        _ if title.starts_with("Coverage intelligence") => {
+            if title.contains("add-test-or-split-before-merge") {
+                Some("fallow/coverage-intelligence-risky-change")
+            } else if title.contains("delete-after-confirming-owner") {
+                Some("fallow/coverage-intelligence-delete")
+            } else if title.contains("refactor-carefully-keep-behavior") {
+                Some("fallow/coverage-intelligence-refactor")
+            } else {
+                Some("fallow/coverage-intelligence-review")
+            }
+        }
+        _ if title.starts_with("Security candidate") => Some("fallow/security-candidate"),
+        _ => None,
+    };
+    if let Some(rule_id) = fixed {
+        return rule_id.to_string();
+    }
+    let slug = title
+        .to_ascii_lowercase()
+        .replace(|character: char| !character.is_ascii_alphanumeric(), "-")
+        .trim_matches('-')
+        .to_string();
+    if slug.is_empty() {
+        "fallow/finding".to_string()
+    } else {
+        format!("fallow/{slug}")
+    }
+}
+
+pub(super) fn is_dead_code_rule_id(rule_id: &str) -> bool {
+    fallow_output::issue_output_contracts()
+        .any(|contract| contract.sarif_rule_ids.iter().any(|id| id == rule_id))
+        || rule_id == "fallow/missing-suppression-reason"
+}
+
+const fn annotation_level(level: AnnotationLevel) -> &'static str {
+    match level {
+        AnnotationLevel::Error => "error",
+        AnnotationLevel::Warning => "warning",
+        AnnotationLevel::Notice => "note",
+    }
+}
+
+fn envelope_type_aware(envelope: &serde_json::Value) -> Option<&serde_json::Value> {
+    envelope
+        .pointer("/_meta/type_aware")
+        .or_else(|| envelope.pointer("/_meta/check/type_aware"))
+}
+
+pub(super) fn print_sarif(
+    results: &AnalysisResults,
+    root: &Path,
+    rules: &RulesConfig,
+    type_aware: Option<&fallow_types::envelope::TypeAwareMeta>,
+) -> ExitCode {
+    let mut sarif = api_sarif_document(results, root, rules);
+    annotate_type_aware_sarif(&mut sarif, type_aware);
     emit_json(&sarif, "SARIF")
 }
 
 /// Print SARIF output with owner properties added to each result.
-///
-/// Calls `build_sarif` to produce the standard SARIF JSON, then post-processes
-/// each result to add `"properties": { "owner": "@team" }` by resolving the
-/// artifact location URI through the `OwnershipResolver`.
 pub(super) fn print_grouped_sarif(
     results: &AnalysisResults,
     root: &Path,
     rules: &RulesConfig,
     resolver: &OwnershipResolver,
+    type_aware: Option<&fallow_types::envelope::TypeAwareMeta>,
 ) -> ExitCode {
-    let mut sarif = build_sarif(results, root, rules);
-
-    // Post-process each result to inject the owner property.
-    if let Some(runs) = sarif.get_mut("runs").and_then(|r| r.as_array_mut()) {
-        for run in runs {
-            if let Some(results) = run.get_mut("results").and_then(|r| r.as_array_mut()) {
-                for result in results {
-                    let uri = result
-                        .pointer("/locations/0/physicalLocation/artifactLocation/uri")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    // Decode percent-encoded brackets before ownership lookup
-                    // (SARIF URIs encode `[`/`]` as `%5B`/`%5D`)
-                    let decoded = uri.replace("%5B", "[").replace("%5D", "]");
-                    let owner =
-                        grouping::resolve_owner(Path::new(&decoded), Path::new(""), resolver);
-                    let props = result
-                        .as_object_mut()
-                        .expect("SARIF result should be an object")
-                        .entry("properties")
-                        .or_insert_with(|| serde_json::json!({}));
-                    props
-                        .as_object_mut()
-                        .expect("properties should be an object")
-                        .insert("owner".to_string(), serde_json::Value::String(owner));
-                }
-            }
-        }
-    }
-
-    emit_json(&sarif, "SARIF")
-}
-
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "line/col numbers are bounded by source size"
-)]
-pub(super) fn print_duplication_sarif(report: &DuplicationReport, root: &Path) -> ExitCode {
-    let mut sarif_results = Vec::new();
-
-    for (i, group) in report.clone_groups.iter().enumerate() {
-        for instance in &group.instances {
-            sarif_results.push(sarif_result(
-                "fallow/code-duplication",
-                "warning",
-                &format!(
-                    "Code clone group {} ({} lines, {} instances)",
-                    i + 1,
-                    group.line_count,
-                    group.instances.len()
-                ),
-                &relative_uri(&instance.file, root),
-                Some((instance.start_line as u32, (instance.start_col + 1) as u32)),
-            ));
-        }
-    }
-
-    let sarif = serde_json::json!({
-        "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
-        "version": "2.1.0",
-        "runs": [{
-            "tool": {
-                "driver": {
-                    "name": "fallow",
-                    "version": env!("CARGO_PKG_VERSION"),
-                    "informationUri": "https://github.com/fallow-rs/fallow",
-                    "rules": [sarif_rule("fallow/code-duplication", "Duplicated code block", "warning")]
-                }
-            },
-            "results": sarif_results
-        }]
+    let mut sarif = api_sarif_document(results, root, rules);
+    annotate_type_aware_sarif(&mut sarif, type_aware);
+    fallow_api::annotate_sarif_results(&mut sarif, "owner", |uri| {
+        let decoded = uri.replace("%5B", "[").replace("%5D", "]");
+        grouping::resolve_owner(Path::new(&decoded), Path::new(""), resolver)
     });
 
     emit_json(&sarif, "SARIF")
 }
 
-// ── Health SARIF output ────────────────────────────────────────────
-// Note: file_scores are intentionally omitted from SARIF output.
-// SARIF is designed for diagnostic results (issues/findings), not metric tables.
-// File health scores are available in JSON, human, compact, and markdown formats.
-
-#[must_use]
-#[expect(
-    clippy::too_many_lines,
-    reason = "flat rules + results table: adding production-coverage rules pushed past the 150 line threshold but each section is a straightforward sequence of sarif_rule / sarif_result calls"
-)]
-pub fn build_health_sarif(
-    report: &crate::health_types::HealthReport,
-    root: &Path,
-) -> serde_json::Value {
-    use crate::health_types::ExceededThreshold;
-
-    let mut sarif_results = Vec::new();
-
-    for finding in &report.findings {
-        let uri = relative_uri(&finding.path, root);
-        // When CRAP contributes alongside complexity, use the CRAP rule as the
-        // most actionable identifier (CRAP combines complexity and coverage)
-        // and surface all exceeded dimensions in the message.
-        let (rule_id, message) = match finding.exceeded {
-            ExceededThreshold::Cyclomatic => (
-                "fallow/high-cyclomatic-complexity",
-                format!(
-                    "'{}' has cyclomatic complexity {} (threshold: {})",
-                    finding.name, finding.cyclomatic, report.summary.max_cyclomatic_threshold,
-                ),
-            ),
-            ExceededThreshold::Cognitive => (
-                "fallow/high-cognitive-complexity",
-                format!(
-                    "'{}' has cognitive complexity {} (threshold: {})",
-                    finding.name, finding.cognitive, report.summary.max_cognitive_threshold,
-                ),
-            ),
-            ExceededThreshold::Both => (
-                "fallow/high-complexity",
-                format!(
-                    "'{}' has cyclomatic complexity {} (threshold: {}) and cognitive complexity {} (threshold: {})",
-                    finding.name,
-                    finding.cyclomatic,
-                    report.summary.max_cyclomatic_threshold,
-                    finding.cognitive,
-                    report.summary.max_cognitive_threshold,
-                ),
-            ),
-            ExceededThreshold::Crap
-            | ExceededThreshold::CyclomaticCrap
-            | ExceededThreshold::CognitiveCrap
-            | ExceededThreshold::All => {
-                let crap = finding.crap.unwrap_or(0.0);
-                let coverage = finding
-                    .coverage_pct
-                    .map(|pct| format!(", coverage {pct:.0}%"))
-                    .unwrap_or_default();
-                (
-                    "fallow/high-crap-score",
-                    format!(
-                        "'{}' has CRAP score {:.1} (threshold: {:.1}, cyclomatic {}{})",
-                        finding.name,
-                        crap,
-                        report.summary.max_crap_threshold,
-                        finding.cyclomatic,
-                        coverage,
-                    ),
-                )
-            }
-        };
-
-        let level = match finding.severity {
-            crate::health_types::FindingSeverity::Critical => "error",
-            crate::health_types::FindingSeverity::High => "warning",
-            crate::health_types::FindingSeverity::Moderate => "note",
-        };
-        sarif_results.push(sarif_result(
-            rule_id,
-            level,
-            &message,
-            &uri,
-            Some((finding.line, finding.col + 1)),
-        ));
-    }
-
-    if let Some(ref production) = report.production_coverage {
-        append_production_coverage_sarif_results(&mut sarif_results, production, root);
-    }
-
-    // Refactoring targets as SARIF results (warning level — advisory recommendations)
-    for target in &report.targets {
-        let uri = relative_uri(&target.path, root);
-        let message = format!(
-            "[{}] {} (priority: {:.1}, efficiency: {:.1}, effort: {}, confidence: {})",
-            target.category.label(),
-            target.recommendation,
-            target.priority,
-            target.efficiency,
-            target.effort.label(),
-            target.confidence.label(),
-        );
-        sarif_results.push(sarif_result(
-            "fallow/refactoring-target",
-            "warning",
-            &message,
-            &uri,
-            None,
-        ));
-    }
-
-    if let Some(ref gaps) = report.coverage_gaps {
-        for item in &gaps.files {
-            let uri = relative_uri(&item.path, root);
-            let message = format!(
-                "File is runtime-reachable but has no test dependency path ({} value export{})",
-                item.value_export_count,
-                if item.value_export_count == 1 {
-                    ""
-                } else {
-                    "s"
-                },
-            );
-            sarif_results.push(sarif_result(
-                "fallow/untested-file",
-                "warning",
-                &message,
-                &uri,
-                None,
-            ));
-        }
-
-        for item in &gaps.exports {
-            let uri = relative_uri(&item.path, root);
-            let message = format!(
-                "Export '{}' is runtime-reachable but never referenced by test-reachable modules",
-                item.export_name
-            );
-            sarif_results.push(sarif_result(
-                "fallow/untested-export",
-                "warning",
-                &message,
-                &uri,
-                Some((item.line, item.col + 1)),
-            ));
-        }
-    }
-
-    let health_rules = vec![
-        sarif_rule(
-            "fallow/high-cyclomatic-complexity",
-            "Function has high cyclomatic complexity",
-            "note",
-        ),
-        sarif_rule(
-            "fallow/high-cognitive-complexity",
-            "Function has high cognitive complexity",
-            "note",
-        ),
-        sarif_rule(
-            "fallow/high-complexity",
-            "Function exceeds both complexity thresholds",
-            "note",
-        ),
-        sarif_rule(
-            "fallow/high-crap-score",
-            "Function has a high CRAP score (high complexity combined with low coverage)",
-            "warning",
-        ),
-        sarif_rule(
-            "fallow/refactoring-target",
-            "File identified as a high-priority refactoring candidate",
-            "warning",
-        ),
-        sarif_rule(
-            "fallow/untested-file",
-            "Runtime-reachable file has no test dependency path",
-            "warning",
-        ),
-        sarif_rule(
-            "fallow/untested-export",
-            "Runtime-reachable export has no test dependency path",
-            "warning",
-        ),
-        sarif_rule(
-            "fallow/production-safe-to-delete",
-            "Function is statically unused and was never invoked in production",
-            "warning",
-        ),
-        sarif_rule(
-            "fallow/production-review-required",
-            "Function is statically used but was never invoked in production",
-            "warning",
-        ),
-        sarif_rule(
-            "fallow/production-low-traffic",
-            "Function was invoked below the low-traffic threshold relative to total trace count",
-            "note",
-        ),
-        sarif_rule(
-            "fallow/production-coverage-unavailable",
-            "Production coverage could not be resolved for this function",
-            "note",
-        ),
-        sarif_rule(
-            "fallow/production-coverage",
-            "Production coverage finding",
-            "note",
-        ),
-    ];
-
-    serde_json::json!({
-        "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
-        "version": "2.1.0",
-        "runs": [{
-            "tool": {
-                "driver": {
-                    "name": "fallow",
-                    "version": env!("CARGO_PKG_VERSION"),
-                    "informationUri": "https://github.com/fallow-rs/fallow",
-                    "rules": health_rules
-                }
-            },
-            "results": sarif_results
-        }]
-    })
+pub(super) fn print_duplication_sarif(report: &DuplicationReport, root: &Path) -> ExitCode {
+    let sarif = fallow_api::build_duplication_sarif(report, root, &sarif_rule);
+    emit_json(&sarif, "SARIF")
 }
 
-fn append_production_coverage_sarif_results(
-    sarif_results: &mut Vec<serde_json::Value>,
-    production: &crate::health_types::ProductionCoverageReport,
+pub(super) fn print_grouped_duplication_sarif(
+    report: &DuplicationReport,
     root: &Path,
-) {
-    for finding in &production.findings {
-        let uri = relative_uri(&finding.path, root);
-        let rule_id = match finding.verdict {
-            crate::health_types::ProductionCoverageVerdict::SafeToDelete => {
-                "fallow/production-safe-to-delete"
-            }
-            crate::health_types::ProductionCoverageVerdict::ReviewRequired => {
-                "fallow/production-review-required"
-            }
-            crate::health_types::ProductionCoverageVerdict::LowTraffic => {
-                "fallow/production-low-traffic"
-            }
-            crate::health_types::ProductionCoverageVerdict::CoverageUnavailable => {
-                "fallow/production-coverage-unavailable"
-            }
-            crate::health_types::ProductionCoverageVerdict::Active
-            | crate::health_types::ProductionCoverageVerdict::Unknown => {
-                "fallow/production-coverage"
-            }
-        };
-        let level = match finding.verdict {
-            crate::health_types::ProductionCoverageVerdict::SafeToDelete
-            | crate::health_types::ProductionCoverageVerdict::ReviewRequired => "warning",
-            _ => "note",
-        };
-        let invocations_hint = finding.invocations.map_or_else(
-            || "untracked".to_owned(),
-            |hits| format!("{hits} invocations"),
-        );
-        let message = format!(
-            "'{}' production coverage verdict: {} ({})",
-            finding.function,
-            finding.verdict.human_label(),
-            invocations_hint,
-        );
-        sarif_results.push(sarif_result(
-            rule_id,
-            level,
-            &message,
-            &uri,
-            Some((finding.line, 1)),
-        ));
-    }
+    resolver: &OwnershipResolver,
+) -> ExitCode {
+    let sarif = fallow_api::build_grouped_duplication_sarif(report, root, &sarif_rule, |group| {
+        super::dupes_grouping::largest_owner(group, root, resolver)
+    });
+    emit_json(&sarif, "SARIF")
+}
+
+#[must_use]
+pub fn api_health_sarif_document(
+    report: &fallow_output::HealthReport,
+    root: &Path,
+) -> serde_json::Value {
+    fallow_api::build_health_sarif(report, root, &sarif_rule)
 }
 
 pub(super) fn print_health_sarif(
-    report: &crate::health_types::HealthReport,
+    report: &fallow_output::HealthReport,
     root: &Path,
+    type_aware: Option<&fallow_types::envelope::TypeAwareMeta>,
 ) -> ExitCode {
-    let sarif = build_health_sarif(report, root);
+    let mut sarif = api_health_sarif_document(report, root);
+    annotate_type_aware_sarif(&mut sarif, type_aware);
+    emit_json(&sarif, "SARIF")
+}
+
+pub(super) fn print_grouped_health_sarif(
+    report: &fallow_output::HealthReport,
+    root: &Path,
+    resolver: &OwnershipResolver,
+    type_aware: Option<&fallow_types::envelope::TypeAwareMeta>,
+) -> ExitCode {
+    let mut sarif = api_health_sarif_document(report, root);
+    annotate_type_aware_sarif(&mut sarif, type_aware);
+    fallow_api::annotate_sarif_results(&mut sarif, "group", |uri| {
+        let decoded = uri.replace("%5B", "[").replace("%5D", "]");
+        grouping::resolve_owner(Path::new(&decoded), Path::new(""), resolver)
+    });
+
     emit_json(&sarif, "SARIF")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::report::test_helpers::sample_results;
-    use fallow_core::results::*;
+    use fallow_types::output_dead_code::UnusedFileFinding;
+    use fallow_types::results::UnusedFile;
     use std::path::PathBuf;
 
-    #[test]
-    fn sarif_has_required_top_level_fields() {
-        let root = PathBuf::from("/project");
-        let results = AnalysisResults::default();
-        let sarif = build_sarif(&results, &root, &RulesConfig::default());
-
-        assert_eq!(
-            sarif["$schema"],
-            "https://json.schemastore.org/sarif-2.1.0.json"
-        );
-        assert_eq!(sarif["version"], "2.1.0");
-        assert!(sarif["runs"].is_array());
-    }
-
-    #[test]
-    fn sarif_has_tool_driver_info() {
-        let root = PathBuf::from("/project");
-        let results = AnalysisResults::default();
-        let sarif = build_sarif(&results, &root, &RulesConfig::default());
-
-        let driver = &sarif["runs"][0]["tool"]["driver"];
-        assert_eq!(driver["name"], "fallow");
-        assert!(driver["version"].is_string());
-        assert_eq!(
-            driver["informationUri"],
-            "https://github.com/fallow-rs/fallow"
-        );
-    }
-
-    #[test]
-    fn sarif_declares_all_rules() {
-        let root = PathBuf::from("/project");
-        let results = AnalysisResults::default();
-        let sarif = build_sarif(&results, &root, &RulesConfig::default());
-
-        let rules = sarif["runs"][0]["tool"]["driver"]["rules"]
+    fn rule_by_id<'a>(sarif: &'a serde_json::Value, id: &str) -> &'a serde_json::Value {
+        sarif["runs"][0]["tool"]["driver"]["rules"]
             .as_array()
-            .expect("rules should be an array");
-        assert_eq!(rules.len(), 16);
-
-        let rule_ids: Vec<&str> = rules.iter().map(|r| r["id"].as_str().unwrap()).collect();
-        assert!(rule_ids.contains(&"fallow/unused-file"));
-        assert!(rule_ids.contains(&"fallow/unused-export"));
-        assert!(rule_ids.contains(&"fallow/unused-type"));
-        assert!(rule_ids.contains(&"fallow/unused-dependency"));
-        assert!(rule_ids.contains(&"fallow/unused-dev-dependency"));
-        assert!(rule_ids.contains(&"fallow/unused-optional-dependency"));
-        assert!(rule_ids.contains(&"fallow/type-only-dependency"));
-        assert!(rule_ids.contains(&"fallow/test-only-dependency"));
-        assert!(rule_ids.contains(&"fallow/unused-enum-member"));
-        assert!(rule_ids.contains(&"fallow/unused-class-member"));
-        assert!(rule_ids.contains(&"fallow/unresolved-import"));
-        assert!(rule_ids.contains(&"fallow/unlisted-dependency"));
-        assert!(rule_ids.contains(&"fallow/duplicate-export"));
-        assert!(rule_ids.contains(&"fallow/circular-dependency"));
-        assert!(rule_ids.contains(&"fallow/boundary-violation"));
-    }
-
-    #[test]
-    fn sarif_empty_results_no_results_entries() {
-        let root = PathBuf::from("/project");
-        let results = AnalysisResults::default();
-        let sarif = build_sarif(&results, &root, &RulesConfig::default());
-
-        let sarif_results = sarif["runs"][0]["results"]
-            .as_array()
-            .expect("results should be an array");
-        assert!(sarif_results.is_empty());
-    }
-
-    #[test]
-    fn sarif_unused_file_result() {
-        let root = PathBuf::from("/project");
-        let mut results = AnalysisResults::default();
-        results.unused_files.push(UnusedFile {
-            path: root.join("src/dead.ts"),
-        });
-
-        let sarif = build_sarif(&results, &root, &RulesConfig::default());
-        let entries = sarif["runs"][0]["results"].as_array().unwrap();
-        assert_eq!(entries.len(), 1);
-
-        let entry = &entries[0];
-        assert_eq!(entry["ruleId"], "fallow/unused-file");
-        // Default severity is "error" per RulesConfig::default()
-        assert_eq!(entry["level"], "error");
-        assert_eq!(
-            entry["locations"][0]["physicalLocation"]["artifactLocation"]["uri"],
-            "src/dead.ts"
-        );
-    }
-
-    #[test]
-    fn sarif_unused_export_includes_region() {
-        let root = PathBuf::from("/project");
-        let mut results = AnalysisResults::default();
-        results.unused_exports.push(UnusedExport {
-            path: root.join("src/utils.ts"),
-            export_name: "helperFn".to_string(),
-            is_type_only: false,
-            line: 10,
-            col: 4,
-            span_start: 120,
-            is_re_export: false,
-        });
-
-        let sarif = build_sarif(&results, &root, &RulesConfig::default());
-        let entry = &sarif["runs"][0]["results"][0];
-        assert_eq!(entry["ruleId"], "fallow/unused-export");
-
-        let region = &entry["locations"][0]["physicalLocation"]["region"];
-        assert_eq!(region["startLine"], 10);
-        // SARIF columns are 1-based, code adds +1 to the 0-based col
-        assert_eq!(region["startColumn"], 5);
-    }
-
-    #[test]
-    fn sarif_unresolved_import_is_error_level() {
-        let root = PathBuf::from("/project");
-        let mut results = AnalysisResults::default();
-        results.unresolved_imports.push(UnresolvedImport {
-            path: root.join("src/app.ts"),
-            specifier: "./missing".to_string(),
-            line: 1,
-            col: 0,
-            specifier_col: 0,
-        });
-
-        let sarif = build_sarif(&results, &root, &RulesConfig::default());
-        let entry = &sarif["runs"][0]["results"][0];
-        assert_eq!(entry["ruleId"], "fallow/unresolved-import");
-        assert_eq!(entry["level"], "error");
-    }
-
-    #[test]
-    fn sarif_unlisted_dependency_points_to_import_site() {
-        let root = PathBuf::from("/project");
-        let mut results = AnalysisResults::default();
-        results.unlisted_dependencies.push(UnlistedDependency {
-            package_name: "chalk".to_string(),
-            imported_from: vec![ImportSite {
-                path: root.join("src/cli.ts"),
-                line: 3,
-                col: 0,
-            }],
-        });
-
-        let sarif = build_sarif(&results, &root, &RulesConfig::default());
-        let entry = &sarif["runs"][0]["results"][0];
-        assert_eq!(entry["ruleId"], "fallow/unlisted-dependency");
-        assert_eq!(entry["level"], "error");
-        assert_eq!(
-            entry["locations"][0]["physicalLocation"]["artifactLocation"]["uri"],
-            "src/cli.ts"
-        );
-        let region = &entry["locations"][0]["physicalLocation"]["region"];
-        assert_eq!(region["startLine"], 3);
-        assert_eq!(region["startColumn"], 1);
-    }
-
-    #[test]
-    fn sarif_dependency_issues_point_to_package_json() {
-        let root = PathBuf::from("/project");
-        let mut results = AnalysisResults::default();
-        results.unused_dependencies.push(UnusedDependency {
-            package_name: "lodash".to_string(),
-            location: DependencyLocation::Dependencies,
-            path: root.join("package.json"),
-            line: 5,
-        });
-        results.unused_dev_dependencies.push(UnusedDependency {
-            package_name: "jest".to_string(),
-            location: DependencyLocation::DevDependencies,
-            path: root.join("package.json"),
-            line: 5,
-        });
-
-        let sarif = build_sarif(&results, &root, &RulesConfig::default());
-        let entries = sarif["runs"][0]["results"].as_array().unwrap();
-        for entry in entries {
-            assert_eq!(
-                entry["locations"][0]["physicalLocation"]["artifactLocation"]["uri"],
-                "package.json"
-            );
-        }
-    }
-
-    #[test]
-    fn sarif_duplicate_export_emits_one_result_per_location() {
-        let root = PathBuf::from("/project");
-        let mut results = AnalysisResults::default();
-        results.duplicate_exports.push(DuplicateExport {
-            export_name: "Config".to_string(),
-            locations: vec![
-                DuplicateLocation {
-                    path: root.join("src/a.ts"),
-                    line: 15,
-                    col: 0,
-                },
-                DuplicateLocation {
-                    path: root.join("src/b.ts"),
-                    line: 30,
-                    col: 0,
-                },
-            ],
-        });
-
-        let sarif = build_sarif(&results, &root, &RulesConfig::default());
-        let entries = sarif["runs"][0]["results"].as_array().unwrap();
-        // One SARIF result per location, not one per DuplicateExport
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0]["ruleId"], "fallow/duplicate-export");
-        assert_eq!(entries[1]["ruleId"], "fallow/duplicate-export");
-        assert_eq!(
-            entries[0]["locations"][0]["physicalLocation"]["artifactLocation"]["uri"],
-            "src/a.ts"
-        );
-        assert_eq!(
-            entries[1]["locations"][0]["physicalLocation"]["artifactLocation"]["uri"],
-            "src/b.ts"
-        );
-    }
-
-    #[test]
-    fn sarif_all_issue_types_produce_results() {
-        let root = PathBuf::from("/project");
-        let results = sample_results(&root);
-        let sarif = build_sarif(&results, &root, &RulesConfig::default());
-
-        let entries = sarif["runs"][0]["results"].as_array().unwrap();
-        // All issue types with one entry each; duplicate_exports has 2 locations => one extra SARIF result
-        assert_eq!(entries.len(), results.total_issues() + 1);
-
-        let rule_ids: Vec<&str> = entries
+            .expect("SARIF rules")
             .iter()
-            .map(|e| e["ruleId"].as_str().unwrap())
-            .collect();
-        assert!(rule_ids.contains(&"fallow/unused-file"));
-        assert!(rule_ids.contains(&"fallow/unused-export"));
-        assert!(rule_ids.contains(&"fallow/unused-type"));
-        assert!(rule_ids.contains(&"fallow/unused-dependency"));
-        assert!(rule_ids.contains(&"fallow/unused-dev-dependency"));
-        assert!(rule_ids.contains(&"fallow/unused-optional-dependency"));
-        assert!(rule_ids.contains(&"fallow/type-only-dependency"));
-        assert!(rule_ids.contains(&"fallow/test-only-dependency"));
-        assert!(rule_ids.contains(&"fallow/unused-enum-member"));
-        assert!(rule_ids.contains(&"fallow/unused-class-member"));
-        assert!(rule_ids.contains(&"fallow/unresolved-import"));
-        assert!(rule_ids.contains(&"fallow/unlisted-dependency"));
-        assert!(rule_ids.contains(&"fallow/duplicate-export"));
+            .find(|rule| rule["id"] == id)
+            .expect("rule id")
     }
 
     #[test]
-    fn sarif_serializes_to_valid_json() {
-        let root = PathBuf::from("/project");
-        let results = sample_results(&root);
-        let sarif = build_sarif(&results, &root, &RulesConfig::default());
-
-        let json_str = serde_json::to_string_pretty(&sarif).expect("SARIF should serialize");
-        let reparsed: serde_json::Value =
-            serde_json::from_str(&json_str).expect("SARIF output should be valid JSON");
-        assert_eq!(reparsed, sarif);
+    fn configured_sarif_level_keeps_off_rules_in_rule_table() {
+        assert_eq!(configured_sarif_level(Severity::Error), "error");
+        assert_eq!(configured_sarif_level(Severity::Warn), "warning");
+        assert_eq!(configured_sarif_level(Severity::Off), "none");
     }
 
     #[test]
-    fn sarif_file_write_produces_valid_sarif() {
-        let root = PathBuf::from("/project");
-        let results = sample_results(&root);
-        let sarif = build_sarif(&results, &root, &RulesConfig::default());
-        let json_str = serde_json::to_string_pretty(&sarif).expect("SARIF should serialize");
-
-        let dir = std::env::temp_dir().join("fallow-test-sarif-file");
-        let _ = std::fs::create_dir_all(&dir);
-        let sarif_path = dir.join("results.sarif");
-        std::fs::write(&sarif_path, &json_str).expect("should write SARIF file");
-
-        let contents = std::fs::read_to_string(&sarif_path).expect("should read SARIF file");
-        let parsed: serde_json::Value =
-            serde_json::from_str(&contents).expect("file should contain valid JSON");
-
-        assert_eq!(parsed["version"], "2.1.0");
-        assert_eq!(
-            parsed["$schema"],
-            "https://json.schemastore.org/sarif-2.1.0.json"
-        );
-        let sarif_results = parsed["runs"][0]["results"]
-            .as_array()
-            .expect("results should be an array");
-        assert!(!sarif_results.is_empty());
-
-        // Clean up
-        let _ = std::fs::remove_file(&sarif_path);
-        let _ = std::fs::remove_dir(&dir);
-    }
-
-    // ── Health SARIF ──
-
-    #[test]
-    fn health_sarif_empty_no_results() {
-        let root = PathBuf::from("/project");
-        let report = crate::health_types::HealthReport {
-            summary: crate::health_types::HealthSummary {
-                files_analyzed: 10,
-                functions_analyzed: 50,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let sarif = build_health_sarif(&report, &root);
-        assert_eq!(sarif["version"], "2.1.0");
-        let results = sarif["runs"][0]["results"].as_array().unwrap();
-        assert!(results.is_empty());
-        let rules = sarif["runs"][0]["tool"]["driver"]["rules"]
-            .as_array()
-            .unwrap();
-        assert_eq!(rules.len(), 12);
-    }
-
-    #[test]
-    fn health_sarif_cyclomatic_only() {
-        let root = PathBuf::from("/project");
-        let report = crate::health_types::HealthReport {
-            findings: vec![crate::health_types::HealthFinding {
-                path: root.join("src/utils.ts"),
-                name: "parseExpression".to_string(),
-                line: 42,
-                col: 0,
-                cyclomatic: 25,
-                cognitive: 10,
-                line_count: 80,
-                param_count: 0,
-                exceeded: crate::health_types::ExceededThreshold::Cyclomatic,
-                severity: crate::health_types::FindingSeverity::High,
-                crap: None,
-                coverage_pct: None,
-            }],
-            summary: crate::health_types::HealthSummary {
-                files_analyzed: 5,
-                functions_analyzed: 20,
-                functions_above_threshold: 1,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let sarif = build_health_sarif(&report, &root);
-        let entry = &sarif["runs"][0]["results"][0];
-        assert_eq!(entry["ruleId"], "fallow/high-cyclomatic-complexity");
-        assert_eq!(entry["level"], "warning");
-        assert!(
-            entry["message"]["text"]
-                .as_str()
-                .unwrap()
-                .contains("cyclomatic complexity 25")
-        );
-        assert_eq!(
-            entry["locations"][0]["physicalLocation"]["artifactLocation"]["uri"],
-            "src/utils.ts"
-        );
-        let region = &entry["locations"][0]["physicalLocation"]["region"];
-        assert_eq!(region["startLine"], 42);
-        assert_eq!(region["startColumn"], 1);
-    }
-
-    #[test]
-    fn health_sarif_cognitive_only() {
-        let root = PathBuf::from("/project");
-        let report = crate::health_types::HealthReport {
-            findings: vec![crate::health_types::HealthFinding {
-                path: root.join("src/api.ts"),
-                name: "handleRequest".to_string(),
-                line: 10,
-                col: 4,
-                cyclomatic: 8,
-                cognitive: 20,
-                line_count: 40,
-                param_count: 0,
-                exceeded: crate::health_types::ExceededThreshold::Cognitive,
-                severity: crate::health_types::FindingSeverity::High,
-                crap: None,
-                coverage_pct: None,
-            }],
-            summary: crate::health_types::HealthSummary {
-                files_analyzed: 3,
-                functions_analyzed: 10,
-                functions_above_threshold: 1,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let sarif = build_health_sarif(&report, &root);
-        let entry = &sarif["runs"][0]["results"][0];
-        assert_eq!(entry["ruleId"], "fallow/high-cognitive-complexity");
-        assert!(
-            entry["message"]["text"]
-                .as_str()
-                .unwrap()
-                .contains("cognitive complexity 20")
-        );
-        let region = &entry["locations"][0]["physicalLocation"]["region"];
-        assert_eq!(region["startColumn"], 5); // col 4 + 1
-    }
-
-    #[test]
-    fn health_sarif_both_thresholds() {
-        let root = PathBuf::from("/project");
-        let report = crate::health_types::HealthReport {
-            findings: vec![crate::health_types::HealthFinding {
-                path: root.join("src/complex.ts"),
-                name: "doEverything".to_string(),
-                line: 1,
-                col: 0,
-                cyclomatic: 30,
-                cognitive: 45,
-                line_count: 100,
-                param_count: 0,
-                exceeded: crate::health_types::ExceededThreshold::Both,
-                severity: crate::health_types::FindingSeverity::High,
-                crap: None,
-                coverage_pct: None,
-            }],
-            summary: crate::health_types::HealthSummary {
-                files_analyzed: 1,
-                functions_analyzed: 1,
-                functions_above_threshold: 1,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let sarif = build_health_sarif(&report, &root);
-        let entry = &sarif["runs"][0]["results"][0];
-        assert_eq!(entry["ruleId"], "fallow/high-complexity");
-        let msg = entry["message"]["text"].as_str().unwrap();
-        assert!(msg.contains("cyclomatic complexity 30"));
-        assert!(msg.contains("cognitive complexity 45"));
-    }
-
-    #[test]
-    fn health_sarif_crap_only_emits_crap_rule() {
-        // CRAP-only: cyclomatic + cognitive below their thresholds, CRAP at or
-        // above the CRAP threshold. Rule must be `fallow/high-crap-score`.
-        let root = PathBuf::from("/project");
-        let report = crate::health_types::HealthReport {
-            findings: vec![crate::health_types::HealthFinding {
-                path: root.join("src/untested.ts"),
-                name: "risky".to_string(),
-                line: 8,
-                col: 0,
-                cyclomatic: 10,
-                cognitive: 10,
-                line_count: 20,
-                param_count: 1,
-                exceeded: crate::health_types::ExceededThreshold::Crap,
-                severity: crate::health_types::FindingSeverity::High,
-                crap: Some(82.2),
-                coverage_pct: Some(12.0),
-            }],
-            summary: crate::health_types::HealthSummary {
-                files_analyzed: 1,
-                functions_analyzed: 1,
-                functions_above_threshold: 1,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let sarif = build_health_sarif(&report, &root);
-        let entry = &sarif["runs"][0]["results"][0];
-        assert_eq!(entry["ruleId"], "fallow/high-crap-score");
-        let msg = entry["message"]["text"].as_str().unwrap();
-        assert!(msg.contains("CRAP score 82.2"), "msg: {msg}");
-        assert!(msg.contains("coverage 12%"), "msg: {msg}");
-    }
-
-    #[test]
-    fn health_sarif_cyclomatic_crap_uses_crap_rule() {
-        // Cyclomatic + CRAP both exceeded. The CRAP-centric rule subsumes
-        // the cyclomatic breach; only one SARIF result is emitted.
-        let root = PathBuf::from("/project");
-        let report = crate::health_types::HealthReport {
-            findings: vec![crate::health_types::HealthFinding {
-                path: root.join("src/hot.ts"),
-                name: "branchy".to_string(),
-                line: 1,
-                col: 0,
-                cyclomatic: 67,
-                cognitive: 12,
-                line_count: 80,
-                param_count: 1,
-                exceeded: crate::health_types::ExceededThreshold::CyclomaticCrap,
-                severity: crate::health_types::FindingSeverity::Critical,
-                crap: Some(182.0),
-                coverage_pct: None,
-            }],
-            summary: crate::health_types::HealthSummary {
-                files_analyzed: 1,
-                functions_analyzed: 1,
-                functions_above_threshold: 1,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let sarif = build_health_sarif(&report, &root);
-        let results = sarif["runs"][0]["results"].as_array().unwrap();
-        assert_eq!(
-            results.len(),
-            1,
-            "CyclomaticCrap should emit a single SARIF result under the CRAP rule"
-        );
-        assert_eq!(results[0]["ruleId"], "fallow/high-crap-score");
-        let msg = results[0]["message"]["text"].as_str().unwrap();
-        assert!(msg.contains("CRAP score 182"), "msg: {msg}");
-        // coverage_pct absent => no coverage suffix
-        assert!(!msg.contains("coverage"), "msg: {msg}");
-    }
-
-    // ── Severity mapping ──
-
-    #[test]
-    fn severity_to_sarif_level_error() {
-        assert_eq!(severity_to_sarif_level(Severity::Error), "error");
-    }
-
-    #[test]
-    fn severity_to_sarif_level_warn() {
-        assert_eq!(severity_to_sarif_level(Severity::Warn), "warning");
-    }
-
-    #[test]
-    fn severity_to_sarif_level_off() {
-        assert_eq!(severity_to_sarif_level(Severity::Off), "warning");
-    }
-
-    // ── Re-export properties ──
-
-    #[test]
-    fn sarif_re_export_has_properties() {
-        let root = PathBuf::from("/project");
-        let mut results = AnalysisResults::default();
-        results.unused_exports.push(UnusedExport {
-            path: root.join("src/index.ts"),
-            export_name: "reExported".to_string(),
-            is_type_only: false,
-            line: 1,
-            col: 0,
-            span_start: 0,
-            is_re_export: true,
-        });
-
-        let sarif = build_sarif(&results, &root, &RulesConfig::default());
-        let entry = &sarif["runs"][0]["results"][0];
-        assert_eq!(entry["properties"]["is_re_export"], true);
-        let msg = entry["message"]["text"].as_str().unwrap();
-        assert!(msg.starts_with("Re-export"));
-    }
-
-    #[test]
-    fn sarif_non_re_export_has_no_properties() {
-        let root = PathBuf::from("/project");
-        let mut results = AnalysisResults::default();
-        results.unused_exports.push(UnusedExport {
-            path: root.join("src/utils.ts"),
-            export_name: "foo".to_string(),
-            is_type_only: false,
-            line: 5,
-            col: 0,
-            span_start: 0,
-            is_re_export: false,
-        });
-
-        let sarif = build_sarif(&results, &root, &RulesConfig::default());
-        let entry = &sarif["runs"][0]["results"][0];
-        assert!(entry.get("properties").is_none());
-        let msg = entry["message"]["text"].as_str().unwrap();
-        assert!(msg.starts_with("Export"));
-    }
-
-    // ── Type re-export ──
-
-    #[test]
-    fn sarif_type_re_export_message() {
-        let root = PathBuf::from("/project");
-        let mut results = AnalysisResults::default();
-        results.unused_types.push(UnusedExport {
-            path: root.join("src/index.ts"),
-            export_name: "MyType".to_string(),
-            is_type_only: true,
-            line: 1,
-            col: 0,
-            span_start: 0,
-            is_re_export: true,
-        });
-
-        let sarif = build_sarif(&results, &root, &RulesConfig::default());
-        let entry = &sarif["runs"][0]["results"][0];
-        assert_eq!(entry["ruleId"], "fallow/unused-type");
-        let msg = entry["message"]["text"].as_str().unwrap();
-        assert!(msg.starts_with("Type re-export"));
-        assert_eq!(entry["properties"]["is_re_export"], true);
-    }
-
-    // ── Dependency line == 0 skips region ──
-
-    #[test]
-    fn sarif_dependency_line_zero_skips_region() {
-        let root = PathBuf::from("/project");
-        let mut results = AnalysisResults::default();
-        results.unused_dependencies.push(UnusedDependency {
-            package_name: "lodash".to_string(),
-            location: DependencyLocation::Dependencies,
-            path: root.join("package.json"),
-            line: 0,
-        });
-
-        let sarif = build_sarif(&results, &root, &RulesConfig::default());
-        let entry = &sarif["runs"][0]["results"][0];
-        let phys = &entry["locations"][0]["physicalLocation"];
-        assert!(phys.get("region").is_none());
-    }
-
-    #[test]
-    fn sarif_dependency_line_nonzero_has_region() {
-        let root = PathBuf::from("/project");
-        let mut results = AnalysisResults::default();
-        results.unused_dependencies.push(UnusedDependency {
-            package_name: "lodash".to_string(),
-            location: DependencyLocation::Dependencies,
-            path: root.join("package.json"),
-            line: 7,
-        });
-
-        let sarif = build_sarif(&results, &root, &RulesConfig::default());
-        let entry = &sarif["runs"][0]["results"][0];
-        let region = &entry["locations"][0]["physicalLocation"]["region"];
-        assert_eq!(region["startLine"], 7);
-        assert_eq!(region["startColumn"], 1);
-    }
-
-    // ── Type-only dependency line == 0 skips region ──
-
-    #[test]
-    fn sarif_type_only_dep_line_zero_skips_region() {
-        let root = PathBuf::from("/project");
-        let mut results = AnalysisResults::default();
-        results.type_only_dependencies.push(TypeOnlyDependency {
-            package_name: "zod".to_string(),
-            path: root.join("package.json"),
-            line: 0,
-        });
-
-        let sarif = build_sarif(&results, &root, &RulesConfig::default());
-        let entry = &sarif["runs"][0]["results"][0];
-        let phys = &entry["locations"][0]["physicalLocation"];
-        assert!(phys.get("region").is_none());
-    }
-
-    // ── Circular dependency line == 0 skips region ──
-
-    #[test]
-    fn sarif_circular_dep_line_zero_skips_region() {
-        let root = PathBuf::from("/project");
-        let mut results = AnalysisResults::default();
-        results.circular_dependencies.push(CircularDependency {
-            files: vec![root.join("src/a.ts"), root.join("src/b.ts")],
-            length: 2,
-            line: 0,
-            col: 0,
-            is_cross_package: false,
-        });
-
-        let sarif = build_sarif(&results, &root, &RulesConfig::default());
-        let entry = &sarif["runs"][0]["results"][0];
-        let phys = &entry["locations"][0]["physicalLocation"];
-        assert!(phys.get("region").is_none());
-    }
-
-    #[test]
-    fn sarif_circular_dep_line_nonzero_has_region() {
-        let root = PathBuf::from("/project");
-        let mut results = AnalysisResults::default();
-        results.circular_dependencies.push(CircularDependency {
-            files: vec![root.join("src/a.ts"), root.join("src/b.ts")],
-            length: 2,
-            line: 5,
-            col: 2,
-            is_cross_package: false,
-        });
-
-        let sarif = build_sarif(&results, &root, &RulesConfig::default());
-        let entry = &sarif["runs"][0]["results"][0];
-        let region = &entry["locations"][0]["physicalLocation"]["region"];
-        assert_eq!(region["startLine"], 5);
-        assert_eq!(region["startColumn"], 3);
-    }
-
-    // ── Unused optional dependency ──
-
-    #[test]
-    fn sarif_unused_optional_dependency_result() {
-        let root = PathBuf::from("/project");
-        let mut results = AnalysisResults::default();
-        results.unused_optional_dependencies.push(UnusedDependency {
-            package_name: "fsevents".to_string(),
-            location: DependencyLocation::OptionalDependencies,
-            path: root.join("package.json"),
-            line: 12,
-        });
-
-        let sarif = build_sarif(&results, &root, &RulesConfig::default());
-        let entry = &sarif["runs"][0]["results"][0];
-        assert_eq!(entry["ruleId"], "fallow/unused-optional-dependency");
-        let msg = entry["message"]["text"].as_str().unwrap();
-        assert!(msg.contains("optionalDependencies"));
-    }
-
-    // ── Enum and class member SARIF messages ──
-
-    #[test]
-    fn sarif_enum_member_message_format() {
-        let root = PathBuf::from("/project");
-        let mut results = AnalysisResults::default();
-        results
-            .unused_enum_members
-            .push(fallow_core::results::UnusedMember {
-                path: root.join("src/enums.ts"),
-                parent_name: "Color".to_string(),
-                member_name: "Purple".to_string(),
-                kind: fallow_core::extract::MemberKind::EnumMember,
-                line: 5,
-                col: 2,
-            });
-
-        let sarif = build_sarif(&results, &root, &RulesConfig::default());
-        let entry = &sarif["runs"][0]["results"][0];
-        assert_eq!(entry["ruleId"], "fallow/unused-enum-member");
-        let msg = entry["message"]["text"].as_str().unwrap();
-        assert!(msg.contains("Enum member 'Color.Purple'"));
-        let region = &entry["locations"][0]["physicalLocation"]["region"];
-        assert_eq!(region["startColumn"], 3); // col 2 + 1
-    }
-
-    #[test]
-    fn sarif_class_member_message_format() {
-        let root = PathBuf::from("/project");
-        let mut results = AnalysisResults::default();
-        results
-            .unused_class_members
-            .push(fallow_core::results::UnusedMember {
-                path: root.join("src/service.ts"),
-                parent_name: "API".to_string(),
-                member_name: "fetch".to_string(),
-                kind: fallow_core::extract::MemberKind::ClassMethod,
-                line: 10,
-                col: 4,
-            });
-
-        let sarif = build_sarif(&results, &root, &RulesConfig::default());
-        let entry = &sarif["runs"][0]["results"][0];
-        assert_eq!(entry["ruleId"], "fallow/unused-class-member");
-        let msg = entry["message"]["text"].as_str().unwrap();
-        assert!(msg.contains("Class member 'API.fetch'"));
-    }
-
-    // ── Duplication SARIF ──
-
-    #[test]
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "test line/col values are trivially small"
-    )]
-    fn duplication_sarif_structure() {
-        use fallow_core::duplicates::*;
-
-        let root = PathBuf::from("/project");
-        let report = DuplicationReport {
-            clone_groups: vec![CloneGroup {
-                instances: vec![
-                    CloneInstance {
-                        file: root.join("src/a.ts"),
-                        start_line: 1,
-                        end_line: 10,
-                        start_col: 0,
-                        end_col: 0,
-                        fragment: String::new(),
-                    },
-                    CloneInstance {
-                        file: root.join("src/b.ts"),
-                        start_line: 5,
-                        end_line: 14,
-                        start_col: 2,
-                        end_col: 0,
-                        fragment: String::new(),
-                    },
-                ],
-                token_count: 50,
-                line_count: 10,
-            }],
-            clone_families: vec![],
-            mirrored_directories: vec![],
-            stats: DuplicationStats::default(),
-        };
-
-        let sarif = serde_json::json!({
-            "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
-            "version": "2.1.0",
-            "runs": [{
-                "tool": {
-                    "driver": {
-                        "name": "fallow",
-                        "version": env!("CARGO_PKG_VERSION"),
-                        "informationUri": "https://github.com/fallow-rs/fallow",
-                        "rules": [sarif_rule("fallow/code-duplication", "Duplicated code block", "warning")]
-                    }
-                },
-                "results": []
-            }]
-        });
-        // Just verify the function doesn't panic and produces expected structure
-        let _ = sarif;
-
-        // Test the actual build path through print_duplication_sarif internals
-        let mut sarif_results = Vec::new();
-        for (i, group) in report.clone_groups.iter().enumerate() {
-            for instance in &group.instances {
-                sarif_results.push(sarif_result(
-                    "fallow/code-duplication",
-                    "warning",
-                    &format!(
-                        "Code clone group {} ({} lines, {} instances)",
-                        i + 1,
-                        group.line_count,
-                        group.instances.len()
-                    ),
-                    &super::super::relative_uri(&instance.file, &root),
-                    Some((instance.start_line as u32, (instance.start_col + 1) as u32)),
-                ));
-            }
-        }
-        assert_eq!(sarif_results.len(), 2);
-        assert_eq!(sarif_results[0]["ruleId"], "fallow/code-duplication");
-        assert!(
-            sarif_results[0]["message"]["text"]
-                .as_str()
-                .unwrap()
-                .contains("10 lines")
-        );
-        let region0 = &sarif_results[0]["locations"][0]["physicalLocation"]["region"];
-        assert_eq!(region0["startLine"], 1);
-        assert_eq!(region0["startColumn"], 1); // start_col 0 + 1
-        let region1 = &sarif_results[1]["locations"][0]["physicalLocation"]["region"];
-        assert_eq!(region1["startLine"], 5);
-        assert_eq!(region1["startColumn"], 3); // start_col 2 + 1
-    }
-
-    // ── sarif_rule fallback (unknown rule ID) ──
-
-    #[test]
-    fn sarif_rule_known_id_has_full_description() {
-        let rule = sarif_rule("fallow/unused-file", "fallback text", "error");
-        assert!(rule.get("fullDescription").is_some());
-        assert!(rule.get("helpUri").is_some());
-    }
-
-    #[test]
-    fn sarif_rule_unknown_id_uses_fallback() {
+    fn sarif_rule_uses_fallback_for_unknown_rule() {
         let rule = sarif_rule("fallow/nonexistent", "fallback text", "warning");
+        assert_eq!(rule["id"], "fallow/nonexistent");
         assert_eq!(rule["shortDescription"]["text"], "fallback text");
         assert!(rule.get("fullDescription").is_none());
         assert!(rule.get("helpUri").is_none());
-        assert_eq!(rule["defaultConfiguration"]["level"], "warning");
-    }
-
-    // ── sarif_result without region ──
-
-    #[test]
-    fn sarif_result_no_region_omits_region_key() {
-        let result = sarif_result("rule/test", "error", "test msg", "src/file.ts", None);
-        let phys = &result["locations"][0]["physicalLocation"];
-        assert!(phys.get("region").is_none());
-        assert_eq!(phys["artifactLocation"]["uri"], "src/file.ts");
     }
 
     #[test]
-    fn sarif_result_with_region_includes_region() {
-        let result = sarif_result(
-            "rule/test",
-            "error",
-            "test msg",
-            "src/file.ts",
-            Some((10, 5)),
+    fn saved_renderer_uses_native_rule_ids_for_non_slug_titles() {
+        assert_eq!(
+            native_rule_id("Unused devDependency"),
+            "fallow/unused-dev-dependency"
         );
-        let region = &result["locations"][0]["physicalLocation"]["region"];
-        assert_eq!(region["startLine"], 10);
-        assert_eq!(region["startColumn"], 5);
+        assert_eq!(
+            native_rule_id("Dynamic segment conflict"),
+            "fallow/dynamic-segment-name-conflict"
+        );
+        assert_eq!(
+            native_rule_id("Runtime coverage (safe_to_delete)"),
+            "fallow/runtime-safe-to-delete"
+        );
+        assert_eq!(
+            native_rule_id("High cyclomatic complexity (high)"),
+            "fallow/high-cyclomatic-complexity"
+        );
+        assert_eq!(
+            native_rule_id("High cognitive complexity (moderate)"),
+            "fallow/high-cognitive-complexity"
+        );
+        assert_eq!(
+            native_rule_id("High CRAP score (critical)"),
+            "fallow/high-crap-score"
+        );
     }
 
-    // ── Health SARIF refactoring targets ──
-
     #[test]
-    fn health_sarif_includes_refactoring_targets() {
-        use crate::health_types::*;
-
-        let root = PathBuf::from("/project");
-        let report = HealthReport {
-            summary: HealthSummary {
-                files_analyzed: 10,
-                functions_analyzed: 50,
-                ..Default::default()
-            },
-            targets: vec![RefactoringTarget {
-                path: root.join("src/complex.ts"),
-                priority: 85.0,
-                efficiency: 42.5,
-                recommendation: "Split high-impact file".into(),
-                category: RecommendationCategory::SplitHighImpact,
-                effort: EffortEstimate::Medium,
-                confidence: Confidence::High,
-                factors: vec![],
-                evidence: None,
+    fn stored_envelope_renders_sarif_with_semantic_provenance() {
+        let envelope = serde_json::json!({
+            "kind": "dead-code",
+            "unused_exports": [{
+                "path": "src/dead.ts",
+                "line": 7,
+                "col": 2,
+                "export_name": "dead",
+                "is_type_only": false,
+                "is_re_export": false
             }],
-            ..Default::default()
-        };
-
-        let sarif = build_health_sarif(&report, &root);
-        let entries = sarif["runs"][0]["results"].as_array().unwrap();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0]["ruleId"], "fallow/refactoring-target");
-        assert_eq!(entries[0]["level"], "warning");
-        let msg = entries[0]["message"]["text"].as_str().unwrap();
-        assert!(msg.contains("high impact"));
-        assert!(msg.contains("Split high-impact file"));
-        assert!(msg.contains("42.5"));
-    }
-
-    #[test]
-    fn health_sarif_includes_coverage_gaps() {
-        use crate::health_types::*;
-
-        let root = PathBuf::from("/project");
-        let report = HealthReport {
-            summary: HealthSummary {
-                files_analyzed: 10,
-                functions_analyzed: 50,
-                ..Default::default()
-            },
-            coverage_gaps: Some(CoverageGaps {
-                summary: CoverageGapSummary {
-                    runtime_files: 2,
-                    covered_files: 0,
-                    file_coverage_pct: 0.0,
-                    untested_files: 1,
-                    untested_exports: 1,
-                },
-                files: vec![UntestedFile {
-                    path: root.join("src/app.ts"),
-                    value_export_count: 2,
-                }],
-                exports: vec![UntestedExport {
-                    path: root.join("src/app.ts"),
-                    export_name: "loader".into(),
-                    line: 12,
-                    col: 4,
-                }],
-            }),
-            ..Default::default()
-        };
-
-        let sarif = build_health_sarif(&report, &root);
-        let entries = sarif["runs"][0]["results"].as_array().unwrap();
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0]["ruleId"], "fallow/untested-file");
-        assert_eq!(
-            entries[0]["locations"][0]["physicalLocation"]["artifactLocation"]["uri"],
-            "src/app.ts"
-        );
-        assert!(
-            entries[0]["message"]["text"]
-                .as_str()
-                .unwrap()
-                .contains("2 value exports")
-        );
-        assert_eq!(entries[1]["ruleId"], "fallow/untested-export");
-        assert_eq!(
-            entries[1]["locations"][0]["physicalLocation"]["region"]["startLine"],
-            12
-        );
-        assert_eq!(
-            entries[1]["locations"][0]["physicalLocation"]["region"]["startColumn"],
-            5
-        );
-    }
-
-    // ── Health SARIF rules include fullDescription from explain module ──
-
-    #[test]
-    fn health_sarif_rules_have_full_descriptions() {
-        let root = PathBuf::from("/project");
-        let report = crate::health_types::HealthReport::default();
-        let sarif = build_health_sarif(&report, &root);
-        let rules = sarif["runs"][0]["tool"]["driver"]["rules"]
-            .as_array()
-            .unwrap();
-        for rule in rules {
-            let id = rule["id"].as_str().unwrap();
-            assert!(
-                rule.get("fullDescription").is_some(),
-                "health rule {id} should have fullDescription"
-            );
-            assert!(
-                rule.get("helpUri").is_some(),
-                "health rule {id} should have helpUri"
-            );
-        }
-    }
-
-    // ── Warn severity propagates correctly ──
-
-    #[test]
-    fn sarif_warn_severity_produces_warning_level() {
-        let root = PathBuf::from("/project");
-        let mut results = AnalysisResults::default();
-        results.unused_files.push(UnusedFile {
-            path: root.join("src/dead.ts"),
+            "_meta": {
+                "type_aware": {
+                    "backend": "typescript-go",
+                    "queries": [{
+                        "query_id": 1,
+                        "capability": "symbol-use",
+                        "status": "partial",
+                        "assertion": "evidence-bounded",
+                        "reason_code": "evidence-limit"
+                    }, {
+                        "query_id": 2,
+                        "capability": "symbol-use",
+                        "status": "partial",
+                        "assertion": "evidence-bounded",
+                        "reason_code": "evidence-limit"
+                    }]
+                }
+            }
         });
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("workspace root");
 
+        let sarif = envelope_sarif_document(EnvelopeKind::DeadCode, &envelope, root);
+
+        assert_eq!(sarif["version"], "2.1.0");
+        assert_eq!(
+            sarif["runs"][0]["results"][0]["ruleId"],
+            "fallow/unused-export"
+        );
+        assert_eq!(
+            sarif["runs"][0]["properties"]["typeAware"]["backend"],
+            "typescript-go"
+        );
+        assert_eq!(
+            sarif["runs"][0]["invocations"][0]["toolExecutionNotifications"][0]["properties"]["reasonCode"],
+            "evidence-limit"
+        );
+        assert_eq!(
+            sarif["runs"][0]["invocations"][0]["toolExecutionNotifications"]
+                .as_array()
+                .map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(
+            sarif["runs"][0]["invocations"][0]["toolExecutionNotifications"][0]["properties"]["queryCount"],
+            2
+        );
+        assert_eq!(
+            sarif["runs"][0]["invocations"][0]["toolExecutionNotifications"][0]["properties"]["queryIds"],
+            serde_json::json!([1, 2])
+        );
+    }
+
+    #[test]
+    fn stored_dead_code_sarif_preserves_native_rule_contract() {
+        let root = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            root.path().join(".fallowrc.json"),
+            r#"{"rules":{"unused-files":"warn"}}"#,
+        )
+        .expect("write config");
+        let mut results = AnalysisResults::default();
+        results
+            .unused_files
+            .push(UnusedFileFinding::with_actions(UnusedFile {
+                path: root.path().join("src/dead.ts"),
+            }));
         let rules = RulesConfig {
             unused_files: Severity::Warn,
             ..RulesConfig::default()
         };
+        let direct = api_sarif_document(&results, root.path(), &rules);
+        let mut envelope = serde_json::to_value(&results).expect("serialize results");
+        envelope["kind"] = serde_json::json!("dead-code");
+        fallow_output::strip_root_prefix(&mut envelope, &format!("{}/", root.path().display()));
 
-        let sarif = build_sarif(&results, &root, &rules);
-        let entry = &sarif["runs"][0]["results"][0];
-        assert_eq!(entry["level"], "warning");
-    }
+        let saved = envelope_sarif_document(EnvelopeKind::DeadCode, &envelope, root.path());
 
-    // ── Unused file has no region ──
-
-    #[test]
-    fn sarif_unused_file_has_no_region() {
-        let root = PathBuf::from("/project");
-        let mut results = AnalysisResults::default();
-        results.unused_files.push(UnusedFile {
-            path: root.join("src/dead.ts"),
-        });
-
-        let sarif = build_sarif(&results, &root, &RulesConfig::default());
-        let entry = &sarif["runs"][0]["results"][0];
-        let phys = &entry["locations"][0]["physicalLocation"];
-        assert!(phys.get("region").is_none());
-    }
-
-    // ── Multiple unlisted deps with multiple import sites ──
-
-    #[test]
-    fn sarif_unlisted_dep_multiple_import_sites() {
-        let root = PathBuf::from("/project");
-        let mut results = AnalysisResults::default();
-        results.unlisted_dependencies.push(UnlistedDependency {
-            package_name: "dotenv".to_string(),
-            imported_from: vec![
-                ImportSite {
-                    path: root.join("src/a.ts"),
-                    line: 1,
-                    col: 0,
-                },
-                ImportSite {
-                    path: root.join("src/b.ts"),
-                    line: 5,
-                    col: 0,
-                },
-            ],
-        });
-
-        let sarif = build_sarif(&results, &root, &RulesConfig::default());
-        let entries = sarif["runs"][0]["results"].as_array().unwrap();
-        // One SARIF result per import site
-        assert_eq!(entries.len(), 2);
+        assert_eq!(saved["runs"][0]["results"], direct["runs"][0]["results"]);
         assert_eq!(
-            entries[0]["locations"][0]["physicalLocation"]["artifactLocation"]["uri"],
-            "src/a.ts"
+            saved["runs"][0]["results"][0]["ruleId"],
+            direct["runs"][0]["results"][0]["ruleId"]
         );
         assert_eq!(
-            entries[1]["locations"][0]["physicalLocation"]["artifactLocation"]["uri"],
-            "src/b.ts"
+            saved["runs"][0]["results"][0]["level"],
+            direct["runs"][0]["results"][0]["level"]
         );
+        assert_eq!(
+            sarif_rule_ids(&saved),
+            sarif_rule_ids(&direct),
+            "saved rendering must preserve the native rule registry order"
+        );
+        let direct_rule = rule_by_id(&direct, "fallow/unused-file");
+        let saved_rule = rule_by_id(&saved, "fallow/unused-file");
+        assert_eq!(
+            saved_rule["defaultConfiguration"],
+            direct_rule["defaultConfiguration"]
+        );
+        assert_eq!(
+            saved_rule["fullDescription"],
+            direct_rule["fullDescription"]
+        );
+        assert_eq!(saved_rule["helpUri"], direct_rule["helpUri"]);
     }
 
-    // ── Empty unlisted dep (no import sites) produces zero results ──
-
     #[test]
-    fn sarif_unlisted_dep_no_import_sites() {
-        let root = PathBuf::from("/project");
-        let mut results = AnalysisResults::default();
-        results.unlisted_dependencies.push(UnlistedDependency {
-            package_name: "phantom".to_string(),
-            imported_from: vec![],
+    fn stored_sarif_uses_explicit_report_config() {
+        let root = tempfile::tempdir().expect("root");
+        std::fs::write(
+            root.path().join(".fallowrc.json"),
+            r#"{"rules":{"unused-files":"warn"}}"#,
+        )
+        .expect("write discovered config");
+        let explicit = root.path().join("ci.json");
+        std::fs::write(&explicit, r#"{"rules":{"unused-files":"error"}}"#)
+            .expect("write explicit config");
+        let envelope = serde_json::json!({
+            "kind": "dead-code",
+            "unused_files": [{"path": "src/dead.ts"}]
         });
 
-        let sarif = build_sarif(&results, &root, &RulesConfig::default());
-        let entries = sarif["runs"][0]["results"].as_array().unwrap();
-        // No import sites => no SARIF results for this unlisted dep
-        assert!(entries.is_empty());
+        let saved = envelope_sarif_document_with_config(
+            EnvelopeKind::DeadCode,
+            &envelope,
+            root.path(),
+            Some(&explicit),
+        );
+
+        assert_eq!(saved["runs"][0]["results"][0]["level"], "error");
+    }
+
+    #[test]
+    fn stored_sarif_clamps_invalid_regions() {
+        let envelope = serde_json::json!({
+            "kind": "dead-code",
+            "unused_exports": [{
+                "path": "src/dead.ts",
+                "line": 0,
+                "col": 0,
+                "export_name": "dead",
+                "is_type_only": false,
+                "is_re_export": false
+            }]
+        });
+        let root = PathBuf::from("/project");
+
+        let saved = envelope_sarif_document(EnvelopeKind::DeadCode, &envelope, &root);
+        let region = &saved["runs"][0]["results"][0]["locations"][0]["physicalLocation"]["region"];
+
+        assert_eq!(region["startLine"], 1);
+        assert_eq!(region["startColumn"], 1);
     }
 }

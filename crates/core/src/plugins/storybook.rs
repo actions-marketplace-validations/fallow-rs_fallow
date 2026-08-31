@@ -5,7 +5,8 @@
 //! core.builder, and typescript.reactDocgen as referenced dependencies.
 
 use super::config_parser;
-use super::{Plugin, PluginResult};
+use super::{Plugin, PluginResult, ProvidedDependencyRule};
+use std::path::{Path, PathBuf};
 
 const ENABLERS: &[&str] = &["storybook", "@storybook/"];
 
@@ -19,6 +20,8 @@ const CONFIG_PATTERNS: &[&str] = &[".storybook/main.{ts,js,mjs,cjs}"];
 const ALWAYS_USED: &[&str] = &[
     ".storybook/main.{ts,js,mjs,cjs}",
     ".storybook/preview.{ts,tsx,js,jsx}",
+    ".storybook/preview-head.html",
+    ".storybook/preview-body.html",
     ".storybook/manager.{ts,tsx,js,jsx}",
 ];
 
@@ -38,6 +41,59 @@ const TOOLING_DEPENDENCIES: &[&str] = &[
     "@storybook/preview-api",
 ];
 
+const STORYBOOK_EXPORTS: &[&str] = &["*"];
+
+const MANAGER_EXACT_SPECIFIERS: &[&str] = &[
+    "react",
+    "react-dom",
+    "react-dom/client",
+    "@emotion/react",
+    "@emotion/styled",
+    "@storybook/components",
+    "@storybook/theming",
+    "storybook/manager-api",
+    "storybook/theming",
+    "storybook/core-events",
+];
+
+const MANAGER_SPECIFIER_PREFIXES: &[&str] = &["storybook/internal/"];
+
+fn manager_runtime_dependencies() -> Vec<ProvidedDependencyRule> {
+    vec![ProvidedDependencyRule::new(
+        ".storybook/manager.{ts,tsx,js,jsx}",
+        MANAGER_EXACT_SPECIFIERS.iter().copied(),
+        MANAGER_SPECIFIER_PREFIXES.iter().copied(),
+    )]
+}
+
+fn normalize_mount(to: Option<&str>) -> String {
+    let Some(to) = to else {
+        return "/".to_string();
+    };
+    let trimmed = to.trim();
+    if trimmed.is_empty() || trimmed == "/" {
+        return "/".to_string();
+    }
+    let with_slash = if trimmed.starts_with('/') {
+        trimmed.to_string()
+    } else {
+        format!("/{trimmed}")
+    };
+    with_slash.trim_end_matches('/').to_string()
+}
+
+fn resolve_static_dir_from(config_path: &Path, from: &str) -> PathBuf {
+    let path = Path::new(from);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        config_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(path)
+    }
+}
+
 define_plugin! {
     struct StorybookPlugin => "storybook",
     enablers: ENABLERS,
@@ -45,25 +101,25 @@ define_plugin! {
     config_patterns: CONFIG_PATTERNS,
     always_used: ALWAYS_USED,
     tooling_dependencies: TOOLING_DEPENDENCIES,
+    provided_dependencies: manager_runtime_dependencies(),
+    used_exports: [
+        ("**/*.stories.{ts,tsx,js,jsx,mdx}", STORYBOOK_EXPORTS),
+        (".storybook/**/*.{ts,tsx,js,jsx}", STORYBOOK_EXPORTS),
+    ],
     resolve_config(config_path, source, _root) {
         let mut result = PluginResult::default();
 
-        // Extract import sources as referenced dependencies
         let imports = config_parser::extract_imports(source, config_path);
         for imp in &imports {
             let dep = crate::resolve::extract_package_name(imp);
             result.referenced_dependencies.push(dep);
         }
 
-        // addons -> referenced dependencies
-        // Handles both string form ("@storybook/addon-essentials") and
-        // object form ({ name: "@storybook/addon-essentials", options: {} })
         let addons = config_parser::extract_config_shallow_strings(source, config_path, "addons");
         for addon in &addons {
             let dep = crate::resolve::extract_package_name(addon);
             result.referenced_dependencies.push(dep);
         }
-        // Second pass: extract all string values from addons (catches object { name: "..." } form)
         let addon_strings =
             config_parser::extract_config_property_strings(source, config_path, "addons");
         for s in &addon_strings {
@@ -73,8 +129,6 @@ define_plugin! {
             }
         }
 
-        // framework -> referenced dependency
-        // Can be a string or an object with a `.name` property
         if let Some(framework) =
             config_parser::extract_config_string(source, config_path, &["framework"])
         {
@@ -87,12 +141,17 @@ define_plugin! {
             result.referenced_dependencies.push(dep);
         }
 
-        // stories -> additional entry patterns (if string values)
         let stories = config_parser::extract_config_string_array(source, config_path, &["stories"]);
         result.extend_entry_patterns(stories);
 
-        // core.builder -> referenced dependency
-        // Can be a string or an object with a `.name` property
+        for (from, to) in
+            config_parser::extract_config_static_dir_entries(source, config_path, &["staticDirs"])
+        {
+            result
+                .static_dir_mappings
+                .push((resolve_static_dir_from(config_path, &from), normalize_mount(to.as_deref())));
+        }
+
         if let Some(builder) =
             config_parser::extract_config_string(source, config_path, &["core", "builder"])
         {
@@ -105,7 +164,6 @@ define_plugin! {
             result.referenced_dependencies.push(dep);
         }
 
-        // typescript.reactDocgen -> referenced dependency
         if let Some(docgen) = config_parser::extract_config_string(
             source,
             config_path,

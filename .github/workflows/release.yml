@@ -1,99 +1,231 @@
 name: Release
 
 on:
-  push:
-    tags:
-      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Version tag to publish, for example v3.11.0
+        required: true
+        type: string
+
+run-name: Release ${{ inputs.tag }} from ${{ github.sha }}
+
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 permissions: {}
 
 env:
   CARGO_TERM_COLOR: always
+  RELEASE_TAG: ${{ inputs.tag }}
 
 jobs:
-  publish-crates:
-    name: Publish Rust crates
-    needs: build
+  release-context:
+    name: Verify tag-last release context
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Verify dispatch inputs and release version
+        shell: bash
+        env:
+          TAG_NAME: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "::error::Release workflow must be dispatched from main"
+            exit 1
+          fi
+          if [[ ! "$TAG_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Release tag must match vMAJOR.MINOR.PATCH"
+            exit 1
+          fi
+          workspace_version="$(
+            sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' Cargo.toml
+          )"
+          if [ "$TAG_NAME" != "v${workspace_version}" ]; then
+            echo "::error::Release tag ${TAG_NAME} does not match workspace version ${workspace_version}"
+            exit 1
+          fi
+          # The npm wrapper is bumped in the release commit (step 2b of the
+          # maintainer flow); a stale wrapper means the release commit was
+          # assembled wrong, so fail the dispatch before anything builds.
+          wrapper_version="$(jq -r '.version' npm/fallow/package.json)"
+          if [ "$TAG_NAME" != "v${wrapper_version}" ]; then
+            echo "::error::npm wrapper version ${wrapper_version} does not match release tag ${TAG_NAME}"
+            exit 1
+          fi
+
+          # The type-aware companion is version-locked to the binary at runtime:
+          # the CLI refuses a companion whose version differs, so a release
+          # commit that bumped the workspace without bumping the companion
+          # ships a CLI that cannot run type-aware analysis. Catch it here,
+          # before anything is built, tagged or published, rather than in the
+          # Windows validation job or in the audit tests on main.
+          #
+          # crates/napi is deliberately NOT checked here. Its platform packages
+          # do not exist on the registry until this workflow publishes them, so
+          # the committed manifests stay at the last published version until the
+          # post-release catch-up. Bumping them early breaks the publish tree.
+          WORKSPACE_VERSION="$workspace_version" python3 - <<'PY'
+          import json, os, sys
+
+          expected = os.environ["WORKSPACE_VERSION"]
+          root = "tools/type-aware-sidecar"
+          manifest = json.load(open(f"{root}/package.json"))
+          lock = json.load(open(f"{root}/package-lock.json"))
+
+          found = {
+              f"{root}/package.json": manifest["version"],
+              f"{root}/package-lock.json version": lock["version"],
+              f'{root}/package-lock.json packages[""]': lock["packages"][""]["version"],
+          }
+          stale = {path: value for path, value in found.items() if value != expected}
+          if stale:
+              for path, value in stale.items():
+                  print(f"::error::{path} is {value}, expected {expected}")
+              print(
+                  "::error::bump the type-aware companion to "
+                  f"{expected} in the release commit. Set the version in those "
+                  "files directly; do not run scripts/sync-npm-versions.sh "
+                  "during a release, it also moves crates/napi ahead of publish."
+              )
+              sys.exit(1)
+          print(f"type-aware companion matches the workspace at {expected}")
+          PY
+
+      # Release immutability is verified in the maintainer release flow, not
+      # here. `repos/{owner}/{repo}/immutable-releases` requires the
+      # Administration read permission, which is not a grantable GITHUB_TOKEN
+      # scope: `administration: read` is rejected at workflow-parse time with
+      # HTTP 422, and `contents: read` gets HTTP 403 from the endpoint. The
+      # maintainer pre-flight reads it with personal credentials instead. Also
+      # note that `gh api --jq 'select(.enabled == true)'` is not a gate in any
+      # case: a disabled repository yields empty output and still exits 0.
+
+      - name: Verify release tag is absent
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          set +e
+          tag_error="$(
+            gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG_NAME}" 2>&1
+          )"
+          tag_status=$?
+          set -e
+          if [ "$tag_status" -eq 0 ]; then
+            echo "::error::Release tag ${TAG_NAME} already exists; tag creation must remain near the end"
+            exit 1
+          fi
+          if ! grep -qF "(HTTP 404)" <<<"$tag_error"; then
+            printf '%s\n' "$tag_error"
+            echo "::error::Could not prove that release tag ${TAG_NAME} is absent"
+            exit 1
+          fi
+
+  publish-crates:
+    name: Publish Rust crates
+    needs: [release-verified, release-assets]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: ./.github/actions/setup-rust
+        with:
+          # Dedicated cache scope; do not share with main / PR builds. A poisoned
+          # workspace cache from another job could otherwise be restored here and
+          # influence the bundle that `cargo package` produces.
+          cache-key: release-publish-crates
 
-      - name: Publish fallow-types
-        run: cargo publish -p fallow-types || echo "Already published, skipping"
+      # --no-verify skips the post-package verify-build. Verifying again here
+      # would compile every transitive dependency's build.rs with
+      # CARGO_REGISTRY_TOKEN available in the environment; a single compromised
+      # build script could exfiltrate the token. The same code already built
+      # cleanly in CI on the commit selected for this release, so the verify build
+      # is a redundant safety net we can drop on the privileged path.
+
+      - name: Authenticate to crates.io
+        id: crates_io_auth
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+
+      # Publish every workspace crate in dependency order. A crate that depends
+      # on a just-published sibling can race the crates.io index: the sibling
+      # uploads seconds earlier but the index has not propagated its new version
+      # yet, so `cargo publish` aborts with "failed to select a version for the
+      # requirement". The retry loop below waits that lag out.
+      #
+      # The error classification is load-bearing (incident v2.98.0). The old
+      # per-crate `|| echo "Already published, skipping"` swallowed EVERY
+      # failure, so fallow-cli's index-lag abort shipped a release with
+      # fallow-cli missing from crates.io while the job still reported success.
+      # Now: a genuine "already uploaded" is swallowed (idempotent re-runs),
+      # index-lag and clear network-transient errors are retried with backoff,
+      # and any OTHER failure fails the step instead of being masked.
+      - name: Publish crates to crates.io
+        shell: bash
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-
-      - name: Wait for crates.io index
-        run: sleep 30
-
-      - name: Publish fallow-config
-        run: cargo publish -p fallow-config || echo "Already published, skipping"
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-
-      - name: Wait for crates.io index
-        run: sleep 30
-
-      - name: Publish fallow-extract
-        run: cargo publish -p fallow-extract || echo "Already published, skipping"
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-
-      - name: Wait for crates.io index
-        run: sleep 30
-
-      - name: Publish fallow-graph
-        run: cargo publish -p fallow-graph || echo "Already published, skipping"
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-
-      - name: Wait for crates.io index
-        run: sleep 30
-
-      - name: Publish fallow-core
-        run: cargo publish -p fallow-core || echo "Already published, skipping"
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-
-      - name: Wait for crates.io index
-        run: sleep 30
-
-      - name: Publish fallow-license
-        run: cargo publish -p fallow-license || echo "Already published, skipping"
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-
-      - name: Wait for crates.io index
-        run: sleep 30
-
-      - name: Publish fallow-v8-coverage
-        run: cargo publish -p fallow-v8-coverage || echo "Already published, skipping"
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-
-      - name: Wait for crates.io index
-        run: sleep 30
-
-      - name: Publish fallow-cli
-        run: cargo publish -p fallow-cli || echo "Already published, skipping"
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-
-      - name: Wait for crates.io index
-        run: sleep 30
-
-      - name: Publish fallow-mcp
-        run: cargo publish -p fallow-mcp || echo "Already published, skipping"
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates_io_auth.outputs.token }}
+        run: |
+          set -uo pipefail
+          publish() {
+            crate="$1"
+            attempt=1
+            max_attempts=8
+            while :; do
+              if out=$(cargo publish -p "$crate" --no-verify 2>&1); then
+                printf '%s\n' "$out"
+                echo "::notice::${crate}: published"
+                return 0
+              fi
+              printf '%s\n' "$out"
+              # Already on the registry (idempotent re-run) -> not an error.
+              if printf '%s' "$out" | grep -qiE 'already (been )?uploaded|already exists'; then
+                echo "::notice::${crate}: already published, skipping"
+                return 0
+              fi
+              # crates.io index lag for a just-published dependency, or a clear
+              # network-transient error -> wait and retry.
+              if [ "$attempt" -lt "$max_attempts" ] && printf '%s' "$out" | grep -qiE 'failed to select a version for the requirement|candidate versions found which did|429 Too Many Requests|50[234] |Service Unavailable|Gateway Time-?out|timed out|error sending request'; then
+                echo "::warning::${crate}: transient publish error (attempt ${attempt}/${max_attempts}); retrying in 30s"
+                sleep 30
+                attempt=$((attempt + 1))
+                continue
+              fi
+              # Anything else is a real failure: do NOT mask it.
+              echo "::error::${crate}: cargo publish failed and is neither already-published nor a known transient error"
+              return 1
+            done
+          }
+          first=1
+          for crate in fallow-types fallow-process fallow-config fallow-output fallow-extract fallow-graph fallow-security fallow-core fallow-engine fallow-api fallow-license fallow-v8-coverage fallow-cli fallow-mcp; do
+            # Settle delay between crates so a dependent crate usually finds its
+            # dependency already indexed; the retry loop is the real guarantee.
+            if [ "$first" = 0 ]; then sleep 30; fi
+            first=0
+            publish "$crate" || exit 1
+          done
 
   build:
     name: Build (${{ matrix.target }})
+    needs: release-context
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+    container: ${{ matrix.container }}
     permissions:
       contents: read
     strategy:
@@ -103,69 +235,109 @@ jobs:
           - target: x86_64-apple-darwin
             os: macos-latest
             binary: fallow
+            multicall_binary: fallow-multicall
             lsp_binary: fallow-lsp
             mcp_binary: fallow-mcp
             npm_dir: darwin-x64
           - target: aarch64-apple-darwin
             os: macos-latest
             binary: fallow
+            multicall_binary: fallow-multicall
             lsp_binary: fallow-lsp
             mcp_binary: fallow-mcp
             npm_dir: darwin-arm64
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
+            container: rust:1.97.1-bullseye@sha256:33e0cd779c556a248ac05acabb695c1da0cffaccc1796da507451482ac94d277
             binary: fallow
+            multicall_binary: fallow-multicall
             lsp_binary: fallow-lsp
             mcp_binary: fallow-mcp
             npm_dir: linux-x64-gnu
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
+            container: rust:1.97.1-bullseye@sha256:33e0cd779c556a248ac05acabb695c1da0cffaccc1796da507451482ac94d277
             binary: fallow
+            multicall_binary: fallow-multicall
             lsp_binary: fallow-lsp
             mcp_binary: fallow-mcp
             npm_dir: linux-arm64-gnu
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
             binary: fallow
+            multicall_binary: fallow-multicall
             lsp_binary: fallow-lsp
             mcp_binary: fallow-mcp
             npm_dir: linux-x64-musl
           - target: aarch64-unknown-linux-musl
             os: ubuntu-latest
             binary: fallow
+            multicall_binary: fallow-multicall
             lsp_binary: fallow-lsp
             mcp_binary: fallow-mcp
             npm_dir: linux-arm64-musl
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             binary: fallow.exe
+            multicall_binary: fallow-multicall.exe
             lsp_binary: fallow-lsp.exe
             mcp_binary: fallow-mcp.exe
             npm_dir: win32-x64-msvc
+          - target: aarch64-pc-windows-msvc
+            os: windows-11-arm
+            binary: fallow.exe
+            multicall_binary: fallow-multicall.exe
+            lsp_binary: fallow-lsp.exe
+            mcp_binary: fallow-mcp.exe
+            npm_dir: win32-arm64-msvc
 
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: ./.github/actions/setup-rust
         with:
           targets: ${{ matrix.target }}
-          cache-key: ${{ matrix.target }}
+          cache-key: ${{ matrix.target }}-${{ matrix.container || 'host' }}
 
-      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
         with:
           node-version: '22'
 
       - name: Install musl tools
         if: contains(matrix.target, 'musl')
         run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools
+          apt_get="apt-get"
+          if command -v sudo >/dev/null 2>&1; then
+            apt_get="sudo apt-get"
+          fi
+          $apt_get update
+          $apt_get install -y musl-tools
 
       - name: Install aarch64 cross-compilation tools
         if: contains(matrix.target, 'aarch64-unknown-linux')
         run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
+          apt_get="apt-get"
+          if command -v sudo >/dev/null 2>&1; then
+            apt_get="sudo apt-get"
+          fi
+          $apt_get update
+          $apt_get install -y gcc-aarch64-linux-gnu
+
+      # fallow-mcp pulls rquickjs (QuickJS, a C library). On aarch64-musl the
+      # glibc cross-gcc cannot link C objects into a musl binary, so the MCP
+      # build for this one target uses cargo-zigbuild (zig cc as a musl-capable
+      # C cross-compiler). Pinned to the pair validated locally against
+      # rquickjs-sys 0.12. x86_64-musl (native musl-gcc) and aarch64-gnu (glibc
+      # cross-gcc against a glibc target) keep the plain cargo build.
+      - name: Install cargo-zigbuild for aarch64-musl C cross-compile
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: |
+          python3 -m pip install --user --break-system-packages cargo-zigbuild==0.22.3 ziglang==0.16.0
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/cargo-zigbuild" --version
+          python3 -m ziglang version
 
       - name: Build CLI release binary
         run: cargo build --release --target ${{ matrix.target }} -p fallow-cli
@@ -180,31 +352,129 @@ jobs:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
 
       - name: Build MCP release binary
+        if: matrix.target != 'aarch64-unknown-linux-musl'
         run: cargo build --release --target ${{ matrix.target }} -p fallow-mcp
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
 
-      - name: Install NAPI package dependencies
-        run: cd crates/napi && npm ci --omit=optional
+      - name: Build MCP release binary (aarch64-musl, QuickJS C via zig)
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: cargo zigbuild --release --target ${{ matrix.target }} -p fallow-mcp
 
-      - name: Build NAPI addon
-        run: cd crates/napi && npx napi build --platform --release --target ${{ matrix.target }}
+      # The multicall binary bundles the CLI plus the LSP and MCP server libs
+      # into the single `fallow` binary the npm platform packages ship. Because
+      # it links the MCP lib, it pulls rquickjs (QuickJS, C) exactly like the
+      # standalone MCP binary, so the aarch64-musl leg needs cargo-zigbuild for
+      # the same reason (the glibc cross-gcc cannot link C into a musl binary).
+      # Every other target keeps the plain cargo build.
+      - name: Build multicall release binary
+        if: matrix.target != 'aarch64-unknown-linux-musl'
+        run: cargo build --release --target ${{ matrix.target }} -p fallow-multicall
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
 
+      - name: Build multicall release binary (aarch64-musl, QuickJS C via zig)
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: cargo zigbuild --release --target ${{ matrix.target }} -p fallow-multicall
+
+      # `${{ matrix.target }}` rather than a `$FALLOW_TARGET` env var: the
+      # Windows matrix entries run under pwsh, where `$FALLOW_TARGET` expands
+      # to an empty string and cargo fails with "target was empty".
+      - name: Build local similar-code provider
+        if: matrix.target != 'aarch64-unknown-linux-musl'
+        run: cargo build --locked --manifest-path tools/similar-code-sidecar/Cargo.toml --target-dir target --release --target ${{ matrix.target }}
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
+
+      - name: Build local similar-code provider (aarch64-musl via zig)
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: cargo zigbuild --locked --manifest-path tools/similar-code-sidecar/Cargo.toml --target-dir target --release --target ${{ matrix.target }}
+
+      - name: Install NAPI package dependencies
+        run: cd crates/napi && npm ci --omit=optional --ignore-scripts
+
+      - name: Build NAPI addon
+        run: cd crates/napi && npx napi build --platform --profile napi-release --no-js --target ${{ matrix.target }}
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
+
+      - name: Verify GNU glibc compatibility
+        if: contains(matrix.target, 'unknown-linux-gnu')
+        env:
+          FALLOW_BINARY: ${{ matrix.binary }}
+          FALLOW_LSP_BINARY: ${{ matrix.lsp_binary }}
+          FALLOW_MCP_BINARY: ${{ matrix.mcp_binary }}
+          FALLOW_MULTICALL_BINARY: ${{ matrix.multicall_binary }}
+          FALLOW_NPM_DIR: ${{ matrix.npm_dir }}
+          FALLOW_TARGET: ${{ matrix.target }}
+        run: |
+          ldd --version | head -n1
+          max_allowed="2.31"
+          if ! command -v readelf >/dev/null 2>&1; then
+            apt-get update
+            apt-get install -y binutils
+          fi
+
+          check_glibc_floor() {
+            artifact="$1"
+            if [ ! -f "$artifact" ]; then
+              echo "::error::$artifact missing"
+              exit 1
+            fi
+
+            max_required=$(
+              readelf --version-info "$artifact" |
+                sed -n 's/.*Name: GLIBC_\([0-9.]*\).*/\1/p' |
+                sort -Vu |
+                tail -n1
+            )
+
+            if [ -z "$max_required" ]; then
+              echo "$artifact: no dynamic GLIBC requirement found"
+              return 0
+            fi
+
+            echo "$artifact: requires GLIBC_$max_required"
+            highest=$(printf '%s\n%s\n' "$max_required" "$max_allowed" | sort -V | tail -n1)
+            if [ "$highest" != "$max_allowed" ]; then
+              echo "::error::$artifact requires GLIBC_$max_required; maximum allowed is GLIBC_$max_allowed"
+              exit 1
+            fi
+          }
+
+          check_glibc_floor "target/${FALLOW_TARGET}/release/${FALLOW_BINARY}"
+          check_glibc_floor "target/${FALLOW_TARGET}/release/${FALLOW_MULTICALL_BINARY}"
+          check_glibc_floor "target/${FALLOW_TARGET}/release/${FALLOW_LSP_BINARY}"
+          check_glibc_floor "target/${FALLOW_TARGET}/release/${FALLOW_MCP_BINARY}"
+          check_glibc_floor "target/${FALLOW_TARGET}/release/fallow-similar-code"
+          check_glibc_floor "crates/napi/fallow-node.${FALLOW_NPM_DIR}.node"
+
       - name: Package binaries (unix)
         if: runner.os != 'Windows'
+        env:
+          FALLOW_BINARY: ${{ matrix.binary }}
+          FALLOW_LSP_BINARY: ${{ matrix.lsp_binary }}
+          FALLOW_MCP_BINARY: ${{ matrix.mcp_binary }}
+          FALLOW_TARGET: ${{ matrix.target }}
         run: |
-          cd target/${{ matrix.target }}/release
-          tar czf ../../../fallow-${{ matrix.target }}.tar.gz ${{ matrix.binary }} ${{ matrix.lsp_binary }} ${{ matrix.mcp_binary }}
+          cd "target/${FALLOW_TARGET}/release"
+          tar czf "../../../fallow-${FALLOW_TARGET}.tar.gz" "$FALLOW_BINARY" "$FALLOW_LSP_BINARY" "$FALLOW_MCP_BINARY" fallow-similar-code
 
       - name: Package binaries (windows)
         if: runner.os == 'Windows'
+        shell: bash
+        env:
+          FALLOW_BINARY: ${{ matrix.binary }}
+          FALLOW_LSP_BINARY: ${{ matrix.lsp_binary }}
+          FALLOW_MCP_BINARY: ${{ matrix.mcp_binary }}
+          FALLOW_TARGET: ${{ matrix.target }}
         run: |
-          cd target/${{ matrix.target }}/release
-          7z a ../../../fallow-${{ matrix.target }}.zip ${{ matrix.binary }} ${{ matrix.lsp_binary }} ${{ matrix.mcp_binary }}
+          cd "target/${FALLOW_TARGET}/release"
+          7z a "../../../fallow-${FALLOW_TARGET}.zip" "$FALLOW_BINARY" "$FALLOW_LSP_BINARY" "$FALLOW_MCP_BINARY" fallow-similar-code.exe
 
       - name: Upload release artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -212,39 +482,100 @@ jobs:
           name: fallow-${{ matrix.target }}
           path: fallow-${{ matrix.target }}.*
 
-      - name: Rename CLI, LSP, and MCP binaries with target identifier (unix)
+      # `fallow-<npm_dir>` (standalone CLI), `fallow-lsp-<npm_dir>`, and
+      # `fallow-mcp-<npm_dir>` are the per-platform signed GitHub release assets
+      # (unchanged). `fallow-multicall-<npm_dir>` is the bundled binary the npm
+      # platform packages ship (as `fallow`); it is signed alongside the others
+      # below and staged into the npm payload, but is NOT a GitHub release asset.
+      - name: Rename CLI, LSP, MCP, and multicall binaries with target identifier (unix)
         if: runner.os != 'Windows'
+        env:
+          FALLOW_BINARY: ${{ matrix.binary }}
+          FALLOW_LSP_BINARY: ${{ matrix.lsp_binary }}
+          FALLOW_MCP_BINARY: ${{ matrix.mcp_binary }}
+          FALLOW_MULTICALL_BINARY: ${{ matrix.multicall_binary }}
+          FALLOW_NPM_DIR: ${{ matrix.npm_dir }}
+          FALLOW_TARGET: ${{ matrix.target }}
         run: |
-          cp target/${{ matrix.target }}/release/${{ matrix.binary }} fallow-${{ matrix.npm_dir }}
-          cp target/${{ matrix.target }}/release/${{ matrix.lsp_binary }} fallow-lsp-${{ matrix.npm_dir }}
-          cp target/${{ matrix.target }}/release/${{ matrix.mcp_binary }} fallow-mcp-${{ matrix.npm_dir }}
+          cp "target/${FALLOW_TARGET}/release/${FALLOW_BINARY}" "fallow-${FALLOW_NPM_DIR}"
+          cp "target/${FALLOW_TARGET}/release/${FALLOW_MULTICALL_BINARY}" "fallow-multicall-${FALLOW_NPM_DIR}"
+          cp "target/${FALLOW_TARGET}/release/${FALLOW_LSP_BINARY}" "fallow-lsp-${FALLOW_NPM_DIR}"
+          cp "target/${FALLOW_TARGET}/release/${FALLOW_MCP_BINARY}" "fallow-mcp-${FALLOW_NPM_DIR}"
+          cp "target/${FALLOW_TARGET}/release/fallow-similar-code" "fallow-similar-code-${FALLOW_NPM_DIR}"
 
-      - name: Rename CLI, LSP, and MCP binaries with target identifier (windows)
+      - name: Rename CLI, LSP, MCP, and multicall binaries with target identifier (windows)
         if: runner.os == 'Windows'
+        shell: bash
+        env:
+          FALLOW_BINARY: ${{ matrix.binary }}
+          FALLOW_LSP_BINARY: ${{ matrix.lsp_binary }}
+          FALLOW_MCP_BINARY: ${{ matrix.mcp_binary }}
+          FALLOW_MULTICALL_BINARY: ${{ matrix.multicall_binary }}
+          FALLOW_NPM_DIR: ${{ matrix.npm_dir }}
+          FALLOW_TARGET: ${{ matrix.target }}
         run: |
-          cp target/${{ matrix.target }}/release/${{ matrix.binary }} fallow-${{ matrix.npm_dir }}.exe
-          cp target/${{ matrix.target }}/release/${{ matrix.lsp_binary }} fallow-lsp-${{ matrix.npm_dir }}.exe
-          cp target/${{ matrix.target }}/release/${{ matrix.mcp_binary }} fallow-mcp-${{ matrix.npm_dir }}.exe
+          cp "target/${FALLOW_TARGET}/release/${FALLOW_BINARY}" "fallow-${FALLOW_NPM_DIR}.exe"
+          cp "target/${FALLOW_TARGET}/release/${FALLOW_MULTICALL_BINARY}" "fallow-multicall-${FALLOW_NPM_DIR}.exe"
+          cp "target/${FALLOW_TARGET}/release/${FALLOW_LSP_BINARY}" "fallow-lsp-${FALLOW_NPM_DIR}.exe"
+          cp "target/${FALLOW_TARGET}/release/${FALLOW_MCP_BINARY}" "fallow-mcp-${FALLOW_NPM_DIR}.exe"
+          cp "target/${FALLOW_TARGET}/release/fallow-similar-code.exe" "fallow-similar-code-${FALLOW_NPM_DIR}.exe"
+
+      - name: Verify binary-signing public key parity
+        shell: bash
+        env:
+          ED25519_BINARY_SIGNING_PUBLIC_KEY: ${{ vars.ED25519_BINARY_SIGNING_PUBLIC_KEY }}
+        run: node scripts/signing-key-parity.mjs --release-env
 
       - name: Sign raw binaries
         shell: bash
         env:
           ED25519_BINARY_SIGNING_PRIVATE_KEY: ${{ secrets.ED25519_BINARY_SIGNING_PRIVATE_KEY }}
           ED25519_BINARY_SIGNING_PUBLIC_KEY: ${{ vars.ED25519_BINARY_SIGNING_PUBLIC_KEY }}
+          FALLOW_NPM_DIR: ${{ matrix.npm_dir }}
+          FALLOW_RUNNER_OS: ${{ runner.os }}
         run: |
           ext=""
-          if [ "${{ runner.os }}" = "Windows" ]; then
+          if [ "$FALLOW_RUNNER_OS" = "Windows" ]; then
             ext=".exe"
           fi
 
           for bin in \
-            "fallow-${{ matrix.npm_dir }}${ext}" \
-            "fallow-lsp-${{ matrix.npm_dir }}${ext}" \
-            "fallow-mcp-${{ matrix.npm_dir }}${ext}"
+            "fallow-${FALLOW_NPM_DIR}${ext}" \
+            "fallow-multicall-${FALLOW_NPM_DIR}${ext}" \
+            "fallow-lsp-${FALLOW_NPM_DIR}${ext}" \
+            "fallow-mcp-${FALLOW_NPM_DIR}${ext}" \
+            "fallow-similar-code-${FALLOW_NPM_DIR}${ext}"
           do
             node .github/scripts/sign-binary.mjs "$bin" "${bin}.sig"
             node .github/scripts/verify-binary.mjs "$bin" "${bin}.sig"
           done
+
+      # The npm platform packages ship the multicall `fallow` binary and the
+      # exact-version local similar-code provider.
+      # (CLI + LSP + MCP linked into a single engine). Stage it plus its
+      # signature under the package's `fallow(.exe)` name so the "Upload npm
+      # binary" step carries exactly those two files into the npm-<platform>
+      # artifact, which `npm-prep` copies into `@fallow-cli/<platform>/`. The
+      # standalone per-binary GitHub release assets (`fallow-<npm_dir>`,
+      # `fallow-lsp-<npm_dir>`, `fallow-mcp-<npm_dir>`) are uploaded separately
+      # above and are unchanged. `npm/fallow/scripts/verify-binary.js` and the
+      # GitHub Action installer verify the Ed25519 signature, then cross-check
+      # SHA-256 against the release asset digest. Refs #465.
+      - name: Stage npm platform payload (multicall binary as fallow)
+        shell: bash
+        env:
+          FALLOW_NPM_DIR: ${{ matrix.npm_dir }}
+          FALLOW_RUNNER_OS: ${{ runner.os }}
+        run: |
+          ext=""
+          if [ "$FALLOW_RUNNER_OS" = "Windows" ]; then
+            ext=".exe"
+          fi
+          mkdir -p npm-payload
+          cp "fallow-multicall-${FALLOW_NPM_DIR}${ext}"     "npm-payload/fallow${ext}"
+          cp "fallow-multicall-${FALLOW_NPM_DIR}${ext}.sig" "npm-payload/fallow${ext}.sig"
+          cp "fallow-similar-code-${FALLOW_NPM_DIR}${ext}"     "npm-payload/fallow-similar-code${ext}"
+          cp "fallow-similar-code-${FALLOW_NPM_DIR}${ext}.sig" "npm-payload/fallow-similar-code${ext}.sig"
 
       - name: Upload CLI artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -270,14 +601,23 @@ jobs:
             fallow-mcp-${{ matrix.npm_dir }}${{ runner.os == 'Windows' && '.exe' || '' }}
             fallow-mcp-${{ matrix.npm_dir }}${{ runner.os == 'Windows' && '.exe' || '' }}.sig
 
+      - name: Upload similar-code provider artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: fallow-similar-code-${{ matrix.npm_dir }}
+          path: |
+            fallow-similar-code-${{ matrix.npm_dir }}${{ runner.os == 'Windows' && '.exe' || '' }}
+            fallow-similar-code-${{ matrix.npm_dir }}${{ runner.os == 'Windows' && '.exe' || '' }}.sig
+
       - name: Upload npm binary
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: npm-${{ matrix.npm_dir }}
           path: |
-            target/${{ matrix.target }}/release/${{ matrix.binary }}
-            target/${{ matrix.target }}/release/${{ matrix.lsp_binary }}
-            target/${{ matrix.target }}/release/${{ matrix.mcp_binary }}
+            npm-payload/fallow${{ runner.os == 'Windows' && '.exe' || '' }}
+            npm-payload/fallow${{ runner.os == 'Windows' && '.exe' || '' }}.sig
+            npm-payload/fallow-similar-code${{ runner.os == 'Windows' && '.exe' || '' }}
+            npm-payload/fallow-similar-code${{ runner.os == 'Windows' && '.exe' || '' }}.sig
 
       - name: Upload NAPI addon
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -285,56 +625,234 @@ jobs:
           name: napi-${{ matrix.npm_dir }}
           path: crates/napi/fallow-node.${{ matrix.npm_dir }}.node
 
-  release:
-    name: Create Release
+  validate:
+    name: Release validation
+    needs: release-context
+    uses: ./.github/workflows/release-validation.yml
+    permissions:
+      contents: read
+
+  similar-code-conformance:
+    name: Similar-code production conformance
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 75
     permissions:
-      contents: write
+      contents: read
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+        with:
+          node-version: '22'
+
+      - uses: taiki-e/install-action@6cd13508893c0e7eab5f273c2575d3859bd7229a # v2.86.6
+        with:
+          tool: cargo-audit
+
+      - uses: taiki-e/install-action@6cd13508893c0e7eab5f273c2575d3859bd7229a # v2.86.6
+        with:
+          tool: cargo-deny
+
+      - name: Download exact Linux x64 similar-code provider
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: fallow-similar-code-linux-x64-gnu
+          path: ${{ runner.temp }}/fallow-similar-code
+
+      - name: Prepare exact provider and isolated model cache
+        run: |
+          echo "SIDECAR_BIN=$RUNNER_TEMP/fallow-similar-code/fallow-similar-code-linux-x64-gnu" >> "$GITHUB_ENV"
+          echo "FALLOW_SIMILAR_CODE_CACHE_DIR=$RUNNER_TEMP/fallow-similar-code-cache" >> "$GITHUB_ENV"
+
+      - name: Verify signed provider and release size ceiling
+        env:
+          ED25519_BINARY_SIGNING_PUBLIC_KEY: ${{ vars.ED25519_BINARY_SIGNING_PUBLIC_KEY }}
+        run: |
+          set -euo pipefail
+          chmod +x "$SIDECAR_BIN"
+          node .github/scripts/verify-binary.mjs "$SIDECAR_BIN" "${SIDECAR_BIN}.sig"
+          actual_bytes=$(stat --format=%s "$SIDECAR_BIN")
+          maximum_bytes=$(jq -r '.release_binary_max_bytes' tools/similar-code-sidecar/audit-allowlist.json)
+          if [ "$actual_bytes" -gt "$maximum_bytes" ]; then
+            echo "::error::Similar-code provider is ${actual_bytes} bytes, above ${maximum_bytes}"
+            exit 1
+          fi
+          echo "Similar-code provider size: ${actual_bytes} bytes" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Verify temporary dependency audit ownership
+        run: |
+          set -euo pipefail
+          node scripts/check-similar-code-sidecar-audit.mjs
+          cargo audit \
+            --file tools/similar-code-sidecar/Cargo.lock \
+            --deny unmaintained \
+            --ignore RUSTSEC-2024-0436
+          cargo deny \
+            --manifest-path tools/similar-code-sidecar/Cargo.toml \
+            check licenses
+
+      - name: Cache verified pinned model artifacts
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v5
+        with:
+          path: ${{ runner.temp }}/fallow-similar-code-cache
+          key: similar-code-model-516f4baf13dec4ddddda8631e019b5737c8bc250-semantics-v1
+
+      - name: Set up the exact production model
+        run: |
+          "$SIDECAR_BIN" setup --local --json
+
+      - name: Compare production Candle output with the compact baseline
+        run: |
+          node scripts/semantic-clone-candle-conformance.mjs \
+            --sidecar-bin "$SIDECAR_BIN" \
+            --pretty > similar-code-candle-conformance.json
+          jq -r '
+            ["## Similar-code production conformance", "", "| Case | Similarity | Selected |", "| --- | ---: | :---: |"],
+            (.cases[] | "| \(.id) | \(.similarity) | \(.selected) |")
+          ' similar-code-candle-conformance.json >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload compact production conformance evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: similar-code-candle-conformance
+          path: similar-code-candle-conformance.json
+          if-no-files-found: error
+          retention-days: 30
+          include-hidden-files: false
+
+  release-assets:
+    name: Stage GitHub Release assets
+    needs: [release-verified, vscode-prep, vscode-host-smoke]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
       - name: Download all artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           path: artifacts
           pattern: fallow-*
 
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
-        with:
-          files: artifacts/**/*
-          generate_release_notes: false
-          draft: false
+      - name: Reconfirm release tag is absent
+        shell: bash
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Update stable action tags
-        env:
-          TAG_REF: ${{ github.ref }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ inputs.tag }}
         run: |
-          git tag -f v1 "${GITHUB_SHA}"
-          git push origin refs/tags/v1 --force
+          set -euo pipefail
+          set +e
+          tag_error="$(
+            gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG_NAME}" 2>&1
+          )"
+          tag_status=$?
+          set -e
+          if [ "$tag_status" -eq 0 ]; then
+            echo "::error::Release tag ${TAG_NAME} appeared before publication completed"
+            exit 1
+          fi
+          if ! grep -qF "(HTTP 404)" <<<"$tag_error"; then
+            printf '%s\n' "$tag_error"
+            echo "::error::Could not reconfirm that release tag ${TAG_NAME} is absent"
+            exit 1
+          fi
 
-  npm-publish:
-    name: Publish to npm
-    needs: [build, release]
+      - name: Assemble release asset bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -d '' assets < <(find artifacts -type f -print0)
+          if [ "${#assets[@]}" -eq 0 ]; then
+            echo "::error::No release assets were downloaded"
+            exit 1
+          fi
+
+          mkdir release-assets
+          declare -A asset_names=()
+          for asset in "${assets[@]}"; do
+            name="$(basename "$asset")"
+            if [[ -n "${asset_names[$name]+present}" ]]; then
+              echo "::error::Duplicate release asset name: ${name}"
+              exit 1
+            fi
+            asset_names["$name"]=1
+            cp "$asset" "release-assets/$name"
+          done
+
+      - name: Upload release asset bundle
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-assets
+          path: release-assets/
+          if-no-files-found: error
+          retention-days: 7
+          include-hidden-files: false
+
+      # The rolling v1/v3 action tags are pushed by the maintainer's release
+      # workflow, not from here: GITHUB_TOKEN can never update a ref whose diff
+      # touches .github/workflows/ (GitHub requires the workflows permission,
+      # which GITHUB_TOKEN cannot be granted), so the in-workflow push failed
+      # on the first release after any workflow edit (v3.4.2).
+
+  # The Dockerfile pins ARG FALLOW_VERSION plus two per-arch sha256 digests by
+  # hand. These are refreshed by the maintainer's release workflow, not from
+  # here. Like the crates/napi lockfile catch-up and the rolling v1/v3 tags,
+  # the pin depends on the musl
+  # binaries the `build` matrix compiles and `release-assets` stages, which only exist
+  # after the publish this workflow performs. The maintainer workflow downloads
+  # those assets, re-hashes them, runs
+  # .github/scripts/update-dockerfile-pins.mjs, and pushes the
+  # `chore(docker): pin ...` commit directly to main. The `Docker` job in
+  # ci.yml re-verifies the pin end-to-end on that commit. Refs #1817.
+
+  # Belt-and-suspenders generated contract drift check before either privileged
+  # publish job runs. PR CI runs `npm run generate:contracts:check` on every relevant
+  # contract change, but a release could in theory be dispatched from a commit where
+  # a committed generated surface disagrees with what regen would produce
+  # (force-push to main or history rewrite). The root
+  # bundle validates config/plugin/rule-pack schemas, output schema, npm
+  # capability metadata, issue registry export, TS output contracts, NAPI types,
+  # and agent docs.
+  # Failure here blocks `npm-publish` and both VSIX publisher jobs. Refs #416.
+  #
+  # Prep-tier job: `contents: read` only, no publish tokens, so running
+  # `pnpm install` here matches the release-workflow security boundary
+  # (untrusted-code-may-run is fine without tokens; tokens-present jobs
+  # never install).
+  release-verified:
+    name: Release verified
+    needs: [build, validate, similar-code-conformance]
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions: {}
+    steps:
+      - run: echo "Release artifacts and cross-platform checks passed"
+
+  # Build the npm publish tree (versioned package.json files, binaries, NAPI
+  # addons, schema) into immutable tarballs. This job runs no publish
+  # credentials. The split exists to keep `npm ci`, dependency install
+  # scripts, and any other untrusted-code execution off the privileged
+  # publish job. See the npm-publish job below for the matching pattern.
+  npm-prep:
+    name: Pack npm tarballs
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: read
-      id-token: write
-    env:
-      TAG_REF: ${{ github.ref }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
         with:
           node-version: '22'
-          registry-url: 'https://registry.npmjs.org'
-
-      - name: Ensure latest npm (for trusted publishing)
-        run: npm install -g npm@10.9.8 && npm install -g npm@latest
+          # Intentionally no registry-url: this job must not write
+          # NODE_AUTH_TOKEN to .npmrc. Auth lives in the publish job.
 
       - name: Download all npm binaries
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -351,56 +869,118 @@ jobs:
       - name: Organize binaries into npm directories
         run: |
           for dir in npm-artifacts/npm-*; do
-            target="npm/$(basename "$dir" | sed 's/^npm-//')"
+            platform="$(basename "$dir" | sed 's/^npm-//')"
+            target="npm/$platform"
             mkdir -p "$target"
             cp "$dir"/* "$target"/
+            sidecar_target="npm/fallow-similar-code-$platform"
+            mkdir -p "$sidecar_target"
+            cp "$dir"/fallow-similar-code* "$sidecar_target"/
           done
 
       - name: Set binary permissions
         run: |
-          for bin in npm/*/fallow npm/*/fallow-lsp npm/*/fallow-mcp; do
+          # Platform packages ship the multicall `fallow` binary and the local
+          # similar-code provider. Windows executables need no +x bit.
+          for bin in npm/*/fallow npm/*/fallow-similar-code; do
             [ -f "$bin" ] && chmod +x "$bin"
           done
 
       - name: Update versions
         run: |
-          VERSION="${TAG_REF#refs/tags/v}"
+          VERSION="${RELEASE_TAG#v}"
+          export PKG_VERSION="$VERSION"
           for pkg in npm/*/package.json; do
-            node -e "
-              const fs = require('fs');
-              const pkg = JSON.parse(fs.readFileSync('$pkg', 'utf8'));
-              pkg.version = '$VERSION';
+            PKG_PATH="$pkg" node -e '
+              const fs = require("fs");
+              const path = process.env.PKG_PATH;
+              const version = process.env.PKG_VERSION;
+              const pkg = JSON.parse(fs.readFileSync(path, "utf8"));
+              pkg.version = version;
               if (pkg.optionalDependencies) {
                 for (const key of Object.keys(pkg.optionalDependencies)) {
-                  if (key.startsWith('@fallow-cli/')) {
-                    pkg.optionalDependencies[key] = '$VERSION';
+                  // Companion roots must bump in lockstep: their launchers
+                  // require exact package versions.
+                  if (key.startsWith("@fallow-cli/") || key === "fallow-type-aware" || key === "fallow-similar-code") {
+                    pkg.optionalDependencies[key] = version;
                   }
                 }
               }
-              fs.writeFileSync('$pkg', JSON.stringify(pkg, null, 2) + '\n');
-            "
+              fs.writeFileSync(path, JSON.stringify(pkg, null, 2) + "\n");
+            '
+          done
+
+      # Embed each platform binary's SHA-256 digest into its platform
+      # package's package.json under the `fallowDigests` field. The npm
+      # postinstall script (`npm/fallow/scripts/verify-binary.js`) reads
+      # this field first and only falls back to the GitHub release API
+      # when it is absent. Without the embedded digest, shared-IP CI
+      # runners hit the 60 req/hr unauthenticated rate limit and the
+      # install aborts with `digest-unavailable`. PKG_PATH is set by the
+      # surrounding shell from a glob over npm/*/package.json, never from
+      # untrusted input. Refs #597.
+      - name: Embed SHA-256 digests into platform packages
+        run: |
+          for pkg in npm/*/package.json; do
+            PKG_PATH="$pkg" node -e '
+              const fs = require("fs");
+              const path = require("path");
+              const crypto = require("crypto");
+              const manifestPath = process.env.PKG_PATH;
+              const dir = path.dirname(manifestPath);
+              const pkg = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+              // Only platform packages (@fallow-cli/<platform>) ship binaries;
+              // the npm/fallow wrapper has no binaries to digest. Skip it
+              // silently so the same glob keeps working across both shapes.
+              if (typeof pkg.name !== "string" || !pkg.name.startsWith("@fallow-cli/")) {
+                process.exit(0);
+              }
+              const digests = {};
+              for (const entry of fs.readdirSync(dir)) {
+                if (entry.endsWith(".sig") || entry === "package.json" || entry === "README.md") {
+                  continue;
+                }
+                const full = path.join(dir, entry);
+                const stat = fs.statSync(full);
+                if (!stat.isFile()) continue;
+                digests[entry] = "sha256:" + crypto.createHash("sha256").update(fs.readFileSync(full)).digest("hex");
+              }
+              if (Object.keys(digests).length === 0) {
+                console.error("no binaries found in " + dir);
+                process.exit(1);
+              }
+              pkg.fallowDigests = digests;
+              fs.writeFileSync(manifestPath, JSON.stringify(pkg, null, 2) + "\n");
+              console.log(manifestPath + ": " + Object.keys(digests).join(", "));
+            '
           done
 
       - name: Install NAPI package dependencies
-        run: cd crates/napi && npm ci --omit=optional
+        # --ignore-scripts blocks dependency-tree install scripts here too, on
+        # top of the prep/publish split. The split (keeping dependency installs
+        # off the token-holding npm-publish job) is the primary guard; this is
+        # belt-and-suspenders. napi build does not need install scripts to
+        # produce the native addon, so disabling them is safe.
+        run: cd crates/napi && npm ci --omit=optional --ignore-scripts
 
       - name: Update NAPI package version
         run: |
-          VERSION="${TAG_REF#refs/tags/v}"
-          node -e "
-            const fs = require('fs');
-            const pkgPath = 'crates/napi/package.json';
-            const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
-            pkg.version = '$VERSION';
+          VERSION="${RELEASE_TAG#v}"
+          PKG_VERSION="$VERSION" node -e '
+            const fs = require("fs");
+            const path = "crates/napi/package.json";
+            const version = process.env.PKG_VERSION;
+            const pkg = JSON.parse(fs.readFileSync(path, "utf8"));
+            pkg.version = version;
             if (pkg.optionalDependencies) {
               for (const key of Object.keys(pkg.optionalDependencies)) {
-                if (key.startsWith('@fallow-cli/fallow-node')) {
-                  pkg.optionalDependencies[key] = '$VERSION';
+                if (key.startsWith("@fallow-cli/fallow-node") || key === "fallow-type-aware" || key === "fallow-similar-code") {
+                  pkg.optionalDependencies[key] = version;
                 }
               }
             }
-            fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + '\n');
-          "
+            fs.writeFileSync(path, JSON.stringify(pkg, null, 2) + "\n");
+          '
 
       - name: Prepare NAPI root package for publish
         run: cd crates/napi && npm run publish:prepare
@@ -416,127 +996,672 @@ jobs:
             cp "$dir"/* "$target"/
           done
 
-      - name: Publish platform packages
+      # Bundle the JSON schema into the fallow npm package so consumers
+      # can reference it from `node_modules/fallow/schema.json`. Without
+      # this, users either pin to a remote URL that drifts from the
+      # installed CLI version, or have to run `fallow config-schema`
+      # themselves and refresh on every upgrade. See
+      # https://github.com/fallow-rs/fallow/issues/275.
+      - name: Bundle schema.json into fallow package
         run: |
-          VERSION="${TAG_REF#refs/tags/v}"
-          FAILED=0
-          for dir in ./npm/darwin-arm64 ./npm/darwin-x64 ./npm/linux-x64-gnu ./npm/linux-arm64-gnu ./npm/linux-x64-musl ./npm/linux-arm64-musl ./npm/win32-x64-msvc; do
-            PKG_NAME=$(node -e "console.log(require('$dir/package.json').name)")
-            echo "Publishing $PKG_NAME@$VERSION..."
-            if npm view "$PKG_NAME@$VERSION" version >/dev/null 2>&1; then
-              echo "  Already published, skipping"
-              continue
+          cp schema.json npm/fallow/schema.json
+          # Document the cp invariant: npm/fallow/schema.json is the root
+          # schema.json verbatim. A future refactor that drops or moves the
+          # cp will fail loud here instead of silently shipping a stale
+          # schema to npm consumers. Refs #440.
+          diff schema.json npm/fallow/schema.json
+
+      - name: Pack tarballs
+        run: |
+          # Publish order matters: platform packages before their meta package,
+          # NAPI platform packages before the @fallow-cli/fallow-node root.
+          # Numbered subdirectories make the order explicit and survive the
+          # download/upload artifact round-trip; the publish job iterates them
+          # in sequence and publishes whatever .tgz it finds inside.
+          rm -rf tarballs
+          mkdir -p tarballs/10-cli-platform tarballs/12-similar-code-platform tarballs/15-companions tarballs/20-cli-root tarballs/30-napi-platform tarballs/40-napi-root
+
+          # Emit a manifest alongside the tarballs so the publish job can look
+          # up name/version without executing any code from inside a tarball.
+          : > tarballs/manifest.tsv
+
+          pack() {
+            local dest="$1"
+            local src="$2"
+            local name version filename pkg_path="$GITHUB_WORKSPACE/$src/package.json"
+            name=$(PKG_PATH="$pkg_path" node -p 'require(process.env.PKG_PATH).name')
+            version=$(PKG_PATH="$pkg_path" node -p 'require(process.env.PKG_PATH).version')
+            filename=$(cd "$dest" && npm pack --ignore-scripts "$GITHUB_WORKSPACE/$src" | tail -n1)
+            if [ -z "$filename" ] || [ ! -f "$dest/$filename" ]; then
+              echo "::error::npm pack produced no tarball for $src (filename='$filename')"
+              return 1
             fi
-            if ! npm publish "$dir" --access public --provenance; then
-              echo "  Provenance publish failed, retrying without provenance..."
-              if ! npm publish "$dir" --access public; then
-                echo "::error::Failed to publish $PKG_NAME@$VERSION"
-                FAILED=1
-              fi
-            fi
+            # Use tabs as separators; tarball paths and package names never
+            # contain tabs.
+            printf '%s\t%s\t%s\n' "$dest/$filename" "$name" "$version" >> tarballs/manifest.tsv
+          }
+
+          for dir in \
+            ./npm/darwin-arm64 \
+            ./npm/darwin-x64 \
+            ./npm/linux-x64-gnu \
+            ./npm/linux-arm64-gnu \
+            ./npm/linux-x64-musl \
+            ./npm/linux-arm64-musl \
+            ./npm/win32-x64-msvc \
+            ./npm/win32-arm64-msvc
+          do
+            pack tarballs/10-cli-platform "$dir"
           done
-          if [ "$FAILED" -eq 1 ]; then
-            exit 1
-          fi
 
-      - name: Publish fallow
-        run: |
-          VERSION="${TAG_REF#refs/tags/v}"
-          if npm view "fallow@$VERSION" version >/dev/null 2>&1; then
-            echo "fallow@$VERSION already published, skipping"
-          else
-            npm publish ./npm/fallow --access public --provenance --ignore-scripts || \
-              npm publish ./npm/fallow --access public --ignore-scripts
-          fi
-
-      - name: Publish NAPI platform packages
-        run: |
-          VERSION="${TAG_REF#refs/tags/v}"
-          FAILED=0
-          for dir in ./crates/napi/npm/darwin-arm64 ./crates/napi/npm/darwin-x64 ./crates/napi/npm/linux-x64-gnu ./crates/napi/npm/linux-arm64-gnu ./crates/napi/npm/linux-x64-musl ./crates/napi/npm/linux-arm64-musl ./crates/napi/npm/win32-x64-msvc; do
-            PKG_NAME=$(node -e "console.log(require('$dir/package.json').name)")
-            echo "Publishing $PKG_NAME@$VERSION..."
-            if npm view "$PKG_NAME@$VERSION" version >/dev/null 2>&1; then
-              echo "  Already published, skipping"
-              continue
-            fi
-            if ! npm publish "$dir" --access public --provenance; then
-              echo "  Provenance publish failed, retrying without provenance..."
-              if ! npm publish "$dir" --access public; then
-                echo "::error::Failed to publish $PKG_NAME@$VERSION"
-                FAILED=1
-              fi
-            fi
+          for dir in ./npm/fallow-similar-code-darwin-arm64 ./npm/fallow-similar-code-darwin-x64 ./npm/fallow-similar-code-linux-x64-gnu ./npm/fallow-similar-code-linux-arm64-gnu ./npm/fallow-similar-code-linux-x64-musl ./npm/fallow-similar-code-linux-arm64-musl ./npm/fallow-similar-code-win32-x64-msvc ./npm/fallow-similar-code-win32-arm64-msvc; do
+            pack tarballs/12-similar-code-platform "$dir"
           done
-          if [ "$FAILED" -eq 1 ]; then
-            exit 1
-          fi
 
-      - name: Publish fallow-node
+          pack tarballs/15-companions ./tools/type-aware-sidecar
+          pack tarballs/15-companions ./npm/fallow-similar-code
+          pack tarballs/20-cli-root ./npm/fallow
+
+          for dir in \
+            ./crates/napi/npm/darwin-arm64 \
+            ./crates/napi/npm/darwin-x64 \
+            ./crates/napi/npm/linux-x64-gnu \
+            ./crates/napi/npm/linux-arm64-gnu \
+            ./crates/napi/npm/linux-x64-musl \
+            ./crates/napi/npm/linux-arm64-musl \
+            ./crates/napi/npm/win32-x64-msvc \
+            ./crates/napi/npm/win32-arm64-msvc
+          do
+            pack tarballs/30-napi-platform "$dir"
+          done
+
+          pack tarballs/40-napi-root ./crates/napi
+
+          echo "--- manifest ---"
+          cat tarballs/manifest.tsv
+
+      # Fail the release if any packed tarball omits a file it declares in its
+      # own `files` whitelist. npm silently drops a `files` entry with no
+      # matching file on disk, so a broken `.sig` staging step would otherwise
+      # publish a platform package missing `fallow.sig` (the Action installer
+      # then hard-fails every install with `sig-missing`). Runs in the
+      # token-free prep job, before upload, so the publish job never sees a
+      # broken tarball. Refs #944.
+      - name: Verify packed tarballs contain every declared file
         run: |
-          VERSION="${TAG_REF#refs/tags/v}"
-          if npm view "@fallow-cli/fallow-node@$VERSION" version >/dev/null 2>&1; then
-            echo "@fallow-cli/fallow-node@$VERSION already published, skipping"
-          else
-            npm publish ./crates/napi --access public --provenance --ignore-scripts || \
-              npm publish ./crates/napi --access public --ignore-scripts
-          fi
+          node .github/scripts/verify-pack-contents.mjs \
+            tarballs/10-cli-platform/*.tgz \
+            tarballs/12-similar-code-platform/*.tgz \
+            tarballs/15-companions/*.tgz \
+            tarballs/20-cli-root/*.tgz
 
-  vscode-publish:
-    name: Publish VS Code Extension
-    needs: build
+      - name: Upload npm tarballs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: npm-tarballs
+          path: tarballs/
+          retention-days: 7
+          include-hidden-files: false
+
+  npm-publish:
+    name: Publish to npm
+    # Privileged job. Keep the surface tiny:
+    # - downloads pre-packed tarballs (no fresh checkout, no installs)
+    # - the only network calls are `npm publish` and the `npm view` precheck
+    # - --ignore-scripts on every publish blocks lifecycle scripts inside the
+    #   tarballs from executing here.
+    # Anything that needs `npm ci` or runs dependency code belongs in npm-prep.
+    needs: [npm-prep, release-assets]
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: read
+      id-token: write
     env:
-      TAG_REF: ${{ github.ref }}
+      # Bootstrap fallback. When NPM_TOKEN is present in repo secrets,
+      # setup-node writes it to .npmrc and `npm publish` authenticates
+      # with it. When the secret is absent (steady state, once every
+      # package has a trusted publisher registered), this stays empty
+      # and OIDC / trusted publishing handles auth exactly like today.
+      NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
 
-      - uses: pnpm/action-setup@08c4be7e2e672a47d11bd04269e27e5f3e8529cb # v6
+      # Pin the global npm to a known-good version. `npm@latest` would pull
+      # whatever tag is current at publish time; we keep this explicit so a
+      # compromised `latest` tag cannot land in the privileged job without a
+      # commit to this file.
+      #
+      # Two-step bootstrap is required on Node 22 runners. The runner's bundled
+      # npm has a broken dependency tree (`Cannot find module 'promise-retry'`)
+      # when asked to install npm@11.x directly. Installing npm@10.9.8 first
+      # repairs the tree so the second step (the actual pinned version that
+      # holds OIDC trusted-publishing config) can land. Both invocations carry
+      # --ignore-scripts so the supply-chain hardening surface stays narrow.
+      # See incident v2.71.0 -> v2.71.1.
+      - name: Install pinned npm (required for trusted publishing)
+        run: |
+          npm install -g --ignore-scripts npm@10.9.8
+          npm install -g --ignore-scripts npm@11.14.1
+
+      - name: Download npm tarballs
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: npm-tarballs
+          path: tarballs
+
+      - name: Publish all tarballs
+        shell: bash
+        run: |
+          if [ ! -s tarballs/manifest.tsv ]; then
+            echo "::error::tarballs/manifest.tsv missing or empty; npm-prep did not produce any tarballs"
+            exit 1
+          fi
+          VERSION="${RELEASE_TAG#v}"
+          # Fixed expected count: 8 cli platform + 8 similar-code platform +
+          # 2 companion roots + 1 cli root + 8 napi platform + 1 napi root = 28 entries. If this number changes, update the
+          # numbered-stage matrix in npm-prep AND this constant together.
+          EXPECTED=28
+          ACTUAL=$(wc -l < tarballs/manifest.tsv | tr -d ' ')
+          if [ "$ACTUAL" -ne "$EXPECTED" ]; then
+            echo "::error::Expected $EXPECTED tarballs in manifest, got $ACTUAL"
+            cat tarballs/manifest.tsv
+            exit 1
+          fi
+          expected_names=(
+            "@fallow-cli/darwin-arm64"
+            "@fallow-cli/darwin-x64"
+            "@fallow-cli/linux-x64-gnu"
+            "@fallow-cli/linux-arm64-gnu"
+            "@fallow-cli/linux-x64-musl"
+            "@fallow-cli/linux-arm64-musl"
+            "@fallow-cli/win32-x64-msvc"
+            "@fallow-cli/win32-arm64-msvc"
+            "@fallow-cli/fallow-similar-code-darwin-arm64"
+            "@fallow-cli/fallow-similar-code-darwin-x64"
+            "@fallow-cli/fallow-similar-code-linux-x64-gnu"
+            "@fallow-cli/fallow-similar-code-linux-arm64-gnu"
+            "@fallow-cli/fallow-similar-code-linux-x64-musl"
+            "@fallow-cli/fallow-similar-code-linux-arm64-musl"
+            "@fallow-cli/fallow-similar-code-win32-x64-msvc"
+            "@fallow-cli/fallow-similar-code-win32-arm64-msvc"
+            "fallow-type-aware"
+            "fallow-similar-code"
+            "fallow"
+            "@fallow-cli/fallow-node-darwin-arm64"
+            "@fallow-cli/fallow-node-darwin-x64"
+            "@fallow-cli/fallow-node-linux-x64-gnu"
+            "@fallow-cli/fallow-node-linux-arm64-gnu"
+            "@fallow-cli/fallow-node-linux-x64-musl"
+            "@fallow-cli/fallow-node-linux-arm64-musl"
+            "@fallow-cli/fallow-node-win32-x64-msvc"
+            "@fallow-cli/fallow-node-win32-arm64-msvc"
+            "@fallow-cli/fallow-node"
+          )
+          FAILED=0
+          index=0
+          # Manifest format (TSV): <tarball-path>\t<name>\t<version>. Rows are
+          # emitted in publish order by npm-prep, so we just walk top to bottom.
+          while IFS=$'\t' read -r file name version; do
+            [ -n "$file" ] || continue
+            expected_name="${expected_names[$index]}"
+            if [ "$name" != "$expected_name" ]; then
+              echo "::error::Manifest row $((index + 1)) expected $expected_name, got $name"
+              FAILED=1
+              index=$((index + 1))
+              continue
+            fi
+            if [ "$version" != "$VERSION" ]; then
+              echo "::error::Manifest row $((index + 1)) for $name has version $version, expected tag version $VERSION"
+              FAILED=1
+              index=$((index + 1))
+              continue
+            fi
+            if [ ! -f "$file" ]; then
+              echo "::error::Tarball missing: $file"
+              FAILED=1
+              index=$((index + 1))
+              continue
+            fi
+            actual_name=$(tar -xOf "$file" package/package.json | node -e 'const fs=require("fs"); console.log(JSON.parse(fs.readFileSync(0, "utf8")).name)')
+            actual_version=$(tar -xOf "$file" package/package.json | node -e 'const fs=require("fs"); console.log(JSON.parse(fs.readFileSync(0, "utf8")).version)')
+            if [ "$actual_name" != "$name" ] || [ "$actual_version" != "$version" ]; then
+              echo "::error::Tarball package.json mismatch for $file: manifest=$name@$version tarball=$actual_name@$actual_version"
+              FAILED=1
+              index=$((index + 1))
+              continue
+            fi
+            echo "Publishing $name@$version from $file"
+            if npm view "$name@$version" version >/dev/null 2>&1; then
+              echo "  Already published, skipping"
+              index=$((index + 1))
+              continue
+            fi
+            if ! npm publish "$file" --access public --provenance --ignore-scripts; then
+              echo "::error::Failed to publish $name@$version with npm provenance"
+              FAILED=1
+            fi
+            index=$((index + 1))
+          done < tarballs/manifest.tsv
+          if [ "$index" -ne "$EXPECTED" ]; then
+            echo "::error::Validated $index tarballs, expected $EXPECTED"
+            exit 1
+          fi
+          if [ "$FAILED" -eq 1 ]; then
+            exit 1
+          fi
+
+  # Build all marketplace variants in a job with no marketplace tokens.
+  # Publisher jobs below receive only this closed artifact set. They never
+  # check out or build repository code while a registry token is present.
+  vscode-prep:
+    name: Build VS Code target VSIX files
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
         with:
           version: 10.33.0
 
-      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
         with:
           node-version: '22'
           cache: pnpm
           cache-dependency-path: editors/vscode/pnpm-lock.yaml
 
       - name: Install dependencies
-        run: cd editors/vscode && pnpm install --frozen-lockfile
+        run: cd editors/vscode && pnpm install --frozen-lockfile --ignore-scripts
 
       - name: Update extension version
         run: |
-          VERSION="${TAG_REF#refs/tags/v}"
-          node -e "
-            const fs = require('fs');
-            const pkg = JSON.parse(fs.readFileSync('editors/vscode/package.json', 'utf8'));
-            pkg.version = '$VERSION';
-            fs.writeFileSync('editors/vscode/package.json', JSON.stringify(pkg, null, 2) + '\n');
-          "
+          VERSION="${RELEASE_TAG#v}"
+          PKG_VERSION="$VERSION" node -e '
+            const fs = require("fs");
+            const path = "editors/vscode/package.json";
+            const pkg = JSON.parse(fs.readFileSync(path, "utf8"));
+            pkg.version = process.env.PKG_VERSION;
+            fs.writeFileSync(path, JSON.stringify(pkg, null, 2) + "\n");
+          '
 
       - name: Copy LICENSE into extension directory
         run: cp LICENSE editors/vscode/LICENSE
 
-      - name: Build and package extension
+      - name: Build and verify target packages
         run: |
-          cd editors/vscode
-          pnpm build
-          pnpm package
+          pnpm --dir editors/vscode package:variants -- \
+            --output-dir "$RUNNER_TEMP/fallow-vscode-targets"
 
-      - name: Publish to VS Code Marketplace
-        run: cd editors/vscode && pnpm exec vsce publish --no-dependencies
-        env:
-          VSCE_PAT: ${{ secrets.VSCE_PAT }}
+      - name: Require the closed target artifact set
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/fallow-vscode-targets"
+          version="${RELEASE_TAG#v}"
+          targets=(
+            universal
+            darwin-arm64
+            darwin-x64
+            linux-arm64
+            linux-x64
+            win32-arm64
+            win32-x64
+          )
+          expected_files=(inventory.json SHA256SUMS)
+          for target in "${targets[@]}"; do
+            expected_files+=("fallow-vscode-${version}-${target}.vsix")
+          done
 
-      - name: Publish to Open VSX (Cursor, VSCodium)
-        run: cd editors/vscode && pnpm exec ovsx publish --no-dependencies
-        env:
-          OVSX_PAT: ${{ secrets.OVSX_PAT }}
+          mapfile -t actual_files < <(find "$root" -maxdepth 1 -type f -printf '%f\n' | sort)
+          mapfile -t expected_sorted < <(printf '%s\n' "${expected_files[@]}" | sort)
+          if ! diff -u \
+            <(printf '%s\n' "${expected_sorted[@]}") \
+            <(printf '%s\n' "${actual_files[@]}"); then
+            echo "::error::VSIX target artifact contains missing or unexpected files"
+            exit 1
+          fi
+          jq -e \
+            --arg version "$version" \
+            --argjson targets '[["universal",null],["darwin-arm64","darwin-arm64"],["darwin-x64","darwin-x64"],["linux-arm64","linux-arm64"],["linux-x64","linux-x64"],["win32-arm64","win32-arm64"],["win32-x64","win32-x64"]]' \
+            '.schemaVersion == 1 and .extensionVersion == $version and ([.entries[] | [.target, .targetPlatform]] == $targets)' \
+            "$root/inventory.json"
 
-      - name: Upload VSIX artifact
+      - name: Upload VSIX target artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: fallow-vscode
-          path: editors/vscode/*.vsix
+          name: fallow-vscode-targets
+          path: ${{ runner.temp }}/fallow-vscode-targets/
+          if-no-files-found: error
+          retention-days: 7
+          include-hidden-files: false
+
+  # Exercise the exact staged release packages with the matching release
+  # binaries before any registry token or GitHub release asset staging runs.
+  vscode-host-smoke:
+    name: VS Code release target host (${{ matrix.target }})
+    needs: vscode-prep
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 35
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux-x64
+            npm_dir: linux-x64-gnu
+            cli: fallow-linux-x64-gnu
+            lsp: fallow-lsp-linux-x64-gnu
+          - os: windows-latest
+            target: win32-x64
+            npm_dir: win32-x64-msvc
+            cli: fallow-win32-x64-msvc.exe
+            lsp: fallow-lsp-win32-x64-msvc.exe
+          - os: macos-15-intel
+            target: darwin-x64
+            npm_dir: darwin-x64
+            cli: fallow-darwin-x64
+            lsp: fallow-lsp-darwin-x64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+        with:
+          version: 10.33.0
+
+      - name: Initialize pnpm store on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $store = pnpm store path --silent
+          New-Item -ItemType Directory -Force -Path $store | Out-Null
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+          cache: pnpm
+          cache-dependency-path: editors/vscode/pnpm-lock.yaml
+
+      - name: Cache VS Code test download
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v5
+        with:
+          path: ${{ runner.temp }}/fallow-vscode-test-cache
+          key: release-vscode-host-${{ matrix.target }}-vscode-1.96.0
+
+      - name: Install VS Code dependencies
+        run: cd editors/vscode && pnpm install --frozen-lockfile --ignore-scripts
+
+      - name: Download exact prepared VSIX targets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: fallow-vscode-targets
+          path: ${{ runner.temp }}/fallow-vscode-targets
+
+      - name: Download matching release CLI
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: fallow-cli-${{ matrix.npm_dir }}
+          path: ${{ runner.temp }}/fallow-host-bin
+
+      - name: Download matching release LSP
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: fallow-lsp-${{ matrix.npm_dir }}
+          path: ${{ runner.temp }}/fallow-host-bin
+
+      - name: Prepare exact release binaries on Unix
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          CLI_NAME: ${{ matrix.cli }}
+          LSP_NAME: ${{ matrix.lsp }}
+        run: |
+          set -euo pipefail
+          cli="$RUNNER_TEMP/fallow-host-bin/$CLI_NAME"
+          lsp="$RUNNER_TEMP/fallow-host-bin/$LSP_NAME"
+          test -f "$cli"
+          test -f "$lsp"
+          chmod +x "$cli" "$lsp"
+          echo "FALLOW_BIN=$(realpath "$cli")" >> "$GITHUB_ENV"
+          echo "FALLOW_LSP_BIN=$(realpath "$lsp")" >> "$GITHUB_ENV"
+
+      - name: Prepare exact release binaries on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          CLI_NAME: ${{ matrix.cli }}
+          LSP_NAME: ${{ matrix.lsp }}
+        run: |
+          $cli = (Resolve-Path (Join-Path $env:RUNNER_TEMP "fallow-host-bin/$env:CLI_NAME")).Path
+          $lsp = (Resolve-Path (Join-Path $env:RUNNER_TEMP "fallow-host-bin/$env:LSP_NAME")).Path
+          "FALLOW_BIN=$cli" >> $env:GITHUB_ENV
+          "FALLOW_LSP_BIN=$lsp" >> $env:GITHUB_ENV
+
+      - name: Extract and verify the exact release VSIX on Unix
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          FALLOW_VSIX_TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          vsix="$RUNNER_TEMP/fallow-vscode-targets/fallow-vscode-$version-$FALLOW_VSIX_TARGET.vsix"
+          test -f "$vsix"
+          destination="$RUNNER_TEMP/fallow-vscode-$FALLOW_VSIX_TARGET"
+          unzip -q "$vsix" -d "$destination"
+          pnpm --dir editors/vscode verify:vsix "$destination/extension" "$vsix" \
+            --target "$FALLOW_VSIX_TARGET" --version "$version"
+          echo "FALLOW_EXTENSION_PATH=$(realpath "$destination/extension")" >> "$GITHUB_ENV"
+
+      - name: Extract and verify the exact release VSIX on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          FALLOW_VSIX_TARGET: ${{ matrix.target }}
+        run: |
+          $version = $env:RELEASE_TAG.Substring(1)
+          $vsix = Join-Path $env:RUNNER_TEMP "fallow-vscode-targets/fallow-vscode-$version-$env:FALLOW_VSIX_TARGET.vsix"
+          if (-not (Test-Path -PathType Leaf $vsix)) { throw "Expected target VSIX was not downloaded: $vsix" }
+          $archive = Join-Path $env:RUNNER_TEMP "fallow-vscode-$env:FALLOW_VSIX_TARGET.zip"
+          $destination = Join-Path $env:RUNNER_TEMP "fallow-vscode-$env:FALLOW_VSIX_TARGET"
+          Copy-Item $vsix $archive
+          Expand-Archive -Path $archive -DestinationPath $destination
+          pnpm --dir editors/vscode verify:vsix "$destination/extension" $vsix --target $env:FALLOW_VSIX_TARGET --version $version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $extensionPath = (Resolve-Path "$destination/extension").Path
+          "FALLOW_EXTENSION_PATH=$extensionPath" >> $env:GITHUB_ENV
+
+      - name: Run exact release target VSIX host smoke on Linux
+        if: runner.os == 'Linux'
+        env:
+          FALLOW_VSCODE_TEST_CACHE_PATH: ${{ runner.temp }}/fallow-vscode-test-cache
+        run: xvfb-run -a pnpm --dir editors/vscode run test:integration:real
+
+      - name: Run exact release target VSIX host smoke
+        if: runner.os != 'Linux'
+        env:
+          FALLOW_VSCODE_TEST_CACHE_PATH: ${{ runner.temp }}/fallow-vscode-test-cache
+        run: pnpm --dir editors/vscode run test:integration:real
+
+  vscode-publish-marketplace:
+    name: Publish VS Code Marketplace targets
+    needs: [vscode-prep, vscode-host-smoke, release-assets]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions: {}
+    steps:
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+        with:
+          node-version: '22'
+
+      - name: Download closed VSIX target artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: fallow-vscode-targets
+          path: vscode-targets
+
+      - name: Install VS Code Marketplace publisher
+        run: npm install -g --ignore-scripts @vscode/vsce@3.9.2
+
+      - name: Publish every target to VS Code Marketplace
+        shell: bash
+        env:
+          VSCE_PAT: ${{ secrets.VSCE_PAT }}
+        run: |
+          set -u
+          version="${RELEASE_TAG#v}"
+          targets=(universal darwin-arm64 darwin-x64 linux-arm64 linux-x64 win32-arm64 win32-x64)
+          mapfile -t files < <(jq -er '.entries[].file' vscode-targets/inventory.json)
+          if [ "${#files[@]}" -ne "${#targets[@]}" ]; then
+            echo "::error::Inventory does not contain the exact target count"
+            exit 1
+          fi
+          for index in "${!targets[@]}"; do
+            expected="fallow-vscode-${version}-${targets[$index]}.vsix"
+            if [ "${files[$index]}" != "$expected" ]; then
+              echo "::error::Unexpected inventory filename: ${files[$index]}"
+              exit 1
+            fi
+          done
+          failed=0
+          for file in "${files[@]}"; do
+            if [ ! -f "vscode-targets/$file" ]; then
+              echo "::error::Missing inventory file: $file"
+              failed=1
+              continue
+            fi
+            if ! vsce publish \
+              --packagePath "vscode-targets/$file" \
+              --no-dependencies \
+              --skip-duplicate; then
+              echo "::error::VS Code Marketplace publication failed for $file"
+              failed=1
+            fi
+          done
+          exit "$failed"
+
+  vscode-publish-open-vsx:
+    name: Publish Open VSX targets
+    needs: [vscode-prep, vscode-host-smoke, release-assets]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions: {}
+    steps:
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+        with:
+          node-version: '22'
+
+      - name: Download closed VSIX target artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: fallow-vscode-targets
+          path: vscode-targets
+
+      - name: Install Open VSX publisher
+        run: npm install -g --ignore-scripts ovsx@1.1.1
+
+      - name: Publish every target to Open VSX
+        shell: bash
+        env:
+          OVSX_PAT: ${{ secrets.OVSX_PAT }}
+        run: |
+          set -u
+          version="${RELEASE_TAG#v}"
+          targets=(universal darwin-arm64 darwin-x64 linux-arm64 linux-x64 win32-arm64 win32-x64)
+          mapfile -t files < <(jq -er '.entries[].file' vscode-targets/inventory.json)
+          if [ "${#files[@]}" -ne "${#targets[@]}" ]; then
+            echo "::error::Inventory does not contain the exact target count"
+            exit 1
+          fi
+          for index in "${!targets[@]}"; do
+            expected="fallow-vscode-${version}-${targets[$index]}.vsix"
+            if [ "${files[$index]}" != "$expected" ]; then
+              echo "::error::Unexpected inventory filename: ${files[$index]}"
+              exit 1
+            fi
+          done
+          failed=0
+          for file in "${files[@]}"; do
+            if [ ! -f "vscode-targets/$file" ]; then
+              echo "::error::Missing inventory file: $file"
+              failed=1
+              continue
+            fi
+            if ! ovsx publish \
+              "vscode-targets/$file" \
+              --no-dependencies \
+              --skip-duplicate; then
+              echo "::error::Open VSX publication failed for $file"
+              failed=1
+            fi
+          done
+          exit "$failed"
+
+  vscode-public-verify:
+    name: Verify public VS Code registry targets
+    needs: [vscode-prep, vscode-publish-marketplace, vscode-publish-open-vsx]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+        with:
+          node-version: '22'
+
+      - name: Download closed VSIX target artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: fallow-vscode-targets
+          path: vscode-targets
+
+      - name: Verify exact public registry payloads
+        run: node scripts/vscode-public-verify.mjs --artifact-dir vscode-targets
+
+  release-ready:
+    name: Release ready for signed tag
+    needs: [publish-crates, npm-publish, vscode-public-verify, release-assets]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Require the release tag to remain absent
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          set +e
+          tag_error="$(
+            gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG_NAME}" 2>&1
+          )"
+          tag_status=$?
+          set -e
+          if [ "$tag_status" -eq 0 ]; then
+            echo "::error::Release tag ${TAG_NAME} appeared before the release workflow completed"
+            exit 1
+          fi
+          if ! grep -qF "(HTTP 404)" <<<"$tag_error"; then
+            printf '%s\n' "$tag_error"
+            echo "::error::Could not prove that release tag ${TAG_NAME} remains absent"
+            exit 1
+          fi
+          echo "Release workflow completed with ${TAG_NAME} still absent"

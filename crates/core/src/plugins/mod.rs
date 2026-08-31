@@ -2,7 +2,7 @@
 //!
 //! Unlike knip's JavaScript plugin system that evaluates config files at runtime,
 //! fallow's plugin system uses Oxc's parser to extract configuration values from
-//! JS/TS/JSON config files via AST walking — no JavaScript evaluation needed.
+//! JS/TS/JSON config files via AST walking, no JavaScript evaluation needed.
 //!
 //! Each plugin implements the [`Plugin`] trait with:
 //! - **Static defaults**: Entry patterns, config file patterns, used exports
@@ -11,26 +11,35 @@
 
 use std::path::{Path, PathBuf};
 
-use fallow_config::{EntryPointRole, PackageJson, UsedClassMemberRule};
+use fallow_config::{AutoImportRule, EntryPointRole, PackageJson, UsedClassMemberRule};
+use fallow_types::semantic::SemanticFrameworkContract;
 use regex::Regex;
 
 const TEST_ENTRY_POINT_PLUGINS: &[&str] = &[
     "ava",
+    "bun",
+    "deno",
     "cucumber",
     "cypress",
     "jest",
+    "k6",
     "mocha",
     "playwright",
+    "tap",
+    "tsd",
     "vitest",
     "webdriverio",
 ];
 
 const RUNTIME_ENTRY_POINT_PLUGINS: &[&str] = &[
+    "adonis",
     "angular",
     "astro",
+    "browser-extension",
     "convex",
     "docusaurus",
     "electron",
+    "ember",
     "expo",
     "expo-router",
     "gatsby",
@@ -40,16 +49,19 @@ const RUNTIME_ENTRY_POINT_PLUGINS: &[&str] = &[
     "nextjs",
     "nitro",
     "nuxt",
+    "obsidian",
     "parcel",
     "qwik",
     "react-native",
     "react-router",
+    "redwoodsdk",
     "remix",
     "rolldown",
     "rollup",
     "rsbuild",
     "rspack",
     "sanity",
+    "supabase",
     "sveltekit",
     "tanstack-router",
     "tsdown",
@@ -58,50 +70,59 @@ const RUNTIME_ENTRY_POINT_PLUGINS: &[&str] = &[
     "vitepress",
     "webpack",
     "wrangler",
+    "wxt",
 ];
 
 #[cfg(test)]
 const SUPPORT_ENTRY_POINT_PLUGINS: &[&str] = &[
+    "content-collections",
+    "contentlayer",
+    "danger",
     "drizzle",
+    "fumadocs",
     "i18next",
     "knex",
     "kysely",
+    "mintlify",
     "msw",
+    "opencode",
     "prisma",
     "storybook",
+    "stryker",
     "typeorm",
+    "velite",
 ];
 
 /// Result of resolving a plugin's config file.
 #[derive(Debug, Default)]
 pub struct PluginResult {
     /// Additional entry point glob patterns discovered from config.
-    pub entry_patterns: Vec<PathRule>,
+    entry_patterns: Vec<PathRule>,
     /// When true, `entry_patterns` from config replace the plugin's static
     /// `entry_patterns()` defaults instead of adding to them. Tools like Vitest
     /// and Jest treat their config's include/testMatch as a replacement for built-in
     /// defaults, so when the config is explicit the static patterns must be dropped.
-    pub replace_entry_patterns: bool,
+    replace_entry_patterns: bool,
     /// When true, `used_exports` from config replace the plugin's static
     /// `used_export_rules()` defaults instead of adding to them.
-    pub replace_used_export_rules: bool,
+    replace_used_export_rules: bool,
     /// Additional export-usage rules discovered from config.
-    pub used_exports: Vec<UsedExportRule>,
+    used_exports: Vec<UsedExportRule>,
     /// Class member rules that should never be flagged as unused. Contributed
     /// by plugins that know their framework invokes these methods at runtime
     /// and may scope suppression via `extends` / `implements` constraints when
     /// the method name is too common to allowlist globally.
-    pub used_class_members: Vec<UsedClassMemberRule>,
+    used_class_members: Vec<UsedClassMemberRule>,
     /// Dependencies referenced in config files (should not be flagged as unused).
-    pub referenced_dependencies: Vec<String>,
+    referenced_dependencies: Vec<String>,
     /// Additional files that are always considered used.
-    pub always_used_files: Vec<String>,
+    always_used_files: Vec<String>,
     /// Path alias mappings discovered from config (prefix -> replacement directory).
-    pub path_aliases: Vec<(String, String)>,
+    path_aliases: Vec<(String, String)>,
     /// Setup/helper files referenced from config.
-    pub setup_files: Vec<PathBuf>,
+    setup_files: Vec<PathBuf>,
     /// Test fixture glob patterns discovered from config.
-    pub fixture_patterns: Vec<String>,
+    fixture_patterns: Vec<String>,
     /// Absolute directories to include when resolving SCSS/Sass `@import` and
     /// `@use` specifiers. Contributed by framework plugins that read their
     /// tool's equivalent of `includePaths` (e.g. Angular's
@@ -109,24 +130,34 @@ pub struct PluginResult {
     /// `project.json`). Bare SCSS specifiers that fail to resolve relative to
     /// the importing file retry against each include path using the SCSS
     /// partial / directory-index conventions.
-    pub scss_include_paths: Vec<PathBuf>,
+    scss_include_paths: Vec<PathBuf>,
+    /// URL-to-filesystem static directory mappings discovered from tool config.
+    /// Each tuple is `(absolute_source_dir, normalized_url_mount)`.
+    static_dir_mappings: Vec<(PathBuf, String)>,
+    /// File-scoped dependency providers. Matching imports are considered
+    /// available from the framework runtime and are not unlisted dependencies.
+    provided_dependencies: Vec<ProvidedDependencyRule>,
 }
 
 impl PluginResult {
-    pub fn push_entry_pattern(&mut self, pattern: impl Into<String>) {
-        self.entry_patterns.push(PathRule::new(pattern));
+    fn push_entry_pattern(&mut self, pattern: impl Into<String>) {
+        self.entry_patterns
+            .push(PathRule::new(normalize_entry_pattern(pattern.into())));
     }
 
-    pub fn extend_entry_patterns<I, S>(&mut self, patterns: I)
+    fn extend_entry_patterns<I, S>(&mut self, patterns: I)
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        self.entry_patterns
-            .extend(patterns.into_iter().map(PathRule::new));
+        self.entry_patterns.extend(
+            patterns
+                .into_iter()
+                .map(|pat| PathRule::new(normalize_entry_pattern(pat.into()))),
+        );
     }
 
-    pub fn push_used_export_rule(
+    fn push_used_export_rule(
         &mut self,
         pattern: impl Into<String>,
         exports: impl IntoIterator<Item = impl Into<String>>,
@@ -136,7 +167,7 @@ impl PluginResult {
     }
 
     #[must_use]
-    pub const fn is_empty(&self) -> bool {
+    const fn is_empty(&self) -> bool {
         self.entry_patterns.is_empty()
             && self.used_exports.is_empty()
             && self.used_class_members.is_empty()
@@ -146,7 +177,16 @@ impl PluginResult {
             && self.setup_files.is_empty()
             && self.fixture_patterns.is_empty()
             && self.scss_include_paths.is_empty()
+            && self.static_dir_mappings.is_empty()
+            && self.provided_dependencies.is_empty()
     }
+}
+
+fn normalize_entry_pattern(pattern: String) -> String {
+    pattern
+        .strip_prefix("./")
+        .map(str::to_owned)
+        .unwrap_or(pattern)
 }
 
 /// A file-pattern rule with optional exclusion globs plus path-level or
@@ -167,7 +207,7 @@ pub struct PathRule {
 
 impl PathRule {
     #[must_use]
-    pub fn new(pattern: impl Into<String>) -> Self {
+    pub(crate) fn new(pattern: impl Into<String>) -> Self {
         Self {
             pattern: pattern.into(),
             exclude_globs: Vec::new(),
@@ -177,12 +217,12 @@ impl PathRule {
     }
 
     #[must_use]
-    pub fn from_static(pattern: &'static str) -> Self {
+    fn from_static(pattern: &'static str) -> Self {
         Self::new(pattern)
     }
 
     #[must_use]
-    pub fn with_excluded_globs<I, S>(mut self, patterns: I) -> Self
+    pub(crate) fn with_excluded_globs<I, S>(mut self, patterns: I) -> Self
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
@@ -193,7 +233,7 @@ impl PathRule {
     }
 
     #[must_use]
-    pub fn with_excluded_regexes<I, S>(mut self, patterns: I) -> Self
+    fn with_excluded_regexes<I, S>(mut self, patterns: I) -> Self
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
@@ -204,7 +244,7 @@ impl PathRule {
     }
 
     #[must_use]
-    pub fn with_excluded_segment_regexes<I, S>(mut self, patterns: I) -> Self
+    fn with_excluded_segment_regexes<I, S>(mut self, patterns: I) -> Self
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
@@ -215,7 +255,7 @@ impl PathRule {
     }
 
     #[must_use]
-    pub fn prefixed(&self, ws_prefix: &str) -> Self {
+    fn prefixed(&self, ws_prefix: &str) -> Self {
         Self {
             pattern: prefix_workspace_pattern(&self.pattern, ws_prefix),
             exclude_globs: self
@@ -236,13 +276,13 @@ impl PathRule {
 /// A used-export rule bound to a file-pattern rule.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct UsedExportRule {
-    pub path: PathRule,
-    pub exports: Vec<String>,
+    pub(crate) path: PathRule,
+    pub(crate) exports: Vec<String>,
 }
 
 impl UsedExportRule {
     #[must_use]
-    pub fn new(
+    pub(crate) fn new(
         pattern: impl Into<String>,
         exports: impl IntoIterator<Item = impl Into<String>>,
     ) -> Self {
@@ -253,12 +293,12 @@ impl UsedExportRule {
     }
 
     #[must_use]
-    pub fn from_static(pattern: &'static str, exports: &'static [&'static str]) -> Self {
+    fn from_static(pattern: &'static str, exports: &'static [&'static str]) -> Self {
         Self::new(pattern, exports.iter().copied())
     }
 
     #[must_use]
-    pub fn with_excluded_globs<I, S>(mut self, patterns: I) -> Self
+    fn with_excluded_globs<I, S>(mut self, patterns: I) -> Self
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
@@ -268,7 +308,7 @@ impl UsedExportRule {
     }
 
     #[must_use]
-    pub fn with_excluded_regexes<I, S>(mut self, patterns: I) -> Self
+    fn with_excluded_regexes<I, S>(mut self, patterns: I) -> Self
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
@@ -278,7 +318,7 @@ impl UsedExportRule {
     }
 
     #[must_use]
-    pub fn with_excluded_segment_regexes<I, S>(mut self, patterns: I) -> Self
+    fn with_excluded_segment_regexes<I, S>(mut self, patterns: I) -> Self
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
@@ -288,7 +328,7 @@ impl UsedExportRule {
     }
 
     #[must_use]
-    pub fn prefixed(&self, ws_prefix: &str) -> Self {
+    fn prefixed(&self, ws_prefix: &str) -> Self {
         Self {
             path: self.path.prefixed(ws_prefix),
             exports: self.exports.clone(),
@@ -299,13 +339,13 @@ impl UsedExportRule {
 /// A used-export rule tagged with the plugin that contributed it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginUsedExportRule {
-    pub plugin_name: String,
-    pub rule: UsedExportRule,
+    pub(crate) plugin_name: String,
+    pub(crate) rule: UsedExportRule,
 }
 
 impl PluginUsedExportRule {
     #[must_use]
-    pub fn new(plugin_name: impl Into<String>, rule: UsedExportRule) -> Self {
+    pub(crate) fn new(plugin_name: impl Into<String>, rule: UsedExportRule) -> Self {
         Self {
             plugin_name: plugin_name.into(),
             rule,
@@ -313,11 +353,62 @@ impl PluginUsedExportRule {
     }
 
     #[must_use]
-    pub fn prefixed(&self, ws_prefix: &str) -> Self {
+    fn prefixed(&self, ws_prefix: &str) -> Self {
         Self {
             plugin_name: self.plugin_name.clone(),
             rule: self.rule.prefixed(ws_prefix),
         }
+    }
+}
+
+/// A file-scoped dependency provider rule contributed by a framework plugin.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProvidedDependencyRule {
+    pub(crate) path: PathRule,
+    exact_specifiers: Vec<String>,
+    specifier_prefixes: Vec<String>,
+}
+
+impl ProvidedDependencyRule {
+    #[must_use]
+    fn new(
+        pattern: impl Into<String>,
+        exact_specifiers: impl IntoIterator<Item = impl Into<String>>,
+        specifier_prefixes: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        Self {
+            path: PathRule::new(pattern),
+            exact_specifiers: exact_specifiers.into_iter().map(Into::into).collect(),
+            specifier_prefixes: specifier_prefixes.into_iter().map(Into::into).collect(),
+        }
+    }
+
+    #[must_use]
+    fn prefixed(&self, ws_prefix: &str) -> Self {
+        Self {
+            path: self.path.prefixed(ws_prefix),
+            exact_specifiers: self.exact_specifiers.clone(),
+            specifier_prefixes: self.specifier_prefixes.clone(),
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn may_cover_package(&self, package_name: &str) -> bool {
+        self.exact_specifiers
+            .iter()
+            .chain(self.specifier_prefixes.iter())
+            .any(|specifier| crate::resolve::extract_package_name(specifier) == package_name)
+    }
+
+    #[must_use]
+    pub(crate) fn covers_specifier(&self, specifier: &str) -> bool {
+        self.exact_specifiers
+            .iter()
+            .any(|allowed| allowed == specifier)
+            || self
+                .specifier_prefixes
+                .iter()
+                .any(|prefix| specifier.starts_with(prefix))
     }
 }
 
@@ -559,6 +650,54 @@ pub trait Plugin: Send + Sync {
         })
     }
 
+    /// Check whether this plugin should be active with source discovery available.
+    ///
+    /// Most plugins only need dependency/config activation. Convention-only tools
+    /// can override this to activate from discovered source filenames without
+    /// forcing a separate filesystem walk.
+    ///
+    /// `candidate_index` is the discovery walk's in-memory listing of source +
+    /// non-source config-candidate files (`Some` outside production mode, `None`
+    /// in production). A plugin that activates on a non-source sentinel file
+    /// (`manifest.json`, `.env.schema`) can consult it to avoid a per-directory
+    /// filesystem probe; when it is `None`, the plugin falls back to the
+    /// filesystem.
+    fn is_enabled_with_files(
+        &self,
+        deps: &[String],
+        root: &Path,
+        _discovered_files: &[PathBuf],
+        _candidate_index: Option<&registry::ConfigCandidateIndex>,
+    ) -> bool {
+        self.is_enabled_with_deps(deps, root)
+    }
+
+    /// Package-script binary/package names that can activate this plugin.
+    fn script_enablers(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// Check whether this plugin should be active from package.json scripts.
+    fn is_enabled_with_scripts(
+        &self,
+        script_packages: &rustc_hash::FxHashSet<String>,
+        _root: &Path,
+    ) -> bool {
+        let enablers = self.script_enablers();
+        if enablers.is_empty() {
+            return false;
+        }
+        enablers.iter().any(|enabler| {
+            if enabler.ends_with('/') {
+                script_packages
+                    .iter()
+                    .any(|package| package.starts_with(enabler))
+            } else {
+                script_packages.contains(*enabler)
+            }
+        })
+    }
+
     /// Default glob patterns for entry point files.
     fn entry_patterns(&self) -> &'static [&'static str] {
         &[]
@@ -611,11 +750,36 @@ pub trait Plugin: Send + Sync {
         &[]
     }
 
+    /// Heritage-scoped class member rules. Each rule applies only to classes
+    /// matching its `extends` and/or `implements` clause. Used for frameworks
+    /// where lifecycle members are runtime-invoked only on classes that extend
+    /// a known base (e.g. Lit's `render`/`updated` on classes extending
+    /// `LitElement`, native Web Components' `connectedCallback` on classes
+    /// extending `HTMLElement`). Default: empty. Plugins override when they
+    /// need scoping; flat names should still come from `used_class_members`.
+    fn used_class_member_rules(&self) -> Vec<UsedClassMemberRule> {
+        Vec::new()
+    }
+
+    /// Exact package-backed framework contracts that type-aware analysis may
+    /// verify for latent class-member candidates.
+    fn framework_class_member_contracts(&self) -> Vec<SemanticFrameworkContract> {
+        Vec::new()
+    }
+
     /// Glob patterns for test fixture files consumed by this framework.
     /// These files are implicitly used by the test runner and should not be
     /// flagged as unused. Unlike `always_used()`, this carries semantic intent
     /// for reporting purposes.
     fn fixture_glob_patterns(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// Hidden directory names that should be traversed when this plugin is active.
+    ///
+    /// These are consulted before normal plugin execution because source discovery
+    /// runs first. Keep entries static and package-convention scoped.
+    fn discovery_hidden_dirs(&self) -> &'static [&'static str] {
         &[]
     }
 
@@ -633,12 +797,29 @@ pub trait Plugin: Send + Sync {
         &[]
     }
 
+    /// Package name suffixes that are virtual modules provided by this framework
+    /// at build time (e.g., test runner mock conventions).
+    /// Imports matching these suffixes should not be flagged as unlisted dependencies.
+    /// Each entry is matched as a suffix against the extracted package name
+    /// (e.g., `"/__mocks__"` matches `@aws-sdk/__mocks__` and `some-pkg/__mocks__`).
+    fn virtual_package_suffixes(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     /// Import suffixes for build-time generated relative imports.
     ///
     /// Unresolved relative imports whose specifier ends with one of these suffixes
     /// will not be flagged as unresolved. For example, SvelteKit generates
-    /// `./$types` imports in route files — returning `"/$types"` suppresses those.
+    /// `./$types` imports in route files, returning `"/$types"` suppresses those.
     fn generated_import_patterns(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// Import prefixes for generated type-only relative imports.
+    ///
+    /// Unresolved type-only imports whose specifier starts with one of these prefixes
+    /// will not be flagged as unresolved. Runtime imports are still reported.
+    fn generated_type_import_prefixes(&self) -> &'static [&'static str] {
         &[]
     }
 
@@ -655,10 +836,53 @@ pub trait Plugin: Send + Sync {
         vec![]
     }
 
+    /// Convention-based auto-imports provided by this framework.
+    ///
+    /// Returns the names this framework exposes to user code by filesystem
+    /// convention with no explicit `import` statement (e.g. Nuxt `components/`
+    /// resolved by `<Card001 />` template tags), each mapped to the source file
+    /// providing the export. When a file references one of these names without an
+    /// import, the resolver synthesizes a graph edge to `source`.
+    ///
+    /// Called once when plugins are activated. The project `root` is provided so
+    /// plugins can scan the convention directories on the filesystem. The table is
+    /// a function of which files exist on disk, so it is rebuilt every run and is
+    /// never folded into per-file extraction caching. See issue #704.
+    fn auto_imports(&self, _root: &Path) -> Vec<AutoImportRule> {
+        Vec::new()
+    }
+
+    /// File-scoped dependency providers contributed by this framework.
+    fn provided_dependencies(&self) -> Vec<ProvidedDependencyRule> {
+        Vec::new()
+    }
+
+    /// Check whether parsed package.json metadata activates this plugin.
+    fn is_enabled_with_package_json(&self, _pkg: &PackageJson, _root: &Path) -> bool {
+        false
+    }
+
+    /// Resolve parsed package.json metadata into dynamic plugin facts.
+    fn resolve_package_json(&self, _pkg: &PackageJson, _root: &Path) -> PluginResult {
+        PluginResult::default()
+    }
+
+    /// Dependencies referenced by the package's own package.json metadata.
+    ///
+    /// Unlike config-derived dependencies, these credits apply only to the
+    /// package.json that produced them.
+    fn package_json_referenced_dependencies(
+        &self,
+        _pkg: &PackageJson,
+        _root: &Path,
+    ) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Parse a config file's AST to discover additional entries, dependencies, etc.
     ///
     /// Called for each config file matching `config_patterns()`. The source code
-    /// and parsed AST are provided — use [`config_parser`] utilities to extract values.
+    /// and parsed AST are provided, use [`config_parser`] utilities to extract values.
     fn resolve_config(&self, _config_path: &Path, _source: &str, _root: &Path) -> PluginResult {
         PluginResult::default()
     }
@@ -686,7 +910,8 @@ fn builtin_entry_point_role(name: &str) -> EntryPointRole {
 ///
 /// Generates a struct and a `Plugin` trait impl with the standard static methods
 /// (`name`, `enablers`, `entry_patterns`, `config_patterns`, `always_used`, `tooling_dependencies`,
-/// `fixture_glob_patterns`, `used_exports`).
+/// `fixture_glob_patterns`, `virtual_module_prefixes`, `virtual_package_suffixes`,
+/// `generated_type_import_prefixes`, `used_exports`).
 ///
 /// For plugins that need custom `resolve_config()` or `is_enabled()`, keep those as
 /// manual `impl Plugin for ...` blocks instead of using this macro.
@@ -742,8 +967,6 @@ fn builtin_entry_point_role(name: &str) -> EntryPointRole {
 ///
 /// All fields except `struct` and `enablers` are optional and default to `&[]` / `vec![]`.
 macro_rules! define_plugin {
-    // Variant with `resolve_config: imports_only` — generates a resolve_config method
-    // that extracts imports from config files and registers them as referenced dependencies.
     (
         struct $name:ident => $display:expr,
         enablers: $enablers:expr
@@ -752,7 +975,11 @@ macro_rules! define_plugin {
         $(, always_used: $always:expr)?
         $(, tooling_dependencies: $tooling:expr)?
         $(, fixture_glob_patterns: $fixtures:expr)?
+        $(, discovery_hidden_dirs: $hidden_dirs:expr)?
         $(, virtual_module_prefixes: $virtual:expr)?
+        $(, virtual_package_suffixes: $virtual_suffixes:expr)?
+        $(, generated_type_import_prefixes: $generated_type_prefixes:expr)?
+        $(, provided_dependencies: $provided_dependencies:expr)?
         $(, used_exports: [$( ($pat:expr, $exports:expr) ),* $(,)?])?
         , resolve_config: imports_only
         $(,)?
@@ -773,7 +1000,11 @@ macro_rules! define_plugin {
             $( fn always_used(&self) -> &'static [&'static str] { $always } )?
             $( fn tooling_dependencies(&self) -> &'static [&'static str] { $tooling } )?
             $( fn fixture_glob_patterns(&self) -> &'static [&'static str] { $fixtures } )?
+            $( fn discovery_hidden_dirs(&self) -> &'static [&'static str] { $hidden_dirs } )?
             $( fn virtual_module_prefixes(&self) -> &'static [&'static str] { $virtual } )?
+            $( fn virtual_package_suffixes(&self) -> &'static [&'static str] { $virtual_suffixes } )?
+            $( fn generated_type_import_prefixes(&self) -> &'static [&'static str] { $generated_type_prefixes } )?
+            $( fn provided_dependencies(&self) -> Vec<ProvidedDependencyRule> { $provided_dependencies } )?
 
             $(
                 fn used_exports(&self) -> Vec<(&'static str, &'static [&'static str])> {
@@ -788,19 +1019,16 @@ macro_rules! define_plugin {
                 _root: &std::path::Path,
             ) -> PluginResult {
                 let mut result = PluginResult::default();
-                let imports = crate::plugins::config_parser::extract_imports(source, config_path);
-                for imp in &imports {
-                    let dep = crate::resolve::extract_package_name(imp);
-                    result.referenced_dependencies.push(dep);
-                }
+                crate::plugins::add_import_referenced_dependencies(
+                    &mut result,
+                    source,
+                    config_path,
+                );
                 result
             }
         }
     };
 
-    // Variant with custom resolve_config body — generates a resolve_config method
-    // with the caller-supplied block. Parameter names are caller-controlled (use
-    // `_root` for unused params to satisfy clippy).
     (
         struct $name:ident => $display:expr,
         enablers: $enablers:expr
@@ -809,7 +1037,11 @@ macro_rules! define_plugin {
         $(, always_used: $always:expr)?
         $(, tooling_dependencies: $tooling:expr)?
         $(, fixture_glob_patterns: $fixtures:expr)?
+        $(, discovery_hidden_dirs: $hidden_dirs:expr)?
         $(, virtual_module_prefixes: $virtual:expr)?
+        $(, virtual_package_suffixes: $virtual_suffixes:expr)?
+        $(, generated_type_import_prefixes: $generated_type_prefixes:expr)?
+        $(, provided_dependencies: $provided_dependencies:expr)?
         $(, package_json_config_key: $pkg_key:expr)?
         $(, used_exports: [$( ($pat:expr, $exports:expr) ),* $(,)?])?
         , resolve_config($cp:ident, $src:ident, $root:ident) $body:block
@@ -831,7 +1063,11 @@ macro_rules! define_plugin {
             $( fn always_used(&self) -> &'static [&'static str] { $always } )?
             $( fn tooling_dependencies(&self) -> &'static [&'static str] { $tooling } )?
             $( fn fixture_glob_patterns(&self) -> &'static [&'static str] { $fixtures } )?
+            $( fn discovery_hidden_dirs(&self) -> &'static [&'static str] { $hidden_dirs } )?
             $( fn virtual_module_prefixes(&self) -> &'static [&'static str] { $virtual } )?
+            $( fn virtual_package_suffixes(&self) -> &'static [&'static str] { $virtual_suffixes } )?
+            $( fn generated_type_import_prefixes(&self) -> &'static [&'static str] { $generated_type_prefixes } )?
+            $( fn provided_dependencies(&self) -> Vec<ProvidedDependencyRule> { $provided_dependencies } )?
 
             $(
                 fn package_json_config_key(&self) -> Option<&'static str> {
@@ -855,7 +1091,6 @@ macro_rules! define_plugin {
         }
     };
 
-    // Base variant — no resolve_config.
     (
         struct $name:ident => $display:expr,
         enablers: $enablers:expr
@@ -864,7 +1099,11 @@ macro_rules! define_plugin {
         $(, always_used: $always:expr)?
         $(, tooling_dependencies: $tooling:expr)?
         $(, fixture_glob_patterns: $fixtures:expr)?
+        $(, discovery_hidden_dirs: $hidden_dirs:expr)?
         $(, virtual_module_prefixes: $virtual:expr)?
+        $(, virtual_package_suffixes: $virtual_suffixes:expr)?
+        $(, generated_type_import_prefixes: $generated_type_prefixes:expr)?
+        $(, provided_dependencies: $provided_dependencies:expr)?
         $(, used_exports: [$( ($pat:expr, $exports:expr) ),* $(,)?])?
         $(,)?
     ) => {
@@ -884,7 +1123,11 @@ macro_rules! define_plugin {
             $( fn always_used(&self) -> &'static [&'static str] { $always } )?
             $( fn tooling_dependencies(&self) -> &'static [&'static str] { $tooling } )?
             $( fn fixture_glob_patterns(&self) -> &'static [&'static str] { $fixtures } )?
+            $( fn discovery_hidden_dirs(&self) -> &'static [&'static str] { $hidden_dirs } )?
             $( fn virtual_module_prefixes(&self) -> &'static [&'static str] { $virtual } )?
+            $( fn virtual_package_suffixes(&self) -> &'static [&'static str] { $virtual_suffixes } )?
+            $( fn generated_type_import_prefixes(&self) -> &'static [&'static str] { $generated_type_prefixes } )?
+            $( fn provided_dependencies(&self) -> Vec<ProvidedDependencyRule> { $provided_dependencies } )?
 
             $(
                 fn used_exports(&self) -> Vec<(&'static str, &'static [&'static str])> {
@@ -896,59 +1139,144 @@ macro_rules! define_plugin {
 }
 
 pub mod config_parser;
+mod config_value_credits;
+mod manifest;
+pub mod manifest_entries;
 pub mod registry;
 mod tooling;
 
 pub use registry::{AggregatedPluginResult, PluginRegistry};
-pub use tooling::is_known_tooling_dependency;
+pub(crate) use tooling::is_known_tooling_dependency;
 
+fn add_import_referenced_dependencies(result: &mut PluginResult, source: &str, config_path: &Path) {
+    let imports = config_parser::extract_imports(source, config_path);
+    for import in &imports {
+        result
+            .referenced_dependencies
+            .push(crate::resolve::extract_package_name(import));
+    }
+}
+
+/// Credit the optional peer dependencies a test environment loads at runtime.
+///
+/// The rules are data: see the `test-environment-optional-peer` rows in
+/// `crates/core/data/config_value_credits.toml`. `jsdom` requires its optional
+/// peer `canvas` lazily when it is installed, so a project installing it for
+/// real canvas support has no import of it anywhere and would see the
+/// dependency reported as unused (issue #2005). Environments without such a
+/// peer, like `happy-dom`, have no row.
+///
+/// Only names already declared in the manifest can be credited, so this never
+/// invents an unlisted dependency.
+fn credit_environment_optional_peers(environment: &str, result: &mut PluginResult) {
+    credit_config_value(
+        config_value_credits::CreditSurface::TestEnvironmentOptionalPeer,
+        canonical_test_environment(environment),
+        result,
+    );
+}
+
+/// Record the catalogue credits for a config value, if any.
+///
+/// Returns whether a rule matched, which callers use when the credited packages
+/// replace the dependencies derived from the value itself.
+fn credit_config_value(
+    surface: config_value_credits::CreditSurface,
+    value: &str,
+    result: &mut PluginResult,
+) -> bool {
+    let Some(packages) = config_value_credits::credited_packages(surface, value) else {
+        return false;
+    };
+    result
+        .referenced_dependencies
+        .extend(packages.iter().cloned());
+    true
+}
+
+/// Strip the runner prefix from a test environment specifier.
+///
+/// Both runners accept the bare name and the package it resolves to, so
+/// `testEnvironment: "jest-environment-jsdom"` and `environment: "jsdom"` select
+/// the same environment. Matching the literal short name only meant the fully
+/// qualified form, which the Jest docs use and projects copy, was treated as a
+/// third-party environment and missed its optional-peer credit.
+fn canonical_test_environment(environment: &str) -> &str {
+    environment
+        .strip_prefix("jest-environment-")
+        .or_else(|| environment.strip_prefix("vitest-environment-"))
+        .unwrap_or(environment)
+}
+
+mod adonis;
 mod angular;
 mod astro;
 mod ava;
 mod babel;
 mod biome;
+mod browser_extension;
 mod bun;
 mod c8;
 mod capacitor;
 mod changesets;
+mod commit_and_tag_version;
 mod commitizen;
 mod commitlint;
+mod content_collections;
+mod contentlayer;
 mod convex;
 mod cspell;
 mod cucumber;
 mod cypress;
+mod danger;
+mod deno;
 mod dependency_cruiser;
 mod docusaurus;
 mod drizzle;
 mod electron;
+mod ember;
 mod eslint;
 mod expo;
 mod expo_router;
+mod firebase;
+mod fumadocs;
 mod gatsby;
 mod graphql_codegen;
 mod hardhat;
 mod husky;
 mod i18next;
+mod ionic;
 mod jest;
+mod k6;
 mod karma;
 mod knex;
 mod kysely;
 mod lefthook;
+mod lexical;
 mod lint_staged;
+mod lit;
 mod markdownlint;
+mod mintlify;
 mod mocha;
 mod msw;
+mod napi_rs;
 mod nestjs;
 mod next_intl;
 mod nextjs;
 mod nitro;
 mod nodemon;
-mod nuxt;
+pub(crate) mod nuxt;
 mod nx;
 mod nyc;
+mod obsidian;
 mod openapi_ts;
+mod opencode;
+mod opennext_cloudflare;
 mod oxlint;
+mod pandacss;
 mod parcel;
+mod pinia;
+mod pkg_utils;
 mod playwright;
 mod plop;
 mod pm2;
@@ -957,8 +1285,10 @@ mod postcss;
 mod prettier;
 mod prisma;
 mod qwik;
+mod react_compiler;
 mod react_native;
 mod react_router;
+mod redwoodsdk;
 mod relay;
 mod remark;
 mod remix;
@@ -966,12 +1296,16 @@ mod rolldown;
 mod rollup;
 mod rsbuild;
 mod rspack;
+mod rspress;
 mod sanity;
 mod semantic_release;
 mod sentry;
 mod simple_git_hooks;
+mod size_limit;
 mod storybook;
+mod stryker;
 mod stylelint;
+mod supabase;
 mod sveltekit;
 mod svgo;
 mod svgr;
@@ -979,6 +1313,9 @@ mod swc;
 mod syncpack;
 mod tailwind;
 mod tanstack_router;
+mod tap;
+mod test_alias;
+mod tsd;
 mod tsdown;
 mod tsup;
 mod turborepo;
@@ -986,19 +1323,23 @@ mod typedoc;
 mod typeorm;
 mod typescript;
 mod unocss;
+mod varlock;
+mod velite;
+mod vercel;
 mod vite;
 mod vitepress;
 mod vitest;
+mod vscode;
 mod webdriverio;
 mod webpack;
 mod wrangler;
+mod wuchale;
+mod wxt;
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::Path;
-
-    // ── is_enabled_with_deps edge cases ──────────────────────────
 
     #[test]
     fn is_enabled_with_deps_exact_match() {
@@ -1022,6 +1363,30 @@ mod tests {
     }
 
     #[test]
+    fn environment_optional_peers_come_from_the_credit_catalogue() {
+        for environment in [
+            "jsdom",
+            "jest-environment-jsdom",
+            "vitest-environment-jsdom",
+        ] {
+            let mut result = PluginResult::default();
+            credit_environment_optional_peers(environment, &mut result);
+            assert_eq!(
+                result.referenced_dependencies,
+                vec!["canvas".to_string()],
+                "expected the catalogue credit for {environment}"
+            );
+        }
+    }
+
+    #[test]
+    fn environment_without_a_catalogue_row_credits_nothing() {
+        let mut result = PluginResult::default();
+        credit_environment_optional_peers("happy-dom", &mut result);
+        assert!(result.referenced_dependencies.is_empty());
+    }
+
+    #[test]
     fn entry_point_role_defaults_are_centralized() {
         assert_eq!(vite::VitePlugin.entry_point_role(), EntryPointRole::Runtime);
         assert_eq!(
@@ -1031,6 +1396,10 @@ mod tests {
         assert_eq!(
             storybook::StorybookPlugin.entry_point_role(),
             EntryPointRole::Support
+        );
+        assert_eq!(
+            obsidian::ObsidianPlugin.entry_point_role(),
+            EntryPointRole::Runtime
         );
         assert_eq!(knex::KnexPlugin.entry_point_role(), EntryPointRole::Support);
     }
@@ -1056,8 +1425,6 @@ mod tests {
             );
         }
     }
-
-    // ── PluginResult::is_empty ───────────────────────────────────
 
     #[test]
     fn plugin_result_is_empty_when_default() {
@@ -1110,11 +1477,8 @@ mod tests {
         assert!(!r.is_empty());
     }
 
-    // ── is_enabled_with_deps prefix matching ─────────────────────
-
     #[test]
     fn is_enabled_with_deps_prefix_match() {
-        // Storybook plugin uses prefix enabler "@storybook/"
         let plugin = storybook::StorybookPlugin;
         let deps = vec!["@storybook/react".to_string()];
         assert!(plugin.is_enabled_with_deps(&deps, Path::new("/project")));
@@ -1122,7 +1486,6 @@ mod tests {
 
     #[test]
     fn is_enabled_with_deps_prefix_no_match_without_slash() {
-        // "@storybook/" prefix should NOT match "@storybookish" (different package)
         let plugin = storybook::StorybookPlugin;
         let deps = vec!["@storybookish".to_string()];
         assert!(!plugin.is_enabled_with_deps(&deps, Path::new("/project")));
@@ -1130,7 +1493,6 @@ mod tests {
 
     #[test]
     fn is_enabled_with_deps_multiple_enablers() {
-        // Vitest plugin has multiple enablers
         let plugin = vitest::VitestPlugin;
         let deps_vitest = vec!["vitest".to_string()];
         let deps_none = vec!["mocha".to_string()];
@@ -1138,16 +1500,14 @@ mod tests {
         assert!(!plugin.is_enabled_with_deps(&deps_none, Path::new("/project")));
     }
 
-    // ── Plugin trait default implementations ─────────────────────
-
     #[test]
     fn plugin_default_methods_return_empty() {
-        // Use a simple plugin to test default trait methods
         let plugin = commitizen::CommitizenPlugin;
         assert!(
             plugin.tooling_dependencies().is_empty() || !plugin.tooling_dependencies().is_empty()
         );
         assert!(plugin.virtual_module_prefixes().is_empty());
+        assert!(plugin.virtual_package_suffixes().is_empty());
         assert!(plugin.path_aliases(Path::new("/project")).is_empty());
         assert!(
             plugin.package_json_config_key().is_none()
@@ -1165,8 +1525,6 @@ mod tests {
         );
         assert!(result.is_empty());
     }
-
-    // ── is_enabled_with_deps exact and prefix ────────────────────
 
     #[test]
     fn is_enabled_with_deps_exact_and_prefix_both_work() {
@@ -1187,8 +1545,6 @@ mod tests {
         let deps_cf = vec!["@remix-run/cloudflare".to_string()];
         assert!(plugin.is_enabled_with_deps(&deps_cf, Path::new("/project")));
     }
-
-    // ── Plugin trait default implementations ──────────────────────
 
     struct MinimalPlugin;
     impl Plugin for MinimalPlugin {
@@ -1238,6 +1594,11 @@ mod tests {
     }
 
     #[test]
+    fn default_virtual_package_suffixes_is_empty() {
+        assert!(MinimalPlugin.virtual_package_suffixes().is_empty());
+    }
+
+    #[test]
     fn default_path_aliases_is_empty() {
         assert!(MinimalPlugin.path_aliases(Path::new("/")).is_empty());
     }
@@ -1253,6 +1614,17 @@ mod tests {
     }
 
     #[test]
+    fn default_package_json_metadata_hooks_are_empty() {
+        let pkg = PackageJson::default();
+        assert!(!MinimalPlugin.is_enabled_with_package_json(&pkg, Path::new("/")));
+        assert!(
+            MinimalPlugin
+                .resolve_package_json(&pkg, Path::new("/"))
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn default_package_json_config_key_is_none() {
         assert!(MinimalPlugin.package_json_config_key().is_none());
     }
@@ -1262,8 +1634,6 @@ mod tests {
         let deps = vec!["anything".to_string()];
         assert!(!MinimalPlugin.is_enabled_with_deps(&deps, Path::new("/")));
     }
-
-    // ── All built-in plugins have unique names ───────────────────
 
     #[test]
     fn all_builtin_plugin_names_are_unique() {
@@ -1276,12 +1646,17 @@ mod tests {
     }
 
     #[test]
-    fn all_builtin_plugins_have_enablers() {
+    fn all_builtin_plugins_have_activation_signals() {
+        // Plugins activated from package metadata or filesystem sentinels rather
+        // than dependency enablers (napi binary name; deno.json presence).
+        const NON_DEPENDENCY_ACTIVATED_PLUGINS: &[&str] = &["napi-rs", "deno"];
         let plugins = registry::builtin::create_builtin_plugins();
         for p in &plugins {
             assert!(
-                !p.enablers().is_empty(),
-                "plugin '{}' has no enablers",
+                !p.enablers().is_empty()
+                    || !p.script_enablers().is_empty()
+                    || NON_DEPENDENCY_ACTIVATED_PLUGINS.contains(&p.name()),
+                "plugin '{}' has no activation signal",
                 p.name()
             );
         }
@@ -1301,14 +1676,13 @@ mod tests {
         }
     }
 
-    // ── Enabler patterns for all categories ──────────────────────
-
     #[test]
     fn framework_plugins_enablers() {
         let cases: Vec<(&dyn Plugin, &[&str])> = vec![
             (&nextjs::NextJsPlugin, &["next"]),
             (&nuxt::NuxtPlugin, &["nuxt"]),
             (&angular::AngularPlugin, &["@angular/core"]),
+            (&ionic::IonicPlugin, &["@ionic/angular"]),
             (&sveltekit::SvelteKitPlugin, &["@sveltejs/kit"]),
             (&gatsby::GatsbyPlugin, &["gatsby"]),
         ];
@@ -1333,6 +1707,7 @@ mod tests {
             (&playwright::PlaywrightPlugin, "@playwright/test"),
             (&cypress::CypressPlugin, "cypress"),
             (&mocha::MochaPlugin, "mocha"),
+            (&stryker::StrykerPlugin, "@stryker-mutator/core"),
         ];
         for (plugin, enabler) in cases {
             assert!(
@@ -1364,9 +1739,13 @@ mod tests {
     #[test]
     fn test_plugins_have_test_entry_patterns() {
         let test_plugins: Vec<&dyn Plugin> = vec![
+            &bun::BunPlugin,
+            &deno::DenoPlugin,
             &jest::JestPlugin,
             &vitest::VitestPlugin,
             &mocha::MochaPlugin,
+            &tap::TapPlugin,
+            &tsd::TsdPlugin,
         ];
         for plugin in test_plugins {
             let patterns = plugin.entry_patterns();
@@ -1417,9 +1796,12 @@ mod tests {
             &nuxt::NuxtPlugin,
             &angular::AngularPlugin,
             &nx::NxPlugin,
+            &stryker::StrykerPlugin,
+            &wuchale::WuchalePlugin,
             &rollup::RollupPlugin,
             &sveltekit::SvelteKitPlugin,
             &prettier::PrettierPlugin,
+            &contentlayer::ContentlayerPlugin,
         ];
         for plugin in plugins {
             assert!(
@@ -1439,6 +1821,10 @@ mod tests {
             &typescript::TypeScriptPlugin,
             &eslint::EslintPlugin,
             &prettier::PrettierPlugin,
+            &danger::DangerPlugin,
+            &stryker::StrykerPlugin,
+            &wuchale::WuchalePlugin,
+            &contentlayer::ContentlayerPlugin,
         ];
         for plugin in plugins {
             let tooling = plugin.tooling_dependencies();
@@ -1514,6 +1900,11 @@ mod tests {
     }
 
     #[test]
+    fn tsd_has_package_json_config_key() {
+        assert_eq!(tsd::TsdPlugin.package_json_config_key(), Some("tsd"));
+    }
+
+    #[test]
     fn babel_has_package_json_config_key() {
         assert_eq!(babel::BabelPlugin.package_json_config_key(), Some("babel"));
     }
@@ -1553,6 +1944,22 @@ mod tests {
     }
 
     #[test]
+    fn macro_passes_through_virtual_package_suffixes() {
+        define_plugin! {
+            struct MacroSuffixSmokePlugin => "macro-suffix-smoke",
+            enablers: &["macro-suffix-smoke"],
+            virtual_package_suffixes: &["/__macro_smoke__"],
+        }
+
+        let plugin = MacroSuffixSmokePlugin;
+        assert_eq!(
+            plugin.virtual_package_suffixes(),
+            &["/__macro_smoke__"],
+            "macro-declared virtual_package_suffixes must propagate to the trait method"
+        );
+    }
+
+    #[test]
     fn macro_generated_plugin_imports_only_resolve_config() {
         let plugin = cypress::CypressPlugin;
         let source = r"
@@ -1581,8 +1988,8 @@ mod tests {
     fn builtin_plugin_count_is_expected() {
         let plugins = registry::builtin::create_builtin_plugins();
         assert!(
-            plugins.len() >= 80,
-            "expected at least 80 built-in plugins, got {}",
+            plugins.len() >= 110,
+            "expected at least 110 built-in plugins, got {}",
             plugins.len()
         );
     }

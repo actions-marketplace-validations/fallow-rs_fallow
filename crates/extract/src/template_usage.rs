@@ -1,9 +1,13 @@
+use fallow_types::extract::{SinkArgKind, SinkShape, SinkSite};
 use oxc_allocator::Allocator;
+use oxc_ast::ast::{
+    BinaryOperator, CallExpression, Expression, ObjectExpression, ObjectPropertyKind, Statement,
+};
 use oxc_ast_visit::Visit;
 use oxc_parser::Parser;
 use oxc_semantic::SemanticBuilder;
 use oxc_span::SourceType;
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::MemberAccess;
 use crate::visitor::ModuleInfoExtractor;
@@ -13,11 +17,16 @@ pub struct TemplateUsage {
     pub(crate) used_bindings: FxHashSet<String>,
     pub(crate) member_accesses: Vec<MemberAccess>,
     pub(crate) whole_object_uses: Vec<String>,
+    /// PascalCase tag names that matched no import or local binding.
+    pub(crate) unresolved_tag_names: FxHashSet<String>,
+    pub(crate) security_sinks: Vec<SinkSite>,
 }
 
 impl TemplateUsage {
     pub(crate) fn merge(&mut self, other: Self) {
         self.used_bindings.extend(other.used_bindings);
+        self.unresolved_tag_names.extend(other.unresolved_tag_names);
+        self.security_sinks.extend(other.security_sinks);
         for access in other.member_accesses {
             let key = (&access.object, &access.member);
             let already_present = self
@@ -44,6 +53,8 @@ impl TemplateUsage {
         self.used_bindings.is_empty()
             && self.member_accesses.is_empty()
             && self.whole_object_uses.is_empty()
+            && self.unresolved_tag_names.is_empty()
+            && self.security_sinks.is_empty()
     }
 }
 
@@ -60,8 +71,26 @@ pub fn analyze_template_snippet(
     locals: &[String],
     allow_dollar_prefixed_refs: bool,
 ) -> TemplateUsage {
+    analyze_template_snippet_with_bound_targets(
+        snippet,
+        kind,
+        imported_bindings,
+        &FxHashMap::default(),
+        locals,
+        allow_dollar_prefixed_refs,
+    )
+}
+
+pub fn analyze_template_snippet_with_bound_targets(
+    snippet: &str,
+    kind: TemplateSnippetKind,
+    imported_bindings: &FxHashSet<String>,
+    bound_targets: &FxHashMap<String, String>,
+    locals: &[String],
+    allow_dollar_prefixed_refs: bool,
+) -> TemplateUsage {
     let snippet = snippet.trim();
-    if snippet.is_empty() || imported_bindings.is_empty() {
+    if snippet.is_empty() || (imported_bindings.is_empty() && bound_targets.is_empty()) {
         return TemplateUsage::default();
     }
 
@@ -70,35 +99,80 @@ pub fn analyze_template_snippet(
     let parser_return = Parser::new(&allocator, &wrapped, SourceType::ts()).parse();
 
     let semantic_ret = SemanticBuilder::new().build(&parser_return.program);
-    let unresolved_names: FxHashSet<String> = semantic_ret
-        .semantic
-        .scoping()
-        .root_unresolved_references()
-        .keys()
-        .filter_map(|name| {
-            let name = name.as_str();
-            if imported_bindings.contains(name) {
-                return Some(name.to_string());
-            }
-            if allow_dollar_prefixed_refs
-                && let Some(stripped) = name.strip_prefix('$')
-                && imported_bindings.contains(stripped)
-            {
-                return Some(stripped.to_string());
-            }
-            None
-        })
-        .collect();
+    let (used_bindings, unresolved_targets) = classify_unresolved_references(
+        &semantic_ret,
+        imported_bindings,
+        bound_targets,
+        allow_dollar_prefixed_refs,
+    );
 
-    if unresolved_names.is_empty() {
+    if unresolved_targets.is_empty() {
         return TemplateUsage::default();
     }
 
     let mut extractor = ModuleInfoExtractor::new();
+    extractor.register_template_object_locals(used_bindings.iter().cloned());
     extractor.visit_program(&parser_return.program);
 
+    build_template_usage(
+        used_bindings,
+        &unresolved_targets,
+        bound_targets,
+        allow_dollar_prefixed_refs,
+        extractor,
+    )
+}
+
+/// Split a parsed snippet's root unresolved references into the imported
+/// bindings actually used and the full set of remappable target names
+/// (imported bindings + bound targets, with optional `$`-prefix stripping).
+fn classify_unresolved_references(
+    semantic_ret: &oxc_semantic::SemanticBuilderReturn<'_>,
+    imported_bindings: &FxHashSet<String>,
+    bound_targets: &FxHashMap<String, String>,
+    allow_dollar_prefixed_refs: bool,
+) -> (FxHashSet<String>, FxHashSet<String>) {
+    let mut used_bindings = FxHashSet::default();
+    let mut unresolved_targets = FxHashSet::default();
+    for name in semantic_ret
+        .semantic
+        .scoping()
+        .root_unresolved_references()
+        .keys()
+    {
+        let name = name.as_str();
+        if imported_bindings.contains(name) {
+            used_bindings.insert(name.to_string());
+            unresolved_targets.insert(name.to_string());
+            continue;
+        }
+        if bound_targets.contains_key(name) {
+            unresolved_targets.insert(name.to_string());
+            continue;
+        }
+        if allow_dollar_prefixed_refs && let Some(stripped) = name.strip_prefix('$') {
+            if imported_bindings.contains(stripped) {
+                used_bindings.insert(stripped.to_string());
+                unresolved_targets.insert(stripped.to_string());
+            } else if bound_targets.contains_key(stripped) {
+                unresolved_targets.insert(stripped.to_string());
+            }
+        }
+    }
+    (used_bindings, unresolved_targets)
+}
+
+/// Build the [`TemplateUsage`] from the extracted member accesses / whole-object
+/// uses, remapping each object name through the resolved target set.
+fn build_template_usage(
+    used_bindings: FxHashSet<String>,
+    unresolved_targets: &FxHashSet<String>,
+    bound_targets: &FxHashMap<String, String>,
+    allow_dollar_prefixed_refs: bool,
+    extractor: ModuleInfoExtractor,
+) -> TemplateUsage {
     TemplateUsage {
-        used_bindings: unresolved_names.clone(),
+        used_bindings,
         member_accesses: dedup_member_accesses(
             extractor
                 .member_accesses
@@ -106,7 +180,8 @@ pub fn analyze_template_snippet(
                 .filter_map(|access| {
                     remap_object_name(
                         &access.object,
-                        &unresolved_names,
+                        unresolved_targets,
+                        bound_targets,
                         allow_dollar_prefixed_refs,
                     )
                     .map(|object| MemberAccess {
@@ -121,26 +196,37 @@ pub fn analyze_template_snippet(
                 .whole_object_uses
                 .into_iter()
                 .filter_map(|name| {
-                    remap_object_name(&name, &unresolved_names, allow_dollar_prefixed_refs)
+                    remap_object_name(
+                        &name,
+                        unresolved_targets,
+                        bound_targets,
+                        allow_dollar_prefixed_refs,
+                    )
                 })
                 .collect(),
         ),
+        unresolved_tag_names: FxHashSet::default(),
+        security_sinks: Vec::new(),
     }
 }
 
-/// Collect all unresolved identifier references from a template snippet.
+/// Collect both unresolved identifier references AND static member-access chains
+/// (`obj.member`) where `obj` is unresolved.
 ///
 /// Unlike [`analyze_template_snippet`], this does NOT filter against imported bindings.
-/// Returns every identifier that is not locally scoped. Used for Angular external
-/// templates where unresolved identifiers are potential component class member refs.
-pub fn collect_unresolved_refs(
+/// Returns `(identifiers, member_accesses)`. Used by the Angular template scanner
+/// for external templates where unresolved identifiers are potential component
+/// class member refs and member-access chains (`dataService.getTotal()`) must
+/// be resolved against the component's constructor-injected type bindings to
+/// credit the target class's member as used.
+pub fn collect_unresolved_refs_and_accesses(
     snippet: &str,
     kind: TemplateSnippetKind,
     locals: &[String],
-) -> FxHashSet<String> {
+) -> (FxHashSet<String>, Vec<MemberAccess>) {
     let snippet = snippet.trim();
     if snippet.is_empty() {
-        return FxHashSet::default();
+        return (FxHashSet::default(), Vec::new());
     }
 
     let wrapped = wrap_snippet(snippet, kind, locals);
@@ -148,28 +234,255 @@ pub fn collect_unresolved_refs(
     let parser_return = Parser::new(&allocator, &wrapped, SourceType::ts()).parse();
     let semantic_ret = SemanticBuilder::new().build(&parser_return.program);
 
-    semantic_ret
+    let unresolved_names: FxHashSet<String> = semantic_ret
         .semantic
         .scoping()
         .root_unresolved_references()
         .keys()
         .map(|name| name.to_string())
-        .collect()
+        .collect();
+
+    if unresolved_names.is_empty() {
+        return (unresolved_names, Vec::new());
+    }
+
+    let mut extractor = ModuleInfoExtractor::new();
+    extractor.visit_program(&parser_return.program);
+    let member_accesses = dedup_member_accesses(
+        extractor
+            .member_accesses
+            .into_iter()
+            .filter(|access| unresolved_names.contains(&access.object))
+            .collect(),
+    );
+
+    (unresolved_names, member_accesses)
+}
+
+pub fn template_html_sink(snippet: &str, span_start: usize, span_end: usize) -> Option<SinkSite> {
+    let snippet = snippet.trim();
+    if snippet.is_empty() {
+        return None;
+    }
+
+    let parsed = with_parsed_template_expression(snippet, |expr| {
+        if !is_non_literal_template_arg(expr) {
+            return None;
+        }
+        Some((
+            classify_template_arg_kind(expr),
+            collect_template_arg_idents(expr),
+        ))
+    });
+    let (arg_kind, arg_idents) = match parsed {
+        Some(Some(parsed)) => parsed,
+        Some(None) => return None,
+        None => (SinkArgKind::Other, Vec::new()),
+    };
+
+    Some(SinkSite {
+        sink_shape: SinkShape::MemberAssign,
+        callee_path: "template.innerHTML".to_string(),
+        arg_index: 0,
+        arg_is_non_literal: true,
+        arg_kind,
+        arg_literal: None,
+        regex_pattern: None,
+        object_properties: Vec::new(),
+        object_property_keys: Vec::new(),
+        object_property_keys_complete: false,
+        arg_idents,
+        arg_source_paths: Vec::new(),
+        span_start: u32::try_from(span_start).ok()?,
+        span_end: u32::try_from(span_end).ok()?,
+        url_arg_literal: None,
+        url_shape: None,
+    })
+}
+
+fn with_parsed_template_expression<R>(
+    snippet: &str,
+    body: impl FnOnce(&Expression<'_>) -> R,
+) -> Option<R> {
+    let snippet = snippet.trim();
+    if snippet.is_empty() {
+        return None;
+    }
+    let wrapped = format!("const __f_tpl_sink = ({snippet});");
+    let allocator = Allocator::default();
+    let parser_return = Parser::new(&allocator, &wrapped, SourceType::ts()).parse();
+    let Statement::VariableDeclaration(decl) = parser_return.program.body.first()? else {
+        return None;
+    };
+    let expr = decl.declarations.first()?.init.as_ref()?;
+    Some(body(expr))
+}
+
+fn is_non_literal_template_arg(expr: &Expression<'_>) -> bool {
+    match unwrap_template_parens(expr) {
+        Expression::StringLiteral(_)
+        | Expression::NumericLiteral(_)
+        | Expression::BooleanLiteral(_)
+        | Expression::NullLiteral(_)
+        | Expression::BigIntLiteral(_)
+        | Expression::RegExpLiteral(_) => false,
+        Expression::TemplateLiteral(tpl) => !tpl.expressions.is_empty(),
+        _ => true,
+    }
+}
+
+fn classify_template_arg_kind(expr: &Expression<'_>) -> SinkArgKind {
+    match unwrap_template_parens(expr) {
+        Expression::TemplateLiteral(_) => SinkArgKind::TemplateWithSubst,
+        Expression::BinaryExpression(bin) if bin.operator == BinaryOperator::Addition => {
+            SinkArgKind::Concat
+        }
+        Expression::ObjectExpression(_) => SinkArgKind::Object,
+        Expression::CallExpression(_) => SinkArgKind::Call,
+        _ => SinkArgKind::Other,
+    }
+}
+
+fn collect_template_arg_idents(expr: &Expression<'_>) -> Vec<String> {
+    let mut out = Vec::new();
+    collect_template_idents_into(expr, &mut out);
+    out
+}
+
+fn push_template_ident(name: &str, out: &mut Vec<String>) {
+    if !out.iter().any(|existing| existing == name) {
+        out.push(name.to_string());
+    }
+}
+
+fn collect_template_idents_into(expr: &Expression<'_>, out: &mut Vec<String>) {
+    match expr {
+        Expression::Identifier(ident) => push_template_ident(&ident.name, out),
+        Expression::ParenthesizedExpression(paren) => {
+            collect_template_idents_into(&paren.expression, out);
+        }
+        Expression::StaticMemberExpression(member) => {
+            collect_template_idents_into(&member.object, out);
+        }
+        Expression::ComputedMemberExpression(member) => {
+            collect_template_pair_idents(&member.object, &member.expression, out);
+        }
+        Expression::BinaryExpression(bin) => {
+            collect_template_pair_idents(&bin.left, &bin.right, out);
+        }
+        Expression::LogicalExpression(logical) => {
+            collect_template_pair_idents(&logical.left, &logical.right, out);
+        }
+        Expression::ConditionalExpression(cond) => {
+            collect_template_conditional_idents(&cond.test, &cond.consequent, &cond.alternate, out);
+        }
+        Expression::SequenceExpression(seq) => {
+            for expr in &seq.expressions {
+                collect_template_idents_into(expr, out);
+            }
+        }
+        Expression::TemplateLiteral(tpl) => {
+            for expr in &tpl.expressions {
+                collect_template_idents_into(expr, out);
+            }
+        }
+        Expression::AwaitExpression(await_expr) => {
+            collect_template_idents_into(&await_expr.argument, out);
+        }
+        Expression::UnaryExpression(unary) => {
+            collect_template_idents_into(&unary.argument, out);
+        }
+        Expression::CallExpression(call) => {
+            collect_template_call_idents(call, out);
+        }
+        Expression::ObjectExpression(obj) => {
+            collect_template_object_idents(obj, out);
+        }
+        _ => {}
+    }
+}
+
+fn collect_template_pair_idents(
+    left: &Expression<'_>,
+    right: &Expression<'_>,
+    out: &mut Vec<String>,
+) {
+    collect_template_idents_into(left, out);
+    collect_template_idents_into(right, out);
+}
+
+fn collect_template_conditional_idents(
+    test: &Expression<'_>,
+    consequent: &Expression<'_>,
+    alternate: &Expression<'_>,
+    out: &mut Vec<String>,
+) {
+    collect_template_idents_into(test, out);
+    collect_template_idents_into(consequent, out);
+    collect_template_idents_into(alternate, out);
+}
+
+fn collect_template_call_idents(call: &CallExpression<'_>, out: &mut Vec<String>) {
+    collect_template_idents_into(&call.callee, out);
+    for arg in &call.arguments {
+        if let Some(arg_expr) = arg.as_expression() {
+            collect_template_idents_into(arg_expr, out);
+        }
+    }
+}
+
+fn collect_template_object_idents(obj: &ObjectExpression<'_>, out: &mut Vec<String>) {
+    for prop in &obj.properties {
+        if let ObjectPropertyKind::ObjectProperty(prop) = prop {
+            collect_template_idents_into(&prop.value, out);
+        }
+    }
+}
+
+fn unwrap_template_parens<'a>(mut expr: &'a Expression<'a>) -> &'a Expression<'a> {
+    while let Expression::ParenthesizedExpression(paren) = expr {
+        expr = &paren.expression;
+    }
+    expr
 }
 
 fn remap_object_name(
     name: &str,
     unresolved_names: &FxHashSet<String>,
+    bound_targets: &FxHashMap<String, String>,
     allow_dollar_prefixed_refs: bool,
 ) -> Option<String> {
     if unresolved_names.contains(name) {
+        if let Some(target) = bound_targets.get(name) {
+            return Some(target.clone());
+        }
         return Some(name.to_string());
     }
     if allow_dollar_prefixed_refs
         && let Some(stripped) = name.strip_prefix('$')
         && unresolved_names.contains(stripped)
     {
+        if let Some(target) = bound_targets.get(stripped) {
+            return Some(target.clone());
+        }
         return Some(stripped.to_string());
+    }
+    // unused-load-data-key Primitive C: the SvelteKit global page store read in a
+    // template, `$page.data.KEY` (Svelte 4 `$app/stores`) or `page.data.KEY`
+    // (Svelte 5 `$app/state`), arrives here as the dotted member object
+    // `$page.data` / `page.data` (the object of the outer `.KEY` access). The
+    // root-only logic above remaps `$page`/`page` but drops the `.data` suffix,
+    // so the consumed key is lost. Recover the canonical `page.data` object (the
+    // `$`-stripped form, matching how the root branch normalizes `$page` -> `page`)
+    // so the cross-file detector can see the project-wide `page.data.<key>`
+    // consumer channel. Scoped to the `page` store's `data` member only (gated on
+    // the Svelte dollar-ref path) to stay byte-identical for every other dotted
+    // template member object; `$page.url.pathname` etc. still map root-only.
+    if allow_dollar_prefixed_refs
+        && (name == "page.data" || name == "$page.data")
+        && unresolved_names.contains("page")
+    {
+        return Some("page.data".to_string());
     }
     None
 }
@@ -177,11 +490,11 @@ fn remap_object_name(
 fn wrap_snippet(snippet: &str, kind: TemplateSnippetKind, locals: &[String]) -> String {
     let mut wrapped = String::new();
     if !locals.is_empty() {
-        wrapped.push_str("const __fallow_local = undefined;\n");
+        wrapped.push_str("const __f_tpl_local = undefined;\n");
         for local in locals {
             wrapped.push_str("const ");
             wrapped.push_str(local);
-            wrapped.push_str(" = __fallow_local;\n");
+            wrapped.push_str(" = __f_tpl_local;\n");
         }
     }
 
@@ -303,5 +616,91 @@ mod tests {
         assert_eq!(usage.member_accesses.len(), 1);
         assert_eq!(usage.member_accesses[0].object, "page");
         assert_eq!(usage.member_accesses[0].member, "url");
+    }
+
+    // unused-load-data-key Primitive C: the SvelteKit global page store read in a
+    // template recovers the nested `page.data.<key>` member access.
+
+    #[test]
+    fn svelte4_page_store_data_key_recovers_nested_member() {
+        let usage = analyze_template_snippet(
+            "$page.data.user",
+            TemplateSnippetKind::Expression,
+            &bindings(&["page"]),
+            &[],
+            true,
+        );
+
+        assert!(
+            usage
+                .member_accesses
+                .iter()
+                .any(|a| a.object == "page.data" && a.member == "user"),
+            "`$page.data.user` should recover `page.data.user`, got: {:?}",
+            usage.member_accesses
+        );
+    }
+
+    #[test]
+    fn svelte5_page_state_data_key_recovers_nested_member() {
+        let usage = analyze_template_snippet(
+            "page.data.session",
+            TemplateSnippetKind::Expression,
+            &bindings(&["page"]),
+            &[],
+            true,
+        );
+
+        assert!(
+            usage
+                .member_accesses
+                .iter()
+                .any(|a| a.object == "page.data" && a.member == "session"),
+            "`page.data.session` should recover `page.data.session`, got: {:?}",
+            usage.member_accesses
+        );
+    }
+
+    #[test]
+    fn page_store_non_data_member_stays_root_only() {
+        // `$page.url.pathname` must keep mapping to root `page.url` -> `{page, url}`;
+        // only the `data` channel recovers the nested key. Regression guard for the
+        // existing store-ref behavior.
+        let usage = analyze_template_snippet(
+            "$page.url.pathname",
+            TemplateSnippetKind::Expression,
+            &bindings(&["page"]),
+            &[],
+            true,
+        );
+
+        assert!(
+            !usage.member_accesses.iter().any(|a| a.object == "page.url"),
+            "`$page.url` must not recover a nested member, got: {:?}",
+            usage.member_accesses
+        );
+    }
+
+    #[test]
+    fn page_data_nested_recovery_is_svelte_only() {
+        // Vue templates pass allow_dollar_prefixed_refs=false; the `page` store is
+        // SvelteKit-specific, so `page.data.x` must NOT recover the nested member
+        // in a Vue context (root `{page, data}` is still credited).
+        let usage = analyze_template_snippet(
+            "page.data.x",
+            TemplateSnippetKind::Expression,
+            &bindings(&["page"]),
+            &[],
+            false,
+        );
+
+        assert!(
+            !usage
+                .member_accesses
+                .iter()
+                .any(|a| a.object == "page.data"),
+            "Vue context must not recover `page.data`, got: {:?}",
+            usage.member_accesses
+        );
     }
 }

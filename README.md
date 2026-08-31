@@ -7,486 +7,373 @@
 </p>
 
 <p align="center">
-  <strong>Codebase intelligence for TypeScript & JavaScript.</strong><br>
-  Free static analysis for unused code, duplication, complexity, and architecture drift.<br>
-  Optional runtime intelligence for hot paths, cold paths, and runtime-backed code decisions.<br>
-  <strong>Built for AI-assisted development. No AI inside.</strong><br>
-  <strong>Rust-native. Zero config. Sub-second.</strong>
+  <strong>Codebase intelligence for TypeScript and JavaScript.</strong><br>
+  One binary finds unused code, circular dependencies, duplication, complexity hotspots, boundary violations, and design-system styling drift. An optional paid layer, Fallow Runtime, adds production execution evidence.<br>
+  <sub>Deterministic findings and typed output contracts. No AI inside the analyzer, and no TypeScript compiler or Node.js runtime needed for static analysis.</sub>
 </p>
 
 <p align="center">
+  <a href="https://www.npmjs.com/package/fallow"><img src="https://img.shields.io/npm/v/fallow.svg" alt="npm"></a>
+  <a href="https://www.npmjs.com/package/fallow"><img src="https://img.shields.io/npm/dm/fallow.svg" alt="npm downloads"></a>
   <a href="https://github.com/fallow-rs/fallow/actions/workflows/ci.yml"><img src="https://github.com/fallow-rs/fallow/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://github.com/fallow-rs/fallow/actions/workflows/coverage.yml"><img src="https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/fallow-rs/fallow/badges/coverage.json" alt="Coverage"></a>
-  <a href="https://crates.io/crates/fallow-cli"><img src="https://img.shields.io/crates/v/fallow-cli.svg" alt="crates.io"></a>
-  <a href="https://www.npmjs.com/package/fallow"><img src="https://img.shields.io/npm/v/fallow.svg" alt="npm"></a>
+  <a href="https://app.codspeed.io/fallow-rs/fallow?utm_source=badge"><img src="https://img.shields.io/endpoint?url=https://codspeed.io/badge.json" alt="CodSpeed"></a>
   <a href="https://github.com/fallow-rs/fallow/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License"></a>
-  <a href="https://docs.fallow.tools"><img src="https://img.shields.io/badge/docs-docs.fallow.tools-blue.svg" alt="Documentation"></a>
+</p>
+
+<p align="center">
+  <a href="https://docs.fallow.tools">Docs</a> ·
+  <a href="https://docs.fallow.tools/quickstart">Quickstart</a> ·
+  <a href="https://docs.fallow.tools/integrations/mcp">MCP</a> ·
+  <a href="BENCHMARKS.md">Benchmarks</a>
 </p>
 
 ---
 
-```bash
-npx fallow --summary
-```
+Most repositories carry code nobody dares to delete, because deleting means proving a negative: fallow reads the repository as one dependency graph, from import edges to styling tokens, and reports what that graph shows.
 
 ```
-Dead Code Summary
+Audit scope: 19 changed files vs HEAD~15 (8fbfcb054..HEAD)
 
-      12  Unused files
-      47  Unused exports
-       8  Unused types
-       3  Unused dependencies
-       2  Circular dependencies
+● Unused files (2)
+  packages/vitest/src/public/reporters.ts
+  test/coverage-test/test/configuration-options.test-d.ts
 
-      72  Total
+● Circular dependencies (6)
+  packages/vitest/src/integrations/vi.ts
+    → wait.ts → vi.ts
 
-Duplication Summary
-
-      18  Clone families
-      53  Clone groups
-   2,140  Duplicated lines
-    4.2%  Duplication rate
-
-Health Summary
-
-     612  Functions analyzed
-       9  Above threshold
-    89.4  Average maintainability (good)
+✗ dead code: 156 issues · complexity: 6 findings · duplication: 8 clone groups · 19 changed files (1.05s)
+  audit gate excluded 163 inherited findings (run with --gate all to enforce)
 ```
 
-**Static analysis is free and open source. Runtime intelligence is optional.**
+*Excerpt from `fallow audit` on the vitest monorepo, auditing its last 15 commits. fallow 3.5.0, warm base-snapshot cache. The gate passed: the 163 inherited findings are pre-existing and excluded by design, so they do not block the change. The same run with `--format json` returns one typed JSON document.*
 
-90 framework plugins. No Node.js runtime required for static analysis. No config needed for the first run.
-
-Fallow builds a project-wide understanding of your TS/JS codebase instead of checking one file at a time. Use it to review AI-generated changes faster, clean up dead code, reduce duplication, find risky complexity, and enforce architecture boundaries. Add the runtime layer when you want to know what actually executed in production.
-
-**Fallow is the codebase truth layer your coding agent can call. It is not an AI assistant.**
-
-## Install
+## Quick start
 
 ```bash
-npx fallow                  # Run without installing
-npm install -g fallow       # Or install globally (macOS, Linux, Windows)
-cargo install fallow-cli    # Or via Cargo
+# Zero-install, full pipeline (dead code + duplication + health)
+npx fallow
+
+# Gate only what a PR changed
+npx fallow audit
+
+# Install as a devDependency
+npm install --save-dev fallow
+
+# For agents and scripts: exit 0 and 1 both mean the run succeeded (1 = findings);
+# exit 2 is a real error, reported as a JSON envelope on stdout
+npx fallow audit --format json --quiet 2>/dev/null
 ```
 
-Programmatic Node API:
+The npm package ships the `fallow`, `fallow-lsp`, and `fallow-mcp` launchers plus a version-matched agent skill, so the editor and agent integrations resolve the project-local binary instead of whatever happens to be on `PATH`. Runs are deterministic: the same input produces the same output with stable fingerprints. Re-running to verify an edit is safe. Other channels (pnpm, yarn, `cargo install fallow-cli`, and a local Docker build with a Compose example at [`examples/docker/compose.yaml`](examples/docker/compose.yaml)) are covered in the [installation guide](https://docs.fallow.tools/installation).
 
-```bash
-npm install @fallow-cli/fallow-node
-```
+## What fallow reports
 
-```ts
-import { detectDeadCode, detectDuplication, computeHealth } from '@fallow-cli/fallow-node';
+- [Unused files, exports, types, enum and class members, and dependencies](https://docs.fallow.tools/analysis/dead-code)
+- [Circular dependencies and re-export cycles](https://docs.fallow.tools/analysis/dead-code), part of `fallow dead-code`
+- [Code duplication](https://docs.fallow.tools/analysis/duplication) with a suffix-array detector covering JS/TS and CSS-family stylesheets, plus Vue/Svelte/Astro component regions
+- Opt-in semantic similar-code candidates for functions that may share intent despite different syntax, using a pinned local model and explicit review (`fallow similar-code`)
+- [Complexity hotspots](https://docs.fallow.tools/explanations/health) and a 0 to 100 health score with a letter grade
+- [Architecture boundary violations](https://docs.fallow.tools/analysis/boundaries) with `bulletproof`, `layered`, `hexagonal`, and `feature-sliced` presets
+- [Design-system styling drift](https://docs.fallow.tools/analysis/css-analysis) for CSS and CSS-in-JS
+- [A changed-file PR gate](https://docs.fallow.tools/cli/audit) with a pass, warn, or fail verdict (`fallow audit`)
+- [Auto-fix](https://docs.fallow.tools/analysis/auto-fix) with a dry-run preview
+- Opt-in [security candidates](docs/security-agent-verification.md) ranked by reachability from entry points (`fallow security`)
+- Optional checker-backed TypeScript evidence for exact symbol usage, cross-file private type leaks, targeted tests, and public-signature coupling (`--type-aware`)
 
-const deadCode = await detectDeadCode({ root: process.cwd() });
-const dupes = await detectDuplication({ root: process.cwd(), mode: 'mild', minTokens: 30 });
-const health = await computeHealth({ root: process.cwd(), score: true, ownershipEmails: 'handle' });
-```
+Over 100 built-in [framework plugins](https://docs.fallow.tools/frameworks/built-in) detect entry points and framework-consumed exports automatically, so the first run needs no configuration. Fallow Runtime, the optional paid layer, merges production execution evidence into these same reports; see [Runtime intelligence (optional)](#runtime-intelligence-optional) and [static vs runtime](https://docs.fallow.tools/explanations/static-vs-runtime).
 
-## Start here
+## Your first run
 
-```bash
-fallow                      # Dead code + duplication + health
-fallow dead-code            # Cleanup candidates
-fallow dupes                # Repeated logic
-fallow health               # Complexity + refactor targets
-fallow fix --dry-run        # Preview automatic cleanup
-```
+Findings on a first run usually mean fallow is missing an entry point or a framework convention, or is analyzing generated files you never meant to include. The built-in plugins take care of framework detection; it's generated code that usually needs a hint:
 
-## What it finds
-
-- **Dead code**: unused files, exports, dependencies, types, cycles, boundaries, stale suppressions
-- **Duplication**: repeated blocks from exact to semantic clones
-- **Complexity**: high-risk functions, file scores, hotspots, and refactor targets
-- **Architecture drift**: boundary violations across layers and modules
-
-## Why Fallow exists
-
-Linters check files. TypeScript checks types. Fallow checks the codebase.
-
-It builds a module graph across the whole project so it can find problems that file-local tools cannot:
-
-| What | Linter | Fallow |
-|---|---|---|
-| Unused variable in a function | yes | no |
-| Unused export that nothing imports | no | yes |
-| File that nothing imports | no | yes |
-| Circular dependency across modules | no | yes |
-| Duplicate code blocks across files | no | yes |
-| Dependency in package.json never imported | no | yes |
-
-[Full comparison: fallow vs ESLint, Biome, knip, ts-prune](https://docs.fallow.tools/explanations/fallow-vs-linters)
-
-## Why teams using AI need Fallow
-
-AI accelerates code creation. It does not eliminate review, cleanup, or architecture drift.
-
-When Claude Code, Codex, Cursor, or other tools generate changes, teams still need to know:
-
-- did this introduce dead code?
-- did it duplicate logic that already existed?
-- did complexity get worse?
-- did the change cross a boundary it should not cross?
-- is this code on a hot path or a cold one?
-- what should the reviewer read closely first?
-
-Fallow answers those questions with deterministic, graph-based analysis and structured output, so both humans and agents can act on facts instead of guesses.
-
-## How agents use Fallow
-
-Agents do not need to guess from limited context. They can call Fallow directly via the CLI or MCP.
-
-Common agent workflow:
-
-1. generate or edit code
-2. run `fallow --format json`
-3. inspect dead code, duplication, health findings, and per-issue `actions`
-4. apply safe fixes or adjust the patch before opening a PR
-5. hand the result to a human reviewer with better evidence
-
-```bash
-npx fallow --format json
-npx fallow audit --format json
-npx fallow fix --dry-run --format json
-```
-
-For full adoption instead of one-off review, see the [Fallow compliance happy path](https://github.com/fallow-rs/fallow/blob/main/docs/fallow-compliance.md). It defines the end state clearly: repo-wide dead code and duplication findings are fixed or explicitly documented, `fallow health` reaches `Above threshold: 0` for the repo's chosen thresholds, and `fallow audit` becomes the change-set gate once adoption is wired in. It also includes a copy-paste agent onboarding prompt.
-
-See [Agent integration](https://docs.fallow.tools/integrations/mcp) for MCP setup and the full list of structured tools.
-
-## More static commands
-
-```bash
-fallow audit                # Audit changed files (verdict: pass/warn/fail)
-fallow watch                # Re-analyze on file changes
-fallow fix                  # Apply automatic cleanup after previewing
-```
-
-## Dead code
-
-Finds unused files, exports, dependencies, types, enum members, class members, unresolved imports, unlisted dependencies, duplicate exports, circular dependencies (including cross-package cycles in monorepos), boundary violations, type-only dependencies, test-only production dependencies, and stale suppression comments. Entry points are auto-detected from package.json fields, framework conventions, and plugin patterns. Arrow-wrapped dynamic imports (`React.lazy`, `loadable`, `defineAsyncComponent`) are tracked as references. Script multiplexers (`concurrently`, `npm-run-all`) are analyzed to discover transitive script dependencies. JSDoc tags (`@public`, `@internal`, `@beta`, `@alpha`, `@expected-unused`) control export visibility.
-
-```bash
-fallow dead-code                          # All dead code issues
-fallow dead-code --unused-exports         # Only unused exports
-fallow dead-code --circular-deps          # Only circular dependencies
-fallow dead-code --boundary-violations    # Only boundary violations
-fallow dead-code --stale-suppressions     # Only stale suppression comments
-fallow dead-code --production             # Exclude test/dev files
-fallow dead-code --changed-since main     # Only changed files (for PRs)
-fallow dead-code --file src/utils.ts       # Single file (lint-staged integration)
-fallow dead-code --include-entry-exports  # Also check exports from entry files
-fallow dead-code --group-by owner         # Group by CODEOWNERS for team triage
-fallow dead-code --group-by directory     # Group by first directory component
-fallow dead-code --group-by package       # Group by workspace package (monorepo)
-fallow dead-code --group-by section       # Group by GitLab CODEOWNERS section
-```
-
-## Duplication
-
-Finds copy-pasted code blocks across your codebase. Suffix-array algorithm -- no quadratic pairwise comparison.
-
-```bash
-fallow dupes                              # Default (mild mode)
-fallow dupes --mode semantic              # Catch clones with renamed variables
-fallow dupes --skip-local                 # Only cross-directory duplicates
-fallow dupes --trace src/utils.ts:42      # Show all clones of code at this location
-```
-
-Four detection modes: **strict** (exact tokens), **mild** (default, AST-based), **weak** (different string literals), **semantic** (renamed variables and literals).
-
-## Complexity
-
-Surfaces the most complex functions in your codebase and identifies where to spend refactoring effort.
-
-```bash
-fallow health                             # Functions exceeding thresholds
-fallow health --score                     # Project health score (0-100) with letter grade
-fallow health --min-score 70              # CI gate: fail if score drops below 70
-fallow health --top 20                    # 20 most complex functions
-fallow health --file-scores               # Per-file maintainability index (0-100)
-fallow health --hotspots                  # Riskiest files (git churn x complexity)
-fallow health --hotspots --ownership      # Add bus factor, owner, drift signals
-fallow health --targets                   # Ranked refactoring recommendations
-fallow health --targets --effort low      # Only quick-win refactoring targets
-fallow health --coverage-gaps             # Static test coverage gaps
-fallow health --coverage coverage/coverage-final.json
-fallow health --coverage artifacts/coverage.json --coverage-root /home/runner/work/myapp
-fallow health --production-coverage ./coverage
-fallow health --production-coverage ./coverage --min-invocations-hot 250
-fallow health --trend                     # Compare against saved snapshot
-fallow health --changed-since main        # Only changed files
-```
-
-## Runtime intelligence (optional)
-
-Static analysis answers: **what is connected to what?**
-
-Runtime intelligence answers: **what actually ran?**
-
-Fallow Runtime is the optional paid team layer. It uses production coverage as the collection engine (V8 dumps via `NODE_V8_COVERAGE=...` and Istanbul `coverage-final.json` files), then merges that evidence into `fallow health` so teams and coding agents can:
-
-- review changes on hot production paths more carefully
-- delete cold code with stronger evidence
-- prioritize refactors by runtime importance
-- spot stale feature-flag branches and stale runtime code
-- give agents factual usage data instead of assumptions
-
-```bash
-fallow license activate --trial --email you@company.com
-fallow coverage setup
-fallow health --production-coverage ./coverage
-```
-
-Static `coverage_gaps` and runtime `production_coverage` are separate layers in the same `health` surface:
-
-| Surface | Flag | Input | Answers | License |
-|:--|:--|:--|:--|:--|
-| Static test reachability | `--coverage-gaps` | none | which runtime files/exports have no test dependency path | no |
-| Exact CRAP scoring | `--coverage` | Istanbul JSON file or `coverage-final.json` directory | how covered each function is for CRAP computation | no |
-| Runtime production coverage | `--production-coverage` | V8 directory, V8 JSON file, or Istanbul JSON file | which functions actually executed, which stayed cold, which are hot | yes |
-
-Setup details:
-
-- `fallow license activate --trial --email ...` starts a trial and stores the signed license locally
-- `fallow license refresh` refreshes the stored license before the hard-fail window
-- `fallow coverage setup` detects your framework and package manager, installs the sidecar if needed, writes a collection recipe, and resumes from the current setup state on re-run
-- `fallow coverage upload-inventory` pushes a static function inventory to fallow cloud so the dashboard's `Untracked` filter (functions that exist but never run) lights up. Runs in CI, respects `.gitignore` + `--exclude-paths`, preserves same-named functions by their line-aware cloud identity, and warns when inventory paths do not overlap recent runtime paths. For containerized deployments, pass `--path-prefix /app` (or your Dockerfile `WORKDIR`) so inventory paths match what the runtime beacon reports
-- The sidecar can be installed globally or as a project devDependency; fallow resolves `FALLOW_COV_BIN`, project-local shims, package-manager bin lookups, `~/.fallow/bin/fallow-cov`, and `PATH`
-- `fallow health --production-coverage <path>` accepts a V8 directory, a single V8 JSON file, or a single Istanbul coverage map JSON file (commonly `coverage-final.json`)
-- `fallow health --coverage <path>` accepts a single Istanbul coverage map JSON file or a directory containing `coverage-final.json`
-- `--coverage-root <path>` rebases Istanbul file paths before CRAP matching. Use it when coverage was generated in CI or Docker with a different checkout root, for example `fallow health --coverage artifacts/coverage-final.json --coverage-root /home/runner/work/myapp`
-- V8 dumps that include Node's `source-map-cache` are remapped through supported source-map paths before analysis, including file paths, relative paths, `webpack://...`, and `vite://...`; unsupported virtual schemes safely fall back to raw V8 handling
-- `fallow health --changed-since <ref> --production-coverage <path>` promotes touched hot paths to a `hot-path-changes-needed` verdict during change review
-
-Production coverage is merged into the same human, JSON, SARIF, compact, markdown, and CodeClimate outputs as the rest of the health report.
-
-Read more: [Static vs runtime intelligence](https://docs.fallow.tools/explanations/static-vs-runtime) | [Production coverage](https://docs.fallow.tools/analysis/production-coverage)
-
-## Audit
-
-Quality gate for AI-generated code and PRs. Combines dead code + complexity + duplication scoped to changed files.
-
-```bash
-fallow audit                              # Auto-detects base branch
-fallow audit --base main                  # Explicit base ref
-fallow audit --base HEAD~3               # Audit last 3 commits
-fallow audit --format json                # Structured output with verdict
-```
-
-Returns a verdict: **pass** (exit 0), **warn** (exit 0, warn-severity only), or **fail** (exit 1). JSON output includes a `verdict` field for CI and agent integration.
-
-**Per-analysis baselines.** When touching legacy files with pre-existing issues, reuse the baselines saved by the individual subcommands so audit only fails on genuinely new findings:
-
-```bash
-# Save once from a clean ref
-fallow dead-code --save-baseline fallow-baselines/dead-code.json
-fallow health    --save-baseline fallow-baselines/health.json
-fallow dupes     --save-baseline fallow-baselines/dupes.json
-
-# Feed into audit on every PR
-fallow audit \
-  --dead-code-baseline fallow-baselines/dead-code.json \
-  --health-baseline    fallow-baselines/health.json \
-  --dupes-baseline     fallow-baselines/dupes.json
-```
-
-Keep committed baselines outside `.fallow/`; that directory is for cache and local data and is typically gitignored. `fallow-baselines/` is the recommended default. Configure defaults in `.fallowrc.json` under `audit.deadCodeBaseline` / `audit.healthBaseline` / `audit.dupesBaseline` so CI stays one command (`fallow audit`). CLI flags override config.
-
-## CI integration
-
-```yaml
-# GitHub Action
-- uses: fallow-rs/fallow@v2
-
-# GitLab CI -- include the template and extend
-include:
-  - remote: 'https://raw.githubusercontent.com/fallow-rs/fallow/vX.Y.Z/ci/gitlab-ci.yml'
-fallow:
-  extends: .fallow
-
-# Or run directly on any CI
-- run: npx fallow --ci
-```
-
-`--ci` enables SARIF output, quiet mode, and non-zero exit on issues. Also supports:
-
-- `--group-by owner|directory|package|section` -- group output by CODEOWNERS ownership, directory, workspace package, or GitLab CODEOWNERS `[Section]` headers for team-level triage
-- `--summary` -- show only category counts (no individual issues)
-- `--changed-since main` -- analyze only files touched in a PR
-- `--changed-workspaces origin/main` -- scope monorepo analysis to workspaces containing any changed file (CI primitive; fails hard on git errors so CI never silently widens back to the full repo)
-- `--baseline` / `--save-baseline` -- fail only on **new** issues
-- `--fail-on-regression` / `--tolerance 2%` -- fail only if issues **grew** beyond tolerance
-- `--format sarif` -- upload to GitHub Code Scanning
-- `--format codeclimate` -- GitLab Code Quality inline MR annotations
-- `--format annotations` -- GitHub Actions inline PR annotations (no Action required)
-- `--format json` / `--format markdown` -- for custom workflows (JSON includes machine-actionable `actions` per issue)
-- `--format badge` -- shields.io-compatible SVG health badge (`fallow health --format badge > badge.svg`)
-
-Both the GitHub Action and GitLab CI template auto-detect your package manager (npm/pnpm/yarn) from lock files, so install/uninstall commands in review comments match your project.
-
-Adopt incrementally -- surface issues without blocking CI, then promote when ready:
-
-```jsonc
-{ "rules": { "unused-files": "error", "unused-exports": "warn", "circular-dependencies": "off" } }
-```
-
-### GitLab CI rich MR comments
-
-The GitLab CI template can post rich comments directly on merge requests -- summary comments with collapsible sections and inline review discussions with suggestion blocks.
-
-| Variable | Default | Description |
-|---|---|---|
-| `FALLOW_COMMENT` | `"false"` | Post a summary comment on the MR with collapsible sections per analysis |
-| `FALLOW_REVIEW` | `"false"` | Post inline MR discussions at the relevant lines, with `suggestion` blocks for unused exports |
-| `FALLOW_MAX_COMMENTS` | `"50"` | Maximum number of inline review comments |
-| `FALLOW_SCRIPTS_REF` | `""` | Pinned tag or commit for remote MR-integration scripts; leave empty to prefer vendored local `ci/` + `action/` scripts |
-
-In MR pipelines, `--changed-since` is set automatically to scope analysis to changed files. Previous fallow comments are cleaned up on re-runs.
-
-The comment merging pipeline groups unused exports per file and deduplicates clone reports, keeping MR threads readable.
-
-For remote includes, pin the template to a release tag and keep `FALLOW_SCRIPTS_REF` on the same tag or commit. When you vendor `ci/` and `action/` into your repo, the template now prefers those local scripts and skips the remote fetch path entirely.
-
-A `GITLAB_TOKEN` (PAT with `api` scope) is recommended for full features (suggestion blocks, cleanup of previous comments). `CI_JOB_TOKEN` works for posting but cannot delete comments from prior runs.
-
-```yaml
-# .gitlab-ci.yml -- full example with rich MR comments
-include:
-  - remote: 'https://raw.githubusercontent.com/fallow-rs/fallow/vX.Y.Z/ci/gitlab-ci.yml'
-
-fallow:
-  extends: .fallow
-  variables:
-    FALLOW_COMMENT: "true"       # Summary comment with collapsible sections
-    FALLOW_REVIEW: "true"        # Inline discussions with suggestion blocks
-    FALLOW_MAX_COMMENTS: "30"    # Cap inline comments (default: 50)
-    FALLOW_SCRIPTS_REF: "vX.Y.Z" # Match the pinned template ref when using remote scripts
-    FALLOW_FAIL_ON_ISSUES: "true"
-```
-
-## Configuration
-
-Works out of the box. When you need to customize, create `.fallowrc.json` or run `fallow init`:
-
-```jsonc
-// .fallowrc.json
+```json
 {
-  "$schema": "https://raw.githubusercontent.com/fallow-rs/fallow/main/schema.json",
-  "entry": ["src/workers/*.ts", "scripts/*.ts"],
-  "ignorePatterns": ["**/*.generated.ts"],
-  "ignoreDependencies": ["autoprefixer"],
-  "rules": {
-    "unused-files": "error",
-    "unused-exports": "warn",
-    "unused-types": "off"
-  },
-  "health": {
-    "maxCyclomatic": 20,
-    "maxCognitive": 15,
-    "maxCrap": 30
-  }
+  "$schema": "./node_modules/fallow/schema.json",
+  "ignorePatterns": ["**/*.generated.ts"]
 }
 ```
 
-Architecture boundary presets enforce import rules between layers with zero manual config:
+You do not have to author that config yourself. [`npx fallow recommend`](https://docs.fallow.tools/cli/recommend) detects the stack (frameworks, workspace layout, test runner, package manager), prints a proposed config as a safe starting point, and ends with the few genuinely subjective choices it will not decide for you. For TypeScript projects it also points to the optional, slower `--type-aware` pass without enabling it. It is read-only and always exits 0; nothing changes until you save the config.
 
-```jsonc
-{ "boundaries": { "preset": "bulletproof" } } // or: layered, hexagonal, feature-sliced
+Patterns are relative to the project root and add to fallow's built-in ignore defaults (node_modules, dist, coverage, minified bundles). Config precedence is first match wins per directory, with no merging: `.fallowrc.json` (JSONC accepted) > `.fallowrc.jsonc` > `fallow.toml` > `.fallow.toml`. The full reference is the [configuration overview](https://docs.fallow.tools/configuration/overview); the boundaries of the default syntactic and optional type-aware analyses are documented in [limitations](https://docs.fallow.tools/analysis/limitations); for a hung or failed run, see [debugging](https://docs.fallow.tools/analysis/debugging).
+
+Adopting on an existing codebase? `fallow audit` fails only on findings a change introduces, so a legacy backlog does not block day one, and `--save-baseline` / `--baseline` quarantine the existing findings for the standalone commands. The [adoption guide](https://docs.fallow.tools/adoption) covers the staged path.
+
+## Commands
+
+| Command | What it does |
+|---|---|
+| `npx fallow` | Full pipeline: dead code, duplication, health |
+| [`npx fallow audit`](https://docs.fallow.tools/cli/audit) | Changed-file gate over dead code, complexity, duplication, and styling drift: verdict pass/warn/fail against a base ref. Fails only on findings the change introduced (`--gate all` widens) |
+| [`npx fallow dead-code`](https://docs.fallow.tools/cli/dead-code) | Unused code and circular dependencies (alias: `check`) |
+| `npx fallow dead-code --trace src/file.ts:symbol` | Prove a symbol is unused before deleting it |
+| `npx fallow dead-code --type-aware --symbol-impact src/file.ts:symbol` | Find exact consumers, affected files, and targeted tests for an export or `Class.method` |
+| [`npx fallow dupes`](https://docs.fallow.tools/cli/dupes) | Duplication; modes `strict`, `mild` (default), `weak`, `semantic` |
+| `npx fallow similar-code` | Opt-in semantic function candidates from a pinned local model; inspect and verify before any refactor |
+| [`npx fallow health --score`](https://docs.fallow.tools/cli/health) | Complexity, 0 to 100 health score, hotspots; `--css` adds structural CSS analytics |
+| [`npx fallow fix --dry-run`](https://docs.fallow.tools/cli/fix) | Preview auto-fixes; apply with `npx fallow fix` |
+| `npx fallow guard src/file.ts` | Which boundary rules apply to a file before editing |
+| `npx fallow security` | Opt-in security candidates; `--gate new --changed-since <ref>` fails only on introduced ones |
+| `npx fallow explain <issue-type>` | Explain a rule without analyzing |
+| [`npx fallow recommend`](https://docs.fallow.tools/cli/recommend) | Detect the stack and propose a config; subjective choices stay open questions |
+| [`npx fallow init`](https://docs.fallow.tools/cli/init) | Scaffold config; `--agents` scaffolds an AGENTS.md |
+| `npx fallow migrate` | Migrate from knip, jscpd, or stylelint config |
+| `npx fallow viz` | Interactive HTML map of the codebase: treemap + import graph with dead-code, duplication, boundaries, and hotspot lenses |
+| `npx fallow schema` | Machine-readable capability manifest (always JSON) |
+
+<details>
+<summary>Every other command, one line each</summary>
+
+| Command | Purpose |
+|---|---|
+| `fallow review --brief` | Advisory orientation brief over changed files; always exits 0 |
+| `fallow inspect --file src/api.ts` | Evidence bundle for one file, or one symbol via `--symbol src/api.ts:client` |
+| `fallow trace src/utils.ts:formatDate` | Symbol-level call chains: callers up, callees down |
+| `fallow type-aware status` | Check whether the version-matched optional TypeScript companion is available |
+| `fallow similar-code status` | Check the exact local companion and pinned-model readiness without reading project source |
+| `fallow similar-code setup --local` | Explicitly download and verify the pinned local model |
+| `fallow watch` | Re-run analysis on file changes (interactive use; agents should not run it) |
+| `fallow flags` | Detect feature-flag patterns |
+| `fallow suppressions` | Inventory of `fallow-ignore` markers |
+| `fallow list` | Entry points, files, plugins, and boundaries (`--boundaries`) |
+| `fallow workspaces` | Monorepo workspace discovery diagnostics |
+| `fallow config` | Resolved configuration and which file provided it |
+| `fallow decision-surface` | Ranked structural decisions a change embeds |
+| `fallow impact` | Opt-in, local-only report of what fallow caught; `--all` spans repos |
+| `fallow report --from results.json` | Re-render saved JSON as SARIF, CodeClimate, GitHub output, or GitHub/GitLab PR feedback without re-analyzing |
+| `fallow ci ...` | PR/MR feedback helpers (comments, reviews, check runs) |
+| `fallow ci-template gitlab --vendor` | Vendor the GitLab CI template for offline runners |
+| `fallow agent install` | One-pass agent onboarding for Claude Code, Codex, and Cursor (`status`, `uninstall`, `--dry-run`) |
+| `fallow hooks install --target git` | Managed pre-commit hook; `--target agent` writes agent-gate hooks |
+| `fallow rule-pack init` | Declarative policy rule packs (`list`, `test`, `schema`) |
+| `fallow plugin-check` | Dry-run an external framework plugin |
+| `fallow config-schema` | JSON Schema for config; also `plugin-schema` and `rule-pack schema` |
+| `fallow license activate --trial --email you@company.com` | Fallow Runtime licensing (`status`, `refresh`, `deactivate`) |
+| `fallow telemetry status` | Opt-in telemetry, off by default (`enable`, `disable`, `inspect --example`) |
+| `fallow coverage setup` | Runtime coverage workflow (`analyze`, `upload-inventory`, `upload-source-maps`, `upload-static-findings`) |
+
+</details>
+
+### Optional TypeScript semantic evidence
+
+Default analysis stays Rust-native, syntactic, and independent of Node.js or
+the TypeScript compiler. Add `--type-aware` when a cleanup or refactor depends
+on exact TypeScript identity across aliases, re-exports, packages, or tests:
+
+```bash
+npx fallow dead-code --unused-class-members --type-aware --format json --quiet
+npx fallow fix --type-aware --dry-run --format json --quiet
+npx fallow dead-code --type-aware --symbol-impact src/api.ts:Client --format json --quiet
+npx fallow dead-code --type-aware --symbol-impact src/repository.ts:UserRepository.save --format json --quiet
+npx fallow health --type-aware --type-coupling --format json --quiet
 ```
 
-Run `fallow list --boundaries` to inspect the expanded rules. TOML also supported (`fallow init --toml`). The init command auto-detects your project structure (monorepo layout, frameworks, existing config) and generates a tailored config. It also adds `.fallow/` to your `.gitignore` (cache and local data). Scaffold a pre-commit hook with `fallow init --hooks`. Migrating from knip or jscpd? Run `fallow migrate`.
+This does not replace `tsc --noEmit` or Oxlint. Fallow does not emit compiler
+diagnostics or duplicate local typed lint rules. It uses checker evidence only
+for project-wide questions. It removes false positives caused by interfaces,
+base classes, aliases, and re-exports. A class member becomes automatically
+fixable only after every owning project reports complete negative evidence and
+the exact declaration hash still matches. Otherwise Fallow keeps the finding
+and explains the gap. See the [type-aware analysis contract](docs/type-aware-analysis.md).
 
-See the [full configuration reference](https://docs.fallow.tools/configuration/overview) for all options.
+Per-command flags come from `fallow schema` (machine-readable) or the [CLI reference](https://docs.fallow.tools/cli/global-flags).
 
-## Framework plugins
+## Output and exit codes
 
-90 built-in plugins detect entry points, convention exports, config-defined aliases, and template-visible usage for your framework automatically.
+For machine consumption, add `--format json --quiet` to any command, parse the JSON on stdout, and do not depend on whitespace. JSON is compact by default; add `--pretty` only for manual inspection. Exit 0 and 1 both mean the run succeeded (1 signals findings); exit 2 is a real error and still writes a JSON envelope to stdout. Branch on the code, treating 0 and 1 as success and 2 as failure, rather than blanket-suppressing with `|| true` (which hides real errors from anything that checks the exit code).
 
-| Category | Plugins |
+| `--format` | What you get |
 |---|---|
-| **Frameworks** | Next.js, Nuxt, Remix, Qwik, SvelteKit, Gatsby, Astro, Angular, NestJS, Expo, Expo Router, Electron, and more |
-| **Bundlers** | Vite, Webpack, Rspack, Rsbuild, Rollup, Rolldown, Tsup, Tsdown, Parcel |
-| **Testing** | Vitest, Jest, Playwright, Cypress, Storybook, Mocha, Ava |
-| **CSS** | Tailwind, PostCSS, UnoCSS |
-| **Databases & Backend** | Prisma, Drizzle, Knex, TypeORM, Kysely, Convex |
-| **Blockchain** | Hardhat |
-| **Monorepos** | Turborepo, Nx, Changesets, Syncpack, pnpm |
+| `human` (default) | Terminal report with a `Next:` suggestion line |
+| `json` | The machine contract: one compact typed JSON document on stdout (`--pretty` indents it) |
+| `sarif` | GitHub Code Scanning and other SARIF consumers |
+| `compact` | One grep-friendly line per finding |
+| `markdown` (alias `md`) | Markdown report |
+| `codeclimate` (aliases `gitlab-codequality`, `gitlab-code-quality`) | GitLab Code Quality report |
+| `github-annotations` | Workflow-command annotations; render on fork PRs without a write token |
+| `github-summary` | Job-summary markdown for `$GITHUB_STEP_SUMMARY` |
+| `pr-comment-github`, `pr-comment-gitlab`, `review-github`, `review-gitlab` | Typed CI feedback from final refined findings; supported by type-aware `check` and `audit` runs |
+| `badge` | shields.io-compatible SVG health badge; `fallow health` only (`fallow health --format badge > badge.svg`) |
 
-[Full plugin list](https://docs.fallow.tools/frameworks/built-in) -- missing one? Add a [custom plugin](https://docs.fallow.tools/frameworks/custom-plugins) or [open an issue](https://github.com/fallow-rs/fallow/issues).
+`human`, `json`, `sarif`, `compact`, and `markdown` apply to every analysis command; the CI envelopes and `badge` belong to the command that produces them, as documented per format in the [CI guide](https://docs.fallow.tools/integrations/ci).
 
-## Editor & AI support
+In CI, keep JSON as the provenance-bearing artifact and render presentation
+surfaces from it. For example, analyze once with `--format json -o results.json`,
+then run `fallow report --from results.json --format pr-comment-gitlab` and
+`fallow report --from results.json --format review-gitlab`. This preserves
+type-aware refinement, audit verdicts, and one authoritative finding set.
 
-Fallow is not an AI assistant. It is the codebase truth layer your assistant can call.
+| Exit code | Meaning |
+|---|---|
+| 0 | Clean, or audit verdict pass or warn |
+| 1 | Findings, or audit verdict fail (a normal outcome) |
+| 2 | Validation or runtime error (JSON error envelope on stdout with `--format json`) |
+| 3 | Requested resource unavailable: `config --path` found no config, or a license is unavailable or invalid |
+| 4 | Runtime coverage sidecar is unavailable, unverifiable, protocol-incompatible, or terminated unexpectedly |
+| 5 | Runtime coverage input could not be prepared or parsed |
+| 6 | Runtime coverage sidecar reported an internal error |
+| 7 | Network failure (license and cloud operations) |
+| 8 | Security gate hit (`fallow security --gate`) |
+| 10 | Coverage inventory or static-findings upload input or project validation failed |
+| 11 | Coverage inventory or static-findings upload exceeded the server payload limit |
+| 12 | Coverage inventory or static-findings upload authentication or authorization was rejected |
+| 13 | Coverage inventory or static-findings upload failed after retries or returned another server error |
 
-- **VS Code extension** -- tree views, status bar, one-click fixes, auto-download LSP binary ([Marketplace](https://github.com/fallow-rs/fallow/tree/main/editors/vscode))
-- **LSP server** -- real-time diagnostics, hover info, code actions, Code Lens with reference counts
-- **MCP server** -- AI agent integration for Claude Code, Cursor, Windsurf ([fallow-skills](https://github.com/fallow-rs/fallow-skills))
-- **JSON `actions` array** -- every issue in `--format json` output includes fix suggestions with `auto_fixable` flag, so agents can self-correct
+Rule severity maps onto exit codes: `error` fails CI (the default), `warn` exits 0, `off` skips the rule ([rules reference](https://docs.fallow.tools/configuration/rules)).
 
-## Performance
+The JSON contract, in short:
 
-Benchmarked on real open-source projects (median of 5 runs with 2 warmups, Apple M5).
+- a root `kind` discriminator names the analysis that produced the document
+- per-issue `actions[]` with an `auto_fixable` flag, so a script knows which findings it can hand to `fallow fix`
+- root `next_steps[]` suggestions are runnable as-is
+- errors arrive as `{"error": true, "message": "...", "exit_code": 2}` on stdout, not as a stack trace
 
-### Dead code: fallow vs knip
+Typed contracts ship with the npm package: `import type { CheckOutput, FallowJsonOutput } from "fallow/types"`. The generated schema lives at [docs/output-schema.json](docs/output-schema.json). The output format is CLI-only, via `--format` or `FALLOW_FORMAT`, and is never set in config; all environment variables are listed in [docs/environment-variables.md](docs/environment-variables.md).
 
-| Project | Files | fallow | knip v5 | knip v6 | vs v5 | vs v6 |
-|:--------|------:|-------:|--------:|--------:|------:|------:|
-| [zod](https://github.com/colinhacks/zod) | 174 | **25ms** | 650ms | 330ms | 26x | 13x |
-| [fastify](https://github.com/fastify/fastify) | 286 | **27ms** | 933ms | 222ms | 34x | 8x |
-| [preact](https://github.com/preactjs/preact) | 244 | **200ms** | 911ms | 2.15s | 5x | 11x |
-| [vue/core](https://github.com/vuejs/core) | 522 | **68ms** | ---* | ---* | --- | --- |
-| [TanStack/query](https://github.com/TanStack/query) | 901 | **330ms** | 2.66s | 1.08s | 8x | 3.3x |
-| [vite](https://github.com/vitejs/vite) | 1,420 | **378ms** | ---* | ---* | --- | --- |
-| [svelte](https://github.com/sveltejs/svelte) | 3,337 | **363ms** | 1.95s | 714ms | 5x | 2x |
-| [next.js](https://github.com/vercel/next.js) | 20,416 | **1.72s** | ---* | ---* | --- | --- |
+## Built for agents
 
-On the current benchmark fixtures, knip does not produce valid JSON results for vite, vue/core, and next.js. fallow completes on all three. See the [full comparison page](https://docs.fallow.tools/migration/comparison) for the complete matrix and current caveats. * knip exits without valid results on those fixtures.
+The JSON contract and exit codes above are the agent interface.
 
-### Duplication: fallow vs jscpd
+```json
+{ "mcpServers": { "fallow": { "command": "npx", "args": ["fallow-mcp"] } } }
+```
 
-| Project | Files | fallow | jscpd | Speedup |
-|:--------|------:|-------:|------:|--------:|
-| [fastify](https://github.com/fastify/fastify) | 286 | **76ms** | 1.96s | 26x |
-| [vue/core](https://github.com/vuejs/core) | 522 | **124ms** | 3.11s | 25x |
-| [next.js](https://github.com/vercel/next.js) | 20,416 | **2.89s** | 24.37s | 8x |
+The [MCP server](https://docs.fallow.tools/integrations/mcp) covers analysis, audit, health, duplication, tracing, fix preview and apply, boundary guard checks, and target inspection; every tool documents its nearest CLI fallback, and a bounded read-only Code Mode sandbox composes analysis calls without filesystem or network access.
 
-No TypeScript compiler, no Node.js runtime needed to analyze your code. [Fallow vs linters](https://docs.fallow.tools/explanations/fallow-vs-linters) | [Reproduce benchmarks](https://github.com/fallow-rs/fallow/tree/main/benchmarks)
+- `npx fallow agent install` wires the detected harnesses (Claude Code, Codex, Cursor) in one pass: an `AGENTS.md` task map (plus a `CLAUDE.md` import), the fallow skill, the MCP server registration, and the commit/push gate. Every write is marked, `--dry-run` shows the plan, `status` and `uninstall` cover the same surfaces
+- [`npx fallow recommend --format json`](https://docs.fallow.tools/cli/recommend) is the onboarding entry point: it returns the detected stack, a proposed config, and every decision with its tier and rationale, and it ships the subjective choices as ready-to-ask questions with options and tradeoffs. An agent authors `.fallowrc.json` from evidence and asks the user only what fallow will not decide
+- A version-matched agent skill ships in the npm package under `node_modules/fallow/skills/fallow` ([agent skills](https://docs.fallow.tools/integrations/agent-skills), companion repo [fallow-skills](https://github.com/fallow-rs/fallow-skills))
+- `npx fallow init --agents` scaffolds an AGENTS.md with a task-to-command matrix, and `npx fallow hooks install --target agent` gates `git commit` and `git push` on `fallow audit` ([hooks](https://docs.fallow.tools/integrations/claude-hooks)); both are the single-piece commands underneath `agent install`
+- A compliance loop with a copy-paste agent prompt: [docs/fallow-compliance.md](docs/fallow-compliance.md)
+- To verify security candidates from an agent harness, follow [docs/security-agent-verification.md](docs/security-agent-verification.md)
+- Never run `fallow watch` in an agent loop; it does not exit. Telemetry is off by default and opt-in only, with `DO_NOT_TRACK` honored ([docs/telemetry.md](docs/telemetry.md))
 
 ## Suppressing findings
 
 ```ts
-// fallow-ignore-next-line unused-export
+// fallow-ignore-next-line unused-export -- kept for plugin consumers
 export const keepThis = 1;
-
-// fallow-ignore-file
-// Suppress all issues in this file
 ```
 
-Also supports JSDoc visibility tags (`/** @public */`, `/** @internal */`, `/** @beta */`, `/** @alpha */`) to suppress unused export reports for library APIs consumed externally.
+`// fallow-ignore-file <issue-type>` suppresses the whole file. Both marker forms take a comma-separated list of issue kinds and an optional `-- <reason>` suffix that suppression hygiene records. JSDoc visibility tags (`@public`, `@internal`, `@expected-unused -- <reason>`) keep intentional library API surface quiet. `fallow suppressions` prints the inventory.
 
-## Limitations
+For staged [adoption](https://docs.fallow.tools/adoption), save a baseline once from a clean ref with `--save-baseline`, then pass `--baseline` on every run; `fallow audit` accepts per-analysis baselines. Full syntax lives at [suppression](https://docs.fallow.tools/configuration/suppression).
 
-fallow uses syntactic analysis -- no type information. This is what makes it fast, but type-level dead code is out of scope. Use [inline suppression comments](#suppressing-findings) or [`ignoreExports`](https://docs.fallow.tools/configuration/overview#ignoring-specific-exports) for edge cases.
+## CI
+
+GitHub Actions:
+
+```yaml
+- uses: actions/checkout@v4
+  with:
+    fetch-depth: 0
+- uses: fallow-rs/fallow@v3 # Action wrapper major (or pin a SHA)
+```
+
+The Action ref and the fallow CLI version are independent. `uses: fallow-rs/fallow@v3` selects the Action wrapper code, not the scanner. The CLI version the Action installs resolves in this order: the `version` input, then the `fallow` dependency spec found in the project's `package.json` (checked across `dependencies`, `devDependencies`, `optionalDependencies`, and `peerDependencies`, first match wins), then `latest`. The recommended setup above pins the Action major (or a SHA for supply-chain pinning) and omits `version`, so CI follows the project's own `package.json` pin and CLI upgrades never require touching the workflow. Note that the spec is installed as written: an exact pin (`1.2.3`) gives CI the same scanner as local runs, while a range (`^1.2.3`, the npm default) is resolved fresh in CI and can install a newer version than the one in the local lockfile. A major Action bump (`@v2` to `@v3`) can still be needed when the wrapper's inputs or behavior change.
+
+To force a specific CLI version regardless of `package.json`, set the `version` input:
+
+```yaml
+- uses: fallow-rs/fallow@v3
+  with:
+    version: <fallow version> # exact version, e.g. 1.2.3
+```
+
+When the project's fallow config enables type-aware analysis
+(`typeAware.enabled` or `audit.typeAware`), the Action automatically installs
+the `fallow-type-aware` sidecar at exactly the resolved CLI version and wires
+it through `FALLOW_TYPE_AWARE_BIN`, so no extra workflow setup is needed. The
+`type-aware` input controls this: `auto` (default) follows the config, `true`
+forces the sidecar and passes `--type-aware`, and `false` skips the sidecar and
+keeps the run syntactic even when the config opts in.
+
+When `comment: true` or `review-comments: true` is enabled, grant the job the
+permissions needed for branded feedback:
+
+```yaml
+permissions:
+  contents: read
+  id-token: write
+  pull-requests: write
+  checks: write
+```
+
+`id-token: write` lets the Action obtain a short-lived Fallow GitHub App token,
+so comments and reviews are authored by `fallow-cloud[bot]`. Without that
+permission, the analysis still runs and posting deliberately falls back to
+`github-actions[bot]`.
+
+The Action defaults to the full pipeline with PR-scoped analysis via automatic base detection, and it is a blocking gate out of the box: `fail-on-issues` defaults to true, so any finding fails the job. For a staged rollout, start report-only with `fail-on-issues: false`, or use `command: audit` so only findings a PR introduces can fail CI. A SARIF file is generated by default but uploading it to GitHub Code Scanning is opt-in (`sarif: true` plus `permissions: security-events: write`); inline annotations render without any of that. The `@v3` tag floats within major version 3; pin an exact tag or SHA when the fleet needs reproducible Action code, and pin the CLI through `version` or `package.json` when it needs reproducible scanner behavior. Sticky comments and review comments are inputs documented in the [CI guide](https://docs.fallow.tools/integrations/ci).
+
+GitLab:
+
+```yaml
+include:
+  - remote: 'https://raw.githubusercontent.com/fallow-rs/fallow/v3.21.0/ci/gitlab-ci.yml'
+
+fallow:
+  extends: .fallow
+```
+
+MR comments need a `GITLAB_TOKEN` with api scope; `CI_JOB_TOKEN` cannot create notes. Runners that cannot reach GitHub raw can vendor the template with `npx fallow ci-template gitlab --vendor`.
+
+CI runs diff-scoped on pull requests by default, so CI output can legitimately differ from a full local run. Commit baseline files to keep CI and local in agreement.
+
+## Runtime intelligence (optional)
+
+Fallow Runtime is the optional paid layer. It merges production execution evidence (V8 coverage dumps via `NODE_V8_COVERAGE`, or Istanbul files) into `fallow health` and `fallow audit`: hot paths for careful review, cold-code deletion confidence, runtime-weighted health, and stale-flag evidence. A single local coverage capture is free; continuous and cloud runtime monitoring requires a license. Everything else in this README is free and needs no license.
+
+```bash
+npx fallow license activate --trial --email you@company.com   # 30-day trial, offline Ed25519 verification
+npx fallow coverage setup                                     # resumable first-run flow
+```
+
+Details: [runtime coverage](https://docs.fallow.tools/analysis/runtime-coverage) and [static vs runtime](https://docs.fallow.tools/explanations/static-vs-runtime).
+
+## Editors and integrations
+
+- [VS Code extension](https://docs.fallow.tools/integrations/vscode)
+- Zed and Neovim setups under the [`editors/`](https://github.com/fallow-rs/fallow/tree/main/editors) tree ([Neovim guide](https://docs.fallow.tools/integrations/neovim))
+- The `fallow-lsp` server: diagnostics, hover, code actions, and code lenses. It resolves the project-local binary from a devDependency install
+- The Node API [`@fallow-cli/fallow-node`](https://docs.fallow.tools/integrations/node-bindings) exports `detectDeadCode`, `detectCircularDependencies`, `detectBoundaryViolations`, `detectDuplication`, `detectSimilarCode`, `detectFeatureFlags`, `computeComplexity`, and `computeHealth`. See the [package API reference](crates/napi/README.md) for options and return types
+- [README badges](https://docs.fallow.tools/integrations/badges): `fallow health --format badge > badge.svg`
+
+## Migrating from other tools
+
+`npx fallow migrate` translates existing knip, jscpd, or stylelint configuration into a fallow config. Guides: [from knip](https://docs.fallow.tools/migration/from-knip), [from jscpd](https://docs.fallow.tools/migration/from-jscpd), and the [comparison page](https://docs.fallow.tools/migration/comparison).
+
+## Performance
+
+On the dead-code benchmark set, fallow analyzes fastify in 64ms where knip 6 takes 205ms, and preact in 74ms against 2.01s (27.1x). The counterweight is real too: knip measures faster on astro and TypeScript, and jscpd remains faster at raw duplication scanning. fallow also completes analysis on three projects in the set where knip's runs errored on those projects' own config files (next.js at 20,558 files, vite, and vue/core).
+
+Measured on fallow 2.100.0 (the most recent full benchmark capture), Apple M5, medians of 5 cold runs. Methodology, full tables, and reproduction scripts live in [BENCHMARKS.md](BENCHMARKS.md) and [`benchmarks/`](benchmarks/); rerun them against any version. For how fallow relates to lint tooling, see [fallow vs linters](https://docs.fallow.tools/explanations/fallow-vs-linters).
 
 ## Documentation
 
-- [Getting started](https://docs.fallow.tools)
-- [Configuration reference](https://docs.fallow.tools/configuration/overview)
-- [CI integration guide](https://docs.fallow.tools/integrations/ci)
-- [Migrating from knip](https://docs.fallow.tools/migration/from-knip)
-- [Fallow compliance happy path](https://github.com/fallow-rs/fallow/blob/main/docs/fallow-compliance.md)
-- [Plugin authoring guide](https://github.com/fallow-rs/fallow/blob/main/docs/plugin-authoring.md)
+Public user documentation lives at
+[docs.fallow.tools](https://docs.fallow.tools): [quickstart](https://docs.fallow.tools/quickstart),
+[configuration overview](https://docs.fallow.tools/configuration/overview),
+[CLI reference](https://docs.fallow.tools/cli/global-flags),
+[MCP](https://docs.fallow.tools/integrations/mcp),
+[CI](https://docs.fallow.tools/integrations/ci), and
+[limitations](https://docs.fallow.tools/analysis/limitations). A
+machine-readable index is at
+[docs.fallow.tools/llms.txt](https://docs.fallow.tools/llms.txt).
 
-## Contributing
+Contributor and maintainer documentation starts at
+[docs/README.md](docs/README.md). Use the
+[task context map](docs/development/task-context-map.md) to load the smallest
+relevant architecture, implementation, or verification reference.
 
-Missing a framework plugin? Found a false positive? [Open an issue](https://github.com/fallow-rs/fallow/issues).
+Repository-level policies remain in [CONTRIBUTING.md](CONTRIBUTING.md),
+[BENCHMARKS.md](BENCHMARKS.md), [ROADMAP.md](ROADMAP.md), and
+[SECURITY.md](SECURITY.md).
 
-```bash
-cargo build --workspace && cargo test --workspace
-```
+## Contributing and license
 
-## License
+Missing a framework plugin? Found a false positive? [Open an issue](https://github.com/fallow-rs/fallow/issues). Development setup is covered in [CONTRIBUTING.md](CONTRIBUTING.md).
 
-MIT
+MIT, see [LICENSE](LICENSE).

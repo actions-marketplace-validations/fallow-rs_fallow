@@ -11,10 +11,8 @@
 pub fn extract_script_file_refs(script: &str) -> Vec<String> {
     let mut refs = Vec::new();
 
-    // Runners whose next argument is a file path
-    const RUNNERS: &[&str] = &["node", "ts-node", "tsx", "babel-node"];
+    const RUNNERS: &[&str] = &["node", "bun", "ts-node", "tsx", "babel-node"];
 
-    // Split on shell operators to handle chained commands
     for segment in script.split(&['&', '|', ';'][..]) {
         let segment = segment.trim();
         if segment.is_empty() {
@@ -26,7 +24,6 @@ pub fn extract_script_file_refs(script: &str) -> Vec<String> {
             continue;
         }
 
-        // Skip leading `npx`/`pnpx`/`yarn`/`pnpm exec` to find the actual command
         let mut start = 0;
         if matches!(tokens.first(), Some(&"npx" | &"pnpx")) {
             start = 1;
@@ -40,21 +37,16 @@ pub fn extract_script_file_refs(script: &str) -> Vec<String> {
 
         let cmd = tokens[start];
 
-        // Check if the command is a known runner
         if RUNNERS.contains(&cmd) {
-            // Collect ALL file path arguments after the runner (handles
-            // `node --test file1.mjs file2.mjs ...` and similar multi-file patterns)
             for &token in &tokens[start + 1..] {
                 if token.starts_with('-') {
                     continue;
                 }
-                // Must look like a file path (contains '/' or '.' extension)
                 if looks_like_file_path(token) {
                     refs.push(token.to_string());
                 }
             }
         } else {
-            // Scan all tokens for bare file paths (e.g. `./scripts/build.js`)
             for &token in &tokens[start..] {
                 if token.starts_with('-') {
                     continue;
@@ -69,29 +61,36 @@ pub fn extract_script_file_refs(script: &str) -> Vec<String> {
     refs
 }
 
-/// Check if a token looks like a file path argument (has a directory separator or a
-/// JS/TS file extension).
+/// Check if a token looks like a file path argument (has a directory separator
+/// or a script-like source file extension).
 pub fn looks_like_file_path(token: &str) -> bool {
-    let extensions = [".js", ".ts", ".mjs", ".cjs", ".mts", ".cts", ".jsx", ".tsx"];
+    if !crate::scripts::could_be_file_path(token) {
+        return false;
+    }
+    let extensions = [
+        ".js", ".ts", ".mjs", ".cjs", ".mts", ".cts", ".jsx", ".tsx", ".gts", ".gjs",
+    ];
     if extensions.iter().any(|ext| token.ends_with(ext)) {
         return true;
     }
-    // Only treat tokens with `/` as paths if they look like actual file paths,
-    // not URLs or scoped package names like @scope/package
     token.starts_with("./")
         || token.starts_with("../")
         || (token.contains('/') && !token.starts_with('@') && !token.contains("://"))
 }
 
 /// Check if a token looks like a standalone script file reference (must have a
-/// JS/TS extension and a path-like structure, not a bare command name).
+/// script-like source extension and a path-like structure, not a bare command
+/// name).
 pub fn looks_like_script_file(token: &str) -> bool {
-    let extensions = [".js", ".ts", ".mjs", ".cjs", ".mts", ".cts", ".jsx", ".tsx"];
+    if !crate::scripts::could_be_file_path(token) {
+        return false;
+    }
+    let extensions = [
+        ".js", ".ts", ".mjs", ".cjs", ".mts", ".cts", ".jsx", ".tsx", ".gts", ".gjs",
+    ];
     if !extensions.iter().any(|ext| token.ends_with(ext)) {
         return false;
     }
-    // Must contain a path separator or start with ./ to distinguish from
-    // bare package names like `webpack.js`
     token.contains('/') || token.starts_with("./") || token.starts_with("../")
 }
 
@@ -99,7 +98,6 @@ pub fn looks_like_script_file(token: &str) -> bool {
 mod tests {
     use super::*;
 
-    // extract_script_file_refs tests (Issue 3)
     #[test]
     fn script_node_runner() {
         let refs = extract_script_file_refs("node utilities/generate-coverage-badge.js");
@@ -116,6 +114,12 @@ mod tests {
     fn script_tsx_runner() {
         let refs = extract_script_file_refs("tsx scripts/migrate.ts");
         assert_eq!(refs, vec!["scripts/migrate.ts"]);
+    }
+
+    #[test]
+    fn script_bun_runner() {
+        let refs = extract_script_file_refs("bun scripts/build.ts");
+        assert_eq!(refs, vec!["scripts/build.ts"]);
     }
 
     #[test]
@@ -156,7 +160,6 @@ mod tests {
         assert_eq!(refs, vec!["scripts/a.js", "scripts/b.ts"]);
     }
 
-    // looks_like_file_path tests
     #[test]
     fn file_path_with_extension() {
         assert!(looks_like_file_path("scripts/build.js"));
@@ -175,7 +178,6 @@ mod tests {
         assert!(!looks_like_file_path("build"));
     }
 
-    // looks_like_script_file tests
     #[test]
     fn script_file_with_path() {
         assert!(looks_like_script_file("scripts/build.js"));
@@ -185,9 +187,33 @@ mod tests {
 
     #[test]
     fn not_script_file_bare_name() {
-        // Bare names without path separator should not match
         assert!(!looks_like_script_file("webpack.js"));
         assert!(!looks_like_script_file("build"));
+    }
+
+    #[test]
+    fn looks_like_file_path_rejects_gha_fragments() {
+        assert!(!looks_like_file_path("${{ env.URL }}/api.ts"));
+        assert!(!looks_like_file_path("}}/api/health.ts"));
+    }
+
+    #[test]
+    fn looks_like_file_path_rejects_backslash_and_bracket_class() {
+        assert!(!looks_like_file_path(r"path\to\file.ts"));
+        assert!(!looks_like_file_path(".[]"));
+        assert!(!looks_like_file_path("prefix/[^unclosed.ts"));
+    }
+
+    #[test]
+    fn looks_like_file_path_passes_nextjs_dynamic_route() {
+        assert!(looks_like_file_path("app/[id]/page.tsx"));
+        assert!(looks_like_file_path("pages/[...slug].ts"));
+    }
+
+    #[test]
+    fn looks_like_script_file_rejects_gha_and_regex_fragments() {
+        assert!(!looks_like_script_file("${{ env.X }}/path.ts"));
+        assert!(!looks_like_script_file(r"path\file.ts"));
     }
 
     mod proptests {

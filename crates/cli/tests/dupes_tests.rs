@@ -1,12 +1,82 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "tests and benches use unwrap and expect to keep fixture setup concise"
+)]
+
 #[path = "common/mod.rs"]
 mod common;
 
-use common::{fixture_path, parse_json, redact_all, run_fallow, run_fallow_in_root};
+use common::{
+    fixture_path, parse_json, redact_all, run_fallow, run_fallow_combined, run_fallow_in_root,
+};
 use tempfile::tempdir;
 
-// ---------------------------------------------------------------------------
-// JSON output structure
-// ---------------------------------------------------------------------------
+fn init_git_index(root: &std::path::Path) {
+    let status = std::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(root)
+        .status()
+        .expect("git init should run");
+    assert!(status.success(), "git init should succeed");
+    let status = std::process::Command::new("git")
+        .args(["add", "."])
+        .current_dir(root)
+        .status()
+        .expect("git add should run");
+    assert!(status.success(), "git add should succeed");
+}
+
+fn has_clone_group_with_files(json: &serde_json::Value, expected: &[&str]) -> bool {
+    json["clone_groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|group| {
+            let Some(instances) = group["instances"].as_array() else {
+                return false;
+            };
+            expected.iter().all(|file| {
+                instances
+                    .iter()
+                    .any(|instance| instance["file"].as_str() == Some(*file))
+            })
+        })
+}
+
+/// `fallow dupes --performance` was previously a no-op: the global flag was
+/// parsed but never wired through to `DupesOptions`, so users got nothing.
+/// This pins the behaviour: human format renders a stderr "Duplication
+/// Performance" panel; structured formats (JSON / SARIF / CodeClimate) stay
+/// silent so the machine envelope is uncorrupted.
+#[test]
+fn dupes_performance_panel_renders_for_human_format() {
+    let output = run_fallow("dupes", "duplicate-code", &["--performance"]);
+    assert!(
+        output.stderr.contains("Duplication Performance"),
+        "human dupes --performance should print panel header. stderr: {}",
+        output.stderr
+    );
+    assert!(
+        output.stderr.contains("clone groups:"),
+        "panel should include clone group count. stderr: {}",
+        output.stderr
+    );
+}
+
+#[test]
+fn dupes_performance_panel_suppressed_for_json_format() {
+    let output = run_fallow(
+        "dupes",
+        "duplicate-code",
+        &["--performance", "--format", "json", "--quiet"],
+    );
+    assert!(
+        !output.stderr.contains("Duplication Performance"),
+        "json dupes --performance must not corrupt machine output with the panel. stderr: {}",
+        output.stderr
+    );
+}
 
 #[test]
 fn dupes_json_output_has_clone_groups() {
@@ -21,6 +91,7 @@ fn dupes_json_output_has_clone_groups() {
         !groups.is_empty(),
         "duplicate-code fixture should have clone groups"
     );
+    assert!(groups.iter().all(|group| group["spread"].is_number()));
 }
 
 #[test]
@@ -32,10 +103,6 @@ fn dupes_json_has_stats() {
         "dupes JSON should have stats key"
     );
 }
-
-// ---------------------------------------------------------------------------
-// Mode flags
-// ---------------------------------------------------------------------------
 
 #[test]
 fn dupes_strict_mode_accepted() {
@@ -64,9 +131,99 @@ fn dupes_mild_mode_accepted() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Filtering
-// ---------------------------------------------------------------------------
+#[test]
+fn dupes_near_reports_gapped_function_similarity() {
+    let dir = tempdir().expect("temp dir");
+    let shared_prefix = "export function calculate(input: number): number {\n  const doubled = input * 2;\n  const normalized = doubled + input;\n";
+    let shared_suffix = "\n  const bounded = Math.max(adjusted, 0);\n  const rounded = Math.round(bounded);\n  const weighted = rounded * normalized;\n  const clamped = Math.min(weighted, 1000);\n  const staged = clamped + doubled;\n  const balanced = staged - input;\n  const projected = balanced * 2;\n  const limited = Math.min(projected, 2000);\n  const restored = limited + normalized;\n  const checked = Math.max(restored, doubled);\n  const combined = checked + bounded;\n  const smoothed = Math.round(combined / 2);\n  const finalized = smoothed + staged;\n  return finalized + normalized;\n}\n";
+    let first = format!("{shared_prefix}  const adjusted = normalized + 2;{shared_suffix}");
+    let second = format!(
+        "{shared_prefix}  const offset = normalized > 10 ? 3 : 2;\n  const adjusted = normalized + offset;{shared_suffix}"
+    );
+    std::fs::write(dir.path().join("a.ts"), first).expect("write first");
+    std::fs::write(dir.path().join("b.ts"), second).expect("write second");
+
+    let output = run_fallow_in_root(
+        "dupes",
+        dir.path(),
+        &[
+            "--near",
+            "--min-tokens",
+            "20",
+            "--min-lines",
+            "3",
+            "--format",
+            "json",
+            "--quiet",
+            "--no-cache",
+        ],
+    );
+    let json = parse_json(&output);
+
+    assert!(json["clone_groups"].as_array().is_some_and(|groups| {
+        groups
+            .iter()
+            .any(|group| group["similarity"].as_f64().is_some())
+    }));
+}
+
+#[test]
+fn dupes_config_ignored_clone_resurfaces_after_added_copy() {
+    let dir = tempdir().expect("temp dir");
+    let source = "export function shared(value: number): number {\n  const doubled = value * 2;\n  const shifted = doubled + 3;\n  return shifted * 4;\n}\n";
+    std::fs::write(dir.path().join("a.ts"), source).expect("write first");
+    std::fs::write(dir.path().join("b.ts"), source).expect("write second");
+    let args = [
+        "--min-tokens",
+        "5",
+        "--min-lines",
+        "2",
+        "--format",
+        "json",
+        "--quiet",
+        "--no-cache",
+    ];
+    let initial = parse_json(&run_fallow_in_root("dupes", dir.path(), &args));
+    let group = initial["clone_groups"]
+        .as_array()
+        .and_then(|groups| groups.first())
+        .expect("initial clone group");
+    let fingerprint = group["fingerprint"].as_str().expect("fingerprint");
+    let ignored_key = format!("{fingerprint}:2");
+    std::fs::write(
+        dir.path().join(".fallowrc.json"),
+        serde_json::json!({ "duplicates": { "ignoredClones": [ignored_key] } }).to_string(),
+    )
+    .expect("write config");
+
+    let ignored = parse_json(&run_fallow_in_root("dupes", dir.path(), &args));
+    assert!(
+        ignored["clone_groups"]
+            .as_array()
+            .is_some_and(Vec::is_empty)
+    );
+    assert_eq!(ignored["stats"]["clone_groups_ignored"], 1);
+
+    let human = run_fallow_in_root(
+        "dupes",
+        dir.path(),
+        &["--min-tokens", "5", "--min-lines", "2", "--no-cache"],
+    );
+    assert!(
+        human
+            .stderr
+            .contains("hid 1 reviewed clone group from duplicates.ignoredClones")
+    );
+    assert!(human.stderr.contains("No code duplication found"));
+
+    std::fs::write(dir.path().join("c.ts"), source).expect("write added copy");
+    let resurfaced = parse_json(&run_fallow_in_root("dupes", dir.path(), &args));
+    assert!(
+        resurfaced["clone_groups"]
+            .as_array()
+            .is_some_and(|groups| !groups.is_empty())
+    );
+}
 
 #[test]
 fn dupes_min_tokens_filter() {
@@ -84,6 +241,43 @@ fn dupes_min_tokens_filter() {
 }
 
 #[test]
+fn combined_dupes_min_tokens_filter() {
+    let output = run_fallow_combined(
+        "duplicate-code",
+        &["--dupes-min-tokens", "1000", "--format", "json", "--quiet"],
+    );
+    let json = parse_json(&output);
+    let groups = json["dupes"]["clone_groups"].as_array().unwrap();
+    assert!(
+        groups.is_empty(),
+        "high combined-mode --dupes-min-tokens should filter out all clones"
+    );
+}
+
+#[test]
+fn combined_dupes_accepts_remaining_config_knobs() {
+    let output = run_fallow_combined(
+        "duplicate-code",
+        &[
+            "--dupes-min-lines",
+            "1",
+            "--dupes-skip-local",
+            "--dupes-cross-language",
+            "--dupes-ignore-imports",
+            "--format",
+            "json",
+            "--quiet",
+        ],
+    );
+    assert!(
+        output.code == 0 || output.code == 1,
+        "combined mode should accept dupes config knobs, got exit code {}. stderr: {}",
+        output.code,
+        output.stderr
+    );
+}
+
+#[test]
 fn dupes_top_flag() {
     let output = run_fallow(
         "dupes",
@@ -95,6 +289,426 @@ fn dupes_top_flag() {
     assert!(
         groups.len() <= 1,
         "--top 1 should return at most 1 clone group"
+    );
+}
+
+#[test]
+fn dupes_filters_atomic_function_call_clones() {
+    let dir = tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("src/a")).unwrap();
+    std::fs::create_dir_all(dir.path().join("src/b")).unwrap();
+    std::fs::write(
+        dir.path().join("package.json"),
+        r#"{"name":"dupes-call-filter","type":"module","main":"src/a/call.ts"}"#,
+    )
+    .unwrap();
+    let call = r#"export function alpha() {
+  return createComplexWidget(
+    currentProject.id,
+    currentUser.id,
+    activeWorkspace.slug,
+    selectedEnvironment.name,
+    featureFlags.enableAuditTrail,
+    permissions.canPublish,
+    billingAccount.plan,
+    retryPolicy.maxAttempts,
+    retryPolicy.backoffMs,
+    notifier.email,
+    logger.child({ scope: "workflow" }),
+    {
+      source: "settings",
+      reason: "manual-run",
+      requestedBy: currentUser.email,
+      correlationId: request.id,
+      priority: selectedWorkflow.priority,
+      tags: selectedWorkflow.tags,
+      metadata: selectedWorkflow.metadata,
+      createdAt: clock.now(),
+    },
+  );
+}
+"#;
+    std::fs::write(dir.path().join("src/a/call.ts"), call).unwrap();
+    std::fs::write(
+        dir.path().join("src/b/call.ts"),
+        call.replace("alpha", "beta"),
+    )
+    .unwrap();
+    init_git_index(dir.path());
+
+    let output = run_fallow_in_root(
+        "dupes",
+        dir.path(),
+        &["--format", "json", "--quiet", "--no-cache"],
+    );
+    let json = parse_json(&output);
+    let groups = json["clone_groups"].as_array().unwrap();
+    assert!(
+        groups.is_empty(),
+        "atomic call clones should be filtered. stdout: {} stderr: {}",
+        output.stdout,
+        output.stderr
+    );
+    assert_eq!(json["stats"]["clone_groups"], serde_json::json!(0));
+}
+
+#[test]
+fn dupes_still_reports_repeated_control_flow() {
+    let dir = tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("src/a")).unwrap();
+    std::fs::create_dir_all(dir.path().join("src/b")).unwrap();
+    std::fs::write(
+        dir.path().join("package.json"),
+        r#"{"name":"dupes-control-flow","type":"module","main":"src/a/flow.ts"}"#,
+    )
+    .unwrap();
+    let flow = r#"export function alpha(value) {
+  const normalized = normalizeValue(value);
+  const score = calculateScore(normalized);
+  if (score > 90) {
+    auditTrail.record("high", normalized.id);
+    notifications.send("high-score", normalized.owner);
+    metrics.increment("score.high");
+    return buildResult(normalized, "high", score);
+  }
+  if (score > 50) {
+    auditTrail.record("medium", normalized.id);
+    notifications.send("medium-score", normalized.owner);
+    metrics.increment("score.medium");
+    return buildResult(normalized, "medium", score);
+  }
+  auditTrail.record("low", normalized.id);
+  notifications.send("low-score", normalized.owner);
+  metrics.increment("score.low");
+  return buildResult(normalized, "low", score);
+}
+"#;
+    std::fs::write(dir.path().join("src/a/flow.ts"), flow).unwrap();
+    std::fs::write(
+        dir.path().join("src/b/flow.ts"),
+        flow.replace("alpha", "beta"),
+    )
+    .unwrap();
+    init_git_index(dir.path());
+
+    let output = run_fallow_in_root(
+        "dupes",
+        dir.path(),
+        &["--format", "json", "--quiet", "--no-cache"],
+    );
+    let json = parse_json(&output);
+    let groups = json["clone_groups"].as_array().unwrap();
+    assert!(
+        !groups.is_empty(),
+        "non-atomic repeated control flow should still be reported. stdout: {} stderr: {}",
+        output.stdout,
+        output.stderr
+    );
+}
+
+#[test]
+fn dupes_still_reports_repeated_callback_bodies_inside_calls() {
+    let dir = tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("src/a")).unwrap();
+    std::fs::create_dir_all(dir.path().join("src/b")).unwrap();
+    std::fs::write(
+        dir.path().join("package.json"),
+        r#"{"name":"dupes-callback-body","type":"module","main":"src/a/routes.ts"}"#,
+    )
+    .unwrap();
+    let route = r#"router.get("/alpha", async (ctx) => {
+  const normalized = normalizeValue(ctx.input);
+  const score = calculateScore(normalized);
+  if (score > 90) {
+    auditTrail.record("high", normalized.id);
+    notifications.send("high-score", normalized.owner);
+    metrics.increment("score.high");
+    return buildResult(normalized, "high", score);
+  }
+  if (score > 50) {
+    auditTrail.record("medium", normalized.id);
+    notifications.send("medium-score", normalized.owner);
+    metrics.increment("score.medium");
+    return buildResult(normalized, "medium", score);
+  }
+  auditTrail.record("low", normalized.id);
+  notifications.send("low-score", normalized.owner);
+  metrics.increment("score.low");
+  return buildResult(normalized, "low", score);
+});
+"#;
+    std::fs::write(dir.path().join("src/a/routes.ts"), route).unwrap();
+    std::fs::write(
+        dir.path().join("src/b/routes.ts"),
+        route.replace("/alpha", "/beta"),
+    )
+    .unwrap();
+    init_git_index(dir.path());
+
+    let output = run_fallow_in_root(
+        "dupes",
+        dir.path(),
+        &["--format", "json", "--quiet", "--no-cache"],
+    );
+    let json = parse_json(&output);
+    let groups = json["clone_groups"].as_array().unwrap();
+    assert!(
+        !groups.is_empty(),
+        "callback bodies inside calls should still be reported. stdout: {} stderr: {}",
+        output.stdout,
+        output.stderr
+    );
+}
+
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "test fixture; linear setup/assert, length is not a maintainability concern"
+)]
+fn dupes_reports_web_format_clone_groups() {
+    let dir = tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(
+        dir.path().join("package.json"),
+        r#"{"name":"dupes-web-formats","type":"module","main":"src/main.ts","dependencies":{"astro":"latest","svelte":"latest","vue":"latest"}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("src/main.ts"),
+        "export const entry = true;\n",
+    )
+    .unwrap();
+
+    let css = r".metric-card {
+  display: grid;
+  gap: var(--space-3);
+  padding: clamp(12px, 2vw, 24px);
+  border: 1px solid var(--border-muted);
+}
+.metric-card__title {
+  font-weight: 700;
+  color: var(--text-strong);
+}
+";
+    std::fs::write(dir.path().join("src/alpha.css"), css).unwrap();
+    std::fs::write(dir.path().join("src/beta.css"), css).unwrap();
+
+    let vue = r#"<template>
+  <section class="metric-card">
+    <header class="metric-card__title">Revenue</header>
+    <p class="metric-card__value">{{ value }}</p>
+  </section>
+</template>
+<style>
+.metric-card {
+  display: grid;
+  gap: var(--space-3);
+  padding: 16px;
+}
+</style>
+"#;
+    std::fs::write(dir.path().join("src/AlphaCard.vue"), vue).unwrap();
+    std::fs::write(dir.path().join("src/BetaCard.vue"), vue).unwrap();
+
+    let svelte = r#"<script>
+  export let value = 0;
+</script>
+<section class="metric-card">
+  <header class="metric-card__title">Revenue</header>
+  <p class="metric-card__value">{value}</p>
+</section>
+<style>
+.metric-card {
+  display: grid;
+  gap: var(--space-3);
+  padding: 16px;
+}
+</style>
+"#;
+    std::fs::write(dir.path().join("src/AlphaPanel.svelte"), svelte).unwrap();
+    std::fs::write(dir.path().join("src/BetaPanel.svelte"), svelte).unwrap();
+
+    let astro = r#"---
+const value = 42;
+---
+<section class="metric-card">
+  <header class="metric-card__title">Revenue</header>
+  <p class="metric-card__value">{value}</p>
+</section>
+<style>
+.metric-card {
+  display: grid;
+  gap: var(--space-3);
+  padding: 16px;
+}
+</style>
+"#;
+    std::fs::write(dir.path().join("src/AlphaPage.astro"), astro).unwrap();
+    std::fs::write(dir.path().join("src/BetaPage.astro"), astro).unwrap();
+    init_git_index(dir.path());
+
+    let output = run_fallow_in_root(
+        "dupes",
+        dir.path(),
+        &[
+            "--format",
+            "json",
+            "--quiet",
+            "--no-cache",
+            "--min-tokens",
+            "10",
+            "--min-lines",
+            "2",
+        ],
+    );
+    let json = parse_json(&output);
+    assert!(
+        has_clone_group_with_files(&json, &["src/alpha.css", "src/beta.css"]),
+        "CSS clone group should be reported. stdout: {} stderr: {}",
+        output.stdout,
+        output.stderr
+    );
+    assert!(
+        has_clone_group_with_files(&json, &["src/AlphaCard.vue", "src/BetaCard.vue"]),
+        "Vue clone group should be reported. stdout: {} stderr: {}",
+        output.stdout,
+        output.stderr
+    );
+    assert!(
+        has_clone_group_with_files(&json, &["src/AlphaPanel.svelte", "src/BetaPanel.svelte"]),
+        "Svelte clone group should be reported. stdout: {} stderr: {}",
+        output.stdout,
+        output.stderr
+    );
+    assert!(
+        has_clone_group_with_files(&json, &["src/AlphaPage.astro", "src/BetaPage.astro"]),
+        "Astro clone group should be reported. stdout: {} stderr: {}",
+        output.stdout,
+        output.stderr
+    );
+}
+
+#[test]
+fn dupes_does_not_report_cross_format_clone_groups() {
+    let dir = tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(
+        dir.path().join("package.json"),
+        r#"{"name":"dupes-format-namespace","type":"module","main":"src/main.ts"}"#,
+    )
+    .unwrap();
+
+    let js = "export function alpha() { color: red; margin: 0; padding: 1; }";
+    let css = ".alpha { color: red; margin: 0; padding: 1; }";
+    std::fs::write(dir.path().join("src/alpha.ts"), js).unwrap();
+    std::fs::write(dir.path().join("src/beta.ts"), js).unwrap();
+    std::fs::write(dir.path().join("src/alpha.css"), css).unwrap();
+    init_git_index(dir.path());
+
+    let output = run_fallow_in_root(
+        "dupes",
+        dir.path(),
+        &[
+            "--format",
+            "json",
+            "--quiet",
+            "--no-cache",
+            "--min-tokens",
+            "5",
+            "--min-lines",
+            "1",
+        ],
+    );
+    let json = parse_json(&output);
+    assert!(
+        has_clone_group_with_files(&json, &["src/alpha.ts", "src/beta.ts"]),
+        "same-format JS clone should still be reported. stdout: {} stderr: {}",
+        output.stdout,
+        output.stderr
+    );
+    assert!(
+        !has_clone_group_with_files(&json, &["src/alpha.ts", "src/alpha.css"]),
+        "JS and CSS should not form cross-format clone groups. stdout: {} stderr: {}",
+        output.stdout,
+        output.stderr
+    );
+}
+
+#[test]
+fn dupes_does_not_report_clone_groups_spanning_sfc_sections() {
+    let dir = tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(
+        dir.path().join("package.json"),
+        r#"{"name":"dupes-sfc-boundary","type":"module","main":"src/main.ts","dependencies":{"vue":"latest"}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("src/main.ts"),
+        "export const entry = true;\n",
+    )
+    .unwrap();
+    let component = concat!(
+        "<script>let n = 1;</script><style>.a",
+        "{",
+        "b:c",
+        "}</style>"
+    );
+    std::fs::write(dir.path().join("src/Alpha.vue"), component).unwrap();
+    std::fs::write(dir.path().join("src/Beta.vue"), component).unwrap();
+    init_git_index(dir.path());
+
+    let output = run_fallow_in_root(
+        "dupes",
+        dir.path(),
+        &[
+            "--format",
+            "json",
+            "--quiet",
+            "--no-cache",
+            "--min-tokens",
+            "9",
+            "--min-lines",
+            "1",
+        ],
+    );
+    let json = parse_json(&output);
+    let groups = json["clone_groups"].as_array().unwrap();
+    assert!(
+        groups.is_empty(),
+        "clone groups should not span SFC section boundaries. stdout: {} stderr: {}",
+        output.stdout,
+        output.stderr
+    );
+}
+
+#[test]
+fn dupes_group_by_package_validates_non_monorepo() {
+    let dir = tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("package.json"),
+        r#"{"name":"single","version":"1.0.0","main":"src/index.ts"}"#,
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join("src/index.ts"), "export const value = 1;\n").unwrap();
+
+    let output = run_fallow_in_root(
+        "dupes",
+        dir.path(),
+        &["--group-by", "package", "--format", "json", "--quiet"],
+    );
+
+    assert_eq!(output.code, 2, "dupes should reject package grouping");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&output.stdout).expect("stdout should be a single JSON error object");
+    assert_eq!(parsed["error"], serde_json::json!(true));
+    let msg = parsed["message"]
+        .as_str()
+        .expect("error message should be a string");
+    assert!(
+        msg.contains("monorepo"),
+        "error message should mention 'monorepo': {msg}"
     );
 }
 
@@ -134,9 +748,61 @@ fn dupes_save_baseline_creates_parent_directory() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Path relativization (regression: #85)
-// ---------------------------------------------------------------------------
+#[test]
+fn dupes_baseline_survives_line_shift_and_reports_extra_copy() {
+    let dir = tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("package.json"),
+        r#"{"name":"dupes-baseline-shift","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    let clone = "export function shared(value) {\n  if (value > 1) {\n    return value * 2;\n  }\n  return value + 1;\n}\n";
+    std::fs::write(dir.path().join("src/one.ts"), clone).unwrap();
+    std::fs::write(dir.path().join("src/two.ts"), clone).unwrap();
+
+    let baseline_path = dir.path().join("dupes-baseline.json");
+    let thresholds = ["--min-tokens", "10", "--min-lines", "2"];
+    let mut save_args = vec!["--save-baseline", baseline_path.to_str().unwrap()];
+    save_args.extend(thresholds);
+    save_args.extend(["--format", "json", "--quiet", "--no-cache"]);
+    let saved = run_fallow_in_root("dupes", dir.path(), &save_args);
+    let saved_json = parse_json(&saved);
+    assert!(
+        has_clone_group_with_files(&saved_json, &["src/one.ts", "src/two.ts"]),
+        "fixture should produce a clone group. stdout: {} stderr: {}",
+        saved.stdout,
+        saved.stderr
+    );
+
+    std::fs::write(
+        dir.path().join("src/one.ts"),
+        format!("// unrelated new comment\n\n{clone}"),
+    )
+    .unwrap();
+
+    let mut compare_args = vec!["--baseline", baseline_path.to_str().unwrap()];
+    compare_args.extend(thresholds);
+    compare_args.extend(["--format", "json", "--quiet", "--no-cache"]);
+    let shifted = run_fallow_in_root("dupes", dir.path(), &compare_args);
+    let shifted_json = parse_json(&shifted);
+    assert!(
+        shifted_json["clone_groups"].as_array().unwrap().is_empty(),
+        "a line shift must not resurface a baselined clone. stdout: {} stderr: {}",
+        shifted.stdout,
+        shifted.stderr
+    );
+
+    std::fs::write(dir.path().join("src/three.ts"), clone).unwrap();
+    let copied = run_fallow_in_root("dupes", dir.path(), &compare_args);
+    let copied_json = parse_json(&copied);
+    assert!(
+        has_clone_group_with_files(&copied_json, &["src/three.ts"]),
+        "a fresh copy in a third file must be reported. stdout: {} stderr: {}",
+        copied.stdout,
+        copied.stderr
+    );
+}
 
 #[test]
 fn dupes_json_paths_are_relative() {
@@ -145,7 +811,6 @@ fn dupes_json_paths_are_relative() {
     let groups = json["clone_groups"].as_array().unwrap();
     assert!(!groups.is_empty(), "fixture should have clone groups");
 
-    // All instance paths must be relative (no leading /)
     for group in groups {
         for instance in group["instances"].as_array().unwrap() {
             let path = instance["file"].as_str().unwrap();
@@ -156,7 +821,6 @@ fn dupes_json_paths_are_relative() {
         }
     }
 
-    // Clone families should also have relative paths
     if let Some(families) = json.get("clone_families").and_then(|f| f.as_array()) {
         for family in families {
             if let Some(files) = family.get("files").and_then(|f| f.as_array()) {
@@ -172,9 +836,36 @@ fn dupes_json_paths_are_relative() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Human output snapshot
-// ---------------------------------------------------------------------------
+#[test]
+fn dupes_compact_output_includes_traceable_clone_metadata() {
+    let output = run_fallow(
+        "dupes",
+        "duplicate-code",
+        &["--format", "compact", "--quiet"],
+    );
+    assert!(
+        output.stdout.contains("code-duplication:"),
+        "compact dupes output should use the code-duplication issue tag. stdout: {}",
+        output.stdout
+    );
+    assert!(
+        output.stdout.contains(":fingerprint=dup:"),
+        "compact dupes output should include traceable clone fingerprints. stdout: {}",
+        output.stdout
+    );
+    assert!(
+        output.stdout.contains(",tokens=")
+            && output.stdout.contains(",lines=")
+            && output.stdout.contains(",instances="),
+        "compact dupes output should include parseable clone metadata. stdout: {}",
+        output.stdout
+    );
+    assert!(
+        !output.stdout.contains("clone-group-"),
+        "compact dupes output should not rely on ordinal-only clone labels. stdout: {}",
+        output.stdout
+    );
+}
 
 #[test]
 fn dupes_human_output_snapshot() {
@@ -182,4 +873,125 @@ fn dupes_human_output_snapshot() {
     let root = fixture_path("duplicate-code");
     let redacted = redact_all(&output.stdout, &root);
     insta::assert_snapshot!("dupes_human_output", redacted);
+}
+
+/// Standalone `fallow dupes` must include React Router's `.client` / `.server`
+/// folders in its file walk. The threshold is dropped to the minimum so the
+/// small fixture files survive dupes' token / line filters and surface in
+/// `stats.total_files`.
+#[test]
+fn dupes_includes_plugin_scoped_hidden_dirs_for_react_router() {
+    let output = run_fallow(
+        "dupes",
+        "react-router-conventions",
+        &[
+            "--format",
+            "json",
+            "--quiet",
+            "--min-tokens",
+            "1",
+            "--min-lines",
+            "1",
+        ],
+    );
+    assert_eq!(output.code, 0, "stderr was: {}", output.stderr);
+
+    let json = parse_json(&output);
+    let total_files = json["stats"]["total_files"]
+        .as_u64()
+        .expect("stats.total_files is a number");
+    assert!(
+        total_files >= 5,
+        "expected stats.total_files >= 5 (root + routes + .client + .server), got {total_files}"
+    );
+}
+
+/// Standalone `fallow dupes` must apply the duplication threshold gate.
+///
+/// Regression for #2009: `run_dupes` rendered through
+/// `print_dupes_result_with_grouping`, which returned the renderer's exit code
+/// without ever consulting `exceeds_threshold`. Combined mode kept gating
+/// (it renders via `print_dupes_result`), so the two entry points disagreed
+/// and standalone runs exited 0 at 100% duplication.
+#[test]
+fn dupes_standalone_exits_one_when_duplication_exceeds_threshold() {
+    let output = run_fallow("dupes", "duplicate-code", &["--threshold", "1", "--quiet"]);
+    assert_eq!(
+        output.code, 1,
+        "duplication above the threshold must exit 1. stderr: {}",
+        output.stderr
+    );
+    assert!(
+        output.stderr.contains("exceeds threshold"),
+        "expected a threshold diagnostic on stderr, got: {}",
+        output.stderr
+    );
+}
+
+/// Non-vacuous control for the gate above: the same fixture under a threshold
+/// it does not reach must stay green and stay silent. Without this, a fix that
+/// made `dupes` unconditionally exit 1 would pass the positive test.
+#[test]
+fn dupes_standalone_exits_zero_when_duplication_below_threshold() {
+    let output = run_fallow("dupes", "duplicate-code", &["--threshold", "99", "--quiet"]);
+    assert_eq!(
+        output.code, 0,
+        "duplication below the threshold must exit 0. stderr: {}",
+        output.stderr
+    );
+    assert!(
+        !output.stderr.contains("exceeds threshold"),
+        "no threshold diagnostic expected below the threshold, got: {}",
+        output.stderr
+    );
+}
+
+/// The gate is a property of the run, not of the renderer, so it must fire
+/// identically for machine formats. #2009 was reported against `--format json`.
+#[test]
+fn dupes_standalone_threshold_gate_applies_to_json_format() {
+    let output = run_fallow(
+        "dupes",
+        "duplicate-code",
+        &["--threshold", "1", "--format", "json", "--quiet"],
+    );
+    assert_eq!(
+        output.code, 1,
+        "json format must gate on the threshold too. stderr: {}",
+        output.stderr
+    );
+    let json = parse_json(&output);
+    assert!(
+        json["stats"]["duplication_percentage"]
+            .as_f64()
+            .expect("stats.duplication_percentage is a number")
+            > 1.0,
+        "fixture should exceed the 1% threshold for this test to mean anything"
+    );
+}
+
+/// Pins the standalone/combined parity that #2009 broke: both entry points
+/// must reach the same verdict for the same threshold.
+#[test]
+fn dupes_threshold_verdict_matches_between_standalone_and_combined() {
+    let standalone = run_fallow("dupes", "duplicate-code", &["--threshold", "1", "--quiet"]);
+    let combined = run_fallow_combined(
+        "duplicate-code",
+        &["--dupes-threshold", "1", "--quiet", "--skip", "health"],
+    );
+    assert_eq!(
+        standalone.code, 1,
+        "standalone dupes should gate. stderr: {}",
+        standalone.stderr
+    );
+    assert_eq!(
+        combined.code, 1,
+        "combined mode should gate. stderr: {}",
+        combined.stderr
+    );
+    assert!(
+        combined.stderr.contains("exceeds threshold"),
+        "combined mode should keep its threshold diagnostic, got: {}",
+        combined.stderr
+    );
 }

@@ -5,58 +5,20 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use fallow_config::{OutputFormat, ResolvedConfig};
-use fallow_types::extract::{FlagUse, FlagUseKind, ModuleInfo};
-use fallow_types::results::{FeatureFlag, FlagConfidence, FlagKind};
+use fallow_types::results::{FeatureFlag, FlagKind};
 
 use crate::error::emit_error;
-
-/// Convert an extraction-level `FlagUse` to a result-level `FeatureFlag`.
-fn flag_use_to_feature_flag(
-    flag_use: &FlagUse,
-    module: &ModuleInfo,
-    path: &std::path::Path,
-) -> FeatureFlag {
-    let (kind, confidence) = match flag_use.kind {
-        FlagUseKind::EnvVar => (FlagKind::EnvironmentVariable, FlagConfidence::High),
-        FlagUseKind::SdkCall => (FlagKind::SdkCall, FlagConfidence::High),
-        FlagUseKind::ConfigObject => (FlagKind::ConfigObject, FlagConfidence::Low),
-    };
-
-    let (guard_line_start, guard_line_end) = if let (Some(start), Some(end)) =
-        (flag_use.guard_span_start, flag_use.guard_span_end)
-        && !module.line_offsets.is_empty()
-    {
-        let (sl, _) = fallow_types::extract::byte_offset_to_line_col(&module.line_offsets, start);
-        let (el, _) = fallow_types::extract::byte_offset_to_line_col(&module.line_offsets, end);
-        (Some(sl), Some(el))
-    } else {
-        (None, None)
-    };
-
-    FeatureFlag {
-        path: path.to_path_buf(),
-        flag_name: flag_use.flag_name.clone(),
-        kind,
-        confidence,
-        line: flag_use.line,
-        col: flag_use.col,
-        guard_span_start: flag_use.guard_span_start,
-        guard_span_end: flag_use.guard_span_end,
-        sdk_name: flag_use.sdk_name.clone(),
-        guard_line_start,
-        guard_line_end,
-        guarded_dead_exports: Vec::new(),
-    }
-}
 
 /// Options for the `fallow flags` subcommand.
 pub struct FlagsOptions<'a> {
     pub root: &'a Path,
     pub config_path: &'a Option<std::path::PathBuf>,
     pub output: OutputFormat,
+    pub json_style: crate::json_style::JsonStyle,
     pub no_cache: bool,
     pub threads: usize,
     pub quiet: bool,
+    pub allow_remote_extends: bool,
     pub production: bool,
     pub workspace: Option<&'a [String]>,
     pub changed_workspaces: Option<&'a str>,
@@ -69,141 +31,85 @@ pub struct FlagsOptions<'a> {
 pub fn run_flags(opts: &FlagsOptions<'_>) -> ExitCode {
     let start = Instant::now();
 
-    let config = match crate::load_config(
-        opts.root,
-        opts.config_path,
-        opts.output,
-        opts.no_cache,
-        opts.threads,
-        opts.production,
-        opts.quiet,
-    ) {
+    let config = match load_flags_config(opts) {
         Ok(c) => c,
         Err(code) => return code,
     };
-
-    // Discover files
-    let files = fallow_core::discover::discover_files(&config);
-    if files.is_empty() {
+    let session = match fallow_engine::session::AnalysisSession::from_resolved_config(config) {
+        Ok(session) => session,
+        Err(err) => return emit_error(&format!("Analysis error: {err}"), 2, opts.output),
+    };
+    let analysis = fallow_engine::flags::analyze_feature_flags_with_session(&session);
+    if analysis.files_scanned == 0 {
         return emit_error("no files discovered", 2, opts.output);
     }
 
-    // Parse all files (flag extraction happens automatically during parse)
-    let cache_store = if config.no_cache {
-        None
-    } else {
-        fallow_core::cache::CacheStore::load(&config.cache_dir)
-    };
-    let parse_result = fallow_core::extract::parse_all_files(&files, cache_store.as_ref(), false);
+    let mut flags = analysis.flags;
+    if let Err(code) = apply_flag_scopes(&mut flags, opts) {
+        return code;
+    }
+    // Note find-state for telemetry before any exit (issue #1650 follow-up): the
+    // flags command emits a `code_quality_review` workflow event (the same label
+    // as combined `fallow`), so without this its findings_present serialized as
+    // null. Count the scope-filtered flags BEFORE `--top` truncation so the
+    // bucket reflects the full set, not the displayed head.
+    crate::telemetry::note_result_count(flags.len());
+    sort_and_limit_flags(&mut flags, opts.top);
 
-    // Build file_id -> path lookup from discovered files
-    let file_paths: rustc_hash::FxHashMap<_, _> = files.iter().map(|f| (f.id, &f.path)).collect();
-
-    // Prepare user-configured flag patterns for supplementary extraction
-    let extra_sdk: Vec<(String, usize, String)> = config
-        .flags
-        .sdk_patterns
-        .iter()
-        .map(|p| {
-            (
-                p.function.clone(),
-                p.name_arg,
-                p.provider.clone().unwrap_or_default(),
-            )
-        })
-        .collect();
-    let has_custom_config = !extra_sdk.is_empty()
-        || !config.flags.env_prefixes.is_empty()
-        || config.flags.config_object_heuristics;
-
-    // Collect feature flags from parsed modules (built-in patterns from cache/parse)
-    let mut flags: Vec<FeatureFlag> = Vec::new();
-    for module in &parse_result.modules {
-        let Some(path) = file_paths.get(&module.file_id) else {
-            continue;
-        };
-
-        // Built-in flag results from parse/cache
-        let file_suppressed = fallow_core::suppress::is_file_suppressed(
-            &module.suppressions,
-            fallow_core::suppress::IssueKind::FeatureFlag,
-        );
-        for flag_use in &module.flag_uses {
-            if file_suppressed
-                || fallow_core::suppress::is_suppressed(
-                    &module.suppressions,
-                    flag_use.line,
-                    fallow_core::suppress::IssueKind::FeatureFlag,
-                )
-            {
-                continue;
-            }
-            flags.push(flag_use_to_feature_flag(flag_use, module, path));
-        }
-
-        // Supplementary extraction pass for user-configured patterns.
-        // Built-in patterns are already in module.flag_uses (cached).
-        // Custom SDK patterns, env prefixes, and config object heuristics
-        // require re-reading source because they weren't applied at parse time.
-        if has_custom_config && let Ok(source) = std::fs::read_to_string(path) {
-            let custom_flags = fallow_core::extract::flags::extract_flags_from_source(
-                &source,
-                path,
-                &extra_sdk,
-                &config.flags.env_prefixes,
-                config.flags.config_object_heuristics,
-            );
-            // Only add flags not already found by built-in extraction (dedup by line+name)
-            for flag_use in &custom_flags {
-                let already_found = module.flag_uses.iter().any(|existing| {
-                    existing.line == flag_use.line && existing.flag_name == flag_use.flag_name
-                });
-                if !already_found
-                    && !fallow_core::suppress::is_suppressed(
-                        &module.suppressions,
-                        flag_use.line,
-                        fallow_core::suppress::IssueKind::FeatureFlag,
-                    )
-                {
-                    flags.push(flag_use_to_feature_flag(flag_use, module, path));
-                }
-            }
-        }
+    let elapsed = start.elapsed();
+    if let Err(code) = validate_flags_output(opts.output) {
+        return code;
     }
 
-    // Run dead code analysis for cross-reference (flags guarding dead code).
-    // Uses pre-parsed modules to avoid re-parsing.
-    if let Ok(analysis_output) =
-        fallow_core::analyze_with_parse_result(&config, &parse_result.modules)
-    {
-        fallow_core::analyze::feature_flags::correlate_with_dead_code(
-            &mut flags,
-            &analysis_output.results,
-        );
-    }
+    print_flags_result(
+        &flags,
+        session.config(),
+        opts,
+        elapsed,
+        analysis.files_scanned,
+    );
 
-    // Filter to changed files if --changed-since is active
+    ExitCode::SUCCESS
+}
+
+fn load_flags_config(opts: &FlagsOptions<'_>) -> Result<ResolvedConfig, ExitCode> {
+    crate::runtime_support::load_config(
+        opts.root,
+        opts.config_path,
+        crate::runtime_support::LoadConfigArgs {
+            output: opts.output,
+            no_cache: opts.no_cache,
+            threads: opts.threads,
+            production: opts.production,
+            quiet: opts.quiet,
+            allow_remote_extends: opts.allow_remote_extends,
+        },
+    )
+}
+
+fn apply_flag_scopes(
+    flags: &mut Vec<FeatureFlag>,
+    opts: &FlagsOptions<'_>,
+) -> Result<(), ExitCode> {
     if let Some(git_ref) = opts.changed_since
         && let Some(changed) = crate::check::get_changed_files(opts.root, git_ref)
     {
         flags.retain(|f| changed.contains(&f.path));
     }
 
-    // Filter to workspace(s) if specified (either --workspace or --changed-workspaces)
-    let ws_scope = match crate::check::resolve_workspace_scope(
+    let ws_scope = crate::check::resolve_workspace_scope(
         opts.root,
         opts.workspace,
         opts.changed_workspaces,
         opts.output,
-    ) {
-        Ok(scope) => scope,
-        Err(code) => return code,
-    };
+    )?;
     if let Some(ref ws_roots) = ws_scope {
         flags.retain(|f| ws_roots.iter().any(|r| f.path.starts_with(r)));
     }
+    Ok(())
+}
 
-    // Sort for deterministic output
+fn sort_and_limit_flags(flags: &mut Vec<FeatureFlag>, top: Option<usize>) {
     flags.sort_by(|a, b| {
         a.path
             .cmp(&b.path)
@@ -211,26 +117,29 @@ pub fn run_flags(opts: &FlagsOptions<'_>) -> ExitCode {
             .then(a.flag_name.cmp(&b.flag_name))
     });
 
-    // Apply top N limit
-    if let Some(top) = opts.top {
+    if let Some(top) = top {
         flags.truncate(top);
     }
+}
 
-    let elapsed = start.elapsed();
-
-    // Badge format is health-only
-    if matches!(opts.output, OutputFormat::Badge) {
-        return emit_error(
-            "badge format is only available for the health command",
+fn validate_flags_output(output: OutputFormat) -> Result<(), ExitCode> {
+    if matches!(
+        output,
+        OutputFormat::PrCommentGithub
+            | OutputFormat::PrCommentGitlab
+            | OutputFormat::ReviewGithub
+            | OutputFormat::ReviewGitlab
+            | OutputFormat::Badge
+            | OutputFormat::GithubAnnotations
+            | OutputFormat::GithubSummary
+    ) {
+        return Err(emit_error(
+            "flags supports human, json, compact, sarif, markdown, and codeclimate output",
             2,
-            opts.output,
-        );
+            output,
+        ));
     }
-
-    // Render output
-    print_flags_result(&flags, &config, opts, elapsed);
-
-    ExitCode::SUCCESS
+    Ok(())
 }
 
 /// Print feature flag results in the requested format.
@@ -239,15 +148,24 @@ fn print_flags_result(
     config: &ResolvedConfig,
     opts: &FlagsOptions<'_>,
     elapsed: std::time::Duration,
+    files_scanned: usize,
 ) {
     match opts.output {
-        OutputFormat::Human => print_flags_human(flags, config, elapsed, opts.quiet),
-        OutputFormat::Json => print_flags_json(flags, config, elapsed, opts.explain),
+        OutputFormat::Human => print_flags_human(flags, config, elapsed, opts.quiet, files_scanned),
+        OutputFormat::Json => {
+            print_flags_json(flags, config, elapsed, opts.explain, opts.json_style);
+        }
         OutputFormat::Compact => print_flags_compact(flags, config),
         OutputFormat::Sarif => print_flags_sarif(flags, config),
         OutputFormat::Markdown => print_flags_markdown(flags, config),
         OutputFormat::CodeClimate => print_flags_codeclimate(flags, config),
-        OutputFormat::Badge => unreachable!("handled above"),
+        OutputFormat::PrCommentGithub
+        | OutputFormat::PrCommentGitlab
+        | OutputFormat::ReviewGithub
+        | OutputFormat::ReviewGitlab
+        | OutputFormat::Badge
+        | OutputFormat::GithubAnnotations
+        | OutputFormat::GithubSummary => unreachable!("handled above"),
     }
 }
 
@@ -290,70 +208,161 @@ fn print_file_path(display: &str) {
     }
 }
 
-/// Human-readable output for `fallow flags`.
-fn print_flags_human(
-    flags: &[FeatureFlag],
-    config: &ResolvedConfig,
-    elapsed: std::time::Duration,
-    quiet: bool,
+/// When `fallow flags` finds nothing, surface the configuration surface so the
+/// user can distinguish a true negative from "fallow does not recognize my SDK
+/// yet". On full defaults the hint enumerates the built-in detectors (sourced
+/// from `fallow-engine`, never hardcoded) and points at the config knobs. When
+/// custom `flags.*` config is present, it collapses to a single terse
+/// acknowledgement so users who already found the surface are not nagged. All
+/// lines go to stderr, mirroring the empty-result line they follow.
+fn print_empty_flags_hint(config: &ResolvedConfig, files_scanned: usize) {
+    let custom_sdk = config.flags.sdk_patterns.len();
+    let custom_env = config.flags.env_prefixes.len();
+    let heuristics = config.flags.config_object_heuristics;
+    let has_custom = custom_sdk > 0 || custom_env > 0 || heuristics;
+
+    let files_label = if files_scanned == 1 { "file" } else { "files" };
+
+    if has_custom {
+        print_empty_flags_custom_hint(
+            custom_sdk,
+            custom_env,
+            heuristics,
+            files_scanned,
+            files_label,
+        );
+    } else {
+        print_empty_flags_default_hint(files_scanned, files_label);
+    }
+}
+
+/// Terse one-line acknowledgement of an empty result when custom `flags.*`
+/// config is present.
+fn print_empty_flags_custom_hint(
+    custom_sdk: usize,
+    custom_env: usize,
+    heuristics: bool,
+    files_scanned: usize,
+    files_label: &str,
 ) {
     use colored::Colorize;
 
-    if flags.is_empty() {
-        if !quiet {
-            eprintln!(
-                "{} No feature flags detected ({:.2}s)",
-                "\u{2713}".green().bold(),
-                elapsed.as_secs_f64()
-            );
-        }
-        return;
+    let mut parts: Vec<String> = Vec::new();
+    if custom_sdk > 0 {
+        parts.push(format!(
+            "{custom_sdk} custom SDK pattern{}",
+            if custom_sdk == 1 { "" } else { "s" }
+        ));
     }
+    if custom_env > 0 {
+        parts.push(format!(
+            "{custom_env} custom env prefix{}",
+            if custom_env == 1 { "" } else { "es" }
+        ));
+    }
+    if heuristics {
+        parts.push("config-object heuristics enabled".to_string());
+    }
+    eprintln!(
+        "  {}",
+        format!(
+            "Scanned {files_scanned} {files_label} with your custom flag config: {}.",
+            parts.join(", ")
+        )
+        .dimmed()
+    );
+}
 
-    // Separate flags guarding dead code (cross-reference) from inventory
+/// Enumerate the built-in detectors and config knobs on an empty result with a
+/// full-defaults configuration.
+fn print_empty_flags_default_hint(files_scanned: usize, files_label: &str) {
+    use colored::Colorize;
+
+    let env_prefixes = fallow_engine::flags::builtin_env_prefixes()
+        .iter()
+        .map(|p| format!("{p}*"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let providers = fallow_engine::flags::builtin_sdk_providers().join(", ");
+
+    eprintln!(
+        "  {}",
+        format!("Scanned {files_scanned} {files_label} for:").dimmed()
+    );
+    eprintln!(
+        "    {} Env prefixes: {}",
+        "\u{00b7}".dimmed(),
+        env_prefixes.dimmed()
+    );
+    eprintln!("    {} SDKs: {}", "\u{00b7}".dimmed(), providers.dimmed());
+    eprintln!(
+        "  {}",
+        "Using a different SDK (in-house, or one not listed)? Add it via `flags.sdkPatterns` in your config.".dimmed()
+    );
+    eprintln!(
+        "  {}",
+        "For property-access patterns (config.featureX), enable `flags.configObjectHeuristics`."
+            .dimmed()
+    );
+    eprintln!(
+        "  {}",
+        "Docs: https://docs.fallow.tools/cli/flags#configuration".dimmed()
+    );
+}
+
+/// Print the "Flags guarding dead code" section (human format). No-op when no
+/// flag guards a statically dead export.
+fn print_dead_code_flags_section(flags: &[FeatureFlag], config: &ResolvedConfig) {
+    use colored::Colorize;
+
     let dead_code_flags: Vec<&FeatureFlag> = flags
         .iter()
         .filter(|f| !f.guarded_dead_exports.is_empty())
         .collect();
-
-    // Cross-reference section first (the primary value)
-    if !dead_code_flags.is_empty() {
-        let label = format!("Flags guarding dead code ({})", dead_code_flags.len());
-        println!("{} {}", "\u{25cf}".yellow(), label.yellow().bold());
-
-        for flag in &dead_code_flags {
-            let relative = flag
-                .path
-                .strip_prefix(&config.root)
-                .unwrap_or(&flag.path)
-                .to_string_lossy()
-                .replace('\\', "/");
-            print_file_path(&relative);
-
-            let dead_count = flag.guarded_dead_exports.len();
-            let guard_lines = flag
-                .guard_line_start
-                .and_then(|s| flag.guard_line_end.map(|e| e.saturating_sub(s) + 1))
-                .unwrap_or(0);
-
-            let detail = if guard_lines > 0 {
-                format!("guards {guard_lines} lines, {dead_count} statically dead")
-            } else {
-                format!("{dead_count} dead exports in guarded block")
-            };
-
-            println!(
-                "    {} {} {} {}",
-                format!(":{}", flag.line).dimmed(),
-                flag.flag_name.bold(),
-                kind_tag(flag),
-                format!("({detail})").dimmed(),
-            );
-        }
-        println!();
+    if dead_code_flags.is_empty() {
+        return;
     }
 
-    // Full inventory section
+    let label = format!("Flags guarding dead code ({})", dead_code_flags.len());
+    println!("{} {}", "\u{25cf}".yellow(), label.yellow().bold());
+
+    for flag in &dead_code_flags {
+        let relative = flag
+            .path
+            .strip_prefix(&config.root)
+            .unwrap_or(&flag.path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        print_file_path(&relative);
+
+        let dead_count = flag.guarded_dead_exports.len();
+        let guard_lines = flag
+            .guard_line_start
+            .and_then(|s| flag.guard_line_end.map(|e| e.saturating_sub(s) + 1))
+            .unwrap_or(0);
+
+        let detail = if guard_lines > 0 {
+            format!("guards {guard_lines} lines, {dead_count} statically dead")
+        } else {
+            format!("{dead_count} dead exports in guarded block")
+        };
+
+        println!(
+            "    {} {} {} {}",
+            format!(":{}", flag.line).dimmed(),
+            flag.flag_name.bold(),
+            kind_tag(flag),
+            format!("({detail})").dimmed(),
+        );
+    }
+    println!();
+}
+
+/// Print the per-file "Feature flags" listing (human format), preserving the
+/// order in which files first appear in `flags`.
+fn print_flags_by_file_section(flags: &[FeatureFlag], config: &ResolvedConfig) {
+    use colored::Colorize;
+
     let mut by_file: Vec<(&std::path::Path, Vec<&FeatureFlag>)> = Vec::new();
     for flag in flags {
         if let Some(entry) = by_file.iter_mut().find(|(p, _)| *p == flag.path.as_path()) {
@@ -380,8 +389,33 @@ fn print_flags_human(
             );
         }
     }
+}
 
-    // Footer
+/// Human-readable output for `fallow flags`.
+fn print_flags_human(
+    flags: &[FeatureFlag],
+    config: &ResolvedConfig,
+    elapsed: std::time::Duration,
+    quiet: bool,
+    files_scanned: usize,
+) {
+    use colored::Colorize;
+
+    if flags.is_empty() {
+        if !quiet {
+            eprintln!(
+                "{} No feature flags detected ({:.2}s)",
+                "\u{2713}".green().bold(),
+                elapsed.as_secs_f64()
+            );
+            print_empty_flags_hint(config, files_scanned);
+        }
+        return;
+    }
+
+    print_dead_code_flags_section(flags, config);
+    print_flags_by_file_section(flags, config);
+
     if !quiet {
         let elapsed_str = format!("{:.2}s", elapsed.as_secs_f64());
         eprintln!(
@@ -447,11 +481,15 @@ fn kind_label(flag: &FeatureFlag) -> &'static str {
 }
 
 /// SARIF output for `fallow flags`.
+#[expect(
+    clippy::expect_used,
+    reason = "feature flag SARIF JSON is built from serializable literals"
+)]
 fn print_flags_sarif(flags: &[FeatureFlag], config: &ResolvedConfig) {
     let rules = vec![serde_json::json!({
         "id": "fallow/feature-flag",
         "shortDescription": { "text": "Feature flag pattern detected" },
-        "helpUri": "https://docs.fallow.tools/explanations/feature-flags",
+        "helpUri": "https://docs.fallow.tools/cli/flags",
         "defaultConfiguration": { "level": "note" },
     })];
 
@@ -516,10 +554,8 @@ fn print_flags_markdown(flags: &[FeatureFlag], config: &ResolvedConfig) {
         return;
     }
 
-    // Summary heading
     println!("## Feature flags: {} found\n", flags.len());
 
-    // Cross-reference section first
     let dead_flags: Vec<&FeatureFlag> = flags
         .iter()
         .filter(|f| !f.guarded_dead_exports.is_empty())
@@ -541,7 +577,6 @@ fn print_flags_markdown(flags: &[FeatureFlag], config: &ResolvedConfig) {
         println!();
     }
 
-    // Full inventory
     println!("### Feature flags ({})\n", flags.len());
     println!("| File | Line | Flag | Kind |");
     println!("|------|------|------|------|");
@@ -561,11 +596,14 @@ fn print_flags_markdown(flags: &[FeatureFlag], config: &ResolvedConfig) {
 }
 
 /// CodeClimate output for `fallow flags` (GitLab Code Quality).
+#[expect(
+    clippy::expect_used,
+    reason = "feature flag CodeClimate JSON is built from serializable literals"
+)]
 fn print_flags_codeclimate(flags: &[FeatureFlag], config: &ResolvedConfig) {
     let issues: Vec<serde_json::Value> = flags
         .iter()
         .map(|f| {
-            // Use crate::report::n for bracket encoding (Next.js dynamic routes)
             let path = crate::report::normalize_uri(&relative_path(f, &config.root));
             let mut description = format!(
                 "Feature flag '{}' detected ({})",
@@ -604,106 +642,247 @@ fn print_flags_codeclimate(flags: &[FeatureFlag], config: &ResolvedConfig) {
 }
 
 /// JSON output for `fallow flags`.
+#[expect(
+    clippy::expect_used,
+    reason = "feature flag JSON output is built from serializable literals"
+)]
 fn print_flags_json(
     flags: &[FeatureFlag],
     config: &ResolvedConfig,
     elapsed: std::time::Duration,
     explain: bool,
+    json_style: crate::json_style::JsonStyle,
 ) {
-    let flags_json: Vec<serde_json::Value> = flags
-        .iter()
-        .map(|f| {
-            let path = f
-                .path
-                .strip_prefix(&config.root)
-                .unwrap_or(&f.path)
-                .to_string_lossy()
-                .replace('\\', "/");
-
-            let confidence = match f.confidence {
-                FlagConfidence::High => "high",
-                FlagConfidence::Medium => "medium",
-                FlagConfidence::Low => "low",
-            };
-
-            let kind = match f.kind {
-                FlagKind::EnvironmentVariable => "environment_variable",
-                FlagKind::SdkCall => "sdk_call",
-                FlagKind::ConfigObject => "config_object",
-            };
-
-            let mut obj = serde_json::json!({
-                "path": path,
-                "flag_name": f.flag_name,
-                "kind": kind,
-                "confidence": confidence,
-                "line": f.line,
-                "col": f.col,
-                "actions": [
-                    {
-                        "type": "investigate-flag",
-                        "auto_fixable": false,
-                        "description": format!("Verify whether feature flag '{}' is still active", f.flag_name),
-                    },
-                    {
-                        "type": "suppress-line",
-                        "auto_fixable": false,
-                        "description": "Suppress with an inline comment",
-                        "comment": "// fallow-ignore-next-line feature-flag",
-                    },
-                ],
-            });
-
-            if let Some(ref sdk) = f.sdk_name {
-                obj["sdk_name"] = serde_json::json!(sdk);
-            }
-
-            if !f.guarded_dead_exports.is_empty() {
-                let guard_lines = f
-                    .guard_line_start
-                    .and_then(|s| f.guard_line_end.map(|e| e.saturating_sub(s) + 1))
-                    .unwrap_or(0);
-                obj["dead_code_overlap"] = serde_json::json!({
-                    "guarded_lines": guard_lines,
-                    "dead_export_count": f.guarded_dead_exports.len(),
-                    "dead_exports": f.guarded_dead_exports,
-                });
-            }
-
-            obj
-        })
-        .collect();
-
-    // Schema version must match SCHEMA_VERSION in report/json.rs
-    let mut output = serde_json::json!({
-        "schema_version": 3,
-        "version": env!("CARGO_PKG_VERSION"),
-        "elapsed_ms": elapsed.as_millis(),
-        "feature_flags": flags_json,
-        "total_flags": flags.len(),
-    });
-
-    if explain {
-        output["_meta"] = serde_json::json!({
-            "feature_flags": {
-                "description": "Feature flag patterns detected via AST analysis",
-                "kinds": {
-                    "environment_variable": "process.env.FEATURE_* pattern (high confidence)",
-                    "sdk_call": "Feature flag SDK function call (high confidence)",
-                    "config_object": "Config object property access matching flag keywords (low confidence, heuristic)",
-                },
-                "confidence": {
-                    "high": "Unambiguous pattern match (env vars, direct SDK calls)",
-                    "medium": "Pattern match with some ambiguity",
-                    "low": "Heuristic match (config objects), may produce false positives",
-                },
-                "docs": "https://docs.fallow.tools/explanations/feature-flags",
-            }
+    let output =
+        fallow_output::build_feature_flags_output(fallow_output::FeatureFlagsOutputInput {
+            schema_version: fallow_output::FEATURE_FLAGS_SCHEMA_VERSION,
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            elapsed,
+            flags,
+            root: &config.root,
+            meta: explain.then(fallow_output::feature_flags_meta),
         });
-    }
+    let output = fallow_output::serialize_feature_flags_json_output(
+        output,
+        crate::output_runtime::current_root_envelope_mode(),
+        crate::output_runtime::telemetry_analysis_run_id().as_deref(),
+    )
+    .expect("JSON serialization should not fail");
 
     println!(
         "{}",
-        serde_json::to_string_pretty(&output).expect("JSON serialization should not fail")
+        json_style
+            .serialize(&output)
+            .expect("JSON serialization should not fail")
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fallow_types::results::FlagConfidence;
+    use std::path::PathBuf;
+
+    /// No explicit `--config`; static so the `&Option<PathBuf>` field borrows it.
+    const NO_CONFIG: Option<PathBuf> = None;
+
+    fn flags_fixture_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/feature-flag-suppression")
+    }
+
+    fn flag(kind: FlagKind, name: &str, path: &str) -> FeatureFlag {
+        FeatureFlag {
+            path: PathBuf::from(path),
+            flag_name: name.to_owned(),
+            kind,
+            confidence: FlagConfidence::High,
+            line: 3,
+            col: 2,
+            guard_span_start: None,
+            guard_span_end: None,
+            sdk_name: None,
+            guard_line_start: None,
+            guard_line_end: None,
+            guarded_dead_exports: Vec::new(),
+        }
+    }
+
+    fn flags_opts(root: &Path, output: OutputFormat) -> FlagsOptions<'_> {
+        FlagsOptions {
+            root,
+            config_path: &NO_CONFIG,
+            output,
+            json_style: crate::json_style::JsonStyle::Compact,
+            no_cache: true,
+            threads: 1,
+            quiet: true,
+            allow_remote_extends: false,
+            production: false,
+            workspace: None,
+            changed_workspaces: None,
+            changed_since: None,
+            explain: false,
+            top: None,
+        }
+    }
+
+    #[test]
+    fn fnv_fingerprint_is_deterministic_16_hex() {
+        let a = fnv_fingerprint(&["src/index.ts", "FEATURE_X", "3"]);
+        let b = fnv_fingerprint(&["src/index.ts", "FEATURE_X", "3"]);
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 16);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+        // Per-part separation means reordering parts changes the digest.
+        assert_ne!(a, fnv_fingerprint(&["FEATURE_X", "src/index.ts", "3"]));
+    }
+
+    #[test]
+    fn escape_backticks_escapes_only_backticks() {
+        assert_eq!(escape_backticks("a`b`c"), "a\\`b\\`c");
+        assert_eq!(escape_backticks("no ticks"), "no ticks");
+    }
+
+    #[test]
+    fn kind_label_covers_all_kinds() {
+        assert_eq!(
+            kind_label(&flag(FlagKind::EnvironmentVariable, "X", "a.ts")),
+            "environment variable"
+        );
+        assert_eq!(
+            kind_label(&flag(FlagKind::SdkCall, "X", "a.ts")),
+            "SDK call"
+        );
+        assert_eq!(
+            kind_label(&flag(FlagKind::ConfigObject, "X", "a.ts")),
+            "config object"
+        );
+    }
+
+    #[test]
+    fn relative_path_strips_root_and_normalizes_separators() {
+        let root = Path::new("/proj");
+        let f = flag(FlagKind::EnvironmentVariable, "X", "/proj/src/index.ts");
+        assert_eq!(relative_path(&f, root), "src/index.ts");
+        // A path outside the root is returned as-is (normalized).
+        let outside = flag(FlagKind::EnvironmentVariable, "X", "/other/file.ts");
+        assert_eq!(relative_path(&outside, root), "/other/file.ts");
+    }
+
+    #[test]
+    fn kind_tag_labels_sdk_with_and_without_name() {
+        colored::control::set_override(false);
+        let mut sdk = flag(FlagKind::SdkCall, "X", "a.ts");
+        sdk.sdk_name = Some("LaunchDarkly".to_owned());
+        assert_eq!(kind_tag(&sdk), "(SDK: LaunchDarkly)");
+        sdk.sdk_name = None;
+        assert_eq!(kind_tag(&sdk), "(SDK)");
+        assert_eq!(
+            kind_tag(&flag(FlagKind::EnvironmentVariable, "X", "a.ts")),
+            "(env)"
+        );
+        assert_eq!(
+            kind_tag(&flag(FlagKind::ConfigObject, "X", "a.ts")),
+            "(config, heuristic)"
+        );
+    }
+
+    #[test]
+    fn run_flags_renders_every_supported_format() {
+        colored::control::set_override(false);
+        let root = flags_fixture_root();
+        for output in [
+            OutputFormat::Human,
+            OutputFormat::Json,
+            OutputFormat::Compact,
+            OutputFormat::Sarif,
+            OutputFormat::Markdown,
+            OutputFormat::CodeClimate,
+        ] {
+            assert_eq!(
+                run_flags(&flags_opts(&root, output)),
+                ExitCode::SUCCESS,
+                "format {output:?} should render and exit 0"
+            );
+        }
+    }
+
+    #[test]
+    fn run_flags_with_explain_emits_json_meta() {
+        let root = flags_fixture_root();
+        let opts = FlagsOptions {
+            explain: true,
+            ..flags_opts(&root, OutputFormat::Json)
+        };
+        assert_eq!(run_flags(&opts), ExitCode::SUCCESS);
+    }
+
+    #[test]
+    fn run_flags_rejects_unsupported_format() {
+        let root = flags_fixture_root();
+        // Badge / PR-comment / review formats are not supported by `flags`.
+        assert_eq!(
+            run_flags(&flags_opts(&root, OutputFormat::Badge)),
+            ExitCode::from(2)
+        );
+    }
+
+    #[test]
+    fn run_flags_empty_default_config_surfaces_detectors_hint() {
+        colored::control::set_override(false);
+        let root =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/flags-none-default");
+        // Non-quiet so the built-in detectors hint renders on an empty result.
+        let opts = FlagsOptions {
+            quiet: false,
+            ..flags_opts(&root, OutputFormat::Human)
+        };
+        assert_eq!(run_flags(&opts), ExitCode::SUCCESS);
+    }
+
+    #[test]
+    fn run_flags_empty_custom_config_surfaces_terse_hint() {
+        colored::control::set_override(false);
+        let root =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/flags-none-custom");
+        let opts = FlagsOptions {
+            quiet: false,
+            ..flags_opts(&root, OutputFormat::Human)
+        };
+        assert_eq!(run_flags(&opts), ExitCode::SUCCESS);
+    }
+
+    #[test]
+    fn run_flags_renders_sdk_call_flag_across_formats() {
+        colored::control::set_override(false);
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"name":"flags-sdk","main":"src/index.ts"}"#,
+        )
+        .unwrap();
+        // `variation('name', ...)` is a built-in LaunchDarkly SDK flag pattern,
+        // so the SDK-name branches of every renderer are exercised.
+        std::fs::write(
+            root.join("src/index.ts"),
+            "export function boot() {\n  if (variation('checkout-flag', false)) {\n    console.log('on');\n  }\n}\n",
+        )
+        .unwrap();
+        for output in [
+            OutputFormat::Human,
+            OutputFormat::Compact,
+            OutputFormat::Sarif,
+            OutputFormat::Markdown,
+            OutputFormat::CodeClimate,
+            OutputFormat::Json,
+        ] {
+            assert_eq!(
+                run_flags(&flags_opts(root, output)),
+                ExitCode::SUCCESS,
+                "SDK-flag render for {output:?} should exit 0"
+            );
+        }
+    }
 }

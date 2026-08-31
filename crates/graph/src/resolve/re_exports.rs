@@ -6,7 +6,7 @@
 //! chains in the graph's re-export resolution phase.
 //!
 //! Like `static_imports`, this is a direct 1:1 mapping — the interesting
-//! chain resolution logic lives in `graph/re_exports.rs`, not here.
+//! chain resolution logic lives in `graph/re_exports/`, not here.
 
 use std::path::Path;
 
@@ -26,7 +26,7 @@ pub(super) fn resolve_re_exports(
         .iter()
         .map(|re| ResolvedReExport {
             info: re.clone(),
-            target: resolve_specifier(ctx, file_path, &re.source),
+            target: resolve_specifier(ctx, file_path, &re.source, false),
         })
         .collect()
 }

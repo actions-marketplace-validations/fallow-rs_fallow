@@ -5,21 +5,31 @@ use fallow_config::{FallowConfig, OutputFormat, RulesConfig};
 
 fn external_plugin_config(root: &std::path::Path) -> fallow_config::ResolvedConfig {
     FallowConfig {
+        type_aware: fallow_config::TypeAwareConfig::default(),
         schema: None,
         extends: vec![],
         entry: vec![],
         ignore_patterns: vec![],
+        ignore_findings: vec![],
         framework: vec![],
         workspaces: None,
         ignore_dependencies: vec![],
+        ignore_unresolved_imports: vec![],
         ignore_exports: vec![],
+        ignore_catalog_references: vec![],
+        ignore_dependency_overrides: vec![],
+        ignore_exports_used_in_file: fallow_config::IgnoreExportsUsedInFileConfig::default(),
         used_class_members: vec![],
+        ignore_decorators: vec![],
+        unused_component_props: fallow_config::UnusedComponentPropsConfig::default(),
         duplicates: fallow_config::DuplicatesConfig::default(),
+        similar_code: fallow_config::SimilarCodeConfig::default(),
         health: fallow_config::HealthConfig::default(),
         rules: RulesConfig::default(),
         boundaries: fallow_config::BoundaryConfig::default(),
-        production: false,
+        production: false.into(),
         plugins: vec![],
+        rule_packs: vec![],
         dynamically_loaded: vec![],
         overrides: vec![],
         regression: None,
@@ -27,10 +37,15 @@ fn external_plugin_config(root: &std::path::Path) -> fallow_config::ResolvedConf
         codeowners: None,
         public_packages: vec![],
         flags: fallow_config::FlagsConfig::default(),
+        security: fallow_config::SecurityConfig::default(),
+        fix: fallow_config::FixConfig::default(),
         resolve: fallow_config::ResolveConfig::default(),
         sealed: false,
+        include_entry_exports: false,
+        auto_imports: false,
+        cache: fallow_config::CacheConfig::default(),
     }
-    .resolve(root.to_path_buf(), OutputFormat::Human, 4, true, true)
+    .resolve(root.to_path_buf(), OutputFormat::Human, 4, true, true, None)
 }
 
 #[test]
@@ -42,22 +57,26 @@ fn external_plugin_entry_points_discovered() {
     let unused_file_names: Vec<String> = results
         .unused_files
         .iter()
-        .map(|f| f.path.file_name().unwrap().to_string_lossy().to_string())
+        .map(|f| {
+            f.file
+                .path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .to_string()
+        })
         .collect();
 
-    // home.ts is a route file — external plugin marks src/routes/**/*.{ts,tsx} as entry points
     assert!(
         !unused_file_names.contains(&"home.ts".to_string()),
         "home.ts should be an entry point via external plugin, unused: {unused_file_names:?}"
     );
 
-    // setup.ts is always-used via external plugin
     assert!(
         !unused_file_names.contains(&"setup.ts".to_string()),
         "setup.ts should be always-used via external plugin, unused: {unused_file_names:?}"
     );
 
-    // orphan.ts is NOT covered by the plugin, should be unused
     assert!(
         unused_file_names.contains(&"orphan.ts".to_string()),
         "orphan.ts should be unused, found: {unused_file_names:?}"
@@ -71,18 +90,18 @@ fn plugin_entry_points_carry_correct_plugin_name() {
 
     let files = fallow_core::discover::discover_files(&config);
 
-    // Run plugins to get aggregated result
     let pkg = fallow_config::PackageJson::load(&root.join("package.json")).unwrap();
     let file_paths: Vec<PathBuf> = files.iter().map(|f| f.path.clone()).collect();
     let registry = fallow_core::plugins::PluginRegistry::new(
         fallow_config::discover_external_plugins(&root, &[]),
     );
-    let plugin_result = registry.run(&pkg, &root, &file_paths);
+    let plugin_result = registry
+        .try_run(&pkg, &root, &file_paths)
+        .expect("external plugin registry should run");
 
     let entries =
         fallow_core::discover::discover_plugin_entry_points(&plugin_result, &config, &files);
 
-    // External plugin "my-framework" should attribute entry points with its name
     let home_entry = entries
         .iter()
         .find(|ep| ep.path.ends_with("home.ts"))
@@ -96,7 +115,6 @@ fn plugin_entry_points_carry_correct_plugin_name() {
         home_entry.source
     );
 
-    // setup.ts is always-used via the external plugin
     let setup_entry = entries
         .iter()
         .find(|ep| ep.path.ends_with("setup.ts"))
@@ -120,10 +138,9 @@ fn external_plugin_used_exports_respected() {
     let unused_export_names: Vec<&str> = results
         .unused_exports
         .iter()
-        .map(|e| e.export_name.as_str())
+        .map(|e| e.export.export_name.as_str())
         .collect();
 
-    // `default` and `loader` exports are marked as used by the plugin
     assert!(
         !unused_export_names.contains(&"default"),
         "default export should be used via external plugin used_exports"
@@ -133,7 +150,6 @@ fn external_plugin_used_exports_respected() {
         "loader export should be used via external plugin used_exports"
     );
 
-    // `unused` export in utils.ts (not an entry point) should be flagged
     assert!(
         unused_export_names.contains(&"unused"),
         "unused export in utils.ts should be flagged, found: {unused_export_names:?}"
@@ -149,10 +165,9 @@ fn external_plugin_tooling_dependencies_not_flagged() {
     let unused_dev_dep_names: Vec<&str> = results
         .unused_dev_dependencies
         .iter()
-        .map(|d| d.package_name.as_str())
+        .map(|d| d.dep.package_name.as_str())
         .collect();
 
-    // my-framework-cli is listed as tooling dependency in the external plugin
     assert!(
         !unused_dev_dep_names.contains(&"my-framework-cli"),
         "my-framework-cli should not be flagged (tooling dep), found: {unused_dev_dep_names:?}"
@@ -171,13 +186,86 @@ fn external_plugin_active_in_list() {
     let pkg = fallow_config::PackageJson::load(&pkg_path).unwrap();
 
     let registry = fallow_core::plugins::PluginRegistry::new(config.external_plugins);
-    let result = registry.run(&pkg, &root, &file_paths);
+    let result = registry
+        .try_run(&pkg, &root, &file_paths)
+        .expect("external plugin registry should run");
 
     assert!(
         result.active_plugins.contains(&"my-framework".to_string()),
         "my-framework external plugin should be active, found: {:?}",
         result.active_plugins
     );
+}
+
+fn manifest_config(root: &std::path::Path) -> fallow_config::ResolvedConfig {
+    external_plugin_config(root)
+}
+
+fn unused_rel_paths(results: &fallow_core::results::AnalysisResults) -> Vec<String> {
+    results
+        .unused_files
+        .iter()
+        .map(|f| f.file.path.to_string_lossy().replace('\\', "/"))
+        .collect()
+}
+
+fn is_unused(unused: &[String], suffix: &str) -> bool {
+    unused.iter().any(|p| p.ends_with(suffix))
+}
+
+#[test]
+fn manifest_entries_seed_plugin_trees_from_kibana_jsonc() {
+    let root = fixture_path("manifest-entries-kibana");
+    let config = manifest_config(&root);
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+    let unused = unused_rel_paths(&results);
+
+    // browser + server + extraPublicDirs seeds are all reachable, plus transitive helper.
+    for reachable in [
+        "plugins/alpha/public/index.ts",
+        "plugins/alpha/public/helper.ts",
+        "plugins/alpha/server/index.ts",
+        "plugins/alpha/common/index.ts",
+        "plugins/beta/public/index.ts",
+    ] {
+        assert!(
+            !is_unused(&unused, reachable),
+            "{reachable} should be seeded/reachable via manifestEntries, unused: {unused:?}"
+        );
+    }
+
+    // beta has server:false, so the per-seed `when` skips its server entry.
+    assert!(
+        is_unused(&unused, "plugins/beta/server/index.ts"),
+        "beta server (server:false) must NOT be seeded and stays unused, unused: {unused:?}"
+    );
+    // a genuinely-orphan file stays flagged.
+    assert!(
+        is_unused(&unused, "orphan.ts"),
+        "orphan.ts should stay unused, unused: {unused:?}"
+    );
+}
+
+#[test]
+fn manifest_entries_are_load_bearing() {
+    // Neuter: with the external plugin removed, the plugin trees have no entry
+    // point and must report as unused, proving manifestEntries is what seeds them.
+    let root = fixture_path("manifest-entries-kibana");
+    let mut config = manifest_config(&root);
+    config.external_plugins = vec![];
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+    let unused = unused_rel_paths(&results);
+
+    for should_be_unused in [
+        "plugins/alpha/public/index.ts",
+        "plugins/alpha/server/index.ts",
+        "plugins/beta/public/index.ts",
+    ] {
+        assert!(
+            is_unused(&unused, should_be_unused),
+            "{should_be_unused} should be unused WITHOUT the manifestEntries plugin, unused: {unused:?}"
+        );
+    }
 }
 
 #[test]
@@ -189,10 +277,16 @@ fn external_plugin_config_patterns_always_used() {
     let unused_file_names: Vec<String> = results
         .unused_files
         .iter()
-        .map(|f| f.path.file_name().unwrap().to_string_lossy().to_string())
+        .map(|f| {
+            f.file
+                .path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .to_string()
+        })
         .collect();
 
-    // my-framework.config.ts is matched by config_patterns, should be always-used
     assert!(
         !unused_file_names.contains(&"my-framework.config.ts".to_string()),
         "my-framework.config.ts should be always-used via config_patterns, unused: {unused_file_names:?}"

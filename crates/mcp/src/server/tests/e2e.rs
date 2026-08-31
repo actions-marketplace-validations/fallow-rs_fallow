@@ -6,9 +6,14 @@
 
 use std::path::PathBuf;
 
-use rmcp::model::RawContent;
+use rmcp::model::ContentBlock;
 
-use crate::tools::{build_analyze_args, build_health_args, build_project_info_args, run_fallow};
+use crate::tools::{
+    build_analyze_args, build_health_args, build_impact_closure_args, build_project_info_args,
+    build_security_candidates_args, build_trace_clone_args, build_trace_dependency_args,
+    build_trace_export_args, build_trace_file_args, execute_code_mode, inspect_target, run_fallow,
+    run_trace_clone_tool, run_trace_export_tool,
+};
 
 /// Resolve the fallow binary from `FALLOW_BIN`, or the workspace target dir.
 fn fallow_binary() -> String {
@@ -41,13 +46,11 @@ fn fixture_path(name: &str) -> PathBuf {
 
 /// Extract the text content from a `CallToolResult`.
 fn extract_text(result: &rmcp::model::CallToolResult) -> &str {
-    match &result.content[0].raw {
-        RawContent::Text(t) => &t.text,
+    match &result.content[0] {
+        ContentBlock::Text(t) => &t.text,
         _ => panic!("expected text content"),
     }
 }
-
-// ── End-to-end: analyze ──────────────────────────────────────────
 
 #[tokio::test]
 async fn e2e_analyze_returns_json_on_basic_project() {
@@ -75,8 +78,6 @@ async fn e2e_analyze_returns_json_on_basic_project() {
     );
 }
 
-// ── End-to-end: project_info ─────────────────────────────────────
-
 #[tokio::test]
 async fn e2e_project_info_returns_files() {
     let bin = fallow_binary();
@@ -100,7 +101,86 @@ async fn e2e_project_info_returns_files() {
     );
 }
 
-// ── End-to-end: analyze with issue type filter ───────────────────
+#[test]
+fn e2e_code_execute_runs_project_info_on_basic_project() {
+    let bin = fallow_binary();
+    let root = fixture_path("basic-project");
+    let output = execute_code_mode(
+        bin,
+        crate::params::CodeExecuteParams {
+            code: "return { fileCount: fallow.projectInfo({ files: true }).file_count, root };"
+                .to_string(),
+            root: Some(root.to_string_lossy().to_string()),
+            timeout_ms: Some(10_000),
+            max_output_bytes: Some(1_000_000),
+        },
+    )
+    .unwrap_or_else(|err| panic!("code mode should succeed: {err}"));
+
+    let json: serde_json::Value = serde_json::from_str(&output)
+        .unwrap_or_else(|e| panic!("should parse as JSON: {e}\ntext: {output}"));
+    assert_eq!(json["ok"].as_bool(), Some(true));
+    assert!(json["result"]["fileCount"].as_u64().unwrap_or(0) > 0);
+    assert_eq!(json["calls"][0]["tool"].as_str(), Some("project_info"));
+}
+
+#[test]
+fn e2e_code_execute_enforces_host_output_limit() {
+    let bin = fallow_binary();
+    let root = fixture_path("basic-project");
+    let output = execute_code_mode(
+        bin,
+        crate::params::CodeExecuteParams {
+            code: "return fallow.projectInfo({ files: true });".to_string(),
+            root: Some(root.to_string_lossy().to_string()),
+            timeout_ms: Some(10_000),
+            max_output_bytes: Some(1),
+        },
+    )
+    .expect_err("code mode should cap host output");
+
+    let json: serde_json::Value = serde_json::from_str(&output)
+        .unwrap_or_else(|e| panic!("should parse as JSON: {e}\ntext: {output}"));
+    assert_eq!(json["ok"].as_bool(), Some(false));
+    assert!(
+        json["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("host output exceeded 1 bytes")),
+        "output cap rejection should be explicit: {output}"
+    );
+}
+
+#[test]
+fn e2e_code_execute_rejects_fix_apply() {
+    let bin = fallow_binary();
+    let root = fixture_path("basic-project");
+    let output = execute_code_mode(
+        bin,
+        crate::params::CodeExecuteParams {
+            code: "return fallow.run('fix_apply', {});".to_string(),
+            root: Some(root.to_string_lossy().to_string()),
+            timeout_ms: Some(1_000),
+            max_output_bytes: Some(10_000),
+        },
+    )
+    .expect_err("code mode should reject fix_apply");
+
+    let json: serde_json::Value = serde_json::from_str(&output)
+        .unwrap_or_else(|e| panic!("should parse as JSON: {e}\ntext: {output}"));
+    assert_eq!(json["ok"].as_bool(), Some(false));
+    assert!(
+        json["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("does not expose fix tools")),
+        "fix_apply rejection should be explicit: {output}"
+    );
+    assert_eq!(json["calls"].as_array().map(Vec::len), Some(1));
+    assert_eq!(json["calls"][0]["tool"].as_str(), Some("fix_apply"));
+    assert_eq!(
+        json["calls"][0]["error_kind"].as_str(),
+        Some("unsupported_tool")
+    );
+}
 
 #[tokio::test]
 async fn e2e_analyze_with_issue_type_filter() {
@@ -131,7 +211,390 @@ async fn e2e_analyze_with_issue_type_filter() {
     );
 }
 
-// ── End-to-end: health ───────────────────────────────────────────
+#[tokio::test]
+async fn e2e_security_candidates_returns_security_json() {
+    let bin = fallow_binary();
+    let root = fixture_path("security-client-server-leak");
+    let params = crate::params::SecurityCandidatesParams {
+        root: Some(root.to_string_lossy().to_string()),
+        ..Default::default()
+    };
+    let args = build_security_candidates_args(&params).unwrap();
+    let result = run_fallow(&bin, &args).await.unwrap();
+
+    assert_eq!(result.is_error, Some(false));
+
+    let text = extract_text(&result);
+    let json: serde_json::Value = serde_json::from_str(text)
+        .unwrap_or_else(|e| panic!("should parse as JSON: {e}\ntext: {text}"));
+    assert_eq!(json["kind"].as_str(), Some("security"));
+    assert!(
+        json["security_findings"].is_array(),
+        "security output should include security_findings"
+    );
+}
+
+#[tokio::test]
+async fn e2e_security_candidates_paths_scope_real_cli_output() {
+    let bin = fallow_binary();
+    let root = fixture_path("security-client-server-leak");
+    let params = crate::params::SecurityCandidatesParams {
+        root: Some(root.to_string_lossy().to_string()),
+        paths: Some(vec!["src/export-browser.ts".to_string()]),
+        ..Default::default()
+    };
+    let args = build_security_candidates_args(&params).unwrap();
+    let result = run_fallow(&bin, &args).await.unwrap();
+
+    assert_eq!(result.is_error, Some(false));
+
+    let text = extract_text(&result);
+    let json: serde_json::Value = serde_json::from_str(text)
+        .unwrap_or_else(|e| panic!("should parse as JSON: {e}\ntext: {text}"));
+    assert_eq!(json["kind"].as_str(), Some("security"));
+    assert_eq!(
+        json["security_findings"].as_array().map(Vec::len),
+        Some(0),
+        "unrelated path scope should filter the fixture candidate"
+    );
+}
+
+#[tokio::test]
+async fn e2e_trace_export_returns_json() {
+    let bin = fallow_binary();
+    let root = fixture_path("basic-project");
+    let args = build_trace_export_args(&crate::params::TraceExportParams {
+        file: "src/utils.ts".to_string(),
+        export_name: "usedFunction".to_string(),
+        root: Some(root.to_string_lossy().to_string()),
+        config: None,
+        allow_remote_extends: None,
+        production: None,
+        workspace: None,
+        no_cache: None,
+        threads: None,
+    })
+    .unwrap();
+    let result = run_fallow(&bin, &args).await.unwrap();
+
+    assert_eq!(result.is_error, Some(false));
+
+    let text = extract_text(&result);
+    let json: serde_json::Value = serde_json::from_str(text)
+        .unwrap_or_else(|e| panic!("should parse as JSON: {e}\ntext: {text}"));
+    assert_eq!(json["file"].as_str(), Some("src/utils.ts"));
+    assert_eq!(json["export_name"].as_str(), Some("usedFunction"));
+    assert_eq!(json["namespace"].as_str(), Some("value"));
+    assert_eq!(json["is_used"].as_bool(), Some(true));
+}
+
+#[tokio::test]
+async fn api_backed_trace_export_tool_returns_json() {
+    let root = fixture_path("basic-project");
+    let result = run_trace_export_tool(crate::params::TraceExportParams {
+        file: "src/utils.ts".to_string(),
+        export_name: "usedFunction".to_string(),
+        root: Some(root.to_string_lossy().to_string()),
+        config: None,
+        allow_remote_extends: None,
+        production: None,
+        workspace: None,
+        no_cache: None,
+        threads: None,
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(result.is_error, Some(false));
+
+    let text = extract_text(&result);
+    let json: serde_json::Value = serde_json::from_str(text)
+        .unwrap_or_else(|e| panic!("should parse as JSON: {e}\ntext: {text}"));
+    assert_eq!(json["file"].as_str(), Some("src/utils.ts"));
+    assert_eq!(json["export_name"].as_str(), Some("usedFunction"));
+    assert_eq!(json["namespace"].as_str(), Some("value"));
+    assert_eq!(json["is_used"].as_bool(), Some(true));
+}
+
+#[tokio::test]
+async fn e2e_trace_file_returns_json() {
+    let bin = fallow_binary();
+    let root = fixture_path("basic-project");
+    let args = build_trace_file_args(&crate::params::TraceFileParams {
+        file: "src/utils.ts".to_string(),
+        root: Some(root.to_string_lossy().to_string()),
+        config: None,
+        allow_remote_extends: None,
+        production: None,
+        workspace: None,
+        no_cache: None,
+        threads: None,
+    })
+    .unwrap();
+    let result = run_fallow(&bin, &args).await.unwrap();
+
+    assert_eq!(result.is_error, Some(false));
+
+    let text = extract_text(&result);
+    let json: serde_json::Value = serde_json::from_str(text)
+        .unwrap_or_else(|e| panic!("should parse as JSON: {e}\ntext: {text}"));
+    assert_eq!(json["file"].as_str(), Some("src/utils.ts"));
+    assert_eq!(json["is_reachable"].as_bool(), Some(true));
+    assert!(
+        json["exports"].is_array(),
+        "trace_file should include exports"
+    );
+}
+
+#[tokio::test]
+async fn e2e_impact_closure_returns_json() {
+    let bin = fallow_binary();
+    let root = fixture_path("basic-project");
+    let args = build_impact_closure_args(&crate::params::ImpactClosureParams {
+        path: "src/utils.ts".to_string(),
+        root: Some(root.to_string_lossy().to_string()),
+        config: None,
+        allow_remote_extends: None,
+        production: None,
+        workspace: None,
+        no_cache: None,
+        threads: None,
+    })
+    .unwrap();
+    let result = run_fallow(&bin, &args).await.unwrap();
+
+    assert_eq!(result.is_error, Some(false));
+
+    let text = extract_text(&result);
+    let json: serde_json::Value = serde_json::from_str(text)
+        .unwrap_or_else(|e| panic!("should parse as JSON: {e}\ntext: {text}"));
+    assert_eq!(json["seed"].as_str(), Some("src/utils.ts"));
+    assert!(json["affected_not_shown"].is_array());
+    assert!(json["coordination_gap"].is_array());
+}
+
+#[tokio::test]
+async fn e2e_inspect_target_file_returns_evidence_bundle() {
+    let bin = fallow_binary();
+    let root = fixture_path("basic-project");
+    let result = inspect_target(
+        &bin,
+        &crate::params::InspectTargetParams {
+            target: crate::params::InspectTarget::File {
+                file: "src/utils.ts".to_string(),
+            },
+            root: Some(root.to_string_lossy().to_string()),
+            config: None,
+            allow_remote_extends: None,
+            production: None,
+            workspace: None,
+            no_cache: None,
+            threads: None,
+            type_aware: None,
+            type_aware_projects: None,
+            type_aware_require: None,
+            symbol_chain: None,
+            include_churn: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.is_error, Some(false));
+
+    let text = extract_text(&result);
+    let json: serde_json::Value = serde_json::from_str(text)
+        .unwrap_or_else(|e| panic!("should parse as JSON: {e}\ntext: {text}"));
+    assert_eq!(json["kind"].as_str(), Some("inspect_target"));
+    assert_eq!(json["target"]["type"].as_str(), Some("file"));
+    assert_eq!(json["identity"]["file"].as_str(), Some("src/utils.ts"));
+    assert_eq!(
+        json["evidence"]["trace_file"]["status"].as_str(),
+        Some("ok")
+    );
+    assert_eq!(json["evidence"]["dead_code"]["status"].as_str(), Some("ok"));
+    assert!(json["evidence"]["trace_export"].is_null());
+    assert!(json["evidence"].get("churn").is_none());
+}
+
+#[tokio::test]
+async fn e2e_inspect_target_symbol_returns_symbol_and_file_evidence() {
+    let bin = fallow_binary();
+    let root = fixture_path("basic-project");
+    let result = inspect_target(
+        &bin,
+        &crate::params::InspectTargetParams {
+            target: crate::params::InspectTarget::Symbol {
+                file: "src/utils.ts".to_string(),
+                export_name: "usedFunction".to_string(),
+            },
+            root: Some(root.to_string_lossy().to_string()),
+            config: None,
+            allow_remote_extends: None,
+            production: None,
+            workspace: None,
+            no_cache: None,
+            threads: None,
+            type_aware: None,
+            type_aware_projects: None,
+            type_aware_require: None,
+            symbol_chain: None,
+            include_churn: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.is_error, Some(false));
+
+    let text = extract_text(&result);
+    let json: serde_json::Value = serde_json::from_str(text)
+        .unwrap_or_else(|e| panic!("should parse as JSON: {e}\ntext: {text}"));
+    assert_eq!(json["kind"].as_str(), Some("inspect_target"));
+    assert_eq!(json["target"]["type"].as_str(), Some("symbol"));
+    assert_eq!(json["identity"]["file"].as_str(), Some("src/utils.ts"));
+    assert_eq!(
+        json["identity"]["export_name"].as_str(),
+        Some("usedFunction")
+    );
+    assert_eq!(json["identity"]["is_used"].as_bool(), Some(true));
+    assert_eq!(
+        json["evidence"]["trace_export"]["status"].as_str(),
+        Some("ok")
+    );
+    assert_eq!(
+        json["evidence"]["duplication"]["scope"].as_str(),
+        Some("project_filtered_to_file")
+    );
+    assert!(
+        json["warnings"]
+            .as_array()
+            .is_some_and(|warnings| warnings.iter().any(|warning| warning
+                .as_str()
+                .is_some_and(|warning| warning.contains("file-scoped")))),
+        "symbol bundles should make file-scoped evidence explicit"
+    );
+}
+
+#[tokio::test]
+async fn e2e_trace_dependency_returns_json() {
+    let bin = fallow_binary();
+    let root = fixture_path("basic-project");
+    let args = build_trace_dependency_args(&crate::params::TraceDependencyParams {
+        package_name: "react".to_string(),
+        root: Some(root.to_string_lossy().to_string()),
+        config: None,
+        allow_remote_extends: None,
+        production: None,
+        workspace: None,
+        no_cache: None,
+        threads: None,
+    })
+    .unwrap();
+    let result = run_fallow(&bin, &args).await.unwrap();
+
+    assert_eq!(result.is_error, Some(false));
+
+    let text = extract_text(&result);
+    let json: serde_json::Value = serde_json::from_str(text)
+        .unwrap_or_else(|e| panic!("should parse as JSON: {e}\ntext: {text}"));
+    assert_eq!(json["package_name"].as_str(), Some("react"));
+    assert!(json["imported_by"].is_array());
+}
+
+#[tokio::test]
+async fn e2e_trace_clone_returns_json() {
+    let bin = fallow_binary();
+    let root = fixture_path("duplicate-code");
+    let args = build_trace_clone_args(&crate::params::TraceCloneParams {
+        file: Some("src/original.ts".to_string()),
+        line: Some(2),
+        fingerprint: None,
+        root: Some(root.to_string_lossy().to_string()),
+        config: None,
+        allow_remote_extends: None,
+        workspace: None,
+        mode: None,
+        near: None,
+        min_tokens: None,
+        min_lines: None,
+        threshold: None,
+        skip_local: None,
+        cross_language: None,
+        ignore_imports: None,
+        no_cache: None,
+        threads: None,
+        min_occurrences: None,
+    })
+    .unwrap();
+    let result = run_fallow(&bin, &args).await.unwrap();
+
+    assert_eq!(result.is_error, Some(false));
+
+    let text = extract_text(&result);
+    let json: serde_json::Value = serde_json::from_str(text)
+        .unwrap_or_else(|e| panic!("should parse as JSON: {e}\ntext: {text}"));
+    assert_eq!(json["file"].as_str(), Some("src/original.ts"));
+    assert_eq!(json["line"].as_u64(), Some(2));
+    assert!(json["matched_instance"].is_object());
+    assert!(json["clone_groups"].is_array());
+
+    let matched_file = json["matched_instance"]["file"]
+        .as_str()
+        .expect("matched_instance.file should be a string");
+    assert!(
+        !matched_file.starts_with('/')
+            && !matched_file.contains(":\\")
+            && !matched_file.contains(":/"),
+        "matched_instance.file should be relative, got {matched_file}",
+    );
+    for group in json["clone_groups"].as_array().expect("clone_groups array") {
+        for inst in group["instances"].as_array().expect("instances array") {
+            let file = inst["file"].as_str().expect("instance.file string");
+            assert!(
+                !file.starts_with('/') && !file.contains(":\\") && !file.contains(":/"),
+                "instance.file should be relative, got {file}",
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn api_backed_trace_clone_tool_returns_json() {
+    let root = fixture_path("duplicate-code");
+    let result = run_trace_clone_tool(crate::params::TraceCloneParams {
+        file: Some("src/original.ts".to_string()),
+        line: Some(2),
+        fingerprint: None,
+        root: Some(root.to_string_lossy().to_string()),
+        config: None,
+        allow_remote_extends: None,
+        workspace: None,
+        mode: None,
+        near: None,
+        min_tokens: None,
+        min_lines: None,
+        threshold: None,
+        skip_local: None,
+        cross_language: None,
+        ignore_imports: None,
+        no_cache: None,
+        threads: None,
+        min_occurrences: None,
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(result.is_error, Some(false));
+
+    let text = extract_text(&result);
+    let json: serde_json::Value = serde_json::from_str(text)
+        .unwrap_or_else(|e| panic!("should parse as JSON: {e}\ntext: {text}"));
+    assert_eq!(json["file"].as_str(), Some("src/original.ts"));
+    assert_eq!(json["line"].as_u64(), Some(2));
+    assert!(json["matched_instance"].is_object());
+    assert!(json["clone_groups"].is_array());
+}
 
 #[tokio::test]
 async fn e2e_health_returns_json() {

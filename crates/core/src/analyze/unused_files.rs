@@ -21,8 +21,12 @@ use super::predicates::{
 /// Vite/Parcel-style projects and their referenced assets are tracked via edges.
 ///
 /// Barrel files (index.ts that only re-export) are excluded when their re-export
-/// sources are reachable — they serve an organizational purpose even if consumers
+/// sources are reachable , they serve an organizational purpose even if consumers
 /// import directly from the source files rather than through the barrel.
+#[deprecated(
+    since = "2.76.0",
+    note = "fallow_core is internal; use fallow_api::run_dead_code for typed output; serialize with fallow_api::serialize_dead_code_programmatic_json for JSON output. See docs/fallow-core-migration.md."
+)]
 pub fn find_unused_files(
     graph: &ModuleGraph,
     suppressions: &SuppressionContext<'_>,
@@ -35,19 +39,8 @@ pub fn find_unused_files(
         .filter(|m| !is_config_file(&m.path))
         .filter(|m| !is_html_file(&m.path))
         .filter(|m| !is_barrel_with_reachable_sources(m, graph))
-        // Safety net: don't report as unused if any reachable module imports this file.
-        // BFS reachability should already cover this, but this guard catches edge cases
-        // where import resolution or re-export chain propagation creates edges that BFS
-        // doesn't fully follow (e.g., path alias resolution inconsistencies).
         .filter(|m| !has_reachable_importer(m.file_id, graph))
-        // Don't report as unused if any export actually has references from reachable modules.
-        // Re-export chain propagation (Phase 4) can add references after BFS (Phase 3),
-        // so a file may have referenced exports despite being "unreachable" by BFS alone.
-        // References from other unreachable modules do not save a dead subtree.
         .filter(|m| !has_reachable_export_reference(m.file_id, graph))
-        // Guard against phantom files: don't report files that no longer exist on disk.
-        // This can happen if a file was deleted between discovery and analysis, or if
-        // a stale cache entry references a path that no longer exists.
         .filter(|m| m.path.exists())
         .filter(|m| !suppressions.is_file_suppressed(m.file_id, IssueKind::UnusedFile))
         .map(|m| UnusedFile {
@@ -83,12 +76,16 @@ fn has_reachable_export_reference(file_id: FileId, graph: &ModuleGraph) -> bool 
 }
 
 #[cfg(test)]
+#[expect(
+    deprecated,
+    reason = "Core-internal policy keeps direct detector unit tests while the public warning targets external callers"
+)]
 mod tests {
     use super::*;
     use crate::discover::{DiscoveredFile, EntryPoint, EntryPointSource};
-    use crate::extract::{ExportName, VisibilityTag};
-    use crate::graph::{ExportSymbol, ModuleGraph, ReferenceKind, SymbolReference};
-    use crate::resolve::ResolvedModule;
+    use crate::extract::{ExportInfo, ExportName, ImportInfo, ImportedName, VisibilityTag};
+    use crate::graph::ModuleGraph;
+    use crate::resolve::{ResolveResult, ResolvedImport, ResolvedModule};
     use crate::suppress::Suppression;
     use oxc_span::Span;
     use rustc_hash::{FxHashMap, FxHashSet};
@@ -123,36 +120,99 @@ mod tests {
             .map(|f| ResolvedModule {
                 file_id: f.id,
                 path: f.path.clone(),
-                exports: vec![],
+                exports: vec![].into(),
                 re_exports: vec![],
                 resolved_imports: vec![],
                 resolved_dynamic_imports: vec![],
                 resolved_dynamic_patterns: vec![],
-                member_accesses: vec![],
-                whole_object_uses: vec![],
+                member_accesses: vec![].into(),
+                semantic_facts: std::sync::Arc::default(),
+                whole_object_uses: std::sync::Arc::default(),
                 has_cjs_exports: false,
+                has_angular_component_template_url: false,
                 unused_import_bindings: FxHashSet::default(),
                 type_referenced_import_bindings: vec![],
                 value_referenced_import_bindings: vec![],
+                namespace_object_aliases: vec![],
+                exported_factory_returns: std::sync::Arc::default(),
+                exported_factory_return_object_shapes: std::sync::Arc::default(),
+                type_member_types: std::sync::Arc::default(),
             })
             .collect();
 
         ModuleGraph::build(&resolved_modules, &entry_points, &files)
     }
 
-    // ---- has_reachable_importer tests ----
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "test file counts are trivially small"
+    )]
+    fn build_graph_with_reference(file_specs: &[(&str, bool)], from: u32) -> ModuleGraph {
+        let files: Vec<DiscoveredFile> = file_specs
+            .iter()
+            .enumerate()
+            .map(|(index, (path, _))| DiscoveredFile {
+                id: FileId(index as u32),
+                path: PathBuf::from(path),
+                size_bytes: 0,
+            })
+            .collect();
+        let entry_points: Vec<EntryPoint> = file_specs
+            .iter()
+            .filter(|(_, is_entry)| *is_entry)
+            .map(|(path, _)| EntryPoint {
+                path: PathBuf::from(path),
+                source: EntryPointSource::ManualEntry,
+            })
+            .collect();
+        let mut resolved_modules: Vec<ResolvedModule> = files
+            .iter()
+            .map(|file| ResolvedModule {
+                file_id: file.id,
+                path: file.path.clone(),
+                ..Default::default()
+            })
+            .collect();
+        resolved_modules[1].exports = vec![ExportInfo {
+            name: ExportName::Named("helper".to_string()),
+            local_name: None,
+            is_type_only: false,
+            is_side_effect_used: false,
+            visibility: VisibilityTag::None,
+            expected_unused_reason: None,
+            span: Span::new(0, 10),
+            members: vec![],
+            super_class: None,
+        }]
+        .into();
+        resolved_modules[from as usize]
+            .resolved_imports
+            .push(ResolvedImport {
+                info: ImportInfo {
+                    source: "./helper".to_string(),
+                    imported_name: ImportedName::Named("helper".to_string()),
+                    local_name: "helper".to_string(),
+                    is_type_only: false,
+                    is_type_only_star: false,
+                    from_style: false,
+                    span: Span::new(0, 10),
+                    source_span: Span::default(),
+                },
+                target: ResolveResult::InternalModule(FileId(1)),
+            });
+
+        ModuleGraph::build(&resolved_modules, &entry_points, &files)
+    }
 
     #[test]
     fn has_reachable_importer_out_of_bounds_file_id() {
         let graph = build_graph(&[("/src/entry.ts", true)]);
-        // FileId 999 is out of bounds for reverse_deps
         assert!(!has_reachable_importer(FileId(999), &graph));
     }
 
     #[test]
     fn has_reachable_importer_empty_reverse_deps() {
         let graph = build_graph(&[("/src/entry.ts", true), ("/src/orphan.ts", false)]);
-        // orphan has no importers
         assert!(!has_reachable_importer(FileId(1), &graph));
     }
 
@@ -163,32 +223,19 @@ mod tests {
             ("/src/a.ts", false),
             ("/src/b.ts", false),
         ]);
-        // Both a and b are unreachable, so even if b imports a,
-        // b is not reachable so has_reachable_importer should be false for a
-        // In this test, there are no import edges so reverse_deps is empty for all
         assert!(!has_reachable_importer(FileId(1), &graph));
     }
 
     #[test]
     fn has_reachable_export_reference_ignores_unreachable_references() {
-        let mut graph = build_graph(&[
-            ("/src/entry.ts", true),
-            ("/src/helper.ts", false),
-            ("/src/setup.ts", false),
-        ]);
-
-        graph.modules[1].exports = vec![ExportSymbol {
-            name: ExportName::Named("helper".to_string()),
-            is_type_only: false,
-            visibility: VisibilityTag::None,
-            span: Span::new(0, 10),
-            references: vec![SymbolReference {
-                from_file: FileId(2),
-                kind: ReferenceKind::NamedImport,
-                import_span: Span::new(0, 10),
-            }],
-            members: vec![],
-        }];
+        let graph = build_graph_with_reference(
+            &[
+                ("/src/entry.ts", true),
+                ("/src/helper.ts", false),
+                ("/src/setup.ts", false),
+            ],
+            2,
+        );
 
         assert!(
             !has_reachable_export_reference(FileId(1), &graph),
@@ -198,28 +245,14 @@ mod tests {
 
     #[test]
     fn has_reachable_export_reference_detects_reachable_references() {
-        let mut graph = build_graph(&[("/src/entry.ts", true), ("/src/helper.ts", false)]);
-
-        graph.modules[1].exports = vec![ExportSymbol {
-            name: ExportName::Named("helper".to_string()),
-            is_type_only: false,
-            visibility: VisibilityTag::None,
-            span: Span::new(0, 10),
-            references: vec![SymbolReference {
-                from_file: FileId(0),
-                kind: ReferenceKind::NamedImport,
-                import_span: Span::new(0, 10),
-            }],
-            members: vec![],
-        }];
+        let graph =
+            build_graph_with_reference(&[("/src/entry.ts", true), ("/src/helper.ts", false)], 0);
 
         assert!(
             has_reachable_export_reference(FileId(1), &graph),
             "reference from reachable module should keep file alive"
         );
     }
-
-    // ---- find_unused_files tests ----
 
     #[test]
     fn find_unused_files_empty_graph() {
@@ -261,7 +294,6 @@ mod tests {
 
     #[test]
     fn find_unused_files_skips_suppressed_files() {
-        // Create a temp file that exists on disk
         let dir = tempfile::tempdir().expect("create temp dir");
         let orphan_path = dir.path().join("orphan.ts");
         std::fs::write(&orphan_path, "export const unused = 1;").expect("write temp file");
@@ -287,27 +319,28 @@ mod tests {
             .map(|f| ResolvedModule {
                 file_id: f.id,
                 path: f.path.clone(),
-                exports: vec![],
+                exports: vec![].into(),
                 re_exports: vec![],
                 resolved_imports: vec![],
                 resolved_dynamic_imports: vec![],
                 resolved_dynamic_patterns: vec![],
-                member_accesses: vec![],
-                whole_object_uses: vec![],
+                member_accesses: vec![].into(),
+                semantic_facts: std::sync::Arc::default(),
+                whole_object_uses: std::sync::Arc::default(),
                 has_cjs_exports: false,
+                has_angular_component_template_url: false,
                 unused_import_bindings: FxHashSet::default(),
                 type_referenced_import_bindings: vec![],
                 value_referenced_import_bindings: vec![],
+                namespace_object_aliases: vec![],
+                exported_factory_returns: std::sync::Arc::default(),
+                exported_factory_return_object_shapes: std::sync::Arc::default(),
+                type_member_types: std::sync::Arc::default(),
             })
             .collect();
         let graph = ModuleGraph::build(&resolved_modules, &entry_points, &files);
 
-        // Suppress unused-file for file 1
-        let supps = vec![Suppression {
-            line: 0,
-            comment_line: 1,
-            kind: Some(IssueKind::UnusedFile),
-        }];
+        let supps = vec![Suppression::issue(0, 1, IssueKind::UnusedFile)];
         let supps_slice: &[Suppression] = &supps;
         let mut supp_map: FxHashMap<FileId, &[Suppression]> = FxHashMap::default();
         supp_map.insert(FileId(1), supps_slice);
@@ -321,7 +354,6 @@ mod tests {
     fn find_unused_files_skips_nonexistent_files() {
         let graph = build_graph(&[("/src/entry.ts", true), ("/nonexistent/phantom.ts", false)]);
         let result = find_unused_files(&graph, &SuppressionContext::empty());
-        // phantom.ts doesn't exist on disk, should not be reported
         assert!(
             !result
                 .iter()

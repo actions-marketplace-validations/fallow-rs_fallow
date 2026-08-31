@@ -1,7 +1,5 @@
 use crate::tests::parse_ts as parse_source;
 
-// -- Unused import binding detection (oxc_semantic) --
-
 #[test]
 fn unused_import_binding_detected() {
     let info = parse_source("import { foo } from './utils';");
@@ -58,10 +56,6 @@ fn type_only_import_used_as_type_not_in_unused() {
 
 #[test]
 fn value_import_used_only_as_type_not_in_unused() {
-    // A value import (not `import type`) used only in a type annotation position
-    // should NOT be in unused_import_bindings — oxc_semantic counts type-position
-    // references as real references, which is correct since `import { Foo }` (without
-    // the `type` keyword) may be needed at runtime depending on transpiler settings.
     let info = parse_source("import { Foo } from './types';\nconst x: Foo = {} as any;");
     assert!(
         !info.unused_import_bindings.contains(&"Foo".to_string()),
@@ -114,8 +108,6 @@ fn mixed_used_and_unused_imports() {
         "'unused' is not referenced"
     );
 }
-
-// ── Unused import bindings: additional coverage ──────────────
 
 #[test]
 fn unused_import_mixed_used_and_unused() {

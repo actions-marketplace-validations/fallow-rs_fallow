@@ -1,7 +1,37 @@
 {
   "$schema": "https://raw.githubusercontent.com/fallow-rs/fallow/main/schema.json",
+  "entry": [
+    "src/extension.ts",
+    "src/types.ts",
+    "src/generated/output-contract.d.ts"
+  ],
+  "ignorePatterns": [
+    "test/integration/fixtures/**"
+  ],
+  "ignoreUnresolvedImports": [
+    "./generated/output-contract.js",
+    "../src/generated/output-contract.js",
+    "./generated/lsp-initialization-options.js",
+    "../src/generated/lsp-initialization-options.js"
+  ],
   "ignoreDependencies": ["@vscode/vsce"],
+  "ignoreExports": [
+    {
+      "file": "src/types.ts",
+      "exports": ["*"]
+    },
+    {
+      "file": "src/workspacePicker.ts",
+      "exports": [
+        "CLEAR_WORKSPACE_SCOPE",
+        "WORKSPACE_STATE_KEY",
+        "getWorkspaceStateOverride",
+        "resolveWorkspaceScope"
+      ]
+    }
+  ],
   "rules": {
-    "unlisted-dependencies": "warn"
+    "unlisted-dependencies": "warn",
+    "unresolved-imports": "warn"
   }
 }

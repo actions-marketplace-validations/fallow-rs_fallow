@@ -97,7 +97,6 @@ mod tests {
             source,
             std::path::Path::new("/project"),
         );
-        // Only 'unocss' from the import
         assert_eq!(result.referenced_dependencies, vec!["unocss".to_string()]);
     }
 }

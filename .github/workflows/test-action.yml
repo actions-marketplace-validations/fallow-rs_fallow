@@ -1,9 +1,12 @@
 name: Test GitHub Action
 
 on:
-  # Temporarily disabled to conserve CI minutes; run locally or via workflow_dispatch.
-  # pull_request:
-  #   branches: [main]
+  pull_request:
+    branches: [main]
+    paths:
+      - 'action/**'
+      - 'action.yml'
+      - '.github/workflows/test-action.yml'
   workflow_dispatch:
 
 concurrency:
@@ -16,10 +19,11 @@ jobs:
   test-jq-scripts:
     name: Test jq scripts
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Run jq unit tests
         run: bash action/tests/run.sh
@@ -27,21 +31,29 @@ jobs:
   test-sarif:
     name: Test SARIF output
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read
       security-events: write
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
-      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 20
+          node-version: 22
 
       - name: Run action with SARIF format
         id: fallow
         uses: ./
+        env:
+          # These smoke jobs run the checked-out Action against the currently
+          # published npm package. During the PR window before a release, the
+          # verifier can be newer than published platform packages and fail on
+          # missing .sig files. The fail-closed verifier path is covered by
+          # action/tests/run.sh and npm/fallow/scripts/verify-binary.test.js.
+          FALLOW_SKIP_BINARY_VERIFY: "1"
         with:
           root: tests/fixtures/basic-project
           format: sarif
@@ -79,20 +91,23 @@ jobs:
   test-json:
     name: Test JSON output
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
-      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 20
+          node-version: 22
 
       - name: Run action with JSON format
         id: fallow
         uses: ./
+        env:
+          FALLOW_SKIP_BINARY_VERIFY: "1"
         with:
           command: dead-code
           root: tests/fixtures/basic-project
@@ -127,19 +142,84 @@ jobs:
           fi
           echo "Issues match: $ISSUES"
 
-  test-zero-issues:
-    name: Test clean project (zero issues)
+  test-native-annotations:
+    name: Test native annotation fastpath
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
-      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 20
+          node-version: 22
+
+      - name: Run action with annotations enabled
+        id: fallow
+        uses: ./
+        env:
+          FALLOW_SKIP_BINARY_VERIFY: "1"
+        with:
+          command: dead-code
+          root: tests/fixtures/basic-project
+          format: json
+          annotations: true
+          fail-on-issues: false
+
+      - name: Verify native annotation fastpath ran
+        env:
+          RESULTS_PATH: ${{ steps.fallow.outputs.results }}
+          ISSUES: ${{ steps.fallow.outputs.issues }}
+        run: |
+          if [ ! -f "$RESULTS_PATH" ]; then
+            echo "::error::Results output file not found"
+            exit 1
+          fi
+          if [ -z "$ISSUES" ] || [ "$ISSUES" -eq 0 ]; then
+            echo "::error::Expected issues > 0 for basic-project fixture, got: $ISSUES"
+            exit 1
+          fi
+
+          # The composite already emitted annotations via the native path, but a
+          # later step cannot capture that step's log. Re-run annotate.sh with
+          # the installed binary against the saved envelope to assert the native
+          # renderer ran. HAS_NATIVE_REPORT mirrors what analyze.sh exports for a
+          # report-capable (3.4.2+) binary.
+          OUT=$(HAS_NATIVE_REPORT=true \
+            FALLOW_COMMAND=dead-code \
+            MAX_ANNOTATIONS=50 \
+            ACTION_JQ_DIR="${GITHUB_WORKSPACE}/action/jq" \
+            FALLOW_RESULTS_FILE="$RESULTS_PATH" \
+            bash "${GITHUB_WORKSPACE}/action/scripts/annotate.sh" 2>&1)
+          printf '%s\n' "$OUT"
+
+          if ! printf '%s\n' "$OUT" | grep -q 'annotations rendered via native github-annotations'; then
+            echo "::error::annotate.sh did not take the native path"
+            exit 1
+          fi
+          if ! printf '%s\n' "$OUT" | grep -qE '^::(warning|error) '; then
+            echo "::error::native annotation stream emitted no ::warning or ::error lines"
+            exit 1
+          fi
+          echo "Native annotation fastpath verified ($ISSUES issues)"
+
+  test-zero-issues:
+    name: Test clean project (zero issues)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
 
       - name: Create clean project
         run: |
@@ -158,6 +238,8 @@ jobs:
       - name: Run action against clean project
         id: fallow
         uses: ./
+        env:
+          FALLOW_SKIP_BINARY_VERIFY: "1"
         with:
           root: /tmp/clean-project
           format: json
@@ -179,20 +261,23 @@ jobs:
   test-dupes:
     name: Test dupes command
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
-      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 20
+          node-version: 22
 
       - name: Run action with dupes command
         id: fallow
         uses: ./
+        env:
+          FALLOW_SKIP_BINARY_VERIFY: "1"
         with:
           command: dupes
           root: tests/fixtures/duplicate-code
@@ -228,20 +313,23 @@ jobs:
   test-fix:
     name: Test fix command (dry-run)
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
-      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 20
+          node-version: 22
 
       - name: Run action with fix command
         id: fallow
         uses: ./
+        env:
+          FALLOW_SKIP_BINARY_VERIFY: "1"
         with:
           command: fix
           root: tests/fixtures/basic-project
@@ -277,20 +365,23 @@ jobs:
   test-dead-code-alias:
     name: Test dead-code command alias
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
-      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 20
+          node-version: 22
 
       - name: Run action with dead-code command
         id: fallow
         uses: ./
+        env:
+          FALLOW_SKIP_BINARY_VERIFY: "1"
         with:
           command: dead-code
           root: tests/fixtures/basic-project
@@ -314,20 +405,23 @@ jobs:
   test-bare-combined:
     name: Test bare invocation (combined JSON)
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
-      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 20
+          node-version: 22
 
       - name: Run action with no command (bare invocation)
         id: fallow
         uses: ./
+        env:
+          FALLOW_SKIP_BINARY_VERIFY: "1"
         with:
           root: tests/fixtures/basic-project
           format: json
@@ -358,39 +452,65 @@ jobs:
   test-comment:
     name: Test PR comment
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read
+      id-token: write
       pull-requests: write
     if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
-      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 20
+          node-version: 22
 
       - name: Run action with PR comment
         id: fallow
         uses: ./
+        env:
+          FALLOW_SKIP_BINARY_VERIFY: "1"
         with:
           root: tests/fixtures/basic-project
           format: json
           fail-on-issues: false
           comment: true
+          comment-id: action-smoke-test
 
       - name: Verify comment was posted
         env:
+          EXPECTED_COMMENT_AUTHOR: fallow-cloud[bot]
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           GH_REPO: ${{ github.repository }}
         run: |
           COMMENTS=$(gh api \
             "repos/${GH_REPO}/issues/${PR_NUMBER}/comments" \
-            --jq '[.[] | select(.body | contains("<!-- fallow-results -->"))] | length')
-          if [ "$COMMENTS" -eq 0 ]; then
-            echo "::error::Expected a fallow PR comment but found none"
+            --jq '[.[] | select(.body | contains("<!-- fallow-id: action-smoke-test -->"))]')
+          COMMENT_COUNT=$(printf '%s\n' "$COMMENTS" | jq 'length')
+          if [ "$COMMENT_COUNT" -ne 1 ]; then
+            echo "::error::Expected exactly one fallow PR comment, found $COMMENT_COUNT"
             exit 1
           fi
-          echo "Found $COMMENTS fallow comment(s)"
+          COMMENT_AUTHOR=$(printf '%s\n' "$COMMENTS" | jq -r '.[0].user.login // empty')
+          if [ "$COMMENT_AUTHOR" != "$EXPECTED_COMMENT_AUTHOR" ]; then
+            echo "::error::Expected comment author ${EXPECTED_COMMENT_AUTHOR}, found ${COMMENT_AUTHOR:-none}"
+            exit 1
+          fi
+          echo "Found $COMMENT_COUNT fallow comment(s) authored by $COMMENT_AUTHOR"
+
+      - name: Clean up smoke-test comment
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh api "repos/${GH_REPO}/issues/${PR_NUMBER}/comments" \
+            --jq '.[] | select(.body | contains("<!-- fallow-id: action-smoke-test -->")) | .id' |
+            while read -r COMMENT_ID; do
+              [ -n "$COMMENT_ID" ] || continue
+              gh api --method DELETE "repos/${GH_REPO}/issues/comments/${COMMENT_ID}"
+            done

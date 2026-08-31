@@ -1,8 +1,10 @@
-use std::io::Read as _;
+use std::collections::BTreeMap;
+use std::fmt;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 
 use crate::config::UsedClassMemberRule;
 
@@ -22,6 +24,40 @@ pub enum EntryPointRole {
     Support,
 }
 
+/// Which export shape a convention auto-import credits when its name is
+/// referenced without an explicit `import` statement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoImportKind {
+    /// `import { name } from source` (named export, e.g. a Nuxt composable/util).
+    Named,
+    /// `import name from source` (default export).
+    Default,
+    /// SFC default export consumed by a template tag (Nuxt `components/`).
+    DefaultComponent,
+}
+
+/// A single convention-based auto-import: a bare identifier name that resolves
+/// to an export in `source` by framework convention, with no explicit `import`
+/// statement in the consuming file.
+///
+/// Built by `Plugin::auto_imports` from a filesystem scan (e.g. Nuxt scanning
+/// `components/`), and consumed at graph-build time: the resolver matches a
+/// file's captured `auto_import_candidates` against these rules and synthesizes
+/// an edge to `source`. The table is a function of which files exist on disk,
+/// not of any single file's bytes, so it is computed fresh per run and never
+/// cached as part of per-file extraction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AutoImportRule {
+    /// Bare identifier name (e.g. `useCounter`, `Card001`, `BaseButton`,
+    /// `LazyCard001`). Component names are canonical PascalCase; the consuming
+    /// scanner normalizes kebab-case tags before matching.
+    pub name: String,
+    /// Absolute path to the source file providing the export.
+    pub source: PathBuf,
+    /// Which export to credit when the name is referenced.
+    pub kind: AutoImportKind,
+}
+
 /// How to detect if a plugin should be activated.
 ///
 /// When set on an `ExternalPluginDef`, this takes priority over `enablers`.
@@ -30,13 +66,27 @@ pub enum EntryPointRole {
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum PluginDetection {
     /// Plugin detected if this package is in dependencies.
-    Dependency { package: String },
+    Dependency {
+        /// Exact package name looked up in the project's declared dependencies.
+        package: String,
+    },
     /// Plugin detected if this file pattern matches.
-    FileExists { pattern: String },
+    FileExists {
+        /// Project-root-relative glob; the plugin activates when any
+        /// discovered file matches it. Validated at load like other user
+        /// globs (no absolute paths or `..` segments).
+        pattern: String,
+    },
     /// All conditions must be true.
-    All { conditions: Vec<Self> },
+    All {
+        /// Sub-conditions combined with logical AND.
+        conditions: Vec<Self>,
+    },
     /// Any condition must be true.
-    Any { conditions: Vec<Self> },
+    Any {
+        /// Sub-conditions combined with logical OR.
+        conditions: Vec<Self>,
+    },
 }
 
 /// A declarative plugin definition loaded from a standalone file or inline config.
@@ -98,6 +148,15 @@ pub struct ExternalPluginDef {
     #[serde(default = "default_external_entry_point_role")]
     pub entry_point_role: EntryPointRole,
 
+    /// Entry points DERIVED from framework manifest files.
+    ///
+    /// Unlike `entryPoints` (static globs), each rule finds manifest files by a
+    /// recursive glob, parses them, and seeds sibling entries resolved relative
+    /// to each manifest's directory, gated on the manifest's own fields. Seeded
+    /// entries use this plugin's `entryPointRole`.
+    #[serde(default)]
+    pub manifest_entries: Vec<ManifestEntryRule>,
+
     /// Glob patterns for config files (marked as always-used when active).
     #[serde(default)]
     pub config_patterns: Vec<String>,
@@ -132,6 +191,313 @@ pub struct ExternalUsedExport {
     pub exports: Vec<String>,
 }
 
+/// Format of the manifest files a [`ManifestEntryRule`] reads.
+///
+/// `jsonc` (the default) also parses plain JSON, so it is the tolerant choice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ManifestFormat {
+    /// JSONC (comments + trailing commas). Also accepts plain JSON.
+    #[default]
+    Jsonc,
+    /// Strict JSON.
+    Json,
+}
+
+/// A validated field path into a manifest document.
+///
+/// Field paths use dotted object keys and an exact `[*]` segment for array
+/// traversal. The parsed segments are retained so evaluators do not repeatedly
+/// interpret user-authored path strings.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ManifestFieldPath {
+    raw: String,
+    segments: Vec<ManifestFieldSegment>,
+}
+
+/// One validated traversal step in a [`ManifestFieldPath`].
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ManifestFieldSegment {
+    /// Read one named key from each current JSON object.
+    Key(String),
+    /// Visit every item in each current JSON array.
+    Each,
+}
+
+impl ManifestFieldPath {
+    /// The original validated path, used in diagnostics and serialization.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.raw
+    }
+
+    /// Parsed object-key and array traversal segments in source order.
+    #[must_use]
+    pub fn segments(&self) -> &[ManifestFieldSegment] {
+        &self.segments
+    }
+
+    fn parse(raw: String) -> Result<Self, String> {
+        if raw.is_empty() {
+            return Err("manifest field path must not be empty".to_string());
+        }
+
+        let mut segments = Vec::new();
+        for component in raw.split('.') {
+            if component.is_empty() {
+                return Err(format!(
+                    "manifest field path '{raw}' contains an empty segment"
+                ));
+            }
+
+            let key_end = component.find('[').unwrap_or(component.len());
+            let key = &component[..key_end];
+            if key.is_empty() || key.contains(['{', '}', ']']) {
+                return Err(format!(
+                    "manifest field path '{raw}' contains unsupported bracket syntax"
+                ));
+            }
+            segments.push(ManifestFieldSegment::Key(key.to_string()));
+
+            let mut suffix = &component[key_end..];
+            while !suffix.is_empty() {
+                let Some(rest) = suffix.strip_prefix("[*]") else {
+                    return Err(format!(
+                        "manifest field path '{raw}' only supports exact '[*]' array traversal"
+                    ));
+                };
+                segments.push(ManifestFieldSegment::Each);
+                suffix = rest;
+            }
+        }
+
+        Ok(Self { raw, segments })
+    }
+}
+
+impl FromStr for ManifestFieldPath {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        Self::parse(raw.to_string())
+    }
+}
+
+impl fmt::Display for ManifestFieldPath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.raw)
+    }
+}
+
+impl Serialize for ManifestFieldPath {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.raw)
+    }
+}
+
+impl<'de> Deserialize<'de> for ManifestFieldPath {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Self::parse(raw).map_err(D::Error::custom)
+    }
+}
+
+/// One parsed part of a manifest entry path template.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManifestPathPart {
+    /// Literal path text copied without interpretation.
+    Literal(String),
+    /// A manifest field whose scalar values are interpolated.
+    Field(ManifestFieldPath),
+}
+
+/// A validated manifest-relative entry path with parsed `${field.path}` parts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManifestPathTemplate {
+    raw: String,
+    parts: Vec<ManifestPathPart>,
+}
+
+impl ManifestPathTemplate {
+    /// The original template used for serialization and diagnostics.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.raw
+    }
+
+    /// Parsed literal and field parts in source order.
+    #[must_use]
+    pub fn parts(&self) -> &[ManifestPathPart] {
+        &self.parts
+    }
+
+    /// Replace field interpolations with a safe segment for glob validation.
+    #[must_use]
+    pub fn validation_pattern(&self) -> String {
+        let mut pattern = String::with_capacity(self.raw.len());
+        for part in &self.parts {
+            match part {
+                ManifestPathPart::Literal(literal) => pattern.push_str(literal),
+                ManifestPathPart::Field(_) => pattern.push_str("fallowinterp"),
+            }
+        }
+        pattern
+    }
+
+    fn parse(raw: String) -> Result<Self, String> {
+        let mut parts = Vec::new();
+        let mut rest = raw.as_str();
+
+        while let Some(start) = rest.find("${") {
+            if start > 0 {
+                parts.push(ManifestPathPart::Literal(rest[..start].to_string()));
+            }
+
+            let after = &rest[start + 2..];
+            let Some(end) = after.find('}') else {
+                return Err(format!(
+                    "manifest entry path '{raw}' contains an unterminated interpolation"
+                ));
+            };
+            let field = after[..end].parse::<ManifestFieldPath>()?;
+            parts.push(ManifestPathPart::Field(field));
+            rest = &after[end + 1..];
+        }
+
+        if !rest.is_empty() {
+            parts.push(ManifestPathPart::Literal(rest.to_string()));
+        }
+        if parts.is_empty() {
+            parts.push(ManifestPathPart::Literal(String::new()));
+        }
+
+        Ok(Self { raw, parts })
+    }
+}
+
+impl FromStr for ManifestPathTemplate {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        Self::parse(raw.to_string())
+    }
+}
+
+impl fmt::Display for ManifestPathTemplate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.raw)
+    }
+}
+
+impl Serialize for ManifestPathTemplate {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.raw)
+    }
+}
+
+impl<'de> Deserialize<'de> for ManifestPathTemplate {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Self::parse(raw).map_err(D::Error::custom)
+    }
+}
+
+/// A typed condition used by a manifest entry gate.
+///
+/// Plain JSON values retain strict equality semantics. The reserved
+/// `{ "exists": bool }` object tests field presence without truthiness.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(untagged)]
+pub enum ManifestCondition {
+    /// Require the field path to resolve (`true`) or not resolve (`false`).
+    Exists(ManifestExistsPredicate),
+    /// Require at least one yielded value to equal this JSON value exactly.
+    Equals(serde_json::Value),
+}
+
+/// The explicit field-presence predicate accepted by [`ManifestCondition`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ManifestExistsPredicate {
+    /// Whether the field path must resolve to at least one value.
+    pub exists: bool,
+}
+
+/// A rule that seeds entry points DERIVED from framework manifest files.
+///
+/// For every file matching `manifests` (a recursive glob) that passes the
+/// manifest-level `when` gate, each rule in `entries` is resolved relative to
+/// the manifest's directory (with `${dotted.field}` interpolation) into an entry
+/// point. Seeded entries use the owning plugin's `entryPointRole`.
+///
+/// ```jsonc
+/// {
+///   "manifests": "**/kibana.jsonc",
+///   "when": { "type": "plugin" },
+///   "entries": [
+///     { "path": "public/index.{ts,tsx}", "when": { "plugin.browser": true } },
+///     { "path": "server/index.{ts,tsx}", "when": { "plugin.server": true } },
+///     { "path": "${plugin.extraPublicDirs}/index.{ts,tsx}" }
+///   ]
+/// }
+/// ```
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ManifestEntryRule {
+    /// Recursive glob selecting the manifest files to read (e.g. `**/kibana.jsonc`).
+    pub manifests: String,
+
+    /// Manifest format. Defaults to `jsonc` (which also parses plain JSON).
+    #[serde(default)]
+    pub format: ManifestFormat,
+
+    /// Manifest-level gate: a map of field path to an equality expectation or
+    /// an explicit `exists` predicate. Paths use dotted object keys and may
+    /// traverse arrays with `[*]`. ALL entries must match; a wildcard equality
+    /// matches when any yielded value equals the expectation. An empty map
+    /// matches every manifest.
+    #[serde(default)]
+    #[schemars(with = "BTreeMap<String, ManifestCondition>")]
+    pub when: BTreeMap<ManifestFieldPath, ManifestCondition>,
+
+    /// Entry rules seeded per matching manifest.
+    pub entries: Vec<ManifestSeedRule>,
+}
+
+/// A single entry seeded by a [`ManifestEntryRule`], resolved relative to the
+/// manifest's directory.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ManifestSeedRule {
+    /// Entry glob relative to the manifest directory. May contain
+    /// `${dotted.field}` interpolation that fans out over string / array
+    /// manifest field values; `[*]` traverses object arrays. A missing or empty
+    /// field seeds nothing. The glob must encode its own extension, such as
+    /// `public/index.{ts,tsx}`. Glob entry patterns are matched literally
+    /// against discovered files without
+    /// source-extension probing.
+    #[schemars(with = "String")]
+    pub path: ManifestPathTemplate,
+
+    /// Per-entry gate, using the same strict equality and `[*]` traversal as the
+    /// manifest-level gate. An empty map always passes.
+    #[serde(default)]
+    #[schemars(with = "BTreeMap<String, ManifestCondition>")]
+    pub when: BTreeMap<ManifestFieldPath, ManifestCondition>,
+}
+
 fn default_external_entry_point_role() -> EntryPointRole {
     EntryPointRole::Support
 }
@@ -141,6 +507,118 @@ impl ExternalPluginDef {
     #[must_use]
     pub fn json_schema() -> serde_json::Value {
         serde_json::to_value(schemars::schema_for!(ExternalPluginDef)).unwrap_or_default()
+    }
+
+    /// Validate all user-supplied glob patterns on this plugin definition,
+    /// including patterns nested inside `detection` combinators (`all` / `any`).
+    ///
+    /// Pattern names use the same `framework[].<field>` notation used by
+    /// inline plugin definitions in `FallowConfig::validate_user_globs` so the
+    /// user sees consistent field paths whether the plugin is inline or
+    /// loaded from `.fallow/plugins/` / `fallow-plugin-*.{toml,json,jsonc}`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a non-empty `Vec` of
+    /// [`GlobValidationError`](crate::config::glob_validation::GlobValidationError)
+    /// when any pattern is rejected.
+    pub fn validate_user_globs(
+        &self,
+    ) -> Result<(), Vec<crate::config::glob_validation::GlobValidationError>> {
+        use crate::config::glob_validation::{compile_user_glob, validate_user_globs};
+
+        let mut errors = Vec::new();
+        validate_user_globs(&self.entry_points, "framework[].entryPoints", &mut errors);
+        validate_user_globs(&self.always_used, "framework[].alwaysUsed", &mut errors);
+        validate_user_globs(
+            &self.config_patterns,
+            "framework[].configPatterns",
+            &mut errors,
+        );
+        for used in &self.used_exports {
+            if let Err(e) = compile_user_glob(&used.pattern, "framework[].usedExports[].pattern") {
+                errors.push(e);
+            }
+        }
+        for rule in &self.manifest_entries {
+            if let Err(e) =
+                compile_user_glob(&rule.manifests, "framework[].manifestEntries[].manifests")
+            {
+                errors.push(e);
+            }
+            for seed in &rule.entries {
+                // Substitute `${...}` interpolation with a placeholder segment so
+                // the surrounding glob (e.g. `${x}/index.{ts,tsx}`) validates.
+                let probe = seed.path.validation_pattern();
+                if let Err(e) =
+                    compile_user_glob(&probe, "framework[].manifestEntries[].entries[].path")
+                {
+                    errors.push(e);
+                }
+            }
+        }
+        if let Some(detection) = &self.detection {
+            validate_detection_user_globs(detection, "framework[].detection", &mut errors);
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+}
+
+/// Recursively validate `FileExists.pattern` fields inside a `PluginDetection`
+/// tree. `All` and `Any` combinators recurse into their nested conditions.
+fn validate_detection_user_globs(
+    detection: &PluginDetection,
+    field: &'static str,
+    errors: &mut Vec<crate::config::glob_validation::GlobValidationError>,
+) {
+    match detection {
+        PluginDetection::Dependency { .. } => {}
+        PluginDetection::FileExists { pattern } => {
+            if let Err(e) = crate::config::glob_validation::compile_user_glob(pattern, field) {
+                errors.push(e);
+            }
+        }
+        PluginDetection::All { conditions } | PluginDetection::Any { conditions } => {
+            for condition in conditions {
+                validate_detection_user_globs(condition, field, errors);
+            }
+        }
+    }
+}
+
+/// Discover external plugin definitions AND validate their user-supplied glob
+/// patterns. Accumulates all errors across all loaded plugins so the user sees
+/// every problem in one run.
+///
+/// Discovery is identical to [`discover_external_plugins`]; this wrapper adds
+/// the per-plugin glob validation step required for security
+/// (see issue #463: `framework[].detection.fileExists.pattern` reaches
+/// `glob::glob` on disk via `root.join(pattern)`, so a `..` segment loaded
+/// from `.fallow/plugins/` would be a real path traversal).
+///
+/// # Errors
+///
+/// Returns the list of validation errors when any discovered plugin contains
+/// a rejected pattern. The CLI surfaces these with exit code 2.
+pub fn discover_and_validate_external_plugins(
+    root: &Path,
+    config_plugin_paths: &[String],
+) -> Result<Vec<ExternalPluginDef>, Vec<crate::config::glob_validation::GlobValidationError>> {
+    let plugins = discover_external_plugins(root, config_plugin_paths);
+    let mut errors = Vec::new();
+    for plugin in &plugins {
+        if let Err(mut plugin_errors) = plugin.validate_user_globs() {
+            errors.append(&mut plugin_errors);
+        }
+    }
+    if errors.is_empty() {
+        Ok(plugins)
+    } else {
+        Err(errors)
     }
 }
 
@@ -186,24 +664,13 @@ fn parse_plugin(content: &str, format: &PluginFormat, path: &Path) -> Option<Ext
                 None
             }
         },
-        PluginFormat::Jsonc => {
-            let mut stripped = String::new();
-            match json_comments::StripComments::new(content.as_bytes())
-                .read_to_string(&mut stripped)
-            {
-                Ok(_) => match serde_json::from_str::<ExternalPluginDef>(&stripped) {
-                    Ok(plugin) => Some(plugin),
-                    Err(e) => {
-                        tracing::warn!("failed to parse external plugin {}: {e}", path.display());
-                        None
-                    }
-                },
-                Err(e) => {
-                    tracing::warn!("failed to strip comments from {}: {e}", path.display());
-                    None
-                }
+        PluginFormat::Jsonc => match crate::jsonc::parse_to_value::<ExternalPluginDef>(content) {
+            Ok(plugin) => Some(plugin),
+            Err(e) => {
+                tracing::warn!("failed to parse external plugin {}: {e}", path.display());
+                None
             }
-        }
+        },
     }
 }
 
@@ -220,30 +687,60 @@ pub fn discover_external_plugins(
     let mut plugins = Vec::new();
     let mut seen_names = rustc_hash::FxHashSet::default();
 
-    // All paths are checked against the canonical root to prevent symlink escapes
     let canonical_root = dunce::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
 
-    // 1. Explicit paths from config
+    load_configured_plugin_paths(
+        root,
+        config_plugin_paths,
+        &canonical_root,
+        &mut plugins,
+        &mut seen_names,
+    );
+    load_default_plugins_dir(root, &canonical_root, &mut plugins, &mut seen_names);
+    load_root_plugin_files(root, &canonical_root, &mut plugins, &mut seen_names);
+
+    plugins
+}
+
+fn load_configured_plugin_paths(
+    root: &Path,
+    config_plugin_paths: &[String],
+    canonical_root: &Path,
+    plugins: &mut Vec<ExternalPluginDef>,
+    seen_names: &mut rustc_hash::FxHashSet<String>,
+) {
     for path_str in config_plugin_paths {
         let path = root.join(path_str);
-        if !is_within_root(&path, &canonical_root) {
+        if !is_within_root(&path, canonical_root) {
             tracing::warn!("plugin path '{path_str}' resolves outside project root, skipping");
             continue;
         }
         if path.is_dir() {
-            load_plugins_from_dir(&path, &canonical_root, &mut plugins, &mut seen_names);
+            load_plugins_from_dir(&path, canonical_root, plugins, seen_names);
         } else if path.is_file() {
-            load_plugin_file(&path, &canonical_root, &mut plugins, &mut seen_names);
+            load_plugin_file(&path, canonical_root, plugins, seen_names);
         }
     }
+}
 
-    // 2. .fallow/plugins/ directory
+fn load_default_plugins_dir(
+    root: &Path,
+    canonical_root: &Path,
+    plugins: &mut Vec<ExternalPluginDef>,
+    seen_names: &mut rustc_hash::FxHashSet<String>,
+) {
     let plugins_dir = root.join(".fallow").join("plugins");
-    if plugins_dir.is_dir() && is_within_root(&plugins_dir, &canonical_root) {
-        load_plugins_from_dir(&plugins_dir, &canonical_root, &mut plugins, &mut seen_names);
+    if plugins_dir.is_dir() && is_within_root(&plugins_dir, canonical_root) {
+        load_plugins_from_dir(&plugins_dir, canonical_root, plugins, seen_names);
     }
+}
 
-    // 3. Project root fallow-plugin-* files (.toml, .json, .jsonc)
+fn load_root_plugin_files(
+    root: &Path,
+    canonical_root: &Path,
+    plugins: &mut Vec<ExternalPluginDef>,
+    seen_names: &mut rustc_hash::FxHashSet<String>,
+) {
     if let Ok(entries) = std::fs::read_dir(root) {
         let mut plugin_files: Vec<PathBuf> = entries
             .filter_map(Result::ok)
@@ -257,15 +754,17 @@ pub fn discover_external_plugins(
             .collect();
         plugin_files.sort();
         for path in plugin_files {
-            load_plugin_file(&path, &canonical_root, &mut plugins, &mut seen_names);
+            load_plugin_file(&path, canonical_root, plugins, seen_names);
         }
     }
-
-    plugins
 }
 
 /// Check if a path resolves within the canonical root (follows symlinks).
-fn is_within_root(path: &Path, canonical_root: &Path) -> bool {
+#[expect(
+    clippy::redundant_pub_crate,
+    reason = "this module is glob re-exported from lib.rs, so `pub` would leak this helper into the public API; pub(crate) is the minimal widening for the rule-pack loader"
+)]
+pub(crate) fn is_within_root(path: &Path, canonical_root: &Path) -> bool {
     let canonical = dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     canonical.starts_with(canonical_root)
 }
@@ -295,7 +794,6 @@ fn load_plugin_file(
     plugins: &mut Vec<ExternalPluginDef>,
     seen: &mut rustc_hash::FxHashSet<String>,
 ) {
-    // Verify symlinks don't escape the project root
     if !is_within_root(path, canonical_root) {
         tracing::warn!(
             "plugin file '{}' resolves outside project root (symlink?), skipping",
@@ -312,33 +810,50 @@ fn load_plugin_file(
         return;
     };
 
+    let Some(content) = read_plugin_file(path) else {
+        return;
+    };
+
+    if let Some(plugin) = parse_plugin(&content, &format, path) {
+        push_plugin_if_unique(plugin, path, plugins, seen);
+    }
+}
+
+fn read_plugin_file(path: &Path) -> Option<String> {
     match std::fs::read_to_string(path) {
-        Ok(content) => {
-            if let Some(plugin) = parse_plugin(&content, &format, path) {
-                if plugin.name.is_empty() {
-                    tracing::warn!(
-                        "external plugin in {} has an empty name, skipping",
-                        path.display()
-                    );
-                    return;
-                }
-                if seen.insert(plugin.name.clone()) {
-                    plugins.push(plugin);
-                } else {
-                    tracing::warn!(
-                        "duplicate external plugin '{}' in {}, skipping",
-                        plugin.name,
-                        path.display()
-                    );
-                }
-            }
-        }
+        Ok(content) => Some(content),
         Err(e) => {
             tracing::warn!(
                 "failed to read external plugin file {}: {e}",
                 path.display()
             );
+            None
         }
+    }
+}
+
+fn push_plugin_if_unique(
+    plugin: ExternalPluginDef,
+    path: &Path,
+    plugins: &mut Vec<ExternalPluginDef>,
+    seen: &mut rustc_hash::FxHashSet<String>,
+) {
+    if plugin.name.is_empty() {
+        tracing::warn!(
+            "external plugin in {} has an empty name, skipping",
+            path.display()
+        );
+        return;
+    }
+
+    if seen.insert(plugin.name.clone()) {
+        plugins.push(plugin);
+    } else {
+        tracing::warn!(
+            "duplicate external plugin '{}' in {}, skipping",
+            plugin.name,
+            path.display()
+        );
     }
 }
 
@@ -533,19 +1048,218 @@ exports = ["default"]
     }
 
     #[test]
+    fn manifest_field_paths_and_templates_are_parsed_once_and_round_trip() {
+        let source = r#"{
+            "name": "manifest-plugin",
+            "manifestEntries": [{
+                "manifests": "**/manifest.json",
+                "when": { "plugin.browser": true },
+                "entries": [{
+                    "path": "${plugin.entry}/index.{ts,tsx}",
+                    "when": { "type": "plugin" }
+                }]
+            }]
+        }"#;
+
+        let plugin: ExternalPluginDef = serde_json::from_str(source).unwrap();
+        let rule = &plugin.manifest_entries[0];
+        let condition_path = rule.when.keys().next().unwrap();
+        assert_eq!(
+            condition_path.segments(),
+            &[
+                ManifestFieldSegment::Key("plugin".to_string()),
+                ManifestFieldSegment::Key("browser".to_string()),
+            ]
+        );
+        assert_eq!(
+            rule.entries[0].path.as_str(),
+            "${plugin.entry}/index.{ts,tsx}"
+        );
+        assert_eq!(
+            rule.entries[0].path.parts(),
+            &[
+                ManifestPathPart::Field("plugin.entry".parse().unwrap()),
+                ManifestPathPart::Literal("/index.{ts,tsx}".to_string()),
+            ]
+        );
+
+        let serialized = serde_json::to_value(&plugin).unwrap();
+        assert_eq!(
+            serialized["manifestEntries"][0]["when"]["plugin.browser"],
+            true
+        );
+        assert_eq!(
+            serialized["manifestEntries"][0]["entries"][0]["path"],
+            "${plugin.entry}/index.{ts,tsx}"
+        );
+    }
+
+    #[test]
+    fn invalid_manifest_field_paths_and_templates_are_rejected() {
+        for source in [
+            r#"{
+                "name": "bad-condition",
+                "manifestEntries": [{
+                    "manifests": "**/manifest.json",
+                    "when": { "plugin..browser": true },
+                    "entries": [{ "path": "index.ts" }]
+                }]
+            }"#,
+            r#"{
+                "name": "bad-template-field",
+                "manifestEntries": [{
+                    "manifests": "**/manifest.json",
+                    "entries": [{ "path": "${plugin..entry}/index.ts" }]
+                }]
+            }"#,
+            r#"{
+                "name": "bad-entry-condition",
+                "manifestEntries": [{
+                    "manifests": "**/manifest.json",
+                    "entries": [{
+                        "path": "index.ts",
+                        "when": { "plugin..browser": true }
+                    }]
+                }]
+            }"#,
+            r#"{
+                "name": "unterminated-template",
+                "manifestEntries": [{
+                    "manifests": "**/manifest.json",
+                    "entries": [{ "path": "${plugin.entry/index.ts" }]
+                }]
+            }"#,
+        ] {
+            assert!(serde_json::from_str::<ExternalPluginDef>(source).is_err());
+        }
+    }
+
+    #[test]
+    fn manifest_field_paths_support_only_explicit_array_traversal() {
+        let path: ManifestFieldPath = "content_scripts[*].js[*]".parse().unwrap();
+        assert_eq!(
+            path.segments(),
+            &[
+                ManifestFieldSegment::Key("content_scripts".to_string()),
+                ManifestFieldSegment::Each,
+                ManifestFieldSegment::Key("js".to_string()),
+                ManifestFieldSegment::Each,
+            ]
+        );
+
+        for invalid in [
+            "content_scripts[0].js",
+            "content_scripts[].js",
+            "content_scripts[foo].js",
+            "content_scripts[*x].js",
+            "[*].js",
+        ] {
+            assert!(invalid.parse::<ManifestFieldPath>().is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn manifest_conditions_distinguish_scalar_equality_from_presence() {
+        let source = r#"{
+            "name": "condition-plugin",
+            "manifestEntries": [{
+                "manifests": "**/manifest.json",
+                "when": {
+                    "main": { "exists": true },
+                    "enabled": false,
+                    "mode": "worker",
+                    "version": 3,
+                    "metadata": null
+                },
+                "entries": [{ "path": "index.ts" }]
+            }]
+        }"#;
+        let plugin: ExternalPluginDef = serde_json::from_str(source).unwrap();
+        let when = &plugin.manifest_entries[0].when;
+
+        assert_eq!(
+            when.get(&"main".parse().unwrap()),
+            Some(&ManifestCondition::Exists(ManifestExistsPredicate {
+                exists: true,
+            }))
+        );
+        assert_eq!(
+            when.get(&"enabled".parse().unwrap()),
+            Some(&ManifestCondition::Equals(serde_json::Value::Bool(false)))
+        );
+        assert_eq!(
+            when.get(&"metadata".parse().unwrap()),
+            Some(&ManifestCondition::Equals(serde_json::Value::Null))
+        );
+
+        let serialized = serde_json::to_value(plugin).unwrap();
+        assert_eq!(
+            serialized["manifestEntries"][0]["when"]["main"],
+            serde_json::json!({ "exists": true })
+        );
+    }
+
+    #[test]
+    fn manifest_conditions_preserve_non_operator_json_equality_values() {
+        let expected = [
+            serde_json::json!({ "exists": "not-an-operator" }),
+            serde_json::json!({ "exists": true, "extra": true }),
+            serde_json::json!({ "other": true }),
+            serde_json::json!(["worker"]),
+        ];
+        for condition in expected {
+            let source = serde_json::json!({
+                "name": "equality-condition",
+                "manifestEntries": [{
+                    "manifests": "**/manifest.json",
+                    "when": { "field": condition.clone() },
+                    "entries": [{ "path": "index.ts" }]
+                }]
+            });
+            let plugin: ExternalPluginDef = serde_json::from_value(source).unwrap();
+            assert_eq!(
+                plugin.manifest_entries[0]
+                    .when
+                    .get(&"field".parse().unwrap()),
+                Some(&ManifestCondition::Equals(condition))
+            );
+        }
+    }
+
+    #[test]
+    fn manifest_exists_conditions_deserialize_from_toml() {
+        let source = r#"
+name = "condition-plugin"
+
+[[manifestEntries]]
+manifests = "**/manifest.json"
+
+[manifestEntries.when.main]
+exists = true
+
+[[manifestEntries.entries]]
+path = "index.ts"
+"#;
+        let plugin: ExternalPluginDef = toml::from_str(source).unwrap();
+        assert_eq!(
+            plugin.manifest_entries[0]
+                .when
+                .get(&"main".parse().unwrap()),
+            Some(&ManifestCondition::Exists(ManifestExistsPredicate {
+                exists: true,
+            }))
+        );
+    }
+
+    #[test]
     fn deserialize_jsonc_plugin() {
         let jsonc_str = r#"{
-            // This is a JSONC plugin
             "name": "my-jsonc-plugin",
             "enablers": ["my-pkg"],
             /* Block comment */
             "entryPoints": ["src/**/*.ts"]
         }"#;
-        let mut stripped = String::new();
-        json_comments::StripComments::new(jsonc_str.as_bytes())
-            .read_to_string(&mut stripped)
-            .unwrap();
-        let plugin: ExternalPluginDef = serde_json::from_str(&stripped).unwrap();
+        let plugin: ExternalPluginDef = crate::jsonc::parse_to_value(jsonc_str).unwrap();
         assert_eq!(plugin.name, "my-jsonc-plugin");
         assert_eq!(plugin.enablers, vec!["my-pkg"]);
         assert_eq!(plugin.entry_points, vec!["src/**/*.ts"]);
@@ -554,7 +1268,7 @@ exports = ["default"]
     #[test]
     fn deserialize_json_with_schema_field() {
         let json_str = r#"{
-            "$schema": "https://fallow.dev/plugin-schema.json",
+            "$schema": "https://raw.githubusercontent.com/fallow-rs/fallow/main/plugin-schema.json",
             "name": "schema-plugin",
             "enablers": ["my-pkg"]
         }"#;
@@ -613,7 +1327,6 @@ entryPoints = ["src/**/*.ts"]
         std::fs::write(
             plugins_dir.join("my-plugin.jsonc"),
             r#"{
-                // JSONC plugin
                 "name": "jsonc-plugin",
                 "enablers": ["jsonc-pkg"]
             }"#,
@@ -622,7 +1335,6 @@ entryPoints = ["src/**/*.ts"]
 
         let plugins = discover_external_plugins(&dir, &[]);
         assert_eq!(plugins.len(), 2);
-        // Sorted: json before jsonc
         assert_eq!(plugins[0].name, "json-plugin");
         assert_eq!(plugins[1].name, "jsonc-plugin");
 
@@ -644,7 +1356,6 @@ enablers = ["custom-pkg"]
         )
         .unwrap();
 
-        // Non-matching file should be ignored
         std::fs::write(dir.join("some-other-file.toml"), r#"name = "ignored""#).unwrap();
 
         let plugins = discover_external_plugins(&dir, &[]);
@@ -671,14 +1382,12 @@ enablers = ["custom-pkg"]
         std::fs::write(
             dir.join("fallow-plugin-custom2.jsonc"),
             r#"{
-                // JSONC root plugin
                 "name": "jsonc-root",
                 "enablers": ["jsonc-pkg"]
             }"#,
         )
         .unwrap();
 
-        // Non-matching extension should be ignored
         std::fs::write(
             dir.join("fallow-plugin-bad.yaml"),
             "name: ignored\nenablers:\n  - pkg\n",
@@ -716,7 +1425,6 @@ enablers = ["toml-pkg"]
         std::fs::write(
             plugins_dir.join("c-plugin.jsonc"),
             r#"{
-                // JSONC plugin
                 "name": "jsonc-plugin",
                 "enablers": ["jsonc-pkg"]
             }"#,
@@ -739,7 +1447,6 @@ enablers = ["toml-pkg"]
         let plugins_dir = dir.join(".fallow").join("plugins");
         let _ = std::fs::create_dir_all(&plugins_dir);
 
-        // Same name in .fallow/plugins/ and root
         std::fs::write(
             plugins_dir.join("my-plugin.toml"),
             r#"
@@ -760,7 +1467,6 @@ enablers = ["pkg-b"]
 
         let plugins = discover_external_plugins(&dir, &[]);
         assert_eq!(plugins.len(), 1);
-        // First one wins (.fallow/plugins/ before root)
         assert_eq!(plugins[0].enablers, vec!["pkg-a"]);
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -839,10 +1545,8 @@ enablers = ["single-pkg"]
         let plugins_dir = dir.join(".fallow").join("plugins");
         let _ = std::fs::create_dir_all(&plugins_dir);
 
-        // Invalid: missing required `name` field
         std::fs::write(plugins_dir.join("bad.toml"), r#"enablers = ["pkg"]"#).unwrap();
 
-        // Valid
         std::fs::write(
             plugins_dir.join("good.toml"),
             r#"
@@ -868,10 +1572,8 @@ enablers = ["good-pkg"]
         let plugins_dir = dir.join(".fallow").join("plugins");
         let _ = std::fs::create_dir_all(&plugins_dir);
 
-        // Invalid JSON: missing name
         std::fs::write(plugins_dir.join("bad.json"), r#"{"enablers": ["pkg"]}"#).unwrap();
 
-        // Valid JSON
         std::fs::write(
             plugins_dir.join("good.json"),
             r#"{"name": "good-json", "enablers": ["good-pkg"]}"#,
@@ -923,7 +1625,6 @@ enablers = ["pkg"]
             std::env::temp_dir().join(format!("fallow-test-path-escape-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
 
-        // Attempt to load a plugin from outside the project root
         let plugins = discover_external_plugins(&dir, &["../../../etc".to_string()]);
         assert!(plugins.is_empty(), "paths outside root should be rejected");
 
@@ -957,8 +1658,6 @@ enablers = ["pkg"]
         assert!(!is_plugin_file(Path::new("plugin.txt")));
         assert!(!is_plugin_file(Path::new("plugin")));
     }
-
-    // ── PluginDetection tests ────────────────────────────────────
 
     #[test]
     fn detection_deserialize_dependency() {
@@ -1015,8 +1714,6 @@ enablers = ["pkg"]
         assert_eq!(plugin.enablers, vec!["my-pkg"]);
     }
 
-    // ── Nested detection combinators ────────────────────────────────
-
     #[test]
     fn detection_nested_all_with_any() {
         let json = r#"{
@@ -1068,8 +1765,6 @@ enablers = ["pkg"]
         ));
     }
 
-    // ── TOML with detection field ───────────────────────────────────
-
     #[test]
     fn detection_toml_dependency() {
         let toml_str = r#"
@@ -1103,12 +1798,10 @@ pattern = "next.config.js"
         ));
     }
 
-    // ── Plugin with all fields set ──────────────────────────────────
-
     #[test]
     fn plugin_all_fields_json() {
         let json = r#"{
-            "$schema": "https://fallow.dev/plugin-schema.json",
+            "$schema": "https://raw.githubusercontent.com/fallow-rs/fallow/main/plugin-schema.json",
             "name": "full-plugin",
             "detection": {"type": "dependency", "package": "my-pkg"},
             "enablers": ["fallback-enabler"],
@@ -1131,16 +1824,12 @@ pattern = "next.config.js"
         assert_eq!(plugin.used_exports[0].exports, vec!["default", "setup"]);
     }
 
-    // ── Plugin name validation edge case ────────────────────────────
-
     #[test]
     fn plugin_with_special_chars_in_name() {
         let json = r#"{"name": "@scope/my-plugin-v2.0", "enablers": ["pkg"]}"#;
         let plugin: ExternalPluginDef = serde_json::from_str(json).unwrap();
         assert_eq!(plugin.name, "@scope/my-plugin-v2.0");
     }
-
-    // ── parse_plugin with various formats ───────────────────────────
 
     #[test]
     fn parse_plugin_toml_format() {
@@ -1166,7 +1855,6 @@ entryPoints = ["src/**/*.ts"]
     #[test]
     fn parse_plugin_jsonc_format() {
         let content = r#"{
-            // A comment
             "name": "jsonc-test",
             "enablers": ["pkg"]
         }"#;
@@ -1191,7 +1879,6 @@ entryPoints = ["src/**/*.ts"]
 
     #[test]
     fn parse_plugin_invalid_jsonc_returns_none() {
-        // Missing required `name` field
         let content = r#"{"enablers": ["pkg"]}"#;
         let result = parse_plugin(content, &PluginFormat::Jsonc, Path::new("bad.jsonc"));
         assert!(result.is_none());

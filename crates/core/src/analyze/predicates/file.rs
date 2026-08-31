@@ -4,18 +4,134 @@ pub(in crate::analyze) fn is_declaration_file(path: &std::path::Path) -> bool {
     name.ends_with(".d.ts") || name.ends_with(".d.mts") || name.ends_with(".d.cts")
 }
 
+/// Whether the path is a React/Preact JSX module (`.jsx` / `.tsx`). `.js` / `.ts`
+/// files re-parsed through the JSX retry path also carry React IR, but React
+/// detectors scope to the canonical JSX extensions to keep the surface tight.
+pub(in crate::analyze) fn is_react_file(path: &std::path::Path) -> bool {
+    matches!(
+        path.extension().and_then(|e| e.to_str()),
+        Some("jsx" | "tsx")
+    )
+}
+
+/// The component name: the file stem (e.g. `UserCard` for `UserCard.vue`).
+pub(in crate::analyze) fn component_name_for(path: &std::path::Path) -> String {
+    path.file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_string()
+}
+
 /// Check if a path is an HTML file.
 ///
 /// HTML files are excluded from unused-file detection because they are entry-point-like:
 /// nothing imports an HTML file, so "unused" is meaningless for them. They serve as
 /// entry points in Vite/Parcel-style apps and their referenced assets are tracked
 /// via `<script src>` and `<link href>` edges.
-// Keep in sync with fallow_extract::html::is_html_file (crate boundary prevents sharing)
 pub(in crate::analyze) fn is_html_file(path: &std::path::Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
         .is_some_and(|ext| ext == "html")
 }
+
+/// Compiled glob set over the test / spec / story / fixture subset of
+/// [`PRODUCTION_EXCLUDE_PATTERNS`](crate::discover::PRODUCTION_EXCLUDE_PATTERNS),
+/// built once. `literal_separator(true)` so `*` cannot cross a path separator,
+/// matching production-mode exclusion semantics. The tooling-config patterns
+/// (`*.config.*`, dot-prefixed) are intentionally excluded here: this predicate
+/// answers "is this a TEST / SPEC file", not "is this any low-value anchor"
+/// (the security layer's `is_low_value_anchor` adds the config-file arm on top).
+fn test_or_spec_globset() -> &'static globset::GlobSet {
+    use std::sync::OnceLock;
+    static SET: OnceLock<globset::GlobSet> = OnceLock::new();
+    SET.get_or_init(|| {
+        let mut builder = globset::GlobSetBuilder::new();
+        for pattern in crate::discover::PRODUCTION_EXCLUDE_PATTERNS {
+            // Skip the tooling-config arms (`*.config.*` and the `**/.*.{js,ts,..}`
+            // dotfile rows); they are not test/spec files.
+            if pattern.starts_with("*.config.") || pattern.starts_with("**/.*") {
+                continue;
+            }
+            if let Ok(glob) = globset::GlobBuilder::new(pattern)
+                .literal_separator(true)
+                .build()
+            {
+                builder.add(glob);
+            }
+        }
+        builder
+            .build()
+            .unwrap_or_else(|_| globset::GlobSet::empty())
+    })
+}
+
+/// Check if a path is a test / spec / story / fixture file (a `*.test.*`,
+/// `*.spec.*`, `*.stories.*`, `__tests__/`, `test/`, `tests/`, etc. location).
+///
+/// Reuses the canonical [`PRODUCTION_EXCLUDE_PATTERNS`](crate::discover::PRODUCTION_EXCLUDE_PATTERNS)
+/// test/spec subset so the definition never drifts from production-mode
+/// exclusion. The match runs on the path with separators forward-slash
+/// normalized so the `**/` globs anchor consistently across platforms.
+pub(in crate::analyze) fn is_test_or_spec_file(path: &std::path::Path) -> bool {
+    let normalized = path.to_string_lossy().replace('\\', "/");
+    test_or_spec_globset().is_match(&normalized)
+}
+
+const CONFIG_FILE_PREFIXES: &[&str] = &[
+    "babel.config.",
+    "rollup.config.",
+    "webpack.config.",
+    "postcss.config.",
+    "stencil.config.",
+    "remotion.config.",
+    "metro.config.",
+    "tsup.config.",
+    "unbuild.config.",
+    "esbuild.config.",
+    "swc.config.",
+    "turbo.",
+    "jest.config.",
+    "jest.setup.",
+    "vitest.config.",
+    "vitest.ci.config.",
+    "vitest.setup.",
+    "vitest.workspace.",
+    "playwright.config.",
+    "cypress.config.",
+    "karma.conf.",
+    "eslint.config.",
+    "prettier.config.",
+    "stylelint.config.",
+    "lint-staged.config.",
+    "commitlint.config.",
+    "next.config.",
+    "next-sitemap.config.",
+    "nuxt.config.",
+    "astro.config.",
+    "sanity.config.",
+    "vite.config.",
+    "tailwind.config.",
+    "drizzle.config.",
+    "knexfile.",
+    "sentry.client.config.",
+    "sentry.server.config.",
+    "sentry.edge.config.",
+    "react-router.config.",
+    "typedoc.",
+    "knip.config.",
+    "fallow.config.",
+    "i18next-parser.config.",
+    "codegen.config.",
+    "graphql.config.",
+    "npmpackagejsonlint.config.",
+    "release-it.",
+    "release.config.",
+    "contentlayer.config.",
+    ".size-limit.",
+    "next-env.d.",
+    "env.d.",
+    "vite-env.d.",
+];
 
 /// Check if a file is a configuration file consumed by tooling, not via imports.
 ///
@@ -25,100 +141,30 @@ pub(in crate::analyze) fn is_html_file(path: &std::path::Path) -> bool {
 pub(in crate::analyze) fn is_config_file(path: &std::path::Path) -> bool {
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
-    // Dotfiles with "rc" suffix pattern (e.g., .secretlintrc.cjs, .commitlintrc.js, .prettierrc.js)
-    // Only match files with "rc." before the extension — avoids false matches on arbitrary dotfiles.
     if name.starts_with('.') && !name.starts_with("..") {
         let lower = name.to_ascii_lowercase();
-        // .foorc.{ext} pattern — standard for tool configs
         if lower.contains("rc.") {
             return true;
         }
     }
 
-    // Files matching common config naming patterns.
-    // Each pattern is a prefix — the file must start with it.
-    let config_patterns = [
-        // Build tools
-        "babel.config.",
-        "rollup.config.",
-        "webpack.config.",
-        "postcss.config.",
-        "stencil.config.",
-        "remotion.config.",
-        "metro.config.",
-        "tsup.config.",
-        "unbuild.config.",
-        "esbuild.config.",
-        "swc.config.",
-        "turbo.",
-        // Testing
-        "jest.config.",
-        "jest.setup.",
-        "vitest.config.",
-        "vitest.ci.config.",
-        "vitest.setup.",
-        "vitest.workspace.",
-        "playwright.config.",
-        "cypress.config.",
-        "karma.conf.",
-        // Linting & formatting
-        "eslint.config.",
-        "prettier.config.",
-        "stylelint.config.",
-        "lint-staged.config.",
-        "commitlint.config.",
-        // Frameworks / CMS
-        "next.config.",
-        "next-sitemap.config.",
-        "nuxt.config.",
-        "astro.config.",
-        "sanity.config.",
-        "vite.config.",
-        "tailwind.config.",
-        "drizzle.config.",
-        "knexfile.",
-        "sentry.client.config.",
-        "sentry.server.config.",
-        "sentry.edge.config.",
-        "react-router.config.",
-        // Documentation
-        "typedoc.",
-        // Analysis & misc
-        "knip.config.",
-        "fallow.config.",
-        "i18next-parser.config.",
-        "codegen.config.",
-        "graphql.config.",
-        "npmpackagejsonlint.config.",
-        "release-it.",
-        "release.config.",
-        "contentlayer.config.",
-        // Environment declarations
-        "next-env.d.",
-        "env.d.",
-        "vite-env.d.",
-    ];
-
-    config_patterns.iter().any(|p| name.starts_with(p))
+    CONFIG_FILE_PREFIXES.iter().any(|p| name.starts_with(p))
 }
 
 /// Check if a module is a barrel file (only re-exports) whose sources are reachable.
 ///
 /// A barrel file like `index.ts` that only contains `export { Foo } from './source'`
 /// lines serves an organizational purpose. If the source modules are reachable,
-/// the barrel file should not be reported as unused — consumers may have bypassed
+/// the barrel file should not be reported as unused , consumers may have bypassed
 /// it with direct imports, but the barrel still provides valid re-exports.
 pub(in crate::analyze) fn is_barrel_with_reachable_sources(
     module: &crate::graph::ModuleNode,
     graph: &crate::graph::ModuleGraph,
 ) -> bool {
-    // Must have re-exports
     if module.re_exports.is_empty() {
         return false;
     }
 
-    // Must be a pure barrel: no local exports with real spans (only re-export-generated
-    // exports have span 0..0) and no CJS exports
     let has_local_exports = module
         .exports
         .iter()
@@ -127,7 +173,6 @@ pub(in crate::analyze) fn is_barrel_with_reachable_sources(
         return false;
     }
 
-    // At least one re-export source must be reachable
     module.re_exports.iter().any(|re| {
         let source_idx = re.source_file.0 as usize;
         graph
@@ -141,7 +186,6 @@ pub(in crate::analyze) fn is_barrel_with_reachable_sources(
 mod tests {
     use super::*;
 
-    // Declaration file tests (Issue 4)
     #[test]
     fn declaration_file_dts() {
         assert!(is_declaration_file(std::path::Path::new("styled.d.ts")));
@@ -165,7 +209,47 @@ mod tests {
         assert!(!is_declaration_file(std::path::Path::new("styles.d.css")));
     }
 
-    // Config file tests
+    #[test]
+    fn test_or_spec_file_matches_test_and_spec() {
+        assert!(is_test_or_spec_file(std::path::Path::new(
+            "src/components/Button.test.tsx"
+        )));
+        assert!(is_test_or_spec_file(std::path::Path::new(
+            "src/utils/format.spec.ts"
+        )));
+        assert!(is_test_or_spec_file(std::path::Path::new(
+            "src/__tests__/Button.tsx"
+        )));
+        assert!(is_test_or_spec_file(std::path::Path::new("test/setup.ts")));
+        assert!(is_test_or_spec_file(std::path::Path::new(
+            "tests/e2e/flow.ts"
+        )));
+        assert!(is_test_or_spec_file(std::path::Path::new(
+            "src/Page.stories.tsx"
+        )));
+        assert!(is_test_or_spec_file(std::path::Path::new(
+            "src/__fixtures__/data.ts"
+        )));
+    }
+
+    /// Tooling config files and ordinary source are NOT test/spec files: this
+    /// predicate is narrower than the security `is_low_value_anchor` (which adds
+    /// the config-file arm on top).
+    #[test]
+    fn test_or_spec_file_excludes_config_and_source() {
+        assert!(!is_test_or_spec_file(std::path::Path::new(
+            "src/components/Button.tsx"
+        )));
+        assert!(!is_test_or_spec_file(std::path::Path::new(
+            "vite.config.ts"
+        )));
+        assert!(!is_test_or_spec_file(std::path::Path::new("index.ts")));
+        // A `testimonials` directory is not a `test/` directory (segment-anchored).
+        assert!(!is_test_or_spec_file(std::path::Path::new(
+            "src/testimonials/Card.tsx"
+        )));
+    }
+
     #[test]
     fn config_file_known_patterns() {
         assert!(is_config_file(std::path::Path::new("webpack.config.js")));
@@ -183,6 +267,18 @@ mod tests {
     }
 
     #[test]
+    fn config_file_size_limit_dotfile_without_rc() {
+        // size-limit searches `.size-limit.<ext>` from the package it runs in,
+        // so a hoisted monorepo keeps the config inside a workspace package where
+        // the root plugin's always-used globs never reach.
+        assert!(is_config_file(std::path::Path::new(".size-limit.js")));
+        assert!(is_config_file(std::path::Path::new(
+            "packages/lib/.size-limit.ts"
+        )));
+        assert!(!is_config_file(std::path::Path::new("size-limit.js")));
+    }
+
+    #[test]
     fn not_config_file() {
         assert!(!is_config_file(std::path::Path::new("index.ts")));
         assert!(!is_config_file(std::path::Path::new("utils.js")));
@@ -191,10 +287,6 @@ mod tests {
             "src/webpack-plugin.js"
         )));
     }
-
-    // ---------------------------------------------------------------
-    // is_config_file edge cases
-    // ---------------------------------------------------------------
 
     #[test]
     fn config_file_testing_tool_configs() {
@@ -295,7 +387,7 @@ mod tests {
     }
 
     /// Dotenv files (`.env`, `.env.local`, `.env.production`) are NOT config files
-    /// in this context — they are environment variable files, not JS/TS tool configs.
+    /// in this context , they are environment variable files, not JS/TS tool configs.
     #[test]
     fn not_config_file_dotenv_files() {
         assert!(!is_config_file(std::path::Path::new(".env")));
@@ -354,10 +446,6 @@ mod tests {
         )));
     }
 
-    // ---------------------------------------------------------------
-    // is_declaration_file edge cases
-    // ---------------------------------------------------------------
-
     /// Declaration files in deeply nested paths.
     #[test]
     fn declaration_file_nested_paths() {
@@ -383,10 +471,6 @@ mod tests {
     fn not_declaration_file_d_ts_in_middle() {
         assert!(!is_declaration_file(std::path::Path::new("my.d.ts.backup")));
     }
-
-    // ---------------------------------------------------------------
-    // is_barrel_with_reachable_sources tests
-    // ---------------------------------------------------------------
 
     use crate::discover::{DiscoveredFile, EntryPoint, EntryPointSource, FileId};
     use crate::extract::VisibilityTag;
@@ -422,17 +506,23 @@ mod tests {
             .map(|f| ResolvedModule {
                 file_id: f.id,
                 path: f.path.clone(),
-                exports: vec![],
+                exports: vec![].into(),
                 re_exports: vec![],
                 resolved_imports: vec![],
                 resolved_dynamic_imports: vec![],
                 resolved_dynamic_patterns: vec![],
-                member_accesses: vec![],
-                whole_object_uses: vec![],
+                member_accesses: vec![].into(),
+                semantic_facts: std::sync::Arc::default(),
+                whole_object_uses: std::sync::Arc::default(),
                 has_cjs_exports: false,
+                has_angular_component_template_url: false,
                 unused_import_bindings: rustc_hash::FxHashSet::default(),
                 type_referenced_import_bindings: vec![],
                 value_referenced_import_bindings: vec![],
+                namespace_object_aliases: vec![],
+                exported_factory_returns: std::sync::Arc::default(),
+                exported_factory_return_object_shapes: std::sync::Arc::default(),
+                type_member_types: std::sync::Arc::default(),
             })
             .collect();
 
@@ -456,7 +546,6 @@ mod tests {
             ("/src/utils.ts", false),
         ]);
         graph.modules[2].set_reachable(true);
-        // Add a re-export
         graph.modules[1].re_exports = vec![ReExportEdge {
             source_file: FileId(2),
             imported_name: "helper".to_string(),
@@ -464,13 +553,15 @@ mod tests {
             is_type_only: false,
             span: oxc_span::Span::default(),
         }];
-        // Add a local export with a real span (non-zero)
         graph.modules[1].exports = vec![ExportSymbol {
             name: crate::extract::ExportName::Named("localFn".to_string()),
             is_type_only: false,
+            is_side_effect_used: false,
             visibility: VisibilityTag::None,
+            expected_unused_reason: None,
             span: oxc_span::Span::new(10, 50),
             references: vec![],
+            reference_paths: Vec::new(),
             members: vec![],
         }];
         assert!(!is_barrel_with_reachable_sources(&graph.modules[1], &graph));
@@ -505,7 +596,6 @@ mod tests {
             ("/src/utils.ts", false),
         ]);
         graph.modules[2].set_reachable(true);
-        // Only re-exports, no local exports, no CJS
         graph.modules[1].re_exports = vec![ReExportEdge {
             source_file: FileId(2),
             imported_name: "helper".to_string(),
@@ -513,13 +603,15 @@ mod tests {
             is_type_only: false,
             span: oxc_span::Span::default(),
         }];
-        // Only synthetic exports (span 0..0), which are from re-exports
         graph.modules[1].exports = vec![ExportSymbol {
             name: crate::extract::ExportName::Named("helper".to_string()),
             is_type_only: false,
+            is_side_effect_used: false,
             visibility: VisibilityTag::None,
+            expected_unused_reason: None,
             span: oxc_span::Span::new(0, 0),
             references: vec![],
+            reference_paths: Vec::new(),
             members: vec![],
         }];
         assert!(is_barrel_with_reachable_sources(&graph.modules[1], &graph));
@@ -533,7 +625,6 @@ mod tests {
             ("/src/index.ts", false),
             ("/src/utils.ts", false),
         ]);
-        // utils (source) is NOT reachable
         graph.modules[1].re_exports = vec![ReExportEdge {
             source_file: FileId(2),
             imported_name: "helper".to_string(),
@@ -555,13 +646,8 @@ mod tests {
             is_type_only: false,
             span: oxc_span::Span::default(),
         }];
-        // Should not panic, should return false
         assert!(!is_barrel_with_reachable_sources(&graph.modules[1], &graph));
     }
-
-    // ---------------------------------------------------------------
-    // is_config_file additional coverage
-    // ---------------------------------------------------------------
 
     #[test]
     fn config_file_dotfiles_with_rc() {
