@@ -47,7 +47,7 @@
   "devDependencies": {
     "@commitlint/cli": "21.2.2",
     "@commitlint/config-conventional": "21.2.2",
-    "@tanstack/intent": "0.3.6",
+    "@tanstack/intent": "0.3.7",
     "oxfmt": "0.64.0",
     "oxlint": "1.79.0"
   }
