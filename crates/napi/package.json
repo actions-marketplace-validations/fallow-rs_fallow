@@ -76,6 +76,6 @@
     "@fallow-cli/fallow-node-win32-arm64-msvc": "3.21.0",
     "@fallow-cli/fallow-node-win32-x64-msvc": "3.21.0",
     "fallow-similar-code": "3.21.0",
-    "fallow-type-aware": "3.21.0"
+    "fallow-type-aware": "3.22.0"
   }
 }
